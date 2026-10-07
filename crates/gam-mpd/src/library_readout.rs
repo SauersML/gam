@@ -2395,7 +2395,7 @@ impl Library<'_> {
                     .iter()
                     .map(|&h| {
                         let b = &self.heads[h];
-                        HeadWeights { query: b.query.map.clone(), query_norm: b.query.norm.clone(), key: b.key.map.clone(), key_norm: b.key.norm.clone(), value: b.value.clone(), output: b.output.clone(), scale: b.scale, rotary: b.rotary, causal: b.causal }
+                        HeadWeights { query: b.query.map.clone(), query_norm: b.query.norm.clone(), key: std::sync::Arc::new(b.key.map.clone()), key_norm: b.key.norm.clone(), value: std::sync::Arc::new(b.value.clone()), output: b.output.clone(), scale: b.scale, rotary: b.rotary, causal: b.causal }
                     })
                     .collect(),
                 mlp_norm: norm(&self.sites[2 * l + 1]),

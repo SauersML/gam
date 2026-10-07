@@ -171,13 +171,28 @@ impl Norm {
 pub struct HeadWeights {
     pub query: Array2<f64>,
     pub query_norm: Option<(Array1<f64>, f64)>,
-    pub key: Array2<f64>,
+    /// The key and value maps, one allocation for the heads of a key/value group (grouped-query
+    /// attention); an edit of one head's map gives that head its own copy (`Arc::make_mut`).
+    pub key: Arc<Array2<f64>>,
     pub key_norm: Option<(Array1<f64>, f64)>,
-    pub value: Array2<f64>,
+    pub value: Arc<Array2<f64>>,
     pub output: Array2<f64>,
     pub scale: f64,
     pub rotary: Option<Rotary>,
     pub causal: bool,
+}
+
+impl HeadWeights {
+    /// Map `m` (0 query, 1 key, 2 value, 3 output) for an in-place change: a key or value map the
+    /// head shares is copied for it first.
+    fn map_mut(&mut self, m: usize) -> &mut Array2<f64> {
+        match m {
+            0 => &mut self.query,
+            1 => Arc::make_mut(&mut self.key),
+            2 => Arc::make_mut(&mut self.value),
+            _ => &mut self.output,
+        }
+    }
 }
 
 /// One MLP: `h = φ(G x̂ + b)` (times `U x̂ + c` when gated), written by `D h`.
@@ -258,7 +273,7 @@ fn attention_maps(layer: &LayerWeights) -> [Array2<f64>; 4] {
         ndarray::concatenate(Axis(0), &views).expect("heads of one width")
     };
     let outputs: Vec<_> = layer.heads.iter().map(|h| h.output.view()).collect();
-    [stack(&|h| &h.query), stack(&|h| &h.key), stack(&|h| &h.value), ndarray::concatenate(Axis(1), &outputs).expect("heads of one width")]
+    [stack(&|h| &h.query), stack(&|h| &*h.key), stack(&|h| &*h.value), ndarray::concatenate(Axis(1), &outputs).expect("heads of one width")]
 }
 
 /// VPD's subcomponents of one MLP's two matrices (`explanation_battery::Factors`): subcomponent `i`
@@ -470,6 +485,16 @@ impl Weights {
         for (l, layer) in layers.iter().enumerate() {
             let Node::Affine { terms: outputs, .. } = &native.nodes[layer.attention] else { return Err(format!("layer {l}: the attention output is not a map")) };
             let mut heads = Vec::with_capacity(layer.reads.len());
+            // A key/value group's heads read one key and one value node: one map each.
+            let mut shared: BTreeMap<usize, Arc<Array2<f64>>> = BTreeMap::new();
+            let mut map_of = |node: usize, x: usize| -> Result<Arc<Array2<f64>>, String> {
+                if let Some(m) = shared.get(&node) {
+                    return Ok(m.clone());
+                }
+                let m = Arc::new(map(node, x)?.0);
+                shared.insert(node, m.clone());
+                Ok(m)
+            };
             for (h, &read) in layer.reads.iter().enumerate() {
                 let Node::Attend { query, key, value, scale, rotary, causal } = native.nodes[read].clone() else { return Err(format!("layer {l} head {h}: the read is not an attention")) };
                 let x = layer.normed_stream;
@@ -477,9 +502,9 @@ impl Weights {
                 heads.push(HeadWeights {
                     query: map(crate::run_check::head_projection(native, query), x)?.0,
                     query_norm: head_norm(query)?,
-                    key: map(crate::run_check::head_projection(native, key), x)?.0,
+                    key: map_of(crate::run_check::head_projection(native, key), x)?,
                     key_norm: head_norm(key)?,
-                    value: map(value, x)?.0,
+                    value: map_of(value, x)?,
                     output,
                     scale: scale.value(),
                     rotary,
@@ -1405,7 +1430,7 @@ fn heads_write(layer: &LayerWeights, heads: &[usize], inputs: [&Array2<f64>; 3],
     let mut reads = Vec::new();
     for &h in heads {
         let w = &layer.heads[h];
-        let (q, k, v) = (project(&q_hat, &w.query, w.query_norm.as_ref()), project(&k_hat, &w.key, w.key_norm.as_ref()), par_dot(&v_hat, w.value.t()));
+        let (q, k, v) = (project(&q_hat, &w.query, w.query_norm.as_ref()), project(&k_hat, &*w.key, w.key_norm.as_ref()), par_dot(&v_hat, w.value.t()));
         let mut z = Array2::<f64>::zeros(v.dim());
         for (n, &(start, length)) in spans.iter().enumerate() {
             let positions: Vec<u32> = (0..length as u32).collect();
@@ -1872,8 +1897,8 @@ impl WeightEdit {
                 let w = lw.heads.get_mut(h).ok_or("no such head")?;
                 match m {
                     Matrix::Query => &mut w.query,
-                    Matrix::Key => &mut w.key,
-                    Matrix::Value => &mut w.value,
+                    Matrix::Key => Arc::make_mut(&mut w.key),
+                    Matrix::Value => Arc::make_mut(&mut w.value),
                     Matrix::Output => &mut w.output,
                     _ => return Err("an MLP matrix of a head".into()),
                 }
@@ -1917,6 +1942,7 @@ impl WeightEdit {
                 u.row_mut(i).mapv_inplace(|x| x * factor);
             }
         }
+        let maps = key_value_maps(weights, layer, matrix);
         let m = Self::matrix(weights, layer, head, matrix)?;
         let saved = m.clone();
         match self {
@@ -1961,7 +1987,7 @@ impl WeightEdit {
                 }
             }
         }
-        Ok(Restore { layer, head, matrix, saved, factors, shared, heads: Vec::new(), attention: None })
+        Ok(Restore { layer, head, matrix, saved, factors, shared, heads: Vec::new(), attention: None, maps })
     }
 
     /// [`WeightEdit::AttnSubcomponents`]: the change split over the heads (rows `h·d..(h+1)·d` of
@@ -1985,6 +2011,7 @@ impl WeightEdit {
             factors.0.row_mut(i).mapv_inplace(|x| x * factor);
         }
         let mut heads = Vec::new();
+        let maps = key_value_maps(weights, layer, matrix);
         let mut at = 0;
         for h in 0..weights.layers[layer].heads.len() {
             let m = Self::matrix(weights, layer, Some(h), matrix)?;
@@ -1997,7 +2024,16 @@ impl WeightEdit {
             *m += &part;
         }
         let (first, saved) = heads.first().cloned().ok_or("a layer without heads")?;
-        Ok(Restore { layer, head: Some(first), matrix, saved, factors: None, shared: Vec::new(), heads: heads.into_iter().skip(1).collect(), attention: Some((map, saved_u)) })
+        Ok(Restore { layer, head: Some(first), matrix, saved, factors: None, shared: Vec::new(), heads: heads.into_iter().skip(1).collect(), attention: Some((map, saved_u)), maps })
+    }
+}
+
+/// Every head's key and value maps of `layer` before an edit of `matrix` changes them (none for
+/// other matrices): [`Restore`] puts these back so a key/value group shares one map again.
+fn key_value_maps(weights: &Weights, layer: usize, matrix: Matrix) -> Vec<(Arc<Array2<f64>>, Arc<Array2<f64>>)> {
+    match (matrix, weights.layers.get(layer)) {
+        (Matrix::Key | Matrix::Value, Some(lw)) => lw.heads.iter().map(|w| (w.key.clone(), w.value.clone())).collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -2014,6 +2050,8 @@ pub struct Restore {
     /// Further heads' maps before an attention subcomponent edit, and its factors' `U`.
     heads: Vec<(usize, Array2<f64>)>,
     attention: Option<(usize, Array2<f64>)>,
+    /// A key or value edit's heads' maps before it (`key_value_maps`), restored as they were shared.
+    maps: Vec<(Arc<Array2<f64>>, Arc<Array2<f64>>)>,
 }
 
 impl Restore {
@@ -2032,6 +2070,14 @@ impl Restore {
         if let Some((down, u)) = self.factors {
             let vpd = weights.vpd.get_mut(&self.layer).ok_or("the VPD view went missing")?;
             *(if down { &mut vpd.down_u } else { &mut vpd.fc_u }) = u;
+        }
+        if let Some(lw) = weights.layers.get_mut(self.layer).filter(|_| !self.maps.is_empty()) {
+            for (w, (key, value)) in lw.heads.iter_mut().zip(self.maps) {
+                // The restored copies' allocations are freed: no resident copy may outlive them.
+                crate::graph_device::edited(&w.key);
+                crate::graph_device::edited(&w.value);
+                (w.key, w.value) = (key, value);
+            }
         }
         Ok(())
     }
@@ -2272,8 +2318,8 @@ impl Weights {
         let lw = &self.layers[layer];
         match (head, matrix) {
             (Some(h), Matrix::Query) => lw.heads[h].query.clone(),
-            (Some(h), Matrix::Key) => lw.heads[h].key.clone(),
-            (Some(h), Matrix::Value) => lw.heads[h].value.clone(),
+            (Some(h), Matrix::Key) => Array2::clone(&lw.heads[h].key),
+            (Some(h), Matrix::Value) => Array2::clone(&lw.heads[h].value),
             (Some(h), _) => lw.heads[h].output.clone(),
             (None, Matrix::Gate) => lw.mlp.as_ref().map(|m| m.gate.clone()).unwrap_or_default(),
             (None, _) => lw.mlp.as_ref().map(|m| m.out.clone()).unwrap_or_default(),
@@ -2316,7 +2362,7 @@ pub struct Unquantize {
 /// The device's resident copies of a head's or an MLP's matrices are uploaded again
 /// (`graph_device::edited`): every in-place change of `M`'s weights goes through these.
 fn device_head_edited(w: &HeadWeights) {
-    for m in [&w.query, &w.key, &w.value, &w.output] {
+    for m in [&w.query, &*w.key, &*w.value, &w.output] {
         crate::graph_device::edited(m);
     }
 }
@@ -2402,7 +2448,7 @@ impl Weights {
                         let w = self.layers.get_mut(*layer).and_then(|l| l.heads.get_mut(h)).ok_or("no such head")?;
                         device_head_edited(w);
                         out.heads.push((*layer, h, w.clone()));
-                        for m in [&mut w.query, &mut w.key, &mut w.value] {
+                        for m in [&mut w.query, Arc::make_mut(&mut w.key), Arc::make_mut(&mut w.value)] {
                             m.rows_mut().into_iter().for_each(|r| quantize_row(r, bits));
                         }
                         w.output.columns_mut().into_iter().for_each(|c| quantize_row(c, bits));
@@ -2489,13 +2535,13 @@ impl Weights {
                         // the output map.
                         let mut at = 0;
                         for w in lw.heads.iter_mut() {
-                            let target = [&mut w.query, &mut w.key, &mut w.value, &mut w.output][m.min(3)].clone();
-                            let width = if m == 3 { target.ncols() } else { target.nrows() };
+                            let dim = [&w.query, &*w.key, &*w.value, &w.output][m.min(3)].dim();
+                            let width = if m == 3 { dim.1 } else { dim.0 };
                             let part = if m == 3 { change.slice(s![.., at..at + width]).to_owned() } else { change.slice(s![at..at + width, ..]).to_owned() };
-                            if part.dim() != target.dim() {
+                            if part.dim() != dim {
                                 return Err("VPD attention factors of another shape than the heads' maps".into());
                             }
-                            *[&mut w.query, &mut w.key, &mut w.value, &mut w.output][m.min(3)] += &part;
+                            *w.map_mut(m) += &part;
                             at += width;
                         }
                     }

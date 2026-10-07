@@ -4,10 +4,11 @@
 //! tensor operations and the attention of `device_attention`. `M`'s weights stay resident between
 //! runs; a weight edit marks the matrices it touches, which the next run uploads again.
 //!
-//! Covered: native heads (with head norms, rotary, grouped keys and values) and MLP neurons (plain
-//! or gated), swaps, counterfactual and average stand-ins, `Reference` captures. Anything else (a
-//! transcoder or VPD block, site operations, attention blocks, statistics recording) returns
-//! `None` and runs on the host.
+//! Covered: native heads (with head norms, rotary, grouped keys and values, attend rules), MLP
+//! neurons (plain or gated), VPD's views of MLPs and attentions (subcomponents and remainders),
+//! swaps, counterfactual and average stand-ins, site operations, `Reference` captures. Anything else
+//! (a transcoder block, attention blocks, operations on a VPD-view attention's heads) returns `None`
+//! and runs on the host.
 use crate::{
     device_attention::{Segment, forward_segments},
     device_program::{gelu_tanh_constant, law_of},
@@ -19,6 +20,7 @@ use gam_gpu::{
     tensor::{Arithmetic, Device, Op, Storage, Tensor},
 };
 use ndarray::{Array1, Array2, ArrayView2};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Mutex, OnceLock};
 
@@ -36,13 +38,17 @@ pub(crate) struct DeviceState {
 }
 
 /// An array of a [`Reference`]: the embeddings, a head's read (layer, head), a layer's MLP
-/// activations or MLP write (layer).
+/// activations, MLP write, MLP normed input, attention normed input or its heads' reads side by side
+/// (layer).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Field {
     Embed,
     Read,
     Active,
     Mlp,
+    Input,
+    AttentionInput,
+    Reads,
 }
 
 /// The bytes of resident copies of host matrices kept (Qwen3-0.6B's weights in float32 are about
@@ -119,10 +125,16 @@ impl DeviceState {
         let at = self.references.len() - 1;
         if !self.references[at].1.contains_key(&(field, layer, head)) {
             let host = match field {
-                Field::Embed => Some(&r.embed),
-                Field::Read => r.reads.get(layer).and_then(|l| l.get(head)),
-                Field::Active => r.active.get(layer),
-                Field::Mlp => r.mlp.get(layer),
+                Field::Embed => Some(Cow::Borrowed(&r.embed)),
+                Field::Read => r.reads.get(layer).and_then(|l| l.get(head)).map(Cow::Borrowed),
+                Field::Active => r.active.get(layer).map(Cow::Borrowed),
+                Field::Mlp => r.mlp.get(layer).map(Cow::Borrowed),
+                Field::Input => r.inputs.get(layer).map(Cow::Borrowed),
+                Field::AttentionInput => r.attention_inputs.get(layer).map(Cow::Borrowed),
+                Field::Reads => match r.reads.get(layer) {
+                    Some(reads) => Some(Cow::Owned(ndarray::concatenate(ndarray::Axis(1), &reads.iter().map(|x| x.view()).collect::<Vec<_>>()).map_err(|e| e.to_string())?)),
+                    None => None,
+                },
             };
             let host = host.ok_or("an array the counterfactual run did not record")?;
             let t = self.device.upload(host.view()).map_err(|e| e.to_string())?;
@@ -143,6 +155,33 @@ impl DeviceState {
     /// The resident copy under `key` ([`DeviceState::ensure`]).
     fn get(&self, key: Key) -> Result<&Tensor, GpuError> {
         self.resident.get(&key).ok_or_else(|| GpuError::DriverCallFailed { reason: "a resident matrix went missing".into() })
+    }
+
+    /// Heads' maps `maps` (one shape) stacked as rows, or side by side as columns (output maps),
+    /// built from the resident per-head copies and kept until a weight edit drops those.
+    fn stacked(&mut self, maps: &[&Array2<f64>], along_rows: bool) -> Result<Tensor, GpuError> {
+        let keys: Vec<Key> = maps.iter().map(|m| self.ensure(m.view())).collect::<Result<_, _>>()?;
+        if let Some(t) = self.stacks.get(&(keys.clone(), along_rows)) {
+            return self.device.copy(t);
+        }
+        let (r, c) = maps.first().map(|m| m.dim()).ok_or_else(|| GpuError::DriverCallFailed { reason: "no maps to stack".into() })?;
+        let built = if along_rows {
+            let mut out = self.device.zeros(r * maps.len(), c)?;
+            for (i, k) in keys.iter().enumerate() {
+                self.device.set_rows(&mut out, i * r, self.get(*k)?)?;
+            }
+            out
+        } else {
+            // Output columns side by side: stack their transposes as rows, then transpose.
+            let mut out = self.device.zeros(c * maps.len(), r)?;
+            for (i, k) in keys.iter().enumerate() {
+                let t = self.device.transpose(self.get(*k)?)?;
+                self.device.set_rows(&mut out, i * c, &t)?;
+            }
+            self.device.transpose(&out)?
+        };
+        self.stacks.insert((keys, along_rows), self.device.copy(&built)?);
+        Ok(built)
     }
 }
 
@@ -261,7 +300,22 @@ fn standins(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, r: &Refer
                     s.device.gemm(&mut w, sign, &a, Op::N, &o, Op::T, 1.0, arithmetic).map_err(e)?;
                 }
             }
-            _ => return Err("a block the device path does not cover".into()),
+            Block::Slices { layer, down, rest, .. } => {
+                let mlp = weights.layers[*layer].mlp.as_ref().ok_or("a VPD view of a layer without an MLP")?;
+                let vpd = weights.vpd.get(layer).ok_or_else(|| format!("layer {layer} has no VPD view"))?;
+                s.ensure_reference(r, (Field::Active, *layer, 0))?;
+                let active = s.device.copy(s.reference(r, (Field::Active, *layer, 0))?).map_err(e)?;
+                w = sliced(s, (&vpd.down_u, &vpd.down_v), Matrix::Host(&mlp.out), down, *rest, &active).map_err(e)?;
+            }
+            Block::AttnSlices { layer, o, rest, .. } => {
+                let a = weights.vpd_attention.get(layer).ok_or_else(|| format!("layer {layer}'s attention has no VPD view"))?;
+                let lw = &weights.layers[*layer];
+                s.ensure_reference(r, (Field::Reads, *layer, 0))?;
+                let z = s.device.copy(s.reference(r, (Field::Reads, *layer, 0))?).map_err(e)?;
+                let outputs = s.stacked(&lw.heads.iter().map(|h| &h.output).collect::<Vec<_>>(), false).map_err(e)?;
+                w = sliced(s, (&a.o.0, &a.o.1), Matrix::Device(&outputs), o, *rest, &z).map_err(e)?;
+            }
+            Block::Features { .. } => return Err("a block the device path does not cover".into()),
         }
         out.push(w);
     }
@@ -271,8 +325,14 @@ fn standins(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, r: &Refer
 /// `circuit` run on the process's device ([`use_device`]), or `None` when there is none or the
 /// circuit holds a block the device path does not cover.
 pub(crate) fn run(weights: &Weights, circuit: &Circuit, job: &Run) -> Option<Result<Execution, String>> {
-    // Native blocks only; operations on the heads of a VPD-view attention run on the host.
-    if !circuit.units.iter().all(|u| matches!(u.block, Block::Heads { .. } | Block::Neurons { .. })) || !job.ops.head_reads.is_empty() || !job.ops.record_reads.is_empty() {
+    // No transcoder features; a VPD-view attention's heads attend together (alike) and operations
+    // on them run on the host.
+    let covered = |b: &Block| match b {
+        Block::Heads { .. } | Block::Neurons { .. } | Block::Slices { .. } => true,
+        Block::AttnSlices { layer, .. } => weights.layers.get(*layer).is_some_and(|lw| lw.heads.first().is_some_and(|first| lw.heads.iter().all(|h| alike(h, first, false)))),
+        Block::Features { .. } => false,
+    };
+    if !circuit.units.iter().all(|u| covered(&u.block)) || !job.ops.head_reads.is_empty() || !job.ops.record_reads.is_empty() {
         return None;
     }
     on_device(|s| run_on(s, weights, circuit, job))
@@ -498,6 +558,8 @@ pub(crate) fn run_on(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, 
     while at < order.len() {
         let site = circuit.units[order[at]].block.site();
         let end = order[at..].iter().position(|&u| circuit.units[u].block.site() != site).map_or(order.len(), |k| at + k);
+        let pad_job = Padding { places: padded.as_ref(), sequences, longest };
+        let mut slice_writes = vpd_site(s, weights, circuit, job, (site, &order[at..end]), &st, &pad_job, &mut kept)?;
         for &u in &order[at..end] {
             let unit = &circuit.units[u];
             if !unit.computes {
@@ -505,6 +567,10 @@ pub(crate) fn run_on(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, 
             }
             if let Some(value) = job.swaps.get(&u) {
                 st.writes[u] = Some(s.device.upload(value.view()).map_err(e)?);
+                continue;
+            }
+            if let Some(w) = slice_writes.remove(&u) {
+                st.writes[u] = Some(w);
                 continue;
             }
             let slots: Vec<usize> = unit.block.routes().iter().map(|r| r.slot()).collect();
@@ -554,7 +620,6 @@ pub(crate) fn run_on(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, 
                     } else {
                     // All the unit's heads at once where they share their shapes, head-norm gains and
                     // rotary (Qwen3, vpd4l): one product per map and one attention call per layer.
-                    let pad_job = Padding { places: padded.as_ref(), sequences, longest };
                     if let Some(batched) = heads_together(s, lw, heads, &normed_inputs, &pad_job, captured.is_some()) {
                         let (write, reads) = batched.map_err(e)?;
                         if let (Some(c), Some(reads)) = (captured.as_mut(), reads) {
@@ -580,8 +645,8 @@ pub(crate) fn run_on(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, 
                             Ok(p)
                         };
                         let mut q = project(s, &normed_inputs[0], &hw.query, hw.query_norm.as_ref()).map_err(e)?;
-                        let mut k = project(s, &normed_inputs[1], &hw.key, hw.key_norm.as_ref()).map_err(e)?;
-                        let v = project(s, &normed_inputs[2], &hw.value, None).map_err(e)?;
+                        let mut k = project(s, &normed_inputs[1], &*hw.key, hw.key_norm.as_ref()).map_err(e)?;
+                        let v = project(s, &normed_inputs[2], &*hw.value, None).map_err(e)?;
                         if let Some(r) = hw.rotary {
                             let tables = (r.base, r.dims, r.half_split);
                             if !rotations.contains_key(&tables) {
@@ -688,6 +753,138 @@ pub(crate) fn run_on(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, 
     Ok(Execution::of(log_probabilities, writes, captured, kept))
 }
 
+/// The writes of a site's VPD-view units (`graph::run`'s passes), by unit. An MLP's: each reader of
+/// the hidden stream (a unit with `down_proj` subcomponents or the remainder) takes the
+/// counterfactual pre-activation plus the `c_fc` writes it reads (on x minus on x′), applies the
+/// MLP's law and writes through its `down_proj` subcomponents. An attention's likewise: each reader
+/// of the queries, keys and values (a unit with `o_proj` subcomponents) takes the counterfactual
+/// ones plus the q/k/v writes it reads, runs the heads' attention on them (no head norms, as on the
+/// host) and writes through its `o_proj` subcomponents.
+fn vpd_site(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, job: &Run, (site, units): (usize, &[usize]), st: &Streams, pad: &Padding, kept: &mut BTreeMap<(usize, usize), Array2<f64>>) -> Result<BTreeMap<usize, Tensor>, String> {
+    let e = |e: GpuError| e.to_string();
+    let (rows, width, arithmetic, ops) = (job.tokens.len(), weights.width(), s.arithmetic(), job.ops);
+    let mut writes = BTreeMap::new();
+    let computing = |u: &usize| circuit.units[*u].computes && !job.swaps.contains_key(u);
+    // A unit's route inputs (after the cuts into the site) and their normed values under `norm`, the
+    // operations on the site's input applied, less the counterfactual normed input `x_ref`.
+    let normed_deltas = |s: &mut DeviceState, u: usize, norm: &crate::graph::Norm, x_ref: Option<&Tensor>, kept: &mut BTreeMap<(usize, usize), Array2<f64>>| -> Result<Vec<Tensor>, GpuError> {
+        let unit = &circuit.units[u];
+        let slots: Vec<usize> = unit.block.routes().iter().map(|r| r.slot()).collect();
+        let mut inputs: Vec<(usize, Tensor)> = slots.iter().map(|&slot| st.input(&s.device, &unit.routes[slot]).map(|x| (slot, x))).collect::<Result<_, _>>()?;
+        cut_inputs(&s.device, ops, site, unit, &mut inputs, st)?;
+        let gain = s.ensure(row(&norm.gain))?;
+        let mut out = Vec::with_capacity(inputs.len());
+        for (m, (_, x)) in inputs.iter().enumerate() {
+            let unit_x = s.device.rms_norm(x, norm.epsilon)?;
+            let mut x_hat = s.device.zeros(rows, width)?;
+            s.device.scale_columns(&mut x_hat, &unit_x, s.get(gain)?, false)?;
+            normed(&s.device, ops, (site, u, m), &mut x_hat, kept)?;
+            if let Some(x) = x_ref {
+                s.device.axpy(&mut x_hat, -1.0, x)?;
+            }
+            out.push(x_hat);
+        }
+        Ok(out)
+    };
+    let reference = |s: &mut DeviceState, field: Field, layer: usize| -> Result<Option<Tensor>, String> {
+        match job.reference {
+            Some(r) => {
+                s.ensure_reference(r, (field, layer, 0))?;
+                Ok(Some(s.device.copy(s.reference(r, (field, layer, 0))?).map_err(e)?))
+            }
+            // `M` (every unit computing and read) needs no reference: the deltas sum to its own.
+            None => Ok(None),
+        }
+    };
+    let slices: Vec<usize> = units.iter().copied().filter(|&u| matches!(circuit.units[u].block, Block::Slices { .. })).collect();
+    if let Some(&first) = slices.first() {
+        let Block::Slices { layer, .. } = circuit.units[first].block else { return Err("a VPD-view unit of another block".into()) };
+        let lw = &weights.layers[layer];
+        let mlp = lw.mlp.as_ref().ok_or("a VPD view of a layer without an MLP")?;
+        let vpd = weights.vpd.get(&layer).ok_or_else(|| format!("layer {layer} has no VPD view"))?;
+        let x_ref = reference(s, Field::Input, layer)?;
+        let (gate, bias) = (s.ensure(mlp.gate.view()).map_err(e)?, s.ensure(row(&mlp.bias)).map_err(e)?);
+        let mut pre_ref = s.device.zeros(rows, mlp.gate.nrows()).map_err(e)?;
+        if let Some(x) = &x_ref {
+            s.device.gemm(&mut pre_ref, 1.0, x, Op::N, s.get(gate).map_err(e)?, Op::T, 0.0, arithmetic).map_err(e)?;
+        }
+        s.device.add_row(&mut pre_ref, 1.0, s.get(bias).map_err(e)?).map_err(e)?;
+        let mut deltas: BTreeMap<usize, Tensor> = BTreeMap::new();
+        for &u in slices.iter().filter(|u| computing(u)) {
+            let Block::Slices { fc, rest, .. } = &circuit.units[u].block else { return Err("a VPD-view unit of another block".into()) };
+            let x = normed_deltas(s, u, &lw.mlp_norm, x_ref.as_ref(), kept).map_err(e)?;
+            deltas.insert(u, sliced(s, (&vpd.fc_u, &vpd.fc_v), Matrix::Host(&mlp.gate), fc, *rest, &x[0]).map_err(e)?);
+        }
+        let codes = s.device.upload_indices(&vec![law_of(mlp.law).code(); mlp.gate.nrows()]).map_err(e)?;
+        for &u in slices.iter().filter(|u| computing(u)) {
+            let unit = &circuit.units[u];
+            let Block::Slices { down, rest, .. } = &unit.block else { return Err("a VPD-view unit of another block".into()) };
+            if down.is_empty() && !rest {
+                writes.insert(u, s.device.zeros(rows, width).map_err(e)?);
+                continue;
+            }
+            let mut pre = s.device.copy(&pre_ref).map_err(e)?;
+            for (_, delta) in deltas.iter().filter(|(w, _)| reads_hidden(&unit.hidden, **w)) {
+                s.device.axpy(&mut pre, 1.0, delta).map_err(e)?;
+            }
+            let h = s.device.law_values(&pre, &codes, gelu_tanh_constant()).map_err(e)?;
+            writes.insert(u, sliced(s, (&vpd.down_u, &vpd.down_v), Matrix::Host(&mlp.out), down, *rest, &h).map_err(e)?);
+        }
+    }
+    let attention: Vec<usize> = units.iter().copied().filter(|&u| matches!(circuit.units[u].block, Block::AttnSlices { .. })).collect();
+    if let Some(&first) = attention.first() {
+        let Block::AttnSlices { layer, .. } = circuit.units[first].block else { return Err("a VPD-view unit of another block".into()) };
+        let lw = &weights.layers[layer];
+        let a = weights.vpd_attention.get(&layer).ok_or_else(|| format!("layer {layer}'s attention has no VPD view"))?;
+        let head = lw.heads.first().ok_or("a VPD view of an attention without heads")?;
+        // The four native matrices VPD decomposes (`graph::attention_maps`): q, k, v stacked over
+        // heads, the output columns side by side.
+        let mut maps = Vec::with_capacity(4);
+        for (along_rows, map) in [(true, 0), (true, 1), (true, 2), (false, 3)] {
+            let per_head: Vec<&Array2<f64>> = lw.heads.iter().map(|h| [&h.query, &*h.key, &*h.value, &h.output][map]).collect();
+            maps.push(s.stacked(&per_head, along_rows).map_err(e)?);
+        }
+        let x_ref = reference(s, Field::AttentionInput, layer)?;
+        let mut refs = Vec::with_capacity(3);
+        for map in &maps[..3] {
+            let mut p = s.device.zeros(rows, map.rows()).map_err(e)?;
+            if let Some(x) = &x_ref {
+                s.device.gemm(&mut p, 1.0, x, Op::N, map, Op::T, 0.0, arithmetic).map_err(e)?;
+            }
+            refs.push(p);
+        }
+        let factors = [&a.q, &a.k, &a.v];
+        let mut deltas: BTreeMap<usize, Vec<Tensor>> = BTreeMap::new();
+        for &u in attention.iter().filter(|u| computing(u)) {
+            let Block::AttnSlices { q, k, v, rest, .. } = &circuit.units[u].block else { return Err("a VPD-view unit of another block".into()) };
+            let x = normed_deltas(s, u, &lw.attention, x_ref.as_ref(), kept).map_err(e)?;
+            let mut ds = Vec::with_capacity(3);
+            for (m, list) in [q, k, v].into_iter().enumerate() {
+                ds.push(sliced(s, (&factors[m].0, &factors[m].1), Matrix::Device(&maps[m]), list, *rest, &x[m]).map_err(e)?);
+            }
+            deltas.insert(u, ds);
+        }
+        for &u in attention.iter().filter(|u| computing(u)) {
+            let unit = &circuit.units[u];
+            let Block::AttnSlices { o, rest, .. } = &unit.block else { return Err("a VPD-view unit of another block".into()) };
+            if o.is_empty() && !rest {
+                writes.insert(u, s.device.zeros(rows, width).map_err(e)?);
+                continue;
+            }
+            let mut qkv = refs.iter().map(|x| s.device.copy(x)).collect::<Result<Vec<_>, _>>().map_err(e)?;
+            for (_, ds) in deltas.iter().filter(|(w, _)| reads_hidden(&unit.hidden, **w)) {
+                for (x, dx) in qkv.iter_mut().zip(ds) {
+                    s.device.axpy(x, 1.0, dx).map_err(e)?;
+                }
+            }
+            let [q, k, v]: [Tensor; 3] = qkv.try_into().map_err(|_| "three projections")?;
+            let z = attend(s, (q, k, v), (lw.heads.len(), head.query.nrows()), head, false, pad).map_err(e)?;
+            writes.insert(u, sliced(s, (&a.o.0, &a.o.1), Matrix::Device(&maps[3]), o, *rest, &z).map_err(e)?);
+        }
+    }
+    Ok(writes)
+}
+
 /// How the run's rows sit in the padded layout attention reads (`run_on`).
 struct Padding<'a> {
     places: Option<&'a gam_gpu::tensor::Indices>,
@@ -702,54 +899,46 @@ struct Padding<'a> {
 /// reads side by side (rows × heads' value widths) as well.
 fn heads_together(s: &mut DeviceState, lw: &crate::graph::LayerWeights, heads: &[usize], normed: &[Tensor], pad: &Padding, read: bool) -> Option<Result<(Tensor, Option<Array2<f64>>), GpuError>> {
     let first = &lw.heads[*heads.first()?];
-    let same = heads.iter().all(|&h| {
-        let w = &lw.heads[h];
-        w.query.dim() == first.query.dim() && w.key.dim() == first.key.dim() && w.value.dim() == first.value.dim() && w.output.dim() == first.output.dim() && w.query_norm == first.query_norm && w.key_norm == first.key_norm && w.rotary == first.rotary && w.scale == first.scale && w.causal == first.causal
-    });
-    if !same || first.query.nrows() != first.key.nrows() || first.query.nrows() != first.value.nrows() {
+    if !heads.iter().all(|&h| alike(&lw.heads[h], first, true)) {
         return None;
     }
     Some(heads_together_on(s, lw, heads, normed, pad, read))
+}
+
+/// Whether head `w` attends as `first` in one [`attend`] call: the same shapes (queries, keys and
+/// values of one width), rotary, scale and mask, and with `norms` the same head-norm gains.
+fn alike(w: &crate::graph::HeadWeights, first: &crate::graph::HeadWeights, norms: bool) -> bool {
+    let width = first.query.nrows();
+    w.query.dim() == first.query.dim() && w.key.dim() == first.key.dim() && w.value.dim() == first.value.dim() && w.output.dim() == first.output.dim() && first.key.nrows() == width && first.value.nrows() == width && (!norms || w.query_norm == first.query_norm && w.key_norm == first.key_norm) && w.rotary == first.rotary && w.scale == first.scale && w.causal == first.causal
 }
 
 fn heads_together_on(s: &mut DeviceState, lw: &crate::graph::LayerWeights, heads: &[usize], normed: &[Tensor], pad: &Padding, read: bool) -> Result<(Tensor, Option<Array2<f64>>), GpuError> {
     let first = &lw.heads[heads[0]];
     let (n, width, rows) = (heads.len(), first.query.nrows(), normed[0].rows());
     let arithmetic = s.arithmetic();
-    // The stacked maps, built from the resident per-head copies (a weight edit drops those).
-    let stacked = |s: &mut DeviceState, maps: Vec<&Array2<f64>>, along_rows: bool| -> Result<Tensor, GpuError> {
-        let keys: Vec<Key> = maps.iter().map(|m| s.ensure(m.view())).collect::<Result<_, _>>()?;
-        if let Some(t) = s.stacks.get(&(keys.clone(), along_rows)) {
-            return s.device.copy(t);
-        }
-        let (r, c) = maps[0].dim();
-        let built = if along_rows {
-            let mut out = s.device.zeros(r * maps.len(), c)?;
-            for (i, k) in keys.iter().enumerate() {
-                s.device.set_rows(&mut out, i * r, s.get(*k)?)?;
-            }
-            out
-        } else {
-            // Output columns side by side: stack their transposes as rows, then transpose.
-            let mut out = s.device.zeros(c * maps.len(), r)?;
-            for (i, k) in keys.iter().enumerate() {
-                let t = s.device.transpose(s.get(*k)?)?;
-                s.device.set_rows(&mut out, i * c, &t)?;
-            }
-            s.device.transpose(&out)?
-        };
-        s.stacks.insert((keys, along_rows), s.device.copy(&built)?);
-        Ok(built)
-    };
     let project = |s: &mut DeviceState, x: &Tensor, maps: Vec<&Array2<f64>>| -> Result<Tensor, GpuError> {
-        let w = stacked(s, maps, true)?;
+        let w = s.stacked(&maps, true)?;
         let mut p = s.device.zeros(rows, w.rows())?;
         s.device.gemm(&mut p, 1.0, x, Op::N, &w, Op::T, 0.0, arithmetic)?;
         Ok(p)
     };
     let q = project(s, &normed[0], heads.iter().map(|&h| &lw.heads[h].query).collect())?;
-    let k = project(s, &normed[1], heads.iter().map(|&h| &lw.heads[h].key).collect())?;
-    let v = project(s, &normed[2], heads.iter().map(|&h| &lw.heads[h].value).collect())?;
+    let k = project(s, &normed[1], heads.iter().map(|&h| &*lw.heads[h].key).collect())?;
+    let v = project(s, &normed[2], heads.iter().map(|&h| &*lw.heads[h].value).collect())?;
+    let z = attend(s, (q, k, v), (n, width), first, true, pad)?;
+    let reads = if read { Some(s.device.download(&z)?) } else { None };
+    let wo = s.stacked(&heads.iter().map(|&h| &lw.heads[h].output).collect::<Vec<_>>(), false)?;
+    let mut out = s.device.zeros(rows, wo.rows())?;
+    s.device.gemm(&mut out, 1.0, &z, Op::N, &wo, Op::T, 0.0, arithmetic)?;
+    Ok((out, reads))
+}
+
+/// The attention of `n` alike heads (shapes, rotary, scale and mask of `first`) on their stacked
+/// queries, keys and values (rows × n · `width`): split into padded whole sequences for one
+/// attention call, with `first`'s head norms when `norms`, merged back into the heads' reads side
+/// by side (rows × n · `width`).
+fn attend(s: &mut DeviceState, (q, k, v): (Tensor, Tensor, Tensor), (n, width): (usize, usize), first: &crate::graph::HeadWeights, norms: bool, pad: &Padding) -> Result<Tensor, GpuError> {
+    let arithmetic = s.arithmetic();
     let padded_rows = pad.sequences * pad.longest;
     let to_padded = |s: &DeviceState, x: Tensor| -> Result<Tensor, GpuError> {
         match pad.places {
@@ -766,7 +955,7 @@ fn heads_together_on(s: &mut DeviceState, lw: &crate::graph::LayerWeights, heads
     let split = |s: &DeviceState, x: &Tensor| s.device.split_heads(x, 0, n, width, pad.sequences, None, false);
     let (mut qs, mut ks, vs) = (split(s, &q)?, split(s, &k)?, split(s, &v)?);
     for (x, norm) in [(&mut qs, &first.query_norm), (&mut ks, &first.key_norm)] {
-        if let Some((g, epsilon)) = norm {
+        if let Some((g, epsilon)) = norm.as_ref().filter(|_| norms) {
             let unit = s.device.rms_norm(x, *epsilon)?;
             let g = s.ensure(row(g))?;
             s.device.scale_columns(x, &unit, s.get(g)?, false)?;
@@ -782,15 +971,10 @@ fn heads_together_on(s: &mut DeviceState, lw: &crate::graph::LayerWeights, heads
     let zs = forward_segments(&s.device, (&qs, &ks, &vs), &segments, first.scale, first.causal, arithmetic)?;
     let mut z = s.device.zeros(padded_rows, n * width)?;
     s.device.merge_heads(&zs, &mut z, 0, n, pad.sequences, None, false)?;
-    let z = match pad.places {
-        None => z,
-        Some(places) => s.device.gather_rows(&z, places)?,
-    };
-    let reads = if read { Some(s.device.download(&z)?) } else { None };
-    let wo = stacked(s, heads.iter().map(|&h| &lw.heads[h].output).collect(), false)?;
-    let mut out = s.device.zeros(rows, wo.rows())?;
-    s.device.gemm(&mut out, 1.0, &z, Op::N, &wo, Op::T, 0.0, arithmetic)?;
-    Ok((out, reads))
+    match pad.places {
+        None => Ok(z),
+        Some(places) => s.device.gather_rows(&z, places),
+    }
 }
 
 /// Neurons `picked` (all when `None`) of an MLP on normed inputs `x_hat`: their write (rows ×
@@ -843,6 +1027,66 @@ fn neuron_writes(s: &mut DeviceState, mlp: &crate::graph::MlpWeights, x_hat: &Te
     let mut write = d.zeros(rows, out.rows())?;
     d.gemm(&mut write, 1.0, &active, Op::N, out, Op::T, 0.0, arithmetic)?;
     Ok((write, active))
+}
+
+/// A matrix `W` of a VPD view: a host matrix (kept resident) or a device tensor (stacked head maps).
+enum Matrix<'a> {
+    Host(&'a Array2<f64>),
+    Device(&'a Tensor),
+}
+
+/// `graph::sliced_parts` on the device: subcomponents `picked` of `w` (out × in) with factors `U`
+/// (subcomponents × out) and `V` (in × subcomponents) applied to the rows of `x` (rows × in), index
+/// `U`'s row count being the remainder `W − Σ U Vᵀ`; with `rest`, `x wᵀ` less the named ones.
+fn sliced(s: &mut DeviceState, (u, v): (&Array2<f64>, &Array2<f64>), w: Matrix, picked: &[usize], rest: bool, x: &Tensor) -> Result<Tensor, GpuError> {
+    let count = u.nrows();
+    let subs: Vec<u32> = picked.iter().filter(|&&i| i < count).map(|&i| i as u32).collect();
+    let remainder = picked.contains(&count);
+    let (uk, vk) = (s.ensure(u.view())?, s.ensure(v.view())?);
+    let wk = match w {
+        Matrix::Host(m) => Some(s.ensure(m.view())?),
+        Matrix::Device(_) => None,
+    };
+    let s = &*s;
+    let (d, arithmetic) = (&s.device, s.arithmetic());
+    let (uf, vf) = (s.get(uk)?, s.get(vk)?);
+    let wt = match (w, wk) {
+        (Matrix::Device(t), _) => t,
+        (Matrix::Host(_), Some(k)) => s.get(k)?,
+        (Matrix::Host(_), None) => return Err(GpuError::DriverCallFailed { reason: "a VPD matrix went missing".into() }),
+    };
+    let mut named = d.zeros(x.rows(), u.ncols())?;
+    if !subs.is_empty() {
+        let ids = d.upload_indices(&subs)?;
+        let (vs, us) = (d.gather_columns(vf, &ids)?, d.gather_rows(uf, &ids)?);
+        let mut xv = d.zeros(x.rows(), subs.len())?;
+        d.gemm(&mut xv, 1.0, x, Op::N, &vs, Op::N, 0.0, arithmetic)?;
+        d.gemm(&mut named, 1.0, &xv, Op::N, &us, Op::N, 0.0, arithmetic)?;
+    }
+    if remainder {
+        let mut xv = d.zeros(x.rows(), count)?;
+        d.gemm(&mut xv, 1.0, x, Op::N, vf, Op::N, 0.0, arithmetic)?;
+        d.gemm(&mut named, 1.0, x, Op::N, wt, Op::T, 1.0, arithmetic)?;
+        d.gemm(&mut named, -1.0, &xv, Op::N, uf, Op::N, 1.0, arithmetic)?;
+    }
+    if !rest {
+        return Ok(named);
+    }
+    let mut out = d.zeros(x.rows(), u.ncols())?;
+    d.gemm(&mut out, 1.0, x, Op::N, wt, Op::T, 0.0, arithmetic)?;
+    if !subs.is_empty() || remainder {
+        d.axpy(&mut out, -1.0, &named)?;
+    }
+    Ok(out)
+}
+
+/// Whether a unit whose hidden reads are `hidden` reads unit `w`'s writes into its site's hidden
+/// stream (a VPD view's queries, keys, values or MLP pre-activation).
+fn reads_hidden(hidden: &Incoming, w: usize) -> bool {
+    match hidden {
+        Incoming::AllBut(cut) => !cut.contains(&Writer::Unit(w)),
+        Incoming::Only(kept) => kept.contains(&Writer::Unit(w)),
+    }
 }
 
 /// The rotation tables (rows × planes, `cos` and `sin`) of `rotary` at each row's position.

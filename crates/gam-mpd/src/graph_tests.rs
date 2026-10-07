@@ -380,7 +380,7 @@ fn vpd_attention_view_reads_queries_keys_values_through_its_edges() {
     // One subcomponent per output coordinate of q, k, v and per input coordinate of o (exact).
     let lw = &weights.layers[1];
     let stack = |m: &dyn Fn(&crate::graph::HeadWeights) -> ndarray::Array2<f64>| ndarray::concatenate(ndarray::Axis(0), &lw.heads.iter().map(m).collect::<Vec<_>>().iter().map(|a| a.view()).collect::<Vec<_>>()).expect("stack");
-    let (wq, wk, wv) = (stack(&|h| h.query.clone()), stack(&|h| h.key.clone()), stack(&|h| h.value.clone()));
+    let (wq, wk, wv) = (stack(&|h| h.query.clone()), stack(&|h| ndarray::Array2::clone(&h.key)), stack(&|h| ndarray::Array2::clone(&h.value)));
     let wo = ndarray::concatenate(ndarray::Axis(1), &lw.heads.iter().map(|h| h.output.view()).collect::<Vec<_>>()).expect("hstack");
     let exact_in = |w: &ndarray::Array2<f64>| (ndarray::Array2::eye(w.nrows()), w.t().to_owned());
     weights.vpd_attention.insert(1, crate::graph::VpdAttention { q: exact_in(&wq), k: exact_in(&wk), v: exact_in(&wv), o: (wo.t().to_owned(), ndarray::Array2::eye(wo.ncols())) });
@@ -440,7 +440,7 @@ fn library_parts_resolve_to_their_vpd_subcomponents() {
     let wo = ndarray::concatenate(ndarray::Axis(1), &lw.heads.iter().map(|h| h.output.view()).collect::<Vec<_>>()).expect("hstack");
     let eye_in = |rows: usize, w: ndarray::Array2<f64>| (ndarray::Array2::eye(rows), w);
     let stack = |m: &dyn Fn(&crate::graph::HeadWeights) -> ndarray::Array2<f64>| ndarray::concatenate(ndarray::Axis(0), &lw.heads.iter().map(m).collect::<Vec<_>>().iter().map(|a| a.view()).collect::<Vec<_>>()).expect("stack").t().to_owned();
-    let attention = crate::graph::VpdAttention { q: eye_in(width, stack(&|h| h.query.clone())), k: eye_in(width, stack(&|h| h.key.clone())), v: eye_in(width, stack(&|h| h.value.clone())), o: (wo.t().to_owned(), ndarray::Array2::eye(width)) };
+    let attention = crate::graph::VpdAttention { q: eye_in(width, stack(&|h| h.query.clone())), k: eye_in(width, stack(&|h| ndarray::Array2::clone(&h.key))), v: eye_in(width, stack(&|h| ndarray::Array2::clone(&h.value))), o: (wo.t().to_owned(), ndarray::Array2::eye(width)) };
     weights.vpd_attention.insert(1, attention);
     // Layer 1: attention part 0 = every q, k, v subcomponent, part 1 = every o one; MLP part 0 = c_fc, part 1 = down_proj.
     let slices = |site: usize, n: usize| (0..n).map(|i| serde_json::json!([site, i])).collect::<Vec<_>>();
@@ -736,4 +736,69 @@ fn device_path_runs_ruled_nodes_as_the_host() {
     let device = crate::graph_device::run_on(&mut state, &weights, &circuit, &job).expect("device");
     let kl = max(&kl_bits(&host.log_probabilities, &device.log_probabilities));
     assert!(kl < 1e-9, "KL(host ‖ device) with a ruled node = {kl:e} bits");
+}
+
+#[test]
+fn device_path_runs_vpd_views_as_the_host() {
+    use ndarray::{Array2, Axis, s};
+    let f = fixture("graph_device_vpd");
+    let library = Library::new(&f.device, &f.device, &f.native, &f.layers, &f.artifact, 1 << 28, 64).expect("library");
+    let mut weights = Weights::of(&library);
+    // Inexact views of layer 1 (scaled, some of each matrix's directions only), so every remainder
+    // is nonzero: `U` scaled rows of the identity, `V` the matching columns of `Wᵀ`.
+    let partial = |w: &Array2<f64>, count: usize, scale: f64| (Array2::<f64>::eye(w.nrows()).slice(s![..count, ..]).to_owned() * scale, w.t().slice(s![.., ..count]).to_owned());
+    let lw = &weights.layers[1];
+    let mlp = lw.mlp.as_ref().expect("an MLP");
+    let hidden = mlp.gate.nrows();
+    let (fc_u, fc_v) = partial(&mlp.gate, hidden - 5, 0.7);
+    let (down_u, down_v) = (mlp.out.t().slice(s![..hidden - 4, ..]).to_owned() * 0.6, Array2::<f64>::eye(hidden).slice(s![.., ..hidden - 4]).to_owned());
+    let stack = |m: &dyn Fn(&crate::graph::HeadWeights) -> &Array2<f64>| ndarray::concatenate(Axis(0), &lw.heads.iter().map(|h| m(h).view()).collect::<Vec<_>>()).expect("stack");
+    let (wq, wk, wv) = (stack(&|h| &h.query), stack(&|h| &*h.key), stack(&|h| &*h.value));
+    let wo = ndarray::concatenate(Axis(1), &lw.heads.iter().map(|h| h.output.view()).collect::<Vec<_>>()).expect("hstack");
+    let o = (wo.t().slice(s![..wo.ncols() - 3, ..]).to_owned() * 0.5, Array2::<f64>::eye(wo.ncols()).slice(s![.., ..wo.ncols() - 3]).to_owned());
+    let attention = crate::graph::VpdAttention { q: partial(&wq, wq.nrows() - 2, 0.8), k: partial(&wk, wk.nrows() - 3, 0.9), v: partial(&wv, wv.nrows() - 1, 0.6), o };
+    weights.vpd.insert(1, crate::graph::VpdMlp { fc_u, fc_v, down_u, down_v });
+    weights.vpd_attention.insert(1, attention);
+    let piece = |kind: &str, index: Index| PieceIr { view: "vpd".into(), layer: 1, kind: kind.into(), index: Some(index) };
+    let rest = || Index::Name("rest".into());
+    let nodes = vec![
+        NodeIr { id: "a0".into(), pieces: vec![PieceIr { view: "native".into(), layer: 0, kind: "head".into(), index: None }], rule: None },
+        NodeIr { id: "m0".into(), pieces: vec![PieceIr { view: "native".into(), layer: 0, kind: "mlp".into(), index: None }], rule: None },
+        NodeIr { id: "QK".into(), pieces: vec![piece("q_proj", Index::Many(vec![0, 3])), piece("k_proj", Index::One(1)), piece("k_proj", rest())], rule: None },
+        NodeIr { id: "V".into(), pieces: vec![piece("v_proj", Index::Many(vec![2, 5]))], rule: None },
+        NodeIr { id: "O".into(), pieces: vec![piece("o_proj", Index::Many(vec![0, 1, 4]))], rule: None },
+        NodeIr { id: "F".into(), pieces: vec![piece("c_fc", Index::Many(vec![0, 2, 7])), piece("c_fc", rest())], rule: None },
+        NodeIr { id: "D".into(), pieces: vec![piece("down_proj", Index::Many(vec![1, 3, 5]))], rule: None },
+    ];
+    let edge = |from: &str, to: &str| EdgeIr { from: from.into(), to: to.into(), route: "input".into() };
+    let mut edges = vec![edge("QK", "O"), edge("F", "D")];
+    for (to, writers) in [("a0", vec!["embed"]), ("m0", vec!["embed", "a0"]), ("QK", vec!["embed", "a0", "m0"]), ("V", vec!["embed", "m0"]), ("F", vec!["embed", "a0", "O"]), ("logits", vec!["embed", "a0", "m0", "O", "D"])] {
+        edges.extend(writers.into_iter().map(|w| edge(w, to)));
+    }
+    let program = Program { model: "tiny".into(), valid: true, nodes, edges, ..Program::default() };
+    let graph = Graph::parse(&program, &weights).expect("parse");
+    let cf = counterfactuals(&f.sequences);
+    let plain = Batch::new(&f.sequences).expect("batch");
+    let mut with_reference = plain.clone();
+    with_reference.reference = Some(std::sync::Arc::new(reference(&weights, &Batch::new(&cf).expect("cf batch")).expect("reference")));
+    let rows: Vec<usize> = (0..plain.tokens.len()).collect();
+    let mut state = crate::graph_device::DeviceState::new(Device::host());
+    let cases = [
+        ("model", graph.model(&weights), &plain),
+        ("edges", graph.program(&weights, true), &with_reference),
+        ("nodes", graph.program(&weights, false), &with_reference),
+        ("empty", Graph::empty().program(&weights, true), &with_reference),
+    ];
+    for (name, circuit, batch) in cases {
+        assert!(circuit.units.iter().any(|u| matches!(u.block, crate::graph::Block::Slices { .. })) || name == "empty", "{name}: VPD units");
+        let host = execute(&weights, &circuit, batch, &rows, &BTreeMap::new()).expect("host");
+        let job = crate::graph_device::Run { tokens: &batch.tokens, spans: &batch.spans, scored: &rows, swaps: &BTreeMap::new(), capture: false, reference: batch.reference.as_deref(), ops: &crate::graph::Interventions::default() };
+        let device = crate::graph_device::run_on(&mut state, &weights, &circuit, &job).expect("device");
+        let kl = max(&kl_bits(&host.log_probabilities, &device.log_probabilities));
+        assert!(kl < 1e-9, "{name}: KL(host ‖ device) with VPD views = {kl:e} bits");
+    }
+    // The program is not M: its undeclared subcomponents and edges carry the counterfactual.
+    let clean = execute(&weights, &graph.model(&weights), &plain, &rows, &BTreeMap::new()).expect("M").log_probabilities;
+    let open = execute(&weights, &graph.program(&weights, true), &with_reference, &rows, &BTreeMap::new()).expect("program").log_probabilities;
+    assert!(max(&kl_bits(&clean, &open)) > 1e-6, "the program equals M");
 }
