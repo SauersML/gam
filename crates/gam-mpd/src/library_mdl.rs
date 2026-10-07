@@ -6640,14 +6640,17 @@ mod tests {
         }
     }
 
-    /// A tiny gated library meets its budget once its passes outlast the momentum (`B` batches above
-    /// `1 / (1 − β₁)`, as in a production fit, so the multiplier's horizon is one pass): on the tiny
-    /// decoder with ReLU functions (gated parts), trained on 256 sequences of its tokens drawn
-    /// uniformly (B = 128 batches of 2), with `K` at the heads plus half the gated share of the free
-    /// fit's count, the expected parts per token over the last 6 of 30 epochs (each epoch's mean
-    /// over its 128 steps) are within three standard errors (from the epochs' own spread) of `K`
-    /// and far below the free fit's. With the fixture's 4 training sequences (B = 2 against the
-    /// momentum's 100 steps) the count at a fixed λ of 20 wandered between 5 and 16 parts over 120
+    /// A tiny gated library meets its budget, an inequality, once its passes outlast the momentum
+    /// (`B` batches above `1 / (1 − β₁)`, as in a production fit, so the multiplier's horizon is one
+    /// pass): on the tiny decoder with ReLU functions (gated parts), trained on 256 sequences of its
+    /// tokens drawn uniformly (B = 128 batches of 2), with `K` at the heads plus half the gated share
+    /// of the free fit's count, the expected parts per token over the last 6 of 30 epochs (each
+    /// epoch's mean over its 128 steps) are at most `K` plus their standard error (from the epochs'
+    /// own spread) and at least 0.8 `K`, so a collapse of the parts still fails. A closed ReLU
+    /// function takes no data gradient, so the count reopens slowly once below `K`: no rule for λ
+    /// held it within three standard errors of `K` on seeds 3–7 on both GHA's Linux host and the Mac
+    /// (ba02aadbc1 and the variants it lists). With the fixture's 4 training sequences (B = 2 against
+    /// the momentum's 100 steps) the count at a fixed λ of 20 wandered between 5 and 16 parts over 120
     /// epochs: no multiplier holds a mean of it at `K`.
     #[test]
     fn a_tiny_gated_library_meets_its_budget() {
@@ -6678,8 +6681,7 @@ mod tests {
         // Every tenth epoch's count and multiplier, for a failure's message.
         let trace: Vec<String> = bound.report.epochs.iter().map(|e| format!("{:.2} at λ {:.3e}", e.expected_parts.unwrap_or(f64::NAN), e.multiplier.unwrap_or(f64::NAN))).collect();
         assert!(last.multiplier.is_some_and(|l| l > 0.0), "the multiplier stayed at zero over the budget: {trace:?}");
-        assert!((mean - limit).abs() <= 3.0 * spread, "the last 6 epochs' mean {mean} ± {spread} parts per token against the budget {limit} (free {free_parts}): {trace:?}");
-        assert!(mean < limit + 0.5 * (free_parts - limit), "{mean} parts per token is not below the free fit's {free_parts}");
+        assert!(mean <= limit + spread && mean >= 0.8 * limit, "the last 6 epochs' mean {mean} ± {spread} parts per token against the budget {limit} (free {free_parts}): {trace:?}");
     }
 
     fn settings() -> Settings {
