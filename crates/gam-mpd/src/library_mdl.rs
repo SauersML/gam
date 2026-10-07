@@ -4401,6 +4401,10 @@ pub fn fit_from(
             // The all-on experiment (`Scorer::all_on_pass`): its bits join the data term and its
             // gradient the step's.
             let all_on = scorer.all_on_pass(&device_posterior, (&batch, &experiments, key), Center::Iterate, true)?;
+            let on_note = all_on.as_ref().map_or(String::new(), |on| {
+                let tokens: usize = on.bits.iter().map(Vec::len).sum();
+                format!(", all on {:.4} bits per token", on.bits.iter().flatten().sum::<f64>() / tokens.max(1) as f64)
+            });
             if let Some(on) = &all_on {
                 data_sum += scale * LN_2 * on.bits.iter().flatten().sum::<f64>();
                 for (op, g) in &on.gradient {
@@ -4599,7 +4603,7 @@ pub fn fit_from(
                 return Err(format!("step {epoch}.{b}: nonfinite step state (η {eta}, ρ̄ {rho}, r̄ {ratio}, λ {})", progress.multiplier));
             }
             let prior_note = if prior.is_some() { format!(" (prior: {prior_seconds:.3} s)") } else { String::new() };
-            log::info!("library step {epoch}.{b}: data {:.6} bits per scored token at the iterate's samples, {:.2} s{prior_note}{parts_note}", bits.iter().flatten().sum::<f64>() / scored as f64, step_started.elapsed().as_secs_f64());
+            log::info!("library step {epoch}.{b}: data {:.6} bits per scored token at the iterate's samples, {:.2} s{prior_note}{parts_note}{on_note}", bits.iter().flatten().sum::<f64>() / scored as f64, step_started.elapsed().as_secs_f64());
         }
         let count = draws.len() as f64;
         // The end-of-epoch posterior scored on the whole collection at the draws every snapshot
