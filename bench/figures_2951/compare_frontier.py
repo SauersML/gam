@@ -75,7 +75,7 @@ points = []
 ref = None
 thr2 = L(f'{RP}/compare-vpd4l-tc4096-thr2/out/checkpoint.json')
 arms = [('transcoders as built (4,096 per layer)', f'{MANIFEST_DIR}/vpd4l_as_is', 'EDITS_as_is_m1.json', thr2['start'] if thr2 else None)]
-for name, label in (('compare-vpd4l-tc4096-thr2', 'transcoder fit by F, read patches'), ('compare-vpd4l-tc4096-thr-edits', 'transcoder fit by F, read patches and the shared operations')):
+for name, label in (('compare-vpd4l-tc4096-thr2', 'fit by F, read patches'), ('compare-vpd4l-tc4096-thr-edits', 'fit by F, read patches and the shared operations')):
     best = L(f'{C7}/{name}/checkpoint.best.json')
     h = L(f'{RP}/{name}/out/checkpoint.json')
     rec = None
@@ -84,7 +84,7 @@ for name, label in (('compare-vpd4l-tc4096-thr2', 'transcoder fit by F, read pat
         rec = next((x['held_out'] for x in h['epochs'] if x['epoch'] == e), None)
         label += f', epoch {e}'
     # The pair's fits were stopped at 17:15 on 10-06: their last best epochs are the final baselines.
-    arms.append(('baseline: ' + label, f'{C7}/{name}', f"EDITS_{'thr2' if name.endswith('thr2') else 'thr_edits'}_m1.json", rec))
+    arms.append(('transcoder baseline: ' + label, f'{C7}/{name}', f"EDITS_{'thr2' if name.endswith('thr2') else 'thr_edits'}_m1.json", rec))
 for label, d, f, rec in arms:
     r = L(f'{d}/{f}')
     if not r or not rec:
