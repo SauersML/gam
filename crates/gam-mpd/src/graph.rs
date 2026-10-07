@@ -3174,6 +3174,14 @@ impl Behavior {
 /// A counterfactual run computed once by whichever run asks first.
 type RunCell = Arc<std::sync::OnceLock<Result<Arc<Reference>, String>>>;
 
+/// The bytes a computed run holds (none while uncomputed or failed).
+fn run_bytes(cell: &RunCell) -> usize {
+    match cell.get() {
+        Some(Ok(r)) => r.bytes(),
+        _ => 0,
+    }
+}
+
 /// The cell under `key` in `cache` (made when absent, then the newest), the oldest computed runs
 /// dropped while the computed ones hold more than `budget` bytes.
 fn cached_run(cache: &std::sync::Mutex<Vec<(String, RunCell)>>, key: String, budget: usize) -> Result<RunCell, String> {
@@ -3184,14 +3192,10 @@ fn cached_run(cache: &std::sync::Mutex<Vec<(String, RunCell)>>, key: String, bud
         cache.push(entry);
         return Ok(cell);
     }
-    let size = |c: &RunCell| match c.get() {
-        Some(Ok(r)) => r.bytes(),
-        _ => 0,
-    };
-    let mut held: usize = cache.iter().map(|(_, c)| size(c)).sum();
+    let mut held: usize = cache.iter().map(|(_, c)| run_bytes(c)).sum();
     while held > budget && !cache.is_empty() {
         let (_, old) = cache.remove(0);
-        held -= size(&old);
+        held -= run_bytes(&old);
     }
     let cell: RunCell = Arc::new(std::sync::OnceLock::new());
     cache.push((key, cell.clone()));
@@ -3580,12 +3584,8 @@ impl Checker {
         }
         let mut measured: Vec<Option<(Vec<f64>, Option<Candidates>)>> = vec![None; runs.len()];
         let clean = if top > 0 { Some(self.model_outcome(&Graph::empty(), &Experiment::Clean)?) } else { None };
-        // Counterfactual runs made for this score stay until it ends (a later run under quantized
-        // weights must find them, never remake them).
-        let budget = std::mem::replace(&mut self.reference_bytes, usize::MAX);
         let plan = Plan { runs: &runs, groups: &groups, parsed: &parsed, circuits: &circuits, n, top, clean: clean.as_ref() };
         let result = self.measure_runs(plan, &mut measured);
-        self.reference_bytes = budget;
         let widths = result?;
         let mut out = Vec::with_capacity(programs.len());
         let mut runs_and_measures = runs.into_iter().zip(measured);
@@ -3643,26 +3643,22 @@ impl Checker {
         // M's outcomes of this score, held until it ends: the cache's byte budget may drop some
         // while later groups add theirs.
         let mut outcomes: BTreeMap<String, Arc<Array2<f64>>> = BTreeMap::new();
+        let distinct = |members: &[usize]| -> Vec<usize> {
+            let mut out: Vec<usize> = Vec::new();
+            for &r in members {
+                if !out.iter().any(|&m| runs[m].2 == runs[r].2) {
+                    out.push(r);
+                }
+            }
+            out
+        };
         for members in groups.values() {
             let restore = match &runs[members[0]].1 {
                 Experiment::Edit { edit, .. } => Some(edit.apply(&mut self.weights)?),
                 _ => None,
             };
-            self.set_edit(&runs[members[0]].1.clone());
             let result = (|| -> Result<(), String> {
-                let mut missing: Vec<usize> = Vec::new();
-                for &r in members {
-                    if !missing.iter().any(|&m| runs[m].2 == runs[r].2) {
-                        missing.push(r);
-                    }
-                }
-                // The counterfactual runs programs will read, made here on this thread: made inside
-                // the parallel runs below, a run that waits on one (a OnceLock) can be stolen by the
-                // thread making it while that thread waits on the device's pool, and neither returns
-                // (a vpd4l score hung so).
-                for &r in &missing {
-                    self.prewarm(&runs[r].1)?;
-                }
+                let missing = distinct(members);
                 let this = &*self;
                 // Each outcome with whether it is new to the cache.
                 let compute = |&r: &usize| -> Result<(String, Arc<Array2<f64>>, bool), String> {
@@ -3687,14 +3683,13 @@ impl Checker {
                 }
                 Ok(())
             })();
-            self.set_edit(&Experiment::Clean);
             if let Some(r) = restore {
                 r.restore(&mut self.weights)?;
             }
             result?;
         }
         let mut widths = Vec::with_capacity(parsed.len());
-        for (i, (graph, _, _)) in parsed.iter().enumerate() {
+        for (graph, _, _) in parsed {
             let mut chosen = Vec::with_capacity(graph.blocks.len());
             for (k, block) in graph.blocks.iter().enumerate() {
                 let bits = self.width(block, n)?;
@@ -3702,44 +3697,91 @@ impl Checker {
                 let scales = quantized_rows(&self.weights, block);
                 chosen.push(Width { node: graph.ids.get(k).cloned().unwrap_or_default(), bits, numbers, scales: if bits.is_some() { scales } else { 0 }, cost_bits: width_cost(numbers, scales, bits, n) });
             }
-            let quantized: Vec<(Block, Option<u32>)> = graph.blocks.iter().cloned().zip(chosen.iter().map(|w| w.bits)).collect();
-            let unquantize = self.weights.quantize(&quantized)?;
+            widths.push(chosen);
+        }
+        let quantized: Vec<Vec<(Block, Option<u32>)>> = parsed.iter().zip(&widths).map(|((g, _, _), w)| g.blocks.iter().cloned().zip(w.iter().map(|x| x.bits)).collect()).collect();
+        // The programs' runs, per edit group in chunks of experiments: a chunk's counterfactual runs
+        // are made first with M's exact weights (on this thread: made inside parallel runs, a run
+        // waiting on one could be stolen by the thread making it while that thread waits on the
+        // device's pool, and neither returns), then each program runs its experiments of the chunk
+        // with its blocks quantized. Counterfactual runs past `reference_bytes` are dropped after
+        // each chunk (a Qwen3-0.6B run holds 2.8 GB), never during one, so no run is remade under
+        // quantized weights.
+        for members in groups.values() {
+            let restore = match &runs[members[0]].1 {
+                Experiment::Edit { edit, .. } => Some(edit.apply(&mut self.weights)?),
+                _ => None,
+            };
+            self.set_edit(&runs[members[0]].1.clone());
+            let budget = self.reference_bytes;
             let result = (|| -> Result<(), String> {
-                for members in groups.values() {
-                    let mine: Vec<usize> = members.iter().copied().filter(|&r| runs[r].0 == i).collect();
-                    if mine.is_empty() {
-                        continue;
+                let experiments = distinct(members);
+                let mut at = 0;
+                let mut size: Option<usize> = None;
+                while at < experiments.len() {
+                    let chunk: Vec<usize> = experiments[at..(at + size.unwrap_or(1)).min(experiments.len())].to_vec();
+                    self.reference_bytes = usize::MAX;
+                    let before = self.held_references();
+                    for &r in &chunk {
+                        self.prewarm(&runs[r].1)?;
                     }
-                    let restore = match &runs[mine[0]].1 {
-                        Experiment::Edit { edit, .. } => Some(edit.apply(&mut self.weights)?),
-                        _ => None,
-                    };
-                    self.set_edit(&runs[mine[0]].1.clone());
-                    let this = &*self;
-                    let score_p = |&r: &usize| -> Result<(usize, Vec<f64>, Option<Candidates>), String> {
-                        let (i, e, key) = &runs[r];
-                        let m = outcomes.get(key).ok_or("M's outcome went missing")?;
-                        let p = this.run(&circuits[*i], e)?;
-                        let kl = kl_bits(m, &p);
-                        let candidates = clean.map(|c| Candidates::of(c, m, &p, &this.rows_of(e), &this.rows_of(&Experiment::Clean), top));
-                        Ok((r, kl, candidates))
-                    };
-                    let scored: Result<Vec<(usize, Vec<f64>, Option<Candidates>)>, String> = if mine.len() == 1 { mine.iter().map(score_p).collect() } else { mine.par_iter().map(score_p).collect() };
-                    self.set_edit(&Experiment::Clean);
-                    if let Some(r) = restore {
-                        r.restore(&mut self.weights)?;
+                    // Chunks as large as the budget holds, measured by the first experiment's runs.
+                    let grown = self.held_references().saturating_sub(before).max(1);
+                    size = Some(size.unwrap_or((budget / grown).clamp(1, 8)));
+                    let keys: BTreeSet<&str> = chunk.iter().map(|&r| runs[r].2.as_str()).collect();
+                    for (i, blocks) in quantized.iter().enumerate() {
+                        let mine: Vec<usize> = members.iter().copied().filter(|&r| runs[r].0 == i && keys.contains(runs[r].2.as_str())).collect();
+                        if mine.is_empty() {
+                            continue;
+                        }
+                        let unquantize = self.weights.quantize(blocks)?;
+                        let this = &*self;
+                        let score_p = |&r: &usize| -> Result<(usize, Vec<f64>, Option<Candidates>), String> {
+                            let (i, e, key) = &runs[r];
+                            let m = outcomes.get(key).ok_or("M's outcome went missing")?;
+                            let p = this.run(&circuits[*i], e)?;
+                            let kl = kl_bits(m, &p);
+                            let candidates = clean.map(|c| Candidates::of(c, m, &p, &this.rows_of(e), &this.rows_of(&Experiment::Clean), top));
+                            Ok((r, kl, candidates))
+                        };
+                        let scored: Result<Vec<(usize, Vec<f64>, Option<Candidates>)>, String> = if mine.len() == 1 { mine.iter().map(score_p).collect() } else { mine.par_iter().map(score_p).collect() };
+                        unquantize.restore(&mut self.weights);
+                        for (r, kl, candidates) in scored? {
+                            measured[r] = Some((kl, candidates));
+                        }
                     }
-                    for (r, kl, candidates) in scored? {
-                        measured[r] = Some((kl, candidates));
-                    }
+                    self.reference_bytes = budget;
+                    self.drop_references()?;
+                    at += chunk.len();
                 }
                 Ok(())
             })();
-            unquantize.restore(&mut self.weights);
+            self.reference_bytes = budget;
+            self.set_edit(&Experiment::Clean);
+            if let Some(r) = restore {
+                r.restore(&mut self.weights)?;
+            }
             result?;
-            widths.push(chosen);
         }
         Ok(widths)
+    }
+
+    /// The bytes of the counterfactual runs both caches hold.
+    fn held_references(&self) -> usize {
+        [&self.references, &self.site_references].iter().map(|c| c.lock().map_or(0, |c| c.iter().map(|(_, cell)| run_bytes(cell)).sum::<usize>())).sum()
+    }
+
+    /// Drops the oldest counterfactual runs while each cache holds more than `reference_bytes`.
+    fn drop_references(&self) -> Result<(), String> {
+        for cache in [&self.references, &self.site_references] {
+            let mut cache = cache.lock().map_err(|e| e.to_string())?;
+            let mut held: usize = cache.iter().map(|(_, c)| run_bytes(c)).sum();
+            while held > self.reference_bytes && !cache.is_empty() {
+                let (_, old) = cache.remove(0);
+                held -= run_bytes(&old);
+            }
+        }
+        Ok(())
     }
 
     /// `M`'s strongest pieces and connections for the behavior ([`Targets`]), measured once and
