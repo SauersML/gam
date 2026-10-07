@@ -34,6 +34,10 @@ changes as KL(M || M_e) in bits, the clean distribution first):
   where     where in the text a piece is most active -> the 3 positions of largest activity and the level
             (a neuron's activation; a head's write norm ||z_h W_o,h^T||), position 0 excluded (attention sink).
   continue  greedy continuation of S tokens with a piece scaled by 2 or 4 (the clean continuation given).
+  attend    where a head attends from the last position -> the 3 positions of largest weight and the weights.
+  carry     a prompt edit and 4 pieces: with which removal (applied to both texts) does the edit move the
+            next-token distribution least -> the order and each KL (a crossed intervention: which piece
+            carries the distinction).
   cut       cut an edge A >> B (A a head, MLP or attention; B a head route, an MLP input, or logits = the
             final residual before the norm) -> the new distribution and its KL.
   prompt    replace one token of the text -> the new distribution and its KL.
@@ -182,6 +186,11 @@ class Qwen3:
             x = layer.input_layernorm(h)
             q, k, v = self.qkv(layer, x, cos, sin)
             z = self.attend(q, k, v)
+            if record is not None:
+                for r, (al, ah) in record.get("attend", {}).items():
+                    if al == l:  # the head's attention weights from the last position (it sees every position)
+                        kk = k[r, ah // (self.H // self.KV)]
+                        record.setdefault("attend_weights", {})[r] = torch.softmax((kk @ q[r, ah, -1]) / math.sqrt(self.hd), dim=-1)
             if iv is not None:
                 # Cut readers among this layer's heads, all texts at once: the head's query, key or value
                 # from the stream with the writer's average write in place of its actual one.
@@ -503,7 +512,11 @@ def batch_questions(m: Qwen3, w: Writer, draw: Draw, tokens: torch.Tensor, sourc
         else:
             l = int(rng.integers(m.L))
             probes[r] = (l, -1, int(rng.choice(draw.neurons[l])))
-    rec = {"probes": probes}
+    attend = {}
+    for r in rows:
+        l = draw.layer_with_heads()
+        attend[r] = (l, int(rng.choice(draw.heads[l])))
+    rec = {"probes": probes, "attend": attend}
     if m.tc or m.parts:
         # Feature probes need the clean pass's activations to pick live features: a first pass picks them.
         first = {}
@@ -557,6 +570,15 @@ def batch_questions(m: Qwen3, w: Writer, draw: Draw, tokens: torch.Tensor, sourc
         ans = " > ".join(names[c] for c in order) + "\nKL bits: " + ", ".join(f"{names[c]} {max(kls[r, c].item(), 0.0):.3f}" for c in order)
         emit(r, "rank", f"<text> {texts[r]}\n<clean> {clean_txt[r][0]}\n<question> which removal, scale(PIECE, 0), changes the next-token distribution most: {listing}\n",
              ans, {"pieces": [piece_text(p) for p in cands[r]], "kl_bits": kls[r].tolist()})
+
+    # attend: where a head looks from the last position (its measured attention weights)
+    for r in rows:
+        l, hh = attend[r]
+        wts = rec["attend_weights"][r].float().cpu()
+        top = wts.topk(min(3, T)).indices.tolist()
+        ans = ", ".join(f"{p}:{w.token(tokens[r, p].item())} {wts[p].item():.2f}" for p in top)
+        emit(r, "attend", f"<text_tokens> {w.numbered(tokens[r].tolist())}\n<question> where does L[{l}].head[{hh}] attend from the last position: three positions and weights\n",
+             ans, {"piece": f"L[{l}].head[{hh}]", "positions": top, "weights": [wts[p].item() for p in top]})
 
     # where
     for r in rows:
@@ -612,25 +634,49 @@ def batch_questions(m: Qwen3, w: Writer, draw: Draw, tokens: torch.Tensor, sourc
     edited_questions("cut", iv, desc, extra)
 
     # prompt edit: one token replaced by a token of another text in the batch
-    if draw.split == "train":
-        toks2 = tokens.clone()
-        desc, extra = [], []
-        for r in rows:
-            cf = counterfactuals[r] if counterfactuals else None
-            if cf is not None:
-                toks2[r] = torch.tensor(cf, device=tokens.device)
-                changed = [i for i in range(T) if int(tokens[r, i]) != cf[i]]
-                edits = ", ".join(f"position {i}: {w.token(int(tokens[r, i]))} -> {w.token(cf[i])}" for i in changed)
-                desc.append(f"<text> {texts[r]}\n<edit> {edits}\n<edited_text> {w.text(cf)}\n")
-                extra.append({"positions": changed, "counterfactual": cf})
-                continue
-            p = int(rng.integers(1, T))
-            new = int(tokens[(r + 1 + int(rng.integers(B - 1))) % B, int(rng.integers(T))].item()) if B > 1 else int(rng.integers(1000))
-            old = int(tokens[r, p].item())
-            toks2[r, p] = new
-            desc.append(f"<text> {texts[r]}\n<edit> position {p}: {w.token(old)} -> {w.token(new)}\n<edited_text> {w.text(toks2[r].tolist())}\n")
-            extra.append({"position": p, "old": old, "new": new})
+    toks2 = tokens.clone()
+    desc, extra = [], []
+    for r in rows:
+        cf = counterfactuals[r] if counterfactuals else None
+        if cf is not None:
+            toks2[r] = torch.tensor(cf, device=tokens.device)
+            changed = [i for i in range(T) if int(tokens[r, i]) != cf[i]]
+            edits = ", ".join(f"position {i}: {w.token(int(tokens[r, i]))} -> {w.token(cf[i])}" for i in changed)
+            desc.append(f"<text> {texts[r]}\n<edit> {edits}\n<edited_text> {w.text(cf)}\n")
+            extra.append({"positions": changed, "counterfactual": cf})
+            continue
+        p = int(rng.integers(1, T))
+        new = int(tokens[(r + 1 + int(rng.integers(B - 1))) % B, int(rng.integers(T))].item()) if B > 1 else int(rng.integers(1000))
+        old = int(tokens[r, p].item())
+        toks2[r, p] = new
+        desc.append(f"<text> {texts[r]}\n<edit> position {p}: {w.token(old)} -> {w.token(new)}\n<edited_text> {w.text(toks2[r].tolist())}\n")
+        extra.append({"position": p, "old": old, "new": new})
+    prompt_desc = desc
+    if draw.split == "train":  # no piece: not asked in held-out-piece shards
         edited_questions("prompt", None, desc, extra, toks=toks2)
+
+    # carry: which of 4 pieces' removal shrinks the prompt edit's effect most (a crossed intervention: the
+    # edit's KL with every piece in place, against its KL with the piece removed, both texts edited alike)
+    lp_cf = m.log_probs(m.forward(toks2, None, None, rec))
+    d0 = kl_bits(lp_clean, lp_cf)
+    cands = [[draw.piece(rec, r, small=True) for _ in range(4)] for r in rows]
+    ivs = []
+    for c in range(4):
+        iv = m.new(B)
+        for r in rows:
+            apply_scale(iv, r, cands[r][c], 0.0)
+        ivs.append(iv)
+    both = Interventions.concat(ivs)
+    lpx = m.log_probs(m.forward(tokens.repeat(4, 1), both)).view(4, B, -1)
+    lpy = m.log_probs(m.forward(toks2.repeat(4, 1), both)).view(4, B, -1)
+    dc = torch.stack([kl_bits(lpx[c], lpy[c]) for c in range(4)], dim=1).cpu()
+    for r in rows:
+        names = "abcd"
+        listing = " ".join(f"({names[c]}) {piece_text(cands[r][c])}" for c in range(4))
+        order = sorted(range(4), key=lambda c: dc[r, c].item())
+        ans = " < ".join(names[c] for c in order) + "\nKL bits after removal: " + ", ".join(f"{names[c]} {max(dc[r, c].item(), 0.0):.3f}" for c in order)
+        emit(r, "carry", prompt_desc[r] + f"<question> the edit moves the next-token distribution by KL {max(d0[r].item(), 0.0):.3f} bits; with which removal, scale(PIECE, 0) on both texts, does the edit move it least: {listing}\n",
+             ans, {"pieces": [piece_text(p) for p in cands[r]], "kl_bits_edit": d0[r].item(), "kl_bits_after_removal": dc[r].tolist()})
 
     # swap: the piece's last-position value from the next text of the batch
     if B > 1:

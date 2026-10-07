@@ -110,6 +110,10 @@ class Vpd4l:
             h = VM.rms(x, t.norms[2 * l], t.eps)
             q, k, v = self.qkv(l, h, iv)
             z = F.scaled_dot_product_attention(q, k, v, is_causal=True).transpose(1, 2)
+            if record is not None:
+                for r, (al, ah) in record.get("attend", {}).items():
+                    if al == l:  # the head's attention weights from the last position
+                        record.setdefault("attend_weights", {})[r] = torch.softmax((k[r, ah] @ q[r, ah, -1]) / self.hd ** 0.5, dim=-1)
             for r, (ak, al, ah, bk, bl, bh, route) in cuts.items():
                 if bk == "head" and bl == l and r in cut_delta:
                     q2, k2, v2 = self.qkv(l, VM.rms(x[r : r + 1] + cut_delta[r], t.norms[2 * l], t.eps), iv, [r])
