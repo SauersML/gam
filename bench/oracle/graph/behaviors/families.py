@@ -887,13 +887,13 @@ def entity_binding(tok, rng):
 def first_letter(tok, rng):
     """The first letter of a word."""
     ws = words(tok, NOUNS)
-    v = Variant("starts_with", "Spelling: the first letter of a quoted word; the counterfactual quotes a word with another first letter.")
+    v = Variant("starts_with", "Spelling: the first letter of a quoted word, as a capital; the counterfactual quotes a word with another first letter.")
     for _ in range(400):
         a, b = rng.sample(ws, 2)
         if a[0] == b[0]:
             continue
         t = rng.choice(['The word "{w}" starts with the letter', 'The first letter of the word "{w}" is the letter'])
-        v.items.append(Item(t.format(w=a), " " + a[0], t.format(w=b), " " + b[0]))
+        v.items.append(Item(t.format(w=a), " " + a[0].upper(), t.format(w=b), " " + b[0].upper()))  # the models name letters in capitals
     return [v]
 
 
