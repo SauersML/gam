@@ -282,7 +282,7 @@ fn behavior(sequences: &[Vec<u32>]) -> Behavior {
     let prompts = sequences
         .iter()
         .enumerate()
-        .map(|(i, s)| Prompt { text: String::new(), token_ids: s.clone(), target_positions: vec![s.len() - 2, s.len() - 1], counterfactual: Some(Counterfactual { text: String::new(), token_ids: sequences[(i + 1) % sequences.len()].clone() }) })
+        .map(|(i, s)| Prompt { text: String::new(), token_ids: s.clone(), target_positions: vec![s.len() - 2, s.len() - 1], counterfactual: Some(Counterfactual { text: String::new(), token_ids: sequences[(i + 1) % sequences.len()].clone() }), attention_block: Vec::new() })
         .collect();
     Behavior { id: "tiny".into(), model: "tiny".into(), family: String::new(), description: String::new(), frequency: None, prompts, split: "train".into(), model_accuracy: None }
 }

@@ -144,7 +144,7 @@ fn checker_scores_the_full_program_at_zero_error() {
     let f = fixture("graph_score");
     let library = Library::new(&f.device, &f.device, &f.native, &f.layers, &f.artifact, 1 << 28, 64).expect("library");
     let weights = Weights::of(&library);
-    let prompts = f.sequences.iter().map(|s| Prompt { text: String::new(), token_ids: s.clone(), target_positions: vec![s.len() - 2, s.len() - 1], counterfactual: None }).collect();
+    let prompts = f.sequences.iter().map(|s| Prompt { text: String::new(), token_ids: s.clone(), target_positions: vec![s.len() - 2, s.len() - 1], counterfactual: None, attention_block: Vec::new() }).collect();
     let behavior = Behavior { id: "tiny".into(), model: "tiny".into(), family: String::new(), description: String::new(), frequency: None, prompts, split: "train".into(), model_accuracy: None };
     let mut checker = Checker::new(weights, behavior).expect("checker");
     // These prompts have no counterfactuals: average stand-ins.
@@ -235,7 +235,7 @@ fn checker_counterfactual_default_scores_the_empty_program_at_the_behavior_signa
         .sequences
         .iter()
         .zip(&cf)
-        .map(|(s, c)| Prompt { text: String::new(), token_ids: s.clone(), target_positions: vec![s.len() - 1], counterfactual: Some(crate::graph::Counterfactual { text: String::new(), token_ids: c.clone() }) })
+        .map(|(s, c)| Prompt { text: String::new(), token_ids: s.clone(), target_positions: vec![s.len() - 1], counterfactual: Some(crate::graph::Counterfactual { text: String::new(), token_ids: c.clone() }), attention_block: Vec::new() })
         .collect();
     let behavior = Behavior { id: "tiny".into(), model: "tiny".into(), family: String::new(), description: String::new(), frequency: None, prompts, split: "train".into(), model_accuracy: None };
     let mut checker = Checker::new(weights, behavior).expect("checker");
@@ -290,4 +290,25 @@ fn transcoder_features_write_the_transcoder_and_the_rest_is_exact() {
     assert!(Graph::parse(&both, &weights).is_err(), "neurons and features of one MLP");
     let far = Program { nodes: vec![feature("f", Index::One(6))], ..program.clone() };
     assert!(Graph::parse(&far, &weights).is_err(), "feature out of range");
+}
+
+#[test]
+fn attention_block_hides_the_prefix_like_running_the_suffix_alone() {
+    let f = fixture("graph_mask");
+    let library = Library::new(&f.device, &f.device, &f.native, &f.layers, &f.artifact, 1 << 28, 64).expect("library");
+    let weights = Weights::of(&library);
+    let stats = Stats::measure(&weights, &f.sequences).expect("stats");
+    // Queries from position 4 on do not see keys before 4: with rotary (relative) positions and no
+    // absolute ones, positions 4.. then compute exactly what the suffix computes alone.
+    let (t, length) = (4, f.sequences[0].len());
+    let mut batch = Batch::new(&f.sequences).expect("batch");
+    batch.blocks = vec![vec![[t, length, 0, t]]; f.sequences.len()];
+    let rows: Vec<usize> = (0..f.sequences.len()).flat_map(|s| (t..length).map(move |p| s * length + p)).collect();
+    let run = execute(&weights, &stats, &Graph::empty().model(&weights), &batch, &rows, &BTreeMap::new(), false).expect("execute");
+    let suffixes: Vec<Vec<u32>> = f.sequences.iter().map(|s| s[t..].to_vec()).collect();
+    let expected = library.log_probabilities(&library.run(&suffixes, &BTreeMap::new()).expect("run").last).expect("log p");
+    let kl = max(&kl_bits(&expected, &run.log_probabilities));
+    assert!(kl < 1e-9, "KL(suffix alone ‖ masked prefix) = {kl:e} bits");
+    let open = execute(&weights, &stats, &Graph::empty().model(&weights), &Batch::new(&f.sequences).expect("batch"), &rows, &BTreeMap::new(), false).expect("execute");
+    assert!(max(&kl_bits(&expected, &open.log_probabilities)) > 1e-6, "the prefix changes nothing unmasked");
 }

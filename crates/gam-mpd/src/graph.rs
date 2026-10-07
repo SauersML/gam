@@ -718,6 +718,8 @@ pub struct Batch {
     pub tokens: Vec<u32>,
     pub spans: Vec<(usize, usize)>,
     pub reference: Option<std::sync::Arc<Reference>>,
+    /// Per sequence its attention blocks ([`Prompt::attention_block`]), positions within it.
+    pub blocks: Vec<Vec<[usize; 4]>>,
 }
 
 impl Batch {
@@ -734,7 +736,8 @@ impl Batch {
         if tokens.is_empty() {
             return Err("no sequences".into());
         }
-        Ok(Self { tokens, spans, reference: None })
+        let blocks = vec![Vec::new(); spans.len()];
+        Ok(Self { tokens, spans, reference: None, blocks })
     }
 
     /// The batch's sequences.
@@ -850,7 +853,7 @@ fn project(x: &Array2<f64>, map: &Array2<f64>, norm: Option<&(Array1<f64>, f64)>
 /// applied to each normed input (route slot, value). With `record`, each head's mean
 /// attention-weighted normalized value input as well.
 #[allow(clippy::type_complexity)]
-fn heads_write(layer: &LayerWeights, heads: &[usize], inputs: [&Array2<f64>; 3], spans: &[(usize, usize)], record: bool, capture: bool, normed: &mut dyn FnMut(usize, &mut Array2<f64>)) -> (Array2<f64>, Vec<Array1<f64>>, Vec<Array2<f64>>) {
+fn heads_write(layer: &LayerWeights, heads: &[usize], inputs: [&Array2<f64>; 3], spans: &[(usize, usize)], blocks: &[Vec<[usize; 4]>], record: bool, capture: bool, normed: &mut dyn FnMut(usize, &mut Array2<f64>)) -> (Array2<f64>, Vec<Array1<f64>>, Vec<Array2<f64>>) {
     let norm = &layer.attention;
     let (mut q_hat, mut k_hat) = (norm.apply(inputs[0]), norm.apply(inputs[1]));
     let v_unit = norm.unit(inputs[2]);
@@ -866,12 +869,15 @@ fn heads_write(layer: &LayerWeights, heads: &[usize], inputs: [&Array2<f64>; 3],
         let (q, k, v) = (project(&q_hat, &w.query, w.query_norm.as_ref()), project(&k_hat, &w.key, w.key_norm.as_ref()), v_hat.dot(&w.value.t()));
         let mut z = Array2::<f64>::zeros(v.dim());
         let mut mixed = Array1::<f64>::zeros(d);
-        for &(start, length) in spans {
+        for (n, &(start, length)) in spans.iter().enumerate() {
             let positions: Vec<u32> = (0..length as u32).collect();
             let span = start..start + length;
             let (qs, ks) = (q.slice(s![span.clone(), ..]).to_owned(), k.slice(s![span.clone(), ..]).to_owned());
             let (qs, ks) = (rotate(&qs, w.rotary, &positions, false), rotate(&ks, w.rotary, &positions, false));
-            let a = probabilities(qs.view(), ks.view(), &positions, 0, w.scale, w.causal);
+            let mut a = probabilities(qs.view(), ks.view(), &positions, 0, w.scale, w.causal);
+            if let Some(b) = blocks.get(n).filter(|b| !b.is_empty()) {
+                block_attention(&mut a, b);
+            }
             z.slice_mut(s![span.clone(), ..]).assign(&a.dot(&v.slice(s![span.clone(), ..])));
             if record {
                 mixed += &a.dot(&v_unit.slice(s![span, ..])).sum_axis(Axis(0));
@@ -886,6 +892,26 @@ fn heads_write(layer: &LayerWeights, heads: &[usize], inputs: [&Array2<f64>; 3],
         }
     }
     (out, recorded, reads)
+}
+
+/// Attention weights (queries × keys of one sequence) with the blocked query-key ranges removed and
+/// each query's remaining weights renormalized: the softmax with those scores at minus infinity. A
+/// query with nothing left attends to nothing.
+fn block_attention(a: &mut Array2<f64>, blocks: &[[usize; 4]]) {
+    let (queries, keys) = a.dim();
+    for &[q0, q1, k0, k1] in blocks {
+        for q in q0..q1.min(queries) {
+            for k in k0..k1.min(keys) {
+                a[[q, k]] = 0.0;
+            }
+        }
+    }
+    for mut row in a.outer_iter_mut() {
+        let total: f64 = row.sum();
+        if total > 0.0 {
+            row /= total;
+        }
+    }
 }
 
 /// Neurons `neurons` of an MLP on the normed stream `x_hat` (rows × width).
@@ -1065,7 +1091,7 @@ fn run(weights: &Weights, stats: &Stats, circuit: &Circuit, batch: &Batch, score
             let mut normed = |slot: usize, x: &mut Array2<f64>| ops.normed(site, u, slot, x, &mut normed_kept);
             let write = match &unit.block {
                 Block::Heads { layer, heads } => {
-                    let (w, recorded, reads) = heads_write(&weights.layers[*layer], heads, [&inputs[0], &inputs[1], &inputs[2]], &batch.spans, record, capture, &mut normed);
+                    let (w, recorded, reads) = heads_write(&weights.layers[*layer], heads, [&inputs[0], &inputs[1], &inputs[2]], &batch.spans, &batch.blocks, record, capture, &mut normed);
                     for (h, r) in heads.iter().zip(recorded) {
                         head_stats[*layer][*h] = r;
                     }
@@ -2104,6 +2130,11 @@ pub struct Prompt {
     pub target_positions: Vec<usize>,
     #[serde(default)]
     pub counterfactual: Option<Counterfactual>,
+    /// Token ranges whose attention is masked, `[query_start, query_end, key_start, key_end]`:
+    /// queries in the first range do not attend to keys in the second (the prompt's and its
+    /// counterfactual's, for `M` and every program, in every experiment).
+    #[serde(default)]
+    pub attention_block: Vec<[usize; 4]>,
 }
 
 /// A behavior file (`~/mpd-data/graph_oracle/behaviors/<model>/<id>.json`).
@@ -2158,6 +2189,8 @@ pub struct Checker {
     pub uniform_seeds: Option<u64>,
     /// Each prompt's tokens with its counterfactual's and back: a sequence's stand-in source.
     partners: std::collections::HashMap<Vec<u32>, Vec<u32>>,
+    /// Each prompt's and counterfactual's attention blocks by their tokens.
+    blocks: std::collections::HashMap<Vec<u32>, Vec<[usize; 4]>>,
     /// The weight edit applied now, if any (its JSON): part of a counterfactual run's cache key.
     edit: Option<String>,
     /// Counterfactual runs by (edit, sequences), each computed once by whichever run asks first.
@@ -2238,6 +2271,13 @@ impl Checker {
         }
         donors.sort_unstable();
         let mut partners = std::collections::HashMap::new();
+        let mut blocks = std::collections::HashMap::new();
+        for p in behavior.prompts.iter().filter(|p| !p.attention_block.is_empty()) {
+            blocks.insert(p.token_ids.clone(), p.attention_block.clone());
+            if let Some(c) = &p.counterfactual {
+                blocks.insert(c.token_ids.clone(), p.attention_block.clone());
+            }
+        }
         for p in &behavior.prompts {
             if let Some(c) = p.counterfactual.as_ref().filter(|c| c.token_ids.len() == p.token_ids.len()) {
                 partners.insert(p.token_ids.clone(), c.token_ids.clone());
@@ -2258,6 +2298,7 @@ impl Checker {
             sites: SiteUnits::default(),
             uniform_seeds: None,
             partners,
+            blocks,
             edit: None,
             references: std::sync::Mutex::new(Vec::new()),
             site_references: std::sync::Mutex::new(BTreeMap::new()),
@@ -2271,6 +2312,8 @@ impl Checker {
     pub fn referenced(&self, circuit: &Circuit, batch: &Batch) -> Result<Batch, String> {
         let mut out = batch.clone();
         out.reference = None;
+        let masked = |b: &mut Batch| b.blocks = b.sequences().iter().map(|s| self.blocks.get(s).cloned().unwrap_or_default()).collect();
+        masked(&mut out);
         if !circuit.counterfactual || circuit.is_model() {
             return Ok(out);
         }
@@ -2293,7 +2336,13 @@ impl Checker {
                 }
             }
         };
-        let r = cell.get_or_init(|| Batch::new(&partner).and_then(|b| reference(&self.weights, &self.stats, &b)).map(Arc::new)).clone()?;
+        let r = cell
+            .get_or_init(|| {
+                let mut b = Batch::new(&partner)?;
+                masked(&mut b);
+                reference(&self.weights, &self.stats, &b).map(Arc::new)
+            })
+            .clone()?;
         out.reference = Some(r);
         Ok(out)
     }
