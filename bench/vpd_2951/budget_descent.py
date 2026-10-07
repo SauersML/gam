@@ -57,6 +57,15 @@ if not (vpd_model.TARGET_DIR / 'model_step_99999.safetensors').exists():  # the 
     vpd_model.load_file = lambda f: torch.load(f.replace('.safetensors', '.pt'), map_location='cpu', weights_only=True)
 VPD_DIR, TOKENS = (Path(sys.argv[10]) if sys.argv[10].endswith('.pth') else Path(sys.argv[10]).parent), sys.argv[11]
 import os
+# DESCENT_TOY=DIR: a real-valued toy of the toy gate as the target (bench/toys_2951/toy_target.py: its maps under
+# vpd_model's site names, its activation, its Gaussian head's outputs as the logits); TOKENS its tokens_descent.u16,
+# VPD unused, K in bits (the rot arm).
+TOY = os.environ.get('DESCENT_TOY')
+if TOY:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'toys_2951'))
+    import toy_target
+    load_target, site_names = (lambda dev: toy_target.load(TOY, dev)), toy_target.site_names(TOY)
+    vpd_model.gelu_tanh = toy_target.activation(TOY)
 # DESCENT_ARM=dir: each slice's gate reads its own direction g_i (signed), z = (g_i.x - tau_i)/s_i,
 # with g_i started at the slice's read v_i ||u_i||, signed so its firing on M's fit tokens is kept.
 ARM = os.environ.get('DESCENT_ARM', 'own')
@@ -121,10 +130,10 @@ vpdlike = start in ('vpd', 'vpdgroup')
 # Starts: svd, vpd, vpdgroup, neuron (the privileged axis: each MLP neuron's c_fc row and down_proj
 # column one exact part under one gate on its own pre-activation).
 # VPD's slices are read for the VPD starts' MLP maps and for the heads (DESCENT_SITES=all, any start).
-if (vpdlike or attn or ARM == 'rot') and str(VPD_DIR).endswith('.pth'):
+if (vpdlike or attn or (ARM == 'rot' and not TOY)) and str(VPD_DIR).endswith('.pth'):
     raw = torch.load(str(VPD_DIR), map_location='cpu', weights_only=True, mmap=True)
     load = lambda k: raw['_components.' + k.rsplit('.', 1)[0].replace('.', '-') + '.' + k.rsplit('.', 1)[1]].float().to(dev)
-elif vpdlike or attn or ARM == 'rot':
+elif vpdlike or attn or (ARM == 'rot' and not TOY):
     shapes = {k: v['shape'] for k, v in json.load(open(VPD_DIR / 'export.json'))['files'].items()}
     load = lambda k: torch.tensor(np.fromfile(VPD_DIR / f'{k}.f64', dtype='<f8').reshape(shapes[k]), dtype=torch.float32, device=dev)
 def frame(F, W):
@@ -200,13 +209,13 @@ for n in mlp:
 GROUP, MULT = {}, {}
 if start == 'neuron':
     # Neuron j's down_proj slice fires with its c_fc slice's gate; the part counts 2 when on.
-    for l in range(4):
+    for l in range(T.n_layer):
         fc, dn = f'h.{l}.mlp.c_fc', f'h.{l}.mlp.down_proj'
         GROUP[dn] = (fc, torch.arange(P[dn]['V'].shape[1], device=dev))
         MULT[fc] = torch.full((P[fc]['V'].shape[1],), 2.0, device=dev)
 if start == 'vpdgroup':
     with torch.no_grad():
-        for l in range(4):
+        for l in range(T.n_layer):
             fc, dn = f'h.{l}.mlp.c_fc', f'h.{l}.mlp.down_proj'
             on = lambda m: (((X[m] @ P[m]['V']).abs() * P[m]['U'].norm(dim=1)) > P[m]['tau']).float()
             gf, gd = on(fc), on(dn)
@@ -224,7 +233,7 @@ if start == 'vpdgroup':
 # at the least-squares fit of the own reads r on M's fit tokens from the 64 router features.
 ROUTER = {}
 if ARM in ('router', 'router_pure'):
-    for l in range(4):
+    for l in range(T.n_layer):
         fc, dn = f'h.{l}.mlp.c_fc', f'h.{l}.mlp.down_proj'
         d = P[fc]['V'].shape[0]
         G1 = torch.randn(d, 64, device=dev) / math.sqrt(d)
@@ -252,7 +261,7 @@ if ARM in ('router', 'router_pure'):
 SHARE = {}
 if ARM == 'share':
     with torch.no_grad():
-        for l in range(4):
+        for l in range(T.n_layer):
             fc, dn = f'h.{l}.mlp.c_fc', f'h.{l}.mlp.down_proj'
             on = lambda m: (((X[m] @ P[m]['V']).abs() * P[m]['U'].norm(dim=1)) > P[m]['tau']).float()
             gf, gd = on(fc), on(dn)
@@ -286,12 +295,12 @@ EDGE = {}
 if EDGES:
     if ARM != 'own' or start == 'vpdgroup':
         raise SystemExit('DESCENT_EDGES: the own arm with per-slice gates only (a shared or separate gate reads the full stream)')
-    for l in range(1, 4):
+    for l in range(1, T.n_layer):
         n_w = sum(P[f'h.{k}.mlp.down_proj']['V'].shape[1] for k in range(l))
         EDGE[l] = {'eta': torch.full((n_w, P[f'h.{l}.mlp.c_fc']['V'].shape[1]), 3.0, device=dev, requires_grad=True), 'bits': math.log2(n_w)}
         print(f'layer {l}: {n_w} x {EDGE[l]["eta"].shape[1]} candidate edges, {EDGE[l]["bits"]:.2f} bits each', flush=True)
     # The pre-MLP norm's scale r of P's own full stream, recorded per layer as the model computes it.
-    MLP_NORM = {id(T.norms[2 * l + 1]): l for l in range(4)}
+    MLP_NORM = {id(T.norms[2 * l + 1]): l for l in range(T.n_layer)}
     plain_rms = vpd_model.rms
     def recording_rms(x, w, eps):
         if id(w) in MLP_NORM:
@@ -1046,6 +1055,9 @@ for n in site_names():
 
 KINDS_ = ('q_proj', 'k_proj', 'v_proj', 'o_proj', 'c_fc', 'down_proj')
 FAMILIES = ('neurons_remove', 'neurons_scale', 'neurons_in_remove', 'neurons_in_scale', 'head_remove', 'head_scale', 'head_swap', 'random')
+if TOY:
+    # A toy's attention is zero (toy_target runs it as no attention): its edits are the MLP neurons'.
+    FAMILIES = FAMILIES[:4]
 def site_of(l, k):
     return f"h.{l}.{'mlp' if k in ('c_fc', 'down_proj') else 'attn'}.{k}"
 
@@ -1057,7 +1069,7 @@ def draw_edit(g, family):
     columns, a head swap puts head h2's q, k, v rows and o columns in head h1's place, and a random edit
     is A B^T on one map with rank log-uniform from 1 to full and size log-uniform from 5% to 100% of
     the map's typical output norm."""
-    l = int(g.integers(4)); W = lambda k: T.site(site_of(l, k)).W
+    l = int(g.integers(T.n_layer)); W = lambda k: T.site(site_of(l, k)).W
     eye = lambda d, idx: torch.eye(d, device=dev)[:, idx]
     if family.startswith('neurons'):
         width = W('down_proj').shape[1]
@@ -1246,14 +1258,14 @@ if sliced:
             T(torch.tensor(tok[i:i + 2, :512].astype(np.int64), device=dev))
         cap = {n: torch.cat(v, 1) for n, v in state['capture'].items()}
         state['capture'] = None
-        for l in range(4):
+        for l in range(T.n_layer):
             n = f'h.{l}.attn.v_proj'; r = cap[n]
             A[n]['s'] = 0.1 * r.pow(2).mean(1).sqrt().clamp_min(1e-12)
             q = 1 - START_SCALE * VPD_ATTN_COUNTS.get(n, 1.0) / r.shape[0] / r.shape[2]
             flat = r.reshape(-1); idx = torch.randperm(flat.numel(), device=dev)[:2_000_000]
             A[n]['tau'] = torch.full_like(A[n]['s'], torch.quantile(flat[idx], q).item()).requires_grad_()
         if ARM == 'share':
-            for l in range(4):
+            for l in range(T.n_layer):
                 v, o = f'h.{l}.attn.v_proj', f'h.{l}.attn.o_proj'
                 gv = (cap[v] > A[v]['tau'][:, None, :]).float(); go = (cap[o] > A[o]['tau'][:, None, :]).float()
                 nv, no = gv.sum(1), go.sum(1)
@@ -1270,6 +1282,9 @@ if sliced:
         del cap
 
 def kl_bits(lm, lp):
+    if TOY:
+        # A Gaussian head's outputs, in units of the task residual: KL = |mu_M - mu_P|^2 / 2 nats.
+        return (lm.float() - lp.float()).pow(2).sum(-1) / (2 * math.log(2))
     pm = F.log_softmax(lm.float(), -1); pp = F.log_softmax(lp.float(), -1)
     return (pm.exp() * (pm - pp)).sum(-1) / math.log(2)
 
@@ -1476,15 +1491,16 @@ if ARM == 'rot':
     # zero-mean prior per tensor, plus its index among VPD's MLP subcomponents.
     with torch.no_grad():
         vb, total = {}, 0
-        for n in mlp + attn:
+        for n in (mlp + attn if not TOY else ()):
             per = 0.0
             for w, ax in (('V', 0), ('U', 1)):
                 t_ = load(f'{n}.{w}'); d_ = t_.shape[ax]
                 s2 = (0.01 * t_.pow(2).mean().sqrt()) ** 2; v_ = t_.pow(2).mean() + s2
                 per = per + 0.5 * (d_ * torch.log(v_ / s2) + (t_.pow(2).sum(ax) + d_ * s2) / v_ - d_) / math.log(2)
             vb[n] = per.mean().item(); total += per.numel()
-        counts = {**VPD_COUNTS, **(VPD_ATTN_COUNTS if attn else {})}
-        K = K / sum(counts.values()) * sum(counts[n] * (vb[n] + math.log2(total)) for n in counts)
+        if not TOY:
+            counts = {**VPD_COUNTS, **(VPD_ATTN_COUNTS if attn else {})}
+            K = K / sum(counts.values()) * sum(counts[n] * (vb[n] + math.log2(total)) for n in counts)
     print('rot budget B', round(K), 'bits per token; VPD subcomponent bits', {n: round(v) for n, v in vb.items()}, flush=True)
     # Each block's noise scale (a tenth of the root mean square of its read with all on), then the thresholds set
     # in the gated run, layer by layer, so the start's expected bits per token are B (the layers' shares as VPD's
@@ -1503,7 +1519,7 @@ if ARM == 'rot':
                 comps.append((R, 'tau', 's', f'h.{l}.attn.{key}', lambda R=R, f=bits0: f(R).mean().item(), share))
         R = ROT[l]
         comps.append((R, 'tau', 's', f'h.{l}.mlp.c_fc', lambda R=R: rot_slice_bits(R, rot_Q(R))[0].mean().item(),
-                      VPD_COUNTS[f'h.{l}.mlp.c_fc'] + VPD_COUNTS[f'h.{l}.mlp.down_proj']))
+                      1.0 if TOY else VPD_COUNTS[f'h.{l}.mlp.c_fc'] + VPD_COUNTS[f'h.{l}.mlp.down_proj']))
     with torch.no_grad():
         install([None])
         state['calib'] = {}
