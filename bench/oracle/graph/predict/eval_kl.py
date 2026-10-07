@@ -31,6 +31,7 @@ import sft
 from sft import load, prompt_text, wrap
 
 TYPES = ("plain", "edit", "cut", "prompt", "swap")
+BINS = ((0.0, 0.01), (0.01, 0.1), (0.1, 1.0), (1.0, float("inf")))  # sizes of the measured change KL(M || M_e), bits
 V = 151936
 
 
@@ -82,7 +83,13 @@ def score_set(model, tok, heldout, args, dev, name):
     """Per question type: the oracle's KL and the no-change answer's on the same questions."""
     result = {}
     for kind in TYPES:
-        qs = heldout.get(kind, [])[: args.per_type]
+        qs = heldout.get(kind, [])
+        if args.stratify and qs and "kl_bits" in qs[0]["numbers"]:
+            # Up to per_type / 4 questions from each size of the measured change, so large effects are represented.
+            by_bin = [[q for q in qs if lo <= max(q["numbers"]["kl_bits"], 0.0) < hi] for lo, hi in BINS]
+            qs = [q for b in by_bin for q in b[: max(1, args.per_type // len(BINS))]]
+        else:
+            qs = qs[: args.per_type]
         if not qs:
             continue
         ours, ref = [], []
@@ -128,6 +135,7 @@ def main():
     ap.add_argument("--rank", type=int, default=16)
     ap.add_argument("--alpha", type=float, default=32.0)
     ap.add_argument("--max-new", type=int, default=72)
+    ap.add_argument("--stratify", action="store_true", help="per type, up to per_type/4 questions from each size of the measured change")
     ap.add_argument("--format", default="chat", choices=("chat", "raw"), help="the format the adapters were trained with (sft.py)")
     args = ap.parse_args()
     sft.FORMAT["name"] = args.format

@@ -241,6 +241,8 @@ def main():
                     help="share of each type's draws taken from its questions whose measured answer differs from no change")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--format", default="chat", choices=("chat", "raw"))
+    ap.add_argument("--save-at", type=lambda t: [int(x) for x in t.split(",") if x], default=[], help="steps at which to also save the adapters (1500,3000)")
+    ap.add_argument("--checkpointing", default="auto", choices=("auto", "on", "off"), help="activation recomputation (auto: on cards under 40 GB)")
     ap.add_argument("--eval-only", default="", help="ADAPTERS: score base and these adapters on the held-out sets, no training")
     ap.add_argument("--export-peft", default="", help="only convert OUT/adapters.safetensors to OUT/peft (no training)")
     args = ap.parse_args()
@@ -307,7 +309,9 @@ def main():
     eval_seconds = time.time() - started
 
     opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=0.0)
-    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    big = dev.type == "cuda" and torch.cuda.get_device_properties(0).total_memory > 40 * 2**30
+    if args.checkpointing == "on" or (args.checkpointing == "auto" and not big):  # recompute activations on cards under 40 GB
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     model.config.use_cache = False
     step, t0 = 0, time.time()
     while step < args.steps:
@@ -330,6 +334,11 @@ def main():
         opt.step()
         opt.zero_grad(set_to_none=True)
         step += 1
+        if step in args.save_at:
+            from safetensors.torch import save_file
+
+            save_file({f"{k}.{n}": getattr(a, n).detach().cpu().contiguous() for k, a in adapters.items() for n in ("A", "B")},
+                      str(out / f"adapters_step{step}.safetensors"))
         if args.eval_every and step % args.eval_every == 0:
             curve = {"step": step, "heldout": evaluate_sets(args.curve_per_type)}
             log.write(json.dumps(curve) + "\n")
