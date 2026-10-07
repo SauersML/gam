@@ -91,19 +91,23 @@ def behavior_text(behavior: dict, prompts: int) -> str:
     return "\n".join(lines)
 
 
-def examples(model: str, shots: int) -> list[tuple[str, str]]:
-    """Up to `shots` example programs (name, source), the target model's first."""
-    found = sorted(HERE.glob("examples/*.py"), key=lambda p: (not p.name.startswith(model.split("-")[0]), p.name))
-    return [(p.stem, p.read_text()) for p in found[:shots]]
+def examples(behavior: dict, shots: int) -> list[tuple[str, dict, str]]:
+    """Up to `shots` example programs (name, index entry, source) for `behavior`: train-split examples
+    of other families only (examples/index.json), so a prompt never shows a program for its own
+    behavior family or a held-out one; the target model's first."""
+    index = json.loads((HERE / "examples/index.json").read_text())
+    names = sorted((n for n, e in index.items() if e["split"] == "train" and e["family"] != behavior.get("family")),
+                   key=lambda n: (index[n]["model"] != behavior["model"], n))
+    return [(n, index[n], (HERE / "examples" / f"{n}.py").read_text()) for n in names[:shots]]
 
 
 def render(behavior: dict, prompts: int = 4, shots: int = 1) -> str:
     model = behavior["model"]
     sizes, pieces = views(model)
     parts = [REFERENCE.format(pieces=pieces)]
-    for name, source in examples(model, shots):
-        target = "vpd4l" if name.startswith("vpd4l") else "qwen3-0.6b"
-        parts.append(f"Example program ({target}; its docstring states the behavior):\n```python\n{source.strip()}\n```")
+    for name, entry, source in examples(behavior, shots):
+        parts.append(f"Example program ({entry['model']}; its docstring states the behavior):\n"
+                     f"```python\n{source.strip()}\n```")
     parts.append(f"{sizes}\n{behavior_text(behavior, prompts)}\n\nWrite the program.")
     return "\n\n".join(parts)
 

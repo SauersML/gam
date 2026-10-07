@@ -1,0 +1,5 @@
+{
+ "vpd4l_induction_native": {"model": "vpd4l", "behavior": null, "family": "induction_text", "split": "train"},
+ "vpd4l_induction_vpd": {"model": "vpd4l", "behavior": null, "family": "induction_text", "split": "train"},
+ "qwen3_induction_heads": {"model": "qwen3-0.6b", "behavior": "induction_random.words8", "family": "induction_random", "split": "train"}
+}

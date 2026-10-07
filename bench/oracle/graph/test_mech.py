@@ -21,8 +21,12 @@ def invalid(source: str, model: str = "vpd4l", sandboxed: bool = False) -> str:
 
 
 def test_examples_trace():
+    import json
+
+    index = json.loads((HERE / "examples/index.json").read_text())
+    assert sorted(index) == sorted(p.stem for p in (HERE / "examples").glob("*.py"))
     for path in sorted((HERE / "examples").glob("*.py")):
-        model = "vpd4l" if path.name.startswith("vpd4l") else "qwen3-0.6b"
+        model = index[path.stem]["model"]
         source = path.read_text()
         ir = mech.trace_inline(source, model)
         assert ir["valid"], (path.name, ir["error"])
@@ -149,6 +153,9 @@ def test_prompt():
     text = prompt.render(behavior, prompts=1, shots=1)
     assert "' red green blue . red green' -> ' blue' 0.90, ' red' 0.05" in text
     assert "PD.tc[l][i, ...]" in text and "PD.vpd" not in text.split("Example program")[0]
+    induction = dict(behavior, family="induction_random")
+    assert "qwen3_induction" not in str(prompt.examples(induction, 3)) and len(prompt.examples(induction, 3)) == 2
+    assert prompt.examples(behavior, 1)[0][0] == "qwen3_induction_heads"
     assert prompt.program_of("x\n```python\nfrom mech import node\n```\n") == "from mech import node\n"
 
 
