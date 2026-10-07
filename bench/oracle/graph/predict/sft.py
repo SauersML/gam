@@ -87,6 +87,18 @@ def save_peft(adapters_path, out_dir, base: str, rank: int, alpha: float):
     (out_dir / "adapter_config.json").write_text(json.dumps(config, indent=1))
 
 
+def load_slim(pattern):
+    """Training questions by type, each kept as its input, answer, text id and whether its measured answer
+    differs from no change (the numbers dropped: a million questions fit in a few GB)."""
+    by_type = {}
+    for path in sorted(p for part in pattern.split(",") for p in glob.glob(part)):
+        for line in open(path):
+            q = json.loads(line)
+            by_type.setdefault(q["type"], []).append({"type": q["type"], "input": q["input"], "answer": q["answer"],
+                                                      "text_id": q["text_id"], "changed": changed(q)})
+    return by_type
+
+
 def load(pattern):
     """Questions by type from every file matching the comma-separated glob patterns."""
     by_type = {}
@@ -101,6 +113,8 @@ def changed(q) -> bool:
     """Whether the measured answer differs from no change: KL above 0.1 bits (the largest of a rank
     question's four), or a continuation that differs from the clean one."""
     n = q["numbers"]
+    if "kl_bits_after_removal" in n:  # carry: some removal moves the edit's effect by more than 0.1 bits
+        return max(abs(v - n["kl_bits_edit"]) for v in n["kl_bits_after_removal"]) > 0.1
     if "kl_bits" in n:
         v = n["kl_bits"]
         return (max(v) if isinstance(v, list) else v) > 0.1
@@ -217,7 +231,7 @@ def main():
         p.requires_grad_(False)
     adapters = wrap(model, args.rank, args.alpha)
     params = [p for a in adapters.values() for p in (a.A, a.B)]
-    train = load(args.train)
+    train = load_slim(args.train)
     if args.types:
         train = {k: v for k, v in train.items() if k in args.types.split(",")}
     sets = {}
@@ -225,7 +239,7 @@ def main():
         name, _, pattern = spec.rpartition("=")
         sets[name or "heldout"] = load(pattern)
     types = sorted(train)
-    moved = {k: [q for q in v if changed(q)] for k, v in train.items()}
+    moved = {k: [q for q in v if q["changed"]] for k, v in train.items()}
     log = open(out / "train.jsonl", "a")
     meta = {"args": vars(args), "train_questions": {k: len(v) for k, v in train.items()}, "changed_questions": {k: len(v) for k, v in moved.items()}, "heldout_questions": {n: {k: len(v) for k, v in h.items()} for n, h in sets.items()},
             "distinct_train_texts": len({q["text_id"] for v in train.values() for q in v}),
