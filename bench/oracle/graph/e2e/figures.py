@@ -4,6 +4,8 @@
       one behavior: each program's total in bits as stacked horizontal bars (execution error, opaque
       numbers, code, reader error). RESULTS.json maps program name -> score dict (run.py --json,
       a sweep file's "programs").
+  figures.py modes RESULTS.json --names a=label ...
+      each program's total under each stand-in form (RESULTS maps "program|form" -> score dict).
   figures.py compare --sweep DIR [--search DIR] [--oracle DIR] [--out PNG]
       every behavior: the total of the empty program, the hand-written program (where one exists),
       search's best program and the oracle's program, as bits per scored token.
@@ -105,6 +107,29 @@ def compare(sweep: Path, search: Path | None, oracle: Path | None, out: Path) ->
     return out
 
 
+def modes(results: dict, labels: dict[str, str], out: Path, title: str) -> Path:
+    """One dot per (program, stand-in form): total bits per scored token. RESULTS maps "program|form"
+    to a score dict."""
+    forms = sorted({k.split("|")[1] for k in results})
+    names = [n for n in labels if any(k.startswith(n + "|") for k in results)]
+    fig, ax = plt.subplots(figsize=(14, 0.9 * len(names) + 2.2))
+    for form, color in zip(forms, COLORS):
+        pts = [(results[f"{n}|{form}"]["total_bits"] / results[f"{n}|{form}"]["N"], i) for i, n in enumerate(names) if f"{n}|{form}" in results]
+        ax.scatter([x for x, _ in pts], [i for _, i in pts], s=140, color=color, label=f"{form} stand-ins", zorder=3,
+                   edgecolor="white", linewidth=2)
+    ax.set_yticks(range(len(names)), [labels[n] for n in names])
+    ax.invert_yaxis()
+    ax.set_xscale("log")
+    ax.set_xlabel("total score, bits per scored token (log scale, lower is better)")
+    ax.set_title(title, loc="left")
+    ax.legend(frameon=False, loc="lower right", fontsize=17)
+    fig.tight_layout()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out, dpi=110)
+    plt.close(fig)
+    return out
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="command", required=True)
@@ -119,8 +144,15 @@ def main() -> None:
     c.add_argument("--search", type=Path)
     c.add_argument("--oracle", type=Path)
     c.add_argument("--out", type=Path, default=FIGURES / "score_per_behavior.png")
+    m = sub.add_parser("modes")
+    m.add_argument("results", type=Path)
+    m.add_argument("--names", nargs="*", default=[], help="name=label, in display order")
+    m.add_argument("--title", default="Score of each program under each stand-in form")
+    m.add_argument("--out", type=Path, default=FIGURES / "standin_forms.png")
     a = ap.parse_args()
-    if a.command == "terms":
+    if a.command == "modes":
+        print(modes(json.loads(a.results.read_text()), dict(kv.split("=", 1) for kv in a.names), a.out, a.title))
+    elif a.command == "terms":
         results = json.loads(a.results.read_text())
         results = results.get("programs", results)
         labels = dict(kv.split("=", 1) for kv in a.names)
