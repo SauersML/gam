@@ -754,15 +754,21 @@ def rot_Q_batched(A):
             return rot_memo(key, As, lambda: rot_Q_all(As))[at[0]]
     return None
 
+def rot_hi(A_):
+    """The angles in float64 (float32 on MPS, which has none): in float32 the series and squarings drift off
+    orthogonal as the angles grow (the whole model's all-on error with groups of 128 rose from 5e-3 to 1e-2 bits
+    per token between 5M and 10M tokens)."""
+    return A_ if A_.device.type == 'mps' else A_.double()
+
 def rot_Q_all(As):
     """rot_Q of each angle tensor in As, the products batched (each group set squared as often as rot_Q
     squares it alone)."""
-    Ss = [A_ - A_.transpose(1, 2) for A_ in (a_ * MASK for a_ in As)]
+    Ss = [A_ - A_.transpose(1, 2) for A_ in (rot_hi(a_ * MASK) for a_ in As)]
     ks = [max(0, math.ceil(math.log2(max(v, 1e-12) / 0.25))) for v in torch.stack([S_.detach().abs().sum((1, 2)).max() for S_ in Ss]).tolist()]
     order = sorted(range(len(As)), key=lambda i: -ks[i])
     sizes = [As[i].shape[0] for i in order]
     X_ = torch.cat([Ss[i] / 2 ** ks[i] for i in order])
-    E_ = torch.eye(ROTG, device=X_.device).expand_as(X_) + X_; term = X_
+    E_ = torch.eye(ROTG, device=X_.device, dtype=X_.dtype).expand_as(X_) + X_; term = X_
     for j in range(2, 10):
         term = term @ X_ / j; E_ = E_ + term
     for m in range(ks[order[0]] if As else 0):
@@ -770,7 +776,7 @@ def rot_Q_all(As):
         E_ = E_ @ E_ if n_ == E_.shape[0] else torch.cat((E_[:n_] @ E_[:n_], E_[n_:]))
     out = [None] * len(As)
     for part, i in zip(E_.split(sizes), order):
-        out[i] = part
+        out[i] = part.float()
     return out
 
 def rot_Q(R):
@@ -780,16 +786,16 @@ def rot_Q(R):
         Q = rot_Q_batched(R['A'])
         if Q is not None:
             return Q
-    A_ = R['A'] * MASK
+    A_ = rot_hi(R['A'] * MASK)
     S_ = A_ - A_.transpose(1, 2)
     k = max(0, math.ceil(math.log2(max(S_.detach().abs().sum((1, 2)).max().item(), 1e-12) / 0.25)))
     X_ = S_ / 2 ** k
-    E_ = torch.eye(ROTG, device=S_.device).expand_as(S_) + X_; term = X_
+    E_ = torch.eye(ROTG, device=S_.device, dtype=S_.dtype).expand_as(S_) + X_; term = X_
     for j in range(2, 10):
         term = term @ X_ / j; E_ = E_ + term
     for _ in range(k):
         E_ = E_ @ E_
-    return E_
+    return E_.float()
 
 def rot_slice_bits(R, Q):
     """Per slice [ng, g]: its description in bits (dense read and write at its widths, its rotation angles' share)
