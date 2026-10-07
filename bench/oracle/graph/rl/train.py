@@ -12,13 +12,16 @@ program: S = total bits (lower is better). One update follows, by --mode:
            measured of it (terms, error, worst experiment families) to the policy and sample N
            revisions; a revision with lower S becomes the best. The kept program is trained as the
            answer to the original input, so experiments only make training data.
-  dpo      the pair (best, worst) of each behavior whose S differ, log pi(y) = sum_t log pi(y_t):
+  dpo      the pair (best valid, an invalid one or else the worst) of each behavior with a valid program
+           whose programs differ, log pi(y) = sum_t log pi(y_t):
              loss = -(1/P) sum log sigmoid(beta [(log pi(y_w) - log pi_ref(y_w)) - (log pi(y_l) - log pi_ref(y_l))]).
-  grpo     reward r = -S, advantage A_e = (r_e - mean_g r) / std_g r within the behavior's group
-           (0 when the group's scores are equal):
-             loss = -(1/E) sum_e A_e sum_t log pi(y_et) + beta (1/E) sum_e sum_t k3_et,
-           k3 = exp(d) - d - 1 >= 0 with d = log pi_ref(y_t) - log pi(y_t), the per-token estimate of
-           KL(pi || pi_ref), summed over the episode's tokens like the log-probabilities.
+  grpo     reward r = -S, an invalid program counting as the group's worst valid one, advantage
+           A_e = (r_e - mean_g r) / std_g r within the behavior's group (0 when the rewards are equal):
+             loss = -(1/E) sum_e (A_e - beta stop_grad(rho_e)) log pi(y_e),  rho_e = log pi(y_e) - log pi_ref(y_e),
+           whose expected gradient is that of E[-r] / std + beta KL(pi || pi_ref) over whole episodes
+           (the KL gradient is E[rho grad log pi]); the mean of rho estimates the KL.
+Invalid programs are infeasible everywhere: the checker scores one as the empty program, which can beat a
+valid program that loses to the empty one, so no mode prefers it to a valid program.
 
 Sums, not per-episode means: a per-episode mean of token log-probabilities (vpd_describe.py) gives each
 token of a long program less weight than each token of a short one, so its gradient is not the gradient
@@ -361,11 +364,13 @@ def grpo_update(pol: Policy, prompts, completions, advantage, beta: float, micro
         sums += episode.detach().tolist()
         loss = -(adv * episode).sum() / len(prompts)
         if beta > 0:
+            # KL(pi || pi_ref) of whole episodes: its gradient is E[(log pi(y) - log pi_ref(y)) grad log pi(y)], so the
+            # episode's detached log-ratio multiplies its log-probability (a k3 penalty differentiated on the sampled
+            # tokens is not this gradient). The mean log-ratio is the unbiased estimate of the KL itself.
             ref, _ = pol.token_logprobs(ps, cs, ref=True)
-            d = ref - cur
-            k3 = ((torch.expm1(d) - d) * mask).sum(1)  # exp(d) - d - 1 without the rounding of 1 + O(d)
-            loss = loss + beta * k3.sum() / len(prompts)
-            kl += float(k3.detach().sum()) / len(prompts)
+            ratio = ((cur - ref) * mask).sum(1).detach()
+            loss = loss + beta * (ratio * episode).sum() / len(prompts)
+            kl += float(ratio.sum()) / len(prompts)
         loss.backward()
         total += float(loss.detach())
     return {"loss": total, "kl_sum_per_episode": kl, "logprob_sums": sums}
@@ -749,13 +754,18 @@ def main():
         flat_c = [c for g in groups for c in g]
         pol.train_mode(True)
         optimizer.zero_grad(set_to_none=True)
+        # An invalid program is infeasible: the checker scores it as the empty program, which can beat valid programs
+        # that lose to the empty one, so for preferences and advantages it counts as no better than the group's worst
+        # valid program (a group with no valid program gives no signal).
+        S_feasible = np.array([np.where(valid[g], S[g], S[g][valid[g]].max()) if valid[g].any() else S[g] for g in range(len(chosen))])
         if args.mode == "grpo":
-            r = -S
+            r = -S_feasible
             std = r.std(1, keepdims=True)
             adv = np.where(std > 0, (r - r.mean(1, keepdims=True)) / np.where(std > 0, std, 1.0), 0.0).reshape(-1)
             stats = grpo_update(pol, flat_p, flat_c, adv.tolist(), beta, args.samples if args.pack else args.micro)
         elif args.mode == "dpo":
-            pairs = [(g, int(S[g].argmin()), int(S[g].argmax())) for g in range(len(chosen)) if S[g].max() > S[g].min()]
+            pairs = [(g, int(np.where(valid[g], S[g], np.inf).argmin()), int(np.where(valid[g], S[g], np.inf).argmax()) if valid[g].all() else int((~valid[g]).argmax()))
+                     for g in range(len(chosen)) if valid[g].any() and (not valid[g].all() or S[g].max() > S[g].min())]
             stats = dpo_update(pol, [prompts[g] for g, _, _ in pairs], [groups[g][w] for g, w, _ in pairs], [groups[g][l] for g, _, l in pairs], beta, 1 if args.pack else args.micro) if pairs else {}
             stats["pairs"] = len(pairs)
         else:
@@ -784,7 +794,7 @@ def main():
         log.write(json.dumps({"step": step, "mode": args.mode, "behaviors": len(chosen), "programs": len(items), "mean_bits": float(S.mean()), "best_bits": float(S.min(1).mean()),
                               "worst_bits": float(S.max(1).mean()), "valid_fraction": float(valid.mean()), "mean_completion_tokens": float(np.mean(tokens)), **stats,
                               "seconds": {"sample": t1 - t0, "score": t2 - t1, "train": t3 - t2}, "elapsed": time.time() - started,
-                              "example": items[int(S.reshape(-1).argmin())]["source"][:2000]}) + "\n")
+                              "example": items[int(np.where(valid, S, np.inf).reshape(-1).argmin())]["source"][:2000]}) + "\n")
         log.flush()
     pol.save(adapter)
     if args.eval_every:

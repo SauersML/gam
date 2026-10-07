@@ -1,7 +1,7 @@
 """Checks of the training losses on a tiny random Qwen3 (CPU, seconds): python test_train.py
 
 - token_logprobs = log-softmax of a plain forward pass at every completion token;
-- at the start pi = pi_ref: the k3 KL term is 0 and the DPO loss is ln 2;
+- at the start pi = pi_ref: the KL term is 0 and the DPO loss is ln 2;
 - the GRPO loss weights an episode by its summed token log-probability: its gradient equals
   -(1/E) sum_e A_e grad log pi(y_e), whatever the episodes' lengths.
 """
