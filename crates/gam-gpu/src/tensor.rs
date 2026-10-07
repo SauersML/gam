@@ -423,7 +423,10 @@ const WIDE_SEGMENTS: usize = 256 * 32;
 /// `Sqrt` `√x` (a group's norm from its squared sum), `Step` the Heaviside `H(x) = 1{x > 0}`,
 /// `Cdf` `Φ(z)` (an expected gate), `CdfSlope` its derivative in `x`, `φ(z) / s`, and `CdfScaleSlope`
 /// its derivative in `s`, `−φ(z) z / s`, and `Ratio` `x / s`, zero where `s` is (a norm's
-/// cotangent over the norm), and `Variance` `e^{2x}` (a variance from its log standard deviation).
+/// cotangent over the norm), `Variance` `e^{2x}` (a variance from its log standard deviation),
+/// and the ramp gate `Ramp` `clamp(z, 0, 1)`, exactly zero where `x ≤ 0`, with its derivatives
+/// `RampSlope` `1 / s` in `x` and `RampScaleSlope` `−z / s` in `s`, both where `0 < z < 1` and
+/// zero elsewhere.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GateFunction {
     Sqrt,
@@ -433,6 +436,9 @@ pub enum GateFunction {
     CdfScaleSlope,
     Ratio,
     Variance,
+    Ramp,
+    RampSlope,
+    RampScaleSlope,
 }
 
 impl GateFunction {
@@ -446,11 +452,14 @@ impl GateFunction {
             Self::CdfScaleSlope => 4,
             Self::Ratio => 5,
             Self::Variance => 6,
+            Self::Ramp => 7,
+            Self::RampSlope => 8,
+            Self::RampScaleSlope => 9,
         }
     }
 
     fn scaled(self) -> bool {
-        matches!(self, Self::Cdf | Self::CdfSlope | Self::CdfScaleSlope | Self::Ratio)
+        matches!(self, Self::Cdf | Self::CdfSlope | Self::CdfScaleSlope | Self::Ratio | Self::Ramp | Self::RampSlope | Self::RampScaleSlope)
     }
 
     /// The map in float64 (the host's, and the kernels' reference).
@@ -478,6 +487,27 @@ impl GateFunction {
                 }
             }
             Self::Variance => (2.0 * x).exp(),
+            Self::Ramp => {
+                if z > 0.0 {
+                    z.min(1.0)
+                } else {
+                    0.0
+                }
+            }
+            Self::RampSlope => {
+                if z > 0.0 && z < 1.0 {
+                    1.0 / s
+                } else {
+                    0.0
+                }
+            }
+            Self::RampScaleSlope => {
+                if z > 0.0 && z < 1.0 {
+                    -z / s
+                } else {
+                    0.0
+                }
+            }
         }
     }
 }
@@ -1642,26 +1672,6 @@ impl Device {
                     offsets.push(u32::try_from(columns.len()).map_err(|_| shape(format!("{} listed entries", columns.len())))?);
                 }
                 Ok(RowLists { rows: mask.rows, cols, offsets: self.upload_indices(&offsets)?, columns: self.upload_indices(&columns)?, row_of: self.upload_indices(&row_of)? })
-            }
-        }
-    }
-
-    /// How many entries [`Device::row_lists`] would list for `mask` and `starts` (the columns of
-    /// every group whose entry is not zero, over all rows), without listing them: CUDA counts each
-    /// row on the device and reads back one count a row.
-    pub fn listed_entries(&self, mask: &Tensor, starts: &[u32]) -> Result<usize, GpuError> {
-        if starts.len() != mask.cols + 1 || starts.first() != Some(&0) || starts.windows(2).any(|w| w[0] > w[1]) {
-            return Err(shape(format!("{} group starts for {} groups", starts.len(), mask.cols)));
-        }
-        match &*self.backend {
-            #[cfg(target_os = "linux")]
-            Backend::Cuda(engine) => {
-                let starts = self.upload_indices(starts)?;
-                Ok(self.download(&engine.row_counts(mask, &starts)?)?.iter().map(|&n| n as usize).sum())
-            }
-            _ => {
-                let m = self.download(mask)?;
-                Ok(m.rows().into_iter().map(|row| row.iter().enumerate().filter(|(_, v)| **v != 0.0).map(|(g, _)| (starts[g + 1] - starts[g]) as usize).sum::<usize>()).sum())
             }
         }
     }
@@ -4440,6 +4450,9 @@ extern "C" __global__ void gate_function(u64 n, unsigned int code, const double*
             case 3: v = density / sd; break;
             case 4: v = -density * z / sd; break;
             case 6: v = exp(2.0 * t); break;
+            case 7: v = z > 0.0 ? fmin(z, 1.0) : 0.0; break;
+            case 8: v = (z > 0.0 && z < 1.0) ? 1.0 / sd : 0.0; break;
+            case 9: v = (z > 0.0 && z < 1.0) ? -z / sd : 0.0; break;
             default: v = sd == 0.0 ? 0.0 : t / sd; break;
         }
         out[i] = v;
@@ -8486,6 +8499,9 @@ kernel void t_gate_function(device const float* x [[buffer(0)]], device const fl
             case 3: v = density / sd; break;
             case 4: v = -density * z / sd; break;
             case 6: v = exp(2.0f * t); break;
+            case 7: v = z > 0.0f ? fmin(z, 1.0f) : 0.0f; break;
+            case 8: v = (z > 0.0f && z < 1.0f) ? 1.0f / sd : 0.0f; break;
+            case 9: v = (z > 0.0f && z < 1.0f) ? -z / sd : 0.0f; break;
             default: v = sd == 0.0f ? 0.0f : t / sd; break;
         }
         out[i] = v;

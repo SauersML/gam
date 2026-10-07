@@ -589,6 +589,9 @@ extern "C" __global__ void gate_function(u64 n, unsigned int code, const float* 
             case 3: v = density / sd; break;
             case 4: v = -density * z / sd; break;
             case 6: v = expf(2.0f * t); break;
+            case 7: v = z > 0.0f ? fminf(z, 1.0f) : 0.0f; break;
+            case 8: v = (z > 0.0f && z < 1.0f) ? 1.0f / sd : 0.0f; break;
+            case 9: v = (z > 0.0f && z < 1.0f) ? -z / sd : 0.0f; break;
             default: v = sd == 0.0f ? 0.0f : t / sd; break;
         }
         out[i] = v;

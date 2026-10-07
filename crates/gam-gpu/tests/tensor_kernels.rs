@@ -782,7 +782,6 @@ fn row_lists_and_their_products_agree_with_the_host() {
     let transposed = Array2::from_shape_fn((n, m), |(c, j)| (0..rows).filter(|&r| on(r, c)).map(|r| v[[r, c]] * y[[r, j]]).sum::<f64>());
     for device in every_device() {
         let lists = device.row_lists(&up(&device, &mask), &starts).expect("row lists");
-        assert_eq!(device.listed_entries(&up(&device, &mask), &starts).expect("entries"), lists.len(), "{}: entries counted", device.name());
         assert_eq!((lists.dim(), lists.len()), ((rows, n), (0..rows).flat_map(|r| (0..n).map(move |c| (r, c))).filter(|&(r, c)| on(r, c)).count()), "{}", device.name());
         assert_eq!(down(&device, &device.sampled_product(&up(&device, &x), &up(&device, &a), &lists).expect("sampled")), sampled, "{}: sampled product", device.name());
         assert_eq!(down(&device, &device.listed_product(&up(&device, &v), &lists, &up(&device, &b)).expect("listed")), listed, "{}: listed product", device.name());

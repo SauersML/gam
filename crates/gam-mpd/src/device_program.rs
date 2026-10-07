@@ -274,17 +274,16 @@ pub struct DeviceProgram {
     /// zero on the others, which the gate multiplies by zero (a component's reads downstream of
     /// its gate), and its cotangent's pull reads those entries alone.
     gated_reads: Vec<Option<usize>>,
-    /// Per affine node read or written on per-row lists and the arithmetic of its pass, the
-    /// measured seconds of its product per listed entry and of its dense product per row
-    /// ([`DeviceProgram::listed_pays`]).
-    list_costs: Mutex<std::collections::HashMap<(usize, std::mem::Discriminant<Arithmetic>), (f64, f64)>>,
+    /// Per affine node read or written on per-row lists, the pass's arithmetic and the gates'
+    /// mode, whether its products run on the lists: decided once, by the first pass that lists
+    /// entries ([`DeviceProgram::list_choice`]).
+    list_choices: Mutex<std::collections::HashMap<ListKey, bool>>,
     /// Every product that can run on per-row lists runs on them, unmeasured
     /// ([`DeviceProgram::read_listed`]).
     always_listed: bool,
-    /// Per gated node and pass arithmetic, the entries per row its lists held at its last count,
-    /// the passes since that count, and the passes to go before the next
-    /// ([`DeviceProgram::gate_entries`]).
-    list_counts: Mutex<std::collections::HashMap<(usize, std::mem::Discriminant<Arithmetic>), (f64, usize, usize)>>,
+    /// Gated nodes with a scale take the ramp `clamp(gate / scale, 0, 1)` in place of the
+    /// expected gate `Φ(gate / scale)` ([`DeviceProgram::set_ramp`]).
+    ramp: bool,
     /// Per node, an earlier node of the same value: the same node over the same arguments (each
     /// argument taken as the earliest node of its value) and the same operators, a common
     /// subexpression. library_vpd's head rules each recompute their layer's attention-input reads
@@ -307,6 +306,10 @@ type Active = Option<Arc<Indices>>;
 /// only reader (`DeviceProgram::reverse_packed`). A transcoder block's reverse thus never forms a
 /// `rows × k` cotangent.
 type Packed = BTreeMap<usize, (Arc<Indices>, Tensor)>;
+
+/// An affine node, a pass's arithmetic and the gates' mode (ramp or expected): the key of a
+/// choice between per-row lists and the dense product (`DeviceProgram::list_choices`).
+type ListKey = (usize, std::mem::Discriminant<Arithmetic>, bool);
 
 /// A reverse call's gradient sums ([`DeviceProgram::vjp_values_dense_edited`]), each operator's,
 /// and those `fresh`: made by this call and not yet written, their memory unset. A fresh sum's
@@ -464,14 +467,14 @@ pub struct DeviceTrace {
     active: BTreeMap<(usize, usize), Active>,
     /// Per gated node read on per-row lists, its lists ([`DeviceProgram::row_lists`]).
     lists: BTreeMap<usize, Arc<RowLists>>,
-    /// The affine nodes whose forward product ran on per-row lists ([`DeviceProgram::listed_pays`]);
+    /// The affine nodes whose forward product ran on per-row lists ([`DeviceProgram::list_choice`]);
     /// their reverse pulls and gradients run on them too.
     listed_nodes: BTreeSet<usize>,
     /// The nodes that took an earlier node's value (`DeviceProgram::aliases`), and that node.
     aliased: BTreeMap<usize, usize>,
-    /// Per gated node, the entries its per-row lists hold, counted before deciding to list them
-    /// (`DeviceProgram::gate_entries`).
-    entries: BTreeMap<usize, usize>,
+    /// The gates' mode of the pass ([`DeviceProgram::set_ramp`]), which its reverse and tangent
+    /// differentiate.
+    ramp: bool,
     /// Bfloat16 copies of node values a bfloat16 forward pass's and the reverse passes' products read
     /// ([`DeviceTrace::rounded_value`]), kept until [`DeviceTrace::release_rounded`].
     rounded: Mutex<BTreeMap<usize, Arc<Tensor>>>,
@@ -1000,7 +1003,7 @@ impl DeviceProgram {
                 _ => None,
             })
             .collect();
-        Ok(Self { device: device.clone(), steps, widths, head, edited_head_nodes, operators, batch: Mutex::new(None), rotary_tables: Mutex::new(Vec::new()), bf16: false, arithmetic: Arithmetic::F64, fused, grouped, revisions: BTreeMap::new(), rounded: Mutex::new(BTreeMap::new()), exact_zeros, dead, sole, listed, gated_reads, list_costs: Mutex::new(std::collections::HashMap::new()), always_listed: false, list_counts: Mutex::new(std::collections::HashMap::new()), aliases })
+        Ok(Self { device: device.clone(), steps, widths, head, edited_head_nodes, operators, batch: Mutex::new(None), rotary_tables: Mutex::new(Vec::new()), bf16: false, arithmetic: Arithmetic::F64, fused, grouped, revisions: BTreeMap::new(), rounded: Mutex::new(BTreeMap::new()), exact_zeros, dead, sole, listed, gated_reads, list_choices: Mutex::new(std::collections::HashMap::new()), always_listed: false, ramp: false, aliases })
     }
 
     /// Operator `op`'s device copy changed: every group reading it runs node by node until
@@ -1292,9 +1295,25 @@ impl DeviceProgram {
     }
 
     /// Every product that can run on per-row lists runs on them from now on, whatever their
-    /// measured cost (`DeviceProgram::listed_pays`): the lists' arithmetic as the tests check it.
+    /// measured cost (`DeviceProgram::list_choice`): the lists' arithmetic as the tests check it.
     pub fn read_listed(&mut self) {
         self.always_listed = true;
+    }
+
+    /// From now on every gated node with a scale gates by the ramp `c = clamp(gate / scale, 0, 1)`
+    /// (`ramp` true), exactly zero where its gate is not positive, or by the expected gate
+    /// `Φ(gate / scale)` (false, as compiled); a pass's reverse and tangent take the mode of its
+    /// forward. The ramp's derivatives are `1 / scale` in the gate and `−gate / scale²` in the
+    /// scale where `0 < gate < scale`, zero elsewhere. A fit's passes with a gradient set it
+    /// false and its scorings true, as `Scorer::reversed` sets the arithmetic.
+    pub fn set_ramp(&mut self, ramp: bool) {
+        self.ramp = ramp;
+    }
+
+    /// Whether gated nodes with a scale take the ramp ([`DeviceProgram::set_ramp`]).
+    #[must_use]
+    pub fn ramp(&self) -> bool {
+        self.ramp
     }
 
     /// How many entries of gated node `gated`'s value the pass that made `trace` listed, its rows'
@@ -1583,59 +1602,10 @@ impl DeviceProgram {
         Ok(Some(lists))
     }
 
-    /// The entries gated node `gated`'s per-row lists hold in the pass that made `trace`, counted
-    /// without listing them (`Device::listed_entries`), or between counts the last count's entries
-    /// per row times the pass's rows, so a product the lists do not pay for never makes them (a
-    /// product that takes them lists them exactly); `None` when the node is not listed or its gate
-    /// is held in bfloat16.
-    fn gate_entries(&self, trace: &mut DeviceTrace, gated: usize) -> Result<Option<usize>, String> {
-        let Some(starts) = &self.listed[gated] else { return Ok(None) };
-        if let Some(lists) = trace.lists.get(&gated) {
-            return Ok(Some(lists.len()));
-        }
-        if let Some(&entries) = trace.entries.get(&gated) {
-            return Ok(Some(entries));
-        }
-        // A count reads one value a row back, a wait on the device; between counts a pass takes
-        // the last count's entries per row. The passes between counts double while the entries
-        // per row stay within a factor 2 of the last count, and fall back to one when they leave
-        // it (the share of entries on moves with training), so the counts are few while it is
-        // steady and follow it when it moves.
-        let key = (gated, std::mem::discriminant(&self.arithmetic));
-        let rows = trace.rows;
-        {
-            let mut counts = self.list_counts.lock().map_err(|_| "device: poisoned list counts".to_string())?;
-            if let Some((per_row, since, wait)) = counts.get_mut(&key)
-                && *since < *wait
-            {
-                *since += 1;
-                let entries = (*per_row * rows as f64).round() as usize;
-                trace.entries.insert(gated, entries);
-                return Ok(Some(entries));
-            }
-        }
-        let Some(mask) = self.gate_mask(trace, gated)? else { return Ok(None) };
-        let entries = self.device.listed_entries(&mask, starts).map_err(error)?;
-        trace.entries.insert(gated, entries);
-        let per_row = entries as f64 / rows.max(1) as f64;
-        let mut counts = self.list_counts.lock().map_err(|_| "device: poisoned list counts".to_string())?;
-        let wait = match counts.get(&key) {
-            Some(&(last, _, wait)) if per_row <= 2.0 * last && last <= 2.0 * per_row => 2 * wait,
-            _ => 1,
-        };
-        counts.insert(key, (per_row, 0, wait));
-        Ok(Some(entries))
-    }
-
-    /// Whether affine node `node` takes the dense product without listing its gated node's
-    /// entries: its measured costs say the dense product is cheaper at `entries` this pass.
-    fn dense_without_lists(&self, node: usize, entries: usize, rows: usize) -> Result<bool, String> {
-        Ok(!self.always_listed && self.listed_pays(node, self.arithmetic, entries, rows)? == Some(false))
-    }
-
     /// Gated node `gated`'s components on, rows × components: not zero exactly where `H(gate)` is
-    /// 1, or with a scale where `Φ(gate / scale) + φ(gate / scale) / scale` is not zero
-    /// ([`DeviceProgram::row_lists`]). `None` for a gate held in bfloat16.
+    /// 1, or with a scale where `Φ(gate / scale) + φ(gate / scale) / scale` is not zero, or in ramp
+    /// mode where the ramp is, the gate positive ([`DeviceProgram::row_lists`]). `None` for a gate
+    /// held in bfloat16.
     fn gate_mask(&self, trace: &DeviceTrace, gated: usize) -> Result<Option<Tensor>, String> {
         let Step::Gated { gate, scale, .. } = &self.steps[gated] else { return Err(format!("device: node {gated} is not gated")) };
         let d = &self.device;
@@ -1645,6 +1615,7 @@ impl DeviceProgram {
         }
         Ok(Some(match scale {
             None => d.gate_function(GateFunction::Step, z, None).map_err(error)?,
+            Some(s) if trace.ramp => d.gate_function(GateFunction::Ramp, z, Some(trace.value(*s)?)).map_err(error)?,
             Some(s) => {
                 let s = trace.value(*s)?;
                 let mut mask = d.gate_function(GateFunction::Cdf, z, Some(s)).map_err(error)?;
@@ -1705,8 +1676,7 @@ impl DeviceProgram {
         if self.listed_operand(operator, trace.value(argument)?)?.is_none() {
             return Ok(None);
         }
-        let Some(entries) = self.gate_entries(trace, gated)? else { return Ok(None) };
-        if self.dense_without_lists(node, entries, trace.rows)? {
+        if self.list_choice(node)? == Some(false) {
             return Ok(None);
         }
         let Some(lists) = self.row_lists(trace, gated)? else { return Ok(None) };
@@ -1719,33 +1689,39 @@ impl DeviceProgram {
         Ok(out)
     }
 
-    /// Whether affine node `node`'s product on per-row lists of `entries` listed entries costs less
-    /// than its dense product over `rows` rows in `arithmetic`, from the seconds each took when the
-    /// node first ran both in that arithmetic ([`DeviceProgram::listed_or_dense`]); `None` before.
-    /// The lists' products read `A`'s rows per listed entry without reuse across rows, so they are
-    /// bound by memory where the dense product is bound by arithmetic, and which is cheaper depends
-    /// on the device, the arithmetic and the share of entries on: on an A40 at vpd4l's MLP sizes
+    /// Whether affine node `node`'s products run on per-row lists in this pass's arithmetic and
+    /// gate mode: decided once, when the node first ran both its listed and its dense product
+    /// ([`DeviceProgram::listed_or_dense`]), and kept for the run, so no later pass counts or makes
+    /// lists for a product the dense one beats; `None` before (always lists under
+    /// [`DeviceProgram::read_listed`]). The lists' products read `A`'s rows per listed entry
+    /// without reuse across rows, so they are bound by memory where the dense product is bound by
+    /// arithmetic, and which is cheaper depends on the device, the arithmetic and the share of
+    /// entries on: on an A40 at vpd4l's MLP sizes
     /// (768 → 3072, 2048 rank-one columns, 4096 rows; mpd_gated_block_bench_2951) the forward with
     /// 1% of the entries on took 12.3 ms against the dense f32 forward's 13.6 and with 3% 17.8
     /// against 13.8, and only at 0.2% did it match the bfloat16 tensor-core forward (9.6 against
     /// 9.8 ms).
-    fn listed_pays(&self, node: usize, arithmetic: Arithmetic, entries: usize, rows: usize) -> Result<Option<bool>, String> {
-        let costs = self.list_costs.lock().map_err(|_| "device: poisoned list costs".to_string())?;
-        Ok(costs.get(&(node, std::mem::discriminant(&arithmetic))).map(|&(per_entry, per_row)| entries as f64 * per_entry < rows as f64 * per_row))
+    fn list_choice(&self, node: usize) -> Result<Option<bool>, String> {
+        if self.always_listed {
+            return Ok(Some(true));
+        }
+        let choices = self.list_choices.lock().map_err(|_| "device: poisoned list choices".to_string())?;
+        Ok(choices.get(&self.list_key(node)).copied())
+    }
+
+    fn list_key(&self, node: usize) -> ListKey {
+        (node, std::mem::discriminant(&self.arithmetic), self.ramp)
     }
 
     /// Affine node `node`'s first term `(argument, operator)` from `listed` (its product on per-row
-    /// lists of `entries` entries) when that costs less than the dense product
-    /// ([`DeviceProgram::listed_pays`]), else `None` for the dense product. The first time the node
-    /// runs in the pass's arithmetic with entries listed, both run twice, each timed to a device
-    /// synchronization the second time (the first takes the kernels' one-time setup), and their
-    /// costs are kept: seconds per listed entry and per row.
+    /// lists of `entries` entries) when the node's products run on lists
+    /// ([`DeviceProgram::list_choice`]), else `None` for the dense product. The first pass that
+    /// lists entries for the node in its arithmetic and gate mode runs both products twice, each
+    /// timed to a device synchronization the second time (the first takes the kernels' one-time
+    /// setup), and the faster decides for the run.
     fn listed_or_dense(&self, trace: &DeviceTrace, (node, argument, operator): (usize, usize, usize), entries: usize, listed: impl Fn() -> Result<Tensor, String>) -> Result<Option<Tensor>, String> {
         let rows = trace.rows;
-        if self.always_listed {
-            return listed().map(Some);
-        }
-        match self.listed_pays(node, self.arithmetic, entries, rows)? {
+        match self.list_choice(node)? {
             Some(true) => return listed().map(Some),
             Some(false) => return Ok(None),
             None if entries == 0 || rows == 0 => return listed().map(Some),
@@ -1766,11 +1742,9 @@ impl DeviceProgram {
         };
         let (out, listed_seconds) = timed(&listed)?;
         let (_, dense_seconds) = timed(&dense)?;
-        self.list_costs
-            .lock()
-            .map_err(|_| "device: poisoned list costs".to_string())?
-            .insert((node, std::mem::discriminant(&self.arithmetic)), (listed_seconds / entries as f64, dense_seconds / rows as f64));
-        Ok((listed_seconds < dense_seconds).then_some(out))
+        let lists = listed_seconds < dense_seconds;
+        self.list_choices.lock().map_err(|_| "device: poisoned list choices".to_string())?.insert(self.list_key(node), lists);
+        Ok(lists.then_some(out))
     }
 
     /// The product of affine node `node`'s term `(argument, operator)` when `argument` is a gated
@@ -1781,8 +1755,7 @@ impl DeviceProgram {
         if self.listed[argument].is_none() || self.listed_operand(operator, trace.value(argument)?)?.is_none() {
             return Ok(None);
         }
-        let Some(entries) = self.gate_entries(trace, argument)? else { return Ok(None) };
-        if self.dense_without_lists(node, entries, trace.rows)? {
+        if self.list_choice(node)? == Some(false) {
             return Ok(None);
         }
         let Some(lists) = self.row_lists(trace, argument)? else { return Ok(None) };
@@ -1828,14 +1801,22 @@ impl DeviceProgram {
         if arithmetic == Arithmetic::Bf16 && gathered.storage() == Storage::F32 { d.bf16_copy(&gathered).map_err(error) } else { Ok(gathered) }
     }
 
-    /// A gated node's weights per row and group: `H(gate)`, or `Φ(gate / scale)` with a scale.
+    /// A gated node's weights per row and group: `H(gate)`, or with a scale `Φ(gate / scale)`, or
+    /// in ramp mode `clamp(gate / scale, 0, 1)` ([`DeviceProgram::set_ramp`]).
     fn gate_weights(&self, trace: &DeviceTrace, gate: usize, scale: Option<usize>) -> Result<Tensor, String> {
         let d = &self.device;
         match scale {
-            Some(s) => d.gate_function(GateFunction::Cdf, trace.value(gate)?, Some(trace.value(s)?)),
+            Some(s) => d.gate_function(if trace.ramp { GateFunction::Ramp } else { GateFunction::Cdf }, trace.value(gate)?, Some(trace.value(s)?)),
             None => d.gate_function(GateFunction::Step, trace.value(gate)?, None),
         }
         .map_err(error)
+    }
+
+    /// A scaled gate's derivatives in its gate and in its scale, in the pass's mode: `φ(z) / s` and
+    /// `−φ(z) z / s` for the expected gate, `1 / s` and `−z / s` inside the ramp (`z = gate /
+    /// scale`).
+    fn gate_slopes(trace: &DeviceTrace) -> [GateFunction; 2] {
+        if trace.ramp { [GateFunction::RampSlope, GateFunction::RampScaleSlope] } else { [GateFunction::CdfSlope, GateFunction::CdfScaleSlope] }
     }
 
     /// The affine term `(argument, operator)` as a new `rows × width` tensor, the values zeros plus
@@ -2103,7 +2084,7 @@ impl DeviceProgram {
             lists: BTreeMap::new(),
             listed_nodes: BTreeSet::new(),
             aliased: BTreeMap::new(),
-            entries: BTreeMap::new(),
+            ramp: self.ramp,
             rounded: Mutex::new(BTreeMap::new()),
         };
         // The nodes an edit replaced: a later node of the same value computes its own.
@@ -2895,7 +2876,8 @@ impl DeviceProgram {
                     if let Some(s) = scale {
                         let (z, sd) = (trace.value(*gate)?, trace.value(*s)?);
                         let along = d.block_products(&cot, trace.value(*v)?, blocks).map_err(error)?;
-                        for (node, slope) in [(*gate, GateFunction::CdfSlope), (*s, GateFunction::CdfScaleSlope)] {
+                        let [gate_slope, scale_slope] = Self::gate_slopes(trace);
+                        for (node, slope) in [(*gate, gate_slope), (*s, scale_slope)] {
                             if needed[node] {
                                 let mut term = d.empty(trace.rows, along.cols()).map_err(error)?;
                                 d.hadamard(&mut term, &along, &d.gate_function(slope, z, Some(sd)).map_err(error)?, false).map_err(error)?;
@@ -3662,7 +3644,8 @@ impl DeviceProgram {
                         if let Some(s) = scale {
                             let (z, sd) = (trace.value(*gate)?, trace.value(*s)?);
                             let mut moved = d.zeros(rows, sd.cols()).map_err(error)?;
-                            for (t, slope) in [(dz, GateFunction::CdfSlope), (ds, GateFunction::CdfScaleSlope)] {
+                            let [gate_slope, scale_slope] = Self::gate_slopes(trace);
+                            for (t, slope) in [(dz, gate_slope), (ds, scale_slope)] {
                                 if let Some(t) = t {
                                     d.hadamard(&mut moved, t, &d.gate_function(slope, z, Some(sd)).map_err(error)?, true).map_err(error)?;
                                 }
@@ -4530,6 +4513,77 @@ mod gated_tests {
             close("the input's cotangent", &device.download(&nodes[&0]).unwrap(), cot[0].as_ref().unwrap());
             for (op, want) in &want {
                 close(&program.operators[*op].name, &device.download(&gradients[op]).unwrap(), want);
+            }
+        }
+    }
+
+    /// In ramp mode (`DeviceProgram::set_ramp`) a soft-gated layer gates by `clamp(z / s, 0, 1)`,
+    /// own and direction gates alike, on every device: the output is the definition by hand from
+    /// the host's reads and gates, the lists hold exactly the entries whose gate is positive, the
+    /// dense read gives the same output, the scale's cotangent is the ramp's `−z / s²` inside it by
+    /// hand, and the reverse is the tangent's transpose along every trainable operator
+    /// (`⟨J t, seed⟩ = Σ_op ⟨t_op, ∂/∂op⟩`), the ramp's slope in the gate included.
+    #[test]
+    fn a_ramp_gate_is_its_definition_on_every_device() {
+        let mut devices = crate::device_program_tests::devices();
+        devices.extend(Device::single_precision(gam_gpu::GpuPolicy::Auto).unwrap());
+        for direction in [false, true] {
+            let (program, family) = layer(direction, true, 7);
+            let host = program.execute(&family, false).unwrap();
+            let interfaces = program.interfaces().unwrap();
+            let gated = program.nodes.iter().position(|n| matches!(n, Node::Gated { .. })).unwrap();
+            let Node::Gated { gate: z, scale: Some(sn), .. } = program.nodes[gated] else { unreachable!() };
+            let u = program.operators[1].matrix_cow().into_owned();
+            let (rows, b, r) = (family.rows, WIDTHS.len(), WIDTHS.iter().sum::<usize>());
+            let ratio = |row: usize, g: usize| host.values[z][[row, g]] / host.values[sn][[row, g]];
+            let (a, mut value) = (&host.values[1], host.values[1].clone());
+            let mut on = 0;
+            for row in 0..rows {
+                for g in 0..b {
+                    let w = ratio(row, g).clamp(0.0, 1.0);
+                    on += if w > 0.0 { interfaces[1].range(g).len() } else { 0 };
+                    interfaces[1].range(g).for_each(|c| value[[row, c]] *= w);
+                }
+            }
+            let expected = value.dot(&u.t());
+            assert!(on > 0 && on < rows * r, "direction {direction}: some entries on and some off: {on}");
+            let seed = Array2::from_shape_fn((rows, OUT), |(i, j)| ((i * 7 + j * 3) % 11) as f64 / 11.0 - 0.5);
+            // The scale's cotangent: Σ over its group of (seed U) ⊙ a, times −z / s² inside the ramp.
+            let pulled = seed.dot(&u);
+            let scale_cot = Array2::from_shape_fn((rows, b), |(row, g)| {
+                let t = ratio(row, g);
+                let slope = if t > 0.0 && t < 1.0 { -t / host.values[sn][[row, g]] } else { 0.0 };
+                interfaces[1].range(g).map(|c| pulled[[row, c]] * a[[row, c]]).sum::<f64>() * slope
+            });
+            let trainable: Vec<usize> = (0..program.operators.len()).filter(|&op| program.operators[op].name != "I").collect();
+            let tangents: BTreeMap<usize, Array2<f64>> = trainable
+                .iter()
+                .map(|&op| (op, Array2::from_shape_fn(program.operators[op].matrix_cow().dim(), |(i, j)| ((i * 3 + j * 5 + op) % 7) as f64 / 7.0 - 0.4)))
+                .collect();
+            for device in &devices {
+                let (tolerance, arithmetic) = if device.float64() { (1e-12, Arithmetic::F64) } else { (1e-4, Arithmetic::F32) };
+                let close = |what: &str, got: &Array2<f64>, want: &Array2<f64>| {
+                    let scale = want.iter().fold(1.0_f64, |m, v| m.max(v.abs()));
+                    let err = (got - want).iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+                    assert!(err <= tolerance * scale, "{} direction {direction}: {what} differs by {err}", device.name());
+                };
+                let mut lowered = DeviceProgram::compile_values(device, &program).unwrap();
+                lowered.set_arithmetic(arithmetic);
+                lowered.set_ramp(true);
+                lowered.read_listed();
+                let trace = lowered.forward(&family).unwrap();
+                close("the output", &device.download(trace.value(program.output).unwrap()).unwrap(), &expected);
+                assert_eq!(lowered.entries_listed(&trace, gated), Some(on), "{} direction {direction}: the lists hold the entries whose gate is positive", device.name());
+                let seeds = BTreeMap::from([(program.output, device.upload(seed.view()).unwrap())]);
+                let (nodes, gradients) = lowered.vjp_values_dense(&trace, seeds, &[0, sn], &trainable, arithmetic).unwrap();
+                close("the scale's cotangent", &device.download(&nodes[&sn]).unwrap(), &scale_cot);
+                let tangent = device.download(&lowered.jvp_span(&trace, None, program.output, &tangents, arithmetic, |_, _, _| Ok(())).unwrap().unwrap()).unwrap();
+                let along = (&tangent * &seed).sum();
+                let back: f64 = trainable.iter().map(|op| (&device.download(&gradients[op]).unwrap() * &tangents[op]).sum()).sum();
+                assert!((along - back).abs() <= tolerance * 10.0 * along.abs().max(back.abs()).max(1.0), "{} direction {direction}: the tangent {along} against the reverse {back}", device.name());
+                lowered.read_densely();
+                let dense = lowered.forward(&family).unwrap();
+                close("the dense read's output", &device.download(dense.value(program.output).unwrap()).unwrap(), &expected);
             }
         }
     }
