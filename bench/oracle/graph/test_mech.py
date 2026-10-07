@@ -116,6 +116,18 @@ def test_forgiving_forms():
     assert "or `import mech`" in invalid("import os, mech\n")
 
 
+def test_tracer_after_fork():
+    import os
+
+    assert mech.trace("from mech import L\n", "vpd4l")["valid"]
+    pid = os.fork()
+    if pid == 0:  # the child must not share the parent's tracer server
+        ok = mech.trace("from mech import node, L\na = node(L[1].head[0])\n", "vpd4l")["valid"]
+        os._exit(0 if ok else 1)
+    assert mech.trace("from mech import node, L\nb = node(L[2].head[1])\n", "vpd4l")["nodes"][0]["id"] == "b"
+    assert os.waitpid(pid, 0)[1] == 0
+
+
 def test_qwen_views():
     ir = mech.trace_inline(HEAD + "f = node(PD.tc[14][163839, 7])\nh = node(L[20].head[15])\n"
                            "edges(f >> h.value, h >> logits)\n", "qwen3-0.6b")

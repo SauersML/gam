@@ -804,7 +804,8 @@ def trace(source: str, model: str, timeout: float = 10.0) -> dict:
     memory-ledger reservation), so a trace costs a fork, a few milliseconds."""
     for attempt in range(2):
         server = getattr(_SERVERS, "proc", None)
-        if server is None or server.poll() is not None:
+        if server is None or server.poll() is not None or _SERVERS.pid != os.getpid():  # a forked caller starts its own
+            _SERVERS.pid = os.getpid()
             server = _SERVERS.proc = subprocess.Popen(
                 [sys.executable, "-I", "-S", str(Path(__file__).resolve()), "serve"],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1,
