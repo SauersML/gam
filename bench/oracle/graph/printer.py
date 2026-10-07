@@ -63,6 +63,11 @@ class Vpd4l:
             self.uv = VL.load_uv(self.dev, Path.home() / "mpd-data/oracle/vpd/uv.safetensors")
         return self.uv[site]  # U [C, d_out], V [d_in, C]
 
+    def rest_t(self, site: str):
+        """The site's remainder, transposed as the forward applies it: W^T - V U (out = h @ W^T)."""
+        U, V = self.factors(site)
+        return self.t.site(site).W.T - V @ U
+
     def forward(self, ids, rows, cols, remove: list[dict] = (), record: bool = False):
         """Log-probabilities at (rows, cols) with `remove` pieces removed; with `record`, also the
         activations a write needs ({("attn", l): y, ("mlp", l): hidden, "final": residual})."""
@@ -77,6 +82,9 @@ class Vpd4l:
                 out = t.site(name)(h)
                 for p in remove:
                     if p["view"] == "vpd" and p["layer"] == i and p["kind"] == kind:
+                        if p["index"] == "rest":
+                            out = out - h @ self.rest_t(name)
+                            continue
                         U, V = self.factors(name)
                         idx = torch.tensor(p["index"], device=self.dev)
                         out = out - (h @ V[:, idx]) @ U[idx]
@@ -123,7 +131,10 @@ class Vpd4l:
             return hid @ t.site(f"h.{l}.mlp.down_proj").W[:, piece["index"]].T
         if piece["view"] == "vpd" and piece["kind"] in ("o_proj", "down_proj"):
             src = seen[("attn", l)] if piece["kind"] == "o_proj" else seen[("mlp", l)]
-            U, V = self.factors(f"h.{l}.{'attn' if piece['kind'] == 'o_proj' else 'mlp'}.{piece['kind']}")
+            name = f"h.{l}.{'attn' if piece['kind'] == 'o_proj' else 'mlp'}.{piece['kind']}"
+            if piece["index"] == "rest":
+                return src[rows, cols] @ self.rest_t(name)
+            U, V = self.factors(name)
             idx = torch.tensor(piece["index"], device=self.dev)
             return (src[rows, cols] @ V[:, idx]) @ U[idx]
         return None
@@ -254,6 +265,8 @@ class Qwen3:
 def expanded(piece: dict) -> dict:
     """The piece with its index as a list (null = every unit of the site)."""
     p = dict(piece)
+    if p["index"] == "rest":
+        return p
     if p["index"] is None:
         shape = SHAPE[0]
         size = {"head": shape["heads"], "mlp": shape["d_mlp"]}.get(p["kind"])
@@ -340,6 +353,8 @@ def facts(engine, ir: dict, behavior: dict, chunk: int = 64) -> dict[str, dict]:
 
 def address(p: dict) -> str:
     idx = p["index"]
+    if idx == "rest":
+        return f"PD.vpd[{p['layer']}].{p['kind']}.rest"
     if p["view"] == "native":
         site = f"L[{p['layer']}].{p['kind']}"
     elif p["view"] == "vpd":

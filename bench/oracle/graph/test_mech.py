@@ -159,6 +159,14 @@ def test_program_from_patch(tmp_path):
                                "rule": None}
 
 
+def test_vpd_rest():
+    ir = mech.trace_inline(HEAD + "a = node(PD.vpd[2].q_proj[3], PD.vpd[2].q_proj.rest, PD.vpd[2].k_proj.rest)\n", "vpd4l")
+    assert ir["valid"], ir["error"]
+    assert {"view": "vpd", "layer": 2, "kind": "q_proj", "index": "rest"} in ir["nodes"][0]["pieces"]
+    assert "only a VPD site" in invalid(HEAD + "node(L[1].mlp.rest)")
+    assert "nodes a and b" in invalid(HEAD + "a = node(PD.vpd[2].q_proj.rest)\nb = node(PD.vpd[2].q_proj.rest)")
+
+
 def test_qwen_views():
     ir = mech.trace_inline(HEAD + "f = node(PD.tc[14][163839, 7])\nh = node(L[20].head[15])\n"
                            "edges(f >> h.value, h >> logits)\n", "qwen3-0.6b")

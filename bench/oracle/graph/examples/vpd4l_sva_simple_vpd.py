@@ -14,10 +14,13 @@ down_proj), leaving 0.64 bits when patched together; layer 3 attn: 128 subcompon
 v_proj, 70 o_proj), leaving 0.88 bits when patched together; layer 3 mlp: 64 subcomponents (37 c_fc,
 27 down_proj), leaving 1.14 bits when patched together. The program lets every write among them
 reach every later read.
+Each attention node also declares its layer's q_proj and k_proj remainders (W - the sum of the
+subcomponents, 8-12% of those matrices' norm), so its attention pattern uses all of its weights.
 """
 from mech import node, edges, PD, embed, logits
 
 attn0 = node(
+    PD.vpd[0].q_proj.rest, PD.vpd[0].k_proj.rest,
     PD.vpd[0].q_proj[27, 28, 38, 42, 74, 98, 148, 156, 195, 230, 237, 268, 276, 277, 302, 317, 413,
     491, 502], PD.vpd[0].k_proj[59, 126, 214, 309, 357, 453, 463], PD.vpd[0].v_proj[64, 82, 200,
     253, 298, 308, 544, 815, 898, 917, 921, 926, 982], PD.vpd[0].o_proj[26, 73, 201, 268, 275, 329,
@@ -29,6 +32,7 @@ mlp0 = node(
     2367, 3171, 3455, 3491, 3494]
 )
 attn1 = node(
+    PD.vpd[1].q_proj.rest, PD.vpd[1].k_proj.rest,
     PD.vpd[1].q_proj[83, 131, 284, 470], PD.vpd[1].k_proj[104, 112, 423, 480], PD.vpd[1].v_proj[72,
     188, 228, 315, 550, 724, 806, 871, 984], PD.vpd[1].o_proj[113, 189, 191, 262, 273, 319, 386,
     411, 454, 498, 569, 573, 756, 781, 997]
@@ -39,6 +43,7 @@ mlp1 = node(
     3034, 3220, 3465, 3478]
 )
 attn2 = node(
+    PD.vpd[2].q_proj.rest, PD.vpd[2].k_proj.rest,
     PD.vpd[2].q_proj[50, 65, 132, 146, 195, 202, 270, 279, 300, 337], PD.vpd[2].k_proj[1, 327],
     PD.vpd[2].v_proj[17, 22, 23, 57, 102, 128, 169, 172, 174, 180, 222, 259, 260, 264, 276, 283,
     294, 318, 326, 341, 345, 346, 352, 376, 377, 397, 404, 417, 436, 453, 473, 491, 572, 581, 631,
@@ -54,6 +59,7 @@ mlp2 = node(
     3240, 3279, 3439, 3493, 3503]
 )
 attn3 = node(
+    PD.vpd[3].q_proj.rest, PD.vpd[3].k_proj.rest,
     PD.vpd[3].q_proj[60, 219, 277, 502], PD.vpd[3].v_proj[44, 61, 90, 135, 214, 228, 274, 286, 299,
     302, 339, 388, 392, 401, 403, 405, 446, 471, 486, 500, 513, 526, 547, 550, 562, 566, 595, 605,
     609, 610, 676, 677, 732, 733, 744, 752, 783, 818, 821, 823, 853, 856, 863, 877, 879, 911, 925,

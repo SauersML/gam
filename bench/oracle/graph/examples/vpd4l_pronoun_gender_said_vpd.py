@@ -13,11 +13,14 @@ when patched together; layer 2 attn: 64 subcomponents (1 q_proj, 2 k_proj, 39 v_
 leaving 0.75 bits when patched together; layer 2 mlp: 16 subcomponents (9 c_fc, 7 down_proj),
 leaving 0.86 bits when patched together; layer 3 attn: 8 subcomponents (3 v_proj, 5 o_proj), leaving
 0.14 bits when patched together; layer 3 mlp: 16 subcomponents (8 c_fc, 8 down_proj), leaving 0.81
-bits when patched together. The program lets every write among them reach every later read.
+bits when patched together. Each attention node also declares its layer's q_proj and k_proj remainders (W - sum of the
+subcomponents, 8-12% of those matrices), so its attention pattern is computed from its own weights.
+The program lets every write among them reach every later read.
 """
 from mech import node, edges, PD, embed, logits
 
 attn0 = node(
+    PD.vpd[0].q_proj.rest, PD.vpd[0].k_proj.rest,
     PD.vpd[0].q_proj[8, 16, 37, 57, 83, 94, 120, 179, 196, 256, 263, 266, 292, 330, 347, 357, 358,
     374, 457, 470, 472, 489, 503], PD.vpd[0].k_proj[15, 16, 24, 54, 81, 99, 127, 132, 138, 184, 196,
     207, 301, 309, 316, 326, 371, 399, 418, 461, 488, 494, 506], PD.vpd[0].v_proj[82, 99, 160, 204,
@@ -32,6 +35,7 @@ mlp0 = node(
     2696, 2860, 3196, 3455, 3473, 3494]
 )
 attn1 = node(
+    PD.vpd[1].q_proj.rest, PD.vpd[1].k_proj.rest,
     PD.vpd[1].q_proj[243, 268, 356, 497], PD.vpd[1].k_proj[147, 215, 495], PD.vpd[1].v_proj[11, 43,
     56, 72, 102, 115, 127, 136, 179, 296, 389, 471, 543, 568, 592, 648, 674, 725, 745, 840, 859,
     908, 984, 1000], PD.vpd[1].o_proj[37, 79, 163, 187, 219, 220, 255, 260, 292, 300, 311, 323, 336,
@@ -42,6 +46,7 @@ mlp1 = node(
     PD.vpd[1].c_fc[2828]
 )
 attn2 = node(
+    PD.vpd[2].q_proj.rest, PD.vpd[2].k_proj.rest,
     PD.vpd[2].q_proj[279], PD.vpd[2].k_proj[1, 224], PD.vpd[2].v_proj[11, 34, 49, 130, 151, 172,
     218, 288, 311, 345, 346, 363, 391, 420, 446, 473, 475, 499, 507, 526, 531, 537, 632, 660, 730,
     750, 762, 769, 781, 844, 854, 866, 882, 893, 941, 991, 999, 1012, 1017], PD.vpd[2].o_proj[4, 19,

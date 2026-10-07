@@ -15,10 +15,13 @@ v_proj, 62 o_proj), leaving 0.48 bits when patched together; layer 2 mlp: 64 sub
 22 k_proj, 84 v_proj, 119 o_proj), leaving 1.94 bits when patched together; layer 3 mlp: 128
 subcomponents (79 c_fc, 49 down_proj), leaving 1.31 bits when patched together. The program lets
 every write among them reach every later read.
+Each attention node also declares its layer's q_proj and k_proj remainders (W - the sum of the
+subcomponents, 8-12% of those matrices' norm), so its attention pattern uses all of its weights.
 """
 from mech import node, edges, PD, embed, logits
 
 attn0 = node(
+    PD.vpd[0].q_proj.rest, PD.vpd[0].k_proj.rest,
     PD.vpd[0].q_proj[3, 7, 11, 25, 28, 33, 41, 55, 77, 87, 103, 105, 112, 115, 132, 136, 149, 157,
     159, 160, 162, 167, 169, 173, 175, 181, 183, 189, 190, 192, 195, 201, 208, 212, 215, 240, 247,
     254, 259, 261, 263, 304, 320, 329, 339, 363, 365, 368, 374, 381, 400, 404, 414, 438, 440, 449,
@@ -39,6 +42,7 @@ mlp0 = node(
     2687, 2696, 2712, 2743, 2812, 2852, 2967, 3006, 3079, 3082, 3086, 3126, 3200, 3257, 3275, 3368]
 )
 attn1 = node(
+    PD.vpd[1].q_proj.rest, PD.vpd[1].k_proj.rest,
     PD.vpd[1].q_proj[53, 56, 97, 130, 164, 199, 203, 215, 224, 226, 235, 267, 331, 381, 430, 435,
     479, 483], PD.vpd[1].k_proj[159, 339, 350], PD.vpd[1].v_proj[147, 171, 219, 228, 259, 346, 529,
     629, 725, 791, 796, 806, 876, 946], PD.vpd[1].o_proj[113, 173, 174, 202, 229, 254, 255, 272,
@@ -51,6 +55,7 @@ mlp1 = node(
     1149, 1679, 2267, 3001, 3572]
 )
 attn2 = node(
+    PD.vpd[2].q_proj.rest, PD.vpd[2].k_proj.rest,
     PD.vpd[2].k_proj[327], PD.vpd[2].v_proj[47, 77, 91, 107, 116, 143, 146, 150, 153, 160, 164, 172,
     180, 259, 264, 281, 288, 302, 311, 353, 362, 369, 377, 416, 426, 446, 453, 485, 503, 507, 518,
     533, 539, 542, 549, 554, 573, 597, 648, 656, 672, 692, 726, 731, 733, 762, 770, 781, 782, 788,
@@ -68,6 +73,7 @@ mlp2 = node(
     3374, 3376, 3511]
 )
 attn3 = node(
+    PD.vpd[3].q_proj.rest, PD.vpd[3].k_proj.rest,
     PD.vpd[3].q_proj[22, 53, 60, 63, 71, 78, 88, 129, 139, 140, 152, 182, 188, 189, 230, 244, 282,
     298, 319, 334, 338, 356, 363, 367, 369, 381, 390, 405, 426, 444, 485], PD.vpd[3].k_proj[0, 11,
     16, 20, 30, 54, 72, 115, 138, 145, 156, 172, 250, 254, 317, 322, 333, 364, 386, 492, 505, 507],

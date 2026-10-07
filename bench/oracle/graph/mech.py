@@ -17,7 +17,8 @@ Addresses (layer l, indices i, j, ... from 0):
   L[l].head[h, ...]          native attention heads (Qwen3: query heads; a head's k/v rows are those of
                              its key-value group, shared with the other heads of the group)
   L[l].mlp[i, ...]           native MLP neurons (L[l].attn: all heads of layer l)
-  PD.vpd[l].<site>[i, ...]   VPD subcomponents U_i V_i^T, site in q_proj k_proj v_proj o_proj c_fc down_proj
+  PD.vpd[l].<site>[i, ...]   VPD subcomponents U_i V_i^T, site in q_proj k_proj v_proj o_proj c_fc down_proj;
+                             PD.vpd[l].<site>.rest is the site's remainder W - sum of its subcomponents
   PD.lib[l].attn[i, ...]     our library's parts of layer l's attention (.mlp[i]: of its MLP); parts may
                              overlap, so a part may sit in several nodes (vpd4l: decomp's start, arm
                              LIBRARY_ARM; part i = the i-th component of that block in the file)
@@ -177,10 +178,13 @@ def _indices(key, size: int | None, what: str) -> tuple[int, ...]:
 class Piece:
     """Pieces of one of M's sites: (view, layer, kind, indices)."""
 
-    def __init__(self, view: str, layer: int, kind: str, index: tuple[int, ...], size: int | None = None):
-        self.view, self.layer, self.kind, self.index, self.size = view, layer, kind, index, size
+    def __init__(self, view: str, layer: int, kind: str, index: tuple[int, ...], size: int | None = None,
+                 rest: bool = False):
+        self.view, self.layer, self.kind, self.index, self.size, self.rest = view, layer, kind, index, size, rest
 
     def name(self) -> str:
+        if self.rest:
+            return f"PD.vpd[{self.layer}].{self.kind}.rest"
         i = ", ".join(map(str, self.index[:4])) + (", ..." if len(self.index) > 4 else "")
         if self.view == "native":
             return f"L[{self.layer}].{self.kind}[{i}]"
@@ -221,7 +225,10 @@ class Piece:
         raise MechError(f"{self.name()} is a piece; make it a node, node({self.name()}), before connecting it")
 
     def ir(self) -> dict:
-        """index: one int, a sorted list, or null for every unit of the site."""
+        """index: one int, a sorted list, null for every unit of the site, or "rest" for a VPD site's
+        remainder W - sum of its subcomponents."""
+        if self.rest:
+            return {"view": self.view, "layer": self.layer, "kind": self.kind, "index": "rest"}
         whole = self.size is not None and len(self.index) == self.size
         return {"view": self.view, "layer": self.layer, "kind": self.kind,
                 "index": None if whole else self.index[0] if len(self.index) == 1 else list(self.index)}
@@ -234,6 +241,14 @@ class _Site:
     def __getitem__(self, key) -> Piece:
         what = Piece(self.view, self.layer, self.kind, (0,)).name().rsplit("[", 1)[0]
         return Piece(self.view, self.layer, self.kind, _indices(key, self.size, what), self.size)
+
+    @property
+    def rest(self) -> Piece:
+        """A VPD site's remainder W - sum of its subcomponents, e.g. PD.vpd[2].q_proj.rest."""
+        if self.view != "vpd":
+            raise MechError(f"{Piece(self.view, self.layer, self.kind, (0,)).name().rsplit('[', 1)[0]}.rest: "
+                            "only a VPD site has a remainder")
+        return Piece(self.view, self.layer, self.kind, (), self.size, rest=True)
 
     def whole(self) -> Piece:
         """Every unit of the site, e.g. node(L[3].mlp)."""
@@ -496,8 +511,8 @@ def node(*pieces, rule=None) -> Node:
         raise MechError("an attention rule applies to a node of native heads (L[l].head[...])")
     merged: dict[tuple, set] = {}
     for p in pieces:
-        merged.setdefault((p.view, p.layer, p.kind, p.size), set()).update(p.index)
-    made = Node(tuple(Piece(v, l, k, tuple(sorted(i)), n) for (v, l, k, n), i in merged.items()))
+        merged.setdefault((p.view, p.layer, p.kind, p.size, p.rest), set()).update(p.index)
+    made = Node(tuple(Piece(v, l, k, tuple(sorted(i)), n, r) for (v, l, k, n, r), i in merged.items()))
     made.rule = rule
     return made
 
@@ -674,7 +689,7 @@ def _validate(program: _Program, namespace: dict, ir: dict) -> None:
                                 f"use one view per layer's attention and MLP")
             if p.view == "library":
                 continue  # library parts may overlap; the checker takes the union per node
-            for i in p.index:
+            for i in (("rest",) if p.rest else p.index):
                 o = owner.setdefault((p.view, p.layer, p.kind, i), n.id)
                 if o != n.id:
                     raise MechError(f"{Piece(p.view, p.layer, p.kind, (i,)).name()} is in nodes {o} and {n.id}; "

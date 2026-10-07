@@ -14,11 +14,14 @@ k_proj, 49 v_proj, 57 o_proj), leaving 1.47 bits when patched together; layer 2 
 subcomponents (27 c_fc, 37 down_proj), leaving 3.80 bits when patched together; layer 3 attn: 256
 subcomponents (19 q_proj, 18 k_proj, 84 v_proj, 135 o_proj), leaving 3.41 bits when patched
 together; layer 3 mlp: 128 subcomponents (62 c_fc, 66 down_proj), leaving 1.72 bits when patched
-together. The program lets every write among them reach every later read.
+together. Each attention node also declares its layer's q_proj and k_proj remainders (W - sum of the
+subcomponents, 8-12% of those matrices), so its attention pattern is computed from its own weights.
+The program lets every write among them reach every later read.
 """
 from mech import node, edges, PD, embed, logits
 
 attn0 = node(
+    PD.vpd[0].q_proj.rest, PD.vpd[0].k_proj.rest,
     PD.vpd[0].q_proj[0, 11, 14, 15, 18, 22, 32, 47, 51, 55, 63, 66, 68, 74, 76, 84, 92, 101, 102,
     105, 107, 111, 112, 130, 136, 139, 141, 146, 148, 149, 153, 156, 159, 160, 161, 168, 170, 180,
     194, 201, 202, 203, 206, 207, 211, 212, 214, 221, 225, 227, 244, 245, 262, 274, 284, 288, 298,
@@ -46,6 +49,7 @@ mlp0 = node(
     3012, 3066, 3086, 3100, 3196, 3200, 3209, 3257, 3260, 3289, 3335, 3413, 3445, 3523, 3543]
 )
 attn1 = node(
+    PD.vpd[1].q_proj.rest, PD.vpd[1].k_proj.rest,
     PD.vpd[1].q_proj[22, 25, 53, 56, 201, 233, 240, 292, 373, 405, 504, 506], PD.vpd[1].k_proj[28,
     104, 119, 277, 315, 339, 433, 452], PD.vpd[1].v_proj[11, 22, 38, 72, 73, 94, 100, 116, 126, 128,
     136, 145, 147, 188, 227, 228, 232, 257, 259, 340, 346, 389, 446, 452, 475, 504, 516, 529, 531,
@@ -61,6 +65,7 @@ mlp1 = node(
     2915, 3220, 3227, 3444, 3478]
 )
 attn2 = node(
+    PD.vpd[2].q_proj.rest, PD.vpd[2].k_proj.rest,
     PD.vpd[2].q_proj[47, 207, 270, 271, 277, 279, 322, 380, 435, 501], PD.vpd[2].k_proj[107, 159,
     185, 217, 280, 306, 308, 327, 370, 424, 452, 486], PD.vpd[2].v_proj[44, 47, 49, 108, 143, 154,
     164, 180, 264, 281, 288, 302, 365, 369, 391, 420, 426, 453, 485, 518, 533, 539, 542, 549, 554,
@@ -78,6 +83,7 @@ mlp2 = node(
     3420, 3439, 3535]
 )
 attn3 = node(
+    PD.vpd[3].q_proj.rest, PD.vpd[3].k_proj.rest,
     PD.vpd[3].q_proj[55, 60, 93, 182, 188, 191, 229, 240, 242, 294, 374, 430, 462, 474, 490, 497,
     498, 499, 504], PD.vpd[3].k_proj[15, 20, 96, 117, 145, 187, 250, 280, 283, 289, 302, 307, 374,
     389, 400, 428, 455, 492], PD.vpd[3].v_proj[7, 24, 34, 44, 61, 71, 76, 80, 92, 94, 95, 104, 110,
