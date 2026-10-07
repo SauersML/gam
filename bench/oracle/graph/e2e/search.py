@@ -114,9 +114,12 @@ class Pool:
     """`workers` checker processes with the behavior loaded; each scores its share of a step's programs in
     one score_batch request (the checker's parallel threads, M's run per experiment shared)."""
 
-    def __init__(self, model: str, behavior: Path, workers: int, export: Path | None = None, stand_in: str | None = None):
-        self.model, self.stand_in = model, stand_in
-        self.checkers = [score.Checker(model, export) for _ in range(workers)]
+    def __init__(self, model: str, behavior: Path, workers: int, export: Path | None = None, stand_in: str | None = None,
+                 views: dict | None = None, log_path: Path | None = None):
+        """views: decomposition views for the checker (score.Checker's); log_path: every scored program is
+        appended there as a JSON line {"source", "seed", "experiments", "score"} (search's data)."""
+        self.model, self.stand_in, self.log_path = model, stand_in, log_path
+        self.checkers = [score.Checker(model, export, views=views) for _ in range(workers)]
         for c in self.checkers:
             e2e.load_behavior(c, behavior)
         self.calls = 0
@@ -133,7 +136,12 @@ class Pool:
         with ThreadPoolExecutor(len(self.checkers)) as ex:
             results = [r for part in ex.map(one, range(min(len(self.checkers), len(irs)))) for r in part]
         self.calls += len(programs)
-        return [r for _, r in sorted(results, key=lambda x: x[0])]
+        scored = [r for _, r in sorted(results, key=lambda x: x[0])]
+        if self.log_path is not None:
+            with self.log_path.open("a") as f:
+                for p, r in zip(programs, scored):
+                    f.write(json.dumps({"source": p, "seed": seed, "experiments": experiments, "score": r}) + "\n")
+        return scored
 
     def close(self):
         for c in self.checkers:
@@ -231,15 +239,24 @@ def main() -> None:
                     help="minimize the score's total, or the total over the experiment families every program shares")
     ap.add_argument("--mlp-view", default="native", choices=["native", "vpd"], help="MLP units: native neuron blocks or VPD subcomponents")
     ap.add_argument("--ranking", type=Path, help="with --mlp-view vpd: measured removal effects of VPD subcomponents (sites -> kl_bits)")
+    ap.add_argument("--vpd", type=Path, default=Path.home() / "mpd-data/engine/vpd4l_decomposition",
+                    help="with --mlp-view vpd: VPD's decomposition export (the checker's vpd view)")
+    ap.add_argument("--prompt-holdout", type=int, default=0,
+                    help="drop every K-th prompt (i %% K == 0) before searching: the prompts the oracle is evaluated on (g-rl)")
     a = ap.parse_args()
     path = a.behavior.expanduser()
     behavior = json.loads(path.read_text())
     model = behavior["model"]
     out = a.out.expanduser()
     out.mkdir(parents=True, exist_ok=True)
+    if a.prompt_holdout:
+        behavior["prompts"] = [p for i, p in enumerate(behavior["prompts"]) if i % a.prompt_holdout != 0]
+        path = out / f"{behavior['id']}.train_prompts.json"
+        path.write_text(json.dumps(behavior))
     if a.mlp_view == "vpd":
         load_ranking(a.ranking)
-    pool = Pool(model, path, a.workers, a.export, a.stand_in)
+    views = {"vpd": a.vpd} if a.mlp_view == "vpd" else None
+    pool = Pool(model, path, a.workers, a.export, a.stand_in, views, out / f"{behavior['id']}{a.tag}.candidates.jsonl")
     try:
         for mode in (["addition", "removal"] if a.mode == "both" else [a.mode]):
             start = pool.calls
