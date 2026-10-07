@@ -148,58 +148,84 @@ class Model:
             self.m = load_target(device)
 
     @torch.no_grad()
-    def logprobs(self, seqs: list[list[int]], positions: list[list[int]], batch: int = 32) -> list[torch.Tensor]:
-        """Log-probabilities [len(positions_i), vocab] at the given positions of each sequence (right padding:
-        causal attention leaves the real positions unchanged)."""
-        out = []
-        for b in range(0, len(seqs), batch):
-            ss = seqs[b:b + batch]
-            T = max(map(len, ss))
-            ids = torch.zeros(len(ss), T, dtype=torch.long)
-            mask = torch.zeros(len(ss), T, dtype=torch.long)
-            for i, s in enumerate(ss):
-                ids[i, :len(s)] = torch.tensor(s)
-                mask[i, :len(s)] = 1
+    def readout(self, seqs: list[list[int]], positions: list[list[int]], wanted: list[list[int]], max_tokens: int = 16384) -> list[dict]:
+        """For each sequence and each of its positions: the top-TOP next tokens with probabilities, the argmax and the
+        log-probabilities of the token ids in wanted[i]. Sequences run in length order, as many per forward pass as fit
+        max_tokens (right padding: causal attention leaves the real positions unchanged); only these numbers leave the
+        device."""
+        order = sorted(range(len(seqs)), key=lambda i: len(seqs[i]))
+        out = [None] * len(seqs)
+        b = 0
+        while b < len(order):
+            e = b + 1
+            while e < len(order) and (e - b + 1) * len(seqs[order[e]]) <= max_tokens:
+                e += 1
+            idx = order[b:e]
+            T = len(seqs[idx[-1]])
+            ids = torch.zeros(len(idx), T, dtype=torch.long)
+            mask = torch.zeros(len(idx), T, dtype=torch.long)
+            for r, i in enumerate(idx):
+                ids[r, :len(seqs[i])] = torch.tensor(seqs[i])
+                mask[r, :len(seqs[i])] = 1
             ids, mask = ids.to(self.device), mask.to(self.device)
             if self.model in HF:  # the head only at the scored positions
                 h, head = self.m.model(input_ids=ids, attention_mask=mask).last_hidden_state, self.m.lm_head
             else:
                 h, head = self.m.hidden(ids), lambda x: x @ self.m.wte.T
-            pos = positions[b:b + batch]
-            bi = torch.tensor([i for i, ps in enumerate(pos) for _ in ps], device=h.device)
-            ti = torch.tensor([t for ps in pos for t in ps], device=h.device)
-            lp = torch.log_softmax(head(h[bi, ti]).float(), -1).cpu()  # one transfer per batch
-            out += list(lp.split([len(ps) for ps in pos]))
+            bi = torch.tensor([r for r, i in enumerate(idx) for _ in positions[i]], device=h.device)
+            ti = torch.tensor([t for i in idx for t in positions[i]], device=h.device)
+            lp = torch.log_softmax(head(h[bi, ti]).float(), -1)
+            tv, tix = lp.exp().topk(TOP, -1)
+            W = max(len(wanted[i]) for i in idx)
+            wid = torch.tensor([wanted[i] + [0] * (W - len(wanted[i])) for i in idx for _ in positions[i]], device=h.device)
+            wl = lp.gather(1, wid)
+            tv, tix, am, wl = tv.cpu(), tix.cpu(), lp.argmax(-1).cpu(), wl.cpu()
+            r = 0
+            for i in idx:
+                n = len(positions[i])
+                out[i] = {"top_p": tv[r:r + n], "top_id": tix[r:r + n], "argmax": am[r:r + n], "wanted": wl[r:r + n, :len(wanted[i])]}
+                r += n
+            b = e
         return out
 
 
-def score(tok: Tok, model: Model, prompts: list[dict]) -> dict:
-    """Fills each prompt's model_top and correct (clean and counterfactual); returns the behavior's accuracies."""
-    seqs = [p["token_ids"] for p in prompts] + [p["counterfactual"]["token_ids"] for p in prompts]
-    pos = [p["target_positions"] for p in prompts] * 2
-    lps = model.logprobs(seqs, pos)
+def readout_requests(prompts: list[dict]):
+    """Sequences, scored positions and wanted tokens (own answers, then the other prompt's first answer token) for the
+    clean and counterfactual prompts of a behavior."""
+    seqs, pos, want = [], [], []
+    for which in ("clean", "cf"):
+        for p in prompts:
+            d, o = (p, p["counterfactual"]) if which == "clean" else (p["counterfactual"], p)
+            tp = p["target_positions"]
+            seqs.append(d["token_ids"])
+            pos.append(tp)
+            want.append([d["token_ids"][t + 1] for t in tp] + [o["token_ids"][tp[0] + 1]])
+    return seqs, pos, want
+
+
+def score(tok: Tok, prompts: list[dict], reads: list[dict]) -> dict:
+    """Fills each prompt's model_top and correct (clean and counterfactual) from readout() results in readout_requests()
+    order; returns the behavior's accuracies."""
     n = len(prompts)
     hits = {"clean": [], "cf": []}
     pair = []
     for k, p in enumerate(prompts):
-        for which, d, lp in (("clean", p, lps[k]), ("cf", p["counterfactual"], lps[n + k])):
+        for which, d, rd in (("clean", p, reads[k]), ("cf", p["counterfactual"], reads[n + k])):
             ids, tp = d["token_ids"], p["target_positions"]
             acc = d.get("accepted_token_ids")
             correct = []
             for i, t in enumerate(tp):
-                top1 = int(lp[i].argmax())
+                top1 = int(rd["argmax"][i])
                 ok = top1 in acc[i] if acc and i < len(acc) else top1 == ids[t + 1]
                 correct.append(bool(ok))
             d["correct"] = correct
-            v, ix = lp.exp().topk(TOP, -1)
-            d["model_top"] = [[[tok.decode(int(j)), round(float(q), 4)] for q, j in zip(vr, ir)] for vr, ir in zip(v, ix)]
+            d["model_top"] = [[[tok.decode(int(j)), round(float(q), 4)] for q, j in zip(vr, ir)] for vr, ir in zip(rd["top_p"], rd["top_id"])]
             hits[which] += correct
         # the answer outranks the counterfactual's answer at the first target, on both prompts
         t0 = p["target_positions"][0]
-        a, b = p["token_ids"][t0 + 1], p["counterfactual"]["token_ids"][t0 + 1]
-        if a != b:
-            pair.append(float(lps[k][0, a] > lps[k][0, b]))
-            pair.append(float(lps[n + k][0, b] > lps[n + k][0, a]))
+        if p["token_ids"][t0 + 1] != p["counterfactual"]["token_ids"][t0 + 1]:
+            for rd in (reads[k], reads[n + k]):
+                pair.append(float(rd["wanted"][0, 0] > rd["wanted"][0, -1]))
     mean = lambda x: round(sum(x) / len(x), 4) if x else None
     return {"model_accuracy": mean(hits["clean"]), "counterfactual_accuracy": mean(hits["cf"]), "pair_accuracy": mean(pair),
             "targets": len(hits["clean"])}
@@ -213,6 +239,7 @@ def main():
     ap.add_argument("--seed", type=int, default=2951)
     ap.add_argument("--device", default="mps")
     ap.add_argument("--dtype", default="float32", choices=["float32", "bfloat16"])
+    ap.add_argument("--max-tokens", type=int, default=16384, help="tokens per forward pass (padding included)")
     ap.add_argument("--out", default=str(OUT), help="root of the behavior files and summary.tsv")
     ap.add_argument("--sva", default=str(families.SVA_DIR), help="Marks et al.'s agreement pairs")
     a = ap.parse_args()
@@ -224,30 +251,41 @@ def main():
     (root / "dropped").mkdir(parents=True, exist_ok=True)
     rows = []
     fams = [f for f in FAMILIES if not a.families or f in a.families.split(",")]
+    jobs = []  # every behavior's prompts first (CPU), then one length-sorted pass of the model over all of them
     for fam in fams:
         rng = random.Random(f"{a.seed}:{fam}")
         for v in FAMILIES[fam](tok, rng):
             bid = f"{fam}.{v.name}"
             prompts = build_prompts(tok, v.items, random.Random(f"{a.seed}:{bid}"))
             random.Random(f"{a.seed}:{bid}:order").shuffle(prompts)
-            prompts = prompts[:MAX_PROMPTS]
-            row = {"model": a.model, "id": bid, "family": fam, "variant": v.name, "prompts": len(prompts), "split": split_of(fam)}
-            if not prompts:
-                rows.append({**row, "status": "no_prompts"})
-                print(f"{bid:40s} no prompts", flush=True)
-                continue
-            acc = score(tok, model, prompts)
-            reason = "top1" if acc["model_accuracy"] >= KEEP_ACCURACY else "contrast" if (acc["pair_accuracy"] or 0) >= KEEP_PAIR else ""
-            status = "too_few" if len(prompts) < MIN_PROMPTS else f"kept_{reason}" if reason else "dropped"
-            beh = {"id": bid, "model": a.model, "family": fam, "variant": v.name, "description": v.description, "frequency": None, "novel": fam in NOVEL,
-                   "prompts": prompts, "split": row["split"], **acc, "keep": status}
-            dest = root / f"{bid}.json" if reason and status != "too_few" else root / "dropped" / f"{bid}.json"
-            for stale in (root / f"{bid}.json", root / "dropped" / f"{bid}.json"):
-                stale.unlink(missing_ok=True)
-            dest.write_text(json.dumps(beh))
-            rows.append({**row, **acc, "status": status})
-            print(f"{bid:40s} n={len(prompts):4d} acc={acc['model_accuracy']:.3f} cf={acc['counterfactual_accuracy']:.3f} "
-                  f"pair={acc['pair_accuracy']} {status}", flush=True)
+            jobs.append((fam, v, bid, prompts[:MAX_PROMPTS]))
+    seqs, pos, want, spans = [], [], [], []
+    for fam, v, bid, prompts in jobs:
+        s_, p_, w_ = readout_requests(prompts)
+        spans.append((len(seqs), len(seqs) + len(s_)))
+        seqs += s_
+        pos += p_
+        want += w_
+    print(f"{len(jobs)} behaviors, {len(seqs)} sequences", flush=True)
+    reads = model.readout(seqs, pos, want, a.max_tokens)
+    for (fam, v, bid, prompts), (lo, hi) in zip(jobs, spans):
+        row = {"model": a.model, "id": bid, "family": fam, "variant": v.name, "prompts": len(prompts), "split": split_of(fam)}
+        if not prompts:
+            rows.append({**row, "status": "no_prompts"})
+            print(f"{bid:40s} no prompts", flush=True)
+            continue
+        acc = score(tok, prompts, reads[lo:hi])
+        reason = "top1" if acc["model_accuracy"] >= KEEP_ACCURACY else "contrast" if (acc["pair_accuracy"] or 0) >= KEEP_PAIR else ""
+        status = "too_few" if len(prompts) < MIN_PROMPTS else f"kept_{reason}" if reason else "dropped"
+        beh = {"id": bid, "model": a.model, "family": fam, "variant": v.name, "description": v.description, "frequency": None, "novel": fam in NOVEL,
+               "prompts": prompts, "split": row["split"], **acc, "keep": status}
+        dest = root / f"{bid}.json" if reason and status != "too_few" else root / "dropped" / f"{bid}.json"
+        for stale in (root / f"{bid}.json", root / "dropped" / f"{bid}.json"):
+            stale.unlink(missing_ok=True)
+        dest.write_text(json.dumps(beh))
+        rows.append({**row, **acc, "status": status})
+        print(f"{bid:40s} n={len(prompts):4d} acc={acc['model_accuracy']:.3f} cf={acc['counterfactual_accuracy']:.3f} "
+              f"pair={acc['pair_accuracy']} {status}", flush=True)
     write_summary(a.model, fams, rows)
 
 
