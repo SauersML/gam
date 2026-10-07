@@ -281,6 +281,13 @@ pub struct DeviceProgram {
     /// Every product that can run on per-row lists runs on them, unmeasured
     /// ([`DeviceProgram::read_listed`]).
     always_listed: bool,
+    /// Per node, an earlier node of the same value: the same node over the same arguments (each
+    /// argument taken as the earliest node of its value) and the same operators, a common
+    /// subexpression. library_vpd's head rules each recompute their layer's attention-input reads
+    /// and gates from the same input, and its o rule recomputes them again; a forward pass takes
+    /// such a node's value from the earlier one unless an edit changed either
+    /// (`DeviceTrace::aliased`).
+    aliases: Vec<Option<usize>>,
 }
 
 /// The columns of an exactly-zero node (`DeviceProgram::exact_zeros`) a product reads: those
@@ -456,6 +463,8 @@ pub struct DeviceTrace {
     /// The affine nodes whose forward product ran on per-row lists ([`DeviceProgram::listed_pays`]);
     /// their reverse pulls and gradients run on them too.
     listed_nodes: BTreeSet<usize>,
+    /// The nodes that took an earlier node's value (`DeviceProgram::aliases`), and that node.
+    aliased: BTreeMap<usize, usize>,
     /// Bfloat16 copies of node values a bfloat16 forward pass's and the reverse passes' products read
     /// ([`DeviceTrace::rounded_value`]), kept until [`DeviceTrace::release_rounded`].
     rounded: Mutex<BTreeMap<usize, Arc<Tensor>>>,
@@ -949,6 +958,31 @@ impl DeviceProgram {
                 _ => None,
             })
             .collect();
+        let aliases = {
+            let n = program.nodes.len();
+            let (operators, bases, rules): (Vec<usize>, Vec<usize>, Vec<usize>) = ((0..program.operators.len()).collect(), (0..program.bases.len()).collect(), (0..program.rules.len()).collect());
+            let mut canonical: Vec<usize> = (0..n).collect();
+            let mut first: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+            let mut out = vec![None; n];
+            for (i, node) in program.nodes.iter().enumerate() {
+                // Fused heads, streamed heads, features and sparse ReLU reads keep their own paths.
+                if grouped[i].is_some() || exact_zeros[i] || matches!(node, Node::Feature { .. }) || matches!(steps[i], Step::Head | Step::Feature { .. }) {
+                    continue;
+                }
+                let mut node = node.clone();
+                super::operator_program::remap_node(&mut node, &canonical, &operators, &bases, &rules);
+                match first.entry(format!("{node:?}")) {
+                    std::collections::hash_map::Entry::Occupied(e) => {
+                        canonical[i] = *e.get();
+                        out[i] = Some(*e.get());
+                    }
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        e.insert(i);
+                    }
+                }
+            }
+            out
+        };
         let gated_reads = (0..program.nodes.len())
             .map(|n| match (&program.nodes[n], sole[n]) {
                 (Node::Affine { terms, .. }, Some(r)) if terms.len() == 1 => match &program.nodes[r] {
@@ -958,7 +992,7 @@ impl DeviceProgram {
                 _ => None,
             })
             .collect();
-        Ok(Self { device: device.clone(), steps, widths, head, edited_head_nodes, operators, batch: Mutex::new(None), rotary_tables: Mutex::new(Vec::new()), bf16: false, arithmetic: Arithmetic::F64, fused, grouped, revisions: BTreeMap::new(), rounded: Mutex::new(BTreeMap::new()), exact_zeros, dead, sole, listed, gated_reads, list_costs: Mutex::new(std::collections::HashMap::new()), always_listed: false })
+        Ok(Self { device: device.clone(), steps, widths, head, edited_head_nodes, operators, batch: Mutex::new(None), rotary_tables: Mutex::new(Vec::new()), bf16: false, arithmetic: Arithmetic::F64, fused, grouped, revisions: BTreeMap::new(), rounded: Mutex::new(BTreeMap::new()), exact_zeros, dead, sole, listed, gated_reads, list_costs: Mutex::new(std::collections::HashMap::new()), always_listed: false, aliases })
     }
 
     /// Operator `op`'s device copy changed: every group reading it runs node by node until
@@ -2002,8 +2036,11 @@ impl DeviceProgram {
             active: BTreeMap::new(),
             lists: BTreeMap::new(),
             listed_nodes: BTreeSet::new(),
+            aliased: BTreeMap::new(),
             rounded: Mutex::new(BTreeMap::new()),
         };
+        // The nodes an edit replaced: a later node of the same value computes its own.
+        let mut replaced = BTreeSet::new();
         for (index, step) in self.steps.iter().enumerate() {
             if Some(index) == entry {
                 let value = entered.take().ok_or("device: a span's entry value")?;
@@ -2036,8 +2073,16 @@ impl DeviceProgram {
             }
             let width = self.widths[index];
             let hook = hooks.before(index);
+            // A common subexpression takes its earlier node's value, unless an edit changed that
+            // value or changes this one before it is read.
+            let alias = self.aliases[index].filter(|&earlier| {
+                !hook && !hooks.before(earlier) && !replaced.contains(&earlier) && trace.has(earlier) && !gated.iter().any(|&(amplitude, mask)| [amplitude, mask].iter().any(|n| *n == index || *n == earlier))
+            });
             let value = |t: Tensor| Slot::Value(t);
-            let mut slot = if let Some(g) = group {
+            let mut slot = if let Some(earlier) = alias {
+                trace.aliased.insert(index, earlier);
+                Slot::Alias(earlier)
+            } else if let Some(g) = group {
                 value(self.heads_output(&trace, g)?)
             } else { match step {
                 Step::Head if materialize_heads => match self.edited_head_nodes.get(&index) {
@@ -2180,6 +2225,7 @@ impl DeviceProgram {
                 }
                 trace.slots[index] = Slot::Value(replacement);
                 trace.forget_rounded(index);
+                replaced.insert(index);
             }
             if let Some(&(_, mask)) = gated.iter().find(|(amplitude, _)| *amplitude == index) {
                 let decided = decide(index, &trace)?;
@@ -2665,6 +2711,18 @@ impl DeviceProgram {
             if index == first {
                 kept.insert(index, cot);
                 break;
+            }
+            // A node that took an earlier node's value passes its cotangent to it, as a readout does.
+            if let Some(&earlier) = trace.aliased.get(&index) {
+                if keep.contains(&index) {
+                    if needed[earlier] {
+                        add(&mut g, earlier, d.copy(&cot).map_err(error)?)?;
+                    }
+                    kept.insert(index, cot);
+                } else if needed[earlier] {
+                    add(&mut g, earlier, cot)?;
+                }
+                continue;
             }
             // The cotangent as the products below read it (`operand`).
             let mut half = None;
@@ -3254,6 +3312,10 @@ impl DeviceProgram {
         // Per gated node read or written on per-row lists, its rows per component.
         let mut by_group = BTreeMap::new();
         for (node, step) in self.steps.iter().enumerate() {
+            // A node that took an earlier node's value passed its cotangent there.
+            if trace.aliased.contains_key(&node) {
+                continue;
+            }
             if let (Some((ids, part)), Step::Affine { terms, bias }) = (packed.get(&node), step) {
                 // A packed cotangent ([`Packed`]): only its columns' rows of the operators and of the
                 // bias have a gradient.
@@ -3436,6 +3498,12 @@ impl DeviceProgram {
             None => 0,
         };
         for index in start..=end {
+            if let Some(&earlier) = trace.aliased.get(&index) {
+                let mut t = dv[earlier].as_ref().map(|t| d.copy(t)).transpose().map_err(error)?;
+                hook(index, &mut t, &dv)?;
+                dv[index] = t;
+                continue;
+            }
             let width = self.widths[index];
             let t = match &self.steps[index] {
                 Step::Concat { .. } | Step::Readout { .. } => return Err("device: resident Concat/readout derivatives are unsupported".into()),
@@ -4323,6 +4391,75 @@ mod gated_tests {
             let (_, dense_gradients) = lowered.vjp_values_dense(&dense, seeds(), &[0], &trainable, arithmetic).unwrap();
             for op in &trainable {
                 close(&program.operators[*op].name, &device.download(&gradients[op]).unwrap(), &device.download(&dense_gradients[op]).unwrap());
+            }
+        }
+    }
+
+    /// Two gated readers of one input recomputing the same reads, norms, gates and gated values
+    /// (as library_vpd's head rules do) take the first's values (`DeviceProgram::aliases`), and the
+    /// output, the input's cotangent and the gradients of the shared reads, the threshold and both
+    /// writes equal the host's sums over both uses.
+    #[test]
+    fn a_repeated_subexpression_is_computed_once() {
+        let mut rng = StdRng::seed_from_u64(6);
+        let mut normal = |r: usize, c: usize| Array2::from_shape_fn((r, c), |_| rng.random::<f64>() - 0.5);
+        let (r, b, rows) = (WIDTHS.iter().sum::<usize>(), WIDTHS.len(), 6);
+        let units = Interface::uniform(b, 1, LabelKind::Unit, 0).unwrap();
+        let dense = |name: &str, rows: Interface, cols: Interface, v: Array2<f64>| Arc::new(Operator::dense(name, rows, cols, v.clone(), exact_precision(v.iter().copied()).unwrap(), Default::default()).unwrap());
+        let out = Interface::native(OUT).unwrap();
+        let operators = vec![
+            dense("V", reads(), Interface::native(D).unwrap(), normal(r, D)),
+            dense("U", out.clone(), reads(), normal(OUT, r)),
+            dense("U2", out.clone(), reads(), normal(OUT, r)),
+            dense("minus_tau", units.clone(), Interface::constant(), Array2::from_shape_fn((b, 1), |(i, _)| -0.3 - 0.05 * i as f64)),
+            Arc::new(Operator::identity("I", units)),
+            Arc::new(Operator::identity("I_out", out)),
+        ];
+        let nodes = vec![
+            Node::Raw { slot: 0 },
+            Node::Affine { terms: vec![(0, 0)], bias: None },
+            Node::Affine { terms: vec![(0, 0)], bias: None },
+            Node::GroupNorm { input: 1 },
+            Node::GroupNorm { input: 2 },
+            Node::Affine { terms: vec![(3, 4)], bias: Some(3) },
+            Node::Affine { terms: vec![(4, 4)], bias: Some(3) },
+            Node::Gated { value: 1, gate: 5, scale: None },
+            Node::Gated { value: 2, gate: 6, scale: None },
+            Node::Affine { terms: vec![(7, 1)], bias: None },
+            Node::Affine { terms: vec![(8, 2)], bias: None },
+            Node::Affine { terms: vec![(9, 5), (10, 5)], bias: None },
+        ];
+        let program = OperatorProgram { declarations: Declarations { domains: vec![], slots: vec![Slot::Raw { width: D }], parameters: 0 }, operators, bases: vec![], rules: vec![], nodes, output: 11 };
+        let family = FamilyInputs { rows, slots: vec![SlotValues::Raw(normal(rows, D))], layout: Some(SequenceLayout { sequence: vec![0; rows], position: (0..rows as u32).collect() }) };
+        let host = program.execute(&family, false).unwrap();
+        let seed = Array2::from_shape_fn((rows, OUT), |(i, j)| ((i * 5 + j * 3) % 7) as f64 / 7.0 - 0.4);
+        let cot = crate::derivatives::vjp_seeded(&program, &family, &host, BTreeMap::from([(11, seed.clone())]), None).unwrap();
+        let c = |n: usize| cot[n].clone().unwrap_or_else(|| Array2::zeros(host.values[n].dim()));
+        let x = &host.values[0];
+        let want: BTreeMap<usize, Array2<f64>> = BTreeMap::from([
+            (0, c(1).t().dot(x) + c(2).t().dot(x)),
+            (1, c(9).t().dot(&host.values[7])),
+            (2, c(10).t().dot(&host.values[8])),
+            (3, (c(5) + c(6)).sum_axis(ndarray::Axis(0)).insert_axis(ndarray::Axis(1))),
+        ]);
+        let mut devices = crate::device_program_tests::devices();
+        devices.extend(Device::single_precision(gam_gpu::GpuPolicy::Auto).unwrap());
+        for device in &devices {
+            let (tolerance, arithmetic) = if device.float64() { (1e-12, Arithmetic::F64) } else { (1e-4, Arithmetic::F32) };
+            let close = |what: &str, got: &Array2<f64>, want: &Array2<f64>| {
+                let scale = want.iter().fold(1.0_f64, |m, v| m.max(v.abs()));
+                let err = (got - want).iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+                assert!(err <= tolerance * scale, "{}: {what} differs by {err}", device.name());
+            };
+            let mut lowered = DeviceProgram::compile_values(device, &program).unwrap();
+            lowered.set_arithmetic(arithmetic);
+            let trace = lowered.forward(&family).unwrap();
+            assert_eq!(trace.aliased, BTreeMap::from([(2, 1), (4, 3), (6, 5), (8, 7)]), "{}: the repeated nodes take the first's values", device.name());
+            close("the output", &device.download(trace.value(11).unwrap()).unwrap(), &host.values[11]);
+            let (nodes, gradients) = lowered.vjp_values_dense(&trace, BTreeMap::from([(11, device.upload(seed.view()).unwrap())]), &[0], &[0, 1, 2, 3], arithmetic).unwrap();
+            close("the input's cotangent", &device.download(&nodes[&0]).unwrap(), cot[0].as_ref().unwrap());
+            for (op, want) in &want {
+                close(&program.operators[*op].name, &device.download(&gradients[op]).unwrap(), want);
             }
         }
     }
