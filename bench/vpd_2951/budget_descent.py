@@ -27,7 +27,10 @@ Dual step (DESCENT_DUAL): measured (default, library_mdl's rule, below) or fixed
 Training rows 0..1023 of tokens.f64, held-out evaluation rows 1024..1031 (4096 tokens), where VPD's
 causal-importance masks give KL 0.737 at 129 active MLP slices per token.
 Usage: budget_descent.py START K STEPS OUT.json GATE EVAL SECONDS GAM TARGET VPD TOKENS
-  GATE     mf = expected gate forward and derivative; st = hard gate forward, expected gate derivative
+  GATE     mf = expected gate forward and derivative; st = hard gate forward, expected gate derivative;
+           ramp = a continuous gate clamp((r - tau)/w, 0, 1) with a learned width w per slice, as VPD's
+           masks are continuous at evaluation: trained as its expectation under the threshold noise
+           (scale s), evaluated as the ramp itself (not binarized), active where r > tau
   EVAL     steps between held-out evaluations; SECONDS: wall-clock limit of the training loop
   GAM      bench/vpd_2951 (vpd_model), TARGET the target run (t-9d2b8f02), VPD the decomposition
            export's export.json (engine/vpd4l_decomposition), TOKENS engine/vpd4l_pile2p27/tokens.f64"""
@@ -179,6 +182,17 @@ def make(n):
         if mult is not None:
             state['gates'][n] = (hard, phi); w = mult
         state['hard'].append((hard * w).sum(-1).reshape(-1))
+        if gate == 'ramp':
+            a, width = read - p['tau'], p['lw'].exp()
+            if state['mode'] == 'hard':
+                return (c * (a / width).clamp(0, 1)) @ p['U']
+            state['soft'].append((phi * w).sum(-1).reshape(-1))
+            # E[clamp((a + s e)/width, 0, 1)] for e ~ N(0, 1): (g(a) - g(a - width)) / width with
+            # g(y) = E[(y + s e)^+] = y Phi(y/s) + s phi(y/s).
+            def g(y):
+                t = y / p['s']
+                return y * 0.5 * (1 + torch.erf(t / SQ2)) + p['s'] * torch.exp(-0.5 * t * t) / math.sqrt(2 * math.pi)
+            return (c * (g(a) - g(a - width)) / width) @ p['U']
         if state['mode'] == 'hard':
             return (c * hard) @ p['U']
         state['soft'].append((phi * w).sum(-1).reshape(-1))
@@ -218,6 +232,11 @@ LR = float(os.environ.get('DESCENT_LR', '1'))
 rms = lambda q: q.detach().pow(2).mean().sqrt().item()
 slots = [(P[n], w, rms(P[n][w])) for n in mlp for w in (('V', 'U', 'G') if ARM == 'dir' else ('V', 'U'))]
 slots += [(P[n], 'tau', 100 / 3 * P[n]['s'].mean().item()) for n in mlp]
+# The ramp's log width, started at log s (a ramp as wide as the threshold noise), by 1% per step.
+if gate == 'ramp':
+    for n in mlp:
+        P[n]['lw'] = P[n]['s'].log().clone().requires_grad_()
+    slots += [(P[n], 'lw', 10 / 3) for n in mlp]
 for l, R in ROUTER.items():
     slots.append((R, 'G1', rms(R['G1'])))
     slots += [(R, n, rms(R[n]) or P[n]['s'].mean().item()) for n in R if n != 'G1']
