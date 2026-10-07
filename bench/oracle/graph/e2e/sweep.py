@@ -46,14 +46,13 @@ def references_for(behavior: dict, seed: int = 0) -> dict[str, str]:
 
 def score_behavior(path: Path, experiments: int, seed: int, stand_in: str | None, export: Path | None) -> dict:
     behavior = json.loads(path.read_text())
-    extra = {} if stand_in is None else {"stand_in": stand_in}
     results = {}
     with score.Checker(behavior["model"], export) as checker:
         checker.behavior(path)
         for name, source in references_for(behavior, seed).items():
             t = time.time()
             try:
-                r = checker.score(source, experiments=experiments, seed=seed, reader=False, **extra)
+                r = checker.score(e2e.ir_of(source, behavior["model"], stand_in), experiments=experiments, seed=seed, reader=False)
             except RuntimeError as e:  # the checker's refusal is this behavior's result
                 r = {"error": str(e), "valid": False}
             r.pop("items", None)
@@ -73,7 +72,7 @@ def main() -> None:
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--experiments", type=int, default=16)
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--stand-in")
+    ap.add_argument("--stand-in", choices=["counterfactual", "global"], help="the programs' stand-in form (checker default: counterfactual)")
     ap.add_argument("--out", type=Path, default=OUT)
     ap.add_argument("--export", type=Path)
     ap.add_argument("--only", nargs="*", help="behavior ids to run (default: all)")

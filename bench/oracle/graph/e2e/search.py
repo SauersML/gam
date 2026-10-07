@@ -10,9 +10,10 @@ and into the logits), so it equals M with its undeclared pieces replaced by stan
   removal   from the full program: each step removes the head or MLP sub-block whose removal lowers
             the total most; stops when no removal lowers it.
 Every candidate of a step is scored under the same experiment seed; the final program is rescored
-under a held-out seed. Candidates are scored in parallel by --workers checker processes.
+under a held-out seed. Candidates go to --workers checker processes as score_batch requests (each
+checker scores its share in parallel threads, RAYON_NUM_THREADS).
 
-  search.py BEHAVIOR.json [--mode addition|removal|both] [--experiments 16] [--workers 4]
+  search.py BEHAVIOR.json [--mode addition|removal|both] [--experiments 16] [--workers 1] [--stand-in counterfactual|global]
 Writes ~/mpd-data/graph_oracle/runs/search/<behavior>.<mode>.json (trajectory, final program source,
 its terms, checker calls) and appends the final program to status.tsv as program "search_<mode>".
 """
@@ -85,25 +86,27 @@ def pieces_of(unit, min_neurons: int):
 
 
 class Pool:
-    """`workers` checker processes with the behavior loaded; scores programs in parallel."""
+    """`workers` checker processes with the behavior loaded; each scores its share of a step's programs in
+    one score_batch request (the checker's parallel threads, M's run per experiment shared)."""
 
     def __init__(self, model: str, behavior: Path, workers: int, export: Path | None = None, stand_in: str | None = None):
+        self.model, self.stand_in = model, stand_in
         self.checkers = [score.Checker(model, export) for _ in range(workers)]
-        self.extra = {} if stand_in is None else {"stand_in": stand_in}
         for c in self.checkers:
             c.behavior(behavior)
         self.calls = 0
 
     def score(self, programs: list[str], experiments: int, seed: int) -> list[dict]:
+        irs = [e2e.ir_of(p, self.model, self.stand_in) for p in programs]
+
         def one(k):
-            c = self.checkers[k % len(self.checkers)]
-            out = []
-            for i in range(k, len(programs), len(self.checkers)):
-                out.append((i, c.score(programs[i], experiments=experiments, seed=seed, reader=False, **self.extra)))
-            return out
+            share = list(range(k, len(irs), len(self.checkers)))
+            answer = self.checkers[k].request({"op": "score_batch", "programs": [irs[i] for i in share], "experiments": experiments,
+                                               "seed": seed, "routing": "edges", "N": None, "reader_top": 0})
+            return list(zip(share, answer["scores"]))
 
         with ThreadPoolExecutor(len(self.checkers)) as ex:
-            results = [r for part in ex.map(one, range(min(len(self.checkers), len(programs)))) for r in part]
+            results = [r for part in ex.map(one, range(min(len(self.checkers), len(irs)))) for r in part]
         self.calls += len(programs)
         return [r for _, r in sorted(results, key=lambda x: x[0])]
 
@@ -167,13 +170,13 @@ def main() -> None:
     ap.add_argument("--experiments", type=int, default=16)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--heldout-seed", type=int, default=1)
-    ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--workers", type=int, default=1)
     ap.add_argument("--min-neurons", type=int, default=384)
     ap.add_argument("--export", type=Path, help="the model's export directory (score.py's default otherwise)")
     ap.add_argument("--out", type=Path, default=OUT)
     ap.add_argument("--start", help="comma-separated units to start from (h<l>_<h>, m<l>_<start>_<stop>)")
     ap.add_argument("--tag", default="", help="suffix of the output names")
-    ap.add_argument("--stand-in", help="the checker's stand-in option (counterfactual, global, position, ...)")
+    ap.add_argument("--stand-in", choices=["counterfactual", "global"], help="the programs' stand-in form (checker default: counterfactual)")
     a = ap.parse_args()
     path = a.behavior.expanduser()
     behavior = json.loads(path.read_text())
