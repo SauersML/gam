@@ -43,7 +43,28 @@
      "down_proj": 3584
     }
    ],
-   "library": null,
+   "library": {
+    "source": "decomp/start.components.json",
+    "arm": "grouped_own",
+    "parts": [
+     {
+      "attn": 706,
+      "mlp": 1448
+     },
+     {
+      "attn": 471,
+      "mlp": 431
+     },
+     {
+      "attn": 912,
+      "mlp": 563
+     },
+     {
+      "attn": 547,
+      "mlp": 1239
+     }
+    ]
+   },
    "transcoder": null
   },
   "source": [

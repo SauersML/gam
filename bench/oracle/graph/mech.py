@@ -18,7 +18,9 @@ Addresses (layer l, indices i, j, ... from 0):
                              its key-value group, shared with the other heads of the group)
   L[l].mlp[i, ...]           native MLP neurons (L[l].attn: all heads of layer l)
   PD.vpd[l].<site>[i, ...]   VPD subcomponents U_i V_i^T, site in q_proj k_proj v_proj o_proj c_fc down_proj
-  PD.lib[l].<site>[i, ...]   our library's parts (not available yet)
+  PD.lib[l].attn[i, ...]     our library's parts of layer l's attention (.mlp[i]: of its MLP); parts may
+                             overlap, so a part may sit in several nodes (vpd4l: decomp's start, arm
+                             LIBRARY_ARM; part i = the i-th component of that block in the file)
   PD.tc[l][i, ...]           transcoder features of layer l's MLP (Qwen3-0.6B)
 Indices may be ints, slices or ranges; a site without indices (L[3].mlp) is all of its units.
 `node(*pieces)` makes one node (its pieces in one layer's attention or one layer's MLP); `writer >> reader` declares an
@@ -58,6 +60,7 @@ ROUTES = ("query", "key", "value", "input")
 EXPORTS = ("node", "edges", "L", "PD", "embed", "logits", "standin")
 ATTRIBUTES = ("head", "attn", "mlp", "vpd", "lib", "tc", "query", "key", "value", "input") + SITES
 STANDINS = ("counterfactual", "global", "position")
+LIBRARY_ARM = "grouped_own"  # the arm of decomp's start that PD.lib addresses
 DEFAULT_STANDIN = "counterfactual"
 
 
@@ -90,6 +93,15 @@ def build_shapes(data: Path) -> dict:
     decomposition = json.loads((data / "engine/vpd4l_decomposition/export.json").read_text())["config"]
     vpd = [{site: decomposition["subcomponents"][f"h.{l}.{'mlp' if site in ('c_fc', 'down_proj') else 'attn'}.{site}"]
             for site in SITES} for l in range(engine["n_layers"])]
+    library = None
+    start = data / "decomp/start.components.json"
+    if start.exists():  # decomp's exact all-on start: part i of layer l's attention or MLP, in file order
+        arm = next(r for r in json.loads(start.read_text()) if r["arm"] == LIBRARY_ARM)
+        parts = [{"attn": 0, "mlp": 0} for _ in range(engine["n_layers"])]
+        for c in arm["components"]:
+            site = c["read"]["own"][0] if "own" in c["read"] else c["read"]["direction"]["site"]
+            parts[site // len(SITES)]["attn" if site % len(SITES) < 4 else "mlp"] += 1
+        library = {"source": "decomp/start.components.json", "arm": LIBRARY_ARM, "parts": parts}
     hub = Path.home() / ".cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots"
     qwen = json.loads(next(hub.glob("*/config.json")).read_text())
     transcoders = data / "transcoders/qwen3-0.6b-lowl0"
@@ -103,7 +115,7 @@ def build_shapes(data: Path) -> dict:
             "layers": engine["n_layers"], "heads": engine["n_heads"], "kv_heads": engine["n_kv_heads"],
             "head_dim": engine["head_dim"], "d_model": engine["d_model"], "d_mlp": engine["d_mlp"],
             "vocab": engine["vocab"],
-            "views": {"native": True, "vpd": vpd, "library": None, "transcoder": None},
+            "views": {"native": True, "vpd": vpd, "library": library, "transcoder": None},
             "source": ["engine/vpd4l/export.json", "engine/vpd4l_decomposition/export.json"],
         },
         "qwen3-0.6b": {
@@ -168,6 +180,8 @@ class Piece:
             return f"L[{self.layer}].{self.kind}[{i}]"
         if self.view == "transcoder":
             return f"PD.tc[{self.layer}][{i}]"
+        if self.view == "library":
+            return f"PD.lib[{self.layer}].{self.kind}[{i}]"
         return f"PD.{'vpd' if self.view == 'vpd' else 'lib'}[{self.layer}].{self.kind}[{i}]"
 
     def block(self) -> str:
@@ -177,7 +191,7 @@ class Piece:
         """What the piece reads: ("resid", position, routes) or (internal stream, layer, routes).
         Residual positions: layer l's attention reads and writes at 2l, its MLP at 2l + 1."""
         l = self.layer
-        if self.kind == "head":
+        if self.kind in ("head", "attn"):  # a native head, or a library part of the attention
             return [("resid", 2 * l, ("query", "key", "value", "input"))]
         if self.kind in ("mlp", "c_fc", "feature"):
             return [("resid", 2 * l + 1, ("input",))]
@@ -189,9 +203,9 @@ class Piece:
 
     def writes(self) -> list[tuple]:
         l = self.layer
-        if self.kind in ("head", "o_proj"):
+        if self.kind in ("head", "attn", "o_proj"):
             return [("resid", 2 * l)]
-        if self.kind in ("mlp", "down_proj", "feature"):
+        if self.kind in ("mlp", "down_proj", "feature"):  # "mlp": native neurons or a library part
             return [("resid", 2 * l + 1)]
         if self.kind in ("q_proj", "k_proj", "v_proj"):
             return [("attn", l)]
@@ -274,6 +288,23 @@ class _DecompLayer:
         return _Site(self._view, self._l, site, sizes and sizes[self._l][site])
 
 
+class _LibLayer:
+    """Our library's parts of layer l: .attn[i] (a part of the attention) and .mlp[i] (of the MLP)."""
+
+    def __init__(self, l: int):
+        self._l = l
+
+    def _site(self, block: str) -> _Site:
+        counts = _view("library", "lib")
+        return _Site("library", self._l, block, counts and counts["parts"][self._l][block])
+
+    attn = property(lambda self: self._site("attn"))
+    mlp = property(lambda self: self._site("mlp"))
+
+    def __getattr__(self, name: str):
+        raise MechError(f"PD.lib[{self._l}].{name}: library parts are PD.lib[l].attn[i] and PD.lib[l].mlp[i]")
+
+
 class _Decomp:
     def __init__(self, view: str, name: str):
         self._view, self._name = view, name
@@ -284,7 +315,7 @@ class _Decomp:
             widths = _view(self._view, self._name)
             return _Site("transcoder", l, "feature", widths and widths[l])
         _view(self._view, self._name)
-        return _DecompLayer(self._view, self._name, l)
+        return _LibLayer(l) if self._view == "library" else _DecompLayer(self._view, self._name, l)
 
 
 class _PD:
@@ -564,6 +595,8 @@ def _validate(program: _Program, namespace: dict, ir: dict) -> None:
             if v != p.view:
                 raise MechError(f"layer {p.layer}'s {p.block()} is read through two views ({v} and {p.view}); "
                                 f"use one view per layer's attention and MLP")
+            if p.view == "library":
+                continue  # library parts may overlap; the checker takes the union per node
             for i in p.index:
                 o = owner.setdefault((p.view, p.layer, p.kind, i), n.id)
                 if o != n.id:

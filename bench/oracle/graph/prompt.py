@@ -67,7 +67,9 @@ def views(model: str) -> tuple[str, str]:
         pieces.append(f"  PD.vpd[l].<site>[i, ...] (rank-one subcomponents of VPD's decomposition of a weight matrix; "
                       f"per layer {sites})")
     if s["views"].get("library"):
-        pieces.append("  PD.lib[l].<site>[i, ...] (parts of our decomposition)")
+        n = s["views"]["library"]["parts"][0]
+        pieces.append(f"  PD.lib[l].attn[i, ...] and PD.lib[l].mlp[i, ...] (parts of our decomposition of layer l's "
+                      f"attention or MLP, which may overlap; layer 0 has {n['attn']} and {n['mlp']})")
     if s["views"].get("transcoder"):
         pieces.append(f"  PD.tc[l][i, ...] (transcoder features replacing layer l's MLP; "
                       f"{s['views']['transcoder'][0]} per layer)")

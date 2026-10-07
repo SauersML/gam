@@ -78,6 +78,16 @@ def test_tracer_speed():
     assert (time.time() - start) / 20 < 0.5
 
 
+def test_library_view():
+    ir = mech.trace_inline(HEAD + "a = node(PD.lib[1].attn[3, 470])\nb = node(PD.lib[2].attn[3])\n"
+                           "c = node(PD.lib[1].attn[3])\nm = node(PD.lib[2].mlp[562])\n"
+                           "edges(a >> b.key, a >> m, m >> logits)\n", "vpd4l")
+    assert ir["valid"], ir["error"]  # parts may overlap between nodes
+    assert ir["nodes"][0]["pieces"] == [{"view": "library", "layer": 1, "kind": "attn", "index": [3, 470]}]
+    assert "out of range" in invalid(HEAD + "node(PD.lib[1].attn[471])")
+    assert "two views" in invalid(HEAD + "a = node(PD.lib[1].mlp[0])\nb = node(L[1].mlp[0])")
+
+
 def test_qwen_views():
     ir = mech.trace_inline(HEAD + "f = node(PD.tc[14][163839, 7])\nh = node(L[20].head[15])\n"
                            "edges(f >> h.value, h >> logits)\n", "qwen3-0.6b")
@@ -86,7 +96,8 @@ def test_qwen_views():
     assert "out of range" in invalid(HEAD + "node(PD.tc[14][163840])", "qwen3-0.6b")
     assert "not available" in invalid(HEAD + "node(PD.vpd[1].c_fc[0])", "qwen3-0.6b")
     assert "not available" in invalid(HEAD + "node(PD.tc[1][0])", "vpd4l")
-    assert "not available" in invalid(HEAD + "node(PD.lib[1].c_fc[0])", "vpd4l")
+    assert "not available" in invalid(HEAD + "node(PD.lib[1].mlp[0])", "qwen3-0.6b")
+    assert "library parts are" in invalid(HEAD + "node(PD.lib[1].c_fc[0])", "vpd4l")
     assert "layers are 0..27" in invalid(HEAD + "node(L[28].head[0])", "qwen3-0.6b")
 
 
