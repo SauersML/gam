@@ -4377,7 +4377,7 @@ extern "C" __global__ void block_products(u64 n, unsigned int cols, unsigned int
 // (s read only when `scaled`).
 extern "C" __global__ void gate_function(u64 n, unsigned int code, const double* x, const double* s, int scaled, double* out) {
     GRID_STRIDE(i, n) {
-        double t = x[i], sd = scaled ? s[i] : 1.0, z = t / sd, density = exp(-0.5 * z * z) * 0.3989422804014327;
+        double t = x[i], sd = scaled ? s[i] : 1.0, z = fmin(fmax(t / sd, -40.0), 40.0), density = exp(-0.5 * z * z) * 0.3989422804014327;
         double v;
         switch (code) {
             case 0: v = sqrt(t); break;
@@ -8417,11 +8417,12 @@ kernel void t_fisher_probe(device float* probabilities [[buffer(0)]], device con
 
 // n: rows · blocks; extra: blocks.
 // A gate's entrywise maps (`GateFunction`, p.a the code): √x, H(x), Φ(z), φ(z)/s, −φ(z) z/s with
-// z = x/s (s read only when p.b).
+// z = x/s (s read only when p.b), z held to ±40: Φ and φ there are their float32 limits (Φ(±40) is
+// 1 or 0, φ(40) is 0), and the fast-math shader made NaN of a finite z near 10²⁹ (s = 10⁻³⁰).
 kernel void t_gate_function(device const float* x [[buffer(0)]], device const float* s [[buffer(1)]], device float* out [[buffer(2)]],
                             constant P& p [[buffer(3)]], uint gid [[thread_position_in_grid]], uint grid [[threads_per_grid]]) {
     ELEMENTS {
-        float t = x[i], sd = p.b ? s[i] : 1.0f, z = t / sd, density = exp(-0.5f * z * z) * 0.39894228040143268f;
+        float t = x[i], sd = p.b ? s[i] : 1.0f, z = fmin(fmax(t / sd, -40.0f), 40.0f), density = exp(-0.5f * z * z) * 0.39894228040143268f;
         float v;
         switch (p.a) {
             case 0: v = sqrt(t); break;

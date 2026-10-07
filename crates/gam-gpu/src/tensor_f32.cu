@@ -580,7 +580,7 @@ extern "C" __global__ void fisher_probe(unsigned int rows, unsigned int cols, fl
 // (s read only when `scaled`).
 extern "C" __global__ void gate_function(u64 n, unsigned int code, const float* x, const float* s, int scaled, float* out) {
     GRID_STRIDE(i, n) {
-        float t = x[i], sd = scaled ? s[i] : 1.0f, z = t / sd, density = expf(-0.5f * z * z) * 0.398942280401432678f;
+        float t = x[i], sd = scaled ? s[i] : 1.0f, z = fminf(fmaxf(t / sd, -40.0f), 40.0f), density = expf(-0.5f * z * z) * 0.398942280401432678f;
         float v;
         switch (code) {
             case 0: v = sqrtf(t); break;
