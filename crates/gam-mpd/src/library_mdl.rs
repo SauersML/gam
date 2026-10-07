@@ -2164,6 +2164,14 @@ impl Scorer {
         Ok(())
     }
 
+    /// Removes the shared stages' assignment operators from a pass's gradient or factor `map`: the
+    /// posterior's maps hold its own operators alone.
+    fn strip(&self, map: &mut BTreeMap<usize, Tensor>) {
+        for a in &self.assignments {
+            map.remove(&a.operator);
+        }
+    }
+
     /// Clears the step's gathered assignment gradients (before a step's passes).
     fn clear_assignment_gradients(&mut self) {
         for a in &mut self.assignments {
@@ -4374,8 +4382,10 @@ fn laplace_sums(scorer: &mut Scorer, device_posterior: &DevicePosterior, draws: 
         // the probe at `P`'s own predictions needs neither `M`'s targets nor the divergence's
         // gradient.
         let key = noise_seed(settings.seed, 0, b);
+        scorer.write_assignments(Relaxation::Soft)?;
         device_posterior.sample_into(scorer.experiments.explanation_mut(), key)?;
-        let factor = scorer.reversed(|e| e.fisher_probe_resident(&batch, &experiments, probe_key(key)))?;
+        let mut factor = scorer.reversed(|e| e.fisher_probe_resident(&batch, &experiments, probe_key(key)))?;
+        scorer.strip(&mut factor);
         for (op, u) in &factor {
             let u = wide.convert(u).map_err(error)?;
             match sums.get_mut(op) {
@@ -4462,6 +4472,7 @@ fn removal_curvature(scorer: &mut Scorer, posterior: &DevicePosterior, draws: &[
             seconds[part] += timed.elapsed().as_secs_f64();
             *timed = Instant::now();
         };
+        scorer.write_assignments(Relaxation::Soft)?;
         posterior.sample_into(scorer.experiments.explanation_mut(), key)?;
         lap(0, &mut timed);
         let batch = draw.batch(sequences)?;
@@ -4471,8 +4482,10 @@ fn removal_curvature(scorer: &mut Scorer, posterior: &DevicePosterior, draws: &[
         lap(2, &mut timed);
         // One forward pass at the batch's sample, reversed twice: the divergence's gradient (in
         // bits) and a draw of the Gauss–Newton factor.
-        let evaluation = scorer.reversed(|e| e.evaluate_probed(&batch, &experiments, Some(&targets), true, Some(probe_key(key))))?;
-        let factor = evaluation.factor.ok_or("no Gauss–Newton factor")?;
+        let mut evaluation = scorer.reversed(|e| e.evaluate_probed(&batch, &experiments, Some(&targets), true, Some(probe_key(key))))?;
+        let mut factor = evaluation.factor.take().ok_or("no Gauss–Newton factor")?;
+        scorer.strip(&mut evaluation.gradient);
+        scorer.strip(&mut factor.gradient);
         lap(3, &mut timed);
         posterior.add_removal((&evaluation.gradient, LN_2), &factor.gradient, key, &mut curvature, &mut pending)?;
         lap(4, &mut timed);
