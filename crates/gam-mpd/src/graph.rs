@@ -3797,11 +3797,13 @@ impl Checker {
     }
 
     /// `M`'s strongest pieces and connections for the behavior ([`Targets`]), measured once and
-    /// kept: every head's and every MLP's output zeroed at every token (equal to its removal,
-    /// graph_sites_tests), the two strongest MLPs' neurons removed in 8 contiguous groups (and, with
-    /// a VPD view, each of their two matrices' subcomponents in 8 groups), and every attention's and
-    /// MLP's output cut into each of the next 8 blocks from the counterfactual; a piece's or
-    /// connection's effect is the mean `KL(M ‖ M_e)` at the targets.
+    /// kept, from the coarse to the fine: every attention's and MLP's output zeroed at every token
+    /// (equal to removing it, graph_sites_tests); then each head of the strongest attentions, the two
+    /// strongest MLPs' neurons in 8 contiguous groups (and, with a VPD view, each of their two
+    /// matrices' subcomponents in 8 groups), and the strongest attentions' and MLPs' outputs cut
+    /// into each of the next 8 blocks from the counterfactual, `TARGETED` of each kind; a piece's or
+    /// connection's effect is the mean `KL(M ‖ M_e)` at the targets. A deep model measures a few
+    /// hundred runs this way, not one per head and per connection (Qwen3-0.6B: about 930).
     pub fn targets(&mut self) -> Result<Targets, String> {
         if let Some(t) = &self.targets {
             return Ok(t.clone());
@@ -3815,46 +3817,63 @@ impl Checker {
         let layers = self.weights.layers.len();
         let blocks = 2 * layers;
         let every = |site: SharedSite, operation: Operation, family: interchange::Family| Experiment::Sites { draw: SiteDraw { family, ops: vec![SiteOp { site, operation, onward: true }], position: 0, length: 1 } };
-        // Site operations leave the weights alone, so they run in parallel.
-        let mut site_runs: Vec<(Option<Block>, Option<SiteOp>, Experiment)> = Vec::new();
-        let mut h = 0;
-        for (l, layer) in self.weights.layers.iter().enumerate() {
-            for head in 0..layer.heads.len() {
-                site_runs.push((Some(Block::Heads { layer: l, heads: vec![head] }), None, every(SharedSite::Head(h), Operation::Scale(0), interchange::Family::Zero)));
-                h += 1;
-            }
-            if self.weights.neurons(l) > 0 {
-                site_runs.push((Some(Block::Neurons { layer: l, neurons: (0..self.weights.neurons(l)).collect() }), None, every(SharedSite::Mlp(l), Operation::Scale(0), interchange::Family::Zero)));
+        let model = graph.model(&self.weights);
+        // Site operations leave the weights alone, so each stage's runs go in parallel.
+        let measure = |this: &Self, runs: &[Experiment]| -> Result<Vec<f64>, String> {
+            runs.par_iter()
+                .map(|e| -> Result<f64, String> {
+                    let key = Self::key(e);
+                    let m = match this.disk_get(&key) {
+                        Some(m) => m,
+                        None => {
+                            let m = this.run(&model, e)?;
+                            this.disk_put(&key, &m);
+                            m
+                        }
+                    };
+                    Ok(effect(&m))
+                })
+                .collect()
+        };
+        // Stage 1: every attention's and MLP's output.
+        let sites: Vec<SharedSite> = (0..layers).flat_map(|l| [SharedSite::Attention(l), SharedSite::Mlp(l)]).filter(|s| !matches!(s, SharedSite::Mlp(l) if self.weights.neurons(*l) == 0)).collect();
+        let coarse = measure(self, &sites.iter().map(|&s| every(s, Operation::Scale(0), interchange::Family::Zero)).collect::<Vec<_>>())?;
+        let mut targets = Targets::default();
+        let mut ranked: Vec<(SharedSite, f64)> = sites.iter().copied().zip(coarse).collect();
+        ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+        for &(s, e) in &ranked {
+            if let SharedSite::Mlp(l) = s {
+                targets.pieces.push((Block::Neurons { layer: l, neurons: (0..self.weights.neurons(l)).collect() }, e));
             }
         }
-        if self.counterfactual_donors() || !self.donors.is_empty() {
-            for from in 0..blocks.saturating_sub(1) {
-                let site = if from % 2 == 0 { SharedSite::Attention(from / 2) } else { SharedSite::Mlp(from / 2) };
-                for to in from + 1..blocks.min(from + 9) {
-                    let op = SiteOp { site, operation: Operation::Cut { to }, onward: true };
-                    site_runs.push((None, Some(op), every(site, op.operation, interchange::Family::Cut)));
+        // Stage 2: each head of the strongest attentions, and the strongest outputs' connections.
+        let mut first = vec![0usize; layers + 1];
+        for (l, layer) in self.weights.layers.iter().enumerate() {
+            first[l + 1] = first[l] + layer.heads.len();
+        }
+        let mut fine: Vec<(Option<Block>, Option<SiteOp>, Experiment)> = Vec::new();
+        for &(s, _) in ranked.iter().filter(|(s, _)| matches!(s, SharedSite::Attention(_))).take(TARGETED) {
+            if let SharedSite::Attention(l) = s {
+                for head in 0..self.weights.layers[l].heads.len() {
+                    fine.push((Some(Block::Heads { layer: l, heads: vec![head] }), None, every(SharedSite::Head(first[l] + head), Operation::Scale(0), interchange::Family::Zero)));
                 }
             }
         }
-        let model = graph.model(&self.weights);
-        let this = &*self;
-        let measured: Vec<f64> = site_runs
-            .par_iter()
-            .map(|(_, _, e)| -> Result<f64, String> {
-                let key = Self::key(e);
-                let m = match this.disk_get(&key) {
-                    Some(m) => m,
-                    None => {
-                        let m = this.run(&model, e)?;
-                        this.disk_put(&key, &m);
-                        m
-                    }
+        if self.counterfactual_donors() || !self.donors.is_empty() {
+            for &(site, _) in ranked.iter().take(TARGETED) {
+                let from = match site {
+                    SharedSite::Attention(l) => 2 * l,
+                    SharedSite::Mlp(l) => 2 * l + 1,
+                    _ => continue,
                 };
-                Ok(effect(&m))
-            })
-            .collect::<Result<_, String>>()?;
-        let mut targets = Targets::default();
-        for ((piece, cut, _), e) in site_runs.into_iter().zip(measured) {
+                for to in from + 1..blocks.min(from + 9) {
+                    let op = SiteOp { site, operation: Operation::Cut { to }, onward: true };
+                    fine.push((None, Some(op), every(site, op.operation, interchange::Family::Cut)));
+                }
+            }
+        }
+        let measured = measure(self, &fine.iter().map(|(_, _, e)| e.clone()).collect::<Vec<_>>())?;
+        for ((piece, cut, _), e) in fine.into_iter().zip(measured) {
             if let Some(b) = piece {
                 targets.pieces.push((b, e));
             }
