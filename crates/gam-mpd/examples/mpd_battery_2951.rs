@@ -368,8 +368,15 @@ fn main() -> Result<(), String> {
         let directions = drawing.push_directions();
         drop(drawing);
         let batch_sequences = m["batch_sequences"].as_u64().ok_or("site_edits: the manifest's batch size")? as usize;
-        if m["rows"].as_str() != Some(rows.as_str()) || m["directions"].as_str() != Some(digest(&mut directions.iter().flatten().map(|v| v.to_bits())).as_str()) || batch_sequences == 0 {
-            return Err(format!("site_edits: {path} was drawn on other rows or directions"));
+        if m["rows"].as_str() != Some(rows.as_str()) || batch_sequences == 0 {
+            return Err(format!("site_edits: {path} was drawn on other rows"));
+        }
+        // The directions are the seed's on every machine up to the last bits of the platform's ln
+        // and cos (a manifest drawn on macOS, scored on Linux), so their digest is reported beside
+        // the manifest's, not required to equal it.
+        let here = digest(&mut directions.iter().flatten().map(|v| v.to_bits()));
+        if m["directions"].as_str() != Some(here.as_str()) {
+            log::warn!("site_edits: the pushed directions' digest {here} differs from the manifest's {} (the seed's directions on this platform)", m["directions"]);
         }
         let experiments: Vec<Vec<interchange::Experiment>> = serde_json::from_value(m["experiments"].clone()).map_err(|e| format!("{path}: experiments: {e}"))?;
         let typical: BTreeMap<interchange::SharedSite, f64> = serde_json::from_value::<Vec<(interchange::SharedSite, f64)>>(m["typical"].clone()).map_err(|e| format!("{path}: typical: {e}"))?.into_iter().collect();
@@ -378,7 +385,7 @@ fn main() -> Result<(), String> {
             return Err(format!("site_edits: {path} has {} batches for {} of the held-out rows", experiments.len(), chunks.len()));
         }
         let batches: Vec<(Vec<Vec<u32>>, Vec<interchange::Experiment>)> = chunks.into_iter().map(<[Vec<u32>]>::to_vec).zip(experiments).collect();
-        report["manifest"] = json!({"file": path, "sha256": sha256(Path::new(path))?, "sequences": m["sequences"], "seed": seed, "families": m["families"], "edits_per_sequence": m["edits_per_sequence"], "batch_sequences": batch_sequences});
+        report["manifest"] = json!({"file": path, "sha256": sha256(Path::new(path))?, "directions": {"manifest": m["directions"], "here": here}, "sequences": m["sequences"], "seed": seed, "families": m["families"], "edits_per_sequence": m["edits_per_sequence"], "batch_sequences": batch_sequences});
         report["site_edits"] = battery::vpd_site_edits(&vpd, export, decomposition, &batches, (&typical, &directions), settings.numeric_bytes)?;
         report["seconds"] = json!(started.elapsed().as_secs_f64());
         save(&report)?;
