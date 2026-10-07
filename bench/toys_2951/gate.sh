@@ -43,8 +43,10 @@ for toy in $toys; do
         echo "$name.$arm.$budget: $(tail -1 $out.log)" >> $root/FAILED.txt
         continue
       fi
-      $binary $t $out.json $out host parts $out/parts >> $out.log 2>&1
-      env MPD_MEM_GIB=3 ~/mpd-data/venv/bin/python $here/score_toys.py $t $out/parts > /dev/null
+      if ! { $binary $t $out.json $out host parts $out/parts >> $out.log 2>&1 && env MPD_MEM_GIB=3 ~/mpd-data/venv/bin/python $here/score_toys.py $t $out/parts > /dev/null; }; then
+        echo "$name.$arm.$budget parts: $(tail -1 $out.log)" >> $root/FAILED.txt
+        continue
+      fi
       $py $here/engine_edits.py $binary $t $out $out.json checkpoint.bin $native/MANIFEST_native.json > /dev/null || echo "$name.$arm.$budget edits: failed" >> $root/FAILED.txt
     done
   done
