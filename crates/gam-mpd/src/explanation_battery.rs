@@ -2799,7 +2799,7 @@ pub fn vpd_adversarial(
         let m_clean = one.m_run(None)?;
         for (f, form_records) in records.iter_mut().enumerate() {
             let clean = mean_from(&one.kl_bits(m_clean.value(vpd.m.hidden)?, one.form(f, &m_clean, None)?.value(vpd.e.hidden)?, 0)?);
-            let found = crate::adversary::ascend(seed, search, &draw.start, steps, probes, |candidates| {
+            let found = crate::adversary::ascend(seed, search, &draw.start, (steps, probes), clean, |candidates| {
                 let (runs, m_plan, e_plan) = pushed(&candidates)?;
                 let m_edited = runs.m_run(Some((&m_plan, None)))?;
                 let run = runs.form(f, &m_edited, Some((&e_plan, None)))?;
