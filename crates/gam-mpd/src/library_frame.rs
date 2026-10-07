@@ -30,7 +30,8 @@
 //!   duals, so the reads are sparse on the data and every map is still cut exactly.
 //!
 //! Each component is one atom's slices on the maps reading its space, with one own gate at that
-//! read, started at `τ = 0`: on wherever it reads anything, which is everywhere its output is
+//! read, started at `τ = 0` (for the sparse frame, at the largest coefficient its dual leaves where
+//! the ℓ1 solution is zero, the solver's residual, so a gate is off where the atom is not used): on wherever it reads anything, which is everywhere its output is
 //! nonzero, so the start is exact and no gate starts saturated. The direction arm gates the same
 //! components by `gᵀx − τ` with `g` the component's own read direction (its first read slice, the
 //! sign that makes its mean coefficient on the fitting rows positive), `c = 0` and `τ = 0`: on
@@ -270,7 +271,7 @@ impl Frame {
     /// 3,000 passes with 7 nonzero coefficients a row against the canonical dual's 320), to a
     /// relative residual of 1e-7 or 3,000 passes. Returns the dual and its coefficients' mean
     /// count of nonzeros per row (the ADMM's sparse iterate).
-    pub fn sparse_dual(&self, rows: &Array2<f64>) -> Result<(Array2<f64>, f64), String> {
+    pub fn sparse_dual(&self, rows: &Array2<f64>) -> Result<(Array2<f64>, f64, Vec<f64>), String> {
         let g0 = self.dual()?;
         let count = self.atoms.nrows();
         let p = Array2::<f64>::eye(count) - g0.dot(&self.atoms.t());
@@ -297,7 +298,13 @@ impl Frame {
         }
         let dual = &g0 + &y.t();
         let nonzeros = a.iter().filter(|v| **v != 0.0).count() as f64 / a.nrows().max(1) as f64;
-        Ok((dual, nonzeros))
+        // Per atom, the largest coefficient the dual leaves where the ℓ1 solution is zero: the
+        // solver's residual, not a read (module note's sparse start).
+        let coefficients = x.dot(&dual.t());
+        let floors = (0..count)
+            .map(|i| (0..a.nrows()).filter(|&r| a[[r, i]] == 0.0).map(|r| coefficients[[r, i]].abs()).fold(0.0_f64, f64::max))
+            .collect();
+        Ok((dual, nonzeros, floors))
     }
 }
 
@@ -394,13 +401,25 @@ fn standardized(magnitudes: &Array2<f64>) -> Array2<f64> {
 
 /// The frame of `kind` for a space of `rows` and its dual: the sparse dual for a sparse frame, the
 /// canonical dual otherwise.
-fn framed(kind: FrameKind, rows: &Array2<f64>, seed: u64) -> Result<(Frame, Array2<f64>), String> {
+fn framed(kind: FrameKind, rows: &Array2<f64>, seed: u64) -> Result<(Frame, Array2<f64>, Vec<f64>), String> {
     let frame = Frame::of(kind, rows, seed)?;
-    let dual = match kind {
-        FrameKind::Sparse => frame.sparse_dual(rows)?.0,
-        _ => frame.dual()?,
+    let (dual, floors) = match kind {
+        FrameKind::Sparse => {
+            let (dual, _, floors) = frame.sparse_dual(rows)?;
+            (dual, floors)
+        }
+        _ => {
+            let dual = frame.dual()?;
+            let zeros = vec![0.0; dual.nrows()];
+            (dual, zeros)
+        }
     };
-    Ok((frame, dual))
+    Ok((frame, dual, floors))
+}
+
+/// [`component`] with its threshold `tau`.
+fn component_at(read: Value, tau: f64, width: f64, slices: &[[usize; 2]]) -> Value {
+    json!({"read": read, "tau": tau, "width": width, "slices": slices})
 }
 
 /// One component of a start file, as library_vpd reads it: its read, `τ = 0`, its gate's width
@@ -509,7 +528,7 @@ pub fn frame_start(native: &OperatorProgram, layers: &[LayerNodes], fitting: &Fa
             // The attention's input: one frame for q, k and v; a component per atom.
             let x = value(layer.normed_stream)?;
             let zero_attention = [&wq, &wk, &wv].iter().all(|w| w.iter().all(|v| *v == 0.0));
-            let (attention_frame, attention_dual) = if zero_attention {
+            let (attention_frame, attention_dual, attention_floors) = if zero_attention {
                 for w in [&wq, &wk, &wv] {
                     layer_sites.push(Site::zero(w.nrows(), w.ncols()));
                 }
@@ -519,13 +538,13 @@ pub fn frame_start(native: &OperatorProgram, layers: &[LayerNodes], fitting: &Fa
                     1.0,
                     &[[site(0), 0], [site(1), 0], [site(2), 0]],
                 ));
-                (None, None)
+                (None, None, Vec::new())
             } else {
-                let (frame, dual) = framed(kind, &x, seed ^ (l as u64 * 6 + 1))?;
+                let (frame, dual, floors) = framed(kind, &x, seed ^ (l as u64 * 6 + 1))?;
                 for w in [&wq, &wk, &wv] {
                     layer_sites.push(Site::framed(w, &frame, &dual));
                 }
-                (Some(frame), Some(dual))
+                (Some(frame), Some(dual), floors)
             };
             // o reads the heads' outputs, concatenated.
             let heads_out = stack(layer.reads.iter().map(|&r| value(r)).collect::<Result<_, _>>()?, 1)?;
@@ -534,9 +553,9 @@ pub fn frame_start(native: &OperatorProgram, layers: &[LayerNodes], fitting: &Fa
                 layer_sites.push(Site::zero(wo.nrows(), wo.ncols()));
                 None
             } else {
-                let (frame, dual) = framed(kind, &heads_out, seed ^ (l as u64 * 6 + 2))?;
+                let (frame, dual, o_floors) = framed(kind, &heads_out, seed ^ (l as u64 * 6 + 2))?;
                 layer_sites.push(Site::framed(&wo, &frame, &dual));
-                Some((frame, dual))
+                Some((frame, dual, o_floors))
             };
             // The MLP: framed under the identity law, neuron groups under a nonlinear one.
             let Node::Pointwise { laws, .. } = &native.nodes[layer.active] else {
@@ -550,12 +569,12 @@ pub fn frame_start(native: &OperatorProgram, layers: &[LayerNodes], fitting: &Fa
                 layer_sites.push(Site::zero(down.nrows(), down.ncols()));
                 None
             } else if linear {
-                let (up_frame, up_dual) = framed(kind, &h2, seed ^ (l as u64 * 6 + 3))?;
+                let (up_frame, up_dual, up_floors) = framed(kind, &h2, seed ^ (l as u64 * 6 + 3))?;
                 layer_sites.push(Site::framed(&up, &up_frame, &up_dual));
                 let hidden = value(layer.active)?;
-                let (down_frame, down_dual) = framed(kind, &hidden, seed ^ (l as u64 * 6 + 4))?;
+                let (down_frame, down_dual, down_floors) = framed(kind, &hidden, seed ^ (l as u64 * 6 + 4))?;
                 layer_sites.push(Site::framed(&down, &down_frame, &down_dual));
-                Some((up_frame.atoms.nrows(), down_frame.atoms.nrows(), Some((up_dual, down_dual))))
+                Some((up_frame.atoms.nrows(), down_frame.atoms.nrows(), Some((up_dual, down_dual, up_floors, down_floors))))
             } else {
                 // Per neuron its c_fc row and down_proj column.
                 let m = up.nrows();
@@ -576,18 +595,19 @@ pub fn frame_start(native: &OperatorProgram, layers: &[LayerNodes], fitting: &Fa
                 shared.extend(candidates(&x.dot(&dual.t()).mapv(f64::abs), first).into_iter().enumerate().map(|(i, c)| (first + i, c)));
                 for i in 0..frame.atoms.nrows() {
                     let slices = [[site(0), i], [site(1), i], [site(2), i]];
-                    own.push(component(json!({"own": [site(0), i]}), own_width(&x, dual.row(i), 3.0), &slices));
+                    // The own gate reads the atom's coefficient through q, k and v: √3 |g_iᵀx|.
+                    own.push(component_at(json!({"own": [site(0), i]}), 3f64.sqrt() * attention_floors[i], own_width(&x, dual.row(i), 3.0), &slices));
                     direction.push(component(direction_read(&x, dual.row(i), site(0)), 1.0, &slices));
                 }
             }
-            if let Some((frame, dual)) = &o_frame {
+            if let Some((frame, dual, o_floors)) = &o_frame {
                 for i in 0..frame.atoms.nrows() {
-                    own.push(component(json!({"own": [site(3), i]}), own_width(&heads_out, dual.row(i), 1.0), &[[site(3), i]]));
+                    own.push(component_at(json!({"own": [site(3), i]}), o_floors[i], own_width(&heads_out, dual.row(i), 1.0), &[[site(3), i]]));
                     direction.push(component(direction_read(&heads_out, dual.row(i), site(3)), 1.0, &[[site(3), i]]));
                 }
             }
             // A zero MLP has no component (library_vpd adds zero for it).
-            if let Some((ups, downs, Some((up_dual, down_dual)))) = &mlp {
+            if let Some((ups, downs, Some((up_dual, down_dual, up_floors, down_floors)))) = &mlp {
                 let hidden = value(layer.active)?;
                 let first = own.len();
                 let up_magnitudes = h2.dot(&up_dual.t()).mapv(f64::abs);
@@ -596,11 +616,11 @@ pub fn frame_start(native: &OperatorProgram, layers: &[LayerNodes], fitting: &Fa
                 let first_down = first + *ups;
                 shared.extend(following(&hidden.dot(&down_dual.t()).mapv(f64::abs), &up_magnitudes, first).into_iter().enumerate().map(|(i, c)| (first_down + i, c)));
                 for i in 0..*ups {
-                    own.push(component(json!({"own": [site(4), i]}), own_width(&h2, up_dual.row(i), 1.0), &[[site(4), i]]));
+                    own.push(component_at(json!({"own": [site(4), i]}), up_floors[i], own_width(&h2, up_dual.row(i), 1.0), &[[site(4), i]]));
                     direction.push(component(direction_read(&h2, up_dual.row(i), site(4)), 1.0, &[[site(4), i]]));
                 }
                 for i in 0..*downs {
-                    own.push(component(json!({"own": [site(5), i]}), own_width(&hidden, down_dual.row(i), 1.0), &[[site(5), i]]));
+                    own.push(component_at(json!({"own": [site(5), i]}), down_floors[i], own_width(&hidden, down_dual.row(i), 1.0), &[[site(5), i]]));
                     direction.push(component(direction_read(&hidden, down_dual.row(i), site(5)), 1.0, &[[site(5), i]]));
                 }
             } else if let Some((m, _, None)) = &mlp {
