@@ -192,6 +192,7 @@ def main():
     ap.add_argument("--alpha", type=float, default=32.0)
     ap.add_argument("--eval-per-type", type=int, default=128)
     ap.add_argument("--hours", type=float, default=1.8)
+    ap.add_argument("--types", default="", help="train only on these question types (comma-separated), e.g. the types two compared runs share")
     ap.add_argument("--changed-share", type=float, default=0.5,
                     help="share of each type's draws taken from its questions whose measured answer differs from no change")
     ap.add_argument("--seed", type=int, default=0)
@@ -217,6 +218,8 @@ def main():
     adapters = wrap(model, args.rank, args.alpha)
     params = [p for a in adapters.values() for p in (a.A, a.B)]
     train = load(args.train)
+    if args.types:
+        train = {k: v for k, v in train.items() if k in args.types.split(",")}
     sets = {}
     for spec in args.heldout:
         name, _, pattern = spec.rpartition("=")

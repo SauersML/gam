@@ -8,7 +8,8 @@
 #   q06tc  Qwen3-0.6B with transcoder features PD.tc at layers 6, 14, 22 (hard links in predict/tc3): 8 tasks
 #          x 4,096 texts after q06's and the Mac's (data only)
 #   vpd4l  vpd4l with VPD subcomponents: 16 tasks x 4,096 Pile training rows (about 0.5 M questions)
-# The q06 and q8 SFT runs use the same steps, batch and held-out design: the self-explanation comparison.
+# The q06 and q8 SFT runs use the same steps, batch and held-out design: the self-explanation comparison
+# (SFT_TYPES=plain,edit,... restricts an SFT to the question types both runs have).
 set -Eeuo pipefail
 export PATH=$PATH:/Users/user/gam/bench/mats
 REF=${2:-$(git -C /Users/user/gam rev-parse origin/main)}
@@ -34,5 +35,5 @@ train=$(MATS_QOS=debug MATS_GPUS=1 MATS_ARRAY=$ARR sub mats-run "$N-train" 6 "$M
 held=$(MATS_QOS=debug MATS_GPUS=1 sub mats-run "$N-heldout" 6 "$MEM" 2 -- bash "$G/mats_heldout.sh" "$MODEL" "$D" "$HELDW" "$HTEXTS" "$BEH" "${EXTRA[@]}")
 if [ -n "${NOSFT:-}" ]; then echo "$N: train $train, heldout $held (commit ${REF:0:12})"; exit 0; fi
 sft=$(MATS_GPUS=1 MATS_AFTEROK="$train:$held" sub mats-run "$N-sft" 6 32 8 -- bash "$G/mats_sft.sh" Qwen/Qwen3-8B "$D/sft" \
-    "$D/train_*.jsonl,$D/behaviors_train.jsonl" 4000 5.2 "prompts=$D/heldout_prompts.jsonl" "pieces=$D/heldout_pieces.jsonl" "behaviors=$D/behaviors_heldout.jsonl")
+    "$D/train_*.jsonl,$D/behaviors_train.jsonl" 4000 5.2 "prompts=$D/heldout_prompts.jsonl" "pieces=$D/heldout_pieces.jsonl" "behaviors=$D/behaviors_heldout.jsonl" ${SFT_TYPES:+"--types=$SFT_TYPES"})
 echo "$N: train $train, heldout $held, sft $sft (commit ${REF:0:12})"
