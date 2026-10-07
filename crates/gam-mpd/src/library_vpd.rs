@@ -67,6 +67,10 @@ enum Read {
     Own([usize; 2]),
     /// `gᵀx + c` at `site`'s input (`coefficients`: `g` then `c`).
     Direction { site: usize, coefficients: Vec<f64> },
+    /// `‖V_bᵀā‖` at the MLP's input (`site` its c_fc map): the norm of the component's down-slice
+    /// reads on the activations `ā` of the layer with every c_fc slice on (a gate on the layer's
+    /// own all-on activation, which no linear read of the input gives).
+    Active { site: usize },
 }
 
 /// One component of a start file.
@@ -172,7 +176,7 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
     }
     let read_site = |c: &Component| match &c.read {
         Read::Own([site, _]) => *site,
-        Read::Direction { site, .. } => *site,
+        Read::Direction { site, .. } | Read::Active { site } => *site,
     };
     let mut artifact = Artifact::native(native)?;
     let mut shares = Vec::new();
@@ -193,8 +197,20 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
         }
         Ok(directions != 0)
     };
-    for comps in at.values() {
+    // Per stage whether its gates read the all-on activations (`Read::Active`: every component of
+    // an MLP input stage, unshared, each carrying down slices, or none).
+    let active_of = |comps: &[usize]| -> Result<bool, String> {
+        let active = comps.iter().filter(|&&b| matches!(components[b].read, Read::Active { .. })).count();
+        if active != 0 && active != comps.len() {
+            return Err(error(format!("a stage with {active} all-on activation reads among {} (a stage gates one way)", comps.len())));
+        }
+        Ok(active != 0)
+    };
+    for (&(_, stage_index), comps) in &at {
         direction_of(comps)?;
+        if active_of(comps)? && (stage_index != 2 || comps.iter().any(|&b| !components[b].candidates.is_empty())) {
+            return Err(error("all-on activation reads gate unshared components at the MLP's input only"));
+        }
     }
     let interfaces = native.interfaces().map_err(error)?;
     let node_interface = |node: usize| -> Result<Interface, String> { interfaces.get(node).cloned().ok_or_else(|| error(format!("no node {node}"))) };
@@ -290,11 +306,11 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
                     let w = cols.width();
                     let g = Array2::from_shape_fn((count, w), |(b, j)| match &components[comps[b]].read {
                         Read::Direction { coefficients, .. } => coefficients[j],
-                        Read::Own(_) => 0.0,
+                        Read::Own(_) | Read::Active { .. } => 0.0,
                     });
                     let c = Array2::from_shape_fn((count, 1), |(b, _)| match &components[comps[b]].read {
                         Read::Direction { coefficients, .. } => coefficients[w] - components[comps[b]].tau,
-                        Read::Own(_) => 0.0,
+                        Read::Own(_) | Read::Active { .. } => 0.0,
                     });
                     ops.push(dense(&format!("{prefix}.direction"), units(count)?, cols.clone(), g)?);
                     ops.push(dense(&format!("{prefix}.threshold"), units(count)?, Interface::constant(), c)?);
@@ -514,7 +530,7 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
         let (fc, dn) = (site(Kind::Up), site(Kind::Down));
         let f_comps = at.get(&(l, 2)).cloned().unwrap_or_default();
         let d_own = at.get(&(l, 3)).cloned().unwrap_or_default();
-        let (f_direction, d_direction) = (direction_of(&f_comps)?, direction_of(&d_own)?);
+        let (f_direction, d_direction, f_active) = (direction_of(&f_comps)?, direction_of(&d_own)?, active_of(&f_comps)?);
         let Node::Pointwise { input: pre, laws } = native.nodes[layer.active].clone() else {
             return Err(error(format!("layer {l}: the MLP activation is not one pointwise law")));
         };
@@ -556,7 +572,33 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
         if fc_assign.is_some() {
             shares.push(share_of(&format!("{name}.mlp.fc"), &f_comps)?);
         }
-        let (gated, z_f, s_f) = stage_nodes(&mut nodes, 0, (base, base + 4, base + 5, base + 6), fc_assign, f_direction);
+        let (gated, z_f, s_f) = if f_active {
+            // The all-on activations ā: every c_fc read, written with every slice on, through the
+            // activation law (the c_fc map's second use); per component the norm of its down reads
+            // on ā (`{name}.mlp.fc.active`, a copy of those reads held by the gate), less its
+            // threshold; then the c_fc reads gated.
+            let widths: Vec<usize> = f_comps.iter().map(|&b| slices_on(b, dn).len()).collect();
+            if widths.contains(&0) {
+                return Err(error(format!("layer {l}: an all-on activation read of a component with no down slice")));
+            }
+            let read: Vec<usize> = f_comps.iter().flat_map(|&b| slices_on(b, dn)).collect();
+            operators.push(dense(&format!("{name}.mlp.fc.active"), grouped(&widths)?, up_rows.clone(), Array2::from_shape_fn((read.len(), hidden), |(r, j)| factors[dn].v[[j, read[r]]]))?);
+            let active = base + operators.len() - 1;
+            nodes.push(Node::Affine { terms: vec![(0, base)], bias: None });
+            let a = nodes.len() - 1;
+            nodes.push(Node::Affine { terms: vec![(a, base + 1)], bias: None });
+            nodes.push(Node::Pointwise { input: nodes.len() - 1, laws: laws.clone() });
+            nodes.push(Node::Affine { terms: vec![(nodes.len() - 1, active)], bias: None });
+            nodes.push(Node::GroupNorm { input: nodes.len() - 1 });
+            nodes.push(Node::Affine { terms: vec![(nodes.len() - 1, base + 4)], bias: Some(base + 5) });
+            let z = nodes.len() - 1;
+            nodes.push(Node::Constant { operator: base + 6 });
+            let s = nodes.len() - 1;
+            nodes.push(Node::Gated { value: a, gate: z, scale: Some(s) });
+            (nodes.len() - 1, z, s)
+        } else {
+            stage_nodes(&mut nodes, 0, (base, base + 4, base + 5, base + 6), fc_assign, f_direction)
+        };
         nodes.push(Node::Affine { terms: vec![(gated, base + 1)], bias: None });
         nodes.push(Node::Pointwise { input: nodes.len() - 1, laws: laws.clone() });
         let act = nodes.len() - 1;
@@ -778,6 +820,16 @@ fn groups_of(artifact: Artifact, layers: &[LayerNodes], gate: Gate) -> Result<Ex
             }
             layer.functions.push(mine);
         }
+        // An all-on activation stage's gate reads, one group per component.
+        if let Ok(g) = named(&format!("{name}.mlp.fc.active")) {
+            trainable.push(g);
+            let mut r = 0;
+            for (b, group) in program.operators[g].rows.clone().groups().iter().enumerate() {
+                groups.push(Group { name: format!("{name}.mlp.fc.active{b}"), cells: vec![Cells { operator: g, rows: (r..r + group.width).collect(), cols: 0..cols_of(g) }] });
+                layer.thresholds.push(groups.len() - 1);
+                r += group.width;
+            }
+        }
         for prefix in ["fc", "dn"] {
             if let Ok(g) = named(&format!("{name}.mlp.{prefix}.direction")) {
                 trainable.push(g);
@@ -870,8 +922,14 @@ pub fn uses(native: &OperatorProgram, layers: &[LayerNodes], artifact: &Artifact
         }
         let Node::Pointwise { input: pre, .. } = native.nodes[layer.active] else { return Err(error(format!("layer {l}: the MLP activation is not one pointwise law"))) };
         let fc = map_of(pre, layer.normed)?;
-        out.push(owner(body, fc, 0..fc.cols.width(), "gate", (0, applying(body, &format!("{name}.mlp.fc_write"))?)));
-        let act = body.nodes.iter().position(|n| matches!(n, Node::Pointwise { .. })).ok_or_else(|| error(format!("{}: no activations", body.name)))?;
+        // Every use of the c_fc map (an all-on activation read's too, `Read::Active`).
+        let fc_write = index_of(program, &format!("{name}.mlp.fc_write"))?;
+        for (n, _) in body.nodes.iter().enumerate().filter(|(_, n)| matches!(n, Node::Affine { terms, .. } if terms.iter().any(|t| t.1 == fc_write))) {
+            out.push(owner(body, fc, 0..fc.cols.width(), "gate", (0, n)));
+        }
+        // The down map's input: the activations its reads take.
+        let dn_read = index_of(program, &format!("{name}.mlp.dn_read"))?;
+        let act = body.nodes.iter().find_map(|n| if let Node::Affine { terms, .. } = n { terms.iter().find(|t| t.1 == dn_read).map(|t| t.0) } else { None }).ok_or_else(|| error(format!("{}: no activations", body.name)))?;
         let down = map_of(layer.mlp, layer.active)?;
         out.push(owner(body, down, 0..down.cols.width(), "out", (act, body.output)));
     }
@@ -1024,9 +1082,12 @@ fn set_gate(part: &mut Dumped, read: String, (on, tau, g): StageGate) {
 pub fn dump_parts(native: &OperatorProgram, layers: &[LayerNodes], artifact: &Artifact, start: &Path, arm: &str, inputs: &FamilyInputs, dir: &Path) -> Result<usize, String> {
     let records: Vec<ArmRecord> = serde_json::from_slice(&std::fs::read(start).map_err(|e| error(format!("{}: {e}", start.display())))?).map_err(error)?;
     let components = records.into_iter().find(|r| r.arm == arm).ok_or_else(|| error(format!("{}: no arm {arm}", start.display())))?.components;
+    if components.iter().any(|c| matches!(c.read, Read::Active { .. })) {
+        return Err(error("dump_parts: all-on activation reads are not dumped"));
+    }
     let read_site = |c: &Component| match &c.read {
         Read::Own([site, _]) => *site,
-        Read::Direction { site, .. } => *site,
+        Read::Direction { site, .. } | Read::Active { site } => *site,
     };
     // Per layer and stage, the components gated there, as `explanation` orders them.
     let mut at: BTreeMap<(usize, usize), Vec<usize>> = BTreeMap::new();
@@ -1368,9 +1429,10 @@ mod tests {
     /// Dense random frames of every map of the tiny export, exact (`V` [in × C] random with
     /// `C = in + 4` slices, `U = Vᵀ(VVᵀ)⁻¹Wᵀ`, so `V U = Wᵀ` with no identity structure), every
     /// component on, under each kind of gate read: own reads at every stage; directions at every
-    /// stage (a small random `g`, a constant far above it); and stages of both kinds in one
+    /// stage (a small random `g`, a constant far above it); stages of both kinds in one
     /// explanation (own attention and down gates, direction c_fc gates, as a neuron start's export
-    /// beside its always-on attention). Each arm's `P` computes `M` (`KL(M ‖ P)` under 10⁻⁵ bits
+    /// beside its always-on attention); and c_fc-and-down components gated on their down reads of the
+    /// all-on activations (`Read::Active`). Each arm's `P` computes `M` (`KL(M ‖ P)` under 10⁻⁵ bits
     /// over every token), which a gate mode chosen for the whole explanation broke (an own gate in
     /// a direction explanation read the constant 0, `Φ(0) = 1/2`, halving its slices). A stage
     /// with both kinds of read is refused.
@@ -1406,7 +1468,7 @@ mod tests {
         // Component reads: own (threshold −1 below a norm) or a direction (g small, c = 10).
         let mut direction = |site: usize| serde_json::json!({"direction": {"site": site, "coefficients": (0..=inputs[site]).map(|j| if j < inputs[site] { 0.01 * (rng.random::<f64>() - 0.5) } else { 10.0 }).collect::<Vec<f64>>()}});
         let mut arms = Vec::new();
-        for (arm, [attention, up, down]) in [("own", [false; 3]), ("direction", [true; 3]), ("stages", [false, true, false]), ("mixed", [false, true, true])] {
+        for (arm, [attention, up, down]) in [("own", [false; 3]), ("direction", [true; 3]), ("stages", [false, true, false]), ("mixed", [false, true, true]), ("active", [false; 3]), ("active_gated", [false; 3])] {
             let mut components = Vec::new();
             for l in 0..2 {
                 let (q, o, fc, dn) = (6 * l, 6 * l + 3, 6 * l + 4, 6 * l + 5);
@@ -1417,8 +1479,10 @@ mod tests {
                 // on their own down gates; "mixed" puts one c_fc part on its own read.
                 for i in 0..count[fc] {
                     let own = !up || (arm == "mixed" && i == 0);
-                    let r = if own { serde_json::json!({"own": [fc, i]}) } else { direction(fc) };
-                    components.push(serde_json::json!({"read": r, "tau": -1.0, "slices": [[fc, i], [dn, i]]}));
+                    let r = if arm.starts_with("active") { serde_json::json!({"active": {"site": fc}}) } else if own { serde_json::json!({"own": [fc, i]}) } else { direction(fc) };
+                    // "active_gated": thresholds that turn about half of the parts off.
+                    let tau = if arm == "active_gated" { 0.05 } else { -1.0 };
+                    components.push(serde_json::json!({"read": r, "tau": tau, "slices": [[fc, i], [dn, i]]}));
                 }
                 for i in count[fc]..count[dn] {
                     let r = if down { direction(dn) } else { serde_json::json!({"own": [dn, i]}) };
@@ -1438,13 +1502,49 @@ mod tests {
         let sequences: Vec<Vec<u32>> = tokens.chunks(12).map(<[u32]>::to_vec).collect();
         let batch = Batch::new(sequences[..3].to_vec(), sequences[3..6].to_vec()).expect("the batch");
         let device = Device::host();
-        for arm in ["own", "direction", "stages"] {
+        for arm in ["own", "direction", "stages", "active"] {
             let explanation = super::explanation(&native, &layers, &factors, &start, arm).expect("the explanation");
             let blocks: Vec<_> = explanation.layers.iter().map(|l| l.sites.clone()).collect();
             let ic = Interchange::new(&device, &native, &blocks, &explanation.artifact, &explanation.trainable, Vec::new(), 1 << 30, 64).expect("the experiments");
             let clean: Vec<Experiment> = (0..3).map(|base| Experiment { base, source: base, explained: vec![true; 4], patch: None, position: 0 }).collect();
             let bits: f64 = ic.evaluate(&batch, &clean, false).expect("evaluate").bits.iter().flatten().sum();
             assert!(bits.abs() < 1e-5, "arm {arm}: KL(M ‖ P) = {bits} bits with every component on");
+        }
+        // Gated on the all-on activations, under neuron-group edits: the training path (both uses of
+        // the c_fc map take its rows' edit; the gate's reads are its own, not the down map's) equals
+        // M and P mutated directly (c_fc rows scaled in M's map and in P's slices' writes, down
+        // columns in M's map and in P's slices' reads).
+        let explanation = super::explanation(&native, &layers, &factors, &start, "active_gated").expect("the explanation");
+        let blocks: Vec<_> = explanation.layers.iter().map(|l| l.sites.clone()).collect();
+        let edits: Vec<crate::weight_edit::Drawn> = crate::weight_edit::candidates(&native, 3, 40).expect("the edits").into_iter().filter(|d| d.kind == crate::weight_edit::Kind::Neurons).take(4).collect();
+        assert!(!edits.is_empty(), "neuron-group edits drawn");
+        let mut ic = Interchange::new(&device, &native, &blocks, &explanation.artifact, &explanation.trainable, Vec::new(), 1 << 30, 64).expect("the experiments");
+        ic.set_weight_edits(edits.clone()).expect("the table");
+        let clean: Vec<Experiment> = (0..3).map(|base| Experiment { base, source: base, explained: vec![true; 4], patch: None, position: 0 }).collect();
+        let open: f64 = ic.evaluate(&batch, &clean, false).expect("evaluate").bits.iter().flatten().sum();
+        assert!(open > 1e-3, "some parts off: KL(M ‖ P) = {open} bits");
+        let scale = |program: &mut crate::operator_program::OperatorProgram, name: &str, rows: bool, units: &[usize], alpha: f64| {
+            let op = super::index_of(program, name).expect("the operator");
+            let old = std::sync::Arc::clone(&program.operators[op]);
+            let mut v = old.matrix();
+            for &u in units {
+                if rows { v.row_mut(u).mapv_inplace(|x| x * alpha) } else { v.column_mut(u).mapv_inplace(|x| x * alpha) }
+            }
+            let precision = crate::operator_program::exact_precision(v.iter().copied()).expect("a precision");
+            program.operators[op] = std::sync::Arc::new(crate::operator_program::Operator::dense(old.name.clone(), old.rows.clone(), old.cols.clone(), v, precision, old.provenance.clone()).expect("an operator"));
+        };
+        for (i, d) in edits.iter().enumerate() {
+            let experiments: Vec<Experiment> = (0..3).map(|base| Experiment { base, source: base, explained: vec![true; 4], patch: Some(crate::interchange::Patch::Weights { edit: i, block: d.block }), position: 0 }).collect();
+            let training: f64 = ic.evaluate(&batch, &experiments, false).expect("evaluate").bits.iter().flatten().sum();
+            let (mut m, mut p) = (native.clone(), explanation.artifact.clone());
+            for e in &d.entries {
+                scale(&mut m, &e.native, e.rows, &e.units, e.alpha);
+                let l = e.native.split('.').nth(1).expect("a layer");
+                let (part, rows) = if e.native.ends_with("c_fc") { ("fc_write", true) } else { ("dn_read", false) };
+                scale(&mut p.program, &format!("library.l{l}.mlp.{part}"), rows, &e.units, e.alpha);
+            }
+            let direct: f64 = Interchange::new(&device, &m, &blocks, &p, &explanation.trainable, Vec::new(), 1 << 30, 64).expect("the experiments").evaluate(&batch, &clean, false).expect("evaluate").bits.iter().flatten().sum();
+            assert!((training - direct).abs() <= 1e-9 * direct.abs().max(1.0), "edit {i}: training {training} bits, direct mutation {direct}");
         }
         let mixed = super::explanation(&native, &layers, &factors, &start, "mixed");
         assert!(mixed.as_ref().is_err_and(|e| e.contains("gates one way")), "a stage with both kinds of read is refused: {:?}", mixed.err());
