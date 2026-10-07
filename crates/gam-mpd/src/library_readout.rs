@@ -2381,3 +2381,27 @@ mod tests {
     }
 
 }
+
+impl Library<'_> {
+    /// The library's blocks as host matrices, for the graph checker (`graph::Weights`); the
+    /// unembedding carries the final norm's gain.
+    pub(crate) fn graph_weights(&self) -> crate::graph::Weights {
+        use crate::graph::{HeadWeights, LayerWeights, MlpWeights, Norm, Weights};
+        let norm = |s: &Site| Norm { gain: s.gain.clone(), epsilon: s.epsilon };
+        let layers = (0..self.layer_heads.len())
+            .map(|l| LayerWeights {
+                attention: norm(&self.sites[2 * l]),
+                heads: self.layer_heads[l]
+                    .iter()
+                    .map(|&h| {
+                        let b = &self.heads[h];
+                        HeadWeights { query: b.query.map.clone(), query_norm: b.query.norm.clone(), key: b.key.map.clone(), key_norm: b.key.norm.clone(), value: b.value.clone(), output: b.output.clone(), scale: b.scale, rotary: b.rotary, causal: b.causal }
+                    })
+                    .collect(),
+                mlp_norm: norm(&self.sites[2 * l + 1]),
+                mlp: self.mlps.iter().find(|b| b.layer == l).map(|b| MlpWeights { gate: b.gate.clone(), bias: b.bias.clone(), up: b.up.as_ref().map(|(_, m)| m.clone()), up_bias: b.up_bias.clone(), out: b.out.clone(), law: b.law }),
+            })
+            .collect();
+        Weights { layers, final_norm: norm(&self.final_site), unembedding: self.unembedding.clone(), embedding: self.embedding.clone() }
+    }
+}

@@ -46,6 +46,10 @@ pub mod resident_causal_fit;
 // The explanation as a library of learned functions, fitted end to end by variational MDL.
 pub mod library_mdl;
 pub mod library_readout;
+// The graph oracle's checker: a program's nodes and edges executed against M under verbatim experiments.
+pub mod graph;
+#[cfg(test)]
+mod graph_tests;
 // Shared functions of the library: one query-key function read by heads of several layers.
 pub mod library_sharing;
 // A learned mixture prior over the gate directions: read–write ties found by gradient.
