@@ -27,7 +27,8 @@ from pathlib import Path
 
 import numpy as np
 
-H = 16
+HEADS = {"qwen3-0.6b": 16, "qwen3-8b": 32, "vpd4l": 6}
+H = [16]  # the shard's model's heads per layer (set in main)
 
 
 def request(address: str, payload: dict) -> dict:
@@ -56,36 +57,59 @@ def parse_piece(text: str):
     m = re.fullmatch(r"L\[(\d+)\]\.mlp\[([\d, ]+)\]", text)
     if m:
         return ("neurons", int(m[1]), [int(x) for x in m[2].split(",")])
+    m = re.fullmatch(r"PD\.vpd\[(\d+)\]\.(\w+)\[([\d, ]+)\]", text)
+    if m:
+        return ("vpd", int(m[1]), m[2], [int(x) for x in m[3].split(",")])
+    m = re.fullmatch(r"PD\.tc\[(\d+)\]\[([\d, ]+)\]", text)
+    if m:
+        return ("tc", int(m[1]), [int(x) for x in m[2].split(",")])
     m = re.fullmatch(r"L\[(\d+)\]\.(mlp|head)\[:\]", text)
     if m:
         return ("mlp" if m[2] == "mlp" else "attn", int(m[1]))
     raise ValueError(text)
 
 
+REGISTERED = []  # non-empty once VPD's subcomponents are registered with the server
+
+
+class Unchecked(Exception):
+    """A piece with no oracle.rs counterpart for this intervention (transcoder features; VPD activity swaps)."""
+
+
 def edits(piece, alpha):
     kind = piece[0]
+    if kind == "vpd" and not REGISTERED:
+        raise Unchecked(kind)
+    if kind == "vpd":  # registered by register_vpd as "h.{l}.{attn|mlp}.{site}:{c}"
+        block = "mlp" if piece[2] in ("c_fc", "down_proj") else "attn"
+        return [{"component": {"kind": "registered", "id": f"h.{piece[1]}.{block}.{piece[2]}:{c}"}, "alpha": alpha} for c in piece[3]]
+    if kind == "tc":
+        raise Unchecked(kind)
     if kind == "head":
         return [{"component": {"kind": "head", "layer": piece[1], "head": piece[2]}, "alpha": alpha}]
     if kind == "neurons":
         return [{"component": {"kind": "neuron", "layer": piece[1], "index": i}, "alpha": alpha} for i in piece[2]]
     if kind == "mlp":
         return [{"component": {"kind": "operator", "name": f"blocks.{piece[1]}.down_proj"}, "alpha": alpha}]
-    return [{"component": {"kind": "head", "layer": piece[1], "head": h}, "alpha": alpha} for h in range(H)]
+    return [{"component": {"kind": "head", "layer": piece[1], "head": h}, "alpha": alpha} for h in range(H[0])]
 
 
 def swap_patches(piece, source):
     value = {"kind": "source", "tokens": source, "positions": [-1]}
     kind = piece[0]
+    if kind in ("vpd", "tc"):
+        raise Unchecked(kind)
     if kind == "head":
         return [{"site": {"kind": "head", "layer": piece[1], "head": piece[2]}, "positions": [-1], "value": value}]
     if kind == "neurons":
         return [{"site": {"kind": "neurons", "layer": piece[1]}, "positions": [-1], "coordinates": piece[2], "value": value}]
     if kind == "mlp":
         return [{"site": {"kind": "neurons", "layer": piece[1]}, "positions": [-1], "value": value}]
-    return [{"site": {"kind": "head", "layer": piece[1], "head": h}, "positions": [-1], "value": value} for h in range(H)]
+    return [{"site": {"kind": "head", "layer": piece[1], "head": h}, "positions": [-1], "value": value} for h in range(H[0])]
 
 
 def tokens_of(windows, text_id: str):
+    """The text of a corpus id "fineweb:ROW:T" / "pile:ROW:T": row ROW of the token file, first T tokens."""
     _, row, T = text_id.split(":")
     return [int(t) for t in windows[int(row), : int(T)]]
 
@@ -102,13 +126,18 @@ def main():
     ap.add_argument("--server", required=True)
     ap.add_argument("--model", required=True)
     ap.add_argument("--per-type", type=int, default=8)
+    ap.add_argument("--register-vpd", default="", help="vpd4l: VPD's decomposition export, registered so PD.vpd edits are checked")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
-    windows = np.memmap(args.windows, dtype="<u4", mode="r").reshape(-1, 128)
+    windows = np.load(args.windows, mmap_mode="r") if args.windows.endswith(".npy") else np.memmap(args.windows, dtype="<u4", mode="r").reshape(-1, 128)
+    if args.register_vpd:
+        print(json.dumps({"registered": request(args.server, {"op": "register_vpd", "model": args.model, "decomposition": args.register_vpd})}), flush=True)
+        REGISTERED.append(True)
     by_type = {}
     for line in open(args.shard):
         q = json.loads(line)
-        if q["source"] == "fineweb":
+        H[0] = HEADS[q["model"]]
+        if q["source"] in ("fineweb", "pile"):
             by_type.setdefault(q["type"], []).append(q)
     rng = np.random.default_rng(args.seed)
     report = {}
@@ -117,7 +146,9 @@ def main():
             continue
         picks = [qs[i] for i in rng.choice(len(qs), size=min(args.per_type, len(qs)), replace=False)]
         dp, dkl, dact, same, total, kls = [], [], [], 0, 0, []
+        unchecked = 0
         for q in picks:
+          try:
             toks = tokens_of(windows, q["text_id"])
             n = q["numbers"]
             run = lambda seq, iv: request(args.server, {"op": "run", "model": args.model, "sequences": [seq], "top": 10, "clean": True, "intervention": iv})["runs"][0]["positions"][0]  # noqa: E731
@@ -158,7 +189,9 @@ def main():
                                               "record": [{"kind": "neurons", "layer": l}], "full": True})["runs"][0]["positions"]
                 for entry, level in zip(reply, n["levels"]):
                     dact.append(abs(entry["record"][0]["value"][i] - level))
-        row = {"checked": len(picks)}
+          except Unchecked:
+            unchecked += 1
+        row = {"checked": len(picks) - unchecked, "unchecked": unchecked}
         if dp:
             row["max_abs_probability_difference"] = max(dp)
         if dkl:
