@@ -78,8 +78,8 @@ def main():
                         writes.append(w[:, n])
                         reads.append(e)
                         owner.append(("neuron", n))
-            if not writes:  # a zero map: one zero slice, owned by no component
-                writes, reads, owner = [np.zeros(w.shape[0])], [np.zeros(w.shape[1])], [None]
+            if not writes:  # a zero map: one zero slice (library_vpd wants every MLP stage to hold a component)
+                writes, reads, owner = [np.zeros(w.shape[0])], [np.zeros(w.shape[1])], [("neuron", 0) if kind.startswith("mlp") else None]
             U = np.stack(writes)  # (C, out)
             V = np.stack(reads, 1)  # (in, C)
             assert np.allclose((V @ U).T, w, atol=1e-10 * max(1.0, np.abs(w).max())), f"{kind} slices do not sum to M"
