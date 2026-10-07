@@ -214,7 +214,16 @@ pub fn use_device(device: Device) -> bool {
 /// shape instead re-uploaded a whole model after each edit (Qwen3-0.6B: the device thread spent
 /// its time uploading and freeing buffers).
 pub(crate) fn edited<A>(m: &Array2<A>) {
-    let key = (m.as_ptr() as usize, m.nrows(), m.ncols());
+    dropped((m.as_ptr() as usize, m.nrows(), m.ncols()));
+}
+
+/// [`edited`] for a host vector the device keeps as a `1 × n` row ([`row`]: a head norm's gain,
+/// an MLP's biases), which `Weights::quantize`'s restore releases with its head or MLP.
+pub(crate) fn edited_row(v: &Array1<f64>) {
+    dropped((v.as_ptr() as usize, 1, v.len()));
+}
+
+fn dropped(key: Key) {
     on_device(|s| {
         s.resident.remove(&key);
         s.stacks.retain(|(keys, _), _| !keys.contains(&key));

@@ -2425,6 +2425,9 @@ fn device_head_edited(w: &HeadWeights) {
     for m in [&w.query, &*w.key, &*w.value, &w.output] {
         crate::graph_device::edited(m);
     }
+    for (gain, _) in [&w.query_norm, &w.key_norm].into_iter().flatten() {
+        crate::graph_device::edited_row(gain);
+    }
 }
 
 /// The same for VPD's factors of an MLP or an attention (the device keeps them resident).
@@ -2445,6 +2448,8 @@ fn device_mlp_edited(m: &MlpWeights) {
     for x in [Some(&m.gate), m.up.as_ref(), Some(&m.out)].into_iter().flatten() {
         crate::graph_device::edited(x);
     }
+    crate::graph_device::edited_row(&m.bias);
+    crate::graph_device::edited_row(&m.up_bias);
 }
 
 impl Unquantize {
