@@ -26,7 +26,8 @@ changes as KL(M || M_e) in bits, the clean distribution first):
   where     where in the text a piece is most active -> the 3 positions of largest activity and the level
             (a neuron's activation; a head's write norm ||z_h W_o,h^T||), position 0 excluded (attention sink).
   continue  greedy continuation of S tokens with a piece scaled by 2 or 4 (the clean continuation given).
-  cut       cut an edge A >> B.route -> the new distribution and its KL.
+  cut       cut an edge A >> B (A a head, MLP or attention; B a head route, an MLP input, or logits = the
+            final residual before the norm) -> the new distribution and its KL.
   prompt    replace one token of the text -> the new distribution and its KL.
   swap      swap a piece's value from another text -> the new distribution and its KL.
 Pieces are drawn half uniformly and half among the pieces most active at the text's last position (a
@@ -74,7 +75,7 @@ class Interventions:
         self.neuron = torch.ones(B, L, Fn, device=dev, dtype=dtype)
         self.head_swap = None  # (mask [B, L, H] bool, values [B, L, H, hd])
         self.neuron_swap = None  # (mask [B, L, F] bool, values [B, L, F])
-        self.cuts = {}  # row -> (a_layer, a_head or -1 for the MLP, b_layer, b_head or -1, route)
+        self.cuts = {}  # row -> (a_kind head|mlp|attn, a_layer, a_head, b_kind head|mlp|logits, b_layer, b_head, route)
 
 
 class Qwen3:
@@ -126,14 +127,15 @@ class Qwen3:
             record.update(z_last=torch.empty(B, self.L, self.H, self.hd, device=self.dev, dtype=self.dtype),
                           act_last=torch.empty(B, self.L, self.Fn, device=self.dev, dtype=self.dtype),
                           mean_z=torch.empty(self.L, self.H, self.hd, device=self.dev, dtype=self.dtype),
-                          mean_mlp=torch.empty(self.L, self.d, device=self.dev, dtype=self.dtype), probe_values={})
+                          mean_mlp=torch.empty(self.L, self.d, device=self.dev, dtype=self.dtype),
+                          mean_attn=torch.empty(self.L, self.d, device=self.dev, dtype=self.dtype), probe_values={})
         for l, layer in enumerate(self.layers):
             x = layer.input_layernorm(h)
             q, k, v = self.qkv(layer, x, cos, sin)
             z = self.attend(q, k, v)
             if iv is not None:
-                for r, (al, ah, bl, bh, route) in iv.cuts.items():
-                    if bl == l and bh >= 0 and r in cut_delta:
+                for r, (ak, al, ah, bk, bl, bh, route) in iv.cuts.items():
+                    if bk == "head" and bl == l and r in cut_delta:
                         xr = layer.input_layernorm(h[r : r + 1] + cut_delta[r])
                         q2, k2, v2 = self.qkv(layer, xr, cos, sin)
                         g = bh // (self.H // self.KV)
@@ -159,15 +161,19 @@ class Qwen3:
                         record["probe_values"][r] = torch.linalg.vector_norm(z[r, :, ph] @ self.Wo[l][:, ph].T, dim=-1)
             attn_out = layer.self_attn.o_proj(z.reshape(B, T, self.H * self.hd))
             if iv is not None:
-                for r, (al, ah, bl, bh, route) in iv.cuts.items():
-                    if al == l and ah >= 0:
+                for r, (ak, al, ah, bk, bl, bh, route) in iv.cuts.items():
+                    if al == l and ak == "head":
                         write = z[r, :, ah] @ self.Wo[l][:, ah].T
                         cut_delta[r] = (means["mean_z"][l, ah] @ self.Wo[l][:, ah].T)[None] - write
+                    elif al == l and ak == "attn":
+                        cut_delta[r] = means["mean_attn"][l][None] - attn_out[r]
+            if record is not None:
+                record["mean_attn"][l] = attn_out[:, 1:].mean(dim=(0, 1))
             mid = h + attn_out
             y = layer.post_attention_layernorm(mid)
             if iv is not None:
-                for r, (al, ah, bl, bh, route) in iv.cuts.items():
-                    if bl == l and bh < 0 and r in cut_delta:
+                for r, (ak, al, ah, bk, bl, bh, route) in iv.cuts.items():
+                    if bk == "mlp" and bl == l and r in cut_delta:
                         y = y.clone()
                         y[r] = layer.post_attention_layernorm(mid[r] + cut_delta[r])
             mlp = layer.mlp
@@ -189,10 +195,15 @@ class Qwen3:
             if record is not None:
                 record["mean_mlp"][l] = mlp_out[:, 1:].mean(dim=(0, 1))
             if iv is not None:
-                for r, (al, ah, bl, bh, route) in iv.cuts.items():
-                    if al == l and ah < 0:
+                for r, (ak, al, ah, bk, bl, bh, route) in iv.cuts.items():
+                    if al == l and ak == "mlp":
                         cut_delta[r] = means["mean_mlp"][l][None] - mlp_out[r]
             h = mid + mlp_out
+        if iv is not None:
+            for r, (ak, al, ah, bk, bl, bh, route) in iv.cuts.items():
+                if bk == "logits":
+                    h = h.clone()
+                    h[r] = h[r] + cut_delta[r]
         return self.inner.norm(h[:, -1])
 
     def log_probs(self, final: torch.Tensor) -> torch.Tensor:
@@ -281,31 +292,36 @@ class Draw:
     def uniform(self):
         r = self.rng.random()
         L = int(self.rng.integers(self.m.L))
-        if r < 0.45:
+        if r < 0.3:
             return ("head", L, int(self.rng.integers(self.m.H)))
-        if r < 0.85:
-            k = int(self.rng.choice([1, 1, 2, 4, 8]))
+        if r < 0.6:
+            k = int(self.rng.choice([1, 4, 16, 64]))
             return ("neurons", L, tuple(sorted(int(i) for i in self.rng.choice(self.m.Fn, size=k, replace=False))))
-        if r < 0.95:
+        if r < 0.8:
             return ("mlp", L)
         return ("attn", L)
 
+    def aimed_head(self, rec, row, L):
+        z = rec["z_last"][row, L]  # [H, hd]
+        norms = torch.linalg.vector_norm(torch.einsum("dhk,hk->hd", self.m.Wo[L], z), dim=-1)
+        return int(self.rng.choice(norms.topk(4).indices.tolist()))
+
     def aimed(self, rec, row):
-        """A piece among the most active at the row's last position: a head by write norm, or neurons by
-        |activation| (top 64 of the layer)."""
+        """A piece among the most active at the row's last position: a head among the 4 of largest write
+        norm in its layer, or neurons among the 256 of largest |activation|."""
         L = int(self.rng.integers(self.m.L))
         if self.rng.random() < 0.5:
-            z = rec["z_last"][row, L]  # [H, hd]
-            norms = torch.linalg.vector_norm(torch.einsum("dhk,hk->hd", self.m.Wo[L], z), dim=-1)
-            top = norms.topk(4).indices.tolist()
-            return ("head", L, int(self.rng.choice(top)))
-        a = rec["act_last"][row, L].abs()
-        top = a.topk(64).indices.cpu().numpy()
-        k = int(self.rng.choice([1, 1, 2, 4, 8]))
-        return ("neurons", L, tuple(sorted(int(i) for i in self.rng.choice(top, size=k, replace=False))))
+            return ("head", L, self.aimed_head(rec, row, L))
+        top = rec["act_last"][row, L].abs().topk(256).indices.cpu().numpy()
+        k = int(self.rng.choice([1, 4, 16, 64]))
+        return ("neurons", L, tuple(sorted(int(i) for i in self.rng.choice(top[: max(k, 16 * k if k < 16 else 256)], size=k, replace=False))))
 
-    def piece(self, rec, row):
-        return self.aimed(rec, row) if self.rng.random() < 0.5 else self.uniform()
+    def piece(self, rec, row, small=False):
+        """Half aimed, half uniform; `small` keeps neuron groups at 4 or fewer (questions listing several pieces)."""
+        while True:
+            p = self.aimed(rec, row) if self.rng.random() < 0.5 else self.uniform()
+            if not small or p[0] != "neurons" or len(p[2]) <= 4:
+                return p
 
 
 # ---------------------------------------------------------------- one batch of texts
@@ -354,7 +370,7 @@ def batch_questions(m: Qwen3, w: Writer, draw: Draw, tokens: torch.Tensor, sourc
     edited_questions("edit", iv, desc, extra)
 
     # rank: 4 candidates, one removal per forward
-    cands = [[draw.piece(rec, r) for _ in range(4)] for r in rows]
+    cands = [[draw.piece(rec, r, small=True) for _ in range(4)] for r in rows]
     kls = torch.empty(B, 4, dtype=m.wide)
     for c in range(4):
         iv = m.new(B)
@@ -397,16 +413,24 @@ def batch_questions(m: Qwen3, w: Writer, draw: Draw, tokens: torch.Tensor, sourc
     # cut
     iv, desc, extra = m.new(B), [], []
     for r in rows:
-        al = int(rng.integers(m.L - 1))
-        ah = int(rng.integers(m.H)) if rng.random() < 0.6 else -1
-        bl = int(rng.integers(al + (1 if ah < 0 else 0), m.L))
-        bh = int(rng.integers(m.H)) if (rng.random() < 0.6 or (ah >= 0 and bl == al)) else -1
-        if ah >= 0 and bl == al:
-            bh = -1  # a head's write reaches its own layer's MLP only
-        route = ROUTES[int(rng.integers(3))] if bh >= 0 else "input"
-        iv.cuts[r] = (al, ah, bl, bh, route)
-        a_txt = f"L[{al}].head[{ah}]" if ah >= 0 else f"L[{al}].mlp"
-        b_txt = (f"L[{bl}].head[{bh}].{route}" if bh >= 0 else f"L[{bl}].mlp.input")
+        al = int(rng.integers(m.L))
+        u = rng.random()
+        if u < 0.5:
+            ak, ah = "head", (draw.aimed_head(rec, r, al) if rng.random() < 0.5 else int(rng.integers(m.H)))
+        else:
+            ak, ah = ("mlp" if u < 0.75 else "attn"), -1
+        first = al + (1 if ak == "mlp" else 0)  # the earliest layer whose readers see A's write
+        v = rng.random()
+        if v < 0.3 or first >= m.L:
+            bk, bl, bh, route = "logits", m.L, -1, ""
+        elif v < 0.65 or first + (0 if ak == "mlp" else 1) >= m.L:
+            bk, bl, bh, route = "mlp", int(rng.integers(first, min(m.L, first + 4))), -1, "input"
+        else:
+            lo = first if ak == "mlp" else first + 1
+            bk, bl, bh, route = "head", int(rng.integers(lo, min(m.L, lo + 4))), int(rng.integers(m.H)), ROUTES[int(rng.integers(3))]
+        iv.cuts[r] = (ak, al, ah, bk, bl, bh, route)
+        a_txt = f"L[{al}].head[{ah}]" if ak == "head" else f"L[{al}].{ak}"
+        b_txt = {"logits": "logits", "mlp": f"L[{bl}].mlp.input", "head": f"L[{bl}].head[{bh}].{route}"}[bk]
         desc.append(f"<intervention> cut({a_txt} >> {b_txt})\n")
         extra.append({"edge": f"{a_txt} >> {b_txt}"})
     edited_questions("cut", iv, desc, extra)
@@ -495,6 +519,8 @@ def main():
                 for q in qs:
                     f.write(json.dumps(q, ensure_ascii=False) + "\n")
                 f.flush()
+                if dev.type == "mps":
+                    torch.mps.empty_cache()
                 written += len(qs)
                 texts += len(rows)
                 rate = texts / (time.time() - started)
