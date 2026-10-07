@@ -421,7 +421,6 @@ def induction(out: Path):
     files = {}
     config = model.export(out, files)
     rows = batch(HELD_OUT // 8, torch.Generator().manual_seed(1))
-    write(out, files, "tokens", rows.double().numpy())
     induction_truth(out, model, rows, files, config)
 
 
@@ -450,7 +449,15 @@ def induction_truth(out: Path, model, rows, files, config):
     from a token with an earlier occurrence at s to s+1 or s+2 above 1/2: the head's key is the
     token a previous-token head copied there, its value the token after); 1/2 is a reporting cut
     for the truth, never a method setting. Each head is one mechanism of its head's rank."""
+    # rows: the held-out sequences, then training sequences of the same law for a fit
     T = rows.shape[1]
+    train = torch.randint(1, model.cfg["vocab"], (HELD_OUT, T), generator=torch.Generator().manual_seed(2))
+    train[:, 0] = 0
+    g = torch.Generator().manual_seed(3)
+    for i in range(HELD_OUT):
+        s, l = int(torch.randint(1, 4, (1,), generator=g)), int(torch.randint(6, 13, (1,), generator=g))
+        train[i, s + l: s + 2 * l] = train[i, s: s + l]
+    write(out, files, "tokens", torch.cat([rows, train]).double().numpy())
     pats = []
     with torch.no_grad():
         model(rows, pats)
@@ -531,6 +538,7 @@ if __name__ == "__main__":
         sys.exit(0)
     if toy == "truth:induction":
         model, record, rows = load_lm(root / "induction", mlp_on=False)
+        rows = rows[: HELD_OUT // 8]
         induction_truth(root / "induction", model, rows, record["files"], record["config"])
         sys.exit(0)
     if toy.startswith("truth:"):

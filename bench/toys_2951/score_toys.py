@@ -335,9 +335,9 @@ def references(toy: Toy, root: Path):
             gate = {"kind": "always", "read": first}
         else:
             # the gate reads the mechanism's own feature: V's single column on the first operator
-            # (e_i for TMS, the embedding's dual frame vector for compressed computation), at the
-            # rounding of that frame (|x_i| is exact for TMS; the dual frame's rounding is ~1e-15)
-            gate = {"kind": "own", "read": first, "tau": 1e-9 if toy.kind == "resid_mlp" else 0.0}
+            # (e_i for TMS, the embedding's dual frame vector for compressed computation); tau is
+            # above that column's factorization rounding (~1e-16 on the other features)
+            gate = {"kind": "own", "read": first, "tau": 1e-9}
         truth.append({"name": m["name"], "slices": slices, "gate": gate})
     write_parts(root / "truth", truth, {"fitter": "truth: the known mechanisms as parts, gated by their feature"})
 
