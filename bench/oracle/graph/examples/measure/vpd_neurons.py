@@ -6,7 +6,8 @@ KL(M_clean || M_patched top-k) + k * numbers per neuron * 1/2 log2 N / N (the op
 token of declaring them, N = 2^24 scored tokens) is reported. The clean family is a proxy for the
 checker's whole score.
 
-  MPD_MEM_GIB=4 mem-lease 4 ~/mpd-data/venv/bin/python vpd_neurons.py BEHAVIOR.json LAYER OUT.json
+  MPD_MEM_GIB=4 mem-lease 4 ~/mpd-data/venv/bin/python vpd_neurons.py OUT_DIR BEHAVIOR.json:LAYER [...]
+(OUT_DIR/neurons_<behavior id>_l<LAYER>.json each; vpd4l is loaded once)
 """
 
 import json
@@ -27,11 +28,19 @@ CHUNK = 16
 
 @torch.no_grad()
 def main():
-    behavior, layer, out = Path(sys.argv[1]), int(sys.argv[2]), Path(sys.argv[3])
+    out_dir = Path(sys.argv[1])
+    out_dir.mkdir(parents=True, exist_ok=True)
     dev = VL.device()
     t = VL.Model(dev).t
+    for job in sys.argv[2:]:
+        if not job.endswith(".json") and ":" in job:
+            path, layer = job.rsplit(":", 1)
+            beh = json.loads(Path(path).read_text())
+            neurons(t, dev, beh, int(layer), out_dir / f"neurons_{beh['id']}_l{layer}.json")
+
+
+def neurons(t, dev, beh: dict, layer: int, out: Path):
     H, D = t.n_head, t.hd
-    beh = json.loads(behavior.read_text())
     prompts = [p for p in beh["prompts"] if p.get("counterfactual")]
     T = max(len(p["token_ids"]) for p in prompts)
 
