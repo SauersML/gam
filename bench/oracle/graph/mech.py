@@ -376,6 +376,9 @@ def node(*pieces, rule=None) -> Node:
     for p in pieces:
         if not isinstance(p, Piece):
             raise MechError(f"node(): {p!r} is not a piece address such as L[1].head[1]")
+    if len({(p.layer, p.block()) for p in pieces}) > 1:
+        raise MechError("a node's pieces must lie in one layer's attention or one layer's MLP; "
+                        "make one node per site and connect them with edges")
     merged: dict[tuple, set] = {}
     for p in pieces:
         merged.setdefault((p.view, p.layer, p.kind), set()).update(p.index)

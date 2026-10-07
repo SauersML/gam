@@ -36,14 +36,14 @@ def test_examples_trace():
 
 
 def test_ir_fields():
-    ir = mech.trace_inline(HEAD + "a = node(L[1].head[1], L[1].head[3])\nb = node(L[2].mlp[5:8], PD.vpd[3].c_fc[2])\n"
+    ir = mech.trace_inline(HEAD + "a = node(L[1].head[1], L[1].head[3])\nb = node(PD.vpd[3].c_fc[2], PD.vpd[3].down_proj[5:8])\n"
                            "edges(a >> b, embed >> a.query, b >> logits)\nnode(L[0].mlp[9]) >> a.key\n", "vpd4l")
     assert ir["valid"], ir["error"]
     assert set(ir) == {"model", "nodes", "edges", "python_tokens", "token_types", "source", "valid", "error"}
     assert ir["nodes"] == [
         {"id": "a", "pieces": [{"view": "native", "layer": 1, "kind": "head", "index": [1, 3]}], "rule": None},
-        {"id": "b", "pieces": [{"view": "native", "layer": 2, "kind": "mlp", "index": [5, 6, 7]},
-                               {"view": "vpd", "layer": 3, "kind": "c_fc", "index": 2}], "rule": None},
+        {"id": "b", "pieces": [{"view": "vpd", "layer": 3, "kind": "c_fc", "index": 2},
+                               {"view": "vpd", "layer": 3, "kind": "down_proj", "index": [5, 6, 7]}], "rule": None},
         {"id": "node0", "pieces": [{"view": "native", "layer": 0, "kind": "mlp", "index": 9}], "rule": None},
     ]
     assert ir["edges"] == [{"from": "a", "to": "b", "route": "input"}, {"from": "embed", "to": "a", "route": "query"},
@@ -79,6 +79,8 @@ def test_invalid_programs():
     assert "is a read" in invalid(HEAD + "a = node(L[1].head[0])\nb = node(L[2].mlp[0])\nedges(a.key >> b)")
     assert "not an edge" in invalid(HEAD + "a = node(L[1].mlp[0])\nedges(a)")
     assert "line 2" in invalid(HEAD + "node(L[9].head[0])")
+    assert "one layer's attention" in invalid(HEAD + "node(L[1].head[0], L[2].head[0])")
+    assert "one layer's attention" in invalid(HEAD + "node(L[1].head[0], L[1].mlp[0])")
     assert "syntax error" in invalid(HEAD + "a = node(")
     assert "unknown model" in invalid(HEAD, model="gpt2")
     # a same-layer edge into an internal stream is legal

@@ -18,19 +18,31 @@ depends on the prompt.
 """
 from mech import node, edges, L, embed, logits
 
-prev_early = node(L[1].head[3], L[2].head[12])   # write the previous token at each position
-induction_early = node(L[3].head[10])            # finds the position after the earlier copy, copies it
-prev_late = node(L[15].head[3], L[20].head[0])
-induction_late = node(L[16].head[14], L[21].head[8])
+prev1 = node(L[1].head[3])      # previous-token heads: write the previous token at each position
+prev2 = node(L[2].head[12])
+induction3 = node(L[3].head[10])  # finds the position after the earlier copy and copies its token
+prev15 = node(L[15].head[3])
+prev20 = node(L[20].head[0])
+induction16 = node(L[16].head[14])
+induction21 = node(L[21].head[8])
 
 edges(
-    embed >> prev_early.value,              # the token to move forward one position
-    prev_early >> induction_early.key,      # key at j+1: "the word before me was A"
-    embed >> induction_early.query,         # query at t: "I am A"
-    embed >> induction_early.value,         # value at j+1: B, the word to copy
-    embed >> prev_late.value,
-    prev_late >> induction_late.key,
-    embed >> induction_late.value,
-    induction_early >> logits,
-    induction_late >> logits,               # B
+    embed >> prev1.value,           # the token to move forward one position
+    embed >> prev2.value,
+    prev1 >> induction3.key,        # key at j+1: "the word before me was A"
+    prev2 >> induction3.key,
+    embed >> induction3.query,      # query at t: "I am A"
+    embed >> induction3.value,      # value at j+1: B, the word to copy
+    embed >> prev15.value,
+    embed >> prev20.value,
+    prev15 >> induction16.key,
+    prev15 >> induction21.key,
+    prev20 >> induction21.key,
+    embed >> induction16.query,
+    embed >> induction21.query,
+    embed >> induction16.value,
+    embed >> induction21.value,
+    induction3 >> logits,
+    induction16 >> logits,
+    induction21 >> logits,          # B
 )
