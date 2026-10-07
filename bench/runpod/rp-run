@@ -467,8 +467,9 @@ ASSETS=https://github.com/SauersML/gam/releases/download/rp-run-bin
 DATA_ASSETS=https://github.com/SauersML/gam/releases/download/rp-run-data
 PUBLISHED=$MAC_DATA/runpod/published.tsv
 # The most a run may upload from the Mac (unpublished inputs): 50 MB, under half a minute at the
-# Mac's measured uplink.
-UPLOAD_MAX_MB=50
+# Mac's measured uplink. RP_UPLOAD_MAX_MB raises it for one run (a private 70 MB LoRA adapter, which
+# must not be published, goes up in a few minutes).
+UPLOAD_MAX_MB=${RP_UPLOAD_MAX_MB:-50}
 # Seconds of setup (pod creation to command start, the GPU idle and paid) past which a run's setup
 # is a failure to fix.
 SETUP_FAIL=600
