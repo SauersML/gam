@@ -109,15 +109,18 @@ def load(pattern):
     return by_type
 
 
+CHANGED_MIN = [0.1]  # bits; --changed-min
+
+
 def changed(q) -> bool:
-    """Whether the measured answer differs from no change: KL above 0.1 bits (the largest of a rank
+    """Whether the measured answer differs from no change: KL above CHANGED_MIN bits (the largest of a rank
     question's four), or a continuation that differs from the clean one."""
     n = q["numbers"]
-    if "kl_bits_after_removal" in n:  # carry: some removal moves the edit's effect by more than 0.1 bits
-        return max(abs(v - n["kl_bits_edit"]) for v in n["kl_bits_after_removal"]) > 0.1
+    if "kl_bits_after_removal" in n:  # carry: some removal moves the edit's effect by more than the threshold
+        return max(abs(v - n["kl_bits_edit"]) for v in n["kl_bits_after_removal"]) > CHANGED_MIN[0]
     if "kl_bits" in n:
         v = n["kl_bits"]
-        return (max(v) if isinstance(v, list) else v) > 0.1
+        return (max(v) if isinstance(v, list) else v) > CHANGED_MIN[0]
     if "tokens_unchanged" in n:
         return n["tokens_unchanged"] < len(n["edited_ids"])
     return True
@@ -237,6 +240,7 @@ def main():
     ap.add_argument("--alpha", type=float, default=32.0)
     ap.add_argument("--eval-per-type", type=int, default=128)
     ap.add_argument("--hours", type=float, default=1.8)
+    ap.add_argument("--changed-min", type=float, default=0.1, help="threshold of changed() in bits: --changed-share draws from questions above it")
     ap.add_argument("--types", default="", help="train only on these question types (comma-separated), e.g. the types two compared runs share")
     ap.add_argument("--changed-share", type=float, default=0.5,
                     help="share of each type's draws taken from its questions whose measured answer differs from no change")
@@ -248,6 +252,7 @@ def main():
     ap.add_argument("--export-peft", default="", help="only convert OUT/adapters.safetensors to OUT/peft (no training)")
     args = ap.parse_args()
     FORMAT["name"] = args.format
+    CHANGED_MIN[0] = args.changed_min
     if args.export_peft:
         save_peft(Path(args.export_peft), Path(args.out), args.model, args.rank, args.alpha)
         return

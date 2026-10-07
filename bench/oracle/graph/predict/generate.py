@@ -477,9 +477,32 @@ class Draw:
         k = min(len(live), int(self.rng.choice([1, 1, 4] if small else [1, 4, 16])))
         return ("tc", L, tuple(sorted(int(i) for i in self.rng.choice(live, size=k, replace=False))))
 
+    def large(self, rec, row):
+        """A piece likely to move M (--aim large): a whole MLP or attention (training split only), the head of
+        largest write norm in its layer, or 16 or 64 neurons among the 256 most active (all at the last position)."""
+        r = self.rng.random()
+        if self.split == "train" and r < 0.25:
+            return ("mlp", int(self.rng.integers(self.m.L)))
+        if self.split == "train" and r < 0.4:
+            return ("attn", int(self.rng.integers(self.m.L)))
+        if r < 0.7:
+            L = self.layer_with_heads()
+            z = rec["z_last"][row, L]
+            norms = torch.linalg.vector_norm(torch.einsum("dhk,hk->hd", self.m.Wo[L], z), dim=-1)
+            norms = torch.where(self.mask("head", L, self.m.H), norms, torch.full_like(norms, -1.0))
+            return ("head", L, int(norms.argmax()))
+        L = int(self.rng.integers(self.m.L))
+        a = rec["act_last"][row, L].abs()
+        a = torch.where(self.mask("neuron", L, self.m.Fn), a, torch.full_like(a, -1.0))
+        top = a.topk(min(256, len(self.neurons[L]))).indices.cpu().numpy()
+        k = int(self.rng.choice([16, 64]))
+        return ("neurons", L, tuple(sorted(int(i) for i in self.rng.choice(top, size=min(k, len(top)), replace=False))))
+
     def piece(self, rec, row, small=False):
         """Half aimed, half uniform (a quarter transcoder features when transcoders are loaded); `small`
         keeps neuron groups at 4 or fewer (questions listing several pieces)."""
+        if OPTIONS["aim"] == "large" and not small:
+            return self.large(rec, row)
         while True:
             if (self.m.tc and self.rng.random() < 0.25) or (self.m.parts and self.rng.random() < 0.4):
                 p = self.feature(rec, row, small)
@@ -492,6 +515,13 @@ class Draw:
 
 
 # ---------------------------------------------------------------- one batch of texts
+
+
+OPTIONS = {"types": None, "min_kl": float("-inf"), "aim": "mixed"}  # set by main: --types, --min-kl, --aim
+
+
+def want(kind: str) -> bool:
+    return OPTIONS["types"] is None or kind in OPTIONS["types"]
 
 
 def batch_questions(m: Qwen3, w: Writer, draw: Draw, tokens: torch.Tensor, source: str, split: str, steps: int, ids: list, counterfactuals=None):
@@ -555,165 +585,182 @@ def batch_questions(m: Qwen3, w: Writer, draw: Draw, tokens: torch.Tensor, sourc
         cf_extra.append({"position": p, "old": old, "new": new})
 
     # plain (no piece: not asked in held-out-piece shards, nor prompt edits)
-    for r in rows if draw.split == "train" else []:
-        emit(r, "plain", f"<text> {texts[r]}\n<question> next-token distribution\n", clean_txt[r][0], {"edited": clean_txt[r][1]})
+    if want("plain"):
+        for r in rows if draw.split == "train" else []:
+            emit(r, "plain", f"<text> {texts[r]}\n<question> next-token distribution\n", clean_txt[r][0], {"edited": clean_txt[r][1]})
 
     def edited_questions(kind, iv, describe, extra=None, toks=None, cf=None):
         lp = m.log_probs(m.forward(tokens if toks is None else toks, iv, None, cf))
         kl = kl_bits(lp_clean, lp)
         for r in rows:
+            if kl[r].item() < OPTIONS["min_kl"]:  # only questions whose measured change is at least min_kl (--min-kl)
+                continue
             d, nums = w.dist(lp[r])
             pre = f"<text> {texts[r]}\n" if toks is None else ""
             emit(r, kind, pre + describe[r] + f"<clean> {clean_txt[r][0]}\n<question> next-token distribution after the intervention, and its KL from clean in bits\n",
                  f"{d}\nKL {max(kl[r].item(), 0.0):.3f} bits", {"edited": nums, "clean": clean_txt[r][1], "kl_bits": kl[r].item(), **(extra[r] if extra else {})})
 
     # edit
-    iv, desc, extra = m.new(B), [], []
-    for r in rows:
-        p, a = draw.piece(rec, r), float(rng.choice([0.0, 0.0, 0.5, 2.0]))
-        apply_scale(iv, r, p, a)
-        desc.append(f"<intervention> scale({piece_text(p)}, {a:g})\n")
-        extra.append({"piece": piece_text(p), "alpha": a})
-    edited_questions("edit", iv, desc, extra)
+    if want("edit"):
+        iv, desc, extra = m.new(B), [], []
+        for r in rows:
+            p, a = draw.piece(rec, r), float(rng.choice([0.0, 2.0, 4.0] if OPTIONS["aim"] == "large" else [0.0, 0.0, 0.5, 2.0]))
+            apply_scale(iv, r, p, a)
+            desc.append(f"<intervention> scale({piece_text(p)}, {a:g})\n")
+            extra.append({"piece": piece_text(p), "alpha": a})
+        edited_questions("edit", iv, desc, extra)
 
     # rank: 4 candidates, one removal per forward
-    cands = [[draw.piece(rec, r, small=True) for _ in range(4)] for r in rows]
-    ivs = []
-    for c in range(4):
-        iv = m.new(B)
+    if want("rank"):
+        cands = [[draw.piece(rec, r, small=True) for _ in range(4)] for r in rows]
+        ivs = []
+        for c in range(4):
+            iv = m.new(B)
+            for r in rows:
+                apply_scale(iv, r, cands[r][c], 0.0)
+            ivs.append(iv)
+        # The 4 removals of every text in one forward of 4 B rows.
+        lp4 = m.log_probs(m.forward(tokens.repeat(4, 1), Interventions.concat(ivs))).view(4, B, -1)
+        kls = torch.stack([kl_bits(lp_clean, lp4[c]) for c in range(4)], dim=1).cpu()
         for r in rows:
-            apply_scale(iv, r, cands[r][c], 0.0)
-        ivs.append(iv)
-    # The 4 removals of every text in one forward of 4 B rows.
-    lp4 = m.log_probs(m.forward(tokens.repeat(4, 1), Interventions.concat(ivs))).view(4, B, -1)
-    kls = torch.stack([kl_bits(lp_clean, lp4[c]) for c in range(4)], dim=1).cpu()
-    for r in rows:
-        names = "abcd"
-        listing = " ".join(f"({names[c]}) {piece_text(cands[r][c])}" for c in range(4))
-        order = sorted(range(4), key=lambda c: -kls[r, c].item())
-        ans = " > ".join(names[c] for c in order) + "\nKL bits: " + ", ".join(f"{names[c]} {max(kls[r, c].item(), 0.0):.3f}" for c in order)
-        emit(r, "rank", f"<text> {texts[r]}\n<clean> {clean_txt[r][0]}\n<question> which removal, scale(PIECE, 0), changes the next-token distribution most: {listing}\n",
-             ans, {"pieces": [piece_text(p) for p in cands[r]], "kl_bits": kls[r].tolist()})
+            names = "abcd"
+            listing = " ".join(f"({names[c]}) {piece_text(cands[r][c])}" for c in range(4))
+            order = sorted(range(4), key=lambda c: -kls[r, c].item())
+            ans = " > ".join(names[c] for c in order) + "\nKL bits: " + ", ".join(f"{names[c]} {max(kls[r, c].item(), 0.0):.3f}" for c in order)
+            emit(r, "rank", f"<text> {texts[r]}\n<clean> {clean_txt[r][0]}\n<question> which removal, scale(PIECE, 0), changes the next-token distribution most: {listing}\n",
+                 ans, {"pieces": [piece_text(p) for p in cands[r]], "kl_bits": kls[r].tolist()})
 
     # attend: where a head looks from the last position (its measured attention weights)
-    for r in rows:
-        l, hh = attend[r]
-        wts = rec["attend_weights"][r].float().cpu()
-        top = wts.topk(min(3, T)).indices.tolist()
-        ans = ", ".join(f"{p}:{w.token(tokens[r, p].item())} {wts[p].item():.2f}" for p in top)
-        emit(r, "attend", f"<text_tokens> {w.numbered(tokens[r].tolist())}\n<question> where does L[{l}].head[{hh}] attend from the last position: three positions and weights\n",
-             ans, {"piece": f"L[{l}].head[{hh}]", "positions": top, "weights": [wts[p].item() for p in top]})
+    if want("attend"):
+        for r in rows:
+            l, hh = attend[r]
+            wts = rec["attend_weights"][r].float().cpu()
+            top = wts.topk(min(3, T)).indices.tolist()
+            ans = ", ".join(f"{p}:{w.token(tokens[r, p].item())} {wts[p].item():.2f}" for p in top)
+            emit(r, "attend", f"<text_tokens> {w.numbered(tokens[r].tolist())}\n<question> where does L[{l}].head[{hh}] attend from the last position: three positions and weights\n",
+                 ans, {"piece": f"L[{l}].head[{hh}]", "positions": top, "weights": [wts[p].item() for p in top]})
 
     # where
-    for r in rows:
-        l, hh, i = probes[r]
-        v = rec["probe_values"][r].to(torch.float32).cpu()
-        order = v[1:].abs().topk(min(3, T - 1)).indices + 1
-        piece = {-1: lambda: f"L[{l}].mlp[{i}]", -2: lambda: f"PD.tc[{l}][{i}]", -3: lambda: f"PD.vpd[{l}].{i[0]}[{i[1]}]"}[hh]() if hh < 0 else f"L[{l}].head[{hh}]"
-        level = "write norm" if hh >= 0 else ("activity v.x" if hh == -3 else "activation")
-        ans = ", ".join(f"{int(p)}:{w.token(tokens[r, int(p)].item())} {v[int(p)].item():.2f}" for p in order)
-        emit(r, "where", f"<text_tokens> {w.numbered(tokens[r].tolist())}\n<question> where is {piece} most active ({level}; position 0 excluded): three positions and levels\n",
-             ans, {"piece": piece, "positions": [int(p) for p in order], "levels": [v[int(p)].item() for p in order], "mean_level": v[1:].abs().mean().item()})
+    if want("where"):
+        for r in rows:
+            l, hh, i = probes[r]
+            v = rec["probe_values"][r].to(torch.float32).cpu()
+            order = v[1:].abs().topk(min(3, T - 1)).indices + 1
+            piece = {-1: lambda: f"L[{l}].mlp[{i}]", -2: lambda: f"PD.tc[{l}][{i}]", -3: lambda: f"PD.vpd[{l}].{i[0]}[{i[1]}]"}[hh]() if hh < 0 else f"L[{l}].head[{hh}]"
+            level = "write norm" if hh >= 0 else ("activity v.x" if hh == -3 else "activation")
+            ans = ", ".join(f"{int(p)}:{w.token(tokens[r, int(p)].item())} {v[int(p)].item():.2f}" for p in order)
+            emit(r, "where", f"<text_tokens> {w.numbered(tokens[r].tolist())}\n<question> where is {piece} most active ({level}; position 0 excluded): three positions and levels\n",
+                 ans, {"piece": piece, "positions": [int(p) for p in order], "levels": [v[int(p)].item() for p in order], "mean_level": v[1:].abs().mean().item()})
 
     # continue
-    iv, desc = m.new(B), []
-    for r in rows:
-        p, a = draw.piece(rec, r), float(rng.choice([2.0, 4.0]))
-        apply_scale(iv, r, p, a)
-        desc.append((piece_text(p), a))
-    both = m.greedy(tokens.repeat(2, 1), steps, Interventions.concat([m.new(B), iv]))  # clean and edited rows in one pass
-    clean_cont, edit_cont = both[:B], both[B:]
-    for r in rows:
-        cc, ec = clean_cont[r].tolist(), edit_cont[r].tolist()
-        same = sum(1 for x, y in zip(cc, ec) if x == y)
-        emit(r, "continue", f"<text> {texts[r]}\n<clean_continuation> {w.text(cc)}\n<intervention> scale({desc[r][0]}, {desc[r][1]:g})\n<question> greedy continuation of {steps} tokens after the intervention\n",
-             w.text(ec), {"piece": desc[r][0], "alpha": desc[r][1], "clean_ids": cc, "edited_ids": ec, "tokens_unchanged": same})
+    if want("continue"):
+        iv, desc = m.new(B), []
+        for r in rows:
+            p, a = draw.piece(rec, r), float(rng.choice([2.0, 4.0]))
+            apply_scale(iv, r, p, a)
+            desc.append((piece_text(p), a))
+        both = m.greedy(tokens.repeat(2, 1), steps, Interventions.concat([m.new(B), iv]))  # clean and edited rows in one pass
+        clean_cont, edit_cont = both[:B], both[B:]
+        for r in rows:
+            cc, ec = clean_cont[r].tolist(), edit_cont[r].tolist()
+            same = sum(1 for x, y in zip(cc, ec) if x == y)
+            emit(r, "continue", f"<text> {texts[r]}\n<clean_continuation> {w.text(cc)}\n<intervention> scale({desc[r][0]}, {desc[r][1]:g})\n<question> greedy continuation of {steps} tokens after the intervention\n",
+                 w.text(ec), {"piece": desc[r][0], "alpha": desc[r][1], "clean_ids": cc, "edited_ids": ec, "tokens_unchanged": same})
 
     # cut
-    iv, desc, extra = m.new(B), [], []
-    for r in rows:
-        u = rng.random()
-        if u < 0.5 or draw.split == "heldout":
-            al = draw.layer_with_heads()
-            ak, ah = "head", (draw.aimed_head(rec, r, al) if rng.random() < 0.5 else int(rng.choice(draw.heads[al])))
-        else:
-            al = int(rng.integers(m.L))
-            ak, ah = ("mlp" if u < 0.75 else "attn"), -1
-        first = al + (1 if ak == "mlp" else 0)  # the earliest layer whose readers see A's write
-        v = rng.random()
-        if v < 0.3 or first >= m.L:
-            bk, bl, bh, route = "logits", m.L, -1, ""
-        elif v < 0.65 or first + (0 if ak == "mlp" else 1) >= m.L:
-            bk, bl, bh, route = "mlp", int(rng.integers(first, min(m.L, first + 4))), -1, "input"
-        else:
-            lo = first if ak == "mlp" else first + 1
-            bl = int(rng.integers(lo, min(m.L, lo + 4)))
-            bh = int(rng.choice(draw.heads[bl])) if len(draw.heads[bl]) else -1
-            bk, route = ("head", ROUTES[int(rng.integers(3))]) if bh >= 0 else ("mlp", "input")
-        iv.cuts[r] = (ak, al, ah, bk, bl, bh, route)
-        a_txt = "node(" + piece_text(("head", al, ah) if ak == "head" else (ak, al)) + ")"
-        b_txt = {"logits": "logits", "mlp": f"node(L[{bl}].mlp[:]).input", "head": f"node(L[{bl}].head[{bh}]).{route}"}[bk]
-        desc.append(f"<counterfactual> {w.text(toks2[r].tolist())}\n<intervention> cut({a_txt} >> {b_txt})\n")
-        extra.append({"edge": f"{a_txt} >> {b_txt}", "cut": "counterfactual"})
-    # The writers' values on x' (graph.rs's counterfactual stand-in: an undeclared edge delivers the writer's value on x').
-    rec_cf = {"write_requests": {r: c[:3] for r, c in iv.cuts.items()}}
-    m.forward(toks2, None, rec_cf)
-    edited_questions("cut", iv, desc, extra, cf=rec_cf)
+    if want("cut"):
+        # x' of a cut: the text's own counterfactual, or under --aim large another text of the batch (the
+        # night plan's "other counterfactual": a different prompt of the same length), whose writes differ more.
+        toks_cut = torch.roll(tokens, 1, 0) if OPTIONS["aim"] == "large" and B > 1 else toks2
+        iv, desc, extra = m.new(B), [], []
+        large = OPTIONS["aim"] == "large"
+        for r in rows:
+            u = rng.random()
+            if large and draw.split == "train":  # writers likely to matter: whole blocks more often
+                u = 0.3 + 0.7 * u  # 30% aimed or random heads, 70% whole MLP or attention
+            if u < 0.5 or draw.split == "heldout":
+                al = draw.layer_with_heads()
+                ak, ah = "head", (draw.aimed_head(rec, r, al) if rng.random() < 0.5 else int(rng.choice(draw.heads[al])))
+            else:
+                al = int(rng.integers(m.L))
+                ak, ah = ("mlp" if u < 0.75 else "attn"), -1
+            first = al + (1 if ak == "mlp" else 0)  # the earliest layer whose readers see A's write
+            v = rng.random() * (0.6 if large else 1.0)  # aim large: half the readers are logits
+            if v < 0.3 or first >= m.L:
+                bk, bl, bh, route = "logits", m.L, -1, ""
+            elif v < 0.65 or first + (0 if ak == "mlp" else 1) >= m.L:
+                bk, bl, bh, route = "mlp", int(rng.integers(first, min(m.L, first + 4))), -1, "input"
+            else:
+                lo = first if ak == "mlp" else first + 1
+                bl = int(rng.integers(lo, min(m.L, lo + 4)))
+                bh = int(rng.choice(draw.heads[bl])) if len(draw.heads[bl]) else -1
+                bk, route = ("head", ROUTES[int(rng.integers(3))]) if bh >= 0 else ("mlp", "input")
+            iv.cuts[r] = (ak, al, ah, bk, bl, bh, route)
+            a_txt = "node(" + piece_text(("head", al, ah) if ak == "head" else (ak, al)) + ")"
+            b_txt = {"logits": "logits", "mlp": f"node(L[{bl}].mlp[:]).input", "head": f"node(L[{bl}].head[{bh}]).{route}"}[bk]
+            desc.append(f"<counterfactual> {w.text(toks_cut[r].tolist())}\n<intervention> cut({a_txt} >> {b_txt})\n")
+            extra.append({"edge": f"{a_txt} >> {b_txt}", "cut": "counterfactual"})
+        # The writers' values on x' (graph.rs's counterfactual stand-in: an undeclared edge delivers the writer's value on x').
+        rec_cf = {"write_requests": {r: c[:3] for r, c in iv.cuts.items()}}
+        m.forward(toks_cut, None, rec_cf)
+        edited_questions("cut", iv, desc, extra, cf=rec_cf)
 
     prompt_desc = cf_desc
-    if draw.split == "train":  # no piece: not asked in held-out-piece shards
+    if draw.split == "train" and want("prompt"):  # no piece: not asked in held-out-piece shards
         edited_questions("prompt", None, cf_desc, cf_extra, toks=toks2)
 
     # carry: which of 4 pieces' removal shrinks the prompt edit's effect most (a crossed intervention: the
-    # edit's KL with every piece in place, against its KL with the piece removed, both texts edited alike)
-    lp_cf = m.log_probs(m.forward(toks2, None, None, rec))
-    d0 = kl_bits(lp_clean, lp_cf)
-    cands = [[draw.piece(rec, r, small=True) for _ in range(4)] for r in rows]
-    ivs = []
-    for c in range(4):
-        iv = m.new(B)
+    if want("carry"):
+        # edit's KL with every piece in place, against its KL with the piece removed, both texts edited alike)
+        lp_cf = m.log_probs(m.forward(toks2, None, None, rec))
+        d0 = kl_bits(lp_clean, lp_cf)
+        cands = [[draw.piece(rec, r, small=True) for _ in range(4)] for r in rows]
+        ivs = []
+        for c in range(4):
+            iv = m.new(B)
+            for r in rows:
+                apply_scale(iv, r, cands[r][c], 0.0)
+            ivs.append(iv)
+        both = Interventions.concat(ivs)
+        lpx = m.log_probs(m.forward(tokens.repeat(4, 1), both)).view(4, B, -1)
+        lpy = m.log_probs(m.forward(toks2.repeat(4, 1), both)).view(4, B, -1)
+        dc = torch.stack([kl_bits(lpx[c], lpy[c]) for c in range(4)], dim=1).cpu()
         for r in rows:
-            apply_scale(iv, r, cands[r][c], 0.0)
-        ivs.append(iv)
-    both = Interventions.concat(ivs)
-    lpx = m.log_probs(m.forward(tokens.repeat(4, 1), both)).view(4, B, -1)
-    lpy = m.log_probs(m.forward(toks2.repeat(4, 1), both)).view(4, B, -1)
-    dc = torch.stack([kl_bits(lpx[c], lpy[c]) for c in range(4)], dim=1).cpu()
-    for r in rows:
-        names = "abcd"
-        listing = " ".join(f"({names[c]}) {piece_text(cands[r][c])}" for c in range(4))
-        order = sorted(range(4), key=lambda c: dc[r, c].item())
-        ans = " < ".join(names[c] for c in order) + "\nKL bits after removal: " + ", ".join(f"{names[c]} {max(dc[r, c].item(), 0.0):.3f}" for c in order)
-        emit(r, "carry", prompt_desc[r] + f"<question> the edit moves the next-token distribution by KL {max(d0[r].item(), 0.0):.3f} bits; with which removal, scale(PIECE, 0) on both texts, does the edit move it least: {listing}\n",
-             ans, {"pieces": [piece_text(p) for p in cands[r]], "kl_bits_edit": d0[r].item(), "kl_bits_after_removal": dc[r].tolist()})
+            names = "abcd"
+            listing = " ".join(f"({names[c]}) {piece_text(cands[r][c])}" for c in range(4))
+            order = sorted(range(4), key=lambda c: dc[r, c].item())
+            ans = " < ".join(names[c] for c in order) + "\nKL bits after removal: " + ", ".join(f"{names[c]} {max(dc[r, c].item(), 0.0):.3f}" for c in order)
+            emit(r, "carry", prompt_desc[r] + f"<question> the edit moves the next-token distribution by KL {max(d0[r].item(), 0.0):.3f} bits; with which removal, scale(PIECE, 0) on both texts, does the edit move it least: {listing}\n",
+                 ans, {"pieces": [piece_text(p) for p in cands[r]], "kl_bits_edit": d0[r].item(), "kl_bits_after_removal": dc[r].tolist()})
 
     # swap: the piece's last-position value from the next text of the batch
-    if B > 1:
-        iv, desc, extra = m.new(B), [], []
-        hm = torch.zeros(B, m.L, m.H, dtype=torch.bool, device=m.dev)
-        nm = torch.zeros(B, m.L, m.Fn, dtype=torch.bool, device=m.dev)
-        src = [(r + 1) % B for r in rows]
-        for r in rows:
-            p = draw.piece(rec, r)
-            if p[0] == "head":
-                hm[r, p[1], p[2]] = True
-            elif p[0] == "neurons":
-                nm[r, p[1], list(p[2])] = True
-            elif p[0] == "mlp":
-                nm[r, p[1]] = True
-            elif p[0] == "tc":
-                idx = torch.tensor(p[2], device=m.dev)
-                iv.tc_swap[r] = (p[1], idx, m.tc_acts(p[1], rec["y_last"][p[1]][src[r]], idx))
-            elif p[0] == "vpd":
-                idx = torch.tensor(p[3], device=m.dev)
-                iv.parts_swap[r] = (p[1], p[2], idx, rec["site_in_last"][(p[1], p[2])][src[r]] @ m.parts[(p[1], p[2])][1][:, idx])
-            else:
-                hm[r, p[1]] = True
-            desc.append(f"<source> {texts[src[r]]}\n<intervention> swap({piece_text(p)}, source)\n")
-            extra.append({"piece": piece_text(p), "source_text_id": ids[src[r]]})
-        iv.head_swap = (hm, rec["z_last"][src])
-        iv.neuron_swap = (nm, rec["act_last"][src])
-        edited_questions("swap", iv, desc, extra)
+    if want("swap"):
+        if B > 1:
+            iv, desc, extra = m.new(B), [], []
+            hm = torch.zeros(B, m.L, m.H, dtype=torch.bool, device=m.dev)
+            nm = torch.zeros(B, m.L, m.Fn, dtype=torch.bool, device=m.dev)
+            src = [(r + 1) % B for r in rows]
+            for r in rows:
+                p = draw.piece(rec, r)
+                if p[0] == "head":
+                    hm[r, p[1], p[2]] = True
+                elif p[0] == "neurons":
+                    nm[r, p[1], list(p[2])] = True
+                elif p[0] == "mlp":
+                    nm[r, p[1]] = True
+                elif p[0] == "tc":
+                    idx = torch.tensor(p[2], device=m.dev)
+                    iv.tc_swap[r] = (p[1], idx, m.tc_acts(p[1], rec["y_last"][p[1]][src[r]], idx))
+                elif p[0] == "vpd":
+                    idx = torch.tensor(p[3], device=m.dev)
+                    iv.parts_swap[r] = (p[1], p[2], idx, rec["site_in_last"][(p[1], p[2])][src[r]] @ m.parts[(p[1], p[2])][1][:, idx])
+                else:
+                    hm[r, p[1]] = True
+                desc.append(f"<source> {texts[src[r]]}\n<intervention> swap({piece_text(p)}, source)\n")
+                extra.append({"piece": piece_text(p), "source_text_id": ids[src[r]]})
+            iv.head_swap = (hm, rec["z_last"][src])
+            iv.neuron_swap = (nm, rec["act_last"][src])
+            edited_questions("swap", iv, desc, extra)
     return out
 
 
@@ -753,6 +800,9 @@ def main():
     ap.add_argument("--steps", type=int, default=8)
     ap.add_argument("--split", default="train")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--types", default="", help="only these question types (comma-separated), e.g. edit,swap,cut")
+    ap.add_argument("--min-kl", type=float, default=float("-inf"), help="keep edit/cut/swap/prompt questions whose measured change is at least this (bits)")
+    ap.add_argument("--aim", default="mixed", choices=("mixed", "large"), help="large: pieces likely to move M (Draw.large)")
     ap.add_argument("--piece-split", default="train", choices=("train", "heldout"),
                     help="ask about training pieces (and whole blocks) or only held-out pieces (held_out_units)")
     ap.add_argument("--row-range", default="", help="A:B, draw texts from rows A..B-1 only (e.g. vpd4l Pile rows 0:3584 train, 3584:4096 held out)")
@@ -765,6 +815,7 @@ def main():
     ap.add_argument("--tc-layers", default="", help="layers whose transcoder features are asked about, e.g. 3,9,14,20,25")
     args = ap.parse_args()
     torch.set_grad_enabled(False)
+    OPTIONS.update(types=set(args.types.split(",")) if args.types else None, min_kl=args.min_kl, aim=args.aim)
     dev = device()
     if args.target == "vpd4l":
         import vpd4l
