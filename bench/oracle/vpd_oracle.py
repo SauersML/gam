@@ -52,7 +52,8 @@ top-activating examples and logits (transcoder_examples.py; --feature-examples, 
 A *_tokens condition (weights_tokens, weights_tokens_lens) gives the vectors in one shared space where the
 reader can contract them: the subcomponent's write as its residual direction r (vpd_lens.py's write lens;
 u for o_proj and down_proj, W_O u for v_proj, W_down u for c_fc) and, for a direction or top question,
-each option token's unembedding row g_f * e_X in the next slots (option order), both through one map
+each option token's unembedding row g_f * e_X in the next slots (option order; a direction question's
+two options, up and down, get its token's row and the row negated), both through one map
 `resid_write`; in the other conditions the write arrives in its site's basis (c_fc's 3072 hidden units,
 v_proj's value space) and the option tokens only as the reader's own text, so the map would have to learn
 vpd4l's vocabulary to compare them. Needs --lens. weights_tokens_signed puts the edit's sign and size on
@@ -635,7 +636,13 @@ def slots(table: Table, ex: dict, condition: str) -> list[tuple]:
         # The option tokens' unembedding rows; the down_read role and the layer past the last mark them (the
         # weights conditions show no neighbours, whose role it is otherwise).
         # Their log norms ride on the magnitude term as every slot's does (the injected direction is norm-matched).
-        return out + [(table.depth, "token", int(t), math.log(float(table.lens["unembed"][int(t)].float().norm())), "down_", True) for t in ex["option_ids"]]
+        # A direction question's options are up and down: its token's row and the row negated, so that its
+        # answer, the sign of one contraction, is a comparison between two slots as a top question's is
+        # (attention weighs keys against each other; with one key its weight carries no sign).
+        rows = [(int(t), table.lens["unembed"][int(t)].float()) for t in ex["option_ids"]]
+        if ex["kind_q"] == "direction":
+            rows = [rows[0], (rows[0][0], -rows[0][1])]
+        return out + [(table.depth, "token", t, math.log(float(e.norm())), "down_", True, e) for t, e in rows]
     if ex["kind_q"] == "attribution":
         out += [(l, k, c, 0.0, "up_", condition in ("graph", "weights")) for l, k, c, _, _ in ex["candidates"]]
     elif ex["kind_q"] == "edge":
@@ -769,10 +776,10 @@ class Oracle(torch.nn.Module):
                     x = None
                     if s < len(items):
                         layer, kind, c, mag, prefix, shown, *given = items[s]
-                        if given and side == "write":  # a residual vector given by slots (the edit's direct write change)
+                        if kind == "token":  # an option token's unembedding row g_f * e_X (given by slots, signed), read side only
+                            x = (given[0] if given else table.lens["unembed"][c].float(), "resid_write") if side == "read" else None
+                        elif given and side == "write":  # a residual vector given by slots (the edit's direct write change)
                             x = (given[0], "resid_write")
-                        elif kind == "token":  # an option token's unembedding row g_f * e_X, read side only
-                            x = (table.lens["unembed"][c].float(), "resid_write") if side == "read" else None
                         elif kind.endswith("@resid") and side == "write" and table.residual_write(layer, kind.removesuffix("@resid"), c) is not None:
                             x = (table.residual_write(layer, kind.removesuffix("@resid"), c), "resid_write")  # r, in the residual stream
                         else:
