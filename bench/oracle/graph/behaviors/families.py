@@ -479,7 +479,8 @@ def number_successor(tok, rng):
 
 
 NUMWORDS = "one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty".split()
-ORDINALS = "first second third fourth fifth sixth seventh eighth ninth tenth eleventh twelfth".split()
+ORDINALS = ("first second third fourth fifth sixth seventh eighth ninth tenth eleventh twelfth thirteenth fourteenth fifteenth "
+            "sixteenth seventeenth eighteenth nineteenth twentieth").split()
 
 
 LIST_TEMPLATES = ["{L},", "Here is the order: {L},", "She said them in order: {L},", "Sequence: {L},"]
