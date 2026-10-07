@@ -61,6 +61,26 @@ def description(held_out):
     return sum(held_out.get(k) or 0.0 for k in ('divergence_bits', 'variance_bits', 'choice_bits', 'prior_bits'))
 
 
+def strong_weights(path):
+    """An arm's scores under the strong native weight edits (MANIFEST_vpd4l_s3.json, an EDITS file's
+    "weights"): over the applicable edits the gap KL(M_e || P_e), the edit-ignoring baseline
+    KL(M_e || P) and the effect KL(M_e || M) in bits per token, in all and per family and per effect bin
+    (the effect on the scored tokens: below 0.01, 0.01 to 0.1, 0.1 to 1, above 1 bit); none without the
+    file."""
+    r = L(path)
+    if not r or not r.get('weights'):
+        return None
+    records = [x for x in r['weights']['records'] if x.get('applicable')]
+    def summary(rs):
+        n = len(rs)
+        mean = lambda k: sum(x[k] for x in rs) / n if n else None
+        return {'edits': n, 'gap': mean('mean_bits_per_token'), 'ignoring': mean('ignoring_mean_bits_per_token'), 'effect': mean('effect_mean_bits_per_token')}
+    bins = [(0.0, 0.01), (0.01, 0.1), (0.1, 1.0), (1.0, float('inf'))]
+    return {'file': path, 'not_applicable': len(r['weights']['records']) - len(records), 'all': summary(records),
+            'families': {f: summary([x for x in records if x.get('family') == f]) for f in sorted({x.get('family') for x in records})},
+            'bins': {f'[{a}, {b})': summary([x for x in records if a <= x['effect_mean_bits_per_token'] < b]) for a, b in bins}}
+
+
 def fixed_bits(out):
     """32 bits per real of each transcoder layer's fixed output bias (not M's tensor)."""
     reals = 0
@@ -95,6 +115,9 @@ attn = L('/Users/user/mpd-data/compare/attention_price.json')
 for model, label, d, f, rec, out in arms:
     r = L(f'{d}/{f}')
     row = {'model': model, 'method': label, 'edits': f'{d}/{f}' if r else None, 'manifest': experiments_of(r)}
+    strong = strong_weights(f"{d}/{f.rsplit('_', 1)[0]}_s3.json")
+    if strong:
+        row['strong_weights'] = strong
     if r:
         row['gap'], row['gap_by_effect'], row['families'] = manifest_gap(r)
         if r.get('weights'):
@@ -116,7 +139,8 @@ for form, label in (('published', 'VPD as published (CI reads the edited M, both
     # On the weight-edit manifest (s2) where scored, else s1.
     path = next((f for f in (f'{MANIFEST_DIR}/vpd_s2/EDITS_vpd_{form}.json', f'{MANIFEST_DIR}/vpd/EDITS_vpd_{form}.json') if os.path.exists(f)), f'{MANIFEST_DIR}/vpd/EDITS_vpd_{form}.json')
     r = L(path)
-    row = {'model': 'vpd4l', 'method': label, 'edits': path if r else None, 'manifest': experiments_of(r),
+    strong = strong_weights(f'{MANIFEST_DIR}/vpd_s3/EDITS_vpd_{form}.json')
+    row = {'model': 'vpd4l', 'method': label, 'edits': path if r else None, 'manifest': experiments_of(r), **({'strong_weights': strong} if strong else {}),
            'description_bits': 11.4e6 + 77.2e6, 'description_note': '11.4M subcomponents + 77.2M CI network', 'active': '213 subcomponents unmasked per token'}
     if r:
         row['gap'], row['gap_by_effect'], row['families'] = manifest_gap(r)
@@ -130,7 +154,8 @@ for p in L('/Users/user/mpd-data/compare/frontier_points.json') or []:
     if p['label'].startswith('VPD'):
         continue
     r = L(p.get('edits'))
-    row = {'model': 'vpd4l', 'method': p['label'], 'edits': p.get('edits') if r else None, 'manifest': experiments_of(r),
+    strong = strong_weights(p.get('weights_edits'))
+    row = {'model': 'vpd4l', 'method': p['label'], 'edits': p.get('edits') if r else None, 'manifest': experiments_of(r), **({'strong_weights': strong} if strong else {}),
            'description_bits': p.get('description_bits'), 'description_note': p.get('description_note'), 'attention_bits': p.get('attention_bits')}
     if r:
         row['gap'], row['gap_by_effect'], row['families'] = manifest_gap(r)
@@ -154,7 +179,10 @@ for r in rows:
           '| F on edits (N = 2^24)', r.get('F_edits') and round(r['F_edits'], 3),
           '| weight edits: gap', (r.get('weights') or {}).get('mean_bits_per_token') and round(r['weights']['mean_bits_per_token'], 4),
           'ignoring', (r.get('weights') or {}).get('ignoring_mean_bits_per_token') and round(r['weights']['ignoring_mean_bits_per_token'], 4),
-          'not applicable', (r.get('weights') or {}).get('not_applicable'), '| bins', {k: (n, round(g, 3)) for k, (n, g) in (r.get('gap_by_effect') or {}).items()}, r.get('refused', ''))
+          'not applicable', (r.get('weights') or {}).get('not_applicable'),
+          '| strong weight edits', (lambda w: w and {'all': {k: (round(v, 4) if isinstance(v, float) else v) for k, v in w['all'].items()}, 'not applicable': w['not_applicable'],
+                                                     'families': {f: (v['edits'], v['gap'] and round(v['gap'], 3), v['ignoring'] and round(v['ignoring'], 3), v['effect'] and round(v['effect'], 3)) for f, v in w['families'].items()},
+                                                     'bins': {b: (v['edits'], v['gap'] and round(v['gap'], 3), v['ignoring'] and round(v['ignoring'], 3)) for b, v in w['bins'].items()}})(r.get('strong_weights')), '| bins', {k: (n, round(g, 3)) for k, (n, g) in (r.get('gap_by_effect') or {}).items()}, r.get('refused', ''))
 if len(sys.argv) > 1:
     plt.rcParams.update({'font.size': 14})
     models = [m for m in ('vpd4l', 'Qwen3-0.6B') if any(r['model'] == m and r.get('F_edits') is not None for r in rows)]
