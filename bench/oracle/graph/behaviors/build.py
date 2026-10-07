@@ -34,7 +34,7 @@ from pathlib import Path
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from families import FAMILIES, MIN_PROMPTS, Item  # noqa: E402
+from families import FAMILIES, MIN_PROMPTS, NOVEL, Item  # noqa: E402
 
 OUT = Path.home() / "mpd-data/graph_oracle/behaviors"
 KEEP_ACCURACY = 0.5  # kept when the answer is the model's top-1 token on most targets ("top1"),
@@ -44,8 +44,9 @@ MAX_PROMPTS = 128  # enough prompts per behavior for the score's sampled experim
 
 
 def split_of(fam: str) -> str:
-    """Held-out families: one in five by a hash of the family name, the same for every model."""
-    return "heldout" if int(hashlib.sha1(fam.encode()).hexdigest(), 16) % 5 == 0 else "train"
+    """Held-out families: every family in NOVEL (written for this suite) and one in five of the others by a hash of the
+    family name, the same for every model."""
+    return "heldout" if fam in NOVEL or int(hashlib.sha1(fam.encode()).hexdigest(), 16) % 5 == 0 else "train"
 
 
 class Tok:
@@ -230,7 +231,7 @@ def main():
             acc = score(tok, model, prompts)
             reason = "top1" if acc["model_accuracy"] >= KEEP_ACCURACY else "contrast" if (acc["pair_accuracy"] or 0) >= KEEP_PAIR else ""
             status = "too_few" if len(prompts) < MIN_PROMPTS else f"kept_{reason}" if reason else "dropped"
-            beh = {"id": bid, "model": a.model, "family": fam, "variant": v.name, "description": v.description, "frequency": None,
+            beh = {"id": bid, "model": a.model, "family": fam, "variant": v.name, "description": v.description, "frequency": None, "novel": fam in NOVEL,
                    "prompts": prompts, "split": row["split"], **acc, "keep": status}
             dest = root / f"{bid}.json" if reason and status != "too_few" else root / "dropped" / f"{bid}.json"
             for stale in (root / f"{bid}.json", root / "dropped" / f"{bid}.json"):

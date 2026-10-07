@@ -926,3 +926,309 @@ def currency(tok, rng):
     """The currency of a country."""
     return fact_variants(CURRENCIES, [("currency", "The currency of {X} is the"), ("pay", "When shopping in {X}, you pay with the local")],
                          "Factual recall: the currency of a named country.")
+
+
+# Families written for this suite that I do not know from published interpretability work; build.py holds them all out.
+NOVEL = {"bracket_type", "clock_add", "json_value", "python_list_index", "roman_numerals", "pattern_ab", "alphabet_skip",
+         "month_number", "last_letter", "email_domain"}
+
+
+@family
+def bracket_type(tok, rng):
+    """Close the innermost open bracket with the matching bracket type."""
+    pairs = {"(": ")", "[": "]", "{": "}"}
+    v = Variant("mixed", "Bracket type matching: after a run of opened brackets of mixed types and one inner pair closed, the next token closes the innermost open bracket with its own type; the counterfactual changes that bracket's type.")
+    for _ in range(300):
+        a, b = rng.sample(list(pairs), 2)
+        x, y = rng.sample("abcdxyz", 2)
+        c = rng.choice(list(pairs))
+        t = "f = {A} {x} + {C} {y} {Cc} +"
+        v.items.append(Item(t.format(A=a, x=x, C=c, y=y, Cc=pairs[c]) + f" 1 ", pairs[a],
+                            t.format(A=b, x=x, C=c, y=y, Cc=pairs[c]) + f" 1 ", pairs[b]))
+    return [v]
+
+
+@family
+def clock_add(tok, rng):
+    """Hours on a 12-hour clock."""
+    v = Variant("hours_later", "Clock arithmetic: the hour on a 12-hour clock a few hours after a given hour (wrapping past 12).")
+    for _ in range(300):
+        h, d = rng.randrange(1, 13), rng.randrange(1, 6)
+        h2 = rng.choice([x for x in range(1, 13) if x != h])
+        r, r2 = (h + d - 1) % 12 + 1, (h2 + d - 1) % 12 + 1
+        t = "If it is {h} o'clock now, then {d} hours later it will be"
+        v.items.append(Item(t.format(h=h, d=d), f" {r}", t.format(h=h2, d=d), f" {r2}"))
+    return [v]
+
+
+JSON_KEYS = ["name", "city", "color", "pet", "food", "team", "brand", "song"]
+JSON_VALS = ["Alice", "Boston", "green", "parrot", "pizza", "Tigers", "Nike", "Yesterday", "Oslo", "violet", "hamster", "sushi", "Lions", "Sony"]
+
+
+@family
+def json_value(tok, rng):
+    """Look up a key's value in a JSON object."""
+    vals = words(tok, JSON_VALS)
+    v = Variant("lookup", "JSON lookup: given a JSON object with three keys, the value of the queried key; the counterfactual queries another key.")
+    for _ in range(300):
+        ks = rng.sample(JSON_KEYS, 3)
+        vs = rng.sample(vals, 3)
+        q, q2 = rng.sample(range(3), 2)
+        obj = "{" + ", ".join(f'"{k}": "{x}"' for k, x in zip(ks, vs)) + "}"
+        t = 'data = {obj}\nprint(data["{k}"])  # prints'
+        v.items.append(Item(t.format(obj=obj, k=ks[q]), " " + vs[q], t.format(obj=obj, k=ks[q2]), " " + vs[q2]))
+    return [v]
+
+
+@family
+def python_list_index(tok, rng):
+    """Index into a Python list literal."""
+    v = Variant("index", "Python list indexing: the element at a given index of a four-element list literal; the counterfactual asks for another index.")
+    for _ in range(300):
+        xs = rng.sample(range(10, 100), 4)
+        i, j = rng.sample(range(4), 2)
+        t = "x = [{xs}]\nassert x[{i}] =="
+        v.items.append(Item(t.format(xs=", ".join(map(str, xs)), i=i), f" {xs[i]}", t.format(xs=", ".join(map(str, xs)), i=j), f" {xs[j]}"))
+    return [v]
+
+
+ROMAN = "I II III IV V VI VII VIII IX X XI XII XIII XIV XV XVI XVII XVIII XIX XX".split()
+
+
+@family
+def roman_numerals(tok, rng):
+    """Continue a sequence of Roman numerals."""
+    return [Variant("sequence", "Roman numeral succession: a run of Roman numerals; the next numeral continues it.",
+                    sequence_items(ROMAN, rng, False, ["The Roman numeral after {X} is"], n=600))]
+
+
+@family
+def pattern_ab(tok, rng):
+    """Continue an alternating pattern of two words."""
+    ws = words(tok, NOUNS)
+    v = Variant("alternate", "Alternation: two words alternate several times; the next word continues the alternation; the counterfactual ends one step later.")
+    for _ in range(300):
+        a, b = rng.sample(ws, 2)
+        n = rng.randrange(3, 6)
+        seq = " ".join([a, b] * n)
+        v.items.append(Item(seq, " " + a, seq + " " + a, " " + b))
+    return [v]
+
+
+@family
+def alphabet_skip(tok, rng):
+    """Continue a run of letters that skips one letter each step."""
+    v = Variant("every_other", "Alphabet with a stride of two: a run of every other capital letter; the next letter continues the stride.")
+    for _ in range(300):
+        i, j = rng.sample(range(0, 26 - 8), 2)
+        k = rng.randrange(3, 5)
+        f = lambda s: ", ".join(LETTERS[s + 2 * q] for q in range(k)) + ","
+        v.items.append(Item(f(i), " " + LETTERS[i + 2 * k], f(j), " " + LETTERS[j + 2 * k]))
+    return [v]
+
+
+@family
+def month_number(tok, rng):
+    """The number of a month."""
+    rows = [(m, str(i + 1)) for i, m in enumerate(MONTHS)]
+    v = Variant("number", "Month numbering: the position of a named month in the year; phrasings 'X is month number' and 'X = month'.")
+    for _ in range(300):
+        i, j = rng.sample(range(12), 2)
+        if len(rows[i][1]) != len(rows[j][1]):
+            continue
+        t = rng.choice(["In the calendar, {m} is month number", "Months: January = 1, February = 2. {m} ="])
+        v.items.append(Item(t.format(m=rows[i][0]), " " + rows[i][1], t.format(m=rows[j][0]), " " + rows[j][1]))
+    return [v]
+
+
+@family
+def last_letter(tok, rng):
+    """The last letter of a word."""
+    ws = words(tok, NOUNS)
+    v = Variant("ends_with", "Spelling: the last letter of a quoted word, as a capital; the counterfactual quotes a word with another last letter.")
+    for _ in range(400):
+        a, b = rng.sample(ws, 2)
+        if a[-1] == b[-1]:
+            continue
+        t = 'The word "{w}" ends with the letter'
+        v.items.append(Item(t.format(w=a), " " + a[-1].upper(), t.format(w=b), " " + b[-1].upper()))
+    return [v]
+
+
+DOMAINS = ["gmail", "yahoo", "outlook", "hotmail", "proton", "icloud"]
+
+
+@family
+def email_domain(tok, rng):
+    """Copy the domain of a person's e-mail address."""
+    names = words(tok, NAMES_F + NAMES_M)
+    v = Variant("domain", "Copy from a contact record: the domain of the named person's e-mail address among two contacts; the counterfactual asks for the other contact.")
+    for _ in range(300):
+        a, b = rng.sample(names, 2)
+        da, db = rng.sample(DOMAINS, 2)
+        t = "Contacts:\n{a}: {la}@{da}.com\n{b}: {lb}@{db}.com\n\n{q}'s e-mail provider is"
+        kw = dict(a=a, b=b, la=a.lower(), lb=b.lower(), da=da, db=db)
+        v.items.append(Item(t.format(q=a, **kw), " " + da, t.format(q=b, **kw), " " + db))
+    return [v]
+
+
+@family
+def key_value_lookup(tok, rng):
+    """Associative recall of a code paired with a word."""
+    ws = words(tok, NOUNS)
+    v = Variant("codes", "Associative recall: three word=number pairs, then a word; the next token is its number; the counterfactual queries another word.")
+    for _ in range(300):
+        ks = rng.sample(ws, 3)
+        vs = rng.sample(range(10, 100), 3)
+        i, j = rng.sample(range(3), 2)
+        pre = ", ".join(f"{k}={x}" for k, x in zip(ks, vs)) + ". "
+        v.items.append(Item(pre + ks[i] + "=", str(vs[i]), pre + ks[j] + "=", str(vs[j])))
+    return [v]
+
+
+@family
+def compare_numbers(tok, rng):
+    """The larger of two numbers."""
+    v = Variant("larger", "Number comparison: the larger of two two-digit numbers; the counterfactual swaps which one is larger by changing one number.")
+    for _ in range(300):
+        x, y = rng.sample(range(10, 100), 2)
+        lo, hi = min(x, y), max(x, y)
+        y2 = rng.randrange(10, lo) if lo > 10 else None
+        if y2 is None:
+            continue
+        t = "Which number is larger, {a} or {b}? Answer:"
+        # counterfactual: the larger number is replaced by one below the smaller
+        if rng.random() < 0.5:
+            v.items.append(Item(t.format(a=lo, b=hi), f" {hi}", t.format(a=lo, b=y2), f" {lo}"))
+        else:
+            v.items.append(Item(t.format(a=hi, b=lo), f" {hi}", t.format(a=y2, b=lo), f" {lo}"))
+    return [v]
+
+
+@family
+def parity(tok, rng):
+    """Whether a number is even or odd."""
+    v = Variant("even_odd", "Parity: whether a number is even or odd; the counterfactual changes the last digit's parity.")
+    for _ in range(300):
+        n = rng.randrange(10, 1000)
+        m = n + rng.choice([-1, 1])
+        t = "Is {n} even or odd? Answer:"
+        v.items.append(Item(t.format(n=n), " even" if n % 2 == 0 else " odd", t.format(n=m), " even" if m % 2 == 0 else " odd"))
+    return [v]
+
+
+@family
+def possessive_pronoun(tok, rng):
+    """The possessive pronoun for a named person."""
+    f, m = words(tok, NAMES_F), words(tok, NAMES_M)
+    objs = ["keys", "phone", "wallet", "umbrella", "notebook", "glasses", "jacket"]
+    v = Variant("lost", "Possessive pronoun: after a named person loses something, 'her' or 'his' follows by the name's usual gender; the counterfactual swaps the name's gender.")
+    for _ in range(300):
+        a, b, o = rng.choice(f), rng.choice(m), rng.choice(objs)
+        t = "This morning {n} could not find"
+        if rng.random() < 0.5:
+            v.items.append(Item(t.format(n=a), " her", t.format(n=b), " his"))
+        else:
+            v.items.append(Item(t.format(n=b), " his", t.format(n=a), " her"))
+    return [v]
+
+
+@family
+def capital_to_country(tok, rng):
+    """The country of a capital city (the reverse of capital)."""
+    rows = [(c[1], c[0]) for c in COUNTRIES if c[1] not in ("Mexico", "Buenos", "Kuala", "Addis")]
+    return fact_variants(rows, [("capital_of", "{X} is the capital city of"), ("qa", "Q: Which country has {X} as its capital?\nA:")],
+                         "Factual recall in reverse: the country whose capital is the named city.")
+
+
+ANIMAL_SOUNDS = [("cow", "moo"), ("dog", "bark"), ("cat", "meow"), ("duck", "quack"), ("sheep", "baa"), ("lion", "roar"),
+                 ("pig", "oink"), ("horse", "neigh"), ("owl", "hoot"), ("snake", "hiss"), ("bee", "buzz"), ("frog", "croak"),
+                 ("wolf", "howl"), ("mouse", "squeak"), ("rooster", "crow"), ("donkey", "bray"), ("bird", "chirp"), ("goat", "bleat"),
+                 ("crow", "caw"), ("dove", "coo"), ("elephant", "trumpet"), ("hyena", "laugh"), ("turkey", "gobble"), ("chick", "peep")]
+ANIMAL_BABIES = [("cat", "kitten"), ("dog", "puppy"), ("cow", "calf"), ("sheep", "lamb"), ("horse", "foal"), ("goat", "kid"),
+                 ("pig", "piglet"), ("duck", "duckling"), ("frog", "tadpole"), ("bear", "cub"), ("lion", "cub"), ("kangaroo", "joey"),
+                 ("deer", "fawn"), ("goose", "gosling"), ("swan", "cygnet"), ("owl", "owlet"), ("eagle", "eaglet"), ("hen", "chick"),
+                 ("butterfly", "caterpillar"), ("seal", "pup"), ("whale", "calf"), ("rabbit", "bunny"), ("fox", "kit"), ("tiger", "cub")]
+
+
+@family
+def animal_sound(tok, rng):
+    """The sound an animal makes."""
+    return fact_variants(ANIMAL_SOUNDS, [("says", "Children learn that the {X} says"), ("few_shot", "dog: woof\ncat: meow\n{X}:"),
+                                         ("sound", "The sound a {X} makes is called a")], "Commonsense recall: the sound a named animal makes.")
+
+
+@family
+def animal_baby(tok, rng):
+    """The name of an animal's young."""
+    return fact_variants(ANIMAL_BABIES, [("called", "A baby {X} is called a"), ("few_shot", "dog: puppy\ncat: kitten\n{X}:"),
+                                         ("young", "The young of a {X} is known as a")], "Commonsense recall: the word for a named animal's young.")
+
+
+TOOLS = [("cut paper", "scissors"), ("drive a nail", "hammer"), ("tell the time", "watch"), ("eat soup", "spoon"), ("write a letter", "pen"),
+         ("dig a hole", "shovel"), ("sweep the floor", "broom"), ("unlock a door", "key"), ("see in the dark", "flashlight"),
+         ("boil water", "kettle"), ("dry your hair", "towel"), ("brush your teeth", "toothbrush"), ("comb your hair", "comb"),
+         ("take a photo", "camera"), ("measure length", "ruler"), ("tighten a bolt", "wrench"), ("stay dry in the rain", "umbrella"),
+         ("call a friend", "phone"), ("cut wood", "saw"), ("paint a wall", "brush"), ("water the plants", "hose"), ("open a can", "opener"),
+         ("light a candle", "match"), ("climb onto the roof", "ladder")]
+
+
+@family
+def tool_use(tok, rng):
+    """The tool for a task."""
+    return fact_variants(TOOLS, [("use", "To {X}, you use a"), ("need", "I need to {X}, so please hand me the"),
+                                 ("qa", "Q: What do you use to {X}?\nA: A")], "Commonsense recall: the everyday tool used for a named task.")
+
+
+YES_NO = [("Is the sun hot?", "Yes"), ("Is ice cold?", "Yes"), ("Can fish swim?", "Yes"), ("Do birds have feathers?", "Yes"),
+          ("Is water wet?", "Yes"), ("Do cats bark?", "No"), ("Can pigs fly?", "No"), ("Is snow black?", "No"), ("Is fire cold?", "No"),
+          ("Do trees have roots?", "Yes"), ("Can a car swim?", "No"), ("Is the moon made of cheese?", "No"), ("Do cows give milk?", "Yes"),
+          ("Is grass blue?", "No"), ("Do humans breathe air?", "Yes"), ("Can rocks talk?", "No"), ("Is a banana a fruit?", "Yes"),
+          ("Is a whale a fish?", "No"), ("Does the sun rise in the east?", "Yes"), ("Is two larger than five?", "No"),
+          ("Do spiders have eight legs?", "Yes"), ("Is Paris in Italy?", "No"), ("Is a tomato blue?", "No"), ("Can dogs read books?", "No"),
+          ("Is honey sweet?", "Yes"), ("Do snakes have legs?", "No"), ("Is lemon juice sour?", "Yes"), ("Can babies drive cars?", "No"),
+          ("Is the ocean salty?", "Yes"), ("Do plants need light?", "Yes"), ("Is a mouse bigger than an elephant?", "No"),
+          ("Is ten more than three?", "Yes")]
+
+
+@family
+def yes_no_facts(tok, rng):
+    """Answer a yes/no commonsense question."""
+    v = Variant("qa", "Yes/no questions about everyday facts after two answered examples; the counterfactual asks a question with the other answer.")
+    yes = [q for q, a in YES_NO if a == "Yes"]
+    no = [q for q, a in YES_NO if a == "No"]
+    for _ in range(300):
+        q1, q2 = rng.choice(yes), rng.choice(no)
+        shots = "Q: Is milk white?\nA: Yes\nQ: Do fish walk?\nA: No\n"
+        if rng.random() < 0.5:
+            v.items.append(Item(shots + f"Q: {q1}\nA:", " Yes", shots + f"Q: {q2}\nA:", " No"))
+        else:
+            v.items.append(Item(shots + f"Q: {q2}\nA:", " No", shots + f"Q: {q1}\nA:", " Yes"))
+    return [v]
+
+
+@family
+def lowercase(tok, rng):
+    """Lowercase a word in a few-shot list."""
+    ws = words(tok, NOUNS)
+    v = Variant("few_shot", "Case conversion: after two examples, the lowercase form of a new uppercase word.")
+    for _ in range(600):
+        a, b, c, d = rng.sample(ws, 4)
+        t = "{A} -> {a}\n{B} -> {b}\n{C} ->"
+        v.items.append(Item(t.format(A=a.upper(), a=a, B=b.upper(), b=b, C=c.upper()), " " + c,
+                            t.format(A=a.upper(), a=a, B=b.upper(), b=b, C=d.upper()), " " + d))
+    return [v]
+
+
+@family
+def number_pattern(tok, rng):
+    """Continue the square numbers or the Fibonacci numbers."""
+    sq = [n * n for n in range(1, 16)]
+    fib = [1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377]
+    tri = [n * (n + 1) // 2 for n in range(1, 16)]
+    out = []
+    for name, seq, desc in [("squares", sq, "square numbers"), ("fibonacci", fib, "Fibonacci numbers"), ("triangular", tri, "triangular numbers")]:
+        v = Variant(name, f"Number patterns: a run of consecutive {desc}; the next number continues it.",
+                    sequence_items([str(x) for x in seq], rng, False, [], n=400))
+        out.append(v)
+    return out
