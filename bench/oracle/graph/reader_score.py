@@ -490,7 +490,8 @@ def main():
     seconds = time.time() - start
     texts = len(programs) * (3 if not args.no_baselines else 1)
     summary = {"reader": scorer.backend.describe(), "target": args.target, "programs": len(programs), "items": len(items), "seconds": seconds,
-               "item_reads_per_second": texts * len(items) / seconds, "results": results}
+               "item_reads_per_second": texts * len(items) / seconds, "item_ids": [it.get("id") for it in items],
+               "item_words": [words(it["experiment"]) for it in items], "results": results}
     Path(args.out).write_text(json.dumps(summary, indent=1))
     for r in results:
         print(json.dumps({k: r[k] for k in r if k not in ("per_item",)}))

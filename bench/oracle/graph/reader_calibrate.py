@@ -207,6 +207,15 @@ def report(args):
         if "english_saved_bits" in r:
             lines.append(f"{k:28s} English saves {(r['code_only_mean_bits_per_item'] - r['mean_bits_per_item']):+.4f} bits/item, program saves "
                          f"{(r['empty_mean_bits_per_item'] - r['mean_bits_per_item']):+.4f} bits/item over the empty program")
+    if "item_words" in d:  # per experiment (its words), every program's mean bits
+        groups: dict[str, list[int]] = {}
+        for j, w in enumerate(d["item_words"]):
+            groups.setdefault(w, []).append(j)
+        lines.append("per experiment, mean bits per item: " + ", ".join(f"{k}" for k in rows) + ", empty")
+        for w, js in groups.items():
+            any_r = next(iter(rows.values()))
+            empty = f"{np.mean(np.array(any_r['per_item_empty'])[js]):.3f}" if "per_item_empty" in any_r else "-"
+            lines.append(f"  {w[:70]:70s} " + " ".join(f"{bits[k][js].mean():.3f}" for k in rows) + f" {empty}")
     print("\n".join(lines))
 
 
