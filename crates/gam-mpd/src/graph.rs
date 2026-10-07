@@ -1881,7 +1881,7 @@ pub struct Candidates {
 impl Candidates {
     /// From `M`'s clean log-probabilities `clean` (rows `clean_rows`), `M_e`'s `m` and `P_e`'s `p`
     /// (rows `rows`).
-    fn of(clean: &Array2<f64>, m: &Array2<f32>, p: &Array2<f64>, rows: &[(usize, usize)], clean_rows: &[(usize, usize)], k: usize) -> Self {
+    fn of(clean: &Array2<f64>, m: &Array2<f64>, p: &Array2<f64>, rows: &[(usize, usize)], clean_rows: &[(usize, usize)], k: usize) -> Self {
         let mut out = Self::default();
         let rest = |values: &[f64]| (1.0 - values.iter().sum::<f64>()).max(0.0);
         for (r, at) in rows.iter().enumerate().take(m.nrows().min(p.nrows())) {
@@ -1891,7 +1891,7 @@ impl Candidates {
             order.sort_by(|a, b| row[*b].total_cmp(&row[*a]));
             order.truncate(k);
             let clean_p: Vec<f64> = order.iter().map(|&t| row[t].exp()).collect();
-            let model_p: Vec<f64> = order.iter().map(|&t| f64::from(m[[r, t]]).exp()).collect();
+            let model_p: Vec<f64> = order.iter().map(|&t| m[[r, t]].exp()).collect();
             let program_p: Vec<f64> = order.iter().map(|&t| p[[r, t]].exp()).collect();
             out.clean_other.push(rest(&clean_p));
             out.model_other.push(rest(&model_p));
@@ -1903,23 +1903,6 @@ impl Candidates {
         }
         out
     }
-}
-
-/// `KL(p ‖ q)` in bits per row, `p` stored in float32.
-pub fn kl_bits_f32(p: &Array2<f32>, q: &Array2<f64>) -> Vec<f64> {
-    p.outer_iter()
-        .zip(q.outer_iter())
-        .map(|(p, q)| {
-            p.iter()
-                .zip(q.iter())
-                .map(|(&a, b)| {
-                    let a = f64::from(a);
-                    if a.is_finite() { a.exp() * (a - b) } else { 0.0 }
-                })
-                .sum::<f64>()
-                / std::f64::consts::LN_2
-        })
-        .collect()
 }
 
 /// The byte budget of `M`'s cached outcomes: `GRAPH_CACHE_GIB` GiB (4 when unset).
@@ -2013,9 +1996,10 @@ pub struct Checker {
     counterfactual: Option<(Batch, Vec<usize>)>,
     /// Per prompt with a same-length donor: (prompt, donor).
     donors: Vec<(usize, usize)>,
-    /// `M`'s outcome per experiment key (log-probabilities in float32) and the keys in the order
+    /// `M`'s outcome per experiment key (log-probabilities in float64: exact scores, an empty or full
+    /// program's error to the last bits) and the keys in the order
     /// they were stored: the oldest are dropped past `cache_bytes`.
-    cache: BTreeMap<String, Arc<Array2<f32>>>,
+    cache: BTreeMap<String, Arc<Array2<f64>>>,
     cached: std::collections::VecDeque<String>,
     pub cache_bytes: usize,
     /// Heads by their measured removal effect on `M` (mean `KL(M ‖ M without the head)` at the
@@ -2261,15 +2245,15 @@ impl Checker {
     }
 
     /// Stores `M`'s outcome under `key`, dropping the oldest past the byte budget.
-    fn keep(&mut self, key: String, outcome: Arc<Array2<f32>>) {
+    fn keep(&mut self, key: String, outcome: Arc<Array2<f64>>) {
         if self.cache.insert(key.clone(), outcome).is_none() {
             self.cached.push_back(key);
         }
-        let mut bytes: usize = self.cache.values().map(|a| a.len() * 4).sum();
+        let mut bytes: usize = self.cache.values().map(|a| a.len() * 8).sum();
         while bytes > self.cache_bytes && self.cached.len() > 1 {
             let Some(old) = self.cached.pop_front() else { break };
             if let Some(a) = self.cache.remove(&old) {
-                bytes -= a.len() * 4;
+                bytes -= a.len() * 8;
             }
         }
     }
@@ -2278,11 +2262,11 @@ impl Checker {
     pub fn model_outcome(&mut self, graph: &Graph, e: &Experiment) -> Result<Array2<f64>, String> {
         let key = self.model_key(graph, e);
         if let Some(hit) = self.cache.get(&key) {
-            return Ok(hit.mapv(f64::from));
+            return Ok((**hit).clone());
         }
         let circuit = graph.model(&self.weights);
         let out = self.outcome(&circuit, e)?;
-        self.keep(key, Arc::new(out.mapv(|v| v as f32)));
+        self.keep(key, Arc::new(out.clone()));
         Ok(out)
     }
 
@@ -2352,11 +2336,11 @@ impl Checker {
                     }
                 }
                 let this = &*self;
-                let made: Vec<(String, Arc<Array2<f32>>)> = missing
+                let made: Vec<(String, Arc<Array2<f64>>)> = missing
                     .par_iter()
-                    .map(|&r| this.run(&models[runs[r].0], &runs[r].1).map(|m| (runs[r].2.clone(), Arc::new(m.mapv(|v| v as f32)))))
+                    .map(|&r| this.run(&models[runs[r].0], &runs[r].1).map(|m| (runs[r].2.clone(), Arc::new(m))))
                     .collect::<Result<_, String>>()?;
-                let fresh: BTreeMap<String, Arc<Array2<f32>>> = made.iter().cloned().collect();
+                let fresh: BTreeMap<String, Arc<Array2<f64>>> = made.iter().cloned().collect();
                 let this = &*self;
                 let scored: Vec<(usize, Vec<f64>, Option<Candidates>)> = members
                     .par_iter()
@@ -2364,7 +2348,7 @@ impl Checker {
                         let (i, e, key) = &runs[r];
                         let m = fresh.get(key).or_else(|| this.cache.get(key)).ok_or("M's outcome went missing")?;
                         let p = this.run(&circuits[*i], e)?;
-                        let kl = kl_bits_f32(m, &p);
+                        let kl = kl_bits(m, &p);
                         let candidates = clean.as_ref().map(|c| Candidates::of(c, m, &p, &this.rows_of(e), &this.rows_of(&Experiment::Clean), top));
                         Ok((r, kl, candidates))
                     })
