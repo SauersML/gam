@@ -241,7 +241,8 @@ fn standins(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, r: &Refer
 /// `circuit` run on the process's device ([`use_device`]), or `None` when there is none or the
 /// circuit holds a block the device path does not cover.
 pub(crate) fn run(weights: &Weights, circuit: &Circuit, job: &Run) -> Option<Result<Execution, String>> {
-    if !circuit.units.iter().all(|u| matches!(u.block, Block::Heads { .. } | Block::Neurons { .. })) {
+    // Native blocks only; operations on the heads of a VPD-view attention run on the host.
+    if !circuit.units.iter().all(|u| matches!(u.block, Block::Heads { .. } | Block::Neurons { .. })) || !job.ops.head_reads.is_empty() || !job.ops.record_reads.is_empty() {
         return None;
     }
     on_device(|s| run_on(s, weights, circuit, job))
