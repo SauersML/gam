@@ -58,6 +58,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import time
 from pathlib import Path
 
@@ -498,9 +499,15 @@ class Draw:
         k = int(self.rng.choice([16, 64]))
         return ("neurons", L, tuple(sorted(int(i) for i in self.rng.choice(top, size=min(k, len(top)), replace=False))))
 
+    def fixed(self):
+        """A piece of the fixed set (--pieces), uniformly."""
+        return OPTIONS["pieces"][int(self.rng.integers(len(OPTIONS["pieces"])))]
+
     def piece(self, rec, row, small=False):
         """Half aimed, half uniform (a quarter transcoder features when transcoders are loaded); `small`
         keeps neuron groups at 4 or fewer (questions listing several pieces)."""
+        if OPTIONS["pieces"]:
+            return self.fixed()
         if OPTIONS["aim"] == "large" and not small:
             return self.large(rec, row)
         while True:
@@ -517,7 +524,18 @@ class Draw:
 # ---------------------------------------------------------------- one batch of texts
 
 
-OPTIONS = {"types": None, "min_kl": float("-inf"), "aim": "mixed"}  # set by main: --types, --min-kl, --aim
+OPTIONS = {"types": None, "min_kl": float("-inf"), "aim": "mixed", "pieces": None}  # set by main: --types, --min-kl, --aim, --pieces
+
+
+def parse_piece(text: str):
+    """A piece from its mech spelling (L[l].head[h], L[l].mlp[:], L[l].head[:], L[l].mlp[i, ...])."""
+    if m := re.fullmatch(r"L\[(\d+)\]\.head\[(\d+)\]", text):
+        return ("head", int(m[1]), int(m[2]))
+    if m := re.fullmatch(r"L\[(\d+)\]\.(mlp|head)\[:\]", text):
+        return ("mlp" if m[2] == "mlp" else "attn", int(m[1]))
+    if m := re.fullmatch(r"L\[(\d+)\]\.mlp\[([\d, ]+)\]", text):
+        return ("neurons", int(m[1]), tuple(int(x) for x in m[2].split(",")))
+    raise ValueError(text)
 
 
 def want(kind: str) -> bool:
@@ -671,14 +689,18 @@ def batch_questions(m: Qwen3, w: Writer, draw: Draw, tokens: torch.Tensor, sourc
     if want("cut"):
         # x' of a cut: the text's own counterfactual, or under --aim large another text of the batch (the
         # night plan's "other counterfactual": a different prompt of the same length), whose writes differ more.
-        toks_cut = torch.roll(tokens, 1, 0) if OPTIONS["aim"] == "large" and B > 1 else toks2
+        toks_cut = torch.roll(tokens, 1, 0) if (OPTIONS["aim"] == "large" or OPTIONS["pieces"]) and B > 1 else toks2
         iv, desc, extra = m.new(B), [], []
-        large = OPTIONS["aim"] == "large"
+        large = OPTIONS["aim"] == "large" or bool(OPTIONS["pieces"])
         for r in rows:
             u = rng.random()
             if large and draw.split == "train":  # writers likely to matter: whole blocks more often
                 u = 0.3 + 0.7 * u  # 30% aimed or random heads, 70% whole MLP or attention
-            if u < 0.5 or draw.split == "heldout":
+            if OPTIONS["pieces"]:  # the writer is a piece of the fixed set
+                p = draw.fixed()
+                al = p[1]
+                ak, ah = ("head", p[2]) if p[0] == "head" else (p[0], -1)
+            elif u < 0.5 or draw.split == "heldout":
                 al = draw.layer_with_heads()
                 ak, ah = "head", (draw.aimed_head(rec, r, al) if rng.random() < 0.5 else int(rng.choice(draw.heads[al])))
             else:
@@ -802,6 +824,7 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--types", default="", help="only these question types (comma-separated), e.g. edit,swap,cut")
     ap.add_argument("--min-kl", type=float, default=float("-inf"), help="keep edit/cut/swap/prompt questions whose measured change is at least this (bits)")
+    ap.add_argument("--pieces", default="", help="JSON list of pieces in mech spelling: every question asks about one of them")
     ap.add_argument("--aim", default="mixed", choices=("mixed", "large"), help="large: pieces likely to move M (Draw.large)")
     ap.add_argument("--piece-split", default="train", choices=("train", "heldout"),
                     help="ask about training pieces (and whole blocks) or only held-out pieces (held_out_units)")
@@ -815,7 +838,8 @@ def main():
     ap.add_argument("--tc-layers", default="", help="layers whose transcoder features are asked about, e.g. 3,9,14,20,25")
     args = ap.parse_args()
     torch.set_grad_enabled(False)
-    OPTIONS.update(types=set(args.types.split(",")) if args.types else None, min_kl=args.min_kl, aim=args.aim)
+    OPTIONS.update(types=set(args.types.split(",")) if args.types else None, min_kl=args.min_kl, aim=args.aim,
+                   pieces=[parse_piece(p) for p in json.load(open(args.pieces))] if args.pieces else None)
     dev = device()
     if args.target == "vpd4l":
         import vpd4l
