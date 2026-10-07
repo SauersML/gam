@@ -5600,8 +5600,10 @@ mod tests {
         let mean = tail.iter().sum::<f64>() / tail.len() as f64;
         let spread = (tail.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (tail.len() - 1) as f64 / tail.len() as f64).sqrt();
         let last = bound.report.epochs.last().unwrap();
-        assert!(last.multiplier.is_some_and(|l| l > 0.0), "the multiplier stayed at zero over the budget");
-        assert!((mean - limit).abs() <= 3.0 * spread, "the last 20 epochs' mean {mean} ± {spread} parts per token against the budget {limit}");
+        // Every tenth epoch's count and multiplier, for a failure's message.
+        let trace: Vec<String> = bound.report.epochs.iter().step_by(10).map(|e| format!("{:.2} at λ {:.3e}", e.expected_parts.unwrap_or(f64::NAN), e.multiplier.unwrap_or(f64::NAN))).collect();
+        assert!(last.multiplier.is_some_and(|l| l > 0.0), "the multiplier stayed at zero over the budget: {trace:?}");
+        assert!((mean - limit).abs() <= 3.0 * spread, "the last 20 epochs' mean {mean} ± {spread} parts per token against the budget {limit} (free {free_parts}): {trace:?}");
         assert!(mean < limit + 0.5 * (free_parts - limit), "{mean} parts per token is not below the free fit's {free_parts}");
     }
 
