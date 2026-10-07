@@ -15,7 +15,7 @@ same_family = all(a['family'] == b['family'] and a['position'] == b['position'] 
 diff = max(abs(a['effect_bits_at_edited_token'] - b['effect_bits_at_edited_token']) for a, b in zip(mine[:n], theirs[:n]))
 check = {'experiments': [len(mine), len(theirs)], 'same_families_and_positions': same_family, 'max_effect_difference_bits': diff}
 print('manifest check', check)
-D = os.path.dirname(out)
+D = os.path.dirname(os.path.abspath(out))
 labels = {'published': 'VPD as published (CI reads the edited M, both ways)', 'causal': 'VPD, causal CI on the edited M', 'autonomous': 'VPD autonomous (causal CI on its own run)'}
 points = [p for p in json.load(open('/Users/user/mpd-data/compare/frontier_points.json'))] if os.path.exists('/Users/user/mpd-data/compare/frontier_points.json') else []
 points = [p for p in points if not p['label'].startswith('VPD')]
