@@ -151,6 +151,14 @@ def test_program_from_patch(tmp_path):
     assert priced["valid"], priced["error"]
     assert [n["id"] for n in priced["nodes"]] == ["mlp0", "h2_4"]  # whole MLPs 1 and 3 do not pay
     assert priced["nodes"][0]["pieces"][0]["index"] == [3068, 3069, 3070, 3071]
+    (tmp_path / "t.json").write_text(json.dumps({"behavior": "toy.a", "base_bits": 4.0, "layers": {
+        "3": [{"feature": 9, "recovery_bits": 0.0001}, {"feature": 5, "recovery_bits": 0.5}, {"feature": 7, "recovery_bits": 0.2}]}}))
+    behavior["model"] = "qwen3-0.6b"
+    (tmp_path / "b.json").write_text(json.dumps(behavior))
+    tc = mech.trace_inline(run("--tc", str(tmp_path / "t.json")), "qwen3-0.6b")
+    assert tc["valid"], tc["error"]
+    assert tc["nodes"][-1] == {"id": "tc3", "pieces": [{"view": "transcoder", "layer": 3, "kind": "feature", "index": [5, 7]}],
+                               "rule": None}
 
 
 def test_qwen_views():

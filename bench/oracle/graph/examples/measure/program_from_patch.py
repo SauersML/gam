@@ -5,7 +5,8 @@ from each into logits. The docstring states the behavior and the measured recove
 to add what the measurements do not show. --neurons TABLE.json[:K] (vpd_neurons.py, repeatable)
 replaces that layer's MLP by its neurons that pay for their opaque price (the table's best k, or K), and
 --head-price P keeps only heads recovering more than P bits per target token (a vpd4l head's opaque
-price is 0.28 at N = 2^24).
+price is 0.28 at N = 2^24). --tc TABLE (qwen_tc_patch.py) replaces those layers' MLPs by the transcoder
+features that recover more than --feature-price when patched alone.
 
   program_from_patch.py PATCH.json BEHAVIOR.json [--fraction 0.1] [--neurons T.json[:K] ...] > examples/NAME.py
 """
@@ -24,7 +25,15 @@ def main():
     ap.add_argument("--neurons", action="append", default=[], help="TABLE.json[:K] (K: neurons kept, default the table's best k)")
     ap.add_argument("--head-price", type=float, default=0.0)
     ap.add_argument("--mlp-price", type=float, default=0.0, help="whole MLPs (no --neurons table) above this only")
+    ap.add_argument("--tc", type=Path, help="qwen_tc_patch.py table: those layers' MLPs enter as transcoder features")
+    ap.add_argument("--feature-price", type=float, default=0.0015, help="bits per token a transcoder feature costs")
     a = ap.parse_args()
+    features = {}
+    if a.tc:
+        for layer, found in json.loads(a.tc.read_text())["layers"].items():
+            paying = sorted(f["feature"] for f in found if f["recovery_bits"] > a.feature_price)
+            if paying:
+                features[int(layer)] = (paying, sum(f["recovery_bits"] for f in found if f["feature"] in paying))
     tables, keep = {}, {}
     for spec in a.neurons:
         path, _, k = spec.partition(":")
@@ -35,11 +44,12 @@ def main():
     chosen = [(c["layer"], 0, c["head"], c["recovery_bits"]) for c in patch["heads"]]
     chosen += [(c["layer"], 1, None, c["recovery_bits"]) for c in patch["mlps"]]
     price = lambda c: a.head_price if c[2] is not None else a.mlp_price  # noqa: E731
-    chosen = sorted(c for c in chosen if c[3] >= a.fraction * base and c[3] > price(c)
-                    or (c[2] is None and c[0] in tables))
+    chosen = sorted(c for c in chosen if (c[2] is not None or c[0] not in features)
+                    and (c[3] >= a.fraction * base and c[3] > price(c) or (c[2] is None and c[0] in tables)))
+    chosen = sorted(chosen + [(l, 1, "tc", r) for l, (_, r) in features.items()])
     neurons = {l: sorted(t["order"][: keep[l]]) for l, t in tables.items()}
-    names = [f"h{l}_{h}" if h is not None else f"mlp{l}" for l, _, h, _ in chosen]
-    listed = ", ".join(f"{'L%d.H%d' % (l, h) if h is not None else 'layer %d MLP' % l} {r:.2f}"
+    names = [f"tc{l}" if h == "tc" else f"h{l}_{h}" if h is not None else f"mlp{l}" for l, _, h, _ in chosen]
+    listed = ", ".join(f"{'layer %d transcoder features (summed)' % l if h == 'tc' else 'L%d.H%d' % (l, h) if h is not None else 'layer %d MLP' % l} {r:.2f}"
                        for l, _, h, r in sorted(chosen, key=lambda c: -c[3]))
     priced = (f", and more than their opaque price per token (1/2 log2 N bits per weight, N = 2^24): "
               f"{a.head_price:.2f} for a head, {a.mlp_price:.2f} for a whole MLP; an MLP may instead enter as the "
@@ -52,9 +62,13 @@ def main():
            f"them reach every later read.")
     lines = ['"""' + "\n".join(textwrap.wrap(doc.split("\n\n")[0], 100)) + "\n\n"
              + "\n".join(textwrap.wrap(doc.split("\n\n")[1], 100)) + '\n"""',
-             "from mech import node, edges, L, embed, logits", ""]
+             "from mech import node, edges, L, PD, embed, logits" if features else "from mech import node, edges, L, embed, logits", ""]
     for name, (l, block, h, r) in zip(names, chosen):
-        if h is not None:
+        if h == "tc":
+            lines.append(f"# layer {l}'s MLP as the transcoder features that recover more than their price when "
+                         f"patched alone ({r:.2f} bits summed)")
+            lines.append(f"{name} = node(PD.tc[{l}][{', '.join(map(str, features[l][0]))}])")
+        elif h is not None:
             lines.append(f"{name} = node(L[{l}].head[{h}])  # recovers {r:.2f} bits")
         elif l in neurons:
             t, k = tables[l], len(neurons[l])
