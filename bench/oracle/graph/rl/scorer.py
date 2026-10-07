@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import sys
 from pathlib import Path
 
@@ -83,7 +84,9 @@ def checker(items: list[dict]) -> list[dict]:
             extra = {"options": json.loads(options)} if json.loads(options) else {}
             for s in range(0, len(batch), BATCH):  # a server's memory grows with the programs of one request
                 chunk = batch[s : s + BATCH]
-                for k, r in zip(chunk, c.score_batch([items[k]["source"] for k in chunk], experiments=experiments, seed=seed, uniform_seeds=uniform or None, **extra)):
+                reader = bool(os.environ.get("GRAPH_READER"))  # without a reader server, no reader items (13 MB per vpd4l score)
+                for k, r in zip(chunk, c.score_batch([items[k]["source"] for k in chunk], experiments=experiments, seed=seed, uniform_seeds=uniform or None, reader=reader, **extra)):
+                    r.pop("items", None)
                     out[k] = r
 
     per_worker = [[] for _ in range(WORKERS)]

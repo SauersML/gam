@@ -22,7 +22,7 @@ class Checker:
     def request(self, message):
         self.path = message["path"]
 
-    def score_batch(self, sources, experiments=32, seed=0, uniform_seeds=None, **options):
+    def score_batch(self, sources, experiments=32, seed=0, uniform_seeds=None, reader=True, **options):
         calls.append((self.path, seed, len(sources)))
         return [{"total_bits": len(x) + seed, "valid": True, "behavior": self.path} for x in sources]
 
