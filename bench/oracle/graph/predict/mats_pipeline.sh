@@ -28,6 +28,7 @@ case $1 in
          EXTRA=(--uv /Users/user/mpd-data/oracle/vpd/uv.safetensors --vpd-target /Users/user/mpd-data/vpd/t-9d2b8f02) ;;
     *) sed -n '2,10p' "$0"; exit 2 ;;
 esac
+ARR=${PREDICT_ARRAY:-$ARR}  # e.g. 0-3%2: fewer training shards first
 N=predict-$1
 D=/Users/user/mpd-data/cluster/$N
 sub() { MATS_REF=$REF MATS_MEM_EXACT=1 "$@" | tail -1; }
