@@ -19,15 +19,19 @@
 //! the heads' rows of those slices' writes. A write-side slice (o, down_proj) of a component gated
 //! at the block's input takes that gate's column (a fixed selection of the gate's columns).
 //!
-//! Training uses the expected gate: each stage holds a fixed operator `{stage}.softness` (one
-//! entry per component, `HARD` in the program as built, so evaluation is the hard gate) that
-//! `library_mdl` sets to the threshold's posterior deviation `σ_b` for a pass with a gradient, with
-//! the threshold at its mean there, so the gate is `Φ(z_b / σ_b)`, the step `H` integrated exactly
-//! over the threshold's posterior, and the gate's threshold and direction take gradients.
+//! Each component's gate has a width `w_b`, a trainable parameter of the explanation (per stage
+//! the operator `{stage}.width`, one entry per component, started at the standard deviation of the
+//! component's gate read over the start's fitting tokens, the data's own scale): the gate's
+//! strength is `Φ(z_b / w_b)`, at the weight sample of each pass, so the posterior's noise in the
+//! read, the threshold and a direction enters through the sample and the fit's expected gate is
+//! `E_q[Φ(z_b / w_b)]`. F moves `w_b` with every other parameter. A component counts as active
+//! where `z_b > 0`. A threshold fixed at a nearly hard gate (`Φ(z_b / σ_b)`, `σ_b` the threshold's
+//! posterior deviation, about 10⁻³ after the Laplace start) left the vpd4l fits' line steps at
+//! 1e-11 to 1e-17 against a transcoder fit's 1e-6 (decomp-vpd4l-b, -c at 6387505b50).
 //!
 //! Prior groups: per slice its read row and its write column (over every head for q, k and v),
-//! per direction gate its row, and per stage of a layer its thresholds (one group, as a transcoder
-//! block's gate biases are). Each head recomputes the attention input stage's gated activations;
+//! per direction gate its row, and per stage of a layer its thresholds and its widths (one group
+//! each, as a transcoder block's gate biases are). Each head recomputes the attention input stage's gated activations;
 //! the heads share the stage's operators.
 
 use crate::{
@@ -40,12 +44,6 @@ use crate::{
 use ndarray::{Array2, Axis, s};
 use serde::Deserialize;
 use std::{collections::BTreeMap, path::Path};
-
-/// The softness of the hard gate: `Φ(z / s)` at `s = 10⁻³⁰` (a normal float32) is `H(z)` for every
-/// `|z| > 10⁻²⁹`, and ½ at `z = 0`, where an own gate's read `V_bᵀx` is zero and so is the
-/// component's output. At `s = 0` the gate `z / s` is undefined at `z = 0`: a component with
-/// `τ_b = 0` on a row whose read is zero (an MLP whose components are all off) made the forward NaN.
-pub const HARD: f64 = 1e-30;
 
 fn error(e: impl std::fmt::Display) -> String {
     format!("library vpd: {e}")
@@ -66,6 +64,10 @@ enum Read {
 struct Component {
     read: Read,
     tau: f64,
+    /// The gate's starting width `w_b` (`vpd_start`: the standard deviation of its read over the
+    /// fitting tokens).
+    #[serde(default)]
+    width: Option<f64>,
     slices: Vec<[usize; 2]>,
 }
 
@@ -212,14 +214,15 @@ pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes], decompositio
                     ops.push(dense(&format!("{prefix}.threshold"), units(count)?, Interface::constant(), c)?);
                 }
             }
-            ops.push(dense(&format!("{prefix}.softness"), units(count)?, Interface::constant(), Array2::from_elem((count, 1), HARD))?);
+            let widths = comps.iter().map(|&b| components[b].width.filter(|w| w.is_finite() && *w > 0.0).ok_or_else(|| error(format!("component {b}: no positive gate width in the start file (rerun mpd_battery_2951 start)")))).collect::<Result<Vec<f64>, String>>()?;
+            ops.push(dense(&format!("{prefix}.width"), units(count)?, Interface::constant(), Array2::from_shape_fn((count, 1), |(b, _)| widths[b]))?);
             Ok(ops)
         };
         // The attention input stage's nodes from `input` (node 0 of a rule's nodes so far): the
-        // stacked read, the gate, the gate's softness, the gated activations; returns (gated node,
-        // gate node, softness node).
+        // stacked read, the gate, the gate's width, the gated activations; returns (gated node,
+        // gate node, width node).
         let stage_nodes = |nodes: &mut Vec<Node>, input: usize, (read, gate_a, gate_b, soft): (usize, usize, usize, usize)| -> (usize, usize, usize) {
-            // A direction gate and its softness come before the reads they gate, so each row reads
+            // A direction gate and its width come before the reads they gate, so each row reads
             // only its components on (`DeviceProgram`'s gated reads); an own gate reads them.
             let (a, z, s) = if direction {
                 nodes.push(Node::Affine { terms: vec![(input, gate_a)], bias: Some(gate_b) });
@@ -259,7 +262,7 @@ pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes], decompositio
                 (base, base + 1, base + 2, base + 3)
             } else {
                 let gate_names = if direction { ("direction", "threshold") } else { ("gate_identity", "threshold") };
-                (shared(&artifact, "read")?, shared(&artifact, gate_names.0)?, shared(&artifact, gate_names.1)?, shared(&artifact, "softness")?)
+                (shared(&artifact, "read")?, shared(&artifact, gate_names.0)?, shared(&artifact, gate_names.1)?, shared(&artifact, "width")?)
             };
             let mut nodes = vec![Node::Param { index: 0 }];
             let (gated, _, _) = stage_nodes(&mut nodes, 0, (read_op, gate_a, gate_b, soft));
@@ -326,7 +329,7 @@ pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes], decompositio
                     index_of(&artifact.program, &format!("{name}.attn.read"))?,
                     index_of(&artifact.program, &format!("{name}.attn.{}", gate_names.0))?,
                     index_of(&artifact.program, &format!("{name}.attn.{}", gate_names.1))?,
-                    index_of(&artifact.program, &format!("{name}.attn.softness"))?,
+                    index_of(&artifact.program, &format!("{name}.attn.width"))?,
                 );
                 let (_, z, s) = stage_nodes(&mut nodes, heads, stage_ops);
                 operators.push(dense(&format!("{name}.o.select_gate"), units(carried.len())?, units(a_comps.len())?, selection(&carried, a_comps.len()))?);
@@ -542,6 +545,11 @@ fn groups_of(artifact: Artifact, layers: &[LayerNodes], direction: bool) -> Resu
                 groups.push(Group { name: format!("{name}.{prefix}.thresholds"), cells: vec![Cells { operator: t, rows: (0..rows_of(t)).collect(), cols: 0..1 }] });
                 thresholds.push(groups.len() - 1);
             }
+            if let Ok(w) = named(&format!("{name}.{prefix}.width")) {
+                trainable.push(w);
+                groups.push(Group { name: format!("{name}.{prefix}.widths"), cells: vec![Cells { operator: w, rows: (0..rows_of(w)).collect(), cols: 0..1 }] });
+                thresholds.push(groups.len() - 1);
+            }
         }
         layer.components.push(thresholds);
         // The MLP: per carrier of c_fc and down slices, its groups (none for an MLP with no
@@ -590,6 +598,11 @@ fn groups_of(artifact: Artifact, layers: &[LayerNodes], direction: bool) -> Resu
                 groups.push(Group { name: format!("{name}.mlp.{prefix}.thresholds"), cells: vec![Cells { operator: t, rows: (0..rows_of(t)).collect(), cols: 0..1 }] });
                 layer.thresholds.push(groups.len() - 1);
             }
+            if let Ok(w) = named(&format!("{name}.mlp.{prefix}.width")) {
+                trainable.push(w);
+                groups.push(Group { name: format!("{name}.mlp.{prefix}.widths"), cells: vec![Cells { operator: w, rows: (0..rows_of(w)).collect(), cols: 0..1 }] });
+                layer.thresholds.push(groups.len() - 1);
+            }
         }
     }
     trainable.sort_unstable();
@@ -598,7 +611,7 @@ fn groups_of(artifact: Artifact, layers: &[LayerNodes], direction: bool) -> Resu
     Ok(Explanation { artifact, trainable, groups, layers: out, removed: Vec::new(), fixed_nats: 0.0, reference, reads: Vec::new() })
 }
 
-/// The gate and softness nodes of a write-side stage from their parts (carried, then own): the part
+/// The gate and width nodes of a write-side stage from their parts (carried, then own): the part
 /// itself when one, else their concatenation.
 /// The uses of `M`'s maps in an explanation [`explanation`] built (`artifact::Owner::uses`), where
 /// each map is a sum of gated slices no single operator holds: per layer, each head's q, k and v map

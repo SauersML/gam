@@ -1952,9 +1952,6 @@ struct Scorer {
     mlps: Vec<Option<Mlp>>,
     /// Per layer its stages of gated components (`library_vpd`), none for a layer of functions.
     stages: Vec<Vec<GatedStage>>,
-    /// Each gated stage's softness and threshold operators and its components (`library_vpd`;
-    /// [`Scorer::soften`]).
-    soft: Vec<(usize, usize, usize)>,
     /// Each trainable operator's position in `Explanation::trainable`.
     position: BTreeMap<usize, usize>,
     /// The blocks the explanation explains ([`scope`]), when not all of them ([`scoped`]): every
@@ -2007,15 +2004,7 @@ impl Scorer {
         let stages = mlps.iter().enumerate().map(|(l, mlp)| if mlp.is_some() { Ok(Vec::new()) } else { GatedStage::of(&flat, explanation, l) }).collect::<Result<_, String>>()?;
         let position = explanation.trainable.iter().enumerate().map(|(i, op)| (*op, i)).collect();
         let scope = Some(scope(explanation)).filter(|blocks| !blocks.iter().all(|b| *b));
-        let program = &explanation.artifact.program;
-        let soft = program
-            .operators
-            .iter()
-            .enumerate()
-            .filter_map(|(i, op)| op.name.strip_suffix(".softness").map(|prefix| (i, prefix.to_string(), op.rows.width())))
-            .map(|(i, prefix, count)| Ok((i, index_of(program, &format!("{prefix}.threshold"))?, count)))
-            .collect::<Result<_, String>>()?;
-        Ok(Self { experiments, mlps, stages, soft, position, scope, families: settings.families.clone(), edits: std::cell::RefCell::new(BTreeMap::new()) })
+        Ok(Self { experiments, mlps, stages, position, scope, families: settings.families.clone(), edits: std::cell::RefCell::new(BTreeMap::new()) })
     }
 
     /// With push among the families, the scorer with the pushed directions set from the seed and
@@ -2033,33 +2022,6 @@ impl Scorer {
 
     fn layers(&self) -> usize {
         self.mlps.len()
-    }
-
-    /// With `posterior`, each gated stage's softness set to its threshold's posterior deviation
-    /// `σ_b` and the threshold to its iterate's mean, so the stage's gates are `Φ(z_b / σ_b)`, the
-    /// hard gate integrated exactly over the threshold's posterior (`library_vpd`), for a pass
-    /// with a gradient; with none, the softness back to `library_vpd::HARD`, the hard gate every other
-    /// evaluation scores.
-    fn soften(&mut self, posterior: Option<&DevicePosterior>) -> Result<(), String> {
-        if self.soft.is_empty() {
-            return Ok(());
-        }
-        for (soft, threshold, count) in self.soft.clone() {
-            let (sd, mean) = match posterior {
-                Some(posterior) => {
-                    let j = self.at(threshold)?;
-                    (posterior.values(j)?.1.mapv(f64::exp), Some(posterior.iterate(j)?))
-                }
-                None => (Array2::from_elem((count, 1), crate::library_vpd::HARD), None),
-            };
-            let program = self.experiments.explanation_mut();
-            let device = program.device().clone();
-            program.replace_dense_parameter(soft, device.upload(sd.view()).map_err(error)?)?;
-            if let Some(mean) = mean {
-                program.replace_dense_parameter(threshold, device.upload(mean.view()).map_err(error)?)?;
-            }
-        }
-        self.experiments.explanation_mut().refresh_fused()
     }
 
     fn at(&self, operator: usize) -> Result<usize, String> {
@@ -2142,10 +2104,7 @@ impl Scorer {
             _ => None,
         };
         let evaluation = if gradient {
-            self.soften(Some(posterior))?;
-            let evaluation = self.reversed(|e| e.evaluate_probed(batch, experiments, Some(targets), gradient, probe));
-            self.soften(None)?;
-            evaluation?
+            self.reversed(|e| e.evaluate_probed(batch, experiments, Some(targets), gradient, probe))?
         } else {
             self.experiments.evaluate_probed(batch, experiments, Some(targets), gradient, probe)?
         };
@@ -3610,7 +3569,7 @@ pub fn fit_from(
         // takes its deviations and curvature one operator at a time.
         drop(device_posterior);
         device_posterior = DevicePosterior::new(device, explanation, &posterior, tokens as f64, Some(State::Zero), 0)?;
-        laplace_start(&scorer, &mut posterior, sums, tokens, |i, log_sd, h| device_posterior.set_start(i, log_sd, h))?;
+        laplace_start(&scorer, explanation, &mut posterior, sums, tokens, |i, log_sd, h| device_posterior.set_start(i, log_sd, h))?;
         device_posterior.settle()?;
         log::info!("library Laplace start: {:.1} s", timed.elapsed().as_secs_f64());
     }
@@ -3997,10 +3956,7 @@ fn laplace_sums(scorer: &mut Scorer, device_posterior: &DevicePosterior, draws: 
         // gradient.
         let key = noise_seed(settings.seed, 0, b);
         device_posterior.sample_into(scorer.experiments.explanation_mut(), key)?;
-        scorer.soften(Some(device_posterior))?;
-        let factor = scorer.reversed(|e| e.fisher_probe_resident(&batch, &experiments, probe_key(key)));
-        scorer.soften(None)?;
-        let factor = factor?;
+        let factor = scorer.reversed(|e| e.fisher_probe_resident(&batch, &experiments, probe_key(key)))?;
         for (op, u) in &factor {
             let u = wide.convert(u).map_err(error)?;
             match sums.get_mut(op) {
@@ -4022,6 +3978,7 @@ fn laplace_sums(scorer: &mut Scorer, device_posterior: &DevicePosterior, draws: 
 /// read, so no more than one operator's curvature is on the host.
 fn laplace_start(
     scorer: &Scorer,
+    explanation: &Explanation,
     posterior: &mut Posterior,
     (wide, sums): (Device, BTreeMap<usize, Tensor>),
     tokens: usize,
@@ -4033,12 +3990,22 @@ fn laplace_start(
     }
     let variance = posterior.variances();
     let n = tokens as f64;
+    let gate: Vec<bool> = explanation.groups.iter().map(|g| g.name.ends_with(".thresholds") || g.name.ends_with(".widths")).collect();
     for i in 0..posterior.mean.len() {
         let mut h = match at.remove(&i) {
             Some(sum) => wide.download(&sum).map_err(error)?,
             None => Array2::zeros(posterior.mean[i].dim()),
         };
         h.mapv_inplace(|square| square / n);
+        // A gate's threshold or width (`library_vpd`'s `.thresholds` and `.widths` groups) starts
+        // at its group's prior, `σ² = v_G`: the curvature of a gate at its start is not a valid
+        // Laplace curvature (a nearly hard gate's is a step's), and from it the thresholds'
+        // deviations started near 10⁻³ and only shrank (vpd4l, decomp-vpd4l-b, -c at 6387505b50).
+        ndarray::Zip::from(&mut h).and(&posterior.membership[i]).for_each(|h, group| {
+            if gate[*group as usize] {
+                *h = 0.0;
+            }
+        });
         ndarray::Zip::from(&mut *posterior.log_sd[i]).and(&h).and(&posterior.membership[i]).for_each(|s, h, group| {
             let v = variance[*group as usize];
             if *s != f64::NEG_INFINITY && v > 0.0 {
@@ -4085,10 +4052,7 @@ fn removal_curvature(scorer: &mut Scorer, posterior: &DevicePosterior, draws: &[
         lap(2, &mut timed);
         // One forward pass at the batch's sample, reversed twice: the divergence's gradient (in
         // bits) and a draw of the Gauss–Newton factor.
-        scorer.soften(Some(posterior))?;
-        let evaluation = scorer.reversed(|e| e.evaluate_probed(&batch, &experiments, Some(&targets), true, Some(probe_key(key))));
-        scorer.soften(None)?;
-        let evaluation = evaluation?;
+        let evaluation = scorer.reversed(|e| e.evaluate_probed(&batch, &experiments, Some(&targets), true, Some(probe_key(key))))?;
         let factor = evaluation.factor.ok_or("no Gauss–Newton factor")?;
         lap(3, &mut timed);
         posterior.add_removal((&evaluation.gradient, LN_2), &factor.gradient, key, &mut curvature, &mut pending)?;
@@ -4361,7 +4325,7 @@ pub fn start_posterior(device: &Device, native: &OperatorProgram, explanation: &
     let sums = laplace_sums(&mut scorer, &device_posterior, &draws, sequences, settings)?;
     device.synchronize().map_err(error)?;
     lap(2, &mut timed);
-    laplace_start(&scorer, &mut posterior, sums, tokens, |_, _, _| Ok(()))?;
+    laplace_start(&scorer, explanation, &mut posterior, sums, tokens, |_, _, _| Ok(()))?;
     lap(3, &mut timed);
     log::info!(
         "library start parts: posterior on the host {:.1} s, to the device {:.1} s, curvature pass {:.1} s, deviations on the host {:.1} s ({} parameters)",

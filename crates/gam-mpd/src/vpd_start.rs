@@ -71,12 +71,21 @@ impl Read {
     }
 }
 
-/// A component: its gate's read and threshold, and its slices (site, index).
+/// A component: its gate's read, threshold and width (the standard deviation of the read over the
+/// fitting rows, `library_vpd`'s starting gate width), and its slices (site, index).
 #[derive(Clone, Debug)]
 struct Component {
     read: Read,
     tau: f64,
+    width: f64,
     slices: Vec<(usize, usize)>,
+}
+
+/// The standard deviation of `values`.
+fn deviation(values: impl Iterator<Item = f64> + Clone) -> f64 {
+    let n = values.clone().count().max(1) as f64;
+    let mean = values.clone().sum::<f64>() / n;
+    (values.map(|v| (v - mean) * (v - mean)).sum::<f64>() / n).sqrt()
 }
 
 /// An arm: its components and, per site and slice, the component holding it (none: dropped).
@@ -172,22 +181,27 @@ fn arms(vpd: &Vpd, fit: &Fit) -> Result<Vec<Arm>, String> {
     // Per site and slice: alive on the fitting rows, and its own threshold.
     let mut alive: Vec<Vec<bool>> = Vec::with_capacity(sites);
     let mut own_tau: Vec<Vec<f64>> = Vec::with_capacity(sites);
+    let mut own_width: Vec<Vec<f64>> = Vec::with_capacity(sites);
     for s in 0..sites {
         let on = on(s);
         let c = vpd.sites[s].1;
-        let fitted: Vec<(bool, f64)> = (0..c)
+        // A slice whose read is constant on every fitting row (zero there: `|v_iᵀx|` with
+        // `v_iᵀx = 0`) gates nothing and is dropped with the slices VPD never turns on.
+        let fitted: Vec<(bool, f64, f64)> = (0..c)
             .into_par_iter()
             .map(|i| {
                 let labels: Vec<bool> = on.column(i).to_vec();
-                if !labels.iter().any(|b| *b) {
-                    return (false, f64::INFINITY);
-                }
                 let values: Vec<f32> = fit.reads[s].column(i).to_vec();
-                (true, best_threshold(&values, &labels).0)
+                let width = deviation(values.iter().map(|v| f64::from(*v)));
+                if !labels.iter().any(|b| *b) || !(width > 0.0) {
+                    return (false, f64::INFINITY, 0.0);
+                }
+                (true, best_threshold(&values, &labels).0, width)
             })
             .collect();
         alive.push(fitted.iter().map(|f| f.0).collect());
         own_tau.push(fitted.iter().map(|f| f.1).collect());
+        own_width.push(fitted.iter().map(|f| f.2).collect());
     }
     let empty_holder = || -> Vec<Vec<Option<usize>>> { vpd.sites.iter().map(|&(_, c, _)| vec![None; c]).collect() };
     // per_slice_own.
@@ -195,7 +209,7 @@ fn arms(vpd: &Vpd, fit: &Fit) -> Result<Vec<Arm>, String> {
     for s in 0..sites {
         for i in (0..vpd.sites[s].1).filter(|&i| alive[s][i]) {
             per_slice.holder[s][i] = Some(per_slice.components.len());
-            per_slice.components.push(Component { read: Read::Own { site: s, index: i }, tau: own_tau[s][i], slices: vec![(s, i)] });
+            per_slice.components.push(Component { read: Read::Own { site: s, index: i }, tau: own_tau[s][i], width: own_width[s][i], slices: vec![(s, i)] });
         }
     }
     // The grouped components: seeds and the write-side slices joining them.
@@ -221,13 +235,24 @@ fn arms(vpd: &Vpd, fit: &Fit) -> Result<Vec<Arm>, String> {
             let first = own.components.len();
             for (k, &(s, i)) in seed_list.iter().enumerate() {
                 let labels: Vec<bool> = fit.masks[s].column(i).iter().map(|m| *m > 0.0).collect();
-                let values: Vec<f32> = scores.column(k).iter().map(|v| *v as f32).collect();
-                let (tau, _) = best_threshold(&values, &labels);
+                // The regression's direction, or where it is flat on the fitting rows (a mask on at
+                // every row regresses onto the constant alone, a gate that never switches), the
+                // slice's own read `v_iᵀx`, signed: a direction gate always has a slope.
+                let mut read: Vec<f64> = coefficients.column(k).to_vec();
+                let mut values: Vec<f64> = scores.column(k).to_vec();
+                if !(deviation(values.iter().copied()) > 0.0) {
+                    let width = x.ncols() - 1;
+                    read = (0..=width).map(|j| if j < width { vpd.factors[s].v[[j, i]] } else { 0.0 }).collect();
+                    values = x.rows().into_iter().map(|row| row.iter().zip(&read).map(|(a, b)| a * b).sum()).collect();
+                }
+                let width = deviation(values.iter().copied());
+                let values32: Vec<f32> = values.iter().map(|v| *v as f32).collect();
+                let (tau, _) = best_threshold(&values32, &labels);
                 for arm in [&mut own, &mut direction] {
                     arm.holder[s][i] = Some(first + k);
                 }
-                own.components.push(Component { read: Read::Own { site: s, index: i }, tau: own_tau[s][i], slices: vec![(s, i)] });
-                direction.components.push(Component { read: Read::Direction { site: input, coefficients: coefficients.column(k).to_vec() }, tau, slices: vec![(s, i)] });
+                own.components.push(Component { read: Read::Own { site: s, index: i }, tau: own_tau[s][i], width: own_width[s][i], slices: vec![(s, i)] });
+                direction.components.push(Component { read: Read::Direction { site: input, coefficients: read }, tau, width, slices: vec![(s, i)] });
             }
             for w in (0..vpd.sites[writes].1).filter(|&w| alive[writes][w]) {
                 let norm = write_masks.column(w).dot(&write_masks.column(w)).sqrt();
@@ -342,7 +367,7 @@ pub fn vpd_start(vpd: &Vpd, fit_rows: &[Vec<u32>], held_out: &[Vec<u32>], batch:
                         Read::Own { site, index } => json!({"own": [site, index]}),
                         Read::Direction { site, coefficients } => json!({"direction": {"site": site, "coefficients": coefficients}}),
                     };
-                    json!({"read": read, "tau": c.tau, "slices": c.slices})
+                    json!({"read": read, "tau": c.tau, "width": c.width, "slices": c.slices})
                 }).collect::<Vec<Value>>(),
             })
         })
