@@ -14,8 +14,9 @@ These are the docstrings' only claims; the edges are the program's and the check
 
   printer.py PROGRAM (.py | .json IR | .json search result with "source") BEHAVIOR.json
              [--name NAME] [--out-dir DIR] [--score SCORE.json]
-writes DIR/NAME.py (the program) and DIR/NAME.graph.json (nodes with their facts and one-line roles,
-edges, score if given). printed(ir, behavior) is the same as a function.
+writes DIR/NAME.py (the program, facts in comments), DIR/NAME.answer.txt (the oracle's format: the program
+block, then its plain-English explanation from the facts in words and the edges) and DIR/NAME.graph.json
+(nodes with their facts and one-line roles, edges, explanation, score if given). printed(ir, behavior) is the same as a function.
 """
 
 from __future__ import annotations
@@ -420,13 +421,104 @@ def source_of(ir: dict, behavior: dict, facts_of: dict[str, dict], score: dict |
     return "\n".join(out) + "\n"
 
 
+SITE_WORDS = {"q_proj": "query", "k_proj": "key", "v_proj": "value", "o_proj": "output", "c_fc": "input",
+              "down_proj": "output"}
+RULE_WORDS = {"offset": "attends to the position {k} back", "first": "attends to the first position",
+              "match": "attends to every earlier position whose previous token is the current token"}
+
+
+def part_words(n: dict) -> str:
+    """A node's pieces in words: "head L2.H4", "12 subcomponents of layer 0's MLP", ..."""
+    out = []
+    for p in n["pieces"]:
+        idx = p["index"]
+        count = None if idx in (None, "rest") else (len(idx) if isinstance(idx, list) else 1)
+        if p["view"] == "native" and p["kind"] == "head":
+            heads = idx if isinstance(idx, list) else [idx]
+            out.append(", ".join(f"L{p['layer']}.H{h}" for h in heads) if idx is not None else f"every head of layer {p['layer']}")
+        elif p["view"] == "native":
+            out.append(f"{count or 'all'} neurons of layer {p['layer']}'s MLP")
+        elif p["view"] == "vpd":
+            block = "MLP" if p["kind"] in ("c_fc", "down_proj") else "attention"
+            what = "the rest of" if idx == "rest" else f"{count} {SITE_WORDS[p['kind']]} subcomponent{'s' if count != 1 else ''} of"
+            out.append(f"{what} layer {p['layer']}'s {block} {p['kind'] if idx == 'rest' else ''}".rstrip())
+        elif p["view"] == "transcoder":
+            out.append(f"{count} transcoder feature{'s' if count != 1 else ''} of layer {p['layer']}'s MLP")
+        else:
+            out.append(f"{count} parts of layer {p['layer']}'s {p['kind']}")
+    return "; ".join(out)
+
+
+def rule_words(rule: dict | None) -> str:
+    if not rule:
+        return ""
+    if "offset" in rule:
+        return RULE_WORDS["offset"].format(k=rule["offset"])
+    return RULE_WORDS["first"] if rule.get("first") else RULE_WORDS["match"]
+
+
+def explanation_of(ir: dict, behavior: dict, facts_of: dict[str, dict]) -> str:
+    """The program's plain-English explanation (what the reader reads): what each part does, from the
+    measured facts in words, and how the parts connect, from the declared edges."""
+    name = {n["id"]: part_words(n) for n in ir["nodes"]}
+    lines = [behavior["description"].rstrip(".") + "."]
+    for n in ir["nodes"]:
+        f = facts_of.get(n["id"])
+        words = name[n["id"]]
+        plural = "," in words or ";" in words or any(w in words for w in ("neurons", "subcomponents", "features", "parts"))
+        rule = rule_words(n.get("rule"))
+        subject = words[0].upper() + words[1:] + (f", which {rule.replace('attends', 'attend' if plural else 'attends')}," if rule else "")
+        if f:
+            d, z, rank = f["removal_answer_bits"], f["direct_answer_logit"], f["direct_answer_rank_median"]
+            be, matter, work = ("are", "matter", "work") if plural else ("is", "matters", "works")
+            weight = (f"{be} essential" if d <= -2 else matter if d <= -0.5 else f"{matter} a little" if d < -0.1
+                      else f"{work} against the answer" if d > 0.1 else f"barely change{'' if plural else 's'} the answer")
+            own = "their" if plural else "its"
+            if z is None:
+                does = f"{own} output feeds {own} layer's computation rather than the output"
+            elif rank is not None and rank <= 3 and z > 0.5:
+                does = f"{own} output writes the answer directly"
+            elif z > 0.2:
+                does = f"{own} output pushes the answer up a little"
+            else:
+                does = f"{own} output does not write the answer; later parts use it"
+            lines.append(f"{subject} {weight}: {does}.")
+        else:
+            lines.append(f"{subject} {'are' if plural else 'is'} part of the mechanism.")
+
+    def site(n):  # where the node reads: layer l's attention 2l, its MLP 2l + 1
+        return min(2 * p["layer"] + (p["kind"] in ("mlp", "c_fc", "down_proj", "feature")) for p in n["pieces"])
+
+    sources = {n["id"]: {e["from"] for e in ir["edges"] if e["to"] == n["id"] and e["from"] != "embed"} for n in ir["nodes"]}
+    earlier = {n["id"]: {m["id"] for m in ir["nodes"] if site(m) < site(n)} for n in ir["nodes"]}
+    writers = [e["from"] for e in ir["edges"] if e["to"] == "logits" and e["from"] != "embed"]
+    if all(sources[k] == earlier[k] for k in sources) and set(writers) == set(name):
+        lines.append("Each part reads the embedding and every earlier part, and each writes to the output.")
+    else:
+        for e in ir["edges"]:
+            if e["from"] == "embed" or e["to"] == "logits":
+                continue
+            route = "" if e["route"] == "input" else f" through its {e['route']}"
+            lines.append(f"{name[e['to']][0].upper() + name[e['to']][1:]} read{'' if ',' in name[e['to']] else 's'} "
+                         f"{name[e['from']]}{route}.")
+        if writers:
+            lines.append(f"The output reads {', '.join(name[w] for w in writers)}.")
+    lines.append("Everything else behaves as it does on the edited prompt.")
+    return " ".join(lines)
+
+
+def answer_of(source: str, explanation: str) -> str:
+    """The full answer in the oracle's format: the program block, then the explanation."""
+    return f"```python\n{source.rstrip()}\n```\n\n{explanation}\n"
+
+
 def graph_of(ir: dict, behavior: dict, facts_of: dict[str, dict], score: dict | None = None) -> dict:
     """A small graph description for rendering: nodes (address, facts, one-line role) and edges."""
     return {"behavior": behavior["id"], "model": ir["model"], "description": behavior["description"],
             "nodes": [{"id": n["id"], "address": ", ".join(address(p) for p in n["pieces"]),
                        "pieces": n["pieces"], "role": role(facts_of[n["id"]]) if n["id"] in facts_of else None,
                        **facts_of.get(n["id"], {})} for n in ir["nodes"]],
-            "edges": ir["edges"], "score": score}
+            "edges": ir["edges"], "explanation": explanation_of(ir, behavior, facts_of), "score": score}
 
 
 ENGINES: dict[str, object] = {}
@@ -486,8 +578,11 @@ def main():
     a.out_dir.mkdir(parents=True, exist_ok=True)
     name = a.name or f"{behavior['id']}.{a.program.stem}"
     (a.out_dir / f"{name}.py").write_text(src)
+    (a.out_dir / f"{name}.answer.txt").write_text(answer_of(src, graph["explanation"]))
     if a.wrong:
-        (a.out_dir / f"{name}.wrong.py").write_text(printed(ir, behavior, score, wrong(measured))[0])
+        bad_src, bad = printed(ir, behavior, score, wrong(measured))
+        (a.out_dir / f"{name}.wrong.py").write_text(bad_src)
+        (a.out_dir / f"{name}.wrong.answer.txt").write_text(answer_of(bad_src, bad["explanation"]))
     (a.out_dir / f"{name}.graph.json").write_text(json.dumps(graph, indent=1))
     print(src)
 

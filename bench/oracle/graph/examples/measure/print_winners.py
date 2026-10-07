@@ -1,6 +1,7 @@
 """Print every example that beats the empty program (rescore_examples.py outputs) with the printer, and
-attach its score: ~/mpd-data/graph_oracle/printed/<example>.{py,wrong.py,graph.json} (for the gallery
-and for training data). Examples already printed with a score are skipped.
+attach its score: ~/mpd-data/graph_oracle/printed/<example>.{py,answer.txt,wrong.py,wrong.answer.txt,graph.json}
+(the answer files are the oracle's format: the program block, then its explanation; for the gallery and
+for training data). Examples already printed with a score are skipped.
 
   MPD_MEM_GIB=3 mem-lease 3 ~/mpd-data/venv/bin/python print_winners.py RESCORE.jsonl [...]
 (PRINTED_DIR / BEHAVIORS_DIR override the output and behavior directories)
@@ -42,7 +43,10 @@ def main():
         score = {k: r["program"].get(k) for k in KEYS} | {"checker": r["checker"]}
         src, graph = printer.printed(ir, behavior, score, measured)
         (OUT / f"{name}.py").write_text(src)
-        (OUT / f"{name}.wrong.py").write_text(printer.printed(ir, behavior, score, printer.wrong(measured))[0])
+        (OUT / f"{name}.answer.txt").write_text(printer.answer_of(src, graph["explanation"]))
+        bad_src, bad = printer.printed(ir, behavior, score, printer.wrong(measured))
+        (OUT / f"{name}.wrong.py").write_text(bad_src)
+        (OUT / f"{name}.wrong.answer.txt").write_text(printer.answer_of(bad_src, bad["explanation"]))
         N = r["empty"].get("N") or 2**24
         graph["empty_score"] = {k: r["empty"].get(k) for k in KEYS}
         graph["summary"] = (f"total {r['program']['total_bits'] / N:.3f} bits per scored token vs the empty program's "

@@ -54,3 +54,23 @@ def test_rebuild():
     assert 0 < r["overlap"]["pieces"] < 1 and 0 < r["overlap"]["edges"] < 1  # L2.H4 >> logits is shared
     [same] = rebuild.rebuild([NATIVE], "vpd4l", lambda asks: ["```python\n" + NATIVE + "```"])
     assert same["overlap"] == {"pieces": 1.0, "edges": 1.0}
+
+
+def test_printer_explanation():
+    import printer
+
+    ir = mech.trace_inline("from mech import node, edges, L, PD, embed, logits, attend, tokens, shift\n"
+                           "prev = node(L[1].head[1])\nind = node(L[2].head[4], rule=attend(query=tokens, key=shift(tokens, 1)))\n"
+                           "m = node(PD.vpd[3].c_fc[1, 2], PD.vpd[3].down_proj[5])\n"
+                           "edges(embed >> prev.value, prev >> ind, ind >> m, m >> logits, ind >> logits)\n", "vpd4l")
+    facts = {"prev": {"removal_answer_bits": -0.3, "direct_answer_logit": 0.0, "direct_answer_rank_median": 900},
+             "ind": {"removal_answer_bits": -5.0, "direct_answer_logit": 2.0, "direct_answer_rank_median": 2},
+             "m": {"removal_answer_bits": -1.0, "direct_answer_logit": None, "direct_answer_rank_median": None}}
+    text = printer.explanation_of(ir, {"description": "Induction."}, facts)
+    assert text.startswith("Induction.") and "L2.H4, which attends to every earlier position" in text
+    assert "is essential: its output writes the answer directly" in text and "L1.H1 matters a little" in text
+    assert "subcomponents of layer 3's MLP" in text and "L2.H4 reads L1.H1." in text and "{" not in text
+    answer = printer.answer_of("x = 1\n", text)
+    import prompt
+
+    assert prompt.split_answer(answer) == ("x = 1\n", text)
