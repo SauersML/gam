@@ -1792,6 +1792,13 @@ pub struct Settings {
     /// budget is a declared constraint, not a term of `F`. None (the default) is no budget.
     #[serde(default)]
     pub budget: Option<f64>,
+    /// With `budget_bits`, `k(x)` counts the description bits of the parts executed on a token in
+    /// place of their rank (`library_vpd`'s gated components, [`GatedStage::bits`]): a part's bits
+    /// are its groups' `KL(q ‖ p)` (its slices' reads and writes and its direction row), its share of
+    /// its stage's thresholds and widths, and its index among the stage's parts, `log₂ n`; `K` is in
+    /// bits per token.
+    #[serde(default)]
+    pub budget_bits: bool,
 }
 
 /// [`Settings`] as configs and checkpoints hold them, unknown keys refused, and the keys of steps
@@ -1826,6 +1833,8 @@ struct SettingsRecord {
     families: Vec<interchange::Family>,
     #[serde(default)]
     budget: Option<f64>,
+    #[serde(default)]
+    budget_bits: bool,
     #[serde(default)]
     measured_beta2: Option<serde::de::IgnoredAny>,
     #[serde(default)]
@@ -1872,6 +1881,7 @@ impl From<SettingsRecord> for Settings {
             epochs: r.epochs,
             families: r.families,
             budget: r.budget,
+            budget_bits: r.budget_bits,
         }
     }
 }
@@ -2250,6 +2260,10 @@ struct GatedStage {
     threshold: usize,
     direction: Option<usize>,
     slices: Vec<Vec<usize>>,
+    /// Per component its own prior groups (its slices' read and write groups and its direction
+    /// row), and the stage's groups its components share (thresholds and widths).
+    groups: Vec<Vec<usize>>,
+    shared: Vec<usize>,
     /// The node holding each component's gate pre-activation: the gate node, or in a shared
     /// stage the gates' pre-activations through the assignment (`library_vpd`).
     component_gate: usize,
@@ -2266,6 +2280,8 @@ impl GatedStage {
     fn of(flat: &OperatorProgram, explanation: &Explanation, l: usize) -> Result<Vec<Self>, String> {
         let program = &explanation.artifact.program;
         let name = format!("library.l{l}");
+        // Every group of the layer by its name.
+        let named_group: BTreeMap<String, usize> = explanation.groups.iter().enumerate().filter(|(_, g)| g.name.starts_with(&format!("{name}."))).map(|(i, g)| (g.name.clone(), i)).collect();
         // Each single-row read group by its operator and row.
         let mut read_group: BTreeMap<(usize, usize), usize> = BTreeMap::new();
         for (g, group) in explanation.groups.iter().enumerate() {
@@ -2319,7 +2335,22 @@ impl GatedStage {
                 None => gate,
             };
             let width = index_of(flat, &format!("{prefix}.width"))?;
-            stages.push(Self { input, threshold, direction, slices, component_gate, assign, width });
+            let groups = slices
+                .iter()
+                .enumerate()
+                .map(|(b, reads)| {
+                    let mut own = Vec::with_capacity(2 * reads.len() + 1);
+                    for &g in reads {
+                        own.push(g);
+                        let write = explanation.groups[g].name.strip_suffix(".read").map(|stem| format!("{stem}.write"));
+                        own.extend(write.and_then(|w| named_group.get(&w).copied()));
+                    }
+                    own.extend(named_group.get(&format!("{prefix}.g{b}")).copied());
+                    own
+                })
+                .collect();
+            let shared = ["thresholds", "widths"].iter().filter_map(|s| named_group.get(&format!("{prefix}.{s}")).copied()).collect();
+            stages.push(Self { input, threshold, direction, slices, groups, shared, component_gate, assign, width });
             Ok(())
         };
         let mut attention = blocks(index_of(program, &format!("{name}.attn.read"))?)?;
@@ -2348,6 +2379,15 @@ impl GatedStage {
     /// Per component its active slices, its rank in rank-one equivalents.
     fn ranks(&self, active: &[bool]) -> Vec<f64> {
         self.slices.iter().map(|groups| groups.iter().filter(|g| active[**g]).count() as f64).collect()
+    }
+
+    /// Per component its description in bits (`Settings::budget_bits`), from each group's bits
+    /// `bits`: its own active groups', an equal share of the stage's shared groups', and its index
+    /// among the stage's components, `log₂ n` (descent's rot arm, 489cf5e569).
+    fn bits(&self, active: &[bool], bits: &[f64]) -> Vec<f64> {
+        let n = self.groups.len() as f64;
+        let shared = self.shared.iter().filter(|g| active[**g]).map(|g| bits[*g]).sum::<f64>() / n;
+        self.groups.iter().map(|own| own.iter().filter(|g| active[**g]).map(|g| bits[*g]).sum::<f64>() + shared + n.log2()).collect()
     }
 }
 
@@ -2390,6 +2430,9 @@ struct Scorer {
     mixings: Vec<Mixing>,
     mixed: BTreeMap<usize, Array2<f64>>,
     mix_step: Option<f64>,
+    /// With a budget in bits (`Settings::budget_bits`), each group's description in bits at the
+    /// posterior as the step found it, which the step's counts weigh their parts by.
+    group_bits: Option<Vec<f64>>,
 }
 
 impl Scorer {
@@ -2447,7 +2490,7 @@ impl Scorer {
         let hard_gates = stages.iter().flatten().filter(|s| !position.contains_key(&s.width)).map(|s| (s.width, s.threshold, program.operators[s.width].rows.width())).collect();
         let scoring = explanation.scoring;
         let thresholds = stages.iter().flatten().map(|s| (s.threshold, program.operators[s.threshold].rows.width())).collect();
-        let mut scorer = Self { experiments, mlps, stages, hard_gates, scoring, thresholds, position, scope, families: settings.families.clone(), edits: std::cell::RefCell::new(BTreeMap::new()), assignments, written: None, version: 0, assignment_step: None, assignment_budget: Vec::new(), mixings, mixed, mix_step: None };
+        let mut scorer = Self { experiments, mlps, stages, hard_gates, scoring, thresholds, position, scope, families: settings.families.clone(), edits: std::cell::RefCell::new(BTreeMap::new()), assignments, written: None, version: 0, assignment_step: None, assignment_budget: Vec::new(), mixings, mixed, mix_step: None, group_bits: None };
         scorer.train_gates(None)?;
         Ok(scorer)
     }
@@ -3050,7 +3093,10 @@ fn complexity_terms(scorer: &mut Scorer, device_posterior: &DevicePosterior, exp
             // components follow its components reads.
             let mut followed: Option<(Tensor, Tensor, Vec<f64>)> = None;
             for stage in &scorer.stages[l] {
-                let rank = stage.ranks(active);
+                let rank = match &scorer.group_bits {
+                    Some(bits) => stage.bits(active, bits),
+                    None => stage.ranks(active),
+                };
                 let j = scorer.at(stage.threshold)?;
                 let bias = (center(j)?.column(0).to_vec(), device_posterior.values(j)?.1.column(0).mapv(|s| (2.0 * s).exp()).to_vec());
                 // A direction gate's means and variances stay on the device (the posterior's iterate
@@ -3096,6 +3142,9 @@ fn complexity_terms(scorer: &mut Scorer, device_posterior: &DevicePosterior, exp
         };
         if layer.functions.is_empty() {
             continue;
+        }
+        if scorer.group_bits.is_some() {
+            return Err("a budget in bits counts gated components (library_vpd), not functions".into());
         }
         let surviving: Vec<bool> = layer.functions.iter().map(|groups| groups.iter().all(alive)).collect();
         if mlp.law != Law::Relu || mlp.up.is_some() {
@@ -4854,6 +4903,9 @@ pub fn fit_from(
             // mean's KL went from 1e-24 to 1.4e5 bits per token; re-measuring `λ̂` in its rate
             // (3a279507d3) moved it from 69 to 2,813 within three steps of a tiny vpd4l fit.
             let mut parts_note = String::new();
+            if settings.budget_bits {
+                scorer.group_bits = Some(device_posterior.divergences()?.iter().map(|d| d / LN_2).collect());
+            }
             let budget = match settings.budget.filter(|k| k.is_finite()) {
                 Some(limit) => Some((limit, complexity_terms(&mut scorer, &device_posterior, explanation, &posterior.active, &batch, (key, false))?)),
                 None => None,
@@ -6528,6 +6580,37 @@ mod tests {
         }
     }
 
+    /// A budget in bits (`Settings::budget_bits`) weighs each part's runs by its description: a
+    /// group's bits add to the count its part's expected runs per token (the count's change when one
+    /// group's bits go from 0 to 1, the same for a slice's read and its write, and positive), and the
+    /// count is linear in the groups' bits.
+    #[test]
+    fn a_budget_in_bits_weighs_each_part_by_its_groups() {
+        let (native, explanation, sequences) = learned_tiny("library_budget_bits");
+        let (device, settings) = (Device::host(), settings());
+        let posterior = Posterior::new(&explanation, 72).unwrap();
+        let device_posterior = DevicePosterior::new(&device, &explanation, &posterior, 72.0, None, 0).unwrap();
+        let mut scorer = Scorer::new(&device, &native, &explanation, &settings).unwrap();
+        let draws = draws(sequences.len(), settings.batch_sequences, settings.seed).unwrap();
+        let batch = draws[0].batch(&sequences).unwrap();
+        let key = training_key(settings.seed, 0, 0);
+        let groups = explanation.groups.len();
+        let mut count = |bits: Vec<f64>| {
+            scorer.group_bits = Some(bits);
+            complexity_terms(&mut scorer, &device_posterior, &explanation, &posterior.active, &batch, (key, false)).unwrap().0
+        };
+        let unit = |g: usize| (0..groups).map(|i| if i == g { 1.0 } else { 0.0 }).collect::<Vec<f64>>();
+        let zero = count(vec![0.0; groups]);
+        // The last MLP's first c_fc slice: its read and its write.
+        let read = explanation.groups.iter().position(|g| g.name.starts_with("library.l1.mlp.") && g.name.ends_with(".read")).unwrap();
+        let write = explanation.groups.iter().position(|g| g.name == explanation.groups[read].name.replace(".read", ".write")).unwrap();
+        let (by_read, by_write) = (count(unit(read)) - zero, count(unit(write)) - zero);
+        assert!(by_read > 0.0, "a slice's read weighs its part's runs: {by_read}");
+        assert!((by_read - by_write).abs() <= 1e-12, "the read's {by_read} and the write's {by_write}");
+        let both: Vec<f64> = (0..groups).map(|i| if i == read || i == write { 1.0 } else { 0.0 }).collect();
+        assert!((count(both) - zero - by_read - by_write).abs() <= 1e-12, "the count is linear in the bits");
+    }
+
     /// A budget that never binds (`K = ∞`, or `K` far above any count, where `λ` stays 0) leaves
     /// the fit bit for bit; a finite one records `K`, `Ê[k]` and `λ` in every epoch.
     #[test]
@@ -6608,6 +6691,7 @@ mod tests {
             epochs: None,
             families: Vec::new(),
             budget: None,
+            budget_bits: false,
         }
     }
 
