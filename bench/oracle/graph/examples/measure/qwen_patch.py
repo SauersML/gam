@@ -12,6 +12,7 @@ pieces carry their counterfactual values.
 
 import json
 import math
+import os
 import sys
 from pathlib import Path
 
@@ -39,7 +40,7 @@ def main():
                     torch.cuda.empty_cache()
 
 
-TOKENS = 16384  # tokens per forward batch: prompts are processed in chunks of TOKENS // length
+TOKENS = int(os.environ.get("PATCH_TOKENS", 16384))  # tokens per forward (chunks of TOKENS // (length x heads) prompts)
 
 
 def patch(model, dev, beh: dict, out: Path):
