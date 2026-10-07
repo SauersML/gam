@@ -707,6 +707,13 @@ fn weight_faithfulness(
     if rows.is_empty() {
         return Err("edits: no rows to score the weight edits on".into());
     }
+    // An explanation that records no owners may compute M's maps as sums of gated slices
+    // (library_vpd): the compile takes their uses.
+    let mut artifact = artifact.clone();
+    if artifact.owners.is_empty() {
+        artifact.owners = gam_mpd::library_vpd::uses(native, layers, &artifact)?;
+    }
+    let artifact = &artifact;
     let batch = interchange::Batch::new(rows.to_vec(), rows.to_vec())?;
     let clean: Vec<interchange::Experiment> = (0..rows.len()).map(|base| interchange::Experiment { base, source: base, explained: vec![true; 2 * layers.len()], patch: None, position: 0 }).collect();
     let interchange = |model: &OperatorProgram, explanation: &gam_mpd::artifact::Artifact| interchange::Interchange::new(device, model, layers, explanation, &[], reads.to_vec(), settings.numeric_bytes, 256);

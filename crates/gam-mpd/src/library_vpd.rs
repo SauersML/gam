@@ -31,7 +31,7 @@
 //! the heads share the stage's operators.
 
 use crate::{
-    artifact::{Argument, Artifact, Callee},
+    artifact::{Argument, Artifact, Callee, Owner},
     explanation_battery::{KINDS, Kind, load_factors},
     library_mdl::{Cells, Explanation, Group, Layer, mean_squares},
     operator_program::{FamilyInputs, Interface, LabelKind, Node, Operator, OperatorProgram, Provenance, Rule, Trace, exact_precision},
@@ -587,6 +587,74 @@ fn groups_of(artifact: Artifact, layers: &[LayerNodes], direction: bool) -> Resu
 
 /// The gate and softness nodes of a write-side stage from their parts (carried, then own): the part
 /// itself when one, else their concatenation.
+/// The uses of `M`'s maps in an explanation [`explanation`] built (`artifact::Owner::uses`), where
+/// each map is a sum of gated slices no single operator holds: per layer, each head's q, k and v map
+/// (the head rule's input into the node writing the head's projection), each head's block of the o
+/// map (the heads' concatenated outputs into the o rule's output), the c_fc map (the MLP rule's input
+/// into its pre-activations) and the down map (the activations into the MLP's output). A native
+/// weight edit compiles through them (`weight_edit`). Empty for an artifact this module did not
+/// build. `explanation` does not record them in the artifact, so the identities of its checkpoints
+/// stay as they are; whoever compiles an edit adds them.
+pub fn uses(native: &OperatorProgram, layers: &[LayerNodes], artifact: &Artifact) -> Result<Vec<Owner>, String> {
+    let program = &artifact.program;
+    if index_of(program, "library.l0.attn.read").is_err() {
+        return Ok(Vec::new());
+    }
+    let rule = |name: &str| program.rules.iter().find(|r| r.name == name).ok_or_else(|| error(format!("no rule {name}")));
+    let applying = |body: &Rule, op: &str| -> Result<usize, String> {
+        let at = index_of(program, op)?;
+        body.nodes.iter().position(|n| matches!(n, Node::Affine { terms, .. } if terms.iter().any(|t| t.1 == at))).ok_or_else(|| error(format!("{}: no node applies {op}", body.name)))
+    };
+    let map_of = |node: usize, input: usize| -> Result<&Operator, String> {
+        match native.nodes.get(node) {
+            Some(Node::Affine { terms, .. }) => terms.iter().find(|t| t.0 == input).map(|t| native.operators[t.1].as_ref()).ok_or_else(|| error(format!("native node {node} reads no map of node {input}"))),
+            _ => Err(error(format!("native node {node} is not a map"))),
+        }
+    };
+    let owner = |body: &Rule, w: &Operator, cols: std::ops::Range<usize>, role: &str, at: (usize, usize)| Owner {
+        rows: 0..w.rows.width(),
+        cols,
+        body: body.name.clone(),
+        site: body.name.clone(),
+        native: w.name.clone(),
+        native_rows: 0..w.rows.width(),
+        native_cols: 0..w.cols.width(),
+        role: role.to_string(),
+        uses: Some(at),
+        ..Owner::default()
+    };
+    let mut out = Vec::new();
+    for (l, layer) in layers.iter().enumerate() {
+        let name = format!("library.l{l}");
+        for (h, &read) in layer.reads.iter().enumerate() {
+            let Node::Attend { query, key, value, .. } = &native.nodes[read] else { return Err(error(format!("layer {l} head {h}: the read is not an attention node"))) };
+            let body = rule(&format!("{name}.h{h}"))?;
+            for (part, node) in ["q", "k", "v"].into_iter().zip([*query, *key, *value]) {
+                let w = map_of(node, layer.normed_stream)?;
+                out.push(owner(body, w, 0..w.cols.width(), part, (0, applying(body, &format!("{name}.h{h}.{part}"))?)));
+            }
+        }
+        if let Ok(body) = rule(&format!("{name}.o")) {
+            let concat = body.nodes.iter().position(|n| matches!(n, Node::Concat { .. })).ok_or_else(|| error(format!("{}: no concatenation of the heads", body.name)))?;
+            let mut offset = 0;
+            for &read in &layer.reads {
+                let w = map_of(layer.attention, read)?;
+                let width = w.cols.width();
+                out.push(owner(body, w, offset..offset + width, "o", (concat, body.output)));
+                offset += width;
+            }
+        }
+        let body = rule(&format!("{name}.mlp"))?;
+        let Node::Pointwise { input: pre, .. } = native.nodes[layer.active] else { return Err(error(format!("layer {l}: the MLP activation is not one pointwise law"))) };
+        let fc = map_of(pre, layer.normed)?;
+        out.push(owner(body, fc, 0..fc.cols.width(), "gate", (0, applying(body, &format!("{name}.mlp.fc_write"))?)));
+        let act = body.nodes.iter().position(|n| matches!(n, Node::Pointwise { .. })).ok_or_else(|| error(format!("{}: no activations", body.name)))?;
+        let down = map_of(layer.mlp, layer.active)?;
+        out.push(owner(body, down, 0..down.cols.width(), "out", (act, body.output)));
+    }
+    Ok(out)
+}
+
 fn joined(nodes: &mut Vec<Node>, gates: Vec<usize>, softs: Vec<usize>) -> (usize, usize) {
     if gates.len() == 1 {
         return (gates[0], softs[0]);

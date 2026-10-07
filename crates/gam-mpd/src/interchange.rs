@@ -902,14 +902,20 @@ pub fn values(native: &OperatorProgram, artifact: &Artifact, layers: &[LayerNode
                 if from >= to {
                     continue;
                 }
-                let at = *named.get(owner.operator.as_str()).ok_or_else(|| error(format!("{}: no operator {}", owner.site, owner.operator)))?;
                 let mut path = invocation(program, &owner.body, &owner.site)?;
                 let body = path.last().and_then(|n| call_rule(program, &path[..path.len() - 1], *n)).ok_or_else(|| error(format!("{}: no rule {}", owner.site, owner.body)))?;
-                let node = program.rules[body]
-                    .nodes
-                    .iter()
-                    .position(|n| matches!(n, Node::Affine { terms, .. } if terms.first().is_some_and(|t| t.1 == at)))
-                    .ok_or_else(|| error(format!("{}: no node of {} applies {}", owner.site, owner.body, owner.operator)))?;
+                // A summed block's use holds the map's output at its output node.
+                let node = match owner.uses {
+                    Some((_, output)) => output,
+                    None => {
+                        let at = *named.get(owner.operator.as_str()).ok_or_else(|| error(format!("{}: no operator {}", owner.site, owner.operator)))?;
+                        program.rules[body]
+                            .nodes
+                            .iter()
+                            .position(|n| matches!(n, Node::Affine { terms, .. } if terms.first().is_some_and(|t| t.1 == at)))
+                            .ok_or_else(|| error(format!("{}: no node of {} applies {}", owner.site, owner.body, owner.operator)))?
+                    }
+                };
                 path.push(node);
                 let shift = owner.rows.start;
                 out.push((Ok(path), shift + from - owner.native_rows.start..shift + to - owner.native_rows.start));

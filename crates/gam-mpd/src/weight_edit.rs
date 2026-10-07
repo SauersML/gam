@@ -288,7 +288,7 @@ mod tests {
     use super::*;
     use crate::{
         import::import_language_model,
-        interchange::{Batch, Experiment, Interchange, reads},
+        interchange::{Batch, Experiment, Interchange},
         library_mdl,
         operator_program::SlotValues,
         run_check::{LayerNodes, layer_nodes, split_sites},
@@ -320,11 +320,10 @@ mod tests {
     }
 
     /// `KL(M_e ‖ P_e)` in bits summed over every token of the three base sequences, `M_e` running
-    /// `model` and `P_e` (autonomous) `explanation`.
+    /// `model` and `P_e` (autonomous) `explanation` (no read patches, so no read variables).
     fn bits(s: &Setup, model: &OperatorProgram, explanation: &Artifact) -> f64 {
         let device = Device::host();
-        let variables = reads(model, &s.blocks).expect("the reads");
-        let ic = Interchange::new(&device, model, &s.blocks, explanation, &s.explanation.trainable, variables, 1 << 30, 64).expect("the experiments");
+        let ic = Interchange::new(&device, model, &s.blocks, explanation, &s.explanation.trainable, Vec::new(), 1 << 30, 64).expect("the experiments");
         let clean: Vec<Experiment> = (0..3).map(|base| Experiment { base, source: base, explained: vec![true; 4], patch: None, position: 0 }).collect();
         ic.evaluate(&s.batch, &clean, false).expect("evaluate").bits.iter().flatten().sum()
     }
@@ -418,6 +417,76 @@ mod tests {
         assert!(edited.abs() <= 1e-9, "the exact copy scores {edited} bits under the edit");
         let ignored = bits(&s, &compiled.model, &s.explanation.artifact);
         assert!(ignored > 1e-4, "the edit moves M ({ignored})");
+    }
+
+    /// An exact decomposition into gated slices (`library_vpd` on the tiny export, VPD's factors set
+    /// to every column slice of each map, `V = I` and `U = Wᵀ`, one component per layer at the
+    /// attention's input carrying every q, k, v and o slice and one at the MLP's input carrying every
+    /// c_fc and down slice, each always on): `P` computes `M` (0 bits, 1e-9), and no operator of `P`
+    /// holds a block of `M`'s maps. Native edits compile through the maps' uses
+    /// (`library_vpd::uses`): edits of layer 1's head-0 query, head 1's block of o, c_fc and down each
+    /// score 0 bits on the decomposition and move `M`; without the uses each is not applicable.
+    #[test]
+    fn edits_reach_an_exact_gated_slice_decomposition_through_its_uses() {
+        let dir = crate::test_support::tiny_export("weight_edit_vpd", 2);
+        let record: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("export.json")).expect("export.json")).expect("the record");
+        let factors = std::env::temp_dir().join(format!("gam_mpd_weight_edit_vpd_factors_{}", std::process::id()));
+        std::fs::create_dir_all(&factors).expect("the factors' directory");
+        let (mut files, mut sites) = (serde_json::Map::new(), Vec::new());
+        let mut write = |name: String, values: Array2<f64>| {
+            let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+            std::fs::write(factors.join(format!("{name}.f64")), bytes).expect("a factor");
+            files.insert(name, serde_json::json!({"shape": [values.nrows(), values.ncols()]}));
+        };
+        let mut components = Vec::new();
+        for l in 0..2 {
+            let mut slices = [Vec::new(), Vec::new()];
+            for (k, name) in ["attn.q_proj", "attn.k_proj", "attn.v_proj", "attn.o_proj", "mlp.c_fc", "mlp.down_proj"].into_iter().enumerate() {
+                let shape = &record["files"][format!("blocks.{l}.{name}")]["shape"];
+                let (r, c) = (shape[0].as_u64().expect("rows") as usize, shape[1].as_u64().expect("columns") as usize);
+                let w = crate::import::read_f64_shaped(&dir.join(format!("blocks.{l}.{name}.f64")), r, c).expect("a map");
+                let site = format!("h.{l}.{name}");
+                write(format!("{site}.U"), w.t().to_owned());
+                write(format!("{site}.V"), Array2::eye(c));
+                sites.push(site);
+                slices[usize::from(k >= 4)].extend((0..c).map(|i| [6 * l + k, i]));
+            }
+            for (stage, slices) in slices.into_iter().enumerate() {
+                components.push(serde_json::json!({"read": {"own": [6 * l + 4 * stage, 0]}, "tau": -1.0, "slices": slices}));
+            }
+        }
+        std::fs::write(factors.join("export.json"), serde_json::json!({"config": {"sites": sites}, "files": files}).to_string()).expect("the factors' record");
+        let start = factors.join("start.json");
+        std::fs::write(&start, serde_json::json!([{"arm": "exact", "components": components}]).to_string()).expect("the start");
+        let imported = import_language_model(&dir, 6, 12).expect("the tiny export imports");
+        std::fs::remove_dir_all(dir).expect("the tiny export is removed");
+        let native = split_sites(&imported.program).expect("the native sites");
+        let layers = layer_nodes(&native, 2).expect("the layers");
+        let explanation = crate::library_vpd::explanation(&native, &layers, &factors, &start, "exact").expect("the decomposition");
+        std::fs::remove_dir_all(&factors).expect("the factors are removed");
+        let SlotValues::Tokens(tokens) = &imported.family.slots[0] else { panic!("a token slot") };
+        let sequences: Vec<Vec<u32>> = tokens.chunks(12).map(<[u32]>::to_vec).collect();
+        let blocks = explanation.layers.iter().map(|l| l.sites.clone()).collect();
+        let batch = Batch::new(sequences[..3].to_vec(), sequences[3..6].to_vec()).expect("the batch");
+        let s = Setup { native, blocks, explanation, batch };
+        let exact = bits(&s, &s.native, &s.explanation.artifact);
+        assert!(exact.abs() <= 1e-9, "the decomposition scores {exact} bits");
+        let mut artifact = s.explanation.artifact.clone();
+        artifact.owners = crate::library_vpd::uses(&s.native, &layers, &artifact).expect("its uses");
+        assert!(!artifact.owners.is_empty() && artifact.owners.iter().all(|o| o.uses.is_some() && o.operator.is_empty()));
+        let mut rng = StdRng::seed_from_u64(13);
+        for (body, role) in [("library.l1.h0", "q"), ("library.l1.o", "o"), ("library.l1.mlp", "gate"), ("library.l1.mlp", "out")] {
+            let owners: Vec<&Owner> = artifact.owners.iter().filter(|o| o.body == body && o.role == role).collect();
+            let native = owners.last().expect("a use").native.clone();
+            let edit = [WeightEdit { native: native.clone(), delta: random(&mut rng, shape(&s.native, &native), 1.0) }];
+            assert!(compile(&s.native, &s.explanation.artifact, &edit).expect("compiles").is_none(), "{native}: not applicable without its uses");
+            let compiled = compile(&s.native, &artifact, &edit).expect("compiles").expect("applicable");
+            assert!((compiled.owned - 1.0).abs() < 1e-12, "{native}: P takes the whole edit");
+            let edited = bits(&s, &compiled.model, &compiled.explanation);
+            assert!(edited.abs() <= 1e-9, "{native}: the decomposition scores {edited} bits under the edit");
+            let ignored = bits(&s, &compiled.model, &s.explanation.artifact);
+            assert!(ignored > 1e-4, "{native}: the edit moves M ({ignored})");
+        }
     }
 
     /// A component spanning the gate, up and out maps of layer 1's MLP (units 2, 5 and 11), removed
