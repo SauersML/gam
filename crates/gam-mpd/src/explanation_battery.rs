@@ -2561,13 +2561,18 @@ impl FormParts {
 /// activations (the edited `M`'s under an edit), the network attending both ways; 1 `causal`, the
 /// same network with causal attention; 2 `autonomous` (`own_causal_1`), masks from the causal
 /// network on VPD's own activations (its run with every mask 1, edited) and then VPD run with them,
-/// edited, reading nothing of `M`. The remainder is dropped (VPD's setting).
+/// edited, reading nothing of `M`. The remainder is dropped (VPD's setting). And 3 `published_mlp`
+/// (weight edits only), VPD's published MLP explanation: the published masks at the MLP maps and
+/// `M`'s own attention maps (every mask 1 and the remainder on there).
 struct FormRuns<'a> {
     vpd: &'a Vpd,
     parts: &'a FormParts,
     family: FamilyInputs,
     length: usize,
     ones: Vec<Tensor>,
+    /// Per site: false everywhere, and true at the attention maps.
+    nowhere: Vec<bool>,
+    attention: Vec<bool>,
 }
 
 /// The unedited runs a swap or a cut reads its donor's values from, one per program a form runs:
@@ -2581,16 +2586,24 @@ impl<'a> FormRuns<'a> {
         let length = views.first().map(|v| v.len()).ok_or_else(|| error("no sequences to run"))?;
         let d = vpd.e.program.device();
         let ones = vpd.sites.iter().map(|&(_, c, _)| d.upload(Array2::<f64>::ones((family.rows, c)).view()).map_err(error)).collect::<Result<_, _>>()?;
-        Ok(Self { vpd, parts, family, length, ones })
+        let nowhere = vec![false; vpd.sites.len()];
+        let attention = vpd.factors.iter().map(|f| f.kind.block() == 0).collect();
+        Ok(Self { vpd, parts, family, length, ones, nowhere, attention })
     }
 
-    /// VPD's mask and remainder slots, the masks `masks` and every remainder off.
-    fn given(&self, masks: &[Tensor]) -> Result<BTreeMap<usize, Tensor>, String> {
+    /// VPD's mask and remainder slots: at the sites `exact` every mask 1 and the remainder on (`M`'s
+    /// own map), elsewhere the masks `masks` and the remainder off.
+    fn given(&self, masks: &[Tensor], exact: &[bool]) -> Result<BTreeMap<usize, Tensor>, String> {
         let d = self.vpd.e.program.device();
         let mut out = BTreeMap::new();
         for (s, &(_, _, width)) in self.vpd.sites.iter().enumerate() {
-            out.insert(self.vpd.layout.masks[s], d.copy(&masks[s]).map_err(error)?);
-            out.insert(self.vpd.layout.deltas[s], d.zeros(self.family.rows, width).map_err(error)?);
+            if exact[s] {
+                out.insert(self.vpd.layout.masks[s], d.copy(&self.ones[s]).map_err(error)?);
+                out.insert(self.vpd.layout.deltas[s], d.upload(Array2::<f64>::ones((self.family.rows, width)).view()).map_err(error)?);
+            } else {
+                out.insert(self.vpd.layout.masks[s], d.copy(&masks[s]).map_err(error)?);
+                out.insert(self.vpd.layout.deltas[s], d.zeros(self.family.rows, width).map_err(error)?);
+            }
         }
         Ok(out)
     }
@@ -2626,11 +2639,16 @@ impl<'a> FormRuns<'a> {
 
     /// VPD's run with `masks`, under `plan` (donor values from `donor`) or unedited.
     fn e_run(&self, masks: &[Tensor], edit: Option<(&Plan, Option<&DeviceTrace>)>) -> Result<DeviceTrace, String> {
+        self.e_run_exact(masks, &self.nowhere, edit)
+    }
+
+    /// [`FormRuns::e_run`] with `M`'s own maps at the sites `exact`.
+    fn e_run_exact(&self, masks: &[Tensor], exact: &[bool], edit: Option<(&Plan, Option<&DeviceTrace>)>) -> Result<DeviceTrace, String> {
         let program = &self.vpd.e.program;
         let d = program.device();
         match edit {
-            Some((plan, donor)) => program.forward_edited(&self.family, self.given(masks)?, &BTreeSet::new(), |_, _| Ok(()), |node, trace| plan.get(&node).map(|steps| apply_steps(d, node, steps, trace, donor)).transpose()),
-            None => program.forward_given(&self.family, self.given(masks)?),
+            Some((plan, donor)) => program.forward_edited(&self.family, self.given(masks, exact)?, &BTreeSet::new(), |_, _| Ok(()), |node, trace| plan.get(&node).map(|steps| apply_steps(d, node, steps, trace, donor)).transpose()),
+            None => program.forward_given(&self.family, self.given(masks, exact)?),
         }
     }
 
@@ -2645,6 +2663,8 @@ impl<'a> FormRuns<'a> {
         match form {
             0 => self.e_run(&self.masks((&vpd.importance, &vpd.outputs), read_m()?)?, with(0)),
             1 => self.e_run(&self.masks(causal, read_m()?)?, with(1)),
+            3 if edit.is_none_or(|(_, donors)| donors.is_none()) => self.e_run_exact(&self.masks((&vpd.importance, &vpd.outputs), read_m()?)?, &self.attention, edit.map(|(plan, _)| (plan, None))),
+            3 => Err(error("published_mlp runs no swaps or cuts (no donor run of its own)")),
             _ => {
                 let all_on = self.e_run(&self.ones, with(2))?;
                 self.e_run(&self.masks(causal, Some(self.inputs_from(&all_on, &vpd.layout.inputs)?))?, with(3))
@@ -2940,7 +2960,7 @@ pub fn native_weight_edit(export: &Path, draw: &Value) -> Result<(String, Vec<Ba
     Ok((family, edits))
 }
 
-/// VPD's three forms (`FormRuns`) under native weight edits of `M`'s maps, as the edits driver
+/// VPD's three forms and its published MLP explanation (`FormRuns`) under native weight edits of `M`'s maps, as the edits driver
 /// scores an explanation (`mpd_library_mdl_2951` weight_faithfulness): each edit (`BatteryEdit`s,
 /// `native_weight_edit`) makes `M` compute with its edited weights and VPD with its subcomponents
 /// edited entry-wise where the edit scales coordinates, plus the always-on term `ΔW·x` on the map's
@@ -2952,7 +2972,7 @@ pub fn vpd_weight_edits(vpd: &Vpd, export: &Path, decomposition: &Path, rows: &[
     let d = vpd.e.program.device().clone();
     let parts = FormParts::new(vpd, export, decomposition, numeric_bytes)?;
     let runs = FormRuns::new(vpd, &parts, rows)?;
-    const FORMS: [&str; 3] = ["published", "causal", "autonomous"];
+    const FORMS: [&str; 4] = ["published", "causal", "autonomous", "published_mlp"];
     let mean_kl = |target: &DeviceTrace, other: &DeviceTrace, side: (usize, usize)| -> Result<f64, String> {
         let mut total = 0.0;
         for s in 0..rows.len() {
