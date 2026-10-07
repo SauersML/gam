@@ -2062,12 +2062,30 @@ pub struct Unquantize {
     vpd: Vec<(usize, VpdMlp)>,
 }
 
+/// The device's resident copies of a head's or an MLP's matrices are uploaded again
+/// (`graph_device::edited`): every in-place change of `M`'s weights goes through these.
+fn device_head_edited(w: &HeadWeights) {
+    for m in [&w.query, &w.key, &w.value, &w.output] {
+        crate::graph_device::edited(m);
+    }
+}
+
+fn device_mlp_edited(m: &MlpWeights) {
+    for x in [Some(&m.gate), m.up.as_ref(), Some(&m.out)].into_iter().flatten() {
+        crate::graph_device::edited(x);
+    }
+}
+
 impl Unquantize {
     pub fn restore(self, weights: &mut Weights) {
         for (l, h, w) in self.heads.into_iter().rev() {
+            device_head_edited(&weights.layers[l].heads[h]);
             weights.layers[l].heads[h] = w;
         }
         for (l, m) in self.mlps.into_iter().rev() {
+            if let Some(old) = &weights.layers[l].mlp {
+                device_mlp_edited(old);
+            }
             weights.layers[l].mlp = Some(m);
         }
         for (l, v) in self.vpd.into_iter().rev() {
@@ -2109,6 +2127,7 @@ impl Weights {
                 Block::Heads { layer, heads } => {
                     for &h in heads {
                         let w = self.layers.get_mut(*layer).and_then(|l| l.heads.get_mut(h)).ok_or("no such head")?;
+                        device_head_edited(w);
                         out.heads.push((*layer, h, w.clone()));
                         for m in [&mut w.query, &mut w.key, &mut w.value] {
                             m.rows_mut().into_iter().for_each(|r| quantize_row(r, bits));
@@ -2118,6 +2137,7 @@ impl Weights {
                 }
                 Block::Neurons { layer, neurons } => {
                     let mlp = self.layers.get_mut(*layer).and_then(|l| l.mlp.as_mut()).ok_or("a neuron block without an MLP")?;
+                    device_mlp_edited(mlp);
                     out.mlps.push((*layer, mlp.clone()));
                     for &i in neurons {
                         quantize_row(mlp.gate.row_mut(i), bits);
@@ -2130,6 +2150,7 @@ impl Weights {
                 Block::Slices { layer, fc, down, .. } => {
                     let vpd = self.vpd.get_mut(layer).ok_or_else(|| format!("layer {layer} has no VPD view"))?;
                     let mlp = self.layers.get_mut(*layer).and_then(|l| l.mlp.as_mut()).ok_or("a VPD view of a layer without an MLP")?;
+                    device_mlp_edited(mlp);
                     out.vpd.push((*layer, vpd.clone()));
                     out.mlps.push((*layer, mlp.clone()));
                     // c_fc: gate (hidden × width) holds U_fc[i] ⊗ V_fc[:, i]; down_proj: out (width ×
