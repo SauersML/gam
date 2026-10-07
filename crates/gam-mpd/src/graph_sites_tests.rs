@@ -494,6 +494,34 @@ fn a_tiny_cache_still_scores() {
     assert_eq!(a.exec_error_bits, b.exec_error_bits);
 }
 
+/// With room for only some counterfactual runs, the runs kept after a score are the ones the next
+/// score of the behavior reads first: the second score reuses every kept run instead of remaking it.
+#[test]
+fn kept_counterfactual_runs_serve_the_next_score() {
+    let (weights, sequences) = model("graph_sites_kept_runs");
+    let empty = Program { model: "tiny".into(), valid: true, ..Program::default() };
+    let mut large = Checker::new(weights.clone(), behavior(&sequences)).expect("checker");
+    let (whole, _) = large.score(&empty, 12, 2, true, None).expect("large budget");
+    let bytes = |c: &Checker| -> Vec<usize> { c.references.lock().expect("lock").iter().map(|(_, cell)| cell.get().and_then(|r| r.as_ref().ok()).map_or(0, |r| r.bytes())).collect() };
+    let all = bytes(&large);
+    assert!(all.len() >= 2, "the empty program reads {} counterfactual runs", all.len());
+    let mut small = Checker::new(weights, behavior(&sequences)).expect("checker");
+    small.reference_bytes = all.iter().sum::<usize>() / 2;
+    let kept = |c: &Checker| -> Vec<(String, usize)> { c.references.lock().expect("lock").iter().map(|(k, cell)| (k.clone(), std::sync::Arc::as_ptr(cell) as usize)).collect() };
+    let (first, _) = small.score(&empty, 12, 2, true, None).expect("first score");
+    let after_first = kept(&small);
+    assert!(!after_first.is_empty() && after_first.len() < all.len(), "{} of {} runs kept", after_first.len(), all.len());
+    assert!(bytes(&small).iter().sum::<usize>() <= small.reference_bytes);
+    let (second, _) = small.score(&empty, 12, 2, true, None).expect("second score");
+    let mut after_second = kept(&small);
+    let mut expected = after_first.clone();
+    after_second.sort();
+    expected.sort();
+    assert_eq!(after_second, expected, "the kept runs were remade or replaced");
+    assert_eq!(first.exec_error_bits, whole.exec_error_bits);
+    assert_eq!(second.exec_error_bits, whole.exec_error_bits);
+}
+
 /// A head's site operation on a program whose attention is in VPD's view acts on the head's read
 /// before o_proj: it runs (there is no unit of that head alone), and zeroing the head changes the
 /// program's outcome.

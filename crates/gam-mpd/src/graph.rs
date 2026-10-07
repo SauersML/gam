@@ -3354,12 +3354,12 @@ pub struct Checker {
     /// The weight edit applied now, if any (its JSON): part of a counterfactual run's cache key.
     edit: Option<String>,
     /// Counterfactual runs by (edit, sequences), each computed once by whichever run asks first.
-    references: std::sync::Mutex<Vec<(String, RunCell)>>,
+    pub(crate) references: std::sync::Mutex<Vec<(String, RunCell)>>,
     /// Counterfactual runs under site operations (`reference_under`) by experiment, for one
     /// [`Checker::score_batch`] (cleared at its start).
     site_references: std::sync::Mutex<Vec<(String, RunCell)>>,
-    /// The bytes of counterfactual runs kept across scores (each cache), oldest dropped first: an
-    /// experiment set's runs are computed once per behavior and serve every later score of it.
+    /// The bytes of counterfactual runs kept across scores (each cache), newest dropped first: an
+    /// experiment set's first runs are computed once per behavior and serve every later score of it.
     pub reference_bytes: usize,
     /// Each declared block's bit width as the search chose it (`Checker::width`), by the block.
     widths: BTreeMap<String, Option<u32>>,
@@ -3830,9 +3830,12 @@ impl Checker {
             let result = (|| -> Result<(), String> {
                 let experiments = distinct(members);
                 let mut at = 0;
-                let mut size: Option<usize> = None;
+                // The most bytes of new counterfactual runs one experiment has made: runs kept from an
+                // earlier score make none, so chunks stay single until an experiment makes some.
+                let mut per = 0;
                 while at < experiments.len() {
-                    let chunk: Vec<usize> = experiments[at..(at + size.unwrap_or(1)).min(experiments.len())].to_vec();
+                    let size = if per == 0 { 1 } else { (budget / per).clamp(1, 8) };
+                    let chunk: Vec<usize> = experiments[at..(at + size).min(experiments.len())].to_vec();
                     self.reference_bytes = usize::MAX;
                     let before = self.held_references();
                     let restore = edit.as_ref().map(|e| e.apply(&mut self.weights)).transpose()?;
@@ -3841,9 +3844,8 @@ impl Checker {
                         r.restore(&mut self.weights)?;
                     }
                     made?;
-                    // Chunks as large as the budget holds, measured by the first experiment's runs.
-                    let grown = self.held_references().saturating_sub(before).max(1);
-                    size = Some(size.unwrap_or((budget / grown).clamp(1, 8)));
+                    // Chunks as large as the budget holds.
+                    per = per.max(self.held_references().saturating_sub(before) / chunk.len());
                     let keys: BTreeSet<&str> = chunk.iter().map(|&r| runs[r].2.as_str()).collect();
                     for (i, blocks) in quantized.iter().enumerate() {
                         let mine: Vec<usize> = members.iter().copied().filter(|&r| runs[r].0 == i && keys.contains(runs[r].2.as_str())).collect();
@@ -3893,14 +3895,17 @@ impl Checker {
         [&self.references, &self.site_references].iter().map(|c| c.lock().map_or(0, |c| c.iter().map(|(_, cell)| run_bytes(cell)).sum::<usize>())).sum()
     }
 
-    /// Drops the oldest counterfactual runs while each cache holds more than `reference_bytes`.
+    /// Drops the newest counterfactual runs while each cache holds more than `reference_bytes`.
+    /// A score walks its experiments in one order every time, so dropping the newest keeps the
+    /// runs its first chunks read on the next score of the behavior; dropping the oldest would
+    /// keep the last chunks' and remake every run on every score.
     fn drop_references(&self) -> Result<(), String> {
         for cache in [&self.references, &self.site_references] {
             let mut cache = cache.lock().map_err(|e| e.to_string())?;
             let mut held: usize = cache.iter().map(|(_, c)| run_bytes(c)).sum();
-            while held > self.reference_bytes && !cache.is_empty() {
-                let (_, old) = cache.remove(0);
-                held -= run_bytes(&old);
+            while held > self.reference_bytes {
+                let Some((_, newest)) = cache.pop() else { break };
+                held -= run_bytes(&newest);
             }
         }
         Ok(())
