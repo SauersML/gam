@@ -838,7 +838,7 @@ fn adversarial_search(experiments: &mut interchange::Interchange, rows: &[Vec<u3
         let unpatched = interchange::Experiment { base: 0, source: 0, explained: vec![true; blocks], patch: None, position: 0 };
         let clean = experiments.evaluate(&batch, &[unpatched], false)?.bits[0][d.position..].to_vec();
         let clean = clean.iter().sum::<f64>() / clean.len().max(1) as f64;
-        let found = gam_mpd::adversary::ascend(seed, search, &d.start, family.steps, family.probes, |candidates| {
+        let found = gam_mpd::adversary::ascend(seed, search, &d.start, (family.steps, family.probes), clean, |candidates| {
             let count = candidates.len();
             experiments.set_push_directions(candidates);
             let drawn: Vec<interchange::Experiment> = (0..count)
