@@ -3039,12 +3039,15 @@ impl Interchange {
                 Family::Read => false,
             })
             .collect();
-        if sites.is_empty() || length < 2 || (family == Family::Push && directions == 0) {
-            return Err(error(format!("{family:?}: no site to operate on, or sequences under two tokens")));
+        if sites.is_empty() || length == 0 || (family == Family::Push && directions == 0) {
+            return Err(error(format!("{family:?}: no site to operate on, or empty sequences")));
         }
         let k = (1usize << rng.random_range(0..=4)).min(sites.len());
         let chosen = hybrid_of(rng, sites.len(), k);
+        // A one-token sequence (a real-valued toy's input, `bench/toys_2951`) is edited at its
+        // token; the draw is made all the same, so longer sequences draw as before.
         let (position, onward) = match rng.random_range(0..3) {
+            _ if length == 1 => (0, true),
             0 => (rng.random_range(1..length), false),
             1 => (rng.random_range(1..length), true),
             _ => (0, true),
