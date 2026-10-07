@@ -10,6 +10,10 @@ logits) inside three question verbs, scale / cut / swap. Pieces of Qwen3-0.6B (n
   L[l].mlp[i, j, ...]   MLP neurons i, j, ...: scale multiplies their activations SiLU(g_i.x)(u_i.x) by a,
                         i.e. their down columns (oracle.rs's Component::Neuron, summed).
   L[l].mlp[:], L[l].head[:]   the whole MLP (every neuron) or the whole attention (every head) of layer l.
+  PD.tc[l][f, ...]      transcoder features (circuit-tracer's Qwen3-0.6B transcoders, --transcoders): the
+                        MLP output is the features' writes plus an exact error piece, so scale adds
+                        (a - 1) relu(W_enc[f].y + b_enc[f]) W_dec[f] to the MLP output at positions 1..
+                        (y the MLP's input); swap replaces the feature's activation at the last position.
   a = 0 removes the piece. A weight edit acts at every position (and every generated step).
   cut(node(A) >> node(B).route)
                         path patching: B's read (route query, key or value of a head, input of an MLP,
@@ -78,6 +82,8 @@ class Interventions:
         self.head_swap = None  # (mask [B, L, H] bool, values [B, L, H, hd])
         self.neuron_swap = None  # (mask [B, L, F] bool, values [B, L, F])
         self.cuts = {}  # row -> (a_kind head|mlp|attn, a_layer, a_head, b_kind head|mlp|logits, b_layer, b_head, route)
+        self.tc_scale = {}  # row -> (layer, feature indices [k], alpha)
+        self.tc_swap = {}  # row -> (layer, feature indices [k], source activations [k])
 
 
 class Qwen3:
@@ -95,6 +101,22 @@ class Qwen3:
         c = self.model.config
         self.L, self.H, self.KV, self.hd, self.Fn, self.d = c.num_hidden_layers, c.num_attention_heads, c.num_key_value_heads, c.head_dim, c.intermediate_size, c.hidden_size
         self.Wo = [layer.self_attn.o_proj.weight.view(self.d, self.H, self.hd) for layer in self.layers]
+        self.tc = {}  # layer -> transcoder tensors (bfloat16 as stored)
+
+    def load_transcoders(self, root: str, layers: list[int]):
+        """circuit-tracer's single-layer transcoders (one file per layer: W_enc, W_dec [F, d], b_enc [F],
+        b_dec [d]); feature f of layer l reads the MLP's input y (the normed stream) and writes
+        relu(W_enc[f].y + b_enc[f]) W_dec[f]."""
+        from safetensors.torch import load_file
+
+        for l in layers:
+            t = load_file(f"{root}/layer_{l}.safetensors")
+            self.tc[l] = {k: t[k].to(self.dev) for k in ("W_enc", "W_dec", "b_enc")}
+
+    def tc_acts(self, l: int, y: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+        """Activations [.., k] of features idx of layer l on MLP inputs y [.., d], in the model's dtype."""
+        t = self.tc[l]
+        return torch.relu(y @ t["W_enc"][idx].to(self.dtype).T + t["b_enc"][idx].to(self.dtype))
 
     def new(self, B):
         return Interventions(B, self.L, self.H, self.Fn, self.dev, self.dtype)
@@ -191,9 +213,27 @@ class Qwen3:
             if record is not None:
                 record["act_last"][:, l] = act[:, -1]
                 for r, (pl, ph, pi) in record.get("probes", {}).items():
-                    if pl == l and ph < 0:
+                    if pl == l and ph == -1:
                         record["probe_values"][r] = act[r, :, pi]
+                    elif pl == l and ph == -2:
+                        record["probe_values"][r] = self.tc_acts(l, y[r], torch.tensor([pi], device=self.dev))[:, 0]
+                if l in self.tc:
+                    t = self.tc[l]
+                    record.setdefault("tc_last", {})[l] = torch.relu(y[:, -1].to(t["W_enc"].dtype) @ t["W_enc"].T + t["b_enc"])  # for aiming only
+                    record.setdefault("y_last", {})[l] = y[:, -1]
             mlp_out = mlp.down_proj(act)
+            if iv is not None and (iv.tc_scale or iv.tc_swap):
+                mlp_out = mlp_out.clone()
+                # A feature's edit acts at positions 1.. (position 0, the attention sink, is outside a
+                # transcoder's domain; library_transcoder.rs gives it the MLP's own output).
+                for r, (tl, idx, alpha) in iv.tc_scale.items():
+                    if tl == l:
+                        a = self.tc_acts(l, y[r, 1:], idx)
+                        mlp_out[r, 1:] += (alpha - 1.0) * (a @ self.tc[l]["W_dec"][idx].to(self.dtype))
+                for r, (tl, idx, values) in iv.tc_swap.items():
+                    if tl == l:
+                        a = self.tc_acts(l, y[r, -1], idx)
+                        mlp_out[r, -1] += (values - a) @ self.tc[l]["W_dec"][idx].to(self.dtype)
             if record is not None:
                 record["mean_mlp"][l] = mlp_out[:, 1:].mean(dim=(0, 1))
             if iv is not None:
@@ -235,6 +275,8 @@ def piece_text(p) -> str:
         return f"L[{p[1]}].mlp[:]"
     if kind == "attn":
         return f"L[{p[1]}].head[:]"
+    if kind == "tc":
+        return f"PD.tc[{p[1]}][{', '.join(str(i) for i in p[2])}]"
     raise ValueError(p)
 
 
@@ -248,6 +290,8 @@ def apply_scale(iv: Interventions, row: int, p, a: float):
         iv.neuron[row, p[1]] = a
     elif kind == "attn":
         iv.head[row, p[1]] = a
+    elif kind == "tc":
+        iv.tc_scale[row] = (p[1], torch.tensor(p[2], device=iv.head.device), a)
 
 
 class Writer:
@@ -318,9 +362,25 @@ class Draw:
         k = int(self.rng.choice([1, 4, 16, 64]))
         return ("neurons", L, tuple(sorted(int(i) for i in self.rng.choice(top[: max(k, 16 * k if k < 16 else 256)], size=k, replace=False))))
 
+    def feature(self, rec, row, small=False):
+        """Transcoder features among the 64 most active at the row's last position of a loaded layer."""
+        L = int(self.rng.choice(sorted(self.m.tc)))
+        top = rec["tc_last"][L][row].float().topk(64)
+        live = top.indices[top.values > 0].cpu().numpy()
+        if len(live) == 0:
+            return None
+        k = min(len(live), int(self.rng.choice([1, 1, 4] if small else [1, 4, 16])))
+        return ("tc", L, tuple(sorted(int(i) for i in self.rng.choice(live, size=k, replace=False))))
+
     def piece(self, rec, row, small=False):
-        """Half aimed, half uniform; `small` keeps neuron groups at 4 or fewer (questions listing several pieces)."""
+        """Half aimed, half uniform (a quarter transcoder features when transcoders are loaded); `small`
+        keeps neuron groups at 4 or fewer (questions listing several pieces)."""
         while True:
+            if self.m.tc and self.rng.random() < 0.25:
+                p = self.feature(rec, row, small)
+                if p is not None:
+                    return p
+                continue
             p = self.aimed(rec, row) if self.rng.random() < 0.5 else self.uniform()
             if not small or p[0] != "neurons" or len(p[2]) <= 4:
                 return p
@@ -345,6 +405,15 @@ def batch_questions(m: Qwen3, w: Writer, draw: Draw, tokens: torch.Tensor, sourc
         l = int(rng.integers(m.L))
         probes[r] = (l, int(rng.integers(m.H)), -1) if rng.random() < 0.4 else (l, -1, int(rng.integers(m.Fn)))
     rec = {"probes": probes}
+    if m.tc:
+        # Feature probes need the clean pass's activations to pick live features: a first pass picks them.
+        first = {}
+        m.forward(tokens, None, first)
+        for r in rows:
+            if rng.random() < 0.3:
+                p = draw.feature(first, r)
+                if p is not None:
+                    probes[r] = (p[1], -2, p[2][0])
     lp_clean = m.log_probs(m.forward(tokens, None, rec))
     clean_txt = [w.dist(lp_clean[r]) for r in rows]
     texts = [w.text(tokens[r].tolist()) for r in rows]
@@ -392,7 +461,7 @@ def batch_questions(m: Qwen3, w: Writer, draw: Draw, tokens: torch.Tensor, sourc
         l, hh, i = probes[r]
         v = rec["probe_values"][r].to(torch.float32).cpu()
         order = v[1:].abs().topk(min(3, T - 1)).indices + 1
-        piece = f"L[{l}].head[{hh}]" if hh >= 0 else f"L[{l}].mlp[{i}]"
+        piece = f"L[{l}].head[{hh}]" if hh >= 0 else (f"L[{l}].mlp[{i}]" if hh == -1 else f"PD.tc[{l}][{i}]")
         level = "write norm" if hh >= 0 else "activation"
         ans = ", ".join(f"{int(p)}:{w.token(tokens[r, int(p)].item())} {v[int(p)].item():.2f}" for p in order)
         emit(r, "where", f"<text_tokens> {w.numbered(tokens[r].tolist())}\n<question> where is {piece} most active ({level}; position 0 excluded): three positions and levels\n",
@@ -463,6 +532,9 @@ def batch_questions(m: Qwen3, w: Writer, draw: Draw, tokens: torch.Tensor, sourc
                 nm[r, p[1], list(p[2])] = True
             elif p[0] == "mlp":
                 nm[r, p[1]] = True
+            elif p[0] == "tc":
+                idx = torch.tensor(p[2], device=m.dev)
+                iv.tc_swap[r] = (p[1], idx, m.tc_acts(p[1], rec["y_last"][p[1]][src[r]], idx))
             else:
                 hm[r, p[1]] = True
             desc.append(f"<source> {texts[src[r]]}\n<intervention> swap({piece_text(p)}, source)\n")
@@ -498,10 +570,14 @@ def main():
     ap.add_argument("--steps", type=int, default=8)
     ap.add_argument("--split", default="train")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--transcoders", default="", help="circuit-tracer transcoder directory (layer_{l}.safetensors)")
+    ap.add_argument("--tc-layers", default="", help="layers whose transcoder features are asked about, e.g. 3,9,14,20,25")
     args = ap.parse_args()
     torch.set_grad_enabled(False)
     dev = device()
     m = Qwen3(args.model, dev)
+    if args.transcoders and args.tc_layers:
+        m.load_transcoders(args.transcoders, [int(x) for x in args.tc_layers.split(",")])
     w = Writer(m)
     rng = np.random.default_rng(args.seed)
     draw = Draw(m, rng)
