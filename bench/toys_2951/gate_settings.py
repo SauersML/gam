@@ -2,7 +2,8 @@
 
 usage: ~/mpd-data/venv/bin/python bench/toys_2951/gate_settings.py TOY_DIR START_DIR ARM BUDGET EPOCHS OUT.json
 
-ARM is one of toy_start.py's arms (per_slice_own, grouped_own, grouped_direction). BUDGET is
+ARM is one of toy_start.py's arms (per_slice_own, grouped_own, grouped_direction) or of a frame
+start's (frame_own, frame_direction; START_DIR one of frame-start's tight/ or dictionary/). BUDGET is
 `true` (the per-token budget K at the toy's true count) or `none` (no budget, K = infinity). The
 true count is, per held-out token, the rank-one slices the known mechanisms active there span
 (each mechanism's numerical rank on every operator it spans), averaged, plus the start's zero
@@ -22,6 +23,9 @@ import numpy as np
 def main():
     toy, start, arm, budget, epochs, out = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3], sys.argv[4], int(sys.argv[5]), Path(sys.argv[6])
     record = json.loads((toy / "export.json").read_text())
+    # a start directory holds its decomposition in decomposition/ (toy_start.py) or is one
+    # (library_frame's frame-start: export.json and start.json side by side)
+    decomposition_dir = start / "decomposition" if (start / "decomposition").exists() else start
     truth = json.loads((toy / "truth.json").read_text())
     rows, context = record["files"]["tokens"]["shape"]
     held = truth["active"]["shape"][0] // context
@@ -37,10 +41,10 @@ def main():
                 s = np.linalg.svd(d, compute_uv=False)
                 total += int(np.sum(s > s[0] * max(d.shape) * np.finfo(float).eps)) if s.size and s[0] > 0 else 0
             ranks.append(total)
-        decomposition = json.loads((start / "decomposition" / "export.json").read_text())
+        decomposition = json.loads((decomposition_dir / "export.json").read_text())
         zero = 0
         for name in decomposition["config"]["sites"]:
-            u = np.fromfile(start / "decomposition" / f"{name}.U.f64", dtype="<f8")
+            u = np.fromfile(decomposition_dir / f"{name}.U.f64", dtype="<f8")
             zero += int(not np.any(u))
         fit["budget"] = float((active @ np.array(ranks, dtype=float)).mean()) + zero
     elif budget != "none":
@@ -48,7 +52,7 @@ def main():
     out.write_text(json.dumps({
         "export_sha256": hashlib.sha256((toy / "export.json").read_bytes()).hexdigest(),
         "training_sequences": rows - held, "context": context, "held_out": [0, held],
-        "vpd": {"decomposition": str(start / "decomposition"), "start": str(start / "start.json"), "arm": arm},
+        "vpd": {"decomposition": str(decomposition_dir), "start": str(start / "start.json"), "arm": arm},
         "fit": fit,
     }, indent=1))
     print(out, fit.get("budget", "no budget"))
