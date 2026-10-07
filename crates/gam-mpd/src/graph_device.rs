@@ -485,7 +485,10 @@ pub(crate) fn run_on(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, 
                         normed_inputs.push(out);
                     }
                     if let Some(c) = captured.as_mut() {
-                        c.attention_inputs[*layer] = s.device.download(&normed_inputs[0]).map_err(e)?;
+                        // Only VPD attention subcomponents read it.
+                        if !weights.vpd_attention.is_empty() {
+                            c.attention_inputs[*layer] = s.device.download(&normed_inputs[0]).map_err(e)?;
+                        }
                     }
                     let mut out = s.device.zeros(rows, width).map_err(e)?;
                     for &h in heads {
@@ -557,7 +560,10 @@ pub(crate) fn run_on(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, 
                         }
                         c.mlp[*layer] = s.device.download(&write).map_err(e)?;
                         c.active[*layer] = s.device.download(&active).map_err(e)?;
-                        c.inputs[*layer] = s.device.download(&x_hat).map_err(e)?;
+                        // Only transcoder features and VPD MLP subcomponents read it.
+                        if !weights.transcoders.is_empty() || !weights.vpd.is_empty() {
+                            c.inputs[*layer] = s.device.download(&x_hat).map_err(e)?;
+                        }
                     }
                     write
                 }
