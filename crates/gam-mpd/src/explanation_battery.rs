@@ -2561,9 +2561,9 @@ impl FormParts {
 /// activations (the edited `M`'s under an edit), the network attending both ways; 1 `causal`, the
 /// same network with causal attention; 2 `autonomous` (`own_causal_1`), masks from the causal
 /// network on VPD's own activations (its run with every mask 1, edited) and then VPD run with them,
-/// edited, reading nothing of `M`. The remainder is dropped (VPD's setting). And 3 `published_mlp`
-/// (weight edits only), VPD's published MLP explanation: the published masks at the MLP maps and
-/// `M`'s own attention maps (every mask 1 and the remainder on there).
+/// edited, reading nothing of `M`. The remainder is dropped (VPD's setting). And 3 `published_mlp`,
+/// VPD's published MLP explanation: the published masks at the MLP maps and `M`'s own attention maps
+/// (every mask 1 and the remainder on there).
 struct FormRuns<'a> {
     vpd: &'a Vpd,
     parts: &'a FormParts,
@@ -2576,8 +2576,8 @@ struct FormRuns<'a> {
 }
 
 /// The unedited runs a swap or a cut reads its donor's values from, one per program a form runs:
-/// published, causal, all-on, autonomous.
-type Donors = [DeviceTrace; 4];
+/// published, causal, all-on, autonomous, published MLP-only.
+type Donors = [DeviceTrace; 5];
 
 impl<'a> FormRuns<'a> {
     fn new(vpd: &'a Vpd, parts: &'a FormParts, sequences: &[Vec<u32>]) -> Result<Self, String> {
@@ -2663,8 +2663,7 @@ impl<'a> FormRuns<'a> {
         match form {
             0 => self.e_run(&self.masks((&vpd.importance, &vpd.outputs), read_m()?)?, with(0)),
             1 => self.e_run(&self.masks(causal, read_m()?)?, with(1)),
-            3 if edit.is_none_or(|(_, donors)| donors.is_none()) => self.e_run_exact(&self.masks((&vpd.importance, &vpd.outputs), read_m()?)?, &self.attention, edit.map(|(plan, _)| (plan, None))),
-            3 => Err(error("published_mlp runs no swaps or cuts (no donor run of its own)")),
+            3 => self.e_run_exact(&self.masks((&vpd.importance, &vpd.outputs), read_m()?)?, &self.attention, with(4)),
             _ => {
                 let all_on = self.e_run(&self.ones, with(2))?;
                 self.e_run(&self.masks(causal, Some(self.inputs_from(&all_on, &vpd.layout.inputs)?))?, with(3))
@@ -2676,7 +2675,7 @@ impl<'a> FormRuns<'a> {
     fn donors(&self, m: &DeviceTrace) -> Result<Donors, String> {
         let all_on = self.e_run(&self.ones, None)?;
         let autonomous = self.e_run(&self.masks((&self.parts.causal, &self.parts.causal_outputs), Some(self.inputs_from(&all_on, &self.vpd.layout.inputs)?))?, None)?;
-        Ok([self.form(0, m, None)?, self.form(1, m, None)?, all_on, autonomous])
+        Ok([self.form(0, m, None)?, self.form(1, m, None)?, all_on, autonomous, self.form(3, m, None)?])
     }
 
     /// `KL(target ‖ other)` in bits at every row of sequence `s` of the family, from two final normed
@@ -2715,7 +2714,7 @@ pub fn vpd_site_edits(
     let d = vpd.e.program.device().clone();
     let heads = vpd.layout.head_reads.first().map_or(0, Vec::len);
     let parts = FormParts::new(vpd, export, decomposition, numeric_bytes)?;
-    const FORMS: [&str; 3] = ["published", "causal", "autonomous"];
+    const FORMS: [&str; 4] = ["published", "causal", "autonomous", "published_mlp"];
     const BINS: [f64; 3] = [0.01, 0.1, 1.0];
     // Per form, per family: every scored token's bits, the edited tokens' bits, and per effect bin
     // the scored tokens' bits summed and counted, the edited tokens' bits summed, the experiments.
@@ -3072,7 +3071,7 @@ pub fn vpd_adversarial(
     let length = rows.first().map(Vec::len).ok_or_else(|| error("adversarial: no rows to search on"))?;
     let blocks = 2 * vpd.layout.streams.len();
     let draws = crate::adversary::draw(seed, searches, rows.len(), length, blocks, vpd.m.head.cols())?;
-    const FORMS: [&str; 3] = ["published", "causal", "autonomous"];
+    const FORMS: [&str; 4] = ["published", "causal", "autonomous", "published_mlp"];
     let mut records: Vec<Vec<Value>> = vec![Vec::new(); FORMS.len()];
     for (search, draw) in draws.iter().enumerate() {
         let sequence = &rows[draw.sequence];
