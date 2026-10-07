@@ -60,6 +60,7 @@ fn reader_experiment(e: &Experiment, program: &Program, graph: &Graph, behavior:
         Experiment::Edit { edit, .. } => match edit {
             WeightEdit::Head { layer, head, factor } => json!({"kind": "scale", "pieces": native(*layer, "head", json!(head)), "factor": factor}),
             WeightEdit::Neurons { layer, neurons, factor } => json!({"kind": "scale", "pieces": native(*layer, "mlp", json!(neurons)), "factor": factor}),
+            WeightEdit::Subcomponents { layer, down, indices, factor } => json!({"kind": "scale", "pieces": [{"view": "vpd", "layer": layer, "kind": if *down { "down_proj" } else { "c_fc" }, "index": indices}], "factor": factor}),
             WeightEdit::RankOne { layer, head, matrix, .. } => {
                 let name = match head {
                     Some(h) => format!("head {h} {matrix:?}").to_lowercase(),

@@ -338,3 +338,31 @@ fn the_disk_cache_serves_a_second_checker() {
     assert!(files > 0, "no outcome written");
     assert_eq!(a.exec_error_bits, b.exec_error_bits);
 }
+
+/// A VPD subcomponent edit changes the matrix by `(factor − 1) U_i ⊗ V_i` (M runs as under that
+/// rank-one change) and scales the subcomponent's factor; restoring returns both.
+#[test]
+fn subcomponent_edits_are_their_rank_one_changes() {
+    let mut s = setup("graph_sites_vpd_edit");
+    let (hidden, width) = s.weights.layers[0].mlp.as_ref().expect("an MLP").gate.dim();
+    let wave = |rows: usize, cols: usize, phase: f64| Array2::from_shape_fn((rows, cols), |(i, j)| 0.1 * ((i * 7 + j * 3) as f64 + phase).sin());
+    s.weights.vpd.insert(0, crate::graph::VpdMlp { fc_u: wave(5, hidden, 0.3), fc_v: wave(width, 5, 1.1), down_u: wave(4, width, 2.0), down_v: wave(hidden, 4, 0.7) });
+    let model = Graph::empty().model(&s.weights);
+    for (down, matrix) in [(false, crate::graph::Matrix::Gate), (true, crate::graph::Matrix::Down)] {
+        let before = s.weights.clone();
+        let vpd = &s.weights.vpd[&0];
+        let (u, v) = if down { (vpd.down_u.row(2).to_vec(), vpd.down_v.column(2).to_vec()) } else { (vpd.fc_u.row(2).to_vec(), vpd.fc_v.column(2).to_vec()) };
+        let rank_one = WeightEdit::RankOne { layer: 0, head: None, matrix, u: u.iter().map(|x| -0.5 * x).collect(), v };
+        let restore = rank_one.apply(&mut s.weights).expect("rank one");
+        let expected = execute(&s.weights, &s.stats, &model, &s.base, &s.rows, &BTreeMap::new(), false).expect("run").log_probabilities;
+        restore.restore(&mut s.weights).expect("restore");
+        let restore = WeightEdit::Subcomponents { layer: 0, down, indices: vec![2], factor: 0.5 }.apply(&mut s.weights).expect("subcomponents");
+        let got = execute(&s.weights, &s.stats, &model, &s.base, &s.rows, &BTreeMap::new(), false).expect("run").log_probabilities;
+        let factor = if down { s.weights.vpd[&0].down_u.row(2).to_vec() } else { s.weights.vpd[&0].fc_u.row(2).to_vec() };
+        restore.restore(&mut s.weights).expect("restore");
+        assert!(max(&kl_bits(&expected, &got)) < 1e-12, "down {down}: the subcomponent edit is not its rank-one change");
+        assert!(factor.iter().zip(&u).all(|(a, b)| (a - 0.5 * b).abs() < 1e-15), "the factor is scaled");
+        assert_eq!(s.weights.layers[0].mlp.as_ref().map(|m| (m.gate.clone(), m.out.clone())), before.layers[0].mlp.as_ref().map(|m| (m.gate.clone(), m.out.clone())));
+        assert_eq!((s.weights.vpd[&0].fc_u.clone(), s.weights.vpd[&0].down_u.clone()), (before.vpd[&0].fc_u.clone(), before.vpd[&0].down_u.clone()));
+    }
+}
