@@ -1493,7 +1493,10 @@ groups += [{'params': [Rn['tau']], 'lr': LR * 0.1 * Rn['s'].item()} for Rn in RE
 if FMODE:
     groups += [{'params': [Rn['ls']], 'lr': LR * 1e-2} for Rn in RES.values()]
     # rot: each slice's dense widths (log sigma by 1% per step), and the leaves its cost reads.
-    groups += [{'params': [R[w] for w in ('ls_fc', 'ls_dn', 'ls') if w in R], 'lr': LR * 1e-2} for R in ROT_ALL]
+    # DESCENT_ROTWIDTH=fixed: the slices' widths stay at the start's (1% of their tensor's root mean square), so a
+    # block costs the same bits whenever it is on and F cannot widen slices into noise that partial gates damp.
+    if os.environ.get('DESCENT_ROTWIDTH') != 'fixed':
+        groups += [{'params': [R[w] for w in ('ls_fc', 'ls_dn', 'ls') if w in R], 'lr': LR * 1e-2} for R in ROT_ALL]
     for cont, key, mu, ls in leaves:
         if any(cont is R for R in ROT_ALL) and key in ('A', 'tau'):
             cont[key + '_leaf'] = (mu, ls)
