@@ -307,7 +307,10 @@ class VllmSampler:
 
         params = SamplingParams(n=n, temperature=1.0, top_p=1.0, top_k=-1, max_tokens=self.max_tokens, stop_token_ids=[self.end], logprobs=0)
         outs = self.llm.generate([{"prompt_token_ids": p} for p in prompts], params, lora_request=LoRARequest(f"policy{version}", version + 1, str(adapter)), use_tqdm=False)
-        self.logprob_sums = [sum(d[t].logprob for d, t in zip(c.logprobs, c.token_ids)) for o in outs for c in o.outputs]
+        try:  # the sampled tokens' log-probabilities, for the on-policy check only
+            self.logprob_sums = [sum(d[t].logprob for d, t in zip(c.logprobs, c.token_ids)) for o in outs for c in o.outputs]
+        except (TypeError, KeyError, AttributeError):  # a vLLM whose logprobs container differs
+            self.logprob_sums = None
         return [[list(c.token_ids) for c in o.outputs] for o in outs]
 
 
