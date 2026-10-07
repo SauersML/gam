@@ -690,6 +690,7 @@ ROT_ALL = list(ROT.values())
 # GATE stw: the hard gate forward with the gradient of a gate DESCENT_STW (10) times wider, Phi(z / w), so a block
 # far below its threshold still feels its value.
 STW = float(os.environ.get('DESCENT_STW', '10'))
+ANNEAL = float(os.environ.get('DESCENT_ANNEAL', '1'))
 
 def rot_train_gate(hard, phi, z):
     """A block's gate in training. mf: the expected gate Phi(z); st: the hard gate (as the scorer runs it) with
@@ -704,6 +705,11 @@ def rot_train_gate(hard, phi, z):
     if gate == 'stw':
         pw = 0.5 * (1 + torch.erf(z / (STW * SQ2)))
         return hard + pw - pw.detach()
+    if gate == 'anneal':
+        # The mean-field gate narrowed as training goes, Phi(z / a), a from 1 to 1/20 over the first DESCENT_ANNEAL
+        # (default all) of the steps: a continuation from the smooth gate to the hard one the scorer runs.
+        a = max(0.05, 1 - state.get('progress', 0.0) / ANNEAL)
+        return 0.5 * (1 + torch.erf(z / (a * SQ2)))
     return hard + phi - phi.detach()
 
 def rot_Q(R):
@@ -1627,6 +1633,7 @@ g_edits = np.random.default_rng(11)
 step_seconds = []
 t0 = time.time()
 for step in range(steps):
+    state['progress'] = step / max(1, steps - 1)
     rows = rng.integers(0, train_rows, batch); rows = np.where(rows >= 1024, rows + 8, rows); offs = rng.integers(0, 513 - seq, batch)
     ids = torch.tensor(np.stack([tok[r, o:o + seq] for r, o in zip(rows, offs)]).astype(np.int64), device=dev)
     t_step = time.time()
