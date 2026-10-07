@@ -100,7 +100,10 @@ fn reader_experiment(e: &Experiment, program: &Program, graph: &Graph, behavior:
             WeightEdit::Head { layer, head, factor } => json!({"kind": "scale", "pieces": native(*layer, "head", json!(head)), "factor": factor}),
             WeightEdit::Neurons { layer, neurons, factor } => json!({"kind": "scale", "pieces": native(*layer, "mlp", json!(neurons)), "factor": factor}),
             WeightEdit::Subcomponents { layer, down, indices, factor } => json!({"kind": "scale", "pieces": [{"view": "vpd", "layer": layer, "kind": if *down { "down_proj" } else { "c_fc" }, "index": indices}], "factor": factor}),
-            WeightEdit::AttnSubcomponents { layer, map, indices, factor } => json!({"kind": "scale", "pieces": [{"view": "vpd", "layer": layer, "kind": ["q_proj", "k_proj", "v_proj", "o_proj"][(*map).min(3)], "index": indices}], "factor": factor}),
+            WeightEdit::AttnSubcomponents { layer, map, indices, factor } => {
+                let kind = ["q_proj", "k_proj", "v_proj", "o_proj"][(*map).min(3)];
+                json!({"kind": "scale", "pieces": [{"view": "vpd", "layer": layer, "kind": kind, "index": indices}], "factor": factor})
+            }
             WeightEdit::RankOne { layer, head, matrix, .. } => {
                 let name = match head {
                     Some(h) => format!("head {h} {matrix:?}").to_lowercase(),
