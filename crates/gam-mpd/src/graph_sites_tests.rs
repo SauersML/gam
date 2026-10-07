@@ -417,3 +417,25 @@ fn attention_subcomponent_edits_split_over_heads() {
         assert_eq!(weights.vpd_attention[&0].o.0, o.0);
     }
 }
+
+/// The aimed half draws site operations on the program's own sites, and with `uniform_seeds` m a
+/// seed and the seed plus m score alike.
+#[test]
+fn aimed_site_operations_and_recurring_seeds() {
+    let (weights, sequences) = model("graph_sites_aimed_draws");
+    let units = units(&weights);
+    let full = Graph::parse(&full_program(), &weights).expect("parse");
+    let aimed = units.aimed_sites(&weights, &full);
+    let drawn = sample(&weights, &full, false, 60, 2, &[], &units);
+    let sites: Vec<&SiteDraw> = drawn.iter().skip(2).step_by(2).filter_map(|e| if let crate::graph::Experiment::Sites { draw } = e { Some(draw) } else { None }).collect();
+    assert!(!sites.is_empty(), "no aimed site operation in 30 aimed draws");
+    assert!(sites.iter().all(|d| d.ops.iter().all(|o| aimed.contains(&o.site))), "an aimed operation off the program's sites");
+    let mut checker = Checker::new(weights, behavior(&sequences)).expect("checker");
+    checker.sites = units;
+    checker.uniform_seeds = Some(4);
+    let program = full_program();
+    let (a, _) = checker.score(&program, 10, 3, true, None).expect("score");
+    let (b, _) = checker.score(&program, 10, 7, true, None).expect("score");
+    assert_eq!(a.exec_error_bits, b.exec_error_bits);
+    assert_eq!(a.per_family.keys().collect::<Vec<_>>(), b.per_family.keys().collect::<Vec<_>>());
+}
