@@ -61,6 +61,8 @@ pub mod library_complexity;
 pub mod library_removal;
 // Transcoder features as the library's MLP functions: relu(g·x + c) u per feature that fires.
 pub mod library_transcoder;
+// Native weight edits compiled into M and an explanation through its owners: D(E_e(P)) = e(D(P)).
+pub mod weight_edit;
 /// VPD's slices with intrinsic gates as a library explanation.
 pub mod library_vpd;
 // Its posterior resident on the device: sample, Adam step and group divergences without transfers.
