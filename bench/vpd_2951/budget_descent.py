@@ -61,10 +61,23 @@ import os
 # with g_i started at the slice's read v_i ||u_i||, signed so its firing on M's fit tokens is kept.
 ARM = os.environ.get('DESCENT_ARM', 'own')
 dev = os.environ.get('DESCENT_DEV') or ('cuda' if torch.cuda.is_available() else 'mps')
-# DESCENT_EXACT=1: every map's slices sum to M's weight at every step by construction (below), so
-# matmuls run in full float32 (TF32's 10-bit mantissa would break the sum).
+# DESCENT_EXACT=1: every map's slices sum to M's weight at every step by construction (below). The
+# frames' duals and writes are computed in full float32 (TF32's 10-bit mantissa would break the sum);
+# the forward passes of M and P run in TF32 alike. DESCENT_DOWN=neuron puts every down_proj map on
+# the hidden (neuron) axis, f_i = e_i, fixed: slice i is neuron i with read e_i and write W[:, i], exact
+# with no dual to compute (the down maps' 3,072-wide QR dominated each exact step).
 EXACT = os.environ.get('DESCENT_EXACT') == '1'
-torch.backends.cuda.matmul.allow_tf32 = not EXACT
+NEURON_DOWN = os.environ.get('DESCENT_DOWN') == 'neuron'
+torch.backends.cuda.matmul.allow_tf32 = True
+
+
+class full_float32:
+    """Matmuls in full float32 inside the block."""
+    def __enter__(self):
+        self.was = torch.backends.cuda.matmul.allow_tf32
+        torch.backends.cuda.matmul.allow_tf32 = False
+    def __exit__(self, *a):
+        torch.backends.cuda.matmul.allow_tf32 = self.was
 torch.manual_seed(0)
 T = load_target(dev)
 mlp = [n for n in site_names() if '.mlp.' in n]
@@ -103,8 +116,9 @@ def frame(F, W):
     canonical dual g_i = (F^T F)^-1 f_i and writes W f_i, so sum_i (W f_i) g_i^T = W F^T F (F^T F)^-1 = W
     for every F. Through the thin QR F = Q R: G^T = R^-1 Q^T, whose rounding error grows with cond(F),
     not cond(F)^2. Returns V (d_in x C, the reads as columns) and U (C x d_out, the writes)."""
-    Q, R = torch.linalg.qr(F)
-    return torch.linalg.solve_triangular(R, Q.T, upper=True), F @ W.T
+    with full_float32():
+        Q, R = torch.linalg.qr(F)
+        return torch.linalg.solve_triangular(R, Q.T, upper=True), F @ W.T
 
 P = {}
 for n in mlp:
@@ -122,7 +136,7 @@ for n in mlp:
         # The start's reads kept (the canonical dual is an involution: the frame R (R^T R)^-1 has dual
         # R), its writes replaced by the exact ones. The SVD start's down_proj has fewer slices than
         # inputs, so its frame is the hidden (neuron) axis: f_i = e_i, slice i = neuron i.
-        if start == 'svd' and n.endswith('down_proj'):
+        if (start == 'svd' or NEURON_DOWN) and n.endswith('down_proj'):
             F0 = torch.eye(W.shape[1], device=dev)
         else:
             Rd = V.T.cpu().double().numpy()
@@ -267,6 +281,11 @@ NH, HD = T.n_head, T.hd
 
 def head_frame(F, W, o):
     """Reads V [H, d_in_h, C] and writes U [H, C, d_out_h] of the head blocks of W from frames F [H, C, HD]."""
+    with full_float32():
+        return head_frame_(F, W, o)
+
+
+def head_frame_(F, W, o):
     Q, R = torch.linalg.qr(F)
     Gt = torch.linalg.solve_triangular(R, Q.transpose(1, 2), upper=True)       # [H, HD, C], the dual^T
     if o:
@@ -646,7 +665,8 @@ def share_parts(l, S):
 def evaluate(final=False):
     if EXACT:
         for n in mlp:
-            P[n]['V'], P[n]['U'] = frame(P[n]['F'], T.site(n).W)
+            if not (NEURON_DOWN and n.endswith('down_proj')):
+                P[n]['V'], P[n]['U'] = frame(P[n]['F'], T.site(n).W)
     for n in attn:
         A[n]['V'], A[n]['U'] = head_frame(A[n]['F'], T.site(n).W, A[n]['o'])
     state['collect'] = {} if SHARE else None
@@ -705,7 +725,8 @@ def evaluate(final=False):
 # threshold's its map's noise scale x 33. DESCENT_LR multiplies every step size (default 1).
 LR = float(os.environ.get('DESCENT_LR', '1'))
 rms = lambda q: q.detach().pow(2).mean().sqrt().item()
-slots = [(P[n], w, rms(P[n][w])) for n in mlp for w in (('F',) if EXACT else ('V', 'U')) + (('G',) if ARM == 'dir' else ())]
+slots = [(P[n], w, rms(P[n][w])) for n in mlp for w in (('F',) if EXACT else ('V', 'U')) + (('G',) if ARM == 'dir' else ())
+         if not (EXACT and NEURON_DOWN and n.endswith('down_proj') and w == 'F')]
 slots += [(A[n], 'F', rms(A[n]['F'])) for n in attn] + [(A[n], 'tau', 100 / 3 * A[n]['s'].mean().item()) for n in attn]
 for l, S in SHARE_A.items():
     slots += [(S, 't', 100 / 3 * S['s'].mean().item()), (S, 'L_v', 20 / 3), (S, 'L_o', 20 / 3)]
@@ -752,7 +773,8 @@ def draw(mean):
         cont[key] = mu if mean else mu + ls.exp() * torch.randn_like(mu)
     if EXACT:
         for n in mlp:
-            P[n]['V'], P[n]['U'] = frame(P[n]['F'], T.site(n).W)
+            if not (NEURON_DOWN and n.endswith('down_proj')):
+                P[n]['V'], P[n]['U'] = frame(P[n]['F'], T.site(n).W)
     for n in attn:
         A[n]['V'], A[n]['U'] = head_frame(A[n]['F'], T.site(n).W, A[n]['o'])
 
