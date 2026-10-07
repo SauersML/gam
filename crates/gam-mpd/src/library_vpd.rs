@@ -687,7 +687,7 @@ fn concat_interface(parts: &[Interface]) -> Result<Interface, String> {
 }
 
 /// `M`'s operator of each site kind, in [`KINDS`] order, by its export name.
-const EXPORT_NAMES: [&str; 6] = ["attn.q_proj", "attn.k_proj", "attn.v_proj", "attn.o_proj", "mlp.c_fc", "mlp.down_proj"];
+pub const EXPORT_NAMES: [&str; 6] = ["attn.q_proj", "attn.k_proj", "attn.v_proj", "attn.o_proj", "mlp.c_fc", "mlp.down_proj"];
 
 /// One component of [`dump_parts`]: per operator of `M` its slices' writes and reads (as columns),
 /// its gate, a direction gate's `g`, and its hard gate on every row.

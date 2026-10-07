@@ -2,7 +2,7 @@
 //! description length on interchange experiments (`gam_mpd::library_mdl`, #2951), on an export's
 //! token rows, and scored on held-out rows after every epoch.
 //!
-//! MODEL SETTINGS.json OUT host|gpu [artifact | edits EDITS.json | parts DIR]
+//! MODEL SETTINGS.json OUT host|gpu [artifact | edits EDITS.json | parts DIR | frame-start DIR]
 //!
 //! `MODEL` is an engine export (`export.json` and its token rows), or a Hugging Face checkpoint
 //! directory (`config.json` and its safetensors, one file or sharded) whose token rows come from
@@ -58,7 +58,9 @@
 //! fitted: the components at the posterior mean of `OUT/checkpoint.bin` (the start's values when
 //! there is none) are written to `DIR` as the toy gate's parts (`library_vpd::dump_parts`: per
 //! component its slices' writes and reads on `M`'s operators, its gate, and its hard gate on every
-//! held-out token in `P`'s own run).
+//! held-out token in `P`'s own run). With `frame-start DIR`, nothing is fitted: the frame starts
+//! (`library_frame::frame_start`) are written to `DIR/{tight,dictionary}/`, fitted on the first
+//! training sequences (at most 8,192 tokens), each a decomposition and a start file for `vpd`.
 //!
 //! With `transcoders` (`{"dir": D, "layers": [l, ...]}`, `D/layer_{l}.safetensors` circuit-tracer
 //! transcoder files), those layers' MLPs are the transcoders' features (`library_transcoder`, with
@@ -870,9 +872,10 @@ fn main() -> Result<(), String> {
         [export, settings, out, mode] => (export, settings, out, mode, false, None, None),
         [export, settings, out, mode, artifact] if artifact == "artifact" => (export, settings, out, mode, true, None, None),
         [export, settings, out, mode, edits, file] if edits == "edits" => (export, settings, out, mode, false, Some(Path::new(file)), None),
-        [export, settings, out, mode, parts, dir] if parts == "parts" => (export, settings, out, mode, false, None, Some(Path::new(dir))),
-        _ => return Err("EXPORT SETTINGS.json OUT host|gpu [artifact | edits EDITS.json | parts DIR]".into()),
+        [export, settings, out, mode, parts, dir] if parts == "parts" || parts == "frame-start" => (export, settings, out, mode, false, None, Some(Path::new(dir))),
+        _ => return Err("EXPORT SETTINGS.json OUT host|gpu [artifact | edits EDITS.json | parts DIR | frame-start DIR]".into()),
     };
+    let frame_start = args.get(4).is_some_and(|a| a == "frame-start");
     let (export, settings_path, out) = (Path::new(export), Path::new(settings_path), Path::new(out));
     let settings: Settings = serde_json::from_slice(&std::fs::read(settings_path).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
     let checkpoint_model = export.join("config.json").exists() && !export.join("export.json").exists();
@@ -928,6 +931,15 @@ fn main() -> Result<(), String> {
     // The imported program's operators the split replaced are not read again.
     drop(program);
     let layers = layer_nodes(&native, layer_count)?;
+    if let (true, Some(dir)) = (frame_start, parts_dir) {
+        let tokens = 8192usize;
+        let count = (tokens / settings.context).clamp(1, train.len());
+        let fitting: Vec<&[u32]> = train[..count].iter().map(Vec::as_slice).collect();
+        let family = library_mdl::sequence_family(&fitting)?;
+        let summary = gam_mpd::library_frame::frame_start(&native, &layers, &family, settings.fit.seed, dir)?;
+        log::info!("frame start: {summary}");
+        return Ok(());
+    }
     let explanation = match (&settings.transcoders, &settings.vpd) {
         (Some(_), Some(_)) => return Err("transcoders and vpd are two different starts".into()),
         (Some(transcoders), None) => {

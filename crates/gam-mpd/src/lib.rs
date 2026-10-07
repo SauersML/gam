@@ -67,6 +67,8 @@ pub mod weight_edit;
 pub mod adversary;
 /// VPD's slices with intrinsic gates as a library explanation.
 pub mod library_vpd;
+/// Frame starts for library_vpd: M's maps cut exactly through an overcomplete frame per read space.
+pub mod library_frame;
 // Its posterior resident on the device: sample, Adam step and group divergences without transfers.
 pub mod device_posterior;
 
