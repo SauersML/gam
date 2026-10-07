@@ -588,6 +588,7 @@ extern "C" __global__ void gate_function(u64 n, unsigned int code, const float* 
             case 2: v = normcdff(z); break;
             case 3: v = density / sd; break;
             case 4: v = -density * z / sd; break;
+            case 6: v = expf(2.0f * t); break;
             default: v = sd == 0.0f ? 0.0f : t / sd; break;
         }
         out[i] = v;

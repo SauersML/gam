@@ -743,6 +743,12 @@ impl DevicePosterior {
         }
     }
 
+    /// Trainable operator `i`'s iterate `μ` and log standard deviations `s` on the device, as the
+    /// posterior holds them (the host's copies: [`Self::iterate`], [`Self::values`]).
+    pub fn iterate_and_log_sd(&self, i: usize) -> Result<(&Tensor, &Tensor), String> {
+        Ok((self.mean.get(i).ok_or_else(|| error("no such trainable operator"))?, self.log_sd.get(i).ok_or_else(|| error("no such trainable operator"))?))
+    }
+
     /// Trainable operator `i`'s iterate `μ` on the host, whose Polyak average is the posterior's
     /// mean.
     pub fn iterate(&self, i: usize) -> Result<Array2<f64>, String> {

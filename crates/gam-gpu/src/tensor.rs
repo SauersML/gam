@@ -423,7 +423,7 @@ const WIDE_SEGMENTS: usize = 256 * 32;
 /// `Sqrt` `√x` (a group's norm from its squared sum), `Step` the Heaviside `H(x) = 1{x > 0}`,
 /// `Cdf` `Φ(z)` (an expected gate), `CdfSlope` its derivative in `x`, `φ(z) / s`, and `CdfScaleSlope`
 /// its derivative in `s`, `−φ(z) z / s`, and `Ratio` `x / s`, zero where `s` is (a norm's
-/// cotangent over the norm).
+/// cotangent over the norm), and `Variance` `e^{2x}` (a variance from its log standard deviation).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GateFunction {
     Sqrt,
@@ -432,6 +432,7 @@ pub enum GateFunction {
     CdfSlope,
     CdfScaleSlope,
     Ratio,
+    Variance,
 }
 
 impl GateFunction {
@@ -444,6 +445,7 @@ impl GateFunction {
             Self::CdfSlope => 3,
             Self::CdfScaleSlope => 4,
             Self::Ratio => 5,
+            Self::Variance => 6,
         }
     }
 
@@ -475,6 +477,7 @@ impl GateFunction {
                     x / s
                 }
             }
+            Self::Variance => (2.0 * x).exp(),
         }
     }
 }
@@ -4436,6 +4439,7 @@ extern "C" __global__ void gate_function(u64 n, unsigned int code, const double*
             case 2: v = normcdf(z); break;
             case 3: v = density / sd; break;
             case 4: v = -density * z / sd; break;
+            case 6: v = exp(2.0 * t); break;
             default: v = sd == 0.0 ? 0.0 : t / sd; break;
         }
         out[i] = v;
@@ -8481,6 +8485,7 @@ kernel void t_gate_function(device const float* x [[buffer(0)]], device const fl
             case 2: v = 0.5f * gam_erfc(-z * 0.70710678118654752f); break;
             case 3: v = density / sd; break;
             case 4: v = -density * z / sd; break;
+            case 6: v = exp(2.0f * t); break;
             default: v = sd == 0.0f ? 0.0f : t / sd; break;
         }
         out[i] = v;

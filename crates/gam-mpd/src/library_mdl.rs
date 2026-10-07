@@ -2457,7 +2457,18 @@ fn part_targets(scorer: &Scorer, batch: &Batch, experiments: Vec<Experiment>) ->
 /// of another law and every attention head with a surviving value executes on every token and
 /// counts one; a gated layer's fixed positions (where its block's output is not its functions',
 /// `library_transcoder`'s first token) count nothing of it.
-fn complexity_terms(scorer: &mut Scorer, device_posterior: &DevicePosterior, explanation: &Explanation, active: &[bool], batch: &Batch, (key, previous): (u64, bool)) -> Result<(f64, Vec<(usize, Array2<f64>, Array2<f64>)>), String> {
+/// `Σ a ⊙ b` over every entry, the rows' sums on the device and their total on the host; `b` in
+/// `a`'s storage first when it is held in another.
+fn device_dot(d: &Device, a: &Tensor, b: &Tensor) -> Result<f64, String> {
+    if a.rows() == 0 || a.cols() == 0 {
+        return Ok(0.0);
+    }
+    let converted = if b.storage() == a.storage() { None } else { Some(d.convert(b).map_err(error)?) };
+    let blocks = d.column_blocks(&[a.cols()]).map_err(error)?;
+    Ok(d.download(&d.block_products(a, converted.as_ref().unwrap_or(b), &blocks).map_err(error)?).map_err(error)?.sum())
+}
+
+fn complexity_terms(scorer: &mut Scorer, device_posterior: &DevicePosterior, explanation: &Explanation, active: &[bool], batch: &Batch, (key, previous): (u64, bool)) -> Result<(f64, Vec<(usize, Tensor, Tensor)>), String> {
     // At the iterate's sample, or with `previous` around the iterate before the pending move (its
     // test, `step_accepted`).
     if previous {
@@ -2490,15 +2501,18 @@ fn complexity_terms(scorer: &mut Scorer, device_posterior: &DevicePosterior, exp
                 let rank = stage.ranks(active);
                 let j = scorer.at(stage.threshold)?;
                 let bias = (device_posterior.iterate(j)?.column(0).to_vec(), device_posterior.values(j)?.1.column(0).mapv(|s| (2.0 * s).exp()).to_vec());
+                // A direction gate's means and variances stay on the device (the posterior's iterate
+                // and `e^{2s}`); its count's derivatives come back as device tensors.
                 let direction = match stage.direction {
                     Some(g) => {
                         let i = scorer.at(g)?;
-                        Some((i, device_posterior.iterate(i)?, device_posterior.values(i)?.1.mapv(|s| (2.0 * s).exp())))
+                        let (mean, log_sd) = device_posterior.iterate_and_log_sd(i)?;
+                        Some((i, mean, d.gate_function(gam_gpu::tensor::GateFunction::Variance, log_sd, None).map_err(error)?))
                     }
                     None => None,
                 };
                 let per = 1.0 / rows as f64;
-                let gate = direction.as_ref().map(|(_, mean, variance)| (mean, variance));
+                let gate = direction.as_ref().map(|(_, mean, variance)| (*mean, variance));
                 // A shared stage counts each component through its assignment, as the pass wrote it.
                 let relaxation = if previous { Relaxation::Previous } else { Relaxation::Soft };
                 let assign = match stage.assign {
@@ -2515,10 +2529,10 @@ fn complexity_terms(scorer: &mut Scorer, device_posterior: &DevicePosterior, exp
                     assignment_terms.push((op, g * per));
                 }
                 if let (Some((i, _, _)), Some((mean, variance))) = (&direction, gate_terms) {
-                    terms.push((*i, mean * per, variance * per));
+                    terms.push((*i, d.scaled(per, &mean).map_err(error)?, d.scaled(per, &variance).map_err(error)?));
                 }
                 count += expected.count;
-                terms.push((j, expected.bias_mean.insert_axis(ndarray::Axis(1)) * per, expected.bias_variance.insert_axis(ndarray::Axis(1)) * per));
+                terms.push((j, d.upload((expected.bias_mean.insert_axis(ndarray::Axis(1)) * per).view()).map_err(error)?, d.upload((expected.bias_variance.insert_axis(ndarray::Axis(1)) * per).view()).map_err(error)?));
             }
             continue;
         };
@@ -2558,9 +2572,9 @@ fn complexity_terms(scorer: &mut Scorer, device_posterior: &DevicePosterior, exp
         })?;
         count += expected.count;
         let per = 1.0 / rows as f64;
-        terms.push((i, expected.mean * per, expected.variance * per));
+        terms.push((i, d.upload((expected.mean * per).view()).map_err(error)?, d.upload((expected.variance * per).view()).map_err(error)?));
         if let Some((j, _, _)) = bias {
-            terms.push((j, expected.bias_mean.insert_axis(ndarray::Axis(1)) * per, expected.bias_variance.insert_axis(ndarray::Axis(1)) * per));
+            terms.push((j, d.upload((expected.bias_mean.insert_axis(ndarray::Axis(1)) * per).view()).map_err(error)?, d.upload((expected.bias_variance.insert_axis(ndarray::Axis(1)) * per).view()).map_err(error)?));
         }
     }
     // The step's own (not the move's test's) for the assignment's pull ([`Scorer::pull_assignments`]).
@@ -2590,11 +2604,11 @@ fn gated_expected(
     d: &Device,
     arithmetic: gam_gpu::tensor::Arithmetic,
     input: &Tensor,
-    gate: Option<(&Array2<f64>, &Array2<f64>)>,
+    gate: Option<(&Tensor, &Tensor)>,
     (bias_mean, bias_variance, widths): (&[f64], &[f64], &[f64]),
     rank: &[f64],
     assign: Option<&Array2<f64>>,
-) -> Result<(crate::library_complexity::Expected, Option<(Array2<f64>, Array2<f64>)>, Option<Array2<f64>>, ndarray::Array1<f64>), String> {
+) -> Result<(crate::library_complexity::Expected, Option<(Tensor, Tensor)>, Option<Array2<f64>>, ndarray::Array1<f64>), String> {
     use gam_gpu::tensor::GateFunction;
     let rows = input.rows();
     let parts = rank.len();
@@ -2623,9 +2637,12 @@ fn gated_expected(
     };
     let (mut m, mut s2) = match (gate, &squares) {
         (Some((mean, variance)), Some(squares)) => {
+            // In the input's storage (the posterior may hold another).
+            let held = |t: &Tensor| -> Result<Option<Tensor>, String> { if t.storage() == input.storage() { Ok(None) } else { d.convert(t).map(Some).map_err(error) } };
+            let (mean_held, variance_held) = (held(mean)?, held(variance)?);
             let (mut m, mut s2) = (d.empty(rows, gates).map_err(error)?, d.empty(rows, gates).map_err(error)?);
-            d.gemm(&mut m, 1.0, input, Op::N, &d.upload(mean.view()).map_err(error)?, Op::T, 0.0, arithmetic).map_err(error)?;
-            d.gemm(&mut s2, 1.0, squares, Op::N, &d.upload(variance.view()).map_err(error)?, Op::T, 0.0, arithmetic).map_err(error)?;
+            d.gemm(&mut m, 1.0, input, Op::N, mean_held.as_ref().unwrap_or(mean), Op::T, 0.0, arithmetic).map_err(error)?;
+            d.gemm(&mut s2, 1.0, squares, Op::N, variance_held.as_ref().unwrap_or(variance), Op::T, 0.0, arithmetic).map_err(error)?;
             (m, s2)
         }
         _ => {
@@ -2737,7 +2754,7 @@ fn gated_expected(
             let (mut mean, mut variance) = (d.empty(gates, input.cols()).map_err(error)?, d.empty(gates, input.cols()).map_err(error)?);
             d.gemm(&mut mean, 1.0, &slope, Op::T, input, Op::N, 0.0, arithmetic).map_err(error)?;
             d.gemm(&mut variance, 0.5, &spread, Op::T, squares, Op::N, 0.0, arithmetic).map_err(error)?;
-            Some((d.download(&mean).map_err(error)?, d.download(&variance).map_err(error)?))
+            Some((mean, variance))
         }
         None => None,
     };
@@ -4216,10 +4233,9 @@ pub fn fit_from(
                 let (mut along, mut square) = (0.0, 0.0);
                 for (i, mean, _) in &terms {
                     if let Some(g) = gradients.get(&explanation.trainable[*i]) {
-                        let data = device.download(g).map_err(error)?;
-                        along += data.iter().zip(mean.iter()).map(|(a, b)| a * b).sum::<f64>() * scale * LN_2;
+                        along += device_dot(&device, g, mean)? * scale * LN_2;
                     }
-                    square += mean.iter().map(|v| v * v).sum::<f64>();
+                    square += device_dot(&device, mean, mean)?;
                 }
                 let measured = if square > 0.0 { (-along).max(0.0) / square } else { 0.0 };
                 if !progress.engaged && expected > limit {
@@ -4239,20 +4255,19 @@ pub fn fit_from(
                     if lambda == 0.0 {
                         continue;
                     }
-                    let pull = mean.mapv(|v| lambda * v / (scale * LN_2));
-                    let pull = device.upload(pull.view()).map_err(error)?;
+                    // On the device, in the fit's storage: `λ/(scale ln 2)` times the count's derivative
+                    // into the gradient and `2λ/N` times its variance term into the curvature.
+                    let (pull, bend) = (device.convert(mean).map_err(error)?, device.convert(variance).map_err(error)?);
                     match gradients.get_mut(&op) {
-                        Some(total) => device.axpy(total, 1.0, &pull).map_err(error)?,
+                        Some(total) => device.axpy(total, lambda / (scale * LN_2), &pull).map_err(error)?,
                         None => {
-                            gradients.insert(op, pull);
+                            gradients.insert(op, device.scaled(lambda / (scale * LN_2), &pull).map_err(error)?);
                         }
                     }
-                    let bend = variance.mapv(|v| 2.0 * lambda * v / tokens as f64);
-                    let bend = device.upload(bend.view()).map_err(error)?;
                     match prior_curvature.get_mut(&op) {
-                        Some(total) => device.axpy(total, 1.0, &bend).map_err(error)?,
+                        Some(total) => device.axpy(total, 2.0 * lambda / tokens as f64, &bend).map_err(error)?,
                         None => {
-                            prior_curvature.insert(op, bend);
+                            prior_curvature.insert(op, device.scaled(2.0 * lambda / tokens as f64, &bend).map_err(error)?);
                         }
                     }
                 }
@@ -5469,6 +5484,7 @@ mod tests {
             complexity_terms(&mut scorer, &device_posterior, &explanation, &posterior.active, &batch, (key, false)).unwrap()
         };
         let (count, terms) = terms_at(&posterior);
+        let terms: Vec<(usize, Array2<f64>, Array2<f64>)> = terms.iter().map(|(i, m, v)| (*i, device.download(m).unwrap(), device.download(v).unwrap())).collect();
         assert!(count > 0.0);
         // The last layer's gate: its trainable index is the largest among the gates' terms whose
         // derivative has the shape of a gate (more than one column).
