@@ -60,6 +60,7 @@ def score_behavior(path: Path, experiments: int, seed: int, stand_in: str | None
             results[name] = r
     return {"behavior": behavior["id"], "family": behavior.get("family"), "model": behavior["model"],
             "prompts": len(behavior["prompts"]), "stand_in": stand_in, "experiments": experiments, "seed": seed,
+            "checker": Path(str(score.BINARY)).name,
             "programs": results}
 
 

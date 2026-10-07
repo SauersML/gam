@@ -64,7 +64,7 @@ def ir_of(source: str, model: str, stand_in: str | None = None) -> dict:
 def status_line(model: str, behavior: str, name: str, result: dict, stand_in: str | None = None) -> list[str]:
     clean = result.get("per_family", {}).get("clean", {}).get("mean_kl_bits")
     row = {"time": time.strftime("%Y-%m-%d %H:%M"), "model": model, "behavior": behavior, "program": name,
-           "clean_kl_bits": clean, "checker": Path(str(score.BINARY)).name, "stand_in": stand_in or "counterfactual", **result}
+           "clean_kl_bits": clean, "checker": Path(str(score.BINARY)).name, "stand_in": stand_in or "default", **result}
     return [("" if row.get(c) is None else f"{row[c]:.6g}" if isinstance(row[c], float) else str(row[c])) for c in COLUMNS]
 
 

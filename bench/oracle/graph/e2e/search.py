@@ -197,7 +197,7 @@ def main() -> None:
                 start = [unit_of(t) for t in a.start.split(",")] if a.start else None
                 found = greedy(pool, model, mode, a.experiments, a.seed, a.min_neurons, log, start)
                 heldout = pool.score([found["source"]], a.experiments, a.heldout_seed)[0]
-                found.update(units=[name(u) for u in found["units"]], heldout=heldout, calls=pool.calls - start, stand_in=a.stand_in,
+                found.update(units=[name(u) for u in found["units"]], heldout=heldout, calls=pool.calls - start, stand_in=a.stand_in, checker=Path(str(score.BINARY)).name,
                              experiments=a.experiments, seed=a.seed, heldout_seed=a.heldout_seed)
                 log(f"{mode}: {len(found['units'])} units, {found['score']['total_bits']:.6g} bits (held-out seed "
                     f"{heldout['total_bits']:.6g}), {found['calls']} checker calls")
