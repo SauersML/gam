@@ -69,5 +69,6 @@
  "vpd4l_pronoun_gender_said_mixed": {"model": "vpd4l", "behavior": "pronoun_gender.said", "family": "pronoun_gender", "split": "train"},
  "vpd4l_induction_random_words8_lib": {"model": "vpd4l", "behavior": "induction_random.words8", "family": "induction_random", "split": "train"},
  "vpd4l_greater_than_war_lib": {"model": "vpd4l", "behavior": "greater_than.war", "family": "greater_than", "split": "train"},
- "vpd4l_sva_simple_lib": {"model": "vpd4l", "behavior": "sva.simple", "family": "sva", "split": "heldout"}
+ "vpd4l_sva_simple_lib": {"model": "vpd4l", "behavior": "sva.simple", "family": "sva", "split": "heldout"},
+ "vpd4l_induction_rules": {"model": "vpd4l", "behavior": "induction_random.words8", "family": "induction_random", "split": "train"}
 }

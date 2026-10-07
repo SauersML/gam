@@ -24,10 +24,14 @@ VPD4L_TOKENIZER = Path.home() / "mpd-data/vpd/t-9d2b8f02/tokenizer.json"
 
 REFERENCE = """\
 Write ONE Python file that explains how the model produces the behavior below. It may import only
-`from mech import node, edges, L, PD, embed, logits`.
+`from mech import node, edges, L, PD, embed, logits, attend, tokens, shift`.
 - node(*pieces) declares a node: pieces of the model's weights that compute with their actual inputs.
 {pieces}  Indices may be several ints, slices or ranges; a site without indices (L[3].mlp) is all of
   its units. A node's pieces lie in one layer's attention or one layer's MLP.
+- node(L[l].head[h], rule=attend(...)) gives heads an attention rule in place of their query and key
+  weights (which are then not charged): attend(offset=k) (the position k back), attend(query=tokens,
+  key=shift(tokens, 1)) (every earlier position whose previous token is the current token), or
+  attend(first=True) (the first position). A ruled head reads only its value.
 - writer >> reader declares an edge, listed in edges(...). The writer is a node or embed; the reader is
   node.query, node.key or node.value (attention), node.input or the node itself (all of its reads), or
   logits. Writers must come before readers.
