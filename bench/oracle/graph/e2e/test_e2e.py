@@ -104,7 +104,8 @@ class FakePool:
             total = 100.0
             for n in ir["nodes"]:
                 p = n["pieces"][0]
-                idx = [p["index"]] if isinstance(p["index"], int) else p["index"]
+                size = mech.shapes("vpd4l")["heads" if p["kind"] == "head" else "d_mlp"]
+                idx = range(size) if p["index"] is None else [p["index"]] if isinstance(p["index"], int) else p["index"]
                 if p["kind"] == "head":
                     total += 1 - 5 * ((p["layer"], idx[0]) in {(1, 1), (2, 4)})
                 else:

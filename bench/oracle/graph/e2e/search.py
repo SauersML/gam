@@ -50,6 +50,12 @@ def name(unit) -> str:
     return f"h{unit[1]}_{unit[2]}" if unit[0] == "head" else f"m{unit[1]}_{unit[2]}_{unit[3]}"
 
 
+def unit_of(text: str):
+    """The unit a name() denotes: h<l>_<h> or m<l>_<start>_<stop>."""
+    parts = [int(x) for x in text[1:].split("_")]
+    return ("head", *parts) if text[0] == "h" else ("mlp", *parts)
+
+
 def source(units) -> str:
     """The program declaring `units` as nodes with every causal edge among them listed."""
     units = sorted(units, key=lambda u: (site(u), u))
@@ -110,11 +116,14 @@ def all_units(model: str):
     return [("head", l, h) for l in range(s["layers"]) for h in range(s["heads"])] + [("mlp", l, 0, s["d_mlp"]) for l in range(s["layers"])]
 
 
-def greedy(pool: Pool, model: str, mode: str, experiments: int, seed: int, min_neurons: int, log) -> dict:
+def greedy(pool: Pool, model: str, mode: str, experiments: int, seed: int, min_neurons: int, log, start=None) -> dict:
+    """`start`: the units to start from (default: none for addition, every unit for removal)."""
     full = all_units(model)
-    current = [] if mode == "addition" else list(full)
-    # Addition draws from `outside`: the pieces not declared yet, as dyadic blocks.
-    outside = list(full) if mode == "addition" else []
+    current = list(start) if start is not None else [] if mode == "addition" else list(full)
+    # Addition draws from `outside`: the pieces not declared yet, as dyadic blocks (whole units the
+    # start does not touch; a start's partial MLP blocks leave nothing outside in that layer).
+    touched = {(u[0], u[1]) if u[0] == "mlp" else u for u in current}
+    outside = [u for u in full if ((u[0], u[1]) if u[0] == "mlp" else u) not in touched] if mode == "addition" else []
     best = pool.score([source(current)], experiments, seed)[0]
     trajectory = [{"step": 0, "units": [name(u) for u in current], "total_bits": best["total_bits"],
                    "exec_error_bits": best["exec_error_bits"], "opaque_bits": best["opaque_bits"], "calls": pool.calls}]
@@ -158,6 +167,8 @@ def main() -> None:
     ap.add_argument("--min-neurons", type=int, default=384)
     ap.add_argument("--export", type=Path, help="the model's export directory (score.py's default otherwise)")
     ap.add_argument("--out", type=Path, default=OUT)
+    ap.add_argument("--start", help="comma-separated units to start from (h<l>_<h>, m<l>_<start>_<stop>)")
+    ap.add_argument("--tag", default="", help="suffix of the output names")
     a = ap.parse_args()
     path = a.behavior.expanduser()
     behavior = json.loads(path.read_text())
@@ -168,20 +179,22 @@ def main() -> None:
     try:
         for mode in (["addition", "removal"] if a.mode == "both" else [a.mode]):
             start = pool.calls
-            log_path = out / f"{behavior['id']}.{mode}.log"
+            stem = f"{behavior['id']}.{mode}{a.tag}"
+            log_path = out / f"{stem}.log"
             with log_path.open("w") as logf:
                 def log(msg):
                     print(msg, flush=True)
                     logf.write(msg + "\n")
                     logf.flush()
-                found = greedy(pool, model, mode, a.experiments, a.seed, a.min_neurons, log)
+                start = [unit_of(t) for t in a.start.split(",")] if a.start else None
+                found = greedy(pool, model, mode, a.experiments, a.seed, a.min_neurons, log, start)
                 heldout = pool.score([found["source"]], a.experiments, a.heldout_seed)[0]
                 found.update(units=[name(u) for u in found["units"]], heldout=heldout, calls=pool.calls - start,
                              experiments=a.experiments, seed=a.seed, heldout_seed=a.heldout_seed)
                 log(f"{mode}: {len(found['units'])} units, {found['score']['total_bits']:.6g} bits (held-out seed "
                     f"{heldout['total_bits']:.6g}), {found['calls']} checker calls")
-            (out / f"{behavior['id']}.{mode}.json").write_text(json.dumps(found, indent=1))
-            e2e.record([e2e.status_line(model, behavior["id"], f"search_{mode}", found["heldout"])])
+            (out / f"{stem}.json").write_text(json.dumps(found, indent=1))
+            e2e.record([e2e.status_line(model, behavior["id"], f"search_{mode}{a.tag}", found["heldout"])])
     finally:
         pool.close()
 
