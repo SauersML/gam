@@ -8,5 +8,8 @@ here=$(cd "$(dirname "$0")" && pwd)
 OUT=$1 STUDY=$2 MODEL=${3:-qwen3-0.6b} HFID=${4:-Qwen/Qwen3-0.6B}
 PY=$HOME/oracle-venv/bin/python
 mkdir -p "$OUT"
+# hidden_choice.py loads with device_map, which needs accelerate; the shared venv lacks it, so it goes in a private dir
+~/.local/bin/uv pip install -q --python "$PY" --target "$OUT/pylib" --no-deps accelerate
+export PYTHONPATH=$OUT/pylib${PYTHONPATH:+:$PYTHONPATH}
 (cd "$STUDY" && $PY hidden_choice.py --model "$HFID" --n 640 --wording B --arms visible --device cuda --seed 1 --out "$OUT/${MODEL//-/_}_B.json")
 RETAINED_STUDY=$STUDY $PY "$here/retained_state.py" --model "$MODEL" --device cuda --out "$OUT" --study-file "$OUT/${MODEL//-/_}_B.json"
