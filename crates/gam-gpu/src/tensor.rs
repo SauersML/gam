@@ -1643,6 +1643,26 @@ impl Device {
         }
     }
 
+    /// How many entries [`Device::row_lists`] would list for `mask` and `starts` (the columns of
+    /// every group whose entry is not zero, over all rows), without listing them: CUDA counts each
+    /// row on the device and reads back one count a row.
+    pub fn listed_entries(&self, mask: &Tensor, starts: &[u32]) -> Result<usize, GpuError> {
+        if starts.len() != mask.cols + 1 || starts.first() != Some(&0) || starts.windows(2).any(|w| w[0] > w[1]) {
+            return Err(shape(format!("{} group starts for {} groups", starts.len(), mask.cols)));
+        }
+        match &*self.backend {
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) => {
+                let starts = self.upload_indices(starts)?;
+                Ok(self.download(&engine.row_counts(mask, &starts)?)?.iter().map(|&n| n as usize).sum())
+            }
+            _ => {
+                let m = self.download(mask)?;
+                Ok(m.rows().into_iter().map(|row| row.iter().enumerate().filter(|(_, v)| **v != 0.0).map(|(g, _)| (starts[g + 1] - starts[g]) as usize).sum::<usize>()).sum())
+            }
+        }
+    }
+
     /// `x Aᵀ` (`x` rows × k, `A` n × k) at the entries `lists` holds, zero at every other: each
     /// listed entry `(r, c)` is `Σ_t x[r, t] A[c, t]`, summed in the tensors' own precision
     /// (a product read only where a gate is on, or a cotangent wanted only there).
@@ -3984,24 +4004,36 @@ extern "C" __global__ void nonzero_columns(u64 n, unsigned int nr, const double*
 }
 
 // Per row r of a rows × groups mask, the columns its groups other than zero span (a NaN counts):
-// Σ (starts[g + 1] − starts[g]) over those g.
+// Σ (starts[g + 1] − starts[g]) over those g. One warp a row, its lanes striding the groups.
 extern "C" __global__ void row_counts(unsigned int rows, unsigned int groups, const double* mask, const unsigned int* starts, double* out) {
-    GRID_STRIDE(r, rows) {
+    u64 lane = threadIdx.x & 31u, warps = ((u64)gridDim.x * blockDim.x) >> 5;
+    for (u64 r = ((u64)blockIdx.x * blockDim.x + threadIdx.x) >> 5; r < rows; r += warps) {
         unsigned int n = 0;
-        for (unsigned int g = 0; g < groups; ++g) {
+        for (u64 g = lane; g < groups; g += 32) {
             if (mask[r * groups + g] != 0.0) n += starts[g + 1] - starts[g];
         }
-        out[r] = (double)n;
+        for (int o = 16; o > 0; o >>= 1) n += __shfl_down_sync(0xffffffffu, n, o);
+        if (lane == 0) out[r] = (double)n;
     }
 }
 
-// Row r's listed columns from offsets[r] on, increasing, each with its row.
+// Row r's listed columns from offsets[r] on, increasing, each with its row. One warp a row, its
+// groups 32 at a time: each lane's columns go after the earlier lanes' (a warp scan of widths).
 extern "C" __global__ void row_fill(unsigned int rows, unsigned int groups, const double* mask, const unsigned int* starts, const unsigned int* offsets, unsigned int* columns, unsigned int* row_of) {
-    GRID_STRIDE(r, rows) {
+    u64 lane = threadIdx.x & 31u, warps = ((u64)gridDim.x * blockDim.x) >> 5;
+    for (u64 r = ((u64)blockIdx.x * blockDim.x + threadIdx.x) >> 5; r < rows; r += warps) {
         unsigned int e = offsets[r];
-        for (unsigned int g = 0; g < groups; ++g) {
-            if (mask[r * groups + g] == 0.0) continue;
-            for (unsigned int c = starts[g]; c < starts[g + 1]; ++c) { columns[e] = c; row_of[e] = (unsigned int)r; ++e; }
+        for (u64 base = 0; base < groups; base += 32) {
+            u64 g = base + lane;
+            unsigned int w = (g < groups && mask[r * groups + g] != 0.0) ? starts[g + 1] - starts[g] : 0u;
+            unsigned int scan = w;
+            for (int o = 1; o < 32; o <<= 1) {
+                unsigned int t = __shfl_up_sync(0xffffffffu, scan, o);
+                if (lane >= (u64)o) scan += t;
+            }
+            unsigned int at = e + scan - w;
+            for (unsigned int k = 0; k < w; ++k) { columns[at + k] = starts[g] + k; row_of[at + k] = (unsigned int)r; }
+            e += __shfl_sync(0xffffffffu, scan, 31);
         }
     }
 }
@@ -6862,7 +6894,7 @@ extern "C" __global__ void group_divergence(u64 n, int scaled, const double* ref
             let (rows, groups) = (u32_of(mask.rows)?, u32_of(mask.cols)?);
             let f = self.kernel("row_counts", storage)?;
             // SAFETY: `starts` holds groups + 1 increasing columns (checked by the caller).
-            unsafe { self.stream.launch_builder(&f).arg(&rows).arg(&groups).input(mask, storage)?.arg(index_slice(starts)?).output(&mut out, storage)?.launch(cfg_elements(u64::from(rows))) }
+            unsafe { self.stream.launch_builder(&f).arg(&rows).arg(&groups).input(mask, storage)?.arg(index_slice(starts)?).output(&mut out, storage)?.launch(cfg_elements(u64::from(rows) * 32)) }
                 .gpu_ctx("tensor row_counts")?;
             Ok(out)
         }
@@ -6884,7 +6916,7 @@ extern "C" __global__ void group_divergence(u64 n, int scaled, const double* ref
                     .arg(index_slice(offsets)?)
                     .arg(&mut columns)
                     .arg(&mut row_of)
-                    .launch(cfg_elements(u64::from(rows)))
+                    .launch(cfg_elements(u64::from(rows) * 32))
             }
             .gpu_ctx("tensor row_fill")?;
             Ok((Indices { len: entries, data: IndexData::Cuda(columns) }, Indices { len: entries, data: IndexData::Cuda(row_of) }))

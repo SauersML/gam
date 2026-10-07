@@ -465,6 +465,9 @@ pub struct DeviceTrace {
     listed_nodes: BTreeSet<usize>,
     /// The nodes that took an earlier node's value (`DeviceProgram::aliases`), and that node.
     aliased: BTreeMap<usize, usize>,
+    /// Per gated node, the entries its per-row lists hold, counted before deciding to list them
+    /// (`DeviceProgram::gate_entries`).
+    entries: BTreeMap<usize, usize>,
     /// Bfloat16 copies of node values a bfloat16 forward pass's and the reverse passes' products read
     /// ([`DeviceTrace::rounded_value`]), kept until [`DeviceTrace::release_rounded`].
     rounded: Mutex<BTreeMap<usize, Arc<Tensor>>>,
@@ -1576,6 +1579,30 @@ impl DeviceProgram {
         Ok(Some(lists))
     }
 
+    /// The entries gated node `gated`'s per-row lists hold in the pass that made `trace`, counted
+    /// once a pass without listing them (`Device::listed_entries`), so a product the lists do not
+    /// pay for never makes them; `None` when the node is not listed or its gate is held in
+    /// bfloat16.
+    fn gate_entries(&self, trace: &mut DeviceTrace, gated: usize) -> Result<Option<usize>, String> {
+        let Some(starts) = &self.listed[gated] else { return Ok(None) };
+        if let Some(lists) = trace.lists.get(&gated) {
+            return Ok(Some(lists.len()));
+        }
+        if let Some(&entries) = trace.entries.get(&gated) {
+            return Ok(Some(entries));
+        }
+        let Some(mask) = self.gate_mask(trace, gated)? else { return Ok(None) };
+        let entries = self.device.listed_entries(&mask, starts).map_err(error)?;
+        trace.entries.insert(gated, entries);
+        Ok(Some(entries))
+    }
+
+    /// Whether affine node `node` takes the dense product without listing its gated node's
+    /// entries: its measured costs say the dense product is cheaper at `entries` this pass.
+    fn dense_without_lists(&self, node: usize, entries: usize, rows: usize) -> Result<bool, String> {
+        Ok(!self.always_listed && self.listed_pays(node, self.arithmetic, entries, rows)? == Some(false))
+    }
+
     /// Gated node `gated`'s components on, rows × components: not zero exactly where `H(gate)` is
     /// 1, or with a scale where `Φ(gate / scale) + φ(gate / scale) / scale` is not zero
     /// ([`DeviceProgram::row_lists`]). `None` for a gate held in bfloat16.
@@ -1648,6 +1675,10 @@ impl DeviceProgram {
         if self.listed_operand(operator, trace.value(argument)?)?.is_none() {
             return Ok(None);
         }
+        let Some(entries) = self.gate_entries(trace, gated)? else { return Ok(None) };
+        if self.dense_without_lists(node, entries, trace.rows)? {
+            return Ok(None);
+        }
         let Some(lists) = self.row_lists(trace, gated)? else { return Ok(None) };
         let x = trace.value(argument)?;
         let a = self.listed_operand(operator, x)?.ok_or("device: a listed operand")?;
@@ -1718,6 +1749,10 @@ impl DeviceProgram {
     /// product.
     fn listed_write(&self, trace: &mut DeviceTrace, node: usize, (argument, operator): (usize, usize)) -> Result<Option<Tensor>, String> {
         if self.listed[argument].is_none() || self.listed_operand(operator, trace.value(argument)?)?.is_none() {
+            return Ok(None);
+        }
+        let Some(entries) = self.gate_entries(trace, argument)? else { return Ok(None) };
+        if self.dense_without_lists(node, entries, trace.rows)? {
             return Ok(None);
         }
         let Some(lists) = self.row_lists(trace, argument)? else { return Ok(None) };
@@ -2038,6 +2073,7 @@ impl DeviceProgram {
             lists: BTreeMap::new(),
             listed_nodes: BTreeSet::new(),
             aliased: BTreeMap::new(),
+            entries: BTreeMap::new(),
             rounded: Mutex::new(BTreeMap::new()),
         };
         // The nodes an edit replaced: a later node of the same value computes its own.

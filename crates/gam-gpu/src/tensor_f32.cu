@@ -595,24 +595,36 @@ extern "C" __global__ void gate_function(u64 n, unsigned int code, const float* 
 }
 
 // Per row r of a rows × groups mask, the columns its groups other than zero span (a NaN counts):
-// Σ (starts[g + 1] − starts[g]) over those g (exact in float below 2^24).
+// Σ (starts[g + 1] − starts[g]) over those g. One warp a row, its lanes striding the groups.
 extern "C" __global__ void row_counts(unsigned int rows, unsigned int groups, const float* mask, const unsigned int* starts, float* out) {
-    GRID_STRIDE(r, rows) {
+    u64 lane = threadIdx.x & 31u, warps = ((u64)gridDim.x * blockDim.x) >> 5;
+    for (u64 r = ((u64)blockIdx.x * blockDim.x + threadIdx.x) >> 5; r < rows; r += warps) {
         unsigned int n = 0;
-        for (unsigned int g = 0; g < groups; ++g) {
+        for (u64 g = lane; g < groups; g += 32) {
             if (mask[r * groups + g] != 0.0f) n += starts[g + 1] - starts[g];
         }
-        out[r] = (float)n;
+        for (int o = 16; o > 0; o >>= 1) n += __shfl_down_sync(0xffffffffu, n, o);
+        if (lane == 0) out[r] = (float)n;
     }
 }
 
-// Row r's listed columns from offsets[r] on, increasing, each with its row.
+// Row r's listed columns from offsets[r] on, increasing, each with its row. One warp a row, its
+// groups 32 at a time: each lane's columns go after the earlier lanes' (a warp scan of widths).
 extern "C" __global__ void row_fill(unsigned int rows, unsigned int groups, const float* mask, const unsigned int* starts, const unsigned int* offsets, unsigned int* columns, unsigned int* row_of) {
-    GRID_STRIDE(r, rows) {
+    u64 lane = threadIdx.x & 31u, warps = ((u64)gridDim.x * blockDim.x) >> 5;
+    for (u64 r = ((u64)blockIdx.x * blockDim.x + threadIdx.x) >> 5; r < rows; r += warps) {
         unsigned int e = offsets[r];
-        for (unsigned int g = 0; g < groups; ++g) {
-            if (mask[r * groups + g] == 0.0f) continue;
-            for (unsigned int c = starts[g]; c < starts[g + 1]; ++c) { columns[e] = c; row_of[e] = (unsigned int)r; ++e; }
+        for (u64 base = 0; base < groups; base += 32) {
+            u64 g = base + lane;
+            unsigned int w = (g < groups && mask[r * groups + g] != 0.0f) ? starts[g + 1] - starts[g] : 0u;
+            unsigned int scan = w;
+            for (int o = 1; o < 32; o <<= 1) {
+                unsigned int t = __shfl_up_sync(0xffffffffu, scan, o);
+                if (lane >= (u64)o) scan += t;
+            }
+            unsigned int at = e + scan - w;
+            for (unsigned int k = 0; k < w; ++k) { columns[at + k] = starts[g] + k; row_of[at + k] = (unsigned int)r; }
+            e += __shfl_sync(0xffffffffu, scan, 31);
         }
     }
 }
