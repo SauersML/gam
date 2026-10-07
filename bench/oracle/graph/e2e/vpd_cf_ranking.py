@@ -9,6 +9,8 @@ torch, bench/oracle/vpd_labels.py); no gradients. Output in removal-scan form fo
 {"sites": {site: {"cf_write_change": [per subcomponent]}}, "behavior": id}.
 
   vpd_cf_ranking.py BEHAVIOR.json OUT.json
+Native pieces get the same measure in OUT's "native" entry: a neuron's change |act(x) - act(x')| times its
+down column's norm, a head's ||W_o,h (y_h(x) - y_h(x'))||, summed and averaged the same way.
 """
 
 from __future__ import annotations
@@ -34,6 +36,9 @@ def main():
     uv = VL.load_uv(dev, Path.home() / "mpd-data/oracle/vpd/uv.safetensors")
     names = VM.site_names(model.t.n_layer)
     total = {n: torch.zeros(uv[n][0].shape[0], dtype=torch.float32, device=dev) for n in names}
+    L, H, hd = model.t.n_layer, model.t.n_head, model.t.hd
+    neurons = torch.zeros(L, model.t.site("h.0.mlp.down_proj").W.shape[1], device=dev)
+    heads = torch.zeros(L, H, device=dev)
     used = 0
     for p in behavior["prompts"]:
         cf = p.get("counterfactual")
@@ -52,9 +57,18 @@ def main():
             dh = (records[0][n] - records[1][n])[0]  # [T, d_in]
             change = (dh @ V).abs().sum(0) * U.norm(dim=1)  # [C]
             total[n] += change.float()
+        for l in range(L):
+            W = model.t.site(f"h.{l}.mlp.down_proj").W  # [d, hidden]: its input is the neurons' activations
+            da = (records[0][f"h.{l}.mlp.down_proj"] - records[1][f"h.{l}.mlp.down_proj"])[0]  # [T, hidden]
+            neurons[l] += da.abs().sum(0) * W.norm(dim=0)
+            Wo = model.t.site(f"h.{l}.attn.o_proj").W  # [d, H * hd]: its input is the heads' outputs
+            dy = (records[0][f"h.{l}.attn.o_proj"] - records[1][f"h.{l}.attn.o_proj"])[0]  # [T, H * hd]
+            for h in range(H):
+                heads[l, h] += (dy[:, h * hd:(h + 1) * hd] @ Wo[:, h * hd:(h + 1) * hd].T).norm(dim=1).sum()
         used += 1
     result = {"behavior": behavior["id"], "prompts": used,
-              "sites": {n: {"cf_write_change": (total[n] / max(used, 1)).tolist()} for n in names}}
+              "sites": {n: {"cf_write_change": (total[n] / max(used, 1)).tolist()} for n in names},
+              "native": {"heads": (heads / max(used, 1)).tolist(), "neurons": (neurons / max(used, 1)).tolist()}}
     out.write_text(json.dumps(result))
     top = sorted(((v, n, i) for n in names for i, v in enumerate(result["sites"][n]["cf_write_change"])), reverse=True)[:8]
     print(f"{used} prompts; top: " + ", ".join(f"{n}[{i}] {v:.3g}" for v, n, i in top))

@@ -77,6 +77,19 @@ def unit_of(text: str):
     return ({"h": "head", "m": "mlp", "v": "vpd"}[text[0]], *parts)
 
 
+def ranked_native(path: Path, model: str = "vpd4l", per_number: bool = True) -> list[tuple]:
+    """Heads and single MLP neurons ("mlp", layer, i, i + 1), largest counterfactual write change (per opaque
+    number, by default) first (vpd_cf_ranking.py's "native" entry)."""
+    native = json.loads(Path(path).read_text())["native"]
+    units = [(v, ("head", l, h)) for l, row in enumerate(native["heads"]) for h, v in enumerate(row)]
+    units += [(v, ("mlp", l, i, i + 1)) for l, row in enumerate(native["neurons"]) for i, v in enumerate(row)]
+    if per_number:  # change per opaque number the unit costs (a head's q, k, v, o maps; a neuron's rows)
+        s_ = mech.shapes(model)
+        cost = {"head": 4 * s_["d_model"] * s_["head_dim"], "mlp": 2 * s_["d_model"] + 1}
+        units = [(v / cost[u[0]], u) for v, u in units]
+    return [u for v, u in sorted(units, key=lambda x: -x[0])]
+
+
 def ranked_subcomponents(path: Path) -> list[tuple]:
     """Every VPD subcomponent ("sub", layer, matrix, index), largest measured removal effect first (g-mech's
     measure/vpd_induction_removal.py output: sites -> {"kl_bits": [per subcomponent]})."""
@@ -397,7 +410,8 @@ def main() -> None:
                 partial = out / f"{stem}.partial.json"
                 save = lambda state: partial.write_text(json.dumps(state, indent=1))
                 if mode == "prefix":
-                    ranked = ranked_subcomponents(a.ranking)[: a.max_units] if a.mlp_view == "vpd" else None
+                    ranked = None if a.ranking is None else (ranked_subcomponents(a.ranking) if a.mlp_view == "vpd"
+                                                             else ranked_native(a.ranking, model))[: a.max_units]
                     found = prefix_search(pool, model, a.experiments, a.seed, a.block, log, a.rank_experiments, save,
                                           objective_of(a.objective), ranked=ranked)
                 else:
