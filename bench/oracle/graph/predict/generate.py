@@ -526,7 +526,8 @@ class Draw:
 # ---------------------------------------------------------------- one batch of texts
 
 
-OPTIONS = {"types": None, "min_kl": float("-inf"), "aim": "mixed", "pieces": None}  # set by main: --types, --min-kl, --aim, --pieces
+DELTA = 3  # risers and fallers in a delta answer
+OPTIONS = {"types": None, "min_kl": float("-inf"), "aim": "mixed", "pieces": None, "answer": "distribution"}  # set by main: --types, --min-kl, --aim, --pieces
 
 
 def parse_piece(text: str):
@@ -617,8 +618,20 @@ def batch_questions(m: Qwen3, w: Writer, draw: Draw, tokens: torch.Tensor, sourc
                 continue
             d, nums = w.dist(lp[r])
             pre = f"<text> {texts[r]}\n" if toks is None else ""
-            emit(r, kind, pre + describe[r] + f"<clean> {clean_txt[r][0]}\n<question> next-token distribution after the intervention, and its KL from clean in bits\n",
-                 f"{d}\nKL {max(kl[r].item(), 0.0):.3f} bits", {"edited": nums, "clean": clean_txt[r][1], "kl_bits": kl[r].item(), **(extra[r] if extra else {})})
+            # The tokens whose probability rises and falls most (over the whole vocabulary): the delta answer.
+            dp = (lp[r].exp() - lp_clean[r].exp()).float()
+            up, down = dp.topk(DELTA), (-dp).topk(DELTA)
+            moves = {"up": [[json.loads(w.token(t)), round(v, 4)] for t, v in zip(up.indices.tolist(), up.values.tolist())],
+                     "down": [[json.loads(w.token(t)), round(-v, 4)] for t, v in zip(down.indices.tolist(), down.values.tolist())]}
+            numbers = {"edited": nums, "clean": clean_txt[r][1], "kl_bits": kl[r].item(), **moves, **(extra[r] if extra else {})}
+            if OPTIONS["answer"] == "delta":
+                question = "<question> change of the next-token distribution after the intervention: its KL from clean in bits and the tokens whose probability rises and falls most\n"
+                answer = (f"KL {max(kl[r].item(), 0.0):.3f} bits\nup: " + ", ".join(f"{json.dumps(t, ensure_ascii=False)} {v:+.3f}" for t, v in moves["up"])
+                          + "\ndown: " + ", ".join(f"{json.dumps(t, ensure_ascii=False)} {v:+.3f}" for t, v in moves["down"]))
+            else:
+                question = "<question> next-token distribution after the intervention, and its KL from clean in bits\n"
+                answer = f"{d}\nKL {max(kl[r].item(), 0.0):.3f} bits"
+            emit(r, kind, pre + describe[r] + f"<clean> {clean_txt[r][0]}\n" + question, answer, numbers)
 
     # edit
     if want("edit"):
@@ -826,6 +839,8 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--types", default="", help="only these question types (comma-separated), e.g. edit,swap,cut")
     ap.add_argument("--min-kl", type=float, default=float("-inf"), help="keep edit/cut/swap/prompt questions whose measured change is at least this (bits)")
+    ap.add_argument("--answer", default="distribution", choices=("distribution", "delta"),
+                    help="edit/cut/swap/prompt answers: the new top-5 distribution, or the KL and the 3 tokens rising and falling most")
     ap.add_argument("--pieces", default="", help="JSON list of pieces in mech spelling: every question asks about one of them")
     ap.add_argument("--aim", default="mixed", choices=("mixed", "large"), help="large: pieces likely to move M (Draw.large)")
     ap.add_argument("--piece-split", default="train", choices=("train", "heldout"),
@@ -840,7 +855,7 @@ def main():
     ap.add_argument("--tc-layers", default="", help="layers whose transcoder features are asked about, e.g. 3,9,14,20,25")
     args = ap.parse_args()
     torch.set_grad_enabled(False)
-    OPTIONS.update(types=set(args.types.split(",")) if args.types else None, min_kl=args.min_kl, aim=args.aim,
+    OPTIONS.update(types=set(args.types.split(",")) if args.types else None, min_kl=args.min_kl, aim=args.aim, answer=args.answer,
                    pieces=[parse_piece(p) for p in json.load(open(args.pieces))] if args.pieces else None)
     dev = device()
     if args.target == "vpd4l":

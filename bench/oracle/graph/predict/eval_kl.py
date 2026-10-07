@@ -71,6 +71,45 @@ def read_answer(text: str):
     return {k: v / total for k, v in listed.items()}, other / total
 
 
+def read_delta(text: str, clean, V: int):
+    """A delta answer ("KL x bits / up: TOKEN +p, ... / down: TOKEN -p, ...") applied to the clean listing the
+    question states: listed tokens move by their stated change, others start at their share of the clean
+    "other" mass; then renormalized. None when unreadable."""
+    if clean is None:
+        return None
+    listed, other = dict(clean[0]), clean[1]
+    moves = []
+    for line in text.strip().split("\n")[1:]:
+        if not line.startswith(("up:", "down:")):
+            continue
+        for part in line.split(":", 1)[1].split(", "):
+            tok, _, v = part.strip().rpartition(" ")
+            if not tok:
+                continue
+            try:
+                moves.append((json.loads(tok), float(v)))
+            except (ValueError, json.JSONDecodeError):
+                return None
+    if not text.startswith("KL ") or not moves:
+        return None
+    spread = other / max(1, V - len(listed))
+    for t, v in moves:
+        if t not in listed:
+            listed[t] = spread
+            other -= spread
+        listed[t] += v
+    listed = {t: max(p, 1e-6) for t, p in listed.items()}
+    other = max(other, 1e-6)
+    total = sum(listed.values()) + other
+    return {t: p / total for t, p in listed.items()}, other / total
+
+
+def clean_listing(q):
+    """The clean distribution the question states (its "<clean> ..." line), read like an answer."""
+    line = next((l[len("<clean> "):] for l in q["input"].split("\n") if l.startswith("<clean> ")), None)
+    return None if line is None else read_answer(line)
+
+
 def kl_bits(measured_strs, measured_p, answer, V: int = QWEN3_VOCAB) -> float:
     """KL(M_e || Q) over M_e's top 5 tokens and the rest, in bits (V = the target's output size)."""
     top = list(zip(measured_strs[:5], measured_p[:5]))
@@ -113,7 +152,8 @@ def score_set(model, tok, heldout, args, dev, name):
             for q, text in zip(chunk, texts):
                 n = q["numbers"]["edited"]
                 strs, V = target_tokens(q, "edited", tok), q.get("vocab", QWEN3_VOCAB)
-                ours.append(kl_bits(strs, n["p"], read_answer(text), V))
+                delta = "rises and falls most" in q["input"]  # generate.py --answer delta
+                ours.append(kl_bits(strs, n["p"], read_delta(text, clean_listing(q), V) if delta else read_answer(text), V))
                 # Per question, for effect-size strata: the measured change, both scores and the answer written.
                 records.append({"set": name, "type": kind, "text_id": q["text_id"], "measured_kl_bits": q["numbers"].get("kl_bits"),
                                 "oracle_kl_bits": ours[-1], "answer": text})

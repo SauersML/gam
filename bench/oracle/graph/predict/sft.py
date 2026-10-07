@@ -215,7 +215,12 @@ def no_change_answer(q):
     lines = q["input"].split("\n")
     if q["type"] in ("edit", "cut", "swap", "prompt"):
         clean = next((l[len("<clean> "):] for l in lines if l.startswith("<clean> ")), None)
-        return None if clean is None else clean + "\nKL 0.000 bits"
+        if clean is None:
+            return None
+        if "rises and falls most" in q["input"]:  # delta answer: the clean top tokens, unmoved
+            tops = ", ".join(p.rsplit(" ", 1)[0] + " +0.000" for p in clean.split(" | ")[:3])
+            return f"KL 0.000 bits\nup: {tops}\ndown: {tops}"
+        return clean + "\nKL 0.000 bits"
     if q["type"] == "continue":
         return next((l[len("<clean_continuation> "):] for l in lines if l.startswith("<clean_continuation> ")), None)
     return None
