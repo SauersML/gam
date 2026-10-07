@@ -106,6 +106,53 @@ def strata(run: Path):
     return "\n".join(lines)
 
 
+def strata_figure(run: Path, path: str):
+    """Per held-out set (panels): trained minus no-change KL (bits, mean and standard error) for each question
+    type against the size of the measured change, from eval_kl's per-question records."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    groups = {}
+    for line in open(run / "eval_kl_trained.questions.jsonl"):
+        r = json.loads(line)
+        if r.get("measured_kl_bits") is None or r.get("no_change_kl_bits") is None:
+            continue
+        b = next(i for i, (lo, hi) in enumerate(BINS) if lo <= max(r["measured_kl_bits"], 0.0) < hi)
+        groups.setdefault(r["set"], {}).setdefault(r["type"], {}).setdefault(b, []).append(r["oracle_kl_bits"] - r["no_change_kl_bits"])
+    plt.rcParams.update({"font.size": 14, "axes.spines.top": False, "axes.spines.right": False})
+    sets = sorted(groups)
+    fig, axes = plt.subplots(1, len(sets), figsize=(5.5 * len(sets), 5), facecolor="white", squeeze=False, sharey=True)
+    names = ["< 0.01", "0.01-0.1", "0.1-1", "> 1"]
+    all_types = sorted({k for s in sets for k in groups[s]})
+    color = {k: f"C{i}" for i, k in enumerate(all_types)}  # one color per type in every panel
+    for ax, s in zip(axes[0], sets):
+        types = sorted(groups[s])
+        for j, k in enumerate(types):
+            xs, ms, ses = [], [], []
+            for b in range(len(BINS)):
+                d = groups[s][k].get(b, [])
+                if len(d) >= 3:
+                    m = sum(d) / len(d)
+                    xs.append(b + (j - len(types) / 2) * 0.08)
+                    ms.append(m)
+                    ses.append((sum((x - m) ** 2 for x in d) / (len(d) - 1) / len(d)) ** 0.5)
+            ax.errorbar(xs, ms, yerr=ses, marker="o", capsize=3, label=k, color=color[k])
+        ax.axhline(0, color="black", lw=0.8)
+        ax.set_yscale("symlog", linthresh=0.1)
+        ax.set_xticks(range(len(BINS)))
+        ax.set_xticklabels(names)
+        ax.set_xlabel("measured change KL(M || M_e), bits")
+        ax.set_title(s)
+    axes[0][0].set_ylabel("oracle minus no-change KL, bits\n(below 0 = oracle better)")
+    from matplotlib.lines import Line2D
+
+    fig.legend([Line2D([], [], color=color[k], marker="o") for k in all_types], all_types, frameon=False, ncol=len(all_types), loc="upper center")
+    fig.tight_layout(rect=(0, 0, 1, 0.9))
+    fig.savefig(path, dpi=150, facecolor="white")
+
+
 def kl_figure(name, r, path):
     """Per held-out set (panels) and question type: KL(M_e || answer) in bits for the base oracle, the trained
     oracle and the no-change answer on the same questions (log scale)."""
@@ -142,6 +189,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--run", action="append", required=True)
     ap.add_argument("--figure", default="")
+    ap.add_argument("--strata-figure", default="", help="eval_kl by size of the measured change for the first run")
     ap.add_argument("--kl-figure", default="", help="eval_kl bars of the first run (base, trained, no change)")
     args = ap.parse_args()
     runs = {}
@@ -153,6 +201,9 @@ def main():
         st = strata(r["dir"])
         if st:
             print(st)
+    if args.strata_figure:
+        strata_figure(next(iter(runs.values()))["dir"], args.strata_figure)
+        print("figure", args.strata_figure)
     if args.kl_figure:
         name, r = next(iter(runs.items()))
         kl_figure(name, r, args.kl_figure)

@@ -224,8 +224,9 @@ def main():
     ap.add_argument("--train", required=True)
     ap.add_argument("--heldout", action="append", required=True,
                     help="NAME=GLOB (repeatable): held-out sets scored separately, e.g. prompts=... pieces=... behaviors=...")
-    ap.add_argument("--eval-every", type=int, default=500, help="score every held-out set every N steps (the learning curve)")
-    ap.add_argument("--curve-per-type", type=int, default=32)
+    ap.add_argument("--eval-every", type=int, default=100, help="score every held-out set every N steps (the learning curve)")
+    ap.add_argument("--curve-per-type", type=int, default=8)
+    ap.add_argument("--save-every", type=int, default=0, help="also save the adapters every N steps (adapters_stepN), for eval_kl over training")
     ap.add_argument("--out", required=True)
     ap.add_argument("--steps", type=int, default=1000)
     ap.add_argument("--batch", type=int, default=8)
@@ -334,7 +335,7 @@ def main():
         opt.step()
         opt.zero_grad(set_to_none=True)
         step += 1
-        if step in args.save_at:
+        if step in args.save_at or (args.save_every and step % args.save_every == 0):
             from safetensors.torch import save_file
 
             save_file({f"{k}.{n}": getattr(a, n).detach().cpu().contiguous() for k, a in adapters.items() for n in ("A", "B")},

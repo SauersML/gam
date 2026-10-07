@@ -15,7 +15,7 @@ gen heldout_pieces --windows "$HELDW" --texts 768 --offset 512 --split heldout -
 gen behaviors_heldout --behaviors "$BEH" --behavior-split heldout --per-behavior 48 --split heldout --seed 102
 sets=(--heldout "prompts=$OUT/data/heldout_prompts.jsonl" --heldout "pieces=$OUT/data/heldout_pieces.jsonl" --heldout "behaviors=$OUT/data/behaviors_heldout.jsonl")
 [ -s "$OUT/sft/adapters.safetensors" ] || $PY "$here/sft.py" --model "$ORACLE" --train "$TRAIN" "${sets[@]}" --out "$OUT/sft" --steps "$STEPS" \
-    --save-at "$SAVE_AT" --eval-every 1000 --curve-per-type 16 --eval-per-type 32 --hours "$HOURS"
+    --save-at "$SAVE_AT" --eval-every 100 --curve-per-type 8 --eval-per-type 32 --hours "$HOURS"
 kl() { [ -s "$OUT/sft/eval_kl_$1.json" ] || $PY "$here/eval_kl.py" --model "$ORACLE" "${sets[@]}" --per-type 64 --stratify --batch 16 --out "$OUT/sft/eval_kl_$1.json" "${@:2}"; }
 kl base
 for s in ${SAVE_AT//,/ }; do
