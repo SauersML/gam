@@ -1050,12 +1050,12 @@ def month_number(tok, rng):
 def last_letter(tok, rng):
     """The last letter of a word."""
     ws = words(tok, NOUNS)
-    v = Variant("ends_with", "Spelling: the last letter of a quoted word, as a capital; the counterfactual quotes a word with another last letter.")
+    v = Variant("ends_with", "Spelling: after two worked examples, the last letter of a word as a capital; the counterfactual asks about a word with another last letter.")
     for _ in range(400):
         a, b = rng.sample(ws, 2)
         if a[-1] == b[-1]:
             continue
-        t = 'The word "{w}" ends with the letter'
+        t = "Last letter of each word:\ncat: T\nlamp: P\n{w}:"
         v.items.append(Item(t.format(w=a), " " + a[-1].upper(), t.format(w=b), " " + b[-1].upper()))
     return [v]
 
@@ -1113,11 +1113,11 @@ def compare_numbers(tok, rng):
 @family
 def parity(tok, rng):
     """Whether a number is even or odd."""
-    v = Variant("even_odd", "Parity: whether a number is even or odd; the counterfactual changes the last digit's parity.")
+    v = Variant("even_odd", "Parity: after two worked examples, whether a number is even or odd; the counterfactual changes the last digit's parity.")
     for _ in range(300):
         n = rng.randrange(10, 1000)
         m = n + rng.choice([-1, 1])
-        t = "Is {n} even or odd? Answer:"
+        t = "Number: 7 -> odd\nNumber: 10 -> even\nNumber: {n} ->"
         v.items.append(Item(t.format(n=n), " even" if n % 2 == 0 else " odd", t.format(n=m), " even" if m % 2 == 0 else " odd"))
     return [v]
 
@@ -1247,7 +1247,8 @@ SOLFEGE = "do re mi fa sol la ti".split()
 def planet_order(tok, rng):
     """The next planet outward from the Sun."""
     return [Variant("order", "Planet order: a run of planets outward from the Sun, or the planet after a named one; the next planet continues the order.",
-                    sequence_items(PLANETS, rng, False, ["The planet after {X}, going outward from the Sun, is", "Moving outward from {X}, the next planet is"], n=400))]
+                    sequence_items(PLANETS, rng, False, ["The planet after {X}, going outward from the Sun, is", "Moving outward from {X}, the next planet is",
+                                                         "Counting outward from the Sun, the planet that follows {X} is", "Next after {X} in the solar system comes"], n=1000))]
 
 
 @family
@@ -1312,7 +1313,8 @@ ELEMENT_NUMBERS = [("hydrogen", 1), ("helium", 2), ("lithium", 3), ("carbon", 6)
 def element_number(tok, rng):
     """The atomic number of an element."""
     return fact_variants([(e, str(n)) for e, n in ELEMENT_NUMBERS],
-                         [("number", "The atomic number of {X} is"), ("few_shot", "hydrogen: 1\ncarbon: 6\n{X}:")],
+                         [("number", "The atomic number of {X} is"), ("few_shot", "hydrogen: 1\ncarbon: 6\n{X}:"),
+                          ("element", "In the periodic table, {X} is element number")],
                          "Factual recall: the atomic number of a named element.")
 
 
@@ -1327,7 +1329,7 @@ STATES = [("California", "CA"), ("Texas", "TX"), ("Florida", "FL"), ("Ohio", "OH
 @family
 def state_abbreviation(tok, rng):
     """The postal abbreviation of a US state."""
-    return fact_variants(STATES, [("parens", "Texas (TX), Ohio (OH), {X} ("), ("code", "The two-letter postal code for {X} is")],
+    return fact_variants(STATES, [("list", "Texas: TX\nOhio: OH\n{X}:"), ("code", "The two-letter postal code for {X} is")],
                          "Factual recall: the postal abbreviation of a named US state.")
 
 
@@ -1402,11 +1404,14 @@ def count_repeats(tok, rng):
     """Count how many times a word is repeated."""
     ws = words(tok, NOUNS)
     nums = ["two", "three", "four", "five"]
-    v = Variant("how_many", "Counting: a word repeated two to five times, then 'That word appeared'; the next word is the count; the counterfactual repeats it once more or less.")
-    for _ in range(300):
-        a = rng.choice(ws)
-        n = rng.randrange(2, 6)
-        m = n + 1 if n < 5 and rng.random() < 0.5 else n - 1 if n > 2 else n + 1
-        t = "{s}. That word appeared"
-        v.items.append(Item(t.format(s=" ".join([a] * n)), " " + nums[n - 2], t.format(s=" ".join([a] * m)), " " + nums[m - 2]))
+    v = Variant("how_many", "Counting: a word appears two to five times among six words (the rest one other word); the next word is its count; the counterfactual turns one occurrence into the other word.")
+    for _ in range(400):
+        a, b = rng.sample(ws, 2)
+        n = rng.randrange(3, 6)
+        pos = sorted(rng.sample(range(6), n))
+        seq = [a if i in pos else b for i in range(6)]
+        alt = list(seq)
+        alt[rng.choice(pos)] = b
+        t = "Words: {s}.\nHow many times does {a} appear? Answer:"
+        v.items.append(Item(t.format(s=" ".join(seq), a=a), " " + nums[n - 2], t.format(s=" ".join(alt), a=a), " " + nums[n - 3]))
     return [v]
