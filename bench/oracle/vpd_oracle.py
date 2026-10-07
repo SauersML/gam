@@ -49,6 +49,13 @@ negative, and the tokens its write then raises and lowers through the unembeddin
 question, each candidate's), from Table's --lens file. For a library warm-started from public
 transcoders, weights_examples adds to weights, and examples gives alone, the transcoder feature's public
 top-activating examples and logits (transcoder_examples.py; --feature-examples, --transcoders).
+A *_tokens condition (weights_tokens, weights_tokens_lens) gives the vectors in one shared space where the
+reader can contract them: the subcomponent's write as its residual direction r (vpd_lens.py's write lens;
+u for o_proj and down_proj, W_O u for v_proj, W_down u for c_fc) and, for a direction or top question,
+each option token's unembedding row g_f * e_X in the next slots (option order), both through one map
+`resid_write`; in the other conditions the write arrives in its site's basis (c_fc's 3072 hidden units,
+v_proj's value space) and the option tokens only as the reader's own text, so the map would have to learn
+vpd4l's vocabulary to compare them. Needs --lens.
 
 Held out: subcomponents of --heldout-layers (never trained on) on held-out texts (the held-out runs), and
 trained layers on held-out texts.
@@ -82,7 +89,8 @@ from reporter import Injection, Magnitude  # noqa: E402
 
 KINDS = ("q_proj", "k_proj", "v_proj", "o_proj", "c_fc", "down_proj", "head", "function")  # VPD's sites, then the library's
 LABELS = "ABCDEFGHIJ"
-CONDITIONS = ("graph", "weights", "activity", "nothing", "graph_lens", "weights_lens", "weights_examples", "examples", "weights_activity", "weights_activity_lens")
+CONDITIONS = ("graph", "weights", "activity", "nothing", "graph_lens", "weights_lens", "weights_examples", "examples", "weights_activity", "weights_activity_lens",
+              "weights_tokens", "weights_tokens_lens")
 QUESTIONS = ("activity", "direction", "top", "continuation", "edge", "attribution", "effect")
 # The edit's effect on M at the edited token, KL(M_e || M) in bits: the edits driver's bins (also the
 # effect question's answers; "barely" includes no change at all).
@@ -249,6 +257,13 @@ class Table:
 
     def piece(self, token: int) -> str:
         return json.dumps(self.tok.decode([int(token)]))
+
+    def residual_write(self, layer: int, kind: str, c: int) -> torch.Tensor | None:
+        """Subcomponent c's write as its residual direction r (vpd_lens.py's write lens), or None (q, k)."""
+        n = site_name(layer, kind)
+        if self.lens is None or f"{n}.write" not in self.lens:
+            return None
+        return self.lens[f"{n}.write"][self.number(layer, kind, c)].float()
 
     def lens_value(self, layer: int, kind: str, c: int, token: int) -> float | None:
         """vpd_lens.py's write lens of one token: (w_X - mean over tokens) / std over tokens, w_X =
@@ -578,16 +593,24 @@ def exemplars(table: Table, ex: dict, n: int = 3) -> str:
 def base(condition: str) -> str:
     """The condition's vector input (a *_lens, *_examples or *_activity condition adds text to graph's or
     weights')."""
-    return condition.removesuffix("_lens").removesuffix("_examples").removesuffix("_activity")  # weights_activity_lens -> weights
+    return condition.removesuffix("_lens").removesuffix("_examples").removesuffix("_activity").removesuffix("_tokens")  # weights_activity_lens -> weights
 
 
 def slots(table: Table, ex: dict, condition: str) -> list[tuple]:
-    """The example's subcomponents in slot order: (layer, kind, index, log magnitude, role prefix, shown)."""
+    """The example's subcomponents in slot order: (layer, kind, index, log magnitude, role prefix, shown);
+    a *_tokens condition marks the subcomponent's kind "<kind>@resid" (its write as r) and adds, for a
+    direction or top question, one slot per option token (kind "token", index its id; read side only)."""
+    tokens = "_tokens" in condition
     condition = base(condition)
     out = []
     if ex["c"] >= 0:
         v, u = table.vectors(ex["layer"], ex["kind"], ex["c"])
-        out.append((ex["layer"], ex["kind"], ex["c"], math.log(float(u.norm() * v.norm())), "", condition in ("graph", "weights")))
+        out.append((ex["layer"], ex["kind"] + ("@resid" if tokens else ""), ex["c"], math.log(float(u.norm() * v.norm())), "", condition in ("graph", "weights")))
+    if tokens and ex["kind_q"] in ("direction", "top") and ex["c"] >= 0:
+        # The option tokens' unembedding rows; the down_read role and the layer past the last mark them (the
+        # weights conditions show no neighbours, whose role it is otherwise).
+        # Their log norms ride on the magnitude term as every slot's does (the injected direction is norm-matched).
+        return out + [(table.depth, "token", int(t), math.log(float(table.lens["unembed"][int(t)].float().norm())), "down_", True) for t in ex["option_ids"]]
     if ex["kind_q"] == "attribution":
         out += [(l, k, c, 0.0, "up_", condition in ("graph", "weights")) for l, k, c, _, _ in ex["candidates"]]
     elif ex["kind_q"] == "edge":
@@ -671,7 +694,10 @@ class Oracle(torch.nn.Module):
         model = AutoModelForCausalLM.from_pretrained(base, dtype=dtype).to(dev)
         self.model = get_peft_model(model, LoraConfig(r=lora_rank, lora_alpha=lora_rank, target_modules="all-linear", lora_dropout=0.0))
         width = self.width = model.config.hidden_size
-        self.maps = torch.nn.ModuleDict({f"{k}_{side}": torch.nn.Linear(dims[k][i], width) for k in KINDS if k in dims for i, side in enumerate(("read", "write"))}).to(dev)
+        self.maps = torch.nn.ModuleDict({f"{k}_{side}": torch.nn.Linear(dims[k][i], width) for k in KINDS if k in dims for i, side in enumerate(("read", "write"))})
+        if "down_proj" in dims:  # residual-stream vectors (the *_tokens conditions): writes as r and option tokens' unembedding rows
+            self.maps["resid_write"] = torch.nn.Linear(dims["down_proj"][1], width)
+        self.maps = self.maps.to(dev)
         self.magnitude = Magnitude(width, depth).to(dev)
         self.hook = Injection(1.0, inject)
         model.model.layers[inject].register_forward_hook(self.hook)
@@ -693,7 +719,7 @@ class Oracle(torch.nn.Module):
         own = self.maps.state_dict()
         maps = {k: v for k, v in state["maps"].items() if k in own and own[k].shape == v.shape}
         missing = self.maps.load_state_dict(maps, strict=False).missing_keys
-        assert all(k.split(".")[0].rsplit("_", 1)[0] in ("head", "function") for k in missing), missing
+        assert all(k.split(".")[0].rsplit("_", 1)[0] in ("head", "function", "resid") for k in missing), missing
         own = self.magnitude.state_dict()  # the layer embedding of another depth (another model) starts fresh
         self.magnitude.load_state_dict({k: v for k, v in state["magnitude"].items() if own[k].shape == v.shape}, strict=False)
 
@@ -715,10 +741,18 @@ class Oracle(torch.nn.Module):
                 for h, side in enumerate(("read", "write")):
                     rows.append(b)
                     cols.append(where[2 * s + h])
+                    x = None
                     if s < len(items):
                         layer, kind, c, mag, prefix, shown = items[s]
-                        v, u = table.vectors(layer, kind, c)
-                        vecs.append(self.maps[f"{kind}_{side}"]((v if side == "read" else u).to(self.dev)))
+                        if kind == "token":  # an option token's unembedding row g_f * e_X, read side only
+                            x = (table.lens["unembed"][c].float(), "resid_write") if side == "read" else None
+                        elif kind.endswith("@resid") and side == "write" and table.residual_write(layer, kind.removesuffix("@resid"), c) is not None:
+                            x = (table.residual_write(layer, kind.removesuffix("@resid"), c), "resid_write")  # r, in the residual stream
+                        else:
+                            v, u = table.vectors(layer, kind.removesuffix("@resid"), c)
+                            x = (v if side == "read" else u, f"{kind.removesuffix('@resid')}_{side}")
+                    if x is not None:
+                        vecs.append(self.maps[x[1]](x[0].to(self.dev)))
                         roles.append(ROLE[prefix + side])
                         mags.append(mag)
                         keeps.append(1.0 if shown else 0.0)
