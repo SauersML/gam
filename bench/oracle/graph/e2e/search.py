@@ -183,11 +183,11 @@ class Pool:
     one score_batch request (the checker's parallel threads, M's run per experiment shared)."""
 
     def __init__(self, model: str, behavior: Path, workers: int, export: Path | None = None, stand_in: str | None = None,
-                 views: dict | None = None, log_path: Path | None = None):
+                 views: dict | None = None, log_path: Path | None = None, device: str | None = None):
         """views: decomposition views for the checker (score.Checker's); log_path: every scored program is
         appended there as a JSON line {"source", "seed", "experiments", "score"} (search's data)."""
         self.model, self.stand_in, self.log_path = model, stand_in, log_path
-        self.checkers = [score.Checker(model, export, views=views) for _ in range(workers)]
+        self.checkers = [score.Checker(model, export, views=views, device=device) for _ in range(workers)]
         for c in self.checkers:
             e2e.load_behavior(c, behavior)
         self.calls = 0
@@ -359,6 +359,8 @@ def main() -> None:
     ap.add_argument("behavior", type=Path)
     ap.add_argument("--mode", default="both", choices=["addition", "removal", "both", "prefix"])
     ap.add_argument("--block", type=int, default=96, help="prefix mode: MLP neurons per unit")
+    ap.add_argument("--max-prune", type=int, default=64, help="prefix mode: prune one unit at a time only up to this many units (else refine k)")
+    ap.add_argument("--device", help="the checker's device (gpu: the single-precision device path)")
     ap.add_argument("--max-units", type=int, default=8192, help="prefix mode with --mlp-view vpd: the top ranked subcomponents considered")
     ap.add_argument("--rank-experiments", type=int, default=0, help="prefix mode: draws beyond clean and counterfactual per one-unit ranking program")
     ap.add_argument("--experiments", type=int, default=16)
@@ -397,7 +399,7 @@ def main() -> None:
         if a.mode != "prefix":
             load_ranking(a.ranking)
     views = {"vpd": a.vpd} if a.mlp_view == "vpd" else None
-    pool = Pool(model, path, a.workers, a.export, a.stand_in, views, out / f"{behavior['id']}{a.tag}.candidates.jsonl")
+    pool = Pool(model, path, a.workers, a.export, a.stand_in, views, out / f"{behavior['id']}{a.tag}.candidates.jsonl", a.device)
     try:
         for mode in (["addition", "removal"] if a.mode == "both" else [a.mode]):
             start = pool.calls
@@ -415,7 +417,7 @@ def main() -> None:
                     ranked = None if a.ranking is None else (ranked_subcomponents(a.ranking) if a.mlp_view == "vpd"
                                                              else ranked_native(a.ranking, model))[: a.max_units]
                     found = prefix_search(pool, model, a.experiments, a.seed, a.block, log, a.rank_experiments, save,
-                                          objective_of(a.objective), ranked=ranked)
+                                          objective_of(a.objective), ranked=ranked, max_prune=a.max_prune)
                 else:
                     found = greedy(pool, model, mode, a.experiments, a.seed, a.min_neurons, log, start_units, a.mlp_view,
                                    save, objective_of(a.objective))
