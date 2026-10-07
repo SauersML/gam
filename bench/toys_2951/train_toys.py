@@ -1,7 +1,7 @@
-"""Train the ground-truth toys of the #2951 toy gate and write each as an export with its known
-mechanism. Toys gate the fitting method; they are never results.
+"""Train the ground-truth toys of the #2951 toy gate and write each as an engine export with its
+known mechanism. Toys gate the fitting method; they are never results.
 
-usage: mem-lease 2 ~/mpd-data/venv/bin/python bench/toys_2951/train_toys.py TOY OUT_ROOT
+usage: mem-lease 3 ~/mpd-data/venv/bin/python bench/toys_2951/train_toys.py TOY[@sSEED] OUT_ROOT
 
 TOY is one of
   tms_40_10       TMS 40-10 (Elhage et al.; SPD 3.1): y = ReLU(W^T W x + b), 40 features in 10
@@ -11,16 +11,24 @@ TOY is one of
   resid_mlp_3l    the same over 3 MLP layers of 50
   modadd_113      1-layer transformer on (a + b) mod 113, trained to grokking (Fourier clocks)
   induction       2-layer attention-only transformer on repeated random segments
+`@sSEED` trains another seed of the toy (initialization; the inputs and the resid_mlp
+embedding are shared by every seed) into OUT_ROOT/TOY_sSEED, for the universality score.
 
 The SPD toys use param_decomp's configs (experiments/{tms,resid_mlp}/configs): sizes, feature
-probability, value range, pretraining steps, batch and rate. The transformers are pre-norm RMS
-rotary models in the engine's export layout (gam_mpd::import::import_language_model reads them).
+probability, value range, pretraining steps, batch and rate. Every toy is a language model that
+gam_mpd::import::import_language_model reads, so all of them go through the same fitter: the
+transformers are pre-norm RMS rotary models; a real-valued toy's tokens index its inputs (its
+embedding is the table of inputs in the residual stream; HELD_OUT held-out inputs, then
+TRAIN_ROWS training inputs, one token per sequence), each block has one zero attention head and
+the toy's MLP, there is no norm, and its readout is the Gaussian head (fixed_head_target::
+GAUSSIAN_HEAD) in units of the toy's task residual sigma, its root mean squared error against its
+training target, so KL(M || P) = ||y_M - y_P||^2 / (2 sigma^2) nats per input.
 
-OUT_ROOT/TOY/ holds export.json, the tensors as raw little-endian float64 `<name>.f64`, the
-held-out inputs (`inputs.f64` for the real-input toys, `tokens.f64` for the transformers) and
-truth.json: the known mechanisms, each a part with its rank, its weight on every operator it
-spans (`truth.<i>.<operator>.f64`, the dense delta of that operator), and its activity on every
-held-out row (`truth_active.f64`, rows x mechanisms, 1 where the mechanism is active).
+OUT_ROOT/TOY/ holds export.json, the tensors as raw little-endian float64 `<name>.f64` (with
+`tokens`) and truth.json: the known mechanisms, each a part with its rank, its weight on every
+operator it spans (`truth.<i>.<operator>.f64`, the dense delta of that operator), and its activity
+on every held-out token (`truth_active.f64`, tokens x mechanisms, 1 where the mechanism is
+active).
 """
 
 import json
@@ -50,68 +58,100 @@ def sparse_features(gen, rows, n, p, low, high):
     return values * (torch.rand(rows, n, generator=gen) < p)
 
 
+# ------------------------------------------------------------------------ real-valued toys
+
+
+TRAIN_ROWS = 1 << 14
+
+
+def real_export(out: Path, files: dict, stream: np.ndarray, mlps: list, act: str, head: np.ndarray, bias, relu: bool, sigma: float) -> dict:
+    """A real-valued toy as the engine's language model (gam_mpd::import, GAUSSIAN_HEAD): each
+    input is a token whose embedding is the input in the residual stream (`stream`, rows: the
+    HELD_OUT held-out inputs, then the training inputs), every block one zero attention head
+    (2 wide, no effect) and the toy's MLP (`mlps`: per block its c_fc and down_proj), no norm, and
+    the Gaussian head `law(E h + b) / sigma` (`head` E, `bias` b, ReLU when `relu`), sigma the
+    toy's task residual: its root mean squared error against its training target, per output."""
+    rows, d = stream.shape
+    write(out, files, "wte", stream)
+    write(out, files, "tokens", np.arange(rows, dtype=np.float64)[:, None])
+    for l, (up, down) in enumerate(mlps):
+        for name, shape in [("attn.q_proj", (2, d)), ("attn.k_proj", (2, d)), ("attn.v_proj", (2, d)), ("attn.o_proj", (d, 2))]:
+            write(out, files, f"blocks.{l}.{name}", np.zeros(shape))
+        write(out, files, f"blocks.{l}.mlp.c_fc", up)
+        write(out, files, f"blocks.{l}.mlp.down_proj", down)
+    write(out, files, "gaussian_head", head / sigma)
+    if bias is not None:
+        write(out, files, "gaussian_head.bias", np.asarray(bias) / sigma)
+    return {"d_model": d, "n_layers": len(mlps), "n_heads": 1, "n_kv_heads": 1, "head_dim": 2, "d_mlp": int(mlps[0][0].shape[0]), "vocab": rows,
+            "rope_theta": 10000.0, "rope_pairing": "rotate_half", "norm_eps": 1e-6, "norm": "none", "mlp_act": act, "tied_embeddings": False,
+            "head": {"law": "gaussian", "relu": relu, "task_residual": sigma}}
+
+
 # ----------------------------------------------------------------------------------------- TMS
 
 
-def tms(out: Path, identity: bool):
+def tms(out: Path, identity: bool, seed: int):
     n, h, p = 40, 10, 0.05
-    gen = torch.Generator().manual_seed(0)
+    gen = torch.Generator().manual_seed(seed)
     bound = 1 / math.sqrt(n)
     W = (torch.rand(h, n, generator=gen) * 2 - 1) * bound
     W.requires_grad_(True)
     b = torch.zeros(n, requires_grad=True)
-    I = torch.eye(h)
     opt = torch.optim.Adam([W, b], lr=5e-3)
     steps = 10000
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: 0.5 * (1 + math.cos(math.pi * s / steps)))
-
-    def forward(x):
-        hidden = x @ W.T
-        if identity:
-            hidden = hidden @ I.T
-        return torch.relu(hidden @ W + b)
-
     for step in range(steps):
         x = sparse_features(gen, 8192, n, p, 0.0, 1.0)
-        loss = ((forward(x) - x) ** 2).mean()
+        # the frozen hidden identity changes nothing in the forward pass
+        loss = ((torch.relu(x @ W.T @ W + b) - x) ** 2).mean()
         opt.zero_grad()
         loss.backward()
         opt.step()
         sched.step()
         if step % 2000 == 0:
             print(f"step {step}: mse {loss.item():.3e}", flush=True)
-    W, b = W.detach().double(), b.detach().double()
-    xs = sparse_features(torch.Generator().manual_seed(1), HELD_OUT, n, p, 0.0, 1.0).double()
-    with torch.no_grad():
-        y = torch.relu((xs @ W.T) @ W + b)
-        s2 = ((y - xs) ** 2).mean().item()
-    files = {}
-    write(out, files, "linear1", W.numpy())  # (h, n): hidden = W x
+    W, b = W.detach().double().numpy(), b.detach().double().numpy()
+    # held-out inputs (seed 1) then training inputs (seed 2), the same for every seed of the toy
+    xs = sparse_features(torch.Generator().manual_seed(1), HELD_OUT, n, p, 0.0, 1.0).double().numpy()
+    train = sparse_features(torch.Generator().manual_seed(2), TRAIN_ROWS, n, p, 0.0, 1.0).double().numpy()
+    sigma = math.sqrt(float(((np.maximum(xs @ W.T @ W + b, 0.0) - xs) ** 2).mean()))
+    # The stream: x in [0, n), W^T W x in [n, 2n), and with the identity the hidden in [2n, 2n + h).
+    d = 2 * n + (h if identity else 0)
+    stream = np.zeros((HELD_OUT + TRAIN_ROWS, d))
+    stream[:, :n] = np.concatenate([xs, train])
+    read = np.zeros((h, d))
+    read[:, :n] = W
+    write_z = np.zeros((d, h))
+    write_z[n:2 * n] = W.T
     if identity:
-        write(out, files, "hidden_layers.0", np.eye(h))
-    write(out, files, "linear2", W.T.numpy())  # (n, h): tied, its own operator
-    write(out, files, "linear2.bias", b.numpy())
-    write(out, files, "inputs", xs.numpy())
-    ops = ["linear1"] + (["hidden_layers.0"] if identity else []) + ["linear2"]
+        to_hidden = np.zeros((d, h))
+        to_hidden[2 * n:] = np.eye(h)
+        from_hidden = np.zeros((h, d))
+        from_hidden[:, 2 * n:] = np.eye(h)
+        mlps = [(read, to_hidden), (from_hidden, write_z)]
+    else:
+        mlps = [(read, write_z)]
+    head = np.zeros((n, d))
+    head[:, n:2 * n] = np.eye(n)
+    files = {}
+    config = real_export(out, files, stream, mlps, "identity", head, b, True, sigma)
+    last = len(mlps) - 1
     mechanisms, active = [], []
     for i in range(n):
-        e = np.zeros(n)
+        e = np.zeros(d)
         e[i] = 1.0
-        w = W[:, i].numpy()
-        pieces = {"linear1": np.outer(w, e), "linear2": np.outer(e, w)}
+        z = np.zeros(d)
+        z[n + i] = 1.0
+        pieces = {"blocks.0.mlp.c_fc": np.outer(W[:, i], e), f"blocks.{last}.mlp.down_proj": np.outer(z, W[:, i])}
         mechanisms.append({"name": f"feature {i}", "rank": 1, "operators": pieces, "gate": f"x[{i}] > 0"})
-        active.append(xs[:, i].numpy() > 0)
+        active.append(xs[:, i] > 0)
     if identity:
-        mechanisms.append({"name": "hidden identity", "rank": h, "operators": {"hidden_layers.0": np.eye(h)}, "gate": "always"})
+        mechanisms.append({"name": "hidden identity", "rank": h, "operators": {"blocks.0.mlp.down_proj": mlps[0][1], "blocks.1.mlp.c_fc": mlps[1][0]}, "gate": "always"})
         active.append(np.ones(HELD_OUT, dtype=bool))
     record = {
-        "model": out.name,
-        "kind": "tms",
-        "config": {"n_features": n, "n_hidden": h, "identity": identity, "feature_probability": p, "value_range": [0, 1]},
-        "forward": "y = ReLU(linear2 (hidden_layers.0) linear1 x + linear2.bias); linear2 = linear1^T (tied)",
-        "operators": ops,
-        "output_variance": s2,
-        "spd_published": "SPD 3.1/3.2: one subcomponent per feature in each of linear1 and linear2, the identity as a full-rank subcomponent set",
+        "model": out.name, "kind": "language_model", "real_valued": "tms", "config": config, "seed": seed,
+        "task": f"TMS {n}-{h}{' with a frozen hidden identity' if identity else ''}: y = ReLU(W^T W x + b), features present with probability {p}, uniform on [0, 1]",
+        "spd_published": "SPD Table 1: MMCS 1.000, ML2R " + ("1.031 (TMS 40-10+ID)" if identity else "1.010 (TMS 40-10)"),
     }
     finish(out, files, record, mechanisms, np.stack(active, 1))
 
@@ -119,12 +159,13 @@ def tms(out: Path, identity: bool):
 # ---------------------------------------------------------------------------- resid MLP (CC)
 
 
-def resid_mlp(out: Path, layers: int):
+def resid_mlp(out: Path, layers: int, seed: int):
     n, d, m, p = 100, 1000, 50, 0.01
     steps = {1: 2000, 2: 3000, 3: 4000}[layers]
-    gen = torch.Generator().manual_seed(0)
-    E = torch.randn(n, d, generator=gen)
+    # the embedding is the same for every seed (seed 0), so seeds share the stream's coordinates
+    E = torch.randn(n, d, generator=torch.Generator().manual_seed(0))
     E = E / E.norm(dim=1, keepdim=True)  # fixed random unit-norm embedding, W_U = E^T
+    gen = torch.Generator().manual_seed(1000 + seed)
     W_in = [((torch.rand(m, d, generator=gen) * 2 - 1) / math.sqrt(d)).requires_grad_(True) for _ in range(layers)]
     W_out = [((torch.rand(d, m, generator=gen) * 2 - 1) / math.sqrt(m)).requires_grad_(True) for _ in range(layers)]
     opt = torch.optim.Adam(W_in + W_out, lr=3e-3)
@@ -149,60 +190,42 @@ def resid_mlp(out: Path, layers: int):
     Wi = [w.detach().double() for w in W_in]
     Wo = [w.detach().double() for w in W_out]
     xs = sparse_features(torch.Generator().manual_seed(1), HELD_OUT, n, p, -1.0, 1.0).double()
+    train = sparse_features(torch.Generator().manual_seed(2), TRAIN_ROWS, n, p, -1.0, 1.0).double()
     with torch.no_grad():
-        y = forward(xs, Wi, Wo)
-        s2 = ((y - (xs + torch.relu(xs))) ** 2).mean().item()
+        sigma = math.sqrt(((forward(xs, Wi, Wo) - (xs + torch.relu(xs))) ** 2).mean().item())
+    En = E.numpy()
     files = {}
-    write(out, files, "W_E", E.numpy())
-    ops = []
-    for l in range(layers):
-        write(out, files, f"blocks.{l}.mlp.W_in", Wi[l].numpy())
-        write(out, files, f"blocks.{l}.mlp.W_out", Wo[l].numpy())
-        ops += [f"blocks.{l}.mlp.W_in", f"blocks.{l}.mlp.W_out"]
-    write(out, files, "inputs", xs.numpy())
-    mechanisms, active = resid_mlp_truth(E.numpy(), [w.numpy() for w in Wi], [w.numpy() for w in Wo], xs.numpy())
+    stream = torch.cat([xs, train]).numpy() @ En
+    config = real_export(out, files, stream, [(Wi[l].numpy(), Wo[l].numpy()) for l in range(layers)], "relu", En, None, False, sigma)
+    mechanisms, active = resid_mlp_truth(En, [w.numpy() for w in Wi], [w.numpy() for w in Wo], xs.numpy())
     record = {
-        "model": out.name,
-        "kind": "resid_mlp",
-        "config": {"n_features": n, "d_embed": d, "d_mlp": m, "n_layers": layers, "feature_probability": p, "value_range": [-1, 1], "label": "x + ReLU(x)"},
-        "forward": "r = W_E^T x; per layer r += W_out ReLU(W_in r); y = W_E r (W_E fixed, not decomposed)",
-        "operators": ops,
-        "output_variance": s2,
+        "model": out.name, "kind": "language_model", "real_valued": "resid_mlp", "config": config, "seed": seed,
+        "task": f"compressed computation: {n} functions x + ReLU(x) through {layers} MLP layer(s) of {m} in a {d}-wide stream, features present with probability {p}, uniform on [-1, 1]",
         "spd_published": {
-            "resid_mlp_1l": "SPD 3.3: 100 rank-one subcomponents in W_in, one per function; W_out one rank-50 component",
-            "resid_mlp_2l": "SPD 3.4: 100 W_in components, each across both layers; W_out one rank-50 component across both layers",
-            "resid_mlp_3l": "SPD 3.4: 102 W_in components across 3 layers; W_out one rank-51 component across all three",
-        }[out.name],
+            1: "SPD 3.3: 100 rank-one subcomponents in W_in, one per function; W_out one rank-50 component",
+            2: "SPD 3.4: 100 W_in components, each across both layers; W_out one rank-50 component across both layers",
+            3: "SPD 3.4: 102 W_in components across 3 layers; W_out one rank-51 component across all three",
+        }[layers],
     }
     finish(out, files, record, mechanisms, active)
 
 
 def resid_mlp_truth(E, Wi, Wo, xs):
-    """SPD's account (3.3, 3.4): function i is every layer's W_in read of its embedding direction
+    """SPD's account (3.3, 3.4): function i is every layer's c_fc read of its embedding direction
     e_i (through the embedding's dual frame, the e_i being near orthogonal, not exactly), one
-    rank-one slice per layer gated by x_i != 0; every layer's W_out together is one always-on
+    rank-one slice per layer gated by x_i != 0; every layer's down_proj together is one always-on
     part of full rank (its slices are not per function: they write every function's output and
     its interference, which a per-function write would drop)."""
     n, layers = E.shape[0], len(Wi)
     dual = np.linalg.pinv(E.T)  # (n, d): dual[i] . e_j = delta_ij on the embedding's span
     mechanisms, active = [], []
     for i in range(n):
-        pieces = {f"blocks.{l}.mlp.W_in": np.outer(Wi[l] @ E[i], dual[i]) for l in range(layers)}
+        pieces = {f"blocks.{l}.mlp.c_fc": np.outer(Wi[l] @ E[i], dual[i]) for l in range(layers)}
         mechanisms.append({"name": f"function {i}", "rank": 1, "operators": pieces, "gate": f"x[{i}] != 0"})
         active.append(xs[:, i] != 0)
-    mechanisms.append({"name": "W_out", "rank": sum(w.shape[1] for w in Wo), "operators": {f"blocks.{l}.mlp.W_out": Wo[l] for l in range(layers)}, "gate": "always"})
+    mechanisms.append({"name": "W_out", "rank": sum(w.shape[1] for w in Wo), "operators": {f"blocks.{l}.mlp.down_proj": Wo[l] for l in range(layers)}, "gate": "always"})
     active.append(np.ones(xs.shape[0], dtype=bool))
     return mechanisms, np.stack(active, 1)
-
-
-def retruth(out: Path):
-    """Rewrite a trained resid_mlp toy's truth from its export."""
-    record = json.loads((out / "export.json").read_text())
-    W = {k: np.fromfile(out / f"{k}.f64", dtype="<f8").reshape(v["shape"]) for k, v in record["files"].items()}
-    L = record["config"]["n_layers"]
-    mechanisms, active = resid_mlp_truth(W["W_E"], [W[f"blocks.{l}.mlp.W_in"] for l in range(L)], [W[f"blocks.{l}.mlp.W_out"] for l in range(L)], W["inputs"])
-    files = record.pop("files")
-    finish(out, files, record, mechanisms, active)
 
 
 # ------------------------------------------------------------------------------- transformers
@@ -298,10 +321,11 @@ def head_pieces(model, l, h):
     return pieces
 
 
-def modadd(out: Path):
+def modadd(out: Path, seed: int):
     p = 113
+    # the train/test split is the same for every seed; the initialization is the seed's
     gen = torch.Generator().manual_seed(0)
-    torch.manual_seed(0)
+    torch.manual_seed(seed)
     a, b = torch.meshgrid(torch.arange(p), torch.arange(p), indexing="ij")
     a, b = a.flatten(), b.flatten()
     tokens = torch.stack([a, b, torch.full_like(a, p)], 1)
@@ -390,10 +414,10 @@ def modadd_truth(out: Path, model, tokens, files, config):
     finish(out, files, record, mechanisms, active)
 
 
-def induction(out: Path):
+def induction(out: Path, seed: int):
     vocab, T = 32, 32
-    gen = torch.Generator().manual_seed(0)
-    torch.manual_seed(0)
+    gen = torch.Generator().manual_seed(seed)
+    torch.manual_seed(seed)
 
     def batch(n, g):
         # BOS (0), then a random segment of 6..12 tokens repeated: [BOS, r, r, filler...]
@@ -511,6 +535,7 @@ def finish(out: Path, files: dict, record: dict, mechanisms: list, active: np.nd
 
 
 if __name__ == "__main__":
+    # TOY or TOY@sSEED (a further seed of the toy, written to TOY_sSEED)
     toy, root = sys.argv[1], Path(sys.argv[2])
     if toy == "truth:modadd_113":
         # a trained export whose truth was not written: its record, rows and truth again (the
@@ -540,17 +565,16 @@ if __name__ == "__main__":
         rows = rows[: HELD_OUT // 8]
         induction_truth(root / "induction", model, rows, record["files"], record["config"])
         sys.exit(0)
-    if toy.startswith("truth:"):
-        retruth(root / toy[6:])
-        sys.exit(0)
-    out = root / toy
+    name, _, seed = toy.partition("@s")
+    seed = int(seed or 0)
+    out = root / (name if seed == 0 else f"{name}_s{seed}")
     out.mkdir(parents=True, exist_ok=True)
     {
-        "tms_40_10": lambda: tms(out, False),
-        "tms_40_10_id": lambda: tms(out, True),
-        "resid_mlp_1l": lambda: resid_mlp(out, 1),
-        "resid_mlp_2l": lambda: resid_mlp(out, 2),
-        "resid_mlp_3l": lambda: resid_mlp(out, 3),
-        "modadd_113": lambda: modadd(out),
-        "induction": lambda: induction(out),
-    }[toy]()
+        "tms_40_10": lambda: tms(out, False, seed),
+        "tms_40_10_id": lambda: tms(out, True, seed),
+        "resid_mlp_1l": lambda: resid_mlp(out, 1, seed),
+        "resid_mlp_2l": lambda: resid_mlp(out, 2, seed),
+        "resid_mlp_3l": lambda: resid_mlp(out, 3, seed),
+        "modadd_113": lambda: modadd(out, seed),
+        "induction": lambda: induction(out, seed),
+    }[name]()
