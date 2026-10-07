@@ -1969,6 +1969,8 @@ struct GatedStage {
     component_gate: usize,
     /// A shared stage's assignment operator.
     assign: Option<usize>,
+    /// The gates' widths `w` (the Gated nodes' `Φ(z / w)`).
+    width: usize,
 }
 
 impl GatedStage {
@@ -2030,7 +2032,8 @@ impl GatedStage {
                 Some(a) => flat.nodes.iter().position(|n| matches!(n, Node::Transposed { operator, .. } if *operator == a)).ok_or_else(|| format!("{prefix}: no gate through the assignment"))?,
                 None => gate,
             };
-            stages.push(Self { input, threshold, direction, slices, component_gate, assign });
+            let width = index_of(flat, &format!("{prefix}.width"))?;
+            stages.push(Self { input, threshold, direction, slices, component_gate, assign, width });
             Ok(())
         };
         let mut attention = blocks(index_of(program, &format!("{name}.attn.read"))?)?;
@@ -2458,17 +2461,6 @@ fn part_targets(scorer: &Scorer, batch: &Batch, experiments: Vec<Experiment>) ->
 /// of another law and every attention head with a surviving value executes on every token and
 /// counts one; a gated layer's fixed positions (where its block's output is not its functions',
 /// `library_transcoder`'s first token) count nothing of it.
-/// `Σ a ⊙ b` over every entry, the rows' sums on the device and their total on the host; `b` in
-/// `a`'s storage first when it is held in another.
-fn device_dot(d: &Device, a: &Tensor, b: &Tensor) -> Result<f64, String> {
-    if a.rows() == 0 || a.cols() == 0 {
-        return Ok(0.0);
-    }
-    let converted = if b.storage() == a.storage() { None } else { Some(d.convert(b).map_err(error)?) };
-    let blocks = d.column_blocks(&[a.cols()]).map_err(error)?;
-    Ok(d.download(&d.block_products(a, converted.as_ref().unwrap_or(b), &blocks).map_err(error)?).map_err(error)?.sum())
-}
-
 fn complexity_terms(scorer: &mut Scorer, device_posterior: &DevicePosterior, explanation: &Explanation, active: &[bool], batch: &Batch, (key, previous): (u64, bool)) -> Result<(f64, Vec<(usize, Tensor, Tensor)>), String> {
     // At the iterate's sample, or with `previous` around the iterate before the pending move (its
     // test, `step_accepted`).
@@ -2500,7 +2492,7 @@ fn complexity_terms(scorer: &mut Scorer, device_posterior: &DevicePosterior, exp
             // device (`gated_expected`).
             // The previous stage's per-component pre-activations and variances, which a stage whose
             // components follow its components reads.
-            let mut followed: Option<(Tensor, Tensor)> = None;
+            let mut followed: Option<(Tensor, Tensor, Vec<f64>)> = None;
             for stage in &scorer.stages[l] {
                 let rank = stage.ranks(active);
                 let j = scorer.at(stage.threshold)?;
@@ -2523,8 +2515,11 @@ fn complexity_terms(scorer: &mut Scorer, device_posterior: &DevicePosterior, exp
                     Some(op) => Some(scorer.assignments.iter().find(|a| a.operator == op).ok_or("a shared stage without its assignment")?.values(relaxation)),
                     None => None,
                 };
-                let extra = followed.as_ref().map(|(m, s2)| (m, s2));
-                let (expected, gate_terms, assigned, components) = gated_expected(d, arithmetic, trace.value(stage.input)?, gate, (&bias.0, &bias.1), &rank, (assign.as_ref(), extra))?;
+                // The gates' widths enter the count (what the pass executes) but take no pull from
+                // it: nothing keeps a width positive.
+                let width = device_posterior.iterate(scorer.at(stage.width)?)?.column(0).to_vec();
+                let extra = followed.as_ref().map(|(m, s2, w)| (m, s2, w.as_slice()));
+                let (expected, gate_terms, assigned, components) = gated_expected(d, arithmetic, trace.value(stage.input)?, gate, (&bias.0, &bias.1, &width), &rank, (assign.as_ref(), extra))?;
                 followed = Some(components);
                 if let (Some(op), Some(g)) = (stage.assign, assigned) {
                     assignment_terms.push((op, g * per));
@@ -2599,18 +2594,20 @@ fn complexity_terms(scorer: &mut Scorer, device_posterior: &DevicePosterior, exp
 /// count's derivative in `A` itself is returned (summed over the rows; none for an unshared stage).
 /// A stage whose components may follow the previous stage's (`library_vpd`'s down components
 /// following c_fc components) has an assignment whose rows past its own gates are those
-/// components, read from `extra` (their per-component pre-activations and variances, the fourth
-/// return of the previous stage's call); the followed stage's thresholds take no pull through
-/// its followers here.
+/// components, read from `extra` (their per-component pre-activations, variances and widths, the
+/// fourth return of the previous stage's call); the followed stage's thresholds take no pull
+/// through its followers here. The gates are soft, `Φ(z / w)` with the gates' widths `widths`
+/// (each component's `w A`), and `E[Φ(z / w)] = Φ(m / √(w² + s²))` for `z ~ N(m, s²)`: the count is
+/// of what the pass executes (with `w = 0`, a hard gate, of `s²` alone).
 fn gated_expected(
     d: &Device,
     arithmetic: gam_gpu::tensor::Arithmetic,
     input: &Tensor,
     gate: Option<(&Tensor, &Tensor)>,
-    (bias_mean, bias_variance): (&[f64], &[f64]),
+    (bias_mean, bias_variance, widths): (&[f64], &[f64], &[f64]),
     rank: &[f64],
-    (assign, extra): (Option<&Array2<f64>>, Option<(&Tensor, &Tensor)>),
-) -> Result<(crate::library_complexity::Expected, Option<(Tensor, Tensor)>, Option<Array2<f64>>, (Tensor, Tensor)), String> {
+    (assign, extra): (Option<&Array2<f64>>, Option<(&Tensor, &Tensor, &[f64])>),
+) -> Result<(crate::library_complexity::Expected, Option<(Tensor, Tensor)>, Option<Array2<f64>>, (Tensor, Tensor, Vec<f64>)), String> {
     use gam_gpu::tensor::GateFunction;
     let rows = input.rows();
     let parts = rank.len();
@@ -2624,7 +2621,7 @@ fn gated_expected(
     let (shared, cross) = match assign {
         Some(a) if a.dim() == (gates, parts) => (Some(upload(a.view())?), None),
         Some(a) if a.ncols() == parts && a.nrows() > gates => {
-            let (m_extra, s2_extra) = extra.ok_or("library budget: a cross-stage assignment without the previous stage's components")?;
+            let (m_extra, s2_extra, _) = extra.ok_or("library budget: a cross-stage assignment without the previous stage's components")?;
             if m_extra.cols() != a.nrows() - gates {
                 return Err(format!("library budget: {} rows past the gates for {} components of the previous stage", a.nrows() - gates, m_extra.cols()));
             }
@@ -2690,6 +2687,20 @@ fn gated_expected(
         }
         None => (d.copy(&m_gate).map_err(error)?, d.copy(&s2_gate).map_err(error)?),
     };
+    // Each component's width `w_b = Σ_g A_gb w_g` over the gates it may take (its gate's own without
+    // sharing; a followed component's width past the stage's gates), as its Gated node's: the pass
+    // executes `Φ(z / w)`, and `E[Φ(z / w)] = Φ(m / √(w² + s²))` for `z ~ N(m, s²)`.
+    if widths.len() != gates {
+        return Err(format!("library budget: {} widths for {gates} gates", widths.len()));
+    }
+    let followed_widths = extra.map(|(_, _, w)| w).unwrap_or(&[]);
+    let component_width: Vec<f64> = match assign {
+        Some(a) => (0..parts).map(|b| (0..a.nrows()).map(|g| a[[g, b]] * if g < gates { widths[g] } else { followed_widths.get(g - gates).copied().unwrap_or(0.0) }).sum()).collect(),
+        None => widths.to_vec(),
+    };
+    let variance = d.copy(&s2).map_err(error)?;
+    let mut s2 = s2;
+    d.add_row(&mut s2, 1.0, &row(&component_width.iter().map(|w| w * w).collect::<Vec<_>>())?).map_err(error)?;
     let s = d.gate_function(GateFunction::Sqrt, &s2, None).map_err(error)?;
     // Per row and component, weighted by its rank: P = Φ(m/s), ∂P/∂m = φ(m/s)/s and
     // 2 ∂P/∂s² = −φ(m/s) m / s³.
@@ -2702,6 +2713,17 @@ fn gated_expected(
     let probability = weighted(&d.gate_function(GateFunction::Cdf, &m, Some(&s)).map_err(error)?)?;
     let slope = weighted(&d.gate_function(GateFunction::CdfSlope, &m, Some(&s)).map_err(error)?)?;
     let spread = weighted(&d.gate_function(GateFunction::Ratio, &d.gate_function(GateFunction::CdfScaleSlope, &m, Some(&s)).map_err(error)?, Some(&s)).map_err(error)?)?;
+    // The assignment's path through the components' widths, `∂(w_b²)/∂A_gb = 2 w_b w_g`:
+    // `w_g w_b Σ_rows 2 ∂P/∂s²_b` (summed over the rows, half of `spread`'s doubling).
+    let width_spread: ndarray::Array1<f64> = match assign {
+        Some(_) => {
+            let ones = d.upload_vec(1, rows, vec![1.0; rows]).map_err(error)?;
+            let mut out = d.empty(1, parts).map_err(error)?;
+            d.gemm(&mut out, 1.0, &ones, Op::N, &spread, Op::N, 0.0, arithmetic).map_err(error)?;
+            d.download(&out).map_err(error)?.row(0).iter().zip(&component_width).map(|(p, w)| p * w).collect()
+        }
+        None => ndarray::Array1::zeros(0),
+    };
     // Back to the gates through the assignment: ∂/∂m_g = Σ_b A_gb ∂/∂m_b, ∂/∂s²_g = Σ_b A_gb² ∂/∂s²_b.
     let (slope_gate, spread_gate) = match &shared {
         Some((a, a2)) => {
@@ -2731,6 +2753,8 @@ fn gated_expected(
                 let bottom = d.download(&direct).map_err(error)? + d.download(&varied).map_err(error)? * &host.slice(ndarray::s![gates.., ..]);
                 total = ndarray::concatenate(ndarray::Axis(0), &[total.view(), bottom.view()]).map_err(error)?;
             }
+            let all_widths: Vec<f64> = widths.iter().chain(followed_widths).copied().collect();
+            total += &Array2::from_shape_fn(total.dim(), |(g, b)| all_widths.get(g).copied().unwrap_or(0.0) * width_spread[b]);
             if pooled && gate.is_none() {
                 let mut pooled = d.empty(gates, parts).map_err(error)?;
                 d.gemm(&mut pooled, 1.0, &slope_gate, Op::T, input, Op::N, 0.0, arithmetic).map_err(error)?;
@@ -2760,7 +2784,7 @@ fn gated_expected(
         None => None,
     };
     let expected = crate::library_complexity::Expected { count, rows, mean: Array2::zeros((gates, 0)), variance: Array2::zeros((gates, 0)), bias_mean, bias_variance };
-    Ok((expected, gate_terms, assigned, (m, s2)))
+    Ok((expected, gate_terms, assigned, (m, variance, component_width)))
 }
 
 /// The test of the posterior's pending move (`DevicePosterior::pending_divergence`) on this step's
@@ -3192,14 +3216,10 @@ struct Progress {
     /// The budget's multiplier `λ` (`Settings::budget`), carried across a resume.
     #[serde(default)]
     multiplier: f64,
-    /// The budget's balance value `λ̄`, the running mean over one pass of each step's `λ̂`, and
-    /// whether the budget has bound and the steps since (`Settings::budget`).
-    #[serde(default)]
-    balance: f64,
+    /// Whether the budget has bound (`Settings::budget`): from then on `multiplier` integrates its
+    /// violation.
     #[serde(default)]
     engaged: bool,
-    #[serde(default)]
-    balance_steps: u64,
     /// The last epoch's snapshot, its per-batch estimates of `F` in nats, when convergence is being
     /// judged.
     previous: Option<Vec<f64>>,
@@ -3947,9 +3967,7 @@ pub fn fit_from(
         epochs: Vec::new(),
         removals: Vec::new(),
         multiplier: 0.0,
-        balance: 0.0,
         engaged: false,
-        balance_steps: 0,
         previous: None,
         collection: COLLECTION,
         active: posterior.active.clone(),
@@ -4231,25 +4249,32 @@ pub fn fit_from(
             if let Some((limit, (expected, terms))) = budget {
                 parts.0 += expected;
                 parts.1 += 1;
-                let (mut along, mut square) = (0.0, 0.0);
-                for (i, mean, _) in &terms {
-                    if let Some(g) = gradients.get(&explanation.trainable[*i]) {
-                        along += device_dot(&device, g, mean)? * scale * LN_2;
+                // The multiplier: from the first step whose count exceeds the budget, λ starts at
+                // the robust balance of F's push on the gates against the count's, the median over
+                // the gates of |∂F/∂z_b| / |∂Ê/∂z_b| (both read off each gate's threshold or bias,
+                // whose derivative is its pre-activation's), and then integrates the violation in
+                // log space, log λ ← log λ + (Ê − K) / (K B) per step (`B` the steps of one pass):
+                // symmetric, unable to wind up, and still only where Ê = K. The global ratio
+                // −⟨g_F, g_k⟩ / |g_k|² (560f12d2d3's λ̄ Ê / K) explodes where most gates are
+                // saturated and |g_k| is tiny: a toy fit (resid_mlp_1l, K = 55) took λ to 8,000 and
+                // diverged with the count flat.
+                if !progress.engaged && limit > 0.0 && expected > limit {
+                    let mut ratios = Vec::new();
+                    for (i, mean, _) in &terms {
+                        let Some(g) = gradients.get(&explanation.trainable[*i]).filter(|_| mean.cols() == 1) else { continue };
+                        let (data, count) = (device.download(g).map_err(error)?, device.download(mean).map_err(error)?);
+                        ratios.extend(data.iter().zip(count.iter()).filter(|(f, k)| **k != 0.0 && f.is_finite()).map(|(f, k)| (f * scale * LN_2).abs() / k.abs()));
                     }
-                    square += device_dot(&device, mean, mean)?;
+                    ratios.sort_by(f64::total_cmp);
+                    if let Some(balance) = ratios.get(ratios.len() / 2).copied().filter(|v| *v > 0.0) {
+                        progress.engaged = true;
+                        progress.multiplier = balance;
+                        log::info!("library budget bound at {expected:.4} parts per token (K {limit}): λ starts at {balance:.4e}, the median of {} gates' balances", ratios.len());
+                    }
+                } else if progress.engaged && limit > 0.0 {
+                    progress.multiplier *= ((expected - limit) / (limit * draws.len() as f64)).exp();
                 }
-                let measured = if square > 0.0 { (-along).max(0.0) / square } else { 0.0 };
-                if !progress.engaged && expected > limit {
-                    progress.engaged = true;
-                }
-                let lambda = if progress.engaged && limit > 0.0 {
-                    progress.balance_steps += 1;
-                    progress.balance += (measured - progress.balance) / progress.balance_steps.min(draws.len() as u64) as f64;
-                    progress.balance * expected / limit
-                } else {
-                    0.0
-                };
-                progress.multiplier = lambda;
+                let lambda = if progress.engaged { progress.multiplier } else { 0.0 };
                 for (i, mean, variance) in &terms {
                     let op = explanation.trainable[*i];
                     // At λ = 0 the term adds nothing, and the step is the budget-free one bit for bit.
@@ -6213,9 +6238,7 @@ mod tests {
             epochs: Vec::new(),
             removals: Vec::new(),
             multiplier: 0.0,
-            balance: 0.0,
             engaged: false,
-            balance_steps: 0,
             previous: Some(vec![1.0, 2.0]),
             collection: COLLECTION,
             active: vec![false, true],
