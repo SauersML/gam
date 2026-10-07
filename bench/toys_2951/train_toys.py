@@ -31,8 +31,10 @@ from pathlib import Path
 import numpy as np
 import torch
 
-torch.set_num_threads(2)
+torch.set_num_threads(4)
 HELD_OUT = 4096
+# the transformers train on the Apple GPU when present
+DEVICE = "mps" if torch.backends.mps.is_available() else "cpu"
 
 
 def write(out: Path, files: dict, name: str, value) -> None:
@@ -158,19 +160,7 @@ def resid_mlp(out: Path, layers: int):
         write(out, files, f"blocks.{l}.mlp.W_out", Wo[l].numpy())
         ops += [f"blocks.{l}.mlp.W_in", f"blocks.{l}.mlp.W_out"]
     write(out, files, "inputs", xs.numpy())
-    # Feature i's function: every layer's read of its embedding direction e_i and write onto it,
-    # through the dual frame of the embedding (the e_i are near orthogonal, not exactly).
-    En = E.numpy()
-    dual = np.linalg.pinv(En.T)  # (n, d): dual[i] . e_j = delta_ij on the embedding's span
-    mechanisms, active = [], []
-    for i in range(n):
-        pieces = {}
-        for l in range(layers):
-            Wil, Wol = Wi[l].numpy(), Wo[l].numpy()
-            pieces[f"blocks.{l}.mlp.W_in"] = np.outer(Wil @ En[i], dual[i])
-            pieces[f"blocks.{l}.mlp.W_out"] = np.outer(dual[i], En[i] @ Wol)
-        mechanisms.append({"name": f"function {i}", "rank": 1, "operators": pieces, "gate": f"x[{i}] != 0"})
-        active.append(xs[:, i].numpy() != 0)
+    mechanisms, active = resid_mlp_truth(E.numpy(), [w.numpy() for w in Wi], [w.numpy() for w in Wo], xs.numpy())
     record = {
         "model": out.name,
         "kind": "resid_mlp",
@@ -179,12 +169,40 @@ def resid_mlp(out: Path, layers: int):
         "operators": ops,
         "output_variance": s2,
         "spd_published": {
-            "resid_mlp_1l": "SPD 3.3: 100 subcomponents in W_in, one per function; W_out dense",
-            "resid_mlp_2l": "SPD 3.4: one subcomponent per function across the 2 layers",
-            "resid_mlp_3l": "SPD 3.4: one subcomponent per function across the 3 layers",
+            "resid_mlp_1l": "SPD 3.3: 100 rank-one subcomponents in W_in, one per function; W_out one rank-50 component",
+            "resid_mlp_2l": "SPD 3.4: 100 W_in components, each across both layers; W_out one rank-50 component across both layers",
+            "resid_mlp_3l": "SPD 3.4: 102 W_in components across 3 layers; W_out one rank-51 component across all three",
         }[out.name],
     }
-    finish(out, files, record, mechanisms, np.stack(active, 1))
+    finish(out, files, record, mechanisms, active)
+
+
+def resid_mlp_truth(E, Wi, Wo, xs):
+    """SPD's account (3.3, 3.4): function i is every layer's W_in read of its embedding direction
+    e_i (through the embedding's dual frame, the e_i being near orthogonal, not exactly), one
+    rank-one slice per layer gated by x_i != 0; every layer's W_out together is one always-on
+    part of full rank (its slices are not per function: they write every function's output and
+    its interference, which a per-function write would drop)."""
+    n, layers = E.shape[0], len(Wi)
+    dual = np.linalg.pinv(E.T)  # (n, d): dual[i] . e_j = delta_ij on the embedding's span
+    mechanisms, active = [], []
+    for i in range(n):
+        pieces = {f"blocks.{l}.mlp.W_in": np.outer(Wi[l] @ E[i], dual[i]) for l in range(layers)}
+        mechanisms.append({"name": f"function {i}", "rank": 1, "operators": pieces, "gate": f"x[{i}] != 0"})
+        active.append(xs[:, i] != 0)
+    mechanisms.append({"name": "W_out", "rank": sum(w.shape[1] for w in Wo), "operators": {f"blocks.{l}.mlp.W_out": Wo[l] for l in range(layers)}, "gate": "always"})
+    active.append(np.ones(xs.shape[0], dtype=bool))
+    return mechanisms, np.stack(active, 1)
+
+
+def retruth(out: Path):
+    """Rewrite a trained resid_mlp toy's truth from its export."""
+    record = json.loads((out / "export.json").read_text())
+    W = {k: np.fromfile(out / f"{k}.f64", dtype="<f8").reshape(v["shape"]) for k, v in record["files"].items()}
+    L = record["config"]["n_layers"]
+    mechanisms, active = resid_mlp_truth(W["W_E"], [W[f"blocks.{l}.mlp.W_in"] for l in range(L)], [W[f"blocks.{l}.mlp.W_out"] for l in range(L)], W["inputs"])
+    files = record.pop("files")
+    finish(out, files, record, mechanisms, active)
 
 
 # ------------------------------------------------------------------------------- transformers
@@ -197,8 +215,8 @@ def rms(x, g, eps):
 def rotary(x, theta):
     # x: (..., t, hd), rotate_half pairing (dims i and i + hd/2)
     t, hd = x.shape[-2], x.shape[-1]
-    inv = 1.0 / (theta ** (torch.arange(0, hd, 2, dtype=x.dtype) / hd))
-    ang = torch.arange(t, dtype=x.dtype)[:, None] * inv[None, :]
+    inv = 1.0 / (theta ** (torch.arange(0, hd, 2, dtype=x.dtype, device=x.device) / hd))
+    ang = torch.arange(t, dtype=x.dtype, device=x.device)[:, None] * inv[None, :]
     cos, sin = torch.cat([ang.cos()] * 2, -1), torch.cat([ang.sin()] * 2, -1)
     x1, x2 = x[..., : hd // 2], x[..., hd // 2 :]
     return x * cos + torch.cat([-x2, x1], -1) * sin
@@ -229,7 +247,7 @@ class Lm(torch.nn.Module):
         c = self.cfg
         B, T = tokens.shape
         x = self.wte[tokens]
-        mask = torch.ones(T, T, dtype=torch.bool).tril()
+        mask = torch.ones(T, T, dtype=torch.bool, device=tokens.device).tril()
         for l in range(c["layers"]):
             a = rms(x, self.g1[l], c["eps"])
             q = (a @ self.q[l].T).view(B, T, c["heads"], c["hd"]).transpose(1, 2)
@@ -251,6 +269,7 @@ class Lm(torch.nn.Module):
         return rms(x, self.final, c["eps"]) @ self.lm_head.T
 
     def export(self, out: Path, files: dict):
+        self.cpu()
         c = self.cfg
         write(out, files, "wte", self.wte.detach().double().numpy())
         write(out, files, "lm_head", self.lm_head.detach().double().numpy())
@@ -289,9 +308,12 @@ def modadd(out: Path):
     labels = (a + b) % p
     perm = torch.randperm(p * p, generator=gen)
     train, test = perm[: int(0.3 * p * p)], perm[int(0.3 * p * p):]
-    model = Lm(vocab=p + 1, d=128, layers=1, heads=4, hd=32, mlp=512)
+    model = Lm(vocab=p + 1, d=128, layers=1, heads=4, hd=32, mlp=512).to(DEVICE)
+    tokens, labels = tokens.to(DEVICE), labels.to(DEVICE)
     opt = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1.0, betas=(0.9, 0.98))
-    for step in range(30000):
+    # past generalization (about step 5000) weight decay keeps cleaning the embedding up to a few
+    # key frequencies (Nanda et al. 2023)
+    for step in range(25000):
         logits = model(tokens[train])[:, -1, :p]
         loss = torch.nn.functional.cross_entropy(logits, labels[train])
         opt.zero_grad()
@@ -303,13 +325,20 @@ def modadd(out: Path):
                 acc = (tl.argmax(-1) == labels[test]).float().mean().item()
                 tloss = torch.nn.functional.cross_entropy(tl, labels[test]).item()
             print(f"step {step}: train {loss.item():.3e} test {tloss:.3e} acc {acc:.4f}", flush=True)
-            if acc == 1.0 and tloss < 1e-3:
-                break
     files = {}
+    tokens, labels = tokens.cpu(), labels.cpu()
     config = model.export(out, files)
-    # held-out rows: the test pairs (never trained), shuffled
-    rows = tokens[test][torch.randperm(len(test), generator=gen)][:HELD_OUT]
+    # rows: the test pairs (never trained) shuffled, then the training pairs; the first HELD_OUT
+    # are the held-out rows every score reads
+    rows = torch.cat([tokens[test][torch.randperm(len(test), generator=gen)], tokens[train]])
     write(out, files, "tokens", rows.double().numpy())
+    modadd_truth(out, model, tokens, files, config)
+
+
+def modadd_truth(out: Path, model, tokens, files, config):
+    """The Fourier clocks: key frequencies from the embedding's power on cos/sin(2 pi k a / p),
+    and each MLP neuron assigned to the key frequency carrying most of its activation's power."""
+    p = 113
     # Fourier key frequencies from the embedding: the power of W_E's token rows on cos/sin(2 pi k a / p)
     WE = model.wte.detach().double().numpy()[:p]
     t = np.arange(p)
@@ -354,7 +383,7 @@ def modadd(out: Path):
         pieces = {"wte": proj @ WE_full, "lm_head": proj @ WU, "blocks.0.mlp.c_fc": zu, "blocks.0.mlp.down_proj": zd}
         mechanisms.append({"name": f"clock k={k}", "rank": {"wte": 2, "lm_head": 2, "neurons": int(len(neurons))}, "operators": pieces,
                            "gate": "always (every input uses every key frequency)", "neurons": neurons.tolist()})
-    active = np.ones((len(rows), len(mechanisms)), dtype=bool)
+    active = np.ones((HELD_OUT * 3, len(mechanisms)), dtype=bool)
     record = {"model": "modadd_113", "kind": "language_model", "config": config,
               "task": "tokens a, b, = (113); the prediction at position 2 is (a + b) mod 113; positions 0, 1 untrained",
               "key_frequencies": keys, "embedding_power": {int(k) + 1: float(power[k]) for k in order[:10]},
@@ -378,10 +407,10 @@ def induction(out: Path):
             x[i, s + l: s + 2 * l] = x[i, s: s + l]
         return x
 
-    model = Lm(vocab=vocab, d=64, layers=2, heads=4, hd=16, mlp=1, mlp_on=False)
+    model = Lm(vocab=vocab, d=64, layers=2, heads=4, hd=16, mlp=1, mlp_on=False).to(DEVICE)
     opt = torch.optim.AdamW([p_ for p_ in model.parameters() if p_.requires_grad], lr=2e-3, weight_decay=0.01)
     for step in range(6000):
-        x = batch(256, gen)
+        x = batch(256, gen).to(DEVICE)
         logits = model(x)
         loss = torch.nn.functional.cross_entropy(logits[:, :-1].reshape(-1, vocab), x[:, 1:].reshape(-1))
         opt.zero_grad()
@@ -393,41 +422,70 @@ def induction(out: Path):
     config = model.export(out, files)
     rows = batch(HELD_OUT // 8, torch.Generator().manual_seed(1))
     write(out, files, "tokens", rows.double().numpy())
-    # find the heads: previous-token score (mean attention from t to t-1) in layer 0; induction
-    # score (attention from a repeated token to the token after its earlier occurrence) in layer 1
+    induction_truth(out, model, rows, files, config)
+
+
+def load_lm(out: Path, mlp_on=True):
+    """The Lm of a transformer toy's export."""
+    record = json.loads((out / "export.json").read_text())
+    c = record["config"]
+    W = {k: torch.tensor(np.fromfile(out / f"{k}.f64", dtype="<f8").reshape(v["shape"]), dtype=torch.float32) for k, v in record["files"].items()}
+    model = Lm(vocab=c["vocab"], d=c["d_model"], layers=c["n_layers"], heads=c["n_heads"], hd=c["head_dim"], mlp=c["d_mlp"],
+               theta=int(c["rope_theta"]), eps=c["norm_eps"], mlp_on=mlp_on)
+    with torch.no_grad():
+        model.wte.copy_(W["wte"])
+        model.lm_head.copy_(W["lm_head"])
+        model.final.copy_(W["final_norm.gain"][0])
+        for l in range(c["n_layers"]):
+            for t, name in [(model.q, "attn.q_proj"), (model.k, "attn.k_proj"), (model.v, "attn.v_proj"), (model.o, "attn.o_proj"), (model.up, "mlp.c_fc"), (model.down, "mlp.down_proj")]:
+                t[l].copy_(W[f"blocks.{l}.{name}"])
+            model.g1[l].copy_(W[f"blocks.{l}.rms1.gain"][0])
+            model.g2[l].copy_(W[f"blocks.{l}.rms2.gain"][0])
+    return model, record, W["tokens"].long()
+
+
+def induction_truth(out: Path, model, rows, files, config):
+    """The known mechanism, measured on the held-out rows: layer 0's previous-token heads (mean
+    attention from t to t-1 or to t-2 above 1/2) and layer 1's induction heads (mean attention
+    from a token with an earlier occurrence at s to s+1 or s+2 above 1/2: the head's key is the
+    token a previous-token head copied there, its value the token after); 1/2 is a reporting cut
+    for the truth, never a method setting. Each head is one mechanism of its head's rank."""
+    T = rows.shape[1]
     pats = []
     with torch.no_grad():
         model(rows, pats)
-    prev = pats[0][:, :, torch.arange(1, T), torch.arange(0, T - 1)].mean((0, 2)).numpy()
-    ind = np.zeros(model.cfg["heads"])
+    back = {o: pats[0][:, :, torch.arange(o, T), torch.arange(0, T - o)].mean((0, 2)).numpy() for o in (1, 2)}
     targets = []
     for i in range(rows.shape[0]):
         seen = {}
         for t_ in range(T):
             tok = int(rows[i, t_])
-            if tok in seen and seen[tok] + 1 < t_:
-                targets.append((i, t_, seen[tok] + 1))
+            if tok in seen and seen[tok] + 2 < t_:
+                targets.append((i, t_, seen[tok]))
             seen[tok] = t_
     idx = torch.tensor(targets)
-    ind = pats[1][idx[:, 0], :, idx[:, 1], idx[:, 2]].mean(0).numpy()
-    h0, h1 = int(prev.argmax()), int(ind.argmax())
-    print(f"previous-token scores {prev.round(3)}, induction scores {ind.round(3)}", flush=True)
-    # where the induction mechanism is active: tokens whose earlier occurrence exists (it attends
-    # back); the previous-token head writes at every token
-    act = np.zeros((rows.shape[0] * T, 2), dtype=bool)
-    act[:, 0] = True
+    ind = sum(pats[1][idx[:, 0], :, idx[:, 1], idx[:, 2] + o] for o in (1, 2)).mean(0).numpy()
+    print(f"1-back {back[1].round(3)}, 2-back {back[2].round(3)}, induction {ind.round(3)}", flush=True)
+    heads = model.cfg["heads"]
+    act_rows = np.zeros(rows.shape[0] * T, dtype=bool)
     for (i, t_, _) in targets:
-        act[i * T + t_, 1] = True
-    mechanisms = [
-        {"name": f"previous-token head L0H{h0}", "rank": model.cfg["hd"], "operators": head_pieces(model, 0, h0), "gate": "always", "score": float(prev[h0])},
-        {"name": f"induction head L1H{h1}", "rank": model.cfg["hd"], "operators": head_pieces(model, 1, h1), "gate": "the token occurred before", "score": float(ind[h1])},
-    ]
+        act_rows[i * T + t_] = True
+    mechanisms, active = [], []
+    for h in range(heads):
+        o = 1 if back[1][h] >= back[2][h] else 2
+        if back[o][h] > 0.5:
+            mechanisms.append({"name": f"{o}-back previous-token head L0H{h}", "rank": model.cfg["hd"], "operators": head_pieces(model, 0, h), "gate": "always", "score": float(back[o][h])})
+            active.append(np.ones(rows.shape[0] * T, dtype=bool))
+    for h in range(heads):
+        if ind[h] > 0.5:
+            mechanisms.append({"name": f"induction head L1H{h}", "rank": model.cfg["hd"], "operators": head_pieces(model, 1, h), "gate": "the token occurred before", "score": float(ind[h])})
+            active.append(act_rows)
     record = {"model": "induction", "kind": "language_model", "config": config,
               "task": "BOS, random tokens with a 6..12-token segment repeated right after itself; next-token prediction at every position",
-              "previous_token_scores": prev.tolist(), "induction_scores": ind.tolist(),
+              "back_scores": {str(o): back[o].tolist() for o in (1, 2)}, "induction_scores": ind.tolist(),
               "note": "attention-only: the MLP weights are zero (the importer needs an MLP)",
               "spd_published": "none (VPD/SPD do not decompose this toy)"}
-    finish(out, files, record, mechanisms, act)
+    finish(out, files, record, mechanisms, np.stack(active, 1))
 
 
 def finish(out: Path, files: dict, record: dict, mechanisms: list, active: np.ndarray):
@@ -448,6 +506,36 @@ def finish(out: Path, files: dict, record: dict, mechanisms: list, active: np.nd
 
 if __name__ == "__main__":
     toy, root = sys.argv[1], Path(sys.argv[2])
+    if toy == "truth:modadd_113":
+        # a trained export whose truth was not written: its record, rows and truth again (the
+        # split is the training's, from the same seed)
+        out = root / "modadd_113"
+        p = 113
+        a, b = torch.meshgrid(torch.arange(p), torch.arange(p), indexing="ij")
+        grid = torch.stack([a.flatten(), b.flatten(), torch.full((p * p,), p)], 1)
+        gen = torch.Generator().manual_seed(0)
+        perm = torch.randperm(p * p, generator=gen)
+        train, test = perm[: int(0.3 * p * p)], perm[int(0.3 * p * p):]
+        model = Lm(vocab=p + 1, d=128, layers=1, heads=4, hd=32, mlp=512)
+        files = {}
+        tmp = {k: np.fromfile(out / f"{k}.f64", dtype="<f8") for k in ["wte", "lm_head", "final_norm.gain"] + [f"blocks.0.{n}" for n in ["attn.q_proj", "attn.k_proj", "attn.v_proj", "attn.o_proj", "mlp.c_fc", "mlp.down_proj", "rms1.gain", "rms2.gain"]]}
+        with torch.no_grad():
+            for t, k in [(model.wte, "wte"), (model.lm_head, "lm_head"), (model.final, "final_norm.gain"), (model.q[0], "blocks.0.attn.q_proj"), (model.k[0], "blocks.0.attn.k_proj"),
+                         (model.v[0], "blocks.0.attn.v_proj"), (model.o[0], "blocks.0.attn.o_proj"), (model.up[0], "blocks.0.mlp.c_fc"), (model.down[0], "blocks.0.mlp.down_proj"),
+                         (model.g1[0], "blocks.0.rms1.gain"), (model.g2[0], "blocks.0.rms2.gain")]:
+                t.copy_(torch.tensor(tmp[k].reshape(t.shape)))
+        config = model.export(out, files)
+        rows = torch.cat([grid[test][torch.randperm(len(test), generator=gen)], grid[train]])
+        write(out, files, "tokens", rows.double().numpy())
+        modadd_truth(out, model, grid, files, config)
+        sys.exit(0)
+    if toy == "truth:induction":
+        model, record, rows = load_lm(root / "induction", mlp_on=False)
+        induction_truth(root / "induction", model, rows, record["files"], record["config"])
+        sys.exit(0)
+    if toy.startswith("truth:"):
+        retruth(root / toy[6:])
+        sys.exit(0)
     out = root / toy
     out.mkdir(parents=True, exist_ok=True)
     {
