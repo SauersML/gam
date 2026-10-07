@@ -508,6 +508,8 @@ def make(n):
             state['soft'].append(soft.sum(-1).reshape(-1))
             return emit(c * soft)
         read = x @ p['G'] if ARM == 'dir' else c if start == 'neuron' else c.abs() * un
+        if state.get('calib') is not None:
+            state['calib'].setdefault(n, []).append(read.detach().reshape(-1))
         if router is not None:
             if n.endswith('c_fc'):
                 state['route'][layer] = torch.relu(x @ router['G1'])
@@ -615,6 +617,8 @@ def make_attn(n):
         if state['mode'] == 'all':
             g = 1.0
         else:
+            if state.get('calib') is not None:
+                state['calib'].setdefault(n, []).append((c.abs() * p['U'].norm(dim=-1)[:, None, :]).reshape(-1))
             z = (c.abs() * p['U'].norm(dim=-1)[:, None, :] - p['tau'][:, None, :]) / p['s'][:, None, :]
             hard, phi = force_rows((z > 0).float(), 0.5 * (1 + torch.erf(z / SQ2)), x.shape[1])
             state['hard'].append(hard.sum((0, 2)))
@@ -785,6 +789,8 @@ def attn_v(l, h, pattern):
             back = lambda t: t.view(NH, B_, T_, -1).permute(1, 0, 2, 3)
             hard, soft = back(hard), back(soft)
         else:
+            if state.get('calib') is not None:
+                state['calib'].setdefault(n, []).append(r.detach().reshape(-1))
             z = (r - p['tau'][None, :, None, :]) / p['s'][None, :, None, :]
             hard = (z > 0).float(); soft = 0.5 * (1 + torch.erf(z / SQ2))
         if state['force_on']:
@@ -1004,6 +1010,29 @@ def evaluate(final=False):
                                       'rank_8+': int((rk >= 8).sum())})
     state['collect'] = None
     return out
+
+# The VPD start's thresholds set in the gated run: each map's threshold is the quantile of its reads that
+# matches its target count (VPD's per-map count scaled to the budget) with every upstream map gated at its
+# own threshold, one pass per map in forward order (after pass j the first j maps are at their fixed
+# point). Thresholds set on M's inputs left maps dead whose reads shrink under upstream gating (the
+# whole model at K = 128: layer 0's v and o and layer 1's o at 0.0-0.1 on against 1.2-3.2 targeted, and a
+# gate far below its threshold gets no gradient back).
+if start == 'vpd' and not (SHARE or SHARE_A or ROUTER or EXACT or ARM == 'dir'):
+    target = {n: 1 - START_SCALE * VPD_COUNTS[n] / P[n]['V'].shape[1] for n in mlp}
+    target.update({n: 1 - START_SCALE * VPD_ATTN_COUNTS.get(n, 1.0) / (NH * A[n]['V'].shape[-1]) for n in attn})
+    ids_c = torch.tensor(tok[0:4, :512].astype(np.int64), device=dev)
+    with torch.no_grad():
+        install([None])
+        for _ in range(len(target)):
+            state['calib'] = {}
+            run(ids_c, 'hard')
+            for n, v in state['calib'].items():
+                flat = torch.cat(v); idx = torch.randperm(flat.numel(), device=dev)[:2_000_000]
+                (P[n] if n in P else A[n])['tau'].fill_(torch.quantile(flat[idx].float(), target[n]).item())
+        state['calib'] = None
+        run(ids_c, 'hard')
+        print('thresholds set in the gated run: parts on per token', round(torch.stack(state['hard']).sum(0).mean().item(), 1),
+              [round(h.mean().item(), 2) for h in state['hard']], flush=True)
 
 # Every trained tensor as (container, key, scale): Adam steps of 0.3% of the scale per step, the
 # scale a weight tensor's root mean square (a router G2 started at zero: its map's noise scale) and a
