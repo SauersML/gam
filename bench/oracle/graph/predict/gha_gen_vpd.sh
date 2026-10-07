@@ -10,11 +10,11 @@ A=https://github.com/SauersML/gam/releases/download/rp-run-data
 W=$RUNNER_TEMP/vpd
 mkdir -p "$W/t"
 fetch() { curl -sSfL --retry 3 -o "$2" "$A/$1"; echo "$1  $2" | sha256sum -c --quiet; }
-fetch  "$W/t/model_config.yaml"
-fetch 9664c12d3492ee58520f89703e67ea2790ea13de1f88bf8e3c4594943e0cc59d "$W/t/model_step_99999.safetensors"
-fetch 155e0e9ee8f899ab100bdb84224751308ae86ed57f746dbea403b93276a96552 "$W/t/tokenizer.json"
-fetch d4c0d99d84af59e9126913fafe5210822963e9a3065ee43e6833b358b0c2f825 "$W/uv.safetensors"
-fetch 3caf2b0b16beb91ee261ce63bfc2b8df1f2e3976db80b62cc85d1f6ae58ee118 "$W/rows.npy"
+fetch 9664c12d3492ee58520f89703e67ea2790ea13de1f88bf8e3c4594943e0cc59d "$W/t/model_config.yaml"
+fetch 155e0e9ee8f899ab100bdb84224751308ae86ed57f746dbea403b93276a96552 "$W/t/model_step_99999.safetensors"
+fetch d4c0d99d84af59e9126913fafe5210822963e9a3065ee43e6833b358b0c2f825 "$W/t/tokenizer.json"
+fetch 3caf2b0b16beb91ee261ce63bfc2b8df1f2e3976db80b62cc85d1f6ae58ee118 "$W/uv.safetensors"
+fetch 1406bb75de1061a8b564166d04c5d9d85bd8fe6c2dba42a2cd7d804e1e66163f "$W/rows.npy"
 python3 -m venv "$RUNNER_TEMP/predict-venv"
 export PATH="$RUNNER_TEMP/predict-venv/bin:$PATH"
 python3 -m pip install -q --upgrade pip
