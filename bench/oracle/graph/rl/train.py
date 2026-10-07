@@ -29,10 +29,17 @@ pi_ref is the base (adapter disabled). The loop writes the adapter every step (v
   train.py --mode grpo|dpo|bestofn --base Qwen/Qwen3-8B --model qwen3-0.6b --out DIR --steps S
            [--init SFT_ADAPTER] [--behaviors DIR] [--scorer checker|mock] [--behaviors-per-step 8]
            [--samples 8] [--max-tokens 1536] [--lr 1e-5] [--beta 0.04] [--lora-rank 32] [--hours H]
-  train.py --mode eval --base ... --init ADAPTER --model ... --out DIR   (held-out behaviors, S per program)
+  train.py --mode eval --base ... --init ADAPTER --model ... --out DIR
+
+Evaluation (--mode eval, or every --eval-every steps of training) samples N programs per behavior on two
+sets and scores them under one experiment seed that no training step uses: the held-out behaviors (whole
+families held out by g-behaviors' split) and the held-out prompts of the training behaviors (every
+--prompt-holdout-th prompt, never shown or scored in training). Baselines on the same experiments: the
+empty and the full program (e2e/programs.py) and g-int's search programs (e2e/search.py's outputs).
+--init takes a PEFT adapter or g-predict's sft.py output directory (converted to PEFT's layout).
 
 Outputs: DIR/train.jsonl (a line per step: scores, validity, loss, KL, seconds sampling / scoring /
-training), DIR/samples.jsonl (every program with its score, for repair data and offline SFT),
+training), DIR/eval.jsonl (a line per evaluated behavior and a summary per evaluation), DIR/samples.jsonl (every program with its score, for repair data and offline SFT),
 DIR/best.jsonl (bestofn: the kept programs), DIR/adapter (the policy).
 """
 
@@ -51,6 +58,7 @@ import torch
 
 HERE = Path(__file__).resolve().parent
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")  # CUDA may be initialized here (torch.cuda.is_available) before vLLM starts its engine process
+os.environ.setdefault("MPD_MEM_GIB", "1")  # mech.trace's child is a venv script, which otherwise waits for the venv default of 4 GiB of the Mac's memory ledger
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent))
 import prompt  # noqa: E402
@@ -59,6 +67,7 @@ import scorer  # noqa: E402
 from scorer import SCORERS  # noqa: E402
 
 BEHAVIORS = Path.home() / "mpd-data/graph_oracle/behaviors"
+SEARCH = Path.home() / "mpd-data/graph_oracle/runs/search"
 
 
 def behaviors(root: Path, model: str, split: str) -> list[dict]:
@@ -68,8 +77,58 @@ def behaviors(root: Path, model: str, split: str) -> list[dict]:
         if b.get("split", "train") == split:
             b["path"] = str(p)
             out.append(b)
-    if not out:
-        raise SystemExit(f"no {split} behaviors under {root / model}")
+    return out
+
+
+def split_prompts(pool: list[dict], every: int, root: Path) -> tuple[list[dict], list[dict]]:
+    """Each behavior's prompts split by position: every `every`-th prompt (index % every == 0) is held out.
+    The two views are written as behavior files under root/train/ and root/heldout_prompts/ (the checker
+    reads behaviors by path); returns (training views, held-out-prompt views). every = 0 holds out none."""
+    if every <= 0:
+        return pool, []
+    views = ([], [])
+    for b in pool:
+        for side, name in enumerate(("train", "heldout_prompts")):
+            v = {k: x for k, x in b.items() if k != "path"}
+            v["prompts"] = [p for i, p in enumerate(b["prompts"]) if (i % every == 0) == bool(side)]
+            path = root / name / f"{b['id']}.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(v))
+            views[side].append({**v, "path": str(path)})
+    return views
+
+
+def init_adapter(path: str | None, out: Path) -> str | None:
+    """--init as a PEFT adapter directory: itself, or g-predict's sft.py output (adapters.safetensors with
+    '<module>.A' (r x in) and '<module>.B' (out x r), scale alpha / r, meta.json's args) rewritten in PEFT's
+    layout, which computes the same W x + (alpha / r) B A x."""
+    if path is None or (Path(path) / "adapter_config.json").exists():
+        return path
+    from safetensors.torch import load_file, save_file
+
+    src = Path(path)
+    meta = json.loads((src / "meta.json").read_text())["args"]
+    tensors = load_file(str(src / "adapters.safetensors"))
+    dst = out / "init_adapter"
+    dst.mkdir(parents=True, exist_ok=True)
+    save_file({f"base_model.model.{k.rsplit('.', 1)[0]}.lora_{k.rsplit('.', 1)[1]}.weight": v.contiguous() for k, v in tensors.items()}, str(dst / "adapter_model.safetensors"))
+    targets = sorted({k.rsplit(".", 2)[1] for k in tensors})
+    (dst / "adapter_config.json").write_text(json.dumps({"peft_type": "LORA", "task_type": "CAUSAL_LM", "r": meta["rank"], "lora_alpha": meta["alpha"], "target_modules": targets,
+                                                         "lora_dropout": 0.0, "bias": "none", "base_model_name_or_path": meta["model"], "fan_in_fan_out": False, "inference_mode": True}))
+    return str(dst)
+
+
+def baselines(b: dict) -> dict[str, str]:
+    """Programs the oracle is compared with on behavior b, scored on the same experiments: g-int's
+    references (the empty and the full program, e2e/programs.py) and the search baseline's final
+    programs (e2e/search.py's runs/search/<behavior>.<mode>.json)."""
+    sys.path.insert(0, str(HERE.parent / "e2e"))
+    import programs
+
+    refs = programs.references(b["model"])
+    out = {"empty": refs["empty"], "full": refs["full"]}
+    for p in sorted(SEARCH.glob(f"{b['id']}.*.json")):
+        out["search_" + p.stem[len(b["id"]) + 1 :]] = json.loads(p.read_text())["source"]
     return out
 
 
@@ -259,11 +318,42 @@ def grpo_update(pol: Policy, prompts, completions, advantage, beta: float, micro
     return {"loss": total, "kl_sum_per_episode": kl, "logprob_sums": sums}
 
 
+def evaluate(sets: dict[str, list[dict]], pol, sampler, score, args, adapter: Path, version: int, log, step: int) -> dict:
+    """Programs of the current policy on each evaluation set (N samples per behavior at temperature 1)
+    and the baselines, all under one experiment seed (--eval-seed, never a training step's). Per set: the
+    mean S of a single sample (the oracle's expected score), the best of N, the validity, and each
+    baseline's S, averaged over the behaviors that have it."""
+    summary = {}
+    for name, pool in sets.items():
+        if not pool:
+            continue
+        prompts = [pol.prompt_ids(render(b)) for b in pool]
+        groups = sampler(prompts, args.samples, adapter, version)
+        items = [{"source": program_of(pol.tok.decode(c, skip_special_tokens=True)), "behavior": b, "seed": args.eval_seed} for b, g in zip(pool, groups) for c in g]
+        base = [(b, n, src) for b in pool for n, src in (baselines(b).items() if args.baselines else [])]
+        scores = score(items + [{"source": src, "behavior": b, "seed": args.eval_seed} for b, _, src in base])
+        S = np.array([x["total_bits"] for x in scores[: len(items)]], dtype=float).reshape(len(pool), args.samples)
+        valid = np.array([bool(x["valid"]) for x in scores[: len(items)]]).reshape(len(pool), args.samples)
+        per_base = {}
+        for (b, n, _), x in zip(base, scores[len(items) :]):
+            per_base.setdefault(b["id"], {})[n] = x["total_bits"]
+        for g, b in enumerate(pool):
+            log.write(json.dumps({"set": name, "step": step, "behavior": b["id"], "mean_bits": float(S[g].mean()), "best_bits": float(S[g].min()), "valid_fraction": float(valid[g].mean()),
+                                  "baselines": per_base.get(b["id"], {}), "best_source": items[g * args.samples + int(S[g].argmin())]["source"]}) + "\n")
+        names = sorted({n for d in per_base.values() for n in d})
+        summary[name] = {"behaviors": len(pool), "mean_bits": float(S.mean()), "best_of_n_bits": float(S.min(1).mean()), "valid_fraction": float(valid.mean()),
+                         "baselines": {n: float(np.mean([d[n] for d in per_base.values() if n in d])) for n in names},
+                         "oracle_mean_bits_on_baseline_behaviors": {n: float(np.mean([S[g].mean() for g, b in enumerate(pool) if n in per_base.get(b["id"], {})])) for n in names}}
+    log.write(json.dumps({"summary": summary, "step": step}) + "\n")
+    log.flush()
+    return summary
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--mode", choices=["grpo", "dpo", "bestofn", "eval"], required=True)
     ap.add_argument("--base", default="Qwen/Qwen3-8B")
-    ap.add_argument("--init", help="SFT adapter the policy starts from and is held to (pi_ref)")
+    ap.add_argument("--init", help="SFT adapter the policy starts from and is held to (pi_ref): a PEFT directory or g-predict's sft.py output")
     ap.add_argument("--model", required=True, help="target model whose behaviors are explained: qwen3-0.6b | vpd4l")
     ap.add_argument("--behaviors", default=str(BEHAVIORS))
     ap.add_argument("--scorer", choices=sorted(SCORERS), default="checker")
@@ -282,6 +372,10 @@ def main():
     ap.add_argument("--micro", type=int, default=2)
     ap.add_argument("--sampler", choices=["auto", "vllm", "hf"], default="auto")
     ap.add_argument("--gpu-memory", type=float, default=0.85, help="vLLM's share of its GPU (lower it when the trainer shares the GPU)")
+    ap.add_argument("--prompt-holdout", type=int, default=4, help="every K-th prompt of each training behavior is held out for evaluation (0: none)")
+    ap.add_argument("--eval-every", type=int, default=0, help="evaluate every E training steps and at the end (0: only --mode eval)")
+    ap.add_argument("--eval-seed", type=int, default=1_000_003, help="the evaluation's experiment seed (training steps use their index)")
+    ap.add_argument("--no-baselines", dest="baselines", action="store_false", help="skip scoring the empty, full and search programs in evaluation")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
     lr = args.lr if args.lr is not None else {"bestofn": 1e-4}.get(args.mode, 1e-5)
@@ -290,6 +384,7 @@ def main():
     torch.manual_seed(args.seed)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
+    args.init = init_adapter(args.init, out)
     (out / "config.json").write_text(json.dumps({**vars(args), "lr": lr, "beta": beta}, indent=1))
 
     use_vllm = args.sampler == "vllm" or (args.sampler == "auto" and torch.cuda.is_available() and __import__("importlib").util.find_spec("vllm") is not None)
@@ -305,20 +400,30 @@ def main():
         sampler = HfSampler(pol, args.max_tokens)
     score = SCORERS[args.scorer]
     scorer.WORKERS = args.score_workers
-    pool = behaviors(Path(args.behaviors), args.model, "heldout" if args.mode == "eval" else "train")
+    root = Path(args.behaviors)
+    pool, heldout_prompts = split_prompts(behaviors(root, args.model, "train"), args.prompt_holdout, out / "behaviors")
+    sets = {"heldout_behaviors": behaviors(root, args.model, "heldout"), "heldout_prompts": heldout_prompts}
+    adapter = out / "adapter"
+    if args.mode == "eval":
+        pol.save(adapter)
+        print(json.dumps(evaluate(sets, pol, sampler, score, args, adapter, 0, open(out / "eval.jsonl", "a"), 0)))
+        return
+    if not pool:
+        raise SystemExit(f"no train behaviors under {root / args.model}")
     optimizer = torch.optim.AdamW(pol.params, lr=lr, weight_decay=0.0)
-    log = open(out / "train.jsonl" if args.mode != "eval" else out / "eval.jsonl", "a")
+    log = open(out / "train.jsonl", "a")
+    eval_log = open(out / "eval.jsonl", "a")
     samples_log = open(out / "samples.jsonl", "a")
     best_log = open(out / "best.jsonl", "a") if args.mode == "bestofn" else None
-    adapter = out / "adapter"
     started = time.time()
-    steps = 1 if args.mode == "eval" else args.steps
-    for step in range(steps):
+    for step in range(args.steps):
         if args.hours and time.time() - started > 3600 * args.hours:
             break
         pol.save(adapter)
+        if args.eval_every and step % args.eval_every == 0:
+            evaluate(sets, pol, sampler, score, args, adapter, step, eval_log, step)
         t0 = time.time()
-        chosen = pool if args.mode == "eval" else random.sample(pool, min(args.behaviors_per_step, len(pool)))
+        chosen = random.sample(pool, min(args.behaviors_per_step, len(pool)))
         prompts = [pol.prompt_ids(render(b)) for b in chosen]
         groups = sampler(prompts, args.samples, adapter, step)
         t1 = time.time()
@@ -333,38 +438,35 @@ def main():
         samples_log.flush()
         flat_p = [p for p in prompts for _ in range(args.samples)]
         flat_c = [c for g in groups for c in g]
-        stats = {}
-        if args.mode != "eval":
-            pol.train_mode(True)
-            optimizer.zero_grad(set_to_none=True)
-            if args.mode == "grpo":
-                r = -S
-                std = r.std(1, keepdims=True)
-                adv = np.where(std > 0, (r - r.mean(1, keepdims=True)) / np.where(std > 0, std, 1.0), 0.0).reshape(-1)
-                stats = grpo_update(pol, flat_p, flat_c, adv.tolist(), beta, args.micro)
-            elif args.mode == "dpo":
-                pairs = [(g, int(S[g].argmin()), int(S[g].argmax())) for g in range(len(chosen)) if S[g].max() > S[g].min()]
-                if pairs:
-                    stats = dpo_update(pol, [prompts[g] for g, _, _ in pairs], [groups[g][w] for g, w, _ in pairs], [groups[g][l] for g, _, l in pairs], beta, args.micro)
-                stats["pairs"] = len(pairs)
-            else:
-                keep = [(g, int(np.where(valid[g], S[g], np.inf).argmin())) for g in range(len(chosen)) if valid[g].any()]
-                for g, j in keep:
-                    best_log.write(json.dumps({"behavior": chosen[g]["id"], "prompt": render(chosen[g]), "completion": texts[g][j], "score": scores[g * args.samples + j]}) + "\n")
-                best_log.flush()
-                if keep:
-                    for _ in range(args.sft_epochs):
-                        stats = sft_update(pol, [prompts[g] for g, _ in keep], [groups[g][j] for g, j in keep], args.micro)
-                        torch.nn.utils.clip_grad_norm_(pol.params, 1.0)
-                        optimizer.step()
-                        optimizer.zero_grad(set_to_none=True)
-                stats["kept"] = len(keep)
-            sums = stats.pop("logprob_sums", None)
-            if sums is not None and sampler.logprob_sums is not None:  # on-policy check: the sampler's log pi(y) against the trainer's, per token
-                stats["sampler_trainer_logprob_gap_per_token"] = float(np.sum(np.abs(np.array(sums) - np.array(sampler.logprob_sums))) / max(1, sum(len(c) for c in flat_c)))
-            if args.mode != "bestofn":
-                stats["grad_norm"] = float(torch.nn.utils.clip_grad_norm_(pol.params, 1.0))
+        pol.train_mode(True)
+        optimizer.zero_grad(set_to_none=True)
+        if args.mode == "grpo":
+            r = -S
+            std = r.std(1, keepdims=True)
+            adv = np.where(std > 0, (r - r.mean(1, keepdims=True)) / np.where(std > 0, std, 1.0), 0.0).reshape(-1)
+            stats = grpo_update(pol, flat_p, flat_c, adv.tolist(), beta, args.micro)
+        elif args.mode == "dpo":
+            pairs = [(g, int(S[g].argmin()), int(S[g].argmax())) for g in range(len(chosen)) if S[g].max() > S[g].min()]
+            stats = dpo_update(pol, [prompts[g] for g, _, _ in pairs], [groups[g][w] for g, w, _ in pairs], [groups[g][l] for g, _, l in pairs], beta, args.micro) if pairs else {}
+            stats["pairs"] = len(pairs)
+        else:
+            keep = [(g, int(np.where(valid[g], S[g], np.inf).argmin())) for g in range(len(chosen)) if valid[g].any()]
+            for g, j in keep:
+                best_log.write(json.dumps({"behavior": chosen[g]["id"], "prompt": render(chosen[g]), "completion": texts[g][j], "score": scores[g * args.samples + j]}) + "\n")
+            best_log.flush()
+            stats = {}
+            for _ in range(args.sft_epochs if keep else 0):
+                stats = sft_update(pol, [prompts[g] for g, _ in keep], [groups[g][j] for g, j in keep], args.micro)
+                torch.nn.utils.clip_grad_norm_(pol.params, 1.0)
                 optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+            stats["kept"] = len(keep)
+        sums = stats.pop("logprob_sums", None)
+        if sums is not None and sampler.logprob_sums is not None:  # on-policy check: the sampler's log pi(y) against the trainer's, per token
+            stats["sampler_trainer_logprob_gap_per_token"] = float(np.sum(np.abs(np.array(sums) - np.array(sampler.logprob_sums))) / max(1, sum(len(c) for c in flat_c)))
+        if args.mode != "bestofn":
+            stats["grad_norm"] = float(torch.nn.utils.clip_grad_norm_(pol.params, 1.0))
+            optimizer.step()
         t3 = time.time()
         tokens = [len(c) for c in flat_c]
         log.write(json.dumps({"step": step, "mode": args.mode, "behaviors": len(chosen), "programs": len(items), "mean_bits": float(S.mean()), "best_bits": float(S.min(1).mean()),
@@ -372,8 +474,9 @@ def main():
                               "seconds": {"sample": t1 - t0, "score": t2 - t1, "train": t3 - t2}, "elapsed": time.time() - started,
                               "example": items[int(S.reshape(-1).argmin())]["source"][:2000]}) + "\n")
         log.flush()
-    if args.mode != "eval":
-        pol.save(adapter)
+    pol.save(adapter)
+    if args.eval_every:
+        evaluate(sets, pol, sampler, score, args, adapter, args.steps, eval_log, args.steps)
 
 
 if __name__ == "__main__":
