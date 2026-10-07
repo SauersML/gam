@@ -68,6 +68,8 @@ torch.backends.cuda.matmul.allow_tf32 = not EXACT
 torch.manual_seed(0)
 T = load_target(dev)
 mlp = [n for n in site_names() if '.mlp.' in n]
+# DESCENT_SITES=all: the attention maps are explained too (below; always exact by construction).
+attn = [n for n in site_names() if '.attn.' in n] if os.environ.get('DESCENT_SITES') == 'all' else []
 tok = np.memmap(TOKENS, dtype=np.uint16 if TOKENS.endswith('.u16') else np.float64, mode='r').reshape(-1, 513)
 ev = torch.tensor(tok[1024:1032, :512].astype(np.int64), device=dev)
 # Training rows: DESCENT_TRAIN_ROWS rows of the file, skipping the held-out rows 1024..1031 (default 1024).
@@ -80,11 +82,11 @@ VPD_COUNTS = {'h.0.mlp.c_fc': 18.62, 'h.0.mlp.down_proj': 20.20, 'h.1.mlp.c_fc':
 
 @torch.no_grad()
 def site_inputs(ids):
-    xs = {n: [] for n in mlp}
+    xs = {n: [] for n in mlp + attn}
     for i in range(0, ids.shape[0], 4):
-        for n in mlp: T.site(n).cache_input = True
+        for n in mlp + attn: T.site(n).cache_input = True
         T(ids[i:i + 4])
-        for n in mlp:
+        for n in mlp + attn:
             st = T.site(n); xs[n].append(st.last_input.reshape(-1, st.last_input.shape[-1])); st.cache_input = False
     return {n: torch.cat(v) for n, v in xs.items()}
 
@@ -244,6 +246,72 @@ if EDGES:
             state['r'][MLP_NORM[id(w)]] = (x.float().pow(2).mean(-1, keepdim=True) + eps).sqrt()
         return plain_rms(x, w, eps)
     vpd_model.rms = recording_rms
+# DESCENT_SITES=all, attention: each head h of each attention map is its own block of slices, exact
+# by construction on the head's 128-dimensional side. A frame F_h (C x 128, rows f_i, full rank):
+#   q, k, v (the head's output side): slice i writes f_i into the head's coordinates and reads
+#     W_h^T g_i, g_i the canonical dual of the frame, so sum_i f_i (g_i . W_h x) = W_h x;
+#   o (the head's input side, its 128-dimensional output a_h): slice i reads g_i . a_h and writes
+#     W_h f_i, so sum_i (W_h f_i)(g_i . a_h) = W_h a_h,
+# for any F, through the batched thin QR as frame() does. Each slice is gated by its own read
+# r = |coefficient| ||write|| on its own input at its own position (causal), and counts one rank-one
+# equivalent. VPD start: q, k, v keep VPD's writes restricted to the head as the frame; o keeps VPD's
+# reads restricted to the head (the frame R (R^T R)^-1 has dual R); thresholds one per map, at the
+# quantile of r matching VPD's mean active count at that map (VPD_ATTN_COUNTS, from its masks on M's
+# inputs, rows 1024..1031, vpd_fair_mlp.py with FAIR_SITES=all).
+VPD_ATTN_COUNTS = {'h.0.attn.q_proj': 0.91, 'h.0.attn.k_proj': 1.25, 'h.0.attn.v_proj': 1.9, 'h.0.attn.o_proj': 2.47,
+                   'h.1.attn.q_proj': 1.0, 'h.1.attn.k_proj': 1.22, 'h.1.attn.v_proj': 3.6, 'h.1.attn.o_proj': 5.07,
+                   'h.2.attn.q_proj': 4.28, 'h.2.attn.k_proj': 4.22, 'h.2.attn.v_proj': 10.16, 'h.2.attn.o_proj': 15.76,
+                   'h.3.attn.q_proj': 1.99, 'h.3.attn.k_proj': 2.04, 'h.3.attn.v_proj': 7.74, 'h.3.attn.o_proj': 12.9}
+NH, HD = T.n_head, T.hd
+
+
+def head_frame(F, W, o):
+    """Reads V [H, d_in_h, C] and writes U [H, C, d_out_h] of the head blocks of W from frames F [H, C, HD]."""
+    Q, R = torch.linalg.qr(F)
+    Gt = torch.linalg.solve_triangular(R, Q.transpose(1, 2), upper=True)       # [H, HD, C], the dual^T
+    if o:
+        Wh = W.view(W.shape[0], NH, HD).permute(1, 0, 2)                        # [H, d_model, HD]
+        return Gt, F @ Wh.transpose(1, 2)
+    Wh = W.view(NH, HD, W.shape[1])                                              # [H, HD, d_model]
+    return Wh.transpose(1, 2) @ Gt, F
+
+
+def head_coefficients(x, V, o):
+    """Every slice's coefficient [H, tokens, C] on the map's input x [tokens, d_in]."""
+    return (x.view(-1, NH, HD).permute(1, 0, 2) @ V) if o else (x @ V)
+
+
+def head_output(c, U, o):
+    """The map's output [tokens, d_out] from the gated coefficients c [H, tokens, C]."""
+    y = c @ U
+    return y.sum(0) if o else y.permute(1, 0, 2).reshape(c.shape[1], -1)
+
+
+A = {}
+for n in attn:
+    if start != 'vpd':
+        raise SystemExit('DESCENT_SITES=all: the vpd start only')
+    W = T.site(n).W; o = n.endswith('o_proj')
+    Vv, Uv = load(n + '.V'), load(n + '.U')                                      # [768, C], [C, 768]
+    if o:
+        Rh = Vv.view(NH, HD, -1).transpose(1, 2).cpu().double()                  # [H, C, HD] reads
+        F0 = (Rh @ torch.linalg.inv(Rh.transpose(1, 2) @ Rh)).float().to(dev)
+    else:
+        F0 = Uv.view(-1, NH, HD).permute(1, 0, 2).contiguous()                  # [H, C, HD] writes
+    with torch.no_grad():
+        V, U = head_frame(F0, W, o)
+        x = X[n]
+        c = head_coefficients(x, V, o)
+        r = c.abs() * U.norm(dim=-1)[:, None, :]
+        s_ = 0.1 * r.pow(2).mean(1).sqrt().clamp_min(1e-12)                     # [H, C]
+        q = 1 - VPD_ATTN_COUNTS.get(n, 1.0) / (NH * V.shape[-1])
+        flat = r.reshape(-1); idx = torch.randperm(flat.numel(), device=dev)[:2_000_000]
+        tau = torch.full_like(s_, torch.quantile(flat[idx], q).item())
+        err = (head_output(c, U, o) - x @ W.T).abs().max().item()
+        sv = torch.linalg.svdvals(F0.cpu().double())
+        cond = (sv[:, 0] / sv[:, -1]).max().item()
+    A[n] = {'F': F0.clone().requires_grad_(), 'V': V, 'U': U, 'tau': tau.clone().requires_grad_(), 's': s_, 'o': o}
+    print(n, 'slices', NH * V.shape[-1], 'all-on error', err, 'worst head frame cond', round(cond, 1), flush=True)
 del X
 
 state = {'mode': 'M', 'soft': [], 'hard': [], 'gates': {}, 'route': {}, 'share': {}, 'r': {}, 'writers': {}, 'on': {}, 'gate': {}, 'edges_soft': [], 'edges_hard': []}
@@ -352,6 +420,30 @@ def make(n):
     return fwd
 for n in mlp: T.site(n)._forward = make(n)
 
+
+def make_attn(n):
+    st = T.site(n); p = A[n]
+    def fwd(x):
+        if state['mode'] == 'M':
+            return x @ st.W.T
+        xin = x.reshape(-1, x.shape[-1])
+        c = head_coefficients(xin, p['V'], p['o'])
+        if state['mode'] == 'all':
+            g = 1.0
+        else:
+            z = (c.abs() * p['U'].norm(dim=-1)[:, None, :] - p['tau'][:, None, :]) / p['s'][:, None, :]
+            hard = (z > 0).float()
+            state['hard'].append(hard.sum((0, 2)))
+            if state['mode'] == 'hard':
+                g = hard
+            else:
+                phi = 0.5 * (1 + torch.erf(z / SQ2))
+                state['soft'].append(phi.sum((0, 2)))
+                g = phi if gate == 'mf' else hard + phi - phi.detach()
+        return head_output(c * g, p['U'], p['o']).view(x.shape[0], x.shape[1], -1)
+    return fwd
+for n in attn: T.site(n)._forward = make_attn(n)
+
 def kl_bits(lm, lp):
     pm = F.log_softmax(lm.float(), -1); pp = F.log_softmax(lp.float(), -1)
     return (pm.exp() * (pm - pp)).sum(-1) / math.log(2)
@@ -429,6 +521,8 @@ def evaluate(final=False):
     if EXACT:
         for n in mlp:
             P[n]['V'], P[n]['U'] = frame(P[n]['F'], T.site(n).W)
+    for n in attn:
+        A[n]['V'], A[n]['U'] = head_frame(A[n]['F'], T.site(n).W, A[n]['o'])
     state['collect'] = {} if SHARE else None
     r = {'kl': [], 'kl_soft': [], 'kl_all_on': [], 'active': [], 'active_soft': [], 'per_map': [], 'edges_on': [], 'edges_on_soft': []}
     graph = None
@@ -471,6 +565,7 @@ def evaluate(final=False):
 LR = float(os.environ.get('DESCENT_LR', '1'))
 rms = lambda q: q.detach().pow(2).mean().sqrt().item()
 slots = [(P[n], w, rms(P[n][w])) for n in mlp for w in (('F',) if EXACT else ('V', 'U')) + (('G',) if ARM == 'dir' else ())]
+slots += [(A[n], 'F', rms(A[n]['F'])) for n in attn] + [(A[n], 'tau', 100 / 3 * A[n]['s'].mean().item()) for n in attn]
 slots += [(P[n], 'tau', 100 / 3 * P[n]['s'].mean().item()) for n in mlp]
 # The ramp's log width, started at log s (a ramp as wide as the threshold noise), by 1% per step.
 if gate == 'ramp':
@@ -515,6 +610,8 @@ def draw(mean):
     if EXACT:
         for n in mlp:
             P[n]['V'], P[n]['U'] = frame(P[n]['F'], T.site(n).W)
+    for n in attn:
+        A[n]['V'], A[n]['U'] = head_frame(A[n]['F'], T.site(n).W, A[n]['o'])
 
 def description_bits():
     """KL(q || p) in bits (F only)."""

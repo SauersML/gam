@@ -16,7 +16,7 @@ precision: larger than 2^-23 ||gain_l * v_B|| sqrt(d), the rounding scale of B's
 (norm sqrt(d)); a_A is A's coefficient (its read times its mask), r_l the RMS of the run's own stream at
 layer l's pre-MLP norm and gain_l that norm's gain. Also the active writer-reader pairs, the bound.
 Usage: vpd_fair_mlp.py GAM TARGET VPD_PTH TOKENS OUT.json"""
-import sys, json, math, types
+import sys, json, math, types, os
 from pathlib import Path
 import numpy as np, torch, torch.nn.functional as F
 sys.path.insert(0, sys.argv[1])
@@ -27,9 +27,10 @@ if not (vpd_model.TARGET_DIR / 'model_step_99999.safetensors').exists():  # the 
     vpd_model.load_file = lambda f: torch.load(f.replace('.safetensors', '.pt'), map_location='cpu', weights_only=True)
 vpd_model.VPD_PTH = Path(sys.argv[3])
 TOKENS, out = sys.argv[4], sys.argv[5]
-dev = 'cuda' if torch.cuda.is_available() else 'mps'
+dev = os.environ.get('DESCENT_DEV') or ('cuda' if torch.cuda.is_available() else 'mps')
 T = load_target(dev); V = load_vpd(T, dev)
-mlp = [n for n in site_names() if '.mlp.' in n]
+# FAIR_SITES=all masks all 24 sites (attention too, VPD's published setting); default the 8 MLP maps.
+mlp = site_names() if os.environ.get('FAIR_SITES') == 'all' else [n for n in site_names() if '.mlp.' in n]
 tok = np.memmap(TOKENS, dtype=np.uint16 if TOKENS.endswith('.u16') else np.float64, mode='r').reshape(-1, 513)
 ev = torch.tensor(tok[1024:1032, :512].astype(np.int64), device=dev)
 
