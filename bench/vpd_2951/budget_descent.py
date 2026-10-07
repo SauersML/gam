@@ -588,6 +588,10 @@ def force_rows(hard, soft, T_):
     rows = torch.cat([torch.arange(b * T_, (b + 1) * T_, device=hard.device) for b in state['force_on']])
     return hard.index_fill(1, rows, 1.0), soft.index_fill(1, rows, 1.0)
 
+# DESCENT_UNGATED=q_proj,k_proj (a diagnostic, not an explanation): those attention maps run every slice on
+# and uncounted, to measure what gating them costs.
+UNGATED = set(filter(None, os.environ.get('DESCENT_UNGATED', '').split(',')))
+
 def make_attn(n):
     st = T.site(n); p = A[n]
     def fwd(x):
@@ -622,6 +626,13 @@ def make_attn(n):
                 state['calib'].setdefault(n, []).append((c.abs() * p['U'].norm(dim=-1)[:, None, :]).reshape(-1))
             z = (c.abs() * p['U'].norm(dim=-1)[:, None, :] - p['tau'][:, None, :]) / p['s'][:, None, :]
             hard, phi = force_rows((z > 0).float(), 0.5 * (1 + torch.erf(z / SQ2)), x.shape[1])
+            if n.rsplit('.', 1)[1] in UNGATED:
+                hard, phi = torch.ones_like(hard), torch.ones_like(phi)
+                state['hard'].append(torch.zeros_like(hard[0, :, 0]))
+                if state['mode'] != 'hard':
+                    state['soft'].append(torch.zeros_like(hard[0, :, 0]))
+                y = head_output(c * hard, p['U'], p['o'], swaps_of(n, x.shape[1])).view(x.shape[0], x.shape[1], -1)
+                return y + residual(n, x) if n in RES else y
             state['hard'].append(hard.sum((0, 2)))
             if state['mode'] == 'hard':
                 g = hard
