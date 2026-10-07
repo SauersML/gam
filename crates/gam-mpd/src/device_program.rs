@@ -932,7 +932,7 @@ impl DeviceProgram {
             };
             fused.push(Fused { heads, stacked, sources, live: true, changed: BTreeSet::new(), disabled: false, source_matches: true });
         }
-        let exact_zeros = program
+        let exact_zeros: Vec<bool> = program
             .nodes
             .iter()
             .map(|n| matches!(n, Node::Pointwise { laws, .. } if !laws.is_empty() && laws.iter().all(|l| matches!(l, Law::Relu))))
