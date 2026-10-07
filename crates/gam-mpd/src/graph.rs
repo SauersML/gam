@@ -1790,7 +1790,20 @@ impl WeightEdit {
                 }
             }
         }
-        Ok(Restore { layer, head, matrix, saved, factors })
+        // Keys and values a group of query heads shares (grouped-query attention) are one matrix of
+        // M: a rank-one edit of one head's applies to every head that shares it.
+        let mut shared = Vec::new();
+        if let (Self::RankOne { .. }, Some(h), Matrix::Key | Matrix::Value) = (self, head, matrix) {
+            let edited = Self::matrix(weights, layer, head, matrix)?.clone();
+            for g in (0..weights.layers[layer].heads.len()).filter(|&g| g != h) {
+                let m = Self::matrix(weights, layer, Some(g), matrix)?;
+                if *m == saved {
+                    *m = edited.clone();
+                    shared.push(g);
+                }
+            }
+        }
+        Ok(Restore { layer, head, matrix, saved, factors, shared })
     }
 }
 
@@ -1802,10 +1815,15 @@ pub struct Restore {
     saved: Array2<f64>,
     /// A subcomponent edit's VPD factors before it (`down_proj`'s when true).
     factors: Option<(bool, Array2<f64>)>,
+    /// The heads sharing the edited key or value matrix, edited alike.
+    shared: Vec<usize>,
 }
 
 impl Restore {
     pub fn restore(self, weights: &mut Weights) -> Result<(), String> {
+        for g in &self.shared {
+            *WeightEdit::matrix(weights, self.layer, Some(*g), self.matrix)? = self.saved.clone();
+        }
         *WeightEdit::matrix(weights, self.layer, self.head, self.matrix)? = self.saved;
         if let Some((down, u)) = self.factors {
             let vpd = weights.vpd.get_mut(&self.layer).ok_or("the VPD view went missing")?;

@@ -366,3 +366,22 @@ fn subcomponent_edits_are_their_rank_one_changes() {
         assert_eq!((s.weights.vpd[&0].fc_u.clone(), s.weights.vpd[&0].down_u.clone()), (before.vpd[&0].fc_u.clone(), before.vpd[&0].down_u.clone()));
     }
 }
+
+/// A rank-one edit of a key a group of query heads shares changes it for every head of the group,
+/// and restoring returns them all.
+#[test]
+fn shared_keys_are_edited_together() {
+    let (mut weights, _) = model("graph_sites_gqa");
+    let key = weights.layers[0].heads[0].key.clone();
+    weights.layers[0].heads[1].key = key.clone();
+    let (rows, cols) = key.dim();
+    let edit = WeightEdit::RankOne { layer: 0, head: Some(0), matrix: crate::graph::Matrix::Key, u: vec![0.1; rows], v: vec![0.2; cols] };
+    let restore = edit.apply(&mut weights).expect("edit");
+    assert_ne!(weights.layers[0].heads[0].key, key);
+    assert_eq!(weights.layers[0].heads[1].key, weights.layers[0].heads[0].key, "the sharing head is edited alike");
+    if weights.layers[0].heads.len() > 2 {
+        assert_ne!(weights.layers[0].heads[2].key, weights.layers[0].heads[0].key);
+    }
+    restore.restore(&mut weights).expect("restore");
+    assert_eq!((weights.layers[0].heads[0].key.clone(), weights.layers[0].heads[1].key.clone()), (key.clone(), key));
+}
