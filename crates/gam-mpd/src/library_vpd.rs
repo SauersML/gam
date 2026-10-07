@@ -31,11 +31,12 @@
 //!   into the width and the threshold's mean into the threshold, so the gate is `Φ(z_b / σ_b)`, the
 //!   threshold integrated exactly and the reads and a direction by the pass's weight sample. The
 //!   width is no parameter; its operator holds no prior group.
-//! - `Gate::Learned`: as `Gate::Ramp` in training, evaluated with the hard gate `H(z_b)`.
-//! - `Gate::Ramp`, a labelled partial-strength arm: the width is a trainable parameter (its own
-//!   prior group, started at the standard deviation of the component's gate read over the start's
-//!   fitting tokens), a pass with a gradient gates by `Φ(z_b / w_b)` and every scoring by the ramp
-//!   `clamp(z_b / w_b, 0, 1)` (`DeviceProgram::set_ramp`).
+//! - `Gate::Learned`: the width is a trainable parameter (its own prior group, started at the
+//!   standard deviation of the component's gate read over the start's fitting tokens), a training
+//!   pass gates by `Φ(z_b / w_b)`, and the explanation is scored and exported with the hard gate
+//!   `H(z_b)` (`library_mdl::posterior_mean` writes the widths at [`HARD`](crate::library_vpd::HARD)).
+//!   The relaxed gate is an aid to the optimization alone: a ramp arm scored by `clamp(z_b / w_b,
+//!   0, 1)` scored an explanation other than the one a reader is given.
 //! A component counts as active where `z_b > 0`.
 //!
 //! Prior groups: per slice its read row and its write column (over every head for q, k and v),
@@ -142,8 +143,6 @@ pub enum Gate {
     /// Evaluated hard, `H(z)`; trained by its expectation under the posterior.
     #[default]
     Hard,
-    /// A learned width, evaluated by the ramp `clamp(z / w, 0, 1)`.
-    Ramp,
     /// A learned width, trained through `Φ(z / w)` and evaluated by the hard gate `H(z)`
     /// (`DeviceProgram::set_hard`). Trained as `Hard`, the expected gate `Φ(z / σ_τ)` steepens as
     /// the posterior sharpens (IVON sets `σ_τ` from the measured curvature every step, about 10⁻³
@@ -303,7 +302,7 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
             }
             let widths = match gate {
                 Gate::Hard => vec![HARD; count],
-                Gate::Ramp | Gate::Learned => comps.iter().map(|&b| components[b].width.filter(|w| w.is_finite() && *w > 0.0).ok_or_else(|| error(format!("component {b}: no positive gate width in the start file (rerun mpd_battery_2951 start)")))).collect::<Result<Vec<f64>, String>>()?,
+                Gate::Learned => comps.iter().map(|&b| components[b].width.filter(|w| w.is_finite() && *w > 0.0).ok_or_else(|| error(format!("component {b}: no positive gate width in the start file (rerun mpd_battery_2951 start)")))).collect::<Result<Vec<f64>, String>>()?,
             };
             // A shared own gate's width on the squared norm has the norm's slope at the threshold:
             // d‖·‖²/d‖·‖ = 2τ there (2w for a threshold below one width).
@@ -650,7 +649,6 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
     let built = groups_of(artifact, layers, gate)?;
     let scoring = match gate {
         Gate::Hard => crate::library_mdl::GateScoring::Compiled,
-        Gate::Ramp => crate::library_mdl::GateScoring::Ramp,
         Gate::Learned => crate::library_mdl::GateScoring::Hard,
     };
     Ok(Explanation { shares, fixed_nats: built.fixed_nats + choices, scoring, ..built })

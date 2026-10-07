@@ -54,7 +54,7 @@
 //!
 //! With `vpd` (`{"decomposition": D, "start": S, "arm": A}`), every block is VPD's slices with
 //! intrinsic gates (`library_vpd`), arm `A` of the start file `S` that `mpd_battery_2951 start`
-//! writes (`per_slice_own`, `grouped_own`, `grouped_direction`). An optional `"gate": "ramp"` gives a ramp arm with learned widths; the main arms (`hard`, the default) are evaluated with the hard gate. With `parts DIR`, nothing is
+//! writes (`per_slice_own`, `grouped_own`, `grouped_direction`). An optional `"gate": "learned"` trains learned widths; every arm is scored with the hard gate. With `parts DIR`, nothing is
 //! fitted: the components at the posterior mean of `OUT/checkpoint.bin` (the start's values when
 //! there is none) are written to `DIR` as the toy gate's parts (`library_vpd::dump_parts`: per
 //! component its slices' writes and reads on `M`'s operators, its gate, and its hard gate on every
@@ -123,7 +123,7 @@ struct VpdStart {
     decomposition: PathBuf,
     start: PathBuf,
     arm: String,
-    /// The gates' law (`library_vpd::Gate`): `hard` (the default) or `ramp`.
+    /// The gates' law (`library_vpd::Gate`): `hard` (the default) or `learned`.
     #[serde(default)]
     gate: gam_mpd::library_vpd::Gate,
 }

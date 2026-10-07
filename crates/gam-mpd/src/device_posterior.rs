@@ -854,6 +854,26 @@ impl DevicePosterior {
         Ok((self.mean.get(i).ok_or_else(|| error("no such trainable operator"))?, self.log_sd.get(i).ok_or_else(|| error("no such trainable operator"))?))
     }
 
+    /// Trainable operator `i`'s iterate before the pending move and its log standard deviations on
+    /// the device ([`Self::iterate_and_log_sd`] on the move's old side).
+    pub fn previous_and_log_sd(&self, i: usize) -> Result<(&Tensor, &Tensor), String> {
+        let pending = self.pending.as_ref().ok_or_else(|| error("no pending move"))?;
+        Ok((pending.means.get(i).ok_or_else(|| error("no such trainable operator"))?, self.log_sd.get(i).ok_or_else(|| error("no such trainable operator"))?))
+    }
+
+    /// A pending move of the iterate to `posterior`'s means from where it is, for a test of the
+    /// move's old side.
+    #[cfg(test)]
+    pub(crate) fn propose(&mut self, posterior: &Posterior) -> Result<(), String> {
+        let means = self.mean.iter().map(|m| self.fitting.copy(m)).collect::<Result<Vec<_>, _>>().map_err(error)?;
+        let averages = self.average.iter().map(|m| self.fitting.copy(m)).collect::<Result<Vec<_>, _>>().map_err(error)?;
+        for (i, values) in posterior.mean.iter().enumerate() {
+            self.mean[i] = self.fitting.upload(values.view()).map_err(error)?;
+        }
+        self.pending = Some(Pending { means, averages, divergence_nats: 0.0, predicted: 0.0 });
+        Ok(())
+    }
+
     /// Trainable operator `i`'s iterate `μ` on the host, whose Polyak average is the posterior's
     /// mean.
     pub fn iterate(&self, i: usize) -> Result<Array2<f64>, String> {
