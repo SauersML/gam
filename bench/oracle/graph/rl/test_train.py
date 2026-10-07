@@ -75,7 +75,49 @@ def main():
         (-(torch.tensor(adv) * (lp * mask).sum(1)).sum() / 2).backward()
         for a, b in zip(got, (p.grad for p in pol.params)):
             assert torch.allclose(a, b, atol=1e-6)
-    print("ok: token log-probabilities, KL 0 and DPO ln 2 at the reference, GRPO gradient = summed log-probability policy gradient")
+        check_init_adapter(Path(d))
+    check_split_prompts()
+    print("ok: token log-probabilities, KL 0 and DPO ln 2 at the reference, GRPO gradient = summed log-probability policy gradient, "
+          "g-predict's adapters = their PEFT conversion, prompt split")
+
+
+def check_init_adapter(base: Path):
+    """g-predict's sft.py adapters (its own wrap) and their PEFT conversion give the same logits."""
+    import json
+
+    from safetensors.torch import save_file
+    from transformers import AutoModelForCausalLM
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "predict"))
+    import sft
+
+    model = AutoModelForCausalLM.from_pretrained(base, dtype=torch.float32)
+    adapters = sft.wrap(model, 4, 8.0)
+    torch.manual_seed(2)
+    for a in adapters.values():
+        torch.nn.init.normal_(a.B, std=0.05)
+    ids = torch.randint(0, 1000, (1, 12))
+    with torch.no_grad():
+        want = model(input_ids=ids).logits
+    with tempfile.TemporaryDirectory() as d:
+        src = Path(d) / "sft"
+        src.mkdir()
+        save_file({f"{k}.{n}": getattr(a, n).detach().contiguous() for k, a in adapters.items() for n in ("A", "B")}, str(src / "adapters.safetensors"))
+        (src / "meta.json").write_text(json.dumps({"args": {"rank": 4, "alpha": 8.0, "model": str(base)}}))
+        pol = train.Policy(argparse.Namespace(base=str(base), init=train.init_adapter(str(src), Path(d)), lora_rank=4), torch.device("cpu"))
+        pol.model.float()
+        with torch.no_grad():
+            got = pol.model(input_ids=ids).logits
+    assert torch.allclose(got, want, atol=1e-4), float((got - want).abs().max())
+
+
+def check_split_prompts():
+    with tempfile.TemporaryDirectory() as d:
+        b = {"id": "x", "model": "vpd4l", "path": "/nowhere", "prompts": [{"text": str(i)} for i in range(10)]}
+        train_views, held = train.split_prompts([b], 4, Path(d))
+        assert [p["text"] for p in train_views[0]["prompts"]] == ["1", "2", "3", "5", "6", "7", "9"]
+        assert [p["text"] for p in held[0]["prompts"]] == ["0", "4", "8"]
+        assert Path(held[0]["path"]).exists() and "path" not in __import__("json").loads(Path(held[0]["path"]).read_text())
 
 
 if __name__ == "__main__":
