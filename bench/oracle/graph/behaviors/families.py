@@ -1425,7 +1425,7 @@ def syllogism(tok, rng):
             ("salmon", "fish", "a"), ("carrots", "vegetable", "a")]
     names = words(tok, NAMES_F + NAMES_M + ["Rex", "Fluffy", "Max", "Bella", "Spot"])
     v = Variant("all_are", "Syllogism: 'All X are Y. N is one of the X. So N is a' is followed by Y; the counterfactual changes the category.")
-    for _ in range(400):
+    for _ in range(1200):
         (x, y, art), (x2, y2, art2) = rng.sample(cats, 2)
         if art != art2:
             continue
@@ -1489,7 +1489,10 @@ def object_location(tok, rng):
 
 
 IMPORTS = [("numpy", "np"), ("pandas", "pd"), ("matplotlib.pyplot", "plt"), ("tensorflow", "tf"), ("seaborn", "sns"),
-           ("networkx", "nx"), ("scipy.stats", "stats"), ("torch.nn", "nn"), ("datetime", "dt"), ("plotly.express", "px")]
+           ("networkx", "nx"), ("scipy.stats", "stats"), ("torch.nn", "nn"), ("datetime", "dt"), ("plotly.express", "px"),
+           ("polars", "pl"), ("jax.numpy", "jnp"), ("statsmodels.api", "sm"), ("torch.nn.functional", "F"), ("xarray", "xr"),
+           ("dask.dataframe", "dd"), ("geopandas", "gpd"), ("plotly.graph_objects", "go"), ("tkinter", "tk"),
+           ("multiprocessing", "mp"), ("numpy.typing", "npt"), ("altair", "alt")]
 
 
 @family
@@ -1509,11 +1512,12 @@ def code_import_alias(tok, rng):
 def unit_conversion(tok, rng):
     """Convert a quantity between units by a factor of ten, a hundred or a thousand."""
     units = [("meters", "centimeters", 100), ("kilometers", "meters", 1000), ("kilograms", "grams", 1000), ("liters", "milliliters", 1000),
-             ("centimeters", "millimeters", 10), ("dollars", "cents", 100)]
+             ("centimeters", "millimeters", 10), ("dollars", "cents", 100), ("hours", "minutes", 60), ("minutes", "seconds", 60),
+             ("days", "hours", 24), ("weeks", "days", 7), ("feet", "inches", 12), ("dozens", "items", 12)]
     v = Variant("scale", "Unit conversion: after one worked example of the same units, a small quantity converted to the smaller unit; the counterfactual changes the quantity.")
-    for _ in range(400):
+    for _ in range(800):
         big, small, f = rng.choice(units)
-        q, q2 = rng.sample(range(2, 10), 2)
+        q, q2 = rng.sample(range(2, 10), 2) if rng.random() < 0.5 else rng.sample(range(11, 20), 2)
         t = "1 {b} = {f} {s}\n{q} {b} ="
         v.items.append(Item(t.format(b=big, f=f, s=small, q=q), f" {q * f}", t.format(b=big, f=f, s=small, q=q2), f" {q2 * f}"))
     return [v]
