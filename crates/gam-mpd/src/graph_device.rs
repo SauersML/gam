@@ -207,13 +207,26 @@ pub fn use_device(device: Device) -> bool {
     DEVICE.set(Mutex::new(DeviceState::new(device))).is_ok()
 }
 
-/// A weight edit is about to change host matrix `m` (in place or by replacing it): every resident
-/// copy of that shape is dropped, so neither `m` nor a matrix later allocated at a reused address
-/// reads a stale copy.
+/// A weight edit is about to change host matrix `m` in place or release it: its resident copy and
+/// the stacks built from it are dropped. Every in-place change or release of `M`'s matrices calls
+/// this first (`graph::WeightEdit`, `Weights::quantize` and their restores), so no copy is stale
+/// and a matrix later allocated at a released address never reads one. Dropping every copy of the
+/// shape instead re-uploaded a whole model after each edit (Qwen3-0.6B: the device thread spent
+/// its time uploading and freeing buffers).
 pub(crate) fn edited<A>(m: &Array2<A>) {
-    let dim = m.dim();
+    let key = (m.as_ptr() as usize, m.nrows(), m.ncols());
     on_device(|s| {
-        s.resident.retain(|k, _| (k.1, k.2) != dim);
+        s.resident.remove(&key);
+        s.stacks.retain(|(keys, _), _| !keys.contains(&key));
+    });
+}
+
+/// Drops every resident copy and stack: a newly loaded model's matrices may sit at addresses an
+/// earlier model's copies are keyed by.
+pub(crate) fn forget() {
+    on_device(|s| {
+        s.resident.clear();
+        s.uploaded.clear();
         s.stacks.clear();
     });
 }

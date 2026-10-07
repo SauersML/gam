@@ -360,6 +360,7 @@ impl Weights {
     /// `M`'s blocks with no decomposition views attached; a tied unembedding (equal to the
     /// embedding) is kept once.
     pub fn new(layers: Vec<LayerWeights>, final_norm: Norm, unembedding: Stored, embedding: Stored) -> Self {
+        crate::graph_device::forget();
         let embedding = Arc::new(embedding);
         let unembedding = if unembedding == *embedding { embedding.clone() } else { Arc::new(unembedding) };
         Self { layers, final_norm, unembedding, embedding, transcoders: BTreeMap::new(), vpd: BTreeMap::new(), vpd_attention: BTreeMap::new(), library: BTreeMap::new() }
@@ -1979,6 +1980,7 @@ impl WeightEdit {
             let picked_v = v.select(Axis(1), indices);
             delta = Some(picked_u.t().dot(&picked_v.t()) * (factor - 1.0));
             factors = Some((*down, u.clone()));
+            crate::graph_device::edited(u);
             for &i in indices {
                 u.row_mut(i).mapv_inplace(|x| x * factor);
             }
@@ -2048,6 +2050,7 @@ impl WeightEdit {
         // (out × in) change: U rows are outputs, V columns inputs.
         let delta = factors.0.select(Axis(0), indices).t().dot(&factors.1.select(Axis(1), indices).t()) * (factor - 1.0);
         let saved_u = factors.0.clone();
+        crate::graph_device::edited(&factors.0);
         for &i in indices {
             factors.0.row_mut(i).mapv_inplace(|x| x * factor);
         }
@@ -2105,12 +2108,21 @@ impl Restore {
         }
         if let Some((map, u)) = self.attention {
             let vpd = weights.vpd_attention.get_mut(&self.layer).ok_or("the VPD view of attention went missing")?;
-            [&mut vpd.q, &mut vpd.k, &mut vpd.v, &mut vpd.o][map.min(3)].0 = u;
+            let factors = match map {
+                0 => &mut vpd.q,
+                1 => &mut vpd.k,
+                2 => &mut vpd.v,
+                _ => &mut vpd.o,
+            };
+            crate::graph_device::edited(&factors.0);
+            factors.0 = u;
         }
         *WeightEdit::matrix(weights, self.layer, self.head, self.matrix)? = self.saved;
         if let Some((down, u)) = self.factors {
             let vpd = weights.vpd.get_mut(&self.layer).ok_or("the VPD view went missing")?;
-            *(if down { &mut vpd.down_u } else { &mut vpd.fc_u }) = u;
+            let target = if down { &mut vpd.down_u } else { &mut vpd.fc_u };
+            crate::graph_device::edited(target);
+            *target = u;
         }
         if let Some(lw) = weights.layers.get_mut(self.layer).filter(|_| !self.maps.is_empty()) {
             for (w, (key, value)) in lw.heads.iter_mut().zip(self.maps) {
@@ -2415,6 +2427,20 @@ fn device_head_edited(w: &HeadWeights) {
     }
 }
 
+/// The same for VPD's factors of an MLP or an attention (the device keeps them resident).
+fn device_vpd_edited(v: &VpdMlp) {
+    for m in [&v.fc_u, &v.fc_v, &v.down_u, &v.down_v] {
+        crate::graph_device::edited(m);
+    }
+}
+
+fn device_attention_edited(a: &VpdAttention) {
+    for (u, v) in [&a.q, &a.k, &a.v, &a.o] {
+        crate::graph_device::edited(u);
+        crate::graph_device::edited(v);
+    }
+}
+
 fn device_mlp_edited(m: &MlpWeights) {
     for x in [Some(&m.gate), m.up.as_ref(), Some(&m.out)].into_iter().flatten() {
         crate::graph_device::edited(x);
@@ -2434,10 +2460,14 @@ impl Unquantize {
             weights.layers[l].mlp = Some(m);
         }
         for (l, v) in self.vpd.into_iter().rev() {
-            weights.vpd.insert(l, v);
+            if let Some(old) = weights.vpd.insert(l, v) {
+                device_vpd_edited(&old);
+            }
         }
         for (l, a) in self.attention.into_iter().rev() {
-            weights.vpd_attention.insert(l, a);
+            if let Some(old) = weights.vpd_attention.insert(l, a) {
+                device_attention_edited(&old);
+            }
         }
         for (l, f, row) in self.features.into_iter().rev() {
             if let Some(t) = weights.transcoders.get_mut(&l) {
@@ -2518,6 +2548,7 @@ impl Weights {
                     let vpd = self.vpd.get_mut(layer).ok_or_else(|| format!("layer {layer} has no VPD view"))?;
                     let mlp = self.layers.get_mut(*layer).and_then(|l| l.mlp.as_mut()).ok_or("a VPD view of a layer without an MLP")?;
                     device_mlp_edited(mlp);
+                    device_vpd_edited(vpd);
                     out.vpd.push((*layer, vpd.clone()));
                     out.mlps.push((*layer, mlp.clone()));
                     // c_fc: gate (hidden × width) holds U_fc[i] ⊗ V_fc[:, i]; down_proj: out (width ×
@@ -2550,6 +2581,7 @@ impl Weights {
                 Block::AttnSlices { rest: true, .. } | Block::Features { rest: true, .. } => continue,
                 Block::AttnSlices { layer, q, k, v, o, .. } => {
                     let a = self.vpd_attention.get_mut(layer).ok_or_else(|| format!("layer {layer}'s attention has no VPD view"))?;
+                    device_attention_edited(a);
                     out.attention.push((*layer, a.clone()));
                     let lw = self.layers.get_mut(*layer).ok_or("no such layer")?;
                     for (h, w) in lw.heads.iter().enumerate() {
