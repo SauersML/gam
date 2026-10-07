@@ -366,7 +366,9 @@ class Scorer:
                             suffixes.append(body + c[:-1])
                             reads.append([(slot + j, [c[j]]) for j in range(len(c))])
                             where.append((b, k))
+                t0 = time.time()
                 got = self.backend.read(pr.prefix(texts[a]), suffixes, reads)
+                print(f"reader: text {a + 1}/{len(texts)}, {len(mine)} items, {len(suffixes)} sequences, {time.time() - t0:.1f} s", file=sys.stderr, flush=True)
                 first, extra = {}, {}
                 for (b, k), r in zip(where, got):
                     if k is None:
