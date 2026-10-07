@@ -309,8 +309,12 @@ def modadd(out: Path):
     perm = torch.randperm(p * p, generator=gen)
     train, test = perm[: int(0.3 * p * p)], perm[int(0.3 * p * p):]
     model = Lm(vocab=p + 1, d=128, layers=1, heads=4, hd=32, mlp=512).to(DEVICE)
+    # The norm gains stay at 1: a trained gain rescales the stream per coordinate, which weight
+    # decay on the maps around it then trades against, and the clocks spread over many frequencies.
+    for gain in [model.final, model.g1[0], model.g2[0]]:
+        gain.requires_grad_(False)
     tokens, labels = tokens.to(DEVICE), labels.to(DEVICE)
-    opt = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1.0, betas=(0.9, 0.98))
+    opt = torch.optim.AdamW([q for q in model.parameters() if q.requires_grad], lr=1e-3, weight_decay=1.0, betas=(0.9, 0.98))
     # past generalization (about step 5000) weight decay keeps cleaning the embedding up to a few
     # key frequencies (Nanda et al. 2023)
     for step in range(25000):
@@ -336,23 +340,14 @@ def modadd(out: Path):
 
 
 def modadd_truth(out: Path, model, tokens, files, config):
-    """The Fourier clocks: key frequencies from the embedding's power on cos/sin(2 pi k a / p),
-    and each MLP neuron assigned to the key frequency carrying most of its activation's power."""
+    """The Fourier clocks. Each MLP neuron's activation at the readout position over the full grid
+    of (a, b) is assigned to the frequency k carrying most of its power (the 2-D Fourier terms in a,
+    b and a + b at +-k); the key frequencies are the fewest carrying 90% of all neurons' assigned
+    power (a reporting cut for the truth only). A clock is its neurons' c_fc rows and down_proj
+    columns with the embedding's and readout's cos/sin(2 pi k a / p) plane."""
     p = 113
-    # Fourier key frequencies from the embedding: the power of W_E's token rows on cos/sin(2 pi k a / p)
-    WE = model.wte.detach().double().numpy()[:p]
     t = np.arange(p)
-    power = []
-    for k in range(1, p // 2 + 1):
-        basis = np.stack([np.cos(2 * np.pi * k * t / p), np.sin(2 * np.pi * k * t / p)], 1) / math.sqrt(p / 2)
-        power.append(np.sum((basis.T @ WE) ** 2))
-    power = np.array(power)
-    order = np.argsort(-power)
-    # key frequencies: the fewest whose embedding power is 90% of the total, a reporting cut only
-    cum = np.cumsum(power[order]) / power.sum()
-    keys = [int(order[i]) + 1 for i in range(int(np.searchsorted(cum, 0.9)) + 1)]
-    # MLP neurons by frequency: each neuron's activation over (a, b) on the full grid, its
-    # Fourier power in a + b and a, b separately, assigned to the key frequency it carries most
+    # MLP neurons by frequency
     mlp_acts = []
     with torch.no_grad():
         model(tokens, mlp_out=mlp_acts)
@@ -366,6 +361,10 @@ def modadd_truth(out: Path, model, tokens, files, config):
     total = (np.abs(A) ** 2).sum((0, 1)) - np.abs(A[0, 0]) ** 2
     best = neuron_power.argmax(1)
     share = neuron_power[np.arange(len(best)), best] / np.maximum(total, 1e-30)
+    power = np.array([neuron_power[best == k, k].sum() for k in range(nfreq)])
+    order = np.argsort(-power)
+    cum = np.cumsum(power[order]) / power.sum()
+    keys = [int(order[i]) for i in range(int(np.searchsorted(cum, 0.9)) + 1)]
     mechanisms = []
     WE_full = model.wte.detach().double().numpy()
     WU = model.lm_head.detach().double().numpy()
@@ -386,7 +385,7 @@ def modadd_truth(out: Path, model, tokens, files, config):
     active = np.ones((HELD_OUT * 3, len(mechanisms)), dtype=bool)
     record = {"model": "modadd_113", "kind": "language_model", "config": config,
               "task": "tokens a, b, = (113); the prediction at position 2 is (a + b) mod 113; positions 0, 1 untrained",
-              "key_frequencies": keys, "embedding_power": {int(k) + 1: float(power[k]) for k in order[:10]},
+              "key_frequencies": keys, "neuron_power_share": {int(k): float(power[k] / power.sum()) for k in order[:12]},
               "spd_published": "none for this toy (Nanda et al. 2023: 5 key frequencies at p = 113)"}
     finish(out, files, record, mechanisms, active)
 
