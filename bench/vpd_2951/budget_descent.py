@@ -23,6 +23,8 @@ Gate arms (DESCENT_ARM): own (above); dir, a separate signed gate direction per 
 small causal router per layer added to the own read; router_pure, the router alone; share, learned
 gate sharing across the slices of a layer (below).
 Objective (DESCENT_F=1): F, the bits-back code length per training token (below); otherwise KL alone.
+Wiring (DESCENT_EDGES=1, own arm): the MLP parts' reads of the residual stream are an explicit, fitted
+graph (below), each kept edge charged its index bits.
 Dual step (DESCENT_DUAL): measured (default, library_mdl's rule, below) or fixed (lambda <- lambda +
 0.01 log(E[k] / K) on the loss KL + lambda log E[k], the first runs' rule).
 Training rows 0..1023 of tokens.f64, held-out evaluation rows 1024..1031 (4096 tokens), where VPD's
@@ -194,21 +196,63 @@ if ARM == 'share':
             SHARE[l] = {'G': G.requires_grad_(), 'tg': tg.requires_grad_(), 'sg': sg, 'L': L.requires_grad_(), 'alive': alive,
                         'cols': {fc: slice(0, Cf), dn: slice(Cf, Fm.shape[1])}}
             print(f'layer {l}: {int(alive.sum())} of {Fm.shape[1]} slices fire; {int((size > 0).sum())} gates used, largest part {int(size.max())}', flush=True)
+# DESCENT_EDGES=1: explicit wiring between parts. A c_fc slice B of layer l (a part that reads the
+# residual stream) reads x_B = embedding + every attention output (exact, as in M) + the outputs of the
+# earlier layers' down_proj slices A (the parts that write the stream) on its input list in(B), not the
+# whole stream: its read is v_B . (gain_l * x_B) / r, the scale r = RMS of P's own full stream at the
+# pre-MLP norm (all executed parts, so P stays autonomous) and gain_l the norm's gain. Writing a_A for
+# A's coefficient on the token (its read times its gate) and u_A for its write,
+#   read_B = v_B . h - sum_{A not in in(B)} ((gain_l * v_B) . u_A) a_A / r,
+# h the full normed stream, so with every edge on the read is the slice's own (P unchanged). The edge
+# A -> B is kept where eta_AB > 0: in training the expected gate Phi(eta_AB) under unit Gaussian noise,
+# at evaluation the hard gate 1[eta_AB > 0]. Every kept edge costs its index bits, log2 of the number
+# of candidate sources of B (every down_proj slice of the earlier layers), added to the objective per
+# training token (/ N); the start keeps every edge (eta = 3), which is exact, and F prunes.
+EDGES = os.environ.get('DESCENT_EDGES') == '1'
+EDGE = {}
+if EDGES:
+    if ARM != 'own' or start == 'vpdgroup':
+        raise SystemExit('DESCENT_EDGES: the own arm with per-slice gates only (a shared or separate gate reads the full stream)')
+    for l in range(1, 4):
+        n_w = sum(P[f'h.{k}.mlp.down_proj']['V'].shape[1] for k in range(l))
+        EDGE[l] = {'eta': torch.full((n_w, P[f'h.{l}.mlp.c_fc']['V'].shape[1]), 3.0, device=dev, requires_grad=True), 'bits': math.log2(n_w)}
+        print(f'layer {l}: {n_w} x {EDGE[l]["eta"].shape[1]} candidate edges, {EDGE[l]["bits"]:.2f} bits each', flush=True)
+    # The pre-MLP norm's scale r of P's own full stream, recorded per layer as the model computes it.
+    MLP_NORM = {id(T.norms[2 * l + 1]): l for l in range(4)}
+    plain_rms = vpd_model.rms
+    def recording_rms(x, w, eps):
+        if id(w) in MLP_NORM:
+            state['r'][MLP_NORM[id(w)]] = (x.float().pow(2).mean(-1, keepdim=True) + eps).sqrt()
+        return plain_rms(x, w, eps)
+    vpd_model.rms = recording_rms
 del X
 
-state = {'mode': 'M', 'soft': [], 'hard': [], 'gates': {}, 'route': {}, 'share': {}}
+state = {'mode': 'M', 'soft': [], 'hard': [], 'gates': {}, 'route': {}, 'share': {}, 'r': {}, 'writers': {}, 'on': {}}
 SQ2 = math.sqrt(2)
 def make(n):
     st = T.site(n); p = P[n]; grp = GROUP.get(n); mult = MULT.get(n)
     layer = int(n.split('.')[1]); router = ROUTER.get(layer)
     if grp is not None:
         tied, own = grp[1] >= 0, grp[1].clamp_min(0)
+    def emit(coef):
+        # A down_proj slice's coefficient on each token (its read times its gate): what it writes.
+        if n.endswith('down_proj'):
+            state['writers'][layer] = coef
+        return coef @ p['U']
     def fwd(x):
         if state['mode'] == 'M':
             return x @ st.W.T
         c = x @ p['V']
         if state['mode'] == 'all':
-            return c @ p['U']
+            return emit(c)
+        if layer in EDGE and n.endswith('c_fc'):
+            # The read of the listed inputs only: the full read less the edges that are off.
+            E = EDGE[layer]
+            keep = (E['eta'] > 0).float() if state['mode'] == 'hard' else 0.5 * (1 + torch.erf(E['eta'] / SQ2))
+            writes = torch.cat([P[f'h.{k}.mlp.down_proj']['U'] for k in range(layer)])
+            interaction = writes @ (T.norms[2 * layer + 1][:, None] * p['V'])
+            a = torch.cat([state['writers'][k] for k in range(layer)], -1)
+            c = c - (a @ ((1 - keep) * interaction)) / state['r'][layer]
         if ARM == 'share':
             S = SHARE[layer]
             if n.endswith('c_fc'):
@@ -219,10 +263,10 @@ def make(n):
             hard = hg[..., Lc.argmax(1)] * alive
             state['hard'].append(hard.sum(-1).reshape(-1))
             if state['mode'] == 'hard':
-                return (c * hard) @ p['U']
+                return emit(c * hard)
             soft = pg @ (torch.softmax(Lc, 1) * alive[:, None]).T
             state['soft'].append(soft.sum(-1).reshape(-1))
-            return (c * soft) @ p['U']
+            return emit(c * soft)
         read = x @ p['G'] if ARM == 'dir' else c.abs() * p['U'].norm(dim=1)
         if router is not None:
             if n.endswith('c_fc'):
@@ -242,19 +286,21 @@ def make(n):
         if gate == 'ramp':
             a, width = read - p['tau'], p['lw'].exp()
             if state['mode'] == 'hard':
-                return (c * (a / width).clamp(0, 1)) @ p['U']
+                state['on'][n] = (a > 0).float()
+                return emit(c * (a / width).clamp(0, 1))
             state['soft'].append((phi * w).sum(-1).reshape(-1))
             # E[clamp((a + s e)/width, 0, 1)] for e ~ N(0, 1): (g(a) - g(a - width)) / width with
             # g(y) = E[(y + s e)^+] = y Phi(y/s) + s phi(y/s).
             def g(y):
                 t = y / p['s']
                 return y * 0.5 * (1 + torch.erf(t / SQ2)) + p['s'] * torch.exp(-0.5 * t * t) / math.sqrt(2 * math.pi)
-            return (c * (g(a) - g(a - width)) / width) @ p['U']
+            return emit(c * (g(a) - g(a - width)) / width)
         if state['mode'] == 'hard':
-            return (c * hard) @ p['U']
+            state['on'][n] = hard
+            return emit(c * hard)
         state['soft'].append((phi * w).sum(-1).reshape(-1))
         g = phi if gate == 'mf' else hard + phi - phi.detach()
-        return (c * g) @ p['U']
+        return emit(c * g)
     return fwd
 for n in mlp: T.site(n)._forward = make(n)
 
@@ -266,20 +312,65 @@ def run(ids, mode):
     state['mode'], state['soft'], state['hard'] = mode, [], []
     return T(ids)
 
+def kept_edges():
+    """Per layer with edges, the kept edges (hard) between the parts active on each token: the mean
+    over the tokens of the last hard run."""
+    out = {}
+    for l, E in EDGE.items():
+        writers = torch.cat([state['on'][f'h.{k}.mlp.down_proj'] for k in range(l)], -1).reshape(-1, E['eta'].shape[0])
+        readers = state['on'][f'h.{l}.mlp.c_fc'].reshape(-1, E['eta'].shape[1])
+        out[l] = ((writers @ (E['eta'] > 0).float()) * readers).sum(-1).mean().item()
+    return out
+
+def example_graph(position):
+    """The explanation's graph on one token (held-out row 1024 at `position`) from the last hard run:
+    the active parts of every map (slices whose hard gate is on) and the kept edges between active
+    parts, each with the term it adds to its reader's read, ((gain * v_B) . u_A) a_A / r."""
+    active = {n: torch.nonzero(state['on'][n][0, position] > 0).squeeze(1).tolist() for n in mlp}
+    edges = []
+    for l, E in EDGE.items():
+        fc = f'h.{l}.mlp.c_fc'
+        sources = [(f'h.{k}.mlp.down_proj', j) for k in range(l) for j in range(P[f'h.{k}.mlp.down_proj']['V'].shape[1])]
+        on_w = torch.cat([state['on'][f'h.{k}.mlp.down_proj'][0, position] for k in range(l)]) > 0
+        a = torch.cat([state['writers'][k][0, position] for k in range(l)])
+        writes = torch.cat([P[f'h.{k}.mlp.down_proj']['U'] for k in range(l)])
+        interaction = writes @ (T.norms[2 * l + 1][:, None] * P[fc]['V'])
+        for A in torch.nonzero(on_w).squeeze(1).tolist():
+            for B in active[fc]:
+                if E['eta'][A, B] > 0:
+                    edges.append([*sources[A], fc, B, round((interaction[A, B] * a[A] / state['r'][l][0, position, 0]).item(), 5)])
+    return {'row': 1024, 'position': position, 'active': active, 'edges': edges}
+
 @torch.no_grad()
-def evaluate():
-    r = {'kl': [], 'kl_soft': [], 'kl_all_on': [], 'active': [], 'active_soft': [], 'per_map': []}
+def evaluate(final=False):
+    r = {'kl': [], 'kl_soft': [], 'kl_all_on': [], 'active': [], 'active_soft': [], 'per_map': [], 'edges_active': []}
+    graph = None
     for i in range(0, ev.shape[0], 4):
         ids = ev[i:i + 4]
         lm = run(ids, 'M')
         lp = run(ids, 'hard'); r['kl'].append(kl_bits(lm, lp).mean().item())
         r['active'].append(torch.stack(state['hard']).sum(0).mean().item())
         r['per_map'].append([h.mean().item() for h in state['hard']])
+        if EDGES:
+            r['edges_active'].append(sum(kept_edges().values()))
+            if final and i == 0:
+                graph = example_graph(255)
         lp = run(ids, 'soft'); r['kl_soft'].append(kl_bits(lm, lp).mean().item())
         r['active_soft'].append(torch.stack(state['soft']).sum(0).mean().item())
         lp = run(ids, 'all'); r['kl_all_on'].append(kl_bits(lm, lp).mean().item())
-    out = {k: float(np.mean(v)) for k, v in r.items() if k != 'per_map'}
+    out = {k: float(np.mean(v)) for k, v in r.items() if k != 'per_map' and v}
     out['per_map'] = [round(float(x), 2) for x in np.mean(r['per_map'], 0)]
+    if EDGES:
+        # Kept edges per layer, and the distribution of each reader part's inputs (its kept edges).
+        out['edges'] = {}
+        for l, E in EDGE.items():
+            inputs = (E['eta'] > 0).float().sum(0)
+            q = torch.quantile(inputs, torch.tensor([0.0, 0.25, 0.5, 0.75, 0.9, 1.0], device=dev)).tolist()
+            out['edges'][l] = {'kept': int(inputs.sum().item()), 'candidates': E['eta'].numel(), 'inputs_per_part_quantiles_0_25_50_75_90_100': [round(x, 1) for x in q],
+                               'inputs_per_part_mean': round(inputs.mean().item(), 2), 'parts_with_no_input': int((inputs == 0).sum().item())}
+        out['edge_bits'] = sum(E['bits'] * (E['eta'] > 0).float().sum().item() for E in EDGE.values())
+        if graph is not None:
+            out['example_graph'] = graph
     if SHARE:
         # Parts under the hardened assignment: per layer, the gates used and their ranks (slices).
         out['parts'] = []
@@ -329,6 +420,8 @@ if FMODE:
         groups += [{'params': [mu], 'lr': LR * 3e-3 * scale}, {'params': [ls], 'lr': LR * 1e-2}]
 else:
     groups = [{'params': [cont[key]], 'lr': LR * 3e-3 * scale} for cont, key, scale in slots]
+# Edge gates by 0.01 per step (from the start's 3, 300 steps to drop an edge the data never defends).
+groups += [{'params': [E['eta']], 'lr': LR * 1e-2} for E in EDGE.values()]
 opt = torch.optim.Adam(groups)
 trainable = [q for g in groups for q in g['params']]
 
@@ -353,7 +446,7 @@ def description_bits():
 B = train_rows * 512 / (batch * seq)
 DUAL = os.environ.get('DESCENT_DUAL', 'measured')
 lam, rng = 0.0, np.random.default_rng(0)
-log = {'start': start, 'K': K, 'steps': steps, 'gate': gate, 'arm': ARM, 'dual': DUAL, 'train_rows': train_rows, 'F': FMODE, 'trace': []}
+log = {'start': start, 'K': K, 'steps': steps, 'gate': gate, 'arm': ARM, 'dual': DUAL, 'train_rows': train_rows, 'F': FMODE, 'edges': EDGES, 'trace': []}
 draw(True)
 e = evaluate(); print('start', e, flush=True); log['trace'].append({'step': 0, **e})
 t0 = time.time()
@@ -367,7 +460,9 @@ for step in range(steps):
     kl = kl_bits(lm, lp).mean()
     # The objective's data and description terms (F; without DESCENT_F only the data term).
     desc = description_bits() if FMODE else torch.zeros((), device=dev)
-    objective = kl + desc / N
+    # Each kept edge's index bits, at the expected gates.
+    edge_bits = sum(E['bits'] * (0.5 * (1 + torch.erf(E['eta'] / SQ2))).sum() for E in EDGE.values()) if EDGES else torch.zeros((), device=dev)
+    objective = kl + (desc + edge_bits) / N
     ek = torch.stack(state['soft']).sum(0).mean()
     hk = torch.stack(state['hard']).sum(0).mean().item()
     if DUAL == 'fixed':
@@ -390,8 +485,8 @@ for step in range(steps):
     last = step == steps - 1 or time.time() - t0 > LIMIT
     if (step + 1) % EVAL == 0 or last:
         draw(True)
-        e = evaluate()
-        rec = {'step': step + 1, 'lambda': lam, 'train_kl': kl.item(), 'description_bits': desc.item(),
+        e = evaluate(final=last)
+        rec = {'step': step + 1, 'lambda': lam, 'train_kl': kl.item(), 'description_bits': desc.item(), 'train_edge_bits': float(edge_bits),
                'train_F': objective.item(), 'train_k_soft': ek.item(), 'train_k_hard': hk, **e,
                'seconds': time.time() - t0}
         log['trace'].append(rec); print(rec, flush=True)
