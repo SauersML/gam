@@ -29,7 +29,7 @@ gen parts_all --windows "$HELDW" --texts 2048 --offset 50000 --split heldout --s
 gen parts_moved --windows "$HELDW" --texts 4096 --offset 52048 --split heldout --min-kl 0.1 --seed 302
 sets=(--heldout "parts_all=$OUT/data/parts_all.jsonl" --heldout "parts_moved=$OUT/data/parts_moved.jsonl")
 [ -s "$OUT/sft/adapters.safetensors" ] || $PY "$here/sft.py" --model "$ORACLE" --train "$OUT/data/train.jsonl" "${sets[@]}" --out "$OUT/sft" \
-    --steps "$STEPS" --hours "$HOURS" --changed-min 0.1 --changed-share 0.5 --eval-every 100 --curve-per-type 32 --eval-per-type 64 --save-every 300 "${vec[@]}"
+    --steps "$STEPS" --hours "$HOURS" --changed-min 0.1 --changed-share 0.5 --eval-every 100 --curve-per-type 32 --eval-per-type 64 --save-every 300 "${vec[@]}" ${SFT_EXTRA:-}  # e.g. SFT_EXTRA="--checkpointing on" for 14B on 48 GB
 kl() { [ -s "$OUT/sft/eval_kl_$1.json" ] || $PY "$here/eval_kl.py" --model "$ORACLE" "${sets[@]}" --per-type 64 --stratify --batch 16 --out "$OUT/sft/eval_kl_$1.json" "${@:2}"; }
 kl base
 ch() { [ ${#vec[@]} -gt 0 ] && echo "--channel $OUT/sft/$1.safetensors"; }  # the channel trained beside those adapters
