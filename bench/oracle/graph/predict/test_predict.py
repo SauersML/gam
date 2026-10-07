@@ -211,3 +211,23 @@ def test_draws_respect_the_piece_split(qwen):
                 assert all(G.held_out_units("neuron", p[1], qwen.Fn)[i] == (split == "heldout") for i in p[2])
             else:
                 assert split == "train"  # whole blocks only in training shards
+
+
+def test_vpd_subcomponents_are_the_engines():
+    """PD.vpd[l].site[i] means the same subcomponent here (uv.safetensors) as in the Rust engine's export and
+    in mech's shapes: identical factors, same order, same counts."""
+    export = Path.home() / "mpd-data/engine/vpd4l_decomposition"
+    if not (VPD.exists() and export.exists()):
+        pytest.skip("vpd4l files absent")
+    from safetensors.numpy import load_file
+
+    uv = load_file(str(VPD))
+    files = json.loads((export / "export.json").read_text())["files"]
+    shapes = json.loads((HERE.parent / "shapes.json").read_text())["vpd4l"]["views"]["vpd"]
+    for name, meta in files.items():
+        if name.endswith((".U", ".V")):
+            a = np.fromfile(export / f"{name}.f64", dtype="<f8").reshape(meta["shape"])
+            assert np.array_equal(a, uv[name].astype(np.float64)), name
+            if name.endswith(".U"):
+                layer, site = int(name.split(".")[1]), name.split(".")[3]
+                assert shapes[layer][site] == a.shape[0], name
