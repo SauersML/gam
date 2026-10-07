@@ -21,8 +21,14 @@ points = [p for p in points if not p['label'].startswith('VPD')]
 for form, label in labels.items():
     path = f'{D}/EDITS_vpd_{form}.json'
     json.dump(dict(r['manifest'], families=r['site_edits'][form]['families'], manifest_check=check, source_revision=r.get('source_revision')), open(path, 'w'), indent=1)
-    # Executed per token: every subcomponent (38,912) plus the CI network; active: the masked 213.
-    points.append({'label': label, 'edits': path, 'executed': 38912, 'executed_note': 'all 38,912 subcomponents plus the causal-importance network', 'active': 213,
-                   'description_bits': 11.4e6 + 77.2e6, 'description_note': '11.4M subcomponents + 77.2M CI network (vpdstart)'})
+    # Executed per token, in rank-one units: every subcomponent (38,912, each computed before its
+    # mask), the causal-importance network at each matrix's rank (input 2,048, 8 blocks of q, k, v,
+    # o, fc1, fc2 at 2,048, head 2,048: 102,400), and the run its masks read: M's forward at its
+    # rank (4 layers of q, k, v, o, c_fc, down_proj at 768: 18,432), or for the autonomous form
+    # VPD's own pass with every mask 1 (38,912). Active: the 213 unmasked per token.
+    read = 38912 if form == 'autonomous' else 18432
+    points.append({'label': label, 'edits': path, 'executed': 38912 + 102400 + read, 'active': 213,
+                   'executed_note': f"38,912 subcomponents + 102,400 CI network + {read:,} {'all-on pass' if form == 'autonomous' else 'M forward'}",
+                   'description_bits': 11.4e6 + 77.2e6, 'description_note': '11.4M bits subcomponents + 77.2M bits CI network'})
 json.dump(points, open('/Users/user/mpd-data/compare/frontier_points.json', 'w'), indent=1)
 print('points', [p['label'] for p in points])

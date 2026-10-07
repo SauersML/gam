@@ -4,8 +4,10 @@ x = parts executed per token, counting all executed machinery in rank-one units:
 parts that are evaluated on every token (a transcoder's features: every gate is computed; VPD's
 subcomponents: every one is computed before its mask) plus every map of M it runs unchanged, counted
 at its rank (vpd4l's attention, run as M's own by an MLP-only explanation: q, k, v, o of 768 x 768 per
-layer, 4 x 4 x 768 = 12,288). A second, open marker at the parts active per token (nonzero, or
-unmasked) plus the same unchanged maps.
+layer, 4 x 4 x 768 = 12,288), and every network and pass whose output the explanation needs (VPD:
+its causal-importance network at each matrix's rank, 102,400, and the run its masks read, M's forward
+at its rank, 18,432, or for the autonomous form VPD's own all-on pass, 38,912). A second, open
+marker at the parts active per token (nonzero, or unmasked; VPD's 213) plus the same unchanged maps.
 y = mean KL(M_e || P_e) in bits/token over every scored token of the manifest's operations.
 Labels: description bits under the one convention of compare_f_edits.py, and, for an explanation that runs
 M's attention unchanged, that attention's own description at the Laplace start with its means held at M
@@ -72,7 +74,8 @@ for name, label in (('compare-vpd4l-tc4096-thr2', 'transcoder fit by F, read pat
         e = (best.get('best') or [0, best['epoch'] - 1])[1]
         rec = next((x['held_out'] for x in h['epochs'] if x['epoch'] == e), None)
         label += f', epoch {e}'
-    arms.append((label, f'{C7}/{name}', 'EDITS_thr_best_ops.json', rec))
+    # The pair's fits were stopped at 17:15 on 10-06: their last best epochs are the final baselines.
+    arms.append(('baseline: ' + label, f'{C7}/{name}', 'EDITS_thr_best_ops.json', rec))
 for label, d, f, rec in arms:
     r = L(f'{d}/{f}')
     if not r or not rec:
@@ -112,9 +115,10 @@ if len(sys.argv) > 1 and points:
         ax.scatter([p['active']], [p['gap']], s=90, facecolors='none', edgecolors=c)
         ax.plot([p['active'], p['executed']], [p['gap'], p['gap']], color=c, lw=1)
         attn = f"\n+ {p['attention_bits'] / 1e6:.1f}M bits for M's attention it runs" if p.get('attention_bits') else ("\n+ M's attention it runs (pricing pending)" if p.get('runs_m_attention') else '')
-        ax.annotate('\n'.join(textwrap.wrap(p['label'], 34)) + f"\n{p['description_bits'] / 1e6:.1f}M bits" + attn, (p['executed'], p['gap']), textcoords='offset points', xytext=(8, 4), fontsize=10)
+        bits = p.get('description_note') or f"{p['description_bits'] / 1e6:.1f}M bits"
+        ax.annotate('\n'.join(textwrap.wrap(p['label'], 34) + textwrap.wrap(bits, 34)) + attn, (p['executed'], p['gap']), textcoords='offset points', xytext=(8, 4), fontsize=10)
     ax.set_xscale('log')
-    ax.set_xlim(100, 1e5)
+    ax.set_xlim(30, 5e5)
     ax.xaxis.set_minor_formatter(matplotlib.ticker.NullFormatter())
     ax.xaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(lambda v, _: f'{v:,.0f}'))
     ax.set_xlabel('parts executed per token, rank-one units (filled); active (open)')
