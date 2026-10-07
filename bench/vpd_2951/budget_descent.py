@@ -180,8 +180,10 @@ def evaluate():
 
 params = [P[n][w] for n in mlp for w in (('V', 'U', 'G') if ARM == 'dir' else ('V', 'U'))]
 # Adam steps of 0.3% of each tensor's root mean square, thresholds 1% of their site's noise scale x 10.
-groups = [{'params': [q], 'lr': 3e-3 * q.detach().pow(2).mean().sqrt().item()} for q in params]
-groups += [{'params': [P[n]['tau']], 'lr': 0.1 * P[n]['s'].mean().item()} for n in mlp]
+# DESCENT_LR multiplies every step size (default 1).
+LR = float(os.environ.get('DESCENT_LR', '1'))
+groups = [{'params': [q], 'lr': LR * 3e-3 * q.detach().pow(2).mean().sqrt().item()} for q in params]
+groups += [{'params': [P[n]['tau']], 'lr': LR * 0.1 * P[n]['s'].mean().item()} for n in mlp]
 opt = torch.optim.Adam(groups)
 lam, eta, rng = 0.0, 0.01, np.random.default_rng(0)
 log = {'start': start, 'K': K, 'steps': steps, 'gate': gate, 'trace': []}
