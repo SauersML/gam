@@ -321,6 +321,45 @@ class VllmSampler:
         return [[list(c.token_ids) for c in o.outputs] for o in outs]
 
 
+class ValidSampler:
+    """Draws n programs per prompt and redraws each invalid one (mech.trace: syntax, unknown names, an index
+    beyond its site's size, a rule broken) up to `rounds` times, so the policy is sampled restricted to the
+    programs it can write validly; stats holds the valid share before and after the redraws."""
+
+    def __init__(self, inner, tok, model: str, rounds: int):
+        self.inner, self.tok, self.model, self.rounds = inner, tok, model, rounds
+        self.logprob_sums, self.stats = None, {}
+
+    def valid(self, completions: list[list[int]]) -> list[bool]:
+        import mech
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(8) as ex:  # each trace is a fork of a tracer server
+            return list(ex.map(lambda c: bool(mech.trace(program_of(self.tok.decode(c, skip_special_tokens=True)), self.model)["valid"]), completions))
+
+    def __call__(self, prompts: list[list[int]], n: int, adapter: Path, version: int) -> list[list[list[int]]]:
+        groups = self.inner(prompts, n, adapter, version)
+        sums = list(self.inner.logprob_sums) if self.inner.logprob_sums is not None else None
+        flags = [self.valid(g) for g in groups]
+        first = float(np.mean([f for fs in flags for f in fs]))
+        for _ in range(self.rounds):
+            slots = [(g, j) for g in range(len(groups)) for j in range(n) if not flags[g][j]]
+            if not slots:
+                break
+            redo = self.inner([prompts[g] for g, _ in slots], 1, adapter, version)
+            redo_sums = self.inner.logprob_sums
+            ok = self.valid([r[0] for r in redo])
+            for k, ((g, j), r) in enumerate(zip(slots, redo)):
+                groups[g][j], flags[g][j] = r[0], ok[k]
+                if sums is not None:
+                    sums = None if redo_sums is None else sums
+                    if sums is not None:
+                        sums[g * n + j] = redo_sums[k]
+        self.logprob_sums = sums
+        self.stats = {"first_valid": first, "final_valid": float(np.mean([f for fs in flags for f in fs]))}
+        return groups
+
+
 def micro_batches(n: int, size: int):
     for s in range(0, n, size):
         yield list(range(s, min(n, s + size)))
@@ -545,6 +584,8 @@ def evaluate(sets: dict[str, list[dict]], pol, sampler, score, args, adapter: Pa
                 out.append((b, mine, per_base.get(b["id"], {})))
             if out:
                 summary[name] = summarize(name, step, out, log)
+            if getattr(sampler, "stats", None):
+                summary.setdefault(name, {})["sampling"] = dict(sampler.stats)
     log.write(json.dumps({"summary": summary, "step": step}) + "\n")
     log.flush()
     return summary
@@ -654,6 +695,7 @@ def main():
     ap.add_argument("--micro", type=int, default=2)
     ap.add_argument("--pack", action="store_true", help="GRPO / DPO: one sequence per group (the shared prompt once; see Policy.token_logprobs); sets GRPO's micro-batch to the group")
     ap.add_argument("--sampler", choices=["auto", "vllm", "hf"], default="auto")
+    ap.add_argument("--resample", type=int, default=0, help="redraw each invalid program (mech.trace) up to R times at sampling time")
     ap.add_argument("--hf-batch", type=int, default=16, help="sequences per transformers generate call (the Mac / CPU sampler)")
     ap.add_argument("--gpu-memory", type=float, default=0.85, help="vLLM's share of its GPU (lower it when the trainer shares the GPU)")
     ap.add_argument("--prompt-holdout", type=int, default=4, help="every K-th prompt of each training behavior is held out for evaluation (0: none)")
@@ -703,6 +745,8 @@ def main():
     pol = Policy(args, dev)
     if sampler is None:
         sampler = HfSampler(pol, args.max_tokens, args.hf_batch)
+    if args.resample:
+        sampler = ValidSampler(sampler, pol.tok, args.model, args.resample)
     if args.checker:
         os.environ["GRAPH_CHECKER"] = str(Path(args.checker).resolve())
     score = SCORERS[args.scorer]
@@ -793,7 +837,7 @@ def main():
         tokens = [len(c) for c in flat_c]
         log.write(json.dumps({"step": step, "mode": args.mode, "behaviors": len(chosen), "programs": len(items), "mean_bits": float(S.mean()), "best_bits": float(S.min(1).mean()),
                               "worst_bits": float(S.max(1).mean()), "valid_fraction": float(valid.mean()), "mean_completion_tokens": float(np.mean(tokens)), **stats,
-                              "seconds": {"sample": t1 - t0, "score": t2 - t1, "train": t3 - t2}, "elapsed": time.time() - started,
+                              "sampling": getattr(sampler, "stats", {}), "seconds": {"sample": t1 - t0, "score": t2 - t1, "train": t3 - t2}, "elapsed": time.time() - started,
                               "example": items[int(np.where(valid, S, np.inf).reshape(-1).argmin())]["source"][:2000]}) + "\n")
         log.flush()
     pol.save(adapter)

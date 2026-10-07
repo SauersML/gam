@@ -45,7 +45,8 @@ def main():
     check_evaluate()
     check_sft_examples()
     check_rescore()
-    print("ok: checker scorer order, behaviors and one batch per (behavior, seed); repair keeps a revision only when it lowers S; evaluation summary; SFT data uses each training behavior's best program only; rescore")
+    check_valid_sampler()
+    print("ok: checker scorer order, behaviors and one batch per (behavior, seed); repair keeps a revision only when it lowers S; evaluation summary; SFT data uses each training behavior's best program only; rescore; validity redraws")
 
 
 def check_repair():
@@ -152,6 +153,29 @@ def check_rescore():
     assert s["best_of_n_bits"] == 20.0 and s["baselines"] == {"empty": 100.0} and abs(s["best_recovered"] - 0.8) < 1e-12, s
     assert set(seen) == {(5, 16, '{"families": ["swap"]}')}, seen
     assert sum(1 for _ in open(d / "rescore_t.jsonl")) == 3
+
+
+
+def check_valid_sampler():
+    """ValidSampler redraws only the invalid programs, keeps n per prompt and reports the valid share
+    before and after."""
+    import train
+
+    good = "from mech import node, edges, L, logits\nh = node(L[1].head[0])\nedges(h >> logits)\n"
+    tok = types.SimpleNamespace(decode=lambda c, skip_special_tokens=True: good if c[0] > 0 else "nonsense(")
+    calls = []
+
+    class Inner:
+        logprob_sums = None
+
+        def __call__(self, prompts, n, adapter, version):
+            calls.append((len(prompts), n))
+            return [[[1 if len(calls) > 1 else (j % 2)] for j in range(n)] for _ in prompts]
+
+    vs = train.ValidSampler(Inner(), tok, "vpd4l", 2)
+    out = vs([[0], [0]], 4, Path("."), 0)
+    assert calls == [(2, 4), (4, 1)], calls  # 4 invalid slots redrawn once
+    assert all(len(g) == 4 for g in out) and vs.stats == {"first_valid": 0.5, "final_valid": 1.0}, vs.stats
 
 
 if __name__ == "__main__":
