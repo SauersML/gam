@@ -2264,10 +2264,66 @@ impl Checker {
         if let Some(hit) = self.cache.get(&key) {
             return Ok((**hit).clone());
         }
-        let circuit = graph.model(&self.weights);
-        let out = self.outcome(&circuit, e)?;
+        let out = match self.disk_get(&key) {
+            Some(m) => m,
+            None => {
+                let circuit = graph.model(&self.weights);
+                let m = self.outcome(&circuit, e)?;
+                self.disk_put(&key, &m);
+                m
+            }
+        };
         self.keep(key, Arc::new(out.clone()));
         Ok(out)
+    }
+
+    /// The file of `M`'s outcome under `key` in the disk cache `GRAPH_DISK_CACHE` (shared by every
+    /// checker process): named by the behavior, a fingerprint of its prompts and of `M`'s weights,
+    /// and the key; `None` when the cache is off.
+    fn disk_path(&self, key: &str) -> Option<std::path::PathBuf> {
+        let dir = std::env::var_os("GRAPH_DISK_CACHE")?;
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut absorb = |bytes: &[u8]| {
+            for &b in bytes {
+                h = (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3);
+            }
+        };
+        for p in &self.behavior.prompts {
+            p.token_ids.iter().for_each(|t| absorb(&t.to_le_bytes()));
+            p.target_positions.iter().for_each(|t| absorb(&t.to_le_bytes()));
+            if let Some(c) = &p.counterfactual {
+                c.token_ids.iter().for_each(|t| absorb(&t.to_le_bytes()));
+            }
+        }
+        let prompts = h;
+        let w = &self.weights;
+        for v in w.embedding.row(0).iter().chain(w.unembedding.row(w.unembedding.nrows() - 1).iter()).chain(w.layers.iter().flat_map(|l| l.mlp.iter().flat_map(|m| m.out.row(0).to_vec()))) {
+            absorb(&v.to_le_bytes());
+        }
+        absorb(key.as_bytes());
+        Some(std::path::Path::new(&dir).join(format!("{}_{prompts:016x}", self.behavior.id)).join(format!("{h:016x}.f64")))
+    }
+
+    /// `M`'s outcome under `key` from the disk cache, when it holds it.
+    fn disk_get(&self, key: &str) -> Option<Array2<f64>> {
+        let bytes = std::fs::read(self.disk_path(key)?).ok()?;
+        let (rows, cols) = (u64::from_le_bytes(bytes.get(..8)?.try_into().ok()?) as usize, u64::from_le_bytes(bytes.get(8..16)?.try_into().ok()?) as usize);
+        let values: Vec<f64> = bytes.get(16..)?.chunks_exact(8).map(|c| f64::from_le_bytes(c.try_into().unwrap_or_default())).collect();
+        Array2::from_shape_vec((rows, cols), values).ok()
+    }
+
+    /// Writes `M`'s outcome under `key` to the disk cache (written whole, then renamed into place).
+    fn disk_put(&self, key: &str, m: &Array2<f64>) {
+        let Some(path) = self.disk_path(key) else { return };
+        let (Some(dir), true) = (path.parent(), m.is_standard_layout()) else { return };
+        let mut bytes = Vec::with_capacity(16 + 8 * m.len());
+        bytes.extend_from_slice(&(m.nrows() as u64).to_le_bytes());
+        bytes.extend_from_slice(&(m.ncols() as u64).to_le_bytes());
+        m.iter().for_each(|v| bytes.extend_from_slice(&v.to_le_bytes()));
+        let partial = path.with_extension(format!("partial{}", std::process::id()));
+        if std::fs::create_dir_all(dir).is_ok() && std::fs::write(&partial, bytes).is_ok() {
+            std::fs::rename(&partial, &path).ok();
+        }
     }
 
     /// The program's score under `count` sampled experiments (seed `seed`); `edges` routes by the
@@ -2338,7 +2394,15 @@ impl Checker {
                 let this = &*self;
                 let made: Vec<(String, Arc<Array2<f64>>)> = missing
                     .par_iter()
-                    .map(|&r| this.run(&models[runs[r].0], &runs[r].1).map(|m| (runs[r].2.clone(), Arc::new(m))))
+                    .map(|&r| {
+                        let key = &runs[r].2;
+                        if let Some(m) = this.disk_get(key) {
+                            return Ok((key.clone(), Arc::new(m)));
+                        }
+                        let m = this.run(&models[runs[r].0], &runs[r].1)?;
+                        this.disk_put(key, &m);
+                        Ok((key.clone(), Arc::new(m)))
+                    })
                     .collect::<Result<_, String>>()?;
                 let fresh: BTreeMap<String, Arc<Array2<f64>>> = made.iter().cloned().collect();
                 let this = &*self;

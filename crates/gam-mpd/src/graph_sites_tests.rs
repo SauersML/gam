@@ -319,3 +319,22 @@ fn batch_scores_equal_single_scores() {
     assert!(!batch[3].0.valid && batch[3].0.error.is_some());
     assert!(batch[0].0.exec_error_bits / batch[0].0.n < 1e-9, "the full program is M");
 }
+
+/// With `GRAPH_DISK_CACHE` set, a second checker of the same behavior reads `M`'s outcomes from
+/// the first one's files and scores the same.
+#[test]
+fn the_disk_cache_serves_a_second_checker() {
+    let (weights, sequences) = model("graph_sites_disk");
+    let dir = std::env::temp_dir().join(format!("graph_sites_disk_{}", std::process::id()));
+    // SAFETY: the variable is read by checkers this test makes; tests that read it run nowhere else.
+    unsafe { std::env::set_var("GRAPH_DISK_CACHE", &dir) };
+    let mut first = Checker::new(weights.clone(), behavior(&sequences)).expect("checker");
+    let (a, _) = first.score(&Program { model: "tiny".into(), valid: true, ..Program::default() }, 12, 4, true, None).expect("score");
+    let files = std::fs::read_dir(&dir).map(|d| d.flatten().flat_map(|e| std::fs::read_dir(e.path()).into_iter().flatten()).count()).unwrap_or(0);
+    let mut second = Checker::new(weights, behavior(&sequences)).expect("checker");
+    let (b, _) = second.score(&Program { model: "tiny".into(), valid: true, ..Program::default() }, 12, 4, true, None).expect("score");
+    unsafe { std::env::remove_var("GRAPH_DISK_CACHE") };
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(files > 0, "no outcome written");
+    assert_eq!(a.exec_error_bits, b.exec_error_bits);
+}
