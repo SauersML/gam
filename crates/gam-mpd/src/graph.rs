@@ -206,9 +206,74 @@ pub struct Weights {
     pub final_norm: Norm,
     pub unembedding: Array2<f64>,
     pub embedding: Array2<f64>,
+    /// Per layer with a transcoder view, its features (`attach_transcoders`).
+    pub transcoders: BTreeMap<usize, Features>,
+}
+
+/// One layer's transcoder (circuit-tracer's single-layer ReLU transcoder, `library_transcoder`):
+/// feature `i` reads the MLP's normed input `x̂` and writes `relu(g_i·x̂ + c_i) u_i`. The file, its
+/// feature count, and the rows of the features programs declare (read on demand,
+/// [`Weights::load_features`]).
+#[derive(Clone, Debug)]
+pub struct Features {
+    pub path: std::path::PathBuf,
+    pub count: usize,
+    rows: BTreeMap<usize, (Array1<f64>, f64, Array1<f64>)>,
+}
+
+impl Features {
+    /// The write of features `features` on normed inputs `x_hat` (rows × width).
+    fn write(&self, features: &[usize], x_hat: &Array2<f64>) -> Result<Array2<f64>, String> {
+        let mut out = Array2::<f64>::zeros(x_hat.dim());
+        for f in features {
+            let (g, c, u) = self.rows.get(f).ok_or_else(|| format!("feature {f} not loaded (Weights::load_features)"))?;
+            let a = x_hat.dot(g).mapv(|t| (t + c).max(0.0));
+            out += &(a.insert_axis(Axis(1)) * &u.view().insert_axis(Axis(0)));
+        }
+        Ok(out)
+    }
 }
 
 impl Weights {
+    /// Attaches the transcoder view: `dir/layer_{l}.safetensors` per layer that has one.
+    pub fn attach_transcoders(&mut self, dir: &std::path::Path) -> Result<usize, String> {
+        let mut attached = 0;
+        for l in 0..self.layers.len() {
+            let path = dir.join(format!("layer_{l}.safetensors"));
+            if !path.exists() {
+                continue;
+            }
+            let t = crate::library_transcoder::Transcoder::open(&path)?;
+            if t.width != self.width() {
+                return Err(format!("{}: width {} for a model of width {}", path.display(), t.width, self.width()));
+            }
+            self.transcoders.insert(l, Features { path, count: t.features, rows: BTreeMap::new() });
+            attached += 1;
+        }
+        Ok(attached)
+    }
+
+    /// Reads the rows of every transcoder feature `graph`'s nodes declare.
+    pub fn load_features(&mut self, graph: &Graph) -> Result<(), String> {
+        for block in &graph.blocks {
+            let Block::Features { layer, features, .. } = block else { continue };
+            let t = self.transcoders.get_mut(layer).ok_or_else(|| format!("layer {layer} has no transcoder"))?;
+            let missing: Vec<usize> = features.iter().copied().filter(|f| !t.rows.contains_key(f)).collect();
+            if missing.is_empty() {
+                continue;
+            }
+            let file = crate::safetensors::SafetensorsFile::open(&t.path).map_err(|e| e.to_string())?;
+            let d = file.vector("b_dec", self.embedding.ncols()).map_err(|e| e.to_string())?.len();
+            let (encoder, decoder) = (file.stored("W_enc", t.count, d).map_err(|e| e.to_string())?, file.stored("W_dec", t.count, d).map_err(|e| e.to_string())?);
+            let bias = file.vector("b_enc", t.count).map_err(|e| e.to_string())?;
+            for f in missing {
+                let row = |m: &crate::safetensors::Stored| m.rows(f..f + 1).map(|r| r.matrix().row(0).to_owned()).ok_or_else(|| format!("feature {f} out of range"));
+                t.rows.insert(f, (row(&encoder)?, bias[f], row(&decoder)?));
+            }
+        }
+        Ok(())
+    }
+
     /// The blocks of `library` (the start library of `M` equals `M`).
     pub fn of(library: &Library) -> Self {
         library.graph_weights()
@@ -225,11 +290,14 @@ impl Weights {
 
 // ------------------------------------------------------------------------------ resolved graph
 
-/// The pieces of one site: some heads of a layer's attention, or some neurons of its MLP.
+/// The pieces of one site: some heads of a layer's attention, some neurons of its MLP, or some
+/// transcoder features of its MLP (`rest`: the MLP minus those features, i.e. every other feature
+/// and the transcoder's exact error piece).
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 pub enum Block {
     Heads { layer: usize, heads: Vec<usize> },
     Neurons { layer: usize, neurons: Vec<usize> },
+    Features { layer: usize, features: Vec<usize>, rest: bool },
 }
 
 impl Block {
@@ -237,14 +305,14 @@ impl Block {
     fn site(&self) -> usize {
         match self {
             Self::Heads { layer, .. } => 2 * layer,
-            Self::Neurons { layer, .. } => 2 * layer + 1,
+            Self::Neurons { layer, .. } | Self::Features { layer, .. } => 2 * layer + 1,
         }
     }
 
     fn routes(&self) -> &'static [Route] {
         match self {
             Self::Heads { .. } => &[Route::Query, Route::Key, Route::Value],
-            Self::Neurons { .. } => &[Route::Input],
+            Self::Neurons { .. } | Self::Features { .. } => &[Route::Input],
         }
     }
 
@@ -252,6 +320,7 @@ impl Block {
         match self {
             Self::Heads { heads, .. } => heads.is_empty(),
             Self::Neurons { neurons, .. } => neurons.is_empty(),
+            Self::Features { features, rest, .. } => features.is_empty() && !rest,
         }
     }
 }
@@ -356,6 +425,7 @@ impl Graph {
         let mut ids = Vec::new();
         let mut blocks = Vec::new();
         let mut owned: BTreeSet<(usize, bool, usize)> = BTreeSet::new();
+        let mut featured: BTreeSet<(usize, usize)> = BTreeSet::new();
         for node in &program.nodes {
             if node.id == "embed" || node.id == "logits" || ids.contains(&node.id) {
                 return Err(format!("node id {} is reserved or repeated", node.id));
@@ -365,17 +435,21 @@ impl Graph {
             }
             let mut block: Option<Block> = None;
             for piece in &node.pieces {
-                if piece.view != "native" {
-                    return Err(format!("{}: view {} is not resolved yet (native only)", node.id, piece.view));
-                }
                 if piece.layer >= layers {
                     return Err(format!("{}: layer {} out of range (there are {layers})", node.id, piece.layer));
                 }
                 let l = piece.layer;
-                let next = match piece.kind.as_str() {
-                    "head" => Block::Heads { layer: l, heads: indices(&piece.index, weights.layers[l].heads.len(), "head")? },
-                    "mlp" | "neuron" => Block::Neurons { layer: l, neurons: indices(&piece.index, weights.neurons(l), "neuron")? },
-                    other => return Err(format!("{}: kind {other} is not a native piece", node.id)),
+                let next = match (piece.view.as_str(), piece.kind.as_str()) {
+                    ("native", "head") => Block::Heads { layer: l, heads: indices(&piece.index, weights.layers[l].heads.len(), "head")? },
+                    ("native", "mlp" | "neuron") => Block::Neurons { layer: l, neurons: indices(&piece.index, weights.neurons(l), "neuron")? },
+                    ("transcoder", "feature") => {
+                        let t = weights.transcoders.get(&l).ok_or_else(|| format!("{}: layer {l} has no transcoder view", node.id))?;
+                        if piece.index.is_none() {
+                            return Err(format!("{}: name the transcoder features of layer {l}", node.id));
+                        }
+                        Block::Features { layer: l, features: indices(&piece.index, t.count, "feature")?, rest: false }
+                    }
+                    (view, kind) => return Err(format!("{}: {view} piece of kind {kind} is not resolved (native heads and neurons, transcoder features)", node.id)),
                 };
                 block = Some(match (block, next) {
                     (None, b) => b,
@@ -386,6 +460,10 @@ impl Graph {
                     (Some(Block::Neurons { layer, mut neurons }), Block::Neurons { layer: m, neurons: more }) if layer == m => {
                         neurons.extend(more);
                         Block::Neurons { layer, neurons }
+                    }
+                    (Some(Block::Features { layer, mut features, .. }), Block::Features { layer: m, features: more, .. }) if layer == m => {
+                        features.extend(more);
+                        Block::Features { layer, features, rest: false }
                     }
                     _ => return Err(format!("{}: a node's pieces must lie at one site (one layer's heads or one layer's MLP)", node.id)),
                 });
@@ -408,6 +486,20 @@ impl Graph {
                         }
                     }
                 }
+                Block::Features { layer, features, .. } => {
+                    features.sort_unstable();
+                    if !features.windows(2).all(|w| w[0] < w[1]) {
+                        return Err(format!("{}: a feature listed twice", node.id));
+                    }
+                    if featured.iter().any(|(l, f)| l == layer && features.contains(f)) {
+                        return Err(format!("{}: a feature of layer {layer} is in two nodes", node.id));
+                    }
+                    featured.extend(features.iter().map(|&f| (*layer, f)));
+                }
+            }
+            // One view per site: a layer's MLP is read through its neurons or its transcoder.
+            if let Some((l, _)) = featured.iter().find(|(l, _)| owned.iter().any(|(m, head, _)| m == l && !head)) {
+                return Err(format!("{}: layer {l}'s MLP appears both as neurons and as transcoder features", node.id));
             }
             if block.is_empty() {
                 return Err(format!("{}: a node of no pieces", node.id));
@@ -477,6 +569,18 @@ impl Graph {
             if !rest.is_empty() {
                 out.push(Block::Heads { layer: l, heads: rest });
             }
+            // A transcoder-view MLP: the MLP minus the declared features (every other feature and
+            // the exact error piece).
+            let features: Vec<usize> = self.blocks.iter().flat_map(|b| match b {
+                Block::Features { layer, features, .. } if *layer == l => features.clone(),
+                _ => Vec::new(),
+            }).collect();
+            if !features.is_empty() {
+                let mut features = features;
+                features.sort_unstable();
+                out.push(Block::Features { layer: l, features, rest: true });
+                continue;
+            }
             let rest: Vec<usize> = (0..weights.neurons(l)).filter(|i| !neurons.contains(i)).collect();
             if !rest.is_empty() {
                 out.push(Block::Neurons { layer: l, neurons: rest });
@@ -522,11 +626,12 @@ impl Graph {
 
     /// Opaque numbers: every weight a declared node reads (a head's query, key, value and output
     /// maps and head norm gains, keys and values shared by query heads counted once; a neuron's gate
-    /// and up rows with their biases and its down column) and every stand-in average (`embed`'s,
-    /// one per undeclared head, one per layer with an undeclared neuron), each of width `d`.
+    /// and up rows with their biases and its down column; a transcoder feature's encoder row, bias
+    /// and decoder row) and, under average stand-ins, every stand-in average (`embed`'s, one per
+    /// undeclared head, one per layer with an undeclared neuron), each of width `d`.
     pub fn opaque_numbers(&self, weights: &Weights) -> usize {
         let d = weights.width();
-        let mut count = d;
+        let mut count = 0;
         for block in &self.blocks {
             match block {
                 Block::Heads { layer, heads } => {
@@ -546,13 +651,20 @@ impl Graph {
                     let per = 2 * m.gate.ncols() + 1 + m.up.as_ref().map_or(0, |u| u.ncols() + 1);
                     count += neurons.len() * per;
                 }
+                // A feature's encoder row, bias and decoder row.
+                Block::Features { features, .. } => count += features.len() * (2 * d + 1),
             }
         }
-        for block in self.complement(weights) {
-            count += match block {
-                Block::Heads { heads, .. } => heads.len() * d,
-                Block::Neurons { .. } => d,
-            };
+        // Counterfactual stand-ins are the model's own values and cost nothing; average stand-ins
+        // are numbers the program carries.
+        if !self.counterfactual {
+            count += d;
+            for block in self.complement(weights) {
+                count += match block {
+                    Block::Heads { heads, .. } => heads.len() * d,
+                    Block::Neurons { .. } | Block::Features { .. } => d,
+                };
+            }
         }
         count
     }
@@ -651,6 +763,8 @@ pub struct Reference {
     pub reads: Vec<Vec<Array2<f64>>>,
     pub active: Vec<Array2<f64>>,
     pub mlp: Vec<Array2<f64>>,
+    /// Per layer its MLP's normed input `x̂` (rows × width): transcoder features read it.
+    pub inputs: Vec<Array2<f64>>,
 }
 
 impl Reference {
@@ -678,6 +792,11 @@ impl Reference {
                 } else {
                     Ok(active.select(Axis(1), neurons).dot(&mlp.out.select(Axis(1), neurons).t()))
                 }
+            }
+            Block::Features { layer, features, rest } => {
+                let t = weights.transcoders.get(layer).ok_or_else(|| format!("layer {layer} has no transcoder"))?;
+                let named = t.write(features, self.inputs.get(*layer).ok_or("an MLP the reference did not record")?)?;
+                Ok(if *rest { &self.mlp[*layer] - &named } else { named })
             }
         }
     }
@@ -789,9 +908,26 @@ fn neurons_active(mlp: &MlpWeights, neurons: &[usize], x_hat: &Array2<f64>) -> A
     h
 }
 
+/// Transcoder features `features` of `layer`'s MLP on its normed inputs `x_hat` (rows × width),
+/// or with `rest` the MLP minus them (every other feature and the transcoder's exact error).
+fn features_write(weights: &Weights, layer: usize, features: &[usize], rest: bool, x_hat: &Array2<f64>) -> Result<Array2<f64>, String> {
+    let t = weights.transcoders.get(&layer).ok_or_else(|| format!("layer {layer} has no transcoder"))?;
+    let named = t.write(features, x_hat)?;
+    if !rest {
+        return Ok(named);
+    }
+    let mlp = weights.layers[layer].mlp.as_ref().ok_or("a transcoder on a layer without an MLP")?;
+    let all: Vec<usize> = (0..mlp.gate.nrows()).collect();
+    Ok(neurons_write(mlp, &all, x_hat) - named)
+}
+
 /// A block's stand-in write (width): its pieces applied with `weights` to their stored inputs.
-fn stand_in(weights: &Weights, stats: &Stats, block: &Block) -> Array1<f64> {
-    match block {
+fn stand_in(weights: &Weights, stats: &Stats, block: &Block) -> Result<Array1<f64>, String> {
+    Ok(match block {
+        Block::Features { layer, features, rest } => {
+            let x_hat = (&stats.mlps[*layer] * &weights.layers[*layer].mlp_norm.gain).insert_axis(Axis(0));
+            features_write(weights, *layer, features, *rest, &x_hat)?.row(0).to_owned()
+        }
         Block::Heads { layer, heads } => {
             let lw = &weights.layers[*layer];
             let mut out = Array1::<f64>::zeros(weights.width());
@@ -811,7 +947,7 @@ fn stand_in(weights: &Weights, stats: &Stats, block: &Block) -> Array1<f64> {
             let x_hat = (&stats.mlps[*layer] * &lw.mlp_norm.gain).insert_axis(Axis(0));
             neurons_write(lw.mlp.as_ref().expect("a neuron block has an MLP"), neurons, &x_hat).row(0).to_owned()
         }
-    }
+    })
 }
 
 /// Executes `circuit` on `batch`: per unit in site order its route inputs (the stand-in stream
@@ -858,7 +994,7 @@ fn run(weights: &Weights, stats: &Stats, circuit: &Circuit, batch: &Batch, score
             for (&t, &f) in &stats.tokens {
                 e.scaled_add(f, &weights.embedding.row(t as usize));
             }
-            (broadcast(&e), circuit.units.iter().map(|u| broadcast(&stand_in(weights, stats, &u.block))).collect())
+            (broadcast(&e), circuit.units.iter().map(|u| stand_in(weights, stats, &u.block).map(|v| broadcast(&v))).collect::<Result<_, _>>()?)
         }
     };
     let mut captured = capture.then(|| Reference {
@@ -866,6 +1002,7 @@ fn run(weights: &Weights, stats: &Stats, circuit: &Circuit, batch: &Batch, score
         reads: weights.layers.iter().map(|l| vec![Array2::zeros((0, 0)); l.heads.len()]).collect(),
         active: vec![Array2::zeros((0, 0)); weights.layers.len()],
         mlp: vec![Array2::zeros((0, 0)); weights.layers.len()],
+        inputs: vec![Array2::zeros((0, 0)); weights.layers.len()],
     });
     let mut order: Vec<usize> = (0..circuit.units.len()).collect();
     order.sort_by_key(|&u| circuit.units[u].block.site());
@@ -959,8 +1096,14 @@ fn run(weights: &Weights, stats: &Stats, circuit: &Circuit, batch: &Batch, score
                         }
                         c.mlp[*layer] = write.clone();
                         c.active[*layer] = active;
+                        c.inputs[*layer] = x_hat;
                     }
                     write
+                }
+                Block::Features { layer, features, rest } => {
+                    let mut x_hat = weights.layers[*layer].mlp_norm.apply(&inputs[0]);
+                    normed(0, &mut x_hat);
+                    features_write(weights, *layer, features, *rest, &x_hat)?
                 }
             };
             st.writes[u] = Some(write);
@@ -1188,6 +1331,8 @@ pub fn sample(weights: &Weights, graph: &Graph, counterfactual: bool, count: usi
         };
         match block {
             Block::Heads { layer, heads } => WeightEdit::Head { layer, head: heads[rng.random_range(0..heads.len())], factor },
+            // Transcoder features are not native weights: an aimed edit takes their layer's MLP.
+            Block::Features { layer, .. } => WeightEdit::Neurons { layer, neurons: (0..weights.neurons(layer)).collect(), factor },
             Block::Neurons { layer, neurons } => {
                 // Granularity: one neuron, a group of 8, or every neuron of the block.
                 let picked = match rng.random_range(0..3) {
@@ -1726,7 +1871,7 @@ impl SiteUnits {
                     out.extend(heads.iter().map(|h| SharedSite::Head(first[*layer] + h)));
                     out.insert(SharedSite::Attention(*layer));
                 }
-                Block::Neurons { layer, .. } => {
+                Block::Neurons { layer, .. } | Block::Features { layer, .. } => {
                     out.insert(SharedSite::Mlp(*layer));
                 }
             }
@@ -2351,6 +2496,9 @@ impl Checker {
                 Err(e) => (Graph::empty(), false, Some(e)),
             })
             .collect();
+        for (g, _, _) in &parsed {
+            self.weights.load_features(g)?;
+        }
         let circuits: Vec<Circuit> = parsed.iter().map(|(g, _, _)| g.program(&self.weights, edges)).collect();
         let models: Vec<Circuit> = parsed.iter().map(|(g, _, _)| g.model(&self.weights)).collect();
         // Per program its experiments; per run (program, experiment) the cache key of M's outcome.

@@ -248,3 +248,46 @@ fn checker_counterfactual_default_scores_the_empty_program_at_the_behavior_signa
     let (full, _) = checker.score(&full_program(), 16, 3, true, None).expect("score");
     assert!(full.exec_error_bits / full.n < F32_KL, "full program error {:e} bits per token", full.exec_error_bits / full.n);
 }
+
+#[test]
+fn transcoder_features_write_the_transcoder_and_the_rest_is_exact() {
+    let f = fixture("graph_transcoder");
+    let library = Library::new(&f.device, &f.device, &f.native, &f.layers, &f.artifact, 1 << 28, 64).expect("library");
+    let mut weights = Weights::of(&library);
+    let dir = std::env::temp_dir().join(format!("gam_mpd_graph_tc_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("dir");
+    crate::test_support::transcoder_file(&dir.join("layer_1.safetensors"), 6, 8, 5);
+    assert_eq!(weights.attach_transcoders(&dir).expect("attach"), 1);
+    let feature = |id: &str, index: Index| NodeIr { id: id.into(), pieces: vec![PieceIr { view: "transcoder".into(), layer: 1, kind: "feature".into(), index: Some(index) }], rule: None };
+    let program = Program { model: "tiny".into(), valid: true, nodes: vec![feature("f", Index::Many((0..6).collect()))], ..Program::default() };
+    let graph = Graph::parse(&program, &weights).expect("parse");
+    weights.load_features(&graph).expect("features");
+    let stats = Stats::measure(&weights, &f.sequences).expect("stats");
+    let batch = Batch::new(&f.sequences).expect("batch");
+    let rows: Vec<usize> = (0..batch.tokens.len()).collect();
+    // M with the features as a node: the features plus the rest (other features and the error) is M.
+    let run = execute(&weights, &stats, &graph.model(&weights), &batch, &rows, &BTreeMap::new(), false).expect("execute");
+    let reference_p = library.log_probabilities(&library.run(&f.sequences, &BTreeMap::new()).expect("run").last).expect("log p");
+    assert!(max(&kl_bits(&reference_p, &run.log_probabilities)) < 1e-9);
+    // The node's write is the transcoder's output on layer 1's normed MLP input, less its decoder bias.
+    let x = library.run(&f.sequences, &BTreeMap::new()).expect("run").streams[3].clone();
+    let norm = &weights.layers[1].mlp_norm;
+    let mut x_hat = x.clone();
+    for mut row in x_hat.outer_iter_mut() {
+        let r = crate::operator_program::rms_scale(row.view(), norm.epsilon);
+        row.zip_mut_with(&norm.gain, |v, g| *v *= r * g);
+    }
+    let t = crate::library_transcoder::Transcoder::open(&dir.join("layer_1.safetensors")).expect("transcoder");
+    let file = crate::safetensors::SafetensorsFile::open(&dir.join("layer_1.safetensors")).expect("file");
+    let b = file.vector("b_dec", 8).expect("b_dec");
+    let expected = t.reconstruction(&x_hat).expect("reconstruction") - &b.view().insert_axis(ndarray::Axis(0));
+    let got = run.writes[0].clone().expect("the node computes");
+    let gap = (&got - &expected).iter().fold(0.0f64, |a, v| a.max(v.abs()));
+    assert!(gap < 1e-9, "feature writes differ from the transcoder by {gap:e}");
+    // One view per site; features in range.
+    let mut both = program.clone();
+    both.nodes.push(NodeIr { id: "n".into(), pieces: vec![PieceIr { view: "native".into(), layer: 1, kind: "mlp".into(), index: Some(Index::One(0)) }], rule: None });
+    assert!(Graph::parse(&both, &weights).is_err(), "neurons and features of one MLP");
+    let far = Program { nodes: vec![feature("f", Index::One(6))], ..program.clone() };
+    assert!(Graph::parse(&far, &weights).is_err(), "feature out of range");
+}
