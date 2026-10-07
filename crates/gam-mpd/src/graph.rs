@@ -1040,6 +1040,9 @@ impl Batch {
 /// run used.
 #[derive(Clone, Debug)]
 pub struct Reference {
+    /// The run's identity (`next_reference_id`; a clone keeps it): the device keeps uploaded copies
+    /// of its arrays under it.
+    pub id: u64,
     pub embed: Array2<f64>,
     pub reads: Vec<Vec<Array2<f64>>>,
     pub active: Vec<Array2<f64>>,
@@ -1048,6 +1051,12 @@ pub struct Reference {
     pub inputs: Vec<Array2<f64>>,
     /// Per layer its attention's normed input (rows × width): VPD q, k, v subcomponents read it.
     pub attention_inputs: Vec<Array2<f64>>,
+}
+
+/// A fresh [`Reference::id`].
+pub(crate) fn next_reference_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 impl Reference {
@@ -1292,6 +1301,7 @@ fn run(weights: &Weights, circuit: &Circuit, batch: &Batch, scored: &[usize], sw
     }
     let (embed_standin, standins) = standins_of(weights, circuit, batch)?;
     let mut captured = capture.then(|| Reference {
+        id: next_reference_id(),
         embed: embed.clone(),
         reads: weights.layers.iter().map(|l| vec![Array2::zeros((0, 0)); l.heads.len()]).collect(),
         active: vec![Array2::zeros((0, 0)); weights.layers.len()],

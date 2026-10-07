@@ -22,11 +22,26 @@ use ndarray::{Array1, Array2, ArrayView2};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Mutex, OnceLock};
 
-/// The device and its resident copies of host matrices, by address and shape.
+/// The device, its resident copies of host matrices (by address and shape), and the uploaded
+/// arrays of the counterfactual runs used last ([`Reference::id`], most recent last).
 pub(crate) struct DeviceState {
     device: Device,
     resident: HashMap<(usize, usize, usize), Tensor>,
+    references: Vec<(u64, BTreeMap<(Field, usize, usize), Tensor>)>,
 }
+
+/// An array of a [`Reference`]: the embeddings, a head's read (layer, head), a layer's MLP
+/// activations or MLP write (layer).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Field {
+    Embed,
+    Read,
+    Active,
+    Mlp,
+}
+
+/// The counterfactual runs whose arrays stay uploaded.
+const KEPT_REFERENCES: usize = 4;
 
 static DEVICE: OnceLock<Mutex<DeviceState>> = OnceLock::new();
 
@@ -46,7 +61,7 @@ fn on_device<T: Send>(f: impl FnOnce(&mut DeviceState) -> T + Send) -> Option<T>
 
 impl DeviceState {
     pub(crate) fn new(device: Device) -> Self {
-        Self { device, resident: HashMap::new() }
+        Self { device, resident: HashMap::new(), references: Vec::new() }
     }
 
     fn arithmetic(&self) -> Arithmetic {
@@ -64,6 +79,37 @@ impl DeviceState {
             self.resident.insert(key, t);
         }
         Ok(key)
+    }
+
+    /// Uploads array `field` (at `layer`, `head`) of counterfactual run `r` unless it is kept.
+    fn ensure_reference(&mut self, r: &Reference, (field, layer, head): (Field, usize, usize)) -> Result<(), String> {
+        let at = match self.references.iter().position(|(id, _)| *id == r.id) {
+            Some(at) => at,
+            None => {
+                if self.references.len() >= KEPT_REFERENCES {
+                    self.references.remove(0);
+                }
+                self.references.push((r.id, BTreeMap::new()));
+                self.references.len() - 1
+            }
+        };
+        if !self.references[at].1.contains_key(&(field, layer, head)) {
+            let host = match field {
+                Field::Embed => Some(&r.embed),
+                Field::Read => r.reads.get(layer).and_then(|l| l.get(head)),
+                Field::Active => r.active.get(layer),
+                Field::Mlp => r.mlp.get(layer),
+            };
+            let host = host.ok_or("an array the counterfactual run did not record")?;
+            let t = self.device.upload(host.view()).map_err(|e| e.to_string())?;
+            self.references[at].1.insert((field, layer, head), t);
+        }
+        Ok(())
+    }
+
+    /// Array `key` of counterfactual run `r`, uploaded by [`DeviceState::ensure_reference`].
+    fn reference(&self, r: &Reference, key: (Field, usize, usize)) -> Result<&Tensor, String> {
+        self.references.iter().find(|(id, _)| *id == r.id).and_then(|(_, m)| m.get(&key)).ok_or_else(|| "a counterfactual array went missing".to_string())
     }
 
     /// The resident copy under `key` ([`DeviceState::ensure`]).
@@ -145,37 +191,33 @@ pub(crate) struct Run<'a> {
 }
 
 /// The stand-ins (`embed`'s and each unit's write in the counterfactual run `r`, rows × width),
-/// assembled on the device with the current weights as `Reference::write` does on the host.
+/// assembled on the device with the current weights as `Reference::write` does on the host; `r`'s
+/// arrays stay uploaded for the next runs that read it.
 fn standins(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, r: &Reference) -> Result<(Tensor, Vec<Tensor>), String> {
     let e = |e: GpuError| e.to_string();
     let (rows, width, arithmetic) = (r.embed.nrows(), weights.width(), s.arithmetic());
-    let embed = s.device.upload(r.embed.view()).map_err(e)?;
-    // Each layer's activations and MLP write uploaded once for every unit that reads them.
-    let mut layers: BTreeMap<usize, (Tensor, Tensor)> = BTreeMap::new();
+    s.ensure_reference(r, (Field::Embed, 0, 0))?;
+    let embed = s.device.copy(s.reference(r, (Field::Embed, 0, 0))?).map_err(e)?;
     let mut out = Vec::with_capacity(circuit.units.len());
     for unit in &circuit.units {
         let mut w = s.device.zeros(rows, width).map_err(e)?;
         match &unit.block {
             Block::Heads { layer, heads } => {
                 for &h in heads {
-                    let z = r.reads.get(*layer).and_then(|l| l.get(h)).ok_or("a head the reference did not record")?;
-                    let z = s.device.upload(z.view()).map_err(e)?;
+                    s.ensure_reference(r, (Field::Read, *layer, h))?;
                     let wo = s.ensure(weights.layers[*layer].heads[h].output.view()).map_err(e)?;
-                    s.device.gemm(&mut w, 1.0, &z, Op::N, s.get(wo).map_err(e)?, Op::T, 1.0, arithmetic).map_err(e)?;
+                    s.device.gemm(&mut w, 1.0, s.reference(r, (Field::Read, *layer, h))?, Op::N, s.get(wo).map_err(e)?, Op::T, 1.0, arithmetic).map_err(e)?;
                 }
             }
             Block::Neurons { layer, neurons } => {
                 let mlp = weights.layers[*layer].mlp.as_ref().ok_or("a neuron block without an MLP")?;
                 let n = mlp.gate.nrows();
-                if !layers.contains_key(layer) {
-                    let a = r.active.get(*layer).ok_or("an MLP the reference did not record")?;
-                    layers.insert(*layer, (s.device.upload(a.view()).map_err(e)?, s.device.upload(r.mlp[*layer].view()).map_err(e)?));
-                }
+                s.ensure_reference(r, (Field::Active, *layer, 0))?;
+                s.ensure_reference(r, (Field::Mlp, *layer, 0))?;
                 let out_key = s.ensure(mlp.out.view()).map_err(e)?;
-                let (active, whole) = layers.get(layer).ok_or("an MLP's activations")?;
                 // A large block: the MLP's write less the few neurons outside it.
                 let (picked, sign) = if 2 * neurons.len() > n {
-                    s.device.axpy(&mut w, 1.0, whole).map_err(e)?;
+                    s.device.axpy(&mut w, 1.0, s.reference(r, (Field::Mlp, *layer, 0))?).map_err(e)?;
                     let inside: std::collections::BTreeSet<usize> = neurons.iter().copied().collect();
                     ((0..n).filter(|i| !inside.contains(i)).map(|i| i as u32).collect::<Vec<_>>(), -1.0)
                 } else {
@@ -183,7 +225,7 @@ fn standins(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, r: &Refer
                 };
                 if !picked.is_empty() {
                     let ids = s.device.upload_indices(&picked).map_err(e)?;
-                    let a = s.device.gather_columns(active, &ids).map_err(e)?;
+                    let a = s.device.gather_columns(s.reference(r, (Field::Active, *layer, 0))?, &ids).map_err(e)?;
                     let o = s.device.gather_columns(s.get(out_key).map_err(e)?, &ids).map_err(e)?;
                     s.device.gemm(&mut w, sign, &a, Op::N, &o, Op::T, 1.0, arithmetic).map_err(e)?;
                 }
@@ -388,6 +430,7 @@ pub(crate) fn run_on(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, 
         None => return Err("a program's undeclared pieces take their values from the counterfactual run, which this batch lacks".into()),
     };
     let mut captured = job.capture.then(|| Reference {
+        id: crate::graph::next_reference_id(),
         embed: Array2::zeros((0, 0)),
         reads: weights.layers.iter().map(|l| vec![Array2::zeros((0, 0)); l.heads.len()]).collect(),
         active: vec![Array2::zeros((0, 0)); weights.layers.len()],
