@@ -2691,10 +2691,12 @@ fn complexity_terms(scorer: &mut Scorer, device_posterior: &DevicePosterior, exp
                 // The gates' widths enter the count (what the pass executes) but take no pull from
                 // it: nothing keeps a width positive.
                 // A hard gate has no width (`library_vpd::Gate::Hard`): its count is `Φ(m / σ)`.
-                let width = match scorer.at(stage.width) {
-                    Ok(i) => device_posterior.iterate(i)?.column(0).to_vec(),
-                    Err(_) => vec![0.0; explanation.artifact.program.operators[stage.width].rows.width()],
-                };
+                // The count is the hard gate's under the posterior, E_q[H(z)] = Φ(μ_z / sd_q(z)): what
+                // the explanation executes when it is evaluated (hard), with the posterior's own noise
+                // and no learned width (with `s² = w² + σ²` the count followed the widths the data
+                // widened as the budget raised the thresholds: on toys' TMS at its true K it held near
+                // 52 while the hard count fell from 62 to 44). It reaches σ through `∂Ê/∂σ²`.
+                let width = vec![0.0; explanation.artifact.program.operators[stage.width].rows.width()];
                 let extra = followed.as_ref().map(|(m, s2, w)| (m, s2, w.as_slice()));
                 let (expected, gate_terms, assigned, components) = gated_expected(d, arithmetic, trace.value(stage.input)?, gate, (&bias.0, &bias.1, &width), &rank, (assign.as_ref(), extra))?;
                 followed = Some(components);
@@ -4539,11 +4541,18 @@ pub fn fit_from(
                 // at 17.4 against K 11.8, where F's push needs about 20, and with the data's push
                 // `B ln 2 ⟨g_F, ∂Ê/∂μ⟩_σ²` of one batch included it turned negative. The
                 // budget's terms reach the thresholds and gate rows alone, never a learned width:
-                // the count reads the widths (`gated_expected`) but takes no pull from them. The global ratio
+                // the count is the hard gate's under the posterior and reads no width. The global ratio
                 // −⟨g_F, g_k⟩ / |g_k|² (560f12d2d3's λ̄ Ê / K) explodes where most gates are
                 // saturated and |g_k| is tiny: a toy fit (resid_mlp_1l, K = 55) took λ to 8,000 and
                 // diverged with the count flat.
                 if !progress.engaged && limit > 0.0 && expected > limit {
+                    // λ starts at the median over the gates of the balance |⟨∂F, ∂Ê⟩| / |∂Ê|² along
+                    // each gate's row of its parameters (a threshold's entry: |∂F/∂τ| / |∂Ê/∂τ|), every
+                    // gate whose count moves counted once (descent's prototype, 57510547fc). The
+                    // slope-weighted median of F's push alone, max(0, −⟨∂F, ∂Ê⟩) / |∂Ê|² (269b6645c2),
+                    // started λ near 1e-10 on vpd4l grouped direction gates with the count at 3,400
+                    // against K 128 (decomp-vpd4l-i, 1c27e2831b): most gates' push was zero or away
+                    // from the count there, and λ then needed some 23 passes at a factor e per pass.
                     let mut ratios = Vec::new();
                     for (i, mean, _) in &terms {
                         let Some(g) = gradients.get(&explanation.trainable[*i]) else { continue };
@@ -4552,24 +4561,17 @@ pub fn fit_from(
                             continue;
                         }
                         for (f, k) in data.rows().into_iter().zip(count.rows()) {
-                            // F's push against the count along the row, `max(0, −⟨f, k⟩) / |k|²`.
                             let (along, square) = (f.dot(&k) * scale * LN_2, k.dot(&k));
                             if square > 0.0 && along.is_finite() {
-                                ratios.push(((-along).max(0.0) / square, square));
+                                ratios.push(along.abs() / square);
                             }
                         }
                     }
-                    ratios.sort_by(|a, b| a.0.total_cmp(&b.0));
-                    let half = 0.5 * ratios.iter().map(|r| r.1).sum::<f64>();
-                    let mut below = 0.0;
-                    let median = ratios.iter().find(|r| {
-                        below += r.1;
-                        below >= half
-                    });
-                    if let Some(&(balance, _)) = median.filter(|r| r.0 > 0.0) {
+                    ratios.sort_by(f64::total_cmp);
+                    if let Some(&balance) = ratios.get(ratios.len() / 2).filter(|r| **r > 0.0) {
                         progress.engaged = true;
                         progress.multiplier = balance;
-                        log::info!("library budget bound at {expected:.4} parts per token (K {limit}): λ starts at {balance:.4e}, the median of {} gates' balances weighted by their count's slope", ratios.len());
+                        log::info!("library budget bound at {expected:.4} parts per token (K {limit}): λ starts at {balance:.4e}, the median of {} gates' balances", ratios.len());
                     }
                 } else if progress.engaged && limit > 0.0 {
                     let horizon = (draws.len() as f64).max(1.0 / (1.0 - ivon.beta1));
