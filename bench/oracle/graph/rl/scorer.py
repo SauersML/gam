@@ -49,6 +49,7 @@ MEMORY_GIB = None  # the checker server's lease (score.py's default when None)
 VIEWS = None  # decomposition views the checker attaches ({"vpd": DIR}; score.Checker's views)
 DEVICE = None  # "gpu": the checker's single-precision device path
 ITEMS_EVERY = 0  # keep the reader items of every ITEMS_EVERY-th scored program (0: none)
+ITEM_STRIDE = 1  # of a kept program's reader items, keep every ITEM_STRIDE-th
 
 
 def checker(items: list[dict]) -> list[dict]:
@@ -90,6 +91,9 @@ def checker(items: list[dict]) -> list[dict]:
                 for k, r in zip(chunk, c.score_batch([items[k]["source"] for k in chunk], experiments=experiments, seed=seed, uniform_seeds=uniform or None, **extra)):
                     if not os.environ.get("GRAPH_READER") and not (ITEMS_EVERY and k % ITEMS_EVERY == 0):
                         r.pop("items", None)
+                    elif ITEM_STRIDE > 1 and r.get("items"):  # every ITEM_STRIDE-th item: the reader term's mean stays unbiased
+                        r["items"] = r["items"][::ITEM_STRIDE]
+                        r["item_stride"] = ITEM_STRIDE
                     out[k] = r
 
     per_worker = [[] for _ in range(WORKERS)]

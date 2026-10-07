@@ -630,6 +630,7 @@ def main():
     ap.add_argument("--vpd-view", help="VPD's decomposition export for the checker's vpd view (programs with PD.vpd pieces are invalid without it; vpd4l: ~/mpd-data/engine/vpd4l_decomposition)")
     ap.add_argument("--checker-device", choices=["gpu"], help="run the checker's large products on the single-precision device (float32; compare scores only within one device)")
     ap.add_argument("--reader-items", type=int, default=0, help="without a reader server, keep the reader items of every K-th scored program for offline reader scoring (0: none)")
+    ap.add_argument("--reader-item-stride", type=int, default=1, help="of a kept program's reader items, keep every S-th (an unbiased subsample of the reader term's mean)")
     ap.add_argument("--score-batch", type=int, default=4, help="programs per checker request (a server's memory grows with it)")
     ap.add_argument("--checker-gib", type=int, help="the checker server's memory lease on the Mac (score.py's default otherwise)")
     ap.add_argument("--export", help="the target model's export directory for the checker (score.py's EXPORTS entry otherwise)")
@@ -683,7 +684,7 @@ def main():
     if args.mode == "rescore":  # no policy: scores saved programs again
         if args.checker:
             os.environ["GRAPH_CHECKER"] = str(Path(args.checker).resolve())
-        scorer.WORKERS, scorer.EXPORT, scorer.MEMORY_GIB, scorer.VIEWS, scorer.DEVICE, scorer.BATCH, scorer.ITEMS_EVERY = args.score_workers, args.export, args.checker_gib, views_of(args), args.checker_device, args.score_batch, args.reader_items
+        scorer.WORKERS, scorer.EXPORT, scorer.MEMORY_GIB, scorer.VIEWS, scorer.DEVICE, scorer.BATCH, scorer.ITEMS_EVERY, scorer.ITEM_STRIDE = args.score_workers, args.export, args.checker_gib, views_of(args), args.checker_device, args.score_batch, args.reader_items, args.reader_item_stride
         print(json.dumps(rescore(args, SCORERS[args.scorer])))
         return
     use_vllm = args.sampler == "vllm" or (args.sampler == "auto" and torch.cuda.is_available() and __import__("importlib").util.find_spec("vllm") is not None)
@@ -700,7 +701,7 @@ def main():
     if args.checker:
         os.environ["GRAPH_CHECKER"] = str(Path(args.checker).resolve())
     score = SCORERS[args.scorer]
-    scorer.WORKERS, scorer.EXPORT, scorer.MEMORY_GIB, scorer.VIEWS, scorer.DEVICE, scorer.BATCH, scorer.ITEMS_EVERY = args.score_workers, args.export, args.checker_gib, views_of(args), args.checker_device, args.score_batch, args.reader_items
+    scorer.WORKERS, scorer.EXPORT, scorer.MEMORY_GIB, scorer.VIEWS, scorer.DEVICE, scorer.BATCH, scorer.ITEMS_EVERY, scorer.ITEM_STRIDE = args.score_workers, args.export, args.checker_gib, views_of(args), args.checker_device, args.score_batch, args.reader_items, args.reader_item_stride
     root = Path(args.behaviors)
     pool, heldout_prompts = split_prompts(behaviors(root, args.model, "train"), args.prompt_holdout, out / "behaviors")
     sets = {"heldout_behaviors": behaviors(root, args.model, "heldout"), "heldout_prompts": heldout_prompts}
