@@ -84,9 +84,14 @@ class Interventions:
         self.cuts = {}  # row -> (a_kind head|mlp|attn, a_layer, a_head, b_kind head|mlp|logits, b_layer, b_head, route)
         self.tc_scale = {}  # row -> (layer, feature indices [k], alpha)
         self.tc_swap = {}  # row -> (layer, feature indices [k], source activations [k])
+        self.parts_scale = {}  # row -> (layer, site, subcomponent indices [k], alpha)   (vpd4l's VPD view)
+        self.parts_swap = {}  # row -> (layer, site, subcomponent indices [k], source activities [k])
 
 
 class Qwen3:
+    name = MODEL_NAME
+    parts = {}  # no VPD view
+
     def __init__(self, path: str, dev: torch.device, dtype=torch.float32):
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -277,6 +282,8 @@ def piece_text(p) -> str:
         return f"L[{p[1]}].head[:]"
     if kind == "tc":
         return f"PD.tc[{p[1]}][{', '.join(str(i) for i in p[2])}]"
+    if kind == "vpd":
+        return f"PD.vpd[{p[1]}].{p[2]}[{', '.join(str(i) for i in p[3])}]"
     raise ValueError(p)
 
 
@@ -292,6 +299,8 @@ def apply_scale(iv: Interventions, row: int, p, a: float):
         iv.head[row, p[1]] = a
     elif kind == "tc":
         iv.tc_scale[row] = (p[1], torch.tensor(p[2], device=iv.head.device), a)
+    elif kind == "vpd":
+        iv.parts_scale[row] = (p[1], p[2], torch.tensor(p[3], device=iv.head.device), a)
 
 
 class Writer:
@@ -325,7 +334,6 @@ def kl_bits(lp_clean: torch.Tensor, lp_edit: torch.Tensor) -> torch.Tensor:
     return (lp_clean.exp() * (lp_clean - lp_edit)).sum(-1) / math.log(2)
 
 
-HEADER = "<model> qwen3-0.6b\n"
 
 
 # ---------------------------------------------------------------- drawing pieces
@@ -363,7 +371,14 @@ class Draw:
         return ("neurons", L, tuple(sorted(int(i) for i in self.rng.choice(top[: max(k, 16 * k if k < 16 else 256)], size=k, replace=False))))
 
     def feature(self, rec, row, small=False):
-        """Transcoder features among the 64 most active at the row's last position of a loaded layer."""
+        """Transcoder features (Qwen3) or VPD subcomponents (vpd4l) among the 64 most active at the row's
+        last position of a random layer (and site)."""
+        if self.m.parts:
+            l, site = list(self.m.parts)[int(self.rng.integers(len(self.m.parts)))]
+            act = (rec["site_in_last"][(l, site)][row] @ self.m.parts[(l, site)][1]).abs()
+            top = act.topk(64).indices.cpu().numpy()
+            k = int(self.rng.choice([1, 1, 4] if small else [1, 4, 16]))
+            return ("vpd", l, site, tuple(sorted(int(i) for i in self.rng.choice(top, size=k, replace=False))))
         L = int(self.rng.choice(sorted(self.m.tc)))
         top = rec["tc_last"][L][row].float().topk(64)
         live = top.indices[top.values > 0].cpu().numpy()
@@ -376,7 +391,7 @@ class Draw:
         """Half aimed, half uniform (a quarter transcoder features when transcoders are loaded); `small`
         keeps neuron groups at 4 or fewer (questions listing several pieces)."""
         while True:
-            if self.m.tc and self.rng.random() < 0.25:
+            if (self.m.tc and self.rng.random() < 0.25) or (self.m.parts and self.rng.random() < 0.4):
                 p = self.feature(rec, row, small)
                 if p is not None:
                     return p
@@ -398,8 +413,8 @@ def batch_questions(m: Qwen3, w: Writer, draw: Draw, tokens: torch.Tensor, sourc
     rows = list(range(B))
 
     def emit(row, kind, inp, ans, numbers):
-        out.append({"model": MODEL_NAME, "type": kind, "source": source, "split": split, "text_id": ids[row],
-                    "input": HEADER + inp, "answer": ans, "numbers": numbers})
+        out.append({"model": m.name, "type": kind, "source": source, "split": split, "text_id": ids[row],
+                    "input": f"<model> {m.name}\n" + inp, "answer": ans, "numbers": numbers})
 
     # Probes for the where questions: a neuron or a head per text.
     probes = {}
@@ -407,7 +422,7 @@ def batch_questions(m: Qwen3, w: Writer, draw: Draw, tokens: torch.Tensor, sourc
         l = int(rng.integers(m.L))
         probes[r] = (l, int(rng.integers(m.H)), -1) if rng.random() < 0.4 else (l, -1, int(rng.integers(m.Fn)))
     rec = {"probes": probes}
-    if m.tc:
+    if m.tc or m.parts:
         # Feature probes need the clean pass's activations to pick live features: a first pass picks them.
         first = {}
         m.forward(tokens, None, first)
@@ -415,7 +430,7 @@ def batch_questions(m: Qwen3, w: Writer, draw: Draw, tokens: torch.Tensor, sourc
             if rng.random() < 0.3:
                 p = draw.feature(first, r)
                 if p is not None:
-                    probes[r] = (p[1], -2, p[2][0])
+                    probes[r] = (p[1], -2, p[2][0]) if p[0] == "tc" else (p[1], -3, (p[2], p[3][0]))
     lp_clean = m.log_probs(m.forward(tokens, None, rec))
     clean_txt = [w.dist(lp_clean[r]) for r in rows]
     texts = [w.text(tokens[r].tolist()) for r in rows]
@@ -463,8 +478,8 @@ def batch_questions(m: Qwen3, w: Writer, draw: Draw, tokens: torch.Tensor, sourc
         l, hh, i = probes[r]
         v = rec["probe_values"][r].to(torch.float32).cpu()
         order = v[1:].abs().topk(min(3, T - 1)).indices + 1
-        piece = f"L[{l}].head[{hh}]" if hh >= 0 else (f"L[{l}].mlp[{i}]" if hh == -1 else f"PD.tc[{l}][{i}]")
-        level = "write norm" if hh >= 0 else "activation"
+        piece = {-1: lambda: f"L[{l}].mlp[{i}]", -2: lambda: f"PD.tc[{l}][{i}]", -3: lambda: f"PD.vpd[{l}].{i[0]}[{i[1]}]"}[hh]() if hh < 0 else f"L[{l}].head[{hh}]"
+        level = "write norm" if hh >= 0 else ("activity v.x" if hh == -3 else "activation")
         ans = ", ".join(f"{int(p)}:{w.token(tokens[r, int(p)].item())} {v[int(p)].item():.2f}" for p in order)
         emit(r, "where", f"<text_tokens> {w.numbered(tokens[r].tolist())}\n<question> where is {piece} most active ({level}; position 0 excluded): three positions and levels\n",
              ans, {"piece": piece, "positions": [int(p) for p in order], "levels": [v[int(p)].item() for p in order], "mean_level": v[1:].abs().mean().item()})
@@ -545,6 +560,9 @@ def batch_questions(m: Qwen3, w: Writer, draw: Draw, tokens: torch.Tensor, sourc
             elif p[0] == "tc":
                 idx = torch.tensor(p[2], device=m.dev)
                 iv.tc_swap[r] = (p[1], idx, m.tc_acts(p[1], rec["y_last"][p[1]][src[r]], idx))
+            elif p[0] == "vpd":
+                idx = torch.tensor(p[3], device=m.dev)
+                iv.parts_swap[r] = (p[1], p[2], idx, rec["site_in_last"][(p[1], p[2])][src[r]] @ m.parts[(p[1], p[2])][1][:, idx])
             else:
                 hm[r, p[1]] = True
             desc.append(f"<source> {texts[src[r]]}\n<intervention> swap({piece_text(p)}, source)\n")
@@ -579,7 +597,8 @@ def load_behaviors(root: Path, tok, per_behavior: int, rng):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--model", required=True)
+    ap.add_argument("--target", default="qwen3-0.6b", choices=("qwen3-0.6b", "vpd4l"))
+    ap.add_argument("--model", default="", help="Qwen3-0.6B snapshot directory (vpd4l loads its own files)")
     ap.add_argument("--windows", default="")
     ap.add_argument("--behaviors", default="")
     ap.add_argument("--out", required=True)
@@ -596,7 +615,12 @@ def main():
     args = ap.parse_args()
     torch.set_grad_enabled(False)
     dev = device()
-    m = Qwen3(args.model, dev)
+    if args.target == "vpd4l":
+        from vpd4l import Vpd4l
+
+        m = Vpd4l(dev)
+    else:
+        m = Qwen3(args.model, dev)
     if args.transcoders and args.tc_layers:
         m.load_transcoders(args.transcoders, [int(x) for x in args.tc_layers.split(",")])
     w = Writer(m)
@@ -608,13 +632,17 @@ def main():
     started, written, texts = time.time(), 0, 0
     with open(out, "w") as f:
         if args.windows:
-            windows = np.memmap(args.windows, dtype="<u4", mode="r").reshape(-1, 128)
+            if args.windows.endswith(".npy"):  # token rows, e.g. vpd4l's Pile validation rows [N, 513]
+                windows = np.load(args.windows, mmap_mode="r")
+            else:
+                windows = np.memmap(args.windows, dtype="<u4", mode="r").reshape(-1, 128)
             order = np.random.default_rng(args.seed + 1).permutation(len(windows))
             for s in range(args.offset, args.offset + args.texts, args.batch):
                 Tn = lengths[(s // args.batch) % len(lengths)]
                 rows = order[s : s + args.batch]
                 toks = torch.from_numpy(np.asarray(windows[rows, :Tn]).astype(np.int64)).to(dev)
-                qs = batch_questions(m, w, draw, toks, "fineweb", args.split, args.steps, [f"fineweb:{int(i)}:{Tn}" for i in rows])
+                corpus = "fineweb" if args.target == "qwen3-0.6b" else "pile"
+                qs = batch_questions(m, w, draw, toks, corpus, args.split, args.steps, [f"{corpus}:{int(i)}:{Tn}" for i in rows])
                 for q in qs:
                     f.write(json.dumps(q, ensure_ascii=False) + "\n")
                 f.flush()
