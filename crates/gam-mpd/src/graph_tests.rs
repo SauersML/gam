@@ -516,3 +516,20 @@ fn qwen3_like_model_full_graph_and_counterfactual_empty_graph() {
     let shared = h.key.len() + h.value.len() + h.key_norm.as_ref().map_or(0, |(g, _)| g.len());
     assert_eq!(g.opaque_numbers(&weights), 2 * per_query + shared);
 }
+
+#[test]
+fn position_stand_ins_are_each_positions_mean_output() {
+    let f = fixture("graph_position");
+    let library = Library::new(&f.device, &f.device, &f.native, &f.layers, &f.artifact, 1 << 28, 64).expect("library");
+    let weights = Weights::of(&library);
+    // Identical prompts: every position's mean is the prompt's own value, so the empty program is M.
+    let same = vec![f.sequences[0].clone(); 3];
+    let prompts: Vec<Prompt> = same.iter().map(|s| Prompt { text: String::new(), token_ids: s.clone(), target_positions: vec![s.len() - 1], counterfactual: None, attention_block: Vec::new() }).collect();
+    let behavior = Behavior { id: "tiny".into(), model: "tiny".into(), family: String::new(), description: String::new(), frequency: None, prompts, split: "train".into(), model_accuracy: None };
+    let mut checker = Checker::new(weights, behavior).expect("checker");
+    let empty = Program { model: "tiny".into(), valid: true, standin: Some("position".into()), ..Program::default() };
+    let (score, outcomes) = checker.score(&empty, 0, 1, true, None).expect("score");
+    let clean = outcomes.iter().find(|o| o.0 == Experiment::Clean).expect("clean");
+    assert!(max(&clean.1) < 1e-9, "empty program under position means of identical prompts: {:?}", clean.1);
+    assert_eq!(score.opaque_numbers, 0);
+}

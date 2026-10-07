@@ -561,8 +561,19 @@ pub struct Circuit {
     pub units: Vec<Unit>,
     pub logits: Incoming,
     pub nodes: usize,
-    /// Stand-ins from the counterfactual run (else from average inputs).
-    pub counterfactual: bool,
+    /// Where undeclared pieces' values come from.
+    pub standin: StandIn,
+}
+
+/// What undeclared pieces and edges carry: `M`'s values on the prompt's counterfactual (the
+/// default), each piece's mean output at the row's token position over the behavior's prompts
+/// (`M`'s run on them with the current weights), or each piece applied to its average input
+/// (`Stats`). The last two are diagnostics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
+pub enum StandIn {
+    Counterfactual,
+    Position,
+    Global,
 }
 
 impl Circuit {
@@ -580,8 +591,8 @@ pub struct Graph {
     pub ids: Vec<String>,
     pub blocks: Vec<Block>,
     pub edges: Vec<(Writer, Option<usize>, Route)>,
-    /// The program's stand-ins: counterfactual (the default) or global averages (diagnostic).
-    pub counterfactual: bool,
+    /// The program's stand-ins ("standin" in the IR).
+    pub standin: StandIn,
     /// Edges within one MLP site, (writer node, reader node): `c_fc` subcomponents to `down_proj`
     /// subcomponents through the hidden pre-activation.
     pub internal: Vec<(usize, usize)>,
@@ -843,17 +854,18 @@ impl Graph {
                 }
             }
         }
-        let counterfactual = match program.standin.as_deref() {
-            None | Some("counterfactual") => true,
-            Some("global") => false,
-            Some(other) => return Err(format!("unknown stand-in {other} (counterfactual or global)")),
+        let standin = match program.standin.as_deref() {
+            None | Some("counterfactual") => StandIn::Counterfactual,
+            Some("position") => StandIn::Position,
+            Some("global") => StandIn::Global,
+            Some(other) => return Err(format!("unknown stand-in {other} (counterfactual, position or global)")),
         };
-        Ok(Self { ids, blocks, edges, counterfactual, internal })
+        Ok(Self { ids, blocks, edges, standin, internal })
     }
 
     /// The empty program: every piece a stand-in.
     pub fn empty() -> Self {
-        Self { ids: Vec::new(), blocks: Vec::new(), edges: Vec::new(), counterfactual: true, internal: Vec::new() }
+        Self { ids: Vec::new(), blocks: Vec::new(), edges: Vec::new(), standin: StandIn::Counterfactual, internal: Vec::new() }
     }
 
     /// Every piece of `weights` not in a node, per site: the heads of each layer, then its neurons.
@@ -947,7 +959,7 @@ impl Graph {
             })
             .collect();
         units.extend(self.complement(weights).into_iter().map(|block| Unit { block, computes: false, routes: [Incoming::all(), Incoming::all(), Incoming::all()], hidden: Incoming::all() }));
-        Circuit { units, logits: routed(None, Route::Input), nodes: self.blocks.len(), counterfactual: self.counterfactual }
+        Circuit { units, logits: routed(None, Route::Input), nodes: self.blocks.len(), standin: self.standin }
     }
 
     /// `M` as a circuit with the program's nodes as its first units: every piece computing, every
@@ -999,7 +1011,7 @@ impl Graph {
         }
         // Counterfactual stand-ins are the model's own values and cost nothing; average stand-ins
         // are numbers the program carries.
-        if !self.counterfactual {
+        if self.standin == StandIn::Global {
             count += d;
             for block in self.complement(weights) {
                 count += match block {
@@ -1115,6 +1127,45 @@ pub struct Reference {
 }
 
 impl Reference {
+    /// The run averaged per token position over the sequences `spans` (each position over the
+    /// sequences long enough to have it), laid out on the rows of `target` spans (a position past
+    /// every source sequence takes the last position's mean).
+    pub fn position_means(&self, spans: &[(usize, usize)], target: &[(usize, usize)]) -> Self {
+        let longest = spans.iter().map(|s| s.1).max().unwrap_or(0);
+        let rows: usize = target.iter().map(|t| t.1).sum();
+        let average = |a: &Array2<f64>| -> Array2<f64> {
+            if a.nrows() == 0 {
+                return a.clone();
+            }
+            let mut means = Array2::<f64>::zeros((longest, a.ncols()));
+            let mut counts = vec![0.0f64; longest];
+            for &(start, length) in spans {
+                for p in 0..length {
+                    means.row_mut(p).scaled_add(1.0, &a.row(start + p));
+                    counts[p] += 1.0;
+                }
+            }
+            for (mut row, c) in means.outer_iter_mut().zip(&counts) {
+                row /= f64::max(*c, 1.0);
+            }
+            let mut out = Array2::<f64>::zeros((rows, a.ncols()));
+            for &(start, length) in target {
+                for p in 0..length {
+                    out.row_mut(start + p).assign(&means.row(p.min(longest.saturating_sub(1))));
+                }
+            }
+            out
+        };
+        Self {
+            embed: average(&self.embed),
+            reads: self.reads.iter().map(|l| l.iter().map(average).collect()).collect(),
+            active: self.active.iter().map(average).collect(),
+            mlp: self.mlp.iter().map(average).collect(),
+            inputs: self.inputs.iter().map(average).collect(),
+            attention_inputs: self.attention_inputs.iter().map(average).collect(),
+        }
+    }
+
     /// Block `block`'s write in the run (rows × width).
     fn write(&self, weights: &Weights, block: &Block) -> Result<Array2<f64>, String> {
         let rows = self.embed.nrows();
@@ -1369,7 +1420,8 @@ fn run(weights: &Weights, stats: &Stats, circuit: &Circuit, batch: &Batch, score
     let units = circuit.units.len();
     let broadcast = |v: &Array1<f64>| Array2::from_shape_fn((rows, d), |(_, c)| v[c]);
     let (embed_standin, standins): (Array2<f64>, Vec<Array2<f64>>) = match &batch.reference {
-        _ if record => (Array2::zeros((rows, d)), vec![Array2::zeros((rows, d)); units]),
+        // `M` itself (every unit computing, every edge kept) reads no stand-in.
+        _ if record || (batch.reference.is_none() && circuit.is_model()) => (Array2::zeros((rows, d)), vec![Array2::zeros((rows, d)); units]),
         Some(r) => {
             if r.embed.nrows() != rows {
                 return Err(format!("a counterfactual run of {} tokens for a batch of {rows}", r.embed.nrows()));
@@ -2991,7 +3043,35 @@ impl Checker {
         out.reference = None;
         let masked = |b: &mut Batch| b.blocks = b.sequences().iter().map(|s| self.blocks.get(s).cloned().unwrap_or_default()).collect();
         masked(&mut out);
-        if !circuit.counterfactual || circuit.is_model() {
+        if circuit.standin == StandIn::Global || circuit.is_model() {
+            return Ok(out);
+        }
+        if circuit.standin == StandIn::Position {
+            // Each piece's mean output per token position over the behavior's prompts, M's run
+            // with the current weights.
+            let key = format!("{} position", self.edit.as_deref().unwrap_or(""));
+            let cell = {
+                let mut cache = self.references.lock().map_err(|e| e.to_string())?;
+                match cache.iter().find(|(k, _)| *k == key) {
+                    Some((_, c)) => c.clone(),
+                    None => {
+                        if cache.len() >= 6 {
+                            cache.remove(0);
+                        }
+                        let c = Arc::new(std::sync::OnceLock::new());
+                        cache.push((key, c.clone()));
+                        c
+                    }
+                }
+            };
+            let prompts = cell
+                .get_or_init(|| {
+                    let mut b = self.clean.0.clone();
+                    masked(&mut b);
+                    reference(&self.weights, &self.stats, &b).map(Arc::new)
+                })
+                .clone()?;
+            out.reference = Some(Arc::new(prompts.position_means(&self.clean.0.spans, &batch.spans)));
             return Ok(out);
         }
         let partner: Vec<Vec<u32>> = batch.sequences().iter().map(|s| self.partners.get(s).cloned().ok_or("counterfactual stand-ins need each prompt's counterfactual of the same length")).collect::<Result<_, _>>()?;
@@ -3107,10 +3187,11 @@ impl Checker {
     /// `M`'s cache key of `e` on `graph`'s units.
     fn model_key(&self, graph: &Graph, e: &Experiment) -> String {
         // A cut hands the reader the writer's stand-in, so the stand-in form is part of the key.
-        let form = match (graph.counterfactual, self.stats.mean_output) {
-            (true, _) => "counterfactual; ",
-            (false, true) => "mean output; ",
-            (false, false) => "",
+        let form = match (graph.standin, self.stats.mean_output) {
+            (StandIn::Counterfactual, _) => "counterfactual; ",
+            (StandIn::Position, _) => "position; ",
+            (StandIn::Global, true) => "mean output; ",
+            (StandIn::Global, false) => "",
         };
         format!("{form}{}", Self::key(graph, e))
     }
