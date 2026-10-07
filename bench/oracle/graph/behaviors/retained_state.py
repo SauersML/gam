@@ -37,7 +37,7 @@ import os  # noqa: E402
 STUDY = Path(os.environ.get("RETAINED_STUDY", Path.home() / "retained-reply-state"))
 sys.path.insert(0, str(STUDY))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from hidden_choice import ANIMALS, WORDINGS  # noqa: E402
+from hidden_choice import ANIMALS, CLOSE, OPEN, WORDINGS  # noqa: E402
 from stats import animal_level, raises  # noqa: E402
 import build  # noqa: E402
 from build import HF, TOP, write_summary  # noqa: E402
@@ -128,6 +128,41 @@ def score(model, runs: Runs, ids, think, s2, block: bool, device) -> tuple[np.nd
     return best, first
 
 
+@torch.no_grad()
+def generate_runs(model, tok, wording: str, n: int, device, seed: int, batch: int = 32, max_new: int = 600) -> dict:
+    """Turn-1 runs as the study's hidden_choice.py --choice forced makes them (its sampling settings and thinking
+    openings): the animal is drawn uniformly and written into the start of the thinking; runs whose visible reply is
+    exactly "I understand." are kept. Only the turn-1 generation, without the study's arms."""
+    rng = np.random.default_rng(seed)
+    torch.manual_seed(seed)
+    turn1, _ = WORDINGS[wording]
+    prompt = tok.encode(tok.apply_chat_template([{"role": "user", "content": turn1}], tokenize=False, add_generation_prompt=True,
+                                                enable_thinking=True), add_special_tokens=False)
+    chosen, thinking = [], []
+    pad = tok.pad_token_id
+    for s0 in range(0, n, batch):
+        B = min(batch, n - s0)
+        picks = [ANIMALS[k] for k in rng.integers(0, len(ANIMALS), B)]
+        starts = [f"<think>\n{OPEN[rng.integers(len(OPEN))]} Draw #{rng.integers(100, 1000)}: {c}. "
+                  f"{CLOSE[rng.integers(len(CLOSE))]} I'll keep {c} in mind." for c in picks]
+        seqs = [prompt + tok.encode(x, add_special_tokens=False) for x in starts]
+        W = max(map(len, seqs))
+        inp = torch.tensor([[pad] * (W - len(x)) + x for x in seqs], device=device)
+        att = torch.tensor([[0] * (W - len(x)) + [1] * len(x) for x in seqs], device=device)
+        out = model.generate(input_ids=inp, attention_mask=att, max_new_tokens=max_new, do_sample=True, temperature=0.6,
+                             top_p=0.95, top_k=20, pad_token_id=pad)
+        for j in range(B):
+            text = starts[j] + tok.decode(out[j, W:], skip_special_tokens=False).split("<|im_end|>")[0]
+            if "</think>" not in text:
+                continue
+            th, visible = text.split("</think>", 1)
+            if visible.strip() == "I understand.":
+                chosen.append(picks[j])
+                thinking.append(th.replace("<think>", "", 1).strip())
+        print(f"turn 1: {s0 + B} generated, {len(chosen)} kept", flush=True)
+    return {"wording": wording, "choice": "forced", "chosen": chosen, "thinking": thinking, "seed": seed}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="qwen3-0.6b", choices=sorted(HF))
@@ -136,12 +171,16 @@ def main():
     ap.add_argument("--seed", type=int, default=2951)
     ap.add_argument("--out", default=str(build.OUT))
     ap.add_argument("--study-file", default="", help="a hidden_choice.py result (default: the study's results/<model>.json)")
+    ap.add_argument("--generate", type=int, default=0, help="make this many turn-1 runs first (written to --study-file)")
+    ap.add_argument("--wording", default="A", choices=sorted(WORDINGS))
     a = ap.parse_args()
     build.OUT = Path(a.out)
     from transformers import AutoModelForCausalLM, AutoTokenizer
     tok = AutoTokenizer.from_pretrained(HF[a.model])
     model = AutoModelForCausalLM.from_pretrained(HF[a.model], dtype=getattr(torch, a.dtype), attn_implementation="sdpa").to(a.device).eval()
     src = Path(a.study_file) if a.study_file else STUDY / f"results/{a.model.replace('-', '_')}.json"
+    if a.generate:
+        src.write_text(json.dumps(generate_runs(model, tok, a.wording, a.generate, a.device, a.seed)))
     study = json.load(open(src))
     wording = study.get("wording", "A")
     runs = Runs(tok, wording)
