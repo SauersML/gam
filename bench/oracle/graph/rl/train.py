@@ -529,7 +529,7 @@ def evaluate(sets: dict[str, list[dict]], pol, sampler, score, args, adapter: Pa
                 mine = [(it["source"], x) for it, x in zip(items[g * args.samples : (g + 1) * args.samples], scores[g * args.samples : (g + 1) * args.samples])]
                 for src, x in mine:
                     samples.write(json.dumps({"set": name, "step": step, "run": run, "behavior": b["id"], "behavior_path": b.get("path"), "program": "oracle", "source": src, "score": x}) + "\n")
-                if args.scorer == "none":  # sampled and saved only: rescore summarizes
+                if getattr(args, "scorer", None) == "none":  # sampled and saved only: rescore summarizes
                     continue
                 src, x = min(mine, key=lambda m: m[1]["total_bits"])
                 (runs / f"{b['id']}.{run}.json").write_text(json.dumps({"behavior": b["id"], "model": b.get("model"), "source": src, "score": x, "stand_in": "counterfactual",
