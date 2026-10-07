@@ -20,4 +20,4 @@ export TOKENIZERS_PARALLELISM=false HF_HUB_OFFLINE=1
 mkdir -p "$(dirname "$OUT")"
 nvidia-smi --query-gpu=name,memory.total --format=csv 2> /dev/null || echo "no GPU: CPU, float32, ${SLURM_CPUS_PER_TASK:-?} threads"
 export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-8}
-"$py" "$here/reader_score.py" score --model "${READER_MODEL:-Qwen/Qwen3-8B}" --target "$TARGET" --programs "$PROGRAMS" --items "$ITEMS" --out "$OUT" ${READER_ARGS:-}
+"$py" "$here/reader_score.py" score --model "${READER_MODEL:-Qwen/Qwen3-8B}" --target "$TARGET" --programs "$PROGRAMS" --items "$ITEMS" --out "$OUT" ${READER_DTYPE:+--dtype $READER_DTYPE} ${READER_ARGS:-}
