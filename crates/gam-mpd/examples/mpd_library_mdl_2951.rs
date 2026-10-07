@@ -271,13 +271,17 @@ struct AdversarialSettings {
     probes: usize,
 }
 
-/// Native weight edits (`EditSettings::weights`): `edits` of them, each drawn from the settings'
-/// seed and scored on the first `sequences` held-out sequences of the range.
+/// Native weight edits (`EditSettings::weights`): `edits` of them, kept from `candidates` drawn from
+/// the settings' seed by a measured screen (`draw_weights`), and scored on the first `sequences`
+/// held-out sequences of the range.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WeightFamily {
     edits: usize,
     sequences: usize,
+    /// The candidates drawn and screened; none: four per edit kept.
+    #[serde(default)]
+    candidates: Option<usize>,
 }
 
 /// An immutable experiment manifest: what an edits score is a score of, so two explanations are
@@ -322,12 +326,32 @@ enum WeightDraw {
     Units { operator: String, rows: bool, units: Vec<usize>, alpha: f64 },
     /// `scale · u vᵀ` added.
     RankOne { operator: String, scale: f64, u: Vec<f64>, v: Vec<f64> },
+    /// The operator's matrix replaced by `with`'s (another of the same shape).
+    Replaced { operator: String, with: String },
+    /// `ΔW = A Bᵀ` scaled to `ratio ‖W‖_F`, `A` (rows × `rank`) and `B` (columns × `rank`) of random
+    /// signs from `seed` (integer draws only, so every machine builds the same ΔW).
+    Random { operator: String, rank: usize, ratio: f64, seed: u64 },
+    /// Several edits applied together as one (a head, a group of neurons), its `family` and the effect
+    /// `screen_bits` the screen measured, `KL(M_e ‖ M)` per token on the screen's tokens.
+    Group { family: String, screen_bits: f64, edits: Vec<WeightDraw> },
 }
 
 impl WeightDraw {
-    fn operator(&self) -> &str {
+    fn operator(&self) -> String {
         match self {
-            Self::Units { operator, .. } | Self::RankOne { operator, .. } => operator,
+            Self::Units { operator, .. } | Self::RankOne { operator, .. } | Self::Replaced { operator, .. } | Self::Random { operator, .. } => operator.clone(),
+            Self::Group { edits, .. } => edits.iter().map(Self::operator).collect::<Vec<_>>().join("+"),
+        }
+    }
+
+    /// The draw's family (a group's; a single edit's own kind) and the effect its screen measured.
+    fn family(&self) -> (String, Option<f64>) {
+        match self {
+            Self::Group { family, screen_bits, .. } => (family.clone(), Some(*screen_bits)),
+            Self::Units { .. } => ("units".into(), None),
+            Self::RankOne { .. } => ("rank one".into(), None),
+            Self::Replaced { .. } => ("replaced".into(), None),
+            Self::Random { .. } => ("random".into(), None),
         }
     }
 
@@ -335,13 +359,25 @@ impl WeightDraw {
         match self {
             Self::Units { rows, units, alpha, .. } => format!("{} {} scaled by {alpha}", units.len(), if *rows { "rows" } else { "columns" }),
             Self::RankOne { scale, .. } => format!("rank one of Frobenius size {scale:.4}"),
+            Self::Replaced { with, .. } => format!("replaced by {with}"),
+            Self::Random { rank, ratio, .. } => format!("random rank {rank} at {ratio:.3} of its Frobenius size"),
+            Self::Group { family, edits, .. } => format!("{family}: {}", edits.first().map(Self::kind).unwrap_or_default()),
         }
     }
 
-    /// The edit `ΔW` of `M`'s operator (`native` its program).
+    /// The edits `ΔW` of `M`'s operators (`native` its program) the draw makes, one per operator edited
+    /// (a group's several).
+    fn edits(&self, native: &OperatorProgram) -> Result<Vec<gam_mpd::weight_edit::WeightEdit>, String> {
+        match self {
+            Self::Group { edits, .. } => Ok(edits.iter().map(|e| e.edits(native)).collect::<Result<Vec<_>, _>>()?.into_iter().flatten().collect()),
+            _ => Ok(vec![gam_mpd::weight_edit::WeightEdit { native: self.operator(), delta: self.delta(native)? }]),
+        }
+    }
+
+    /// The edit `ΔW` of one of `M`'s operators (`native` its program).
     fn delta(&self, native: &OperatorProgram) -> Result<ndarray::Array2<f64>, String> {
-        let op = native.operators.iter().find(|op| op.name == self.operator()).ok_or_else(|| format!("edits: M has no operator {}", self.operator()))?;
-        let w = op.matrix();
+        let matrix = |name: &str| native.operators.iter().find(|op| op.name == name).map(|op| op.matrix()).ok_or_else(|| format!("edits: M has no operator {name}"));
+        let w = matrix(&self.operator())?;
         let (r, c) = w.dim();
         match self {
             Self::Units { rows, units, alpha, .. } => {
@@ -359,59 +395,132 @@ impl WeightDraw {
             }
             Self::RankOne { scale, u, v, .. } if u.len() == r && v.len() == c => Ok(ndarray::Array2::from_shape_fn((r, c), |(a, b)| scale * u[a] * v[b])),
             Self::RankOne { .. } => Err(format!("edits: a rank-one edit of another shape than {}", self.operator())),
+            Self::Replaced { with, .. } => {
+                let v = matrix(with)?;
+                if v.dim() != w.dim() {
+                    return Err(format!("edits: {} replaced by {with} of another shape", self.operator()));
+                }
+                Ok(&v - &w)
+            }
+            Self::Random { rank, ratio, seed, .. } => {
+                use rand::RngExt;
+                let mut rng = rand::rngs::StdRng::seed_from_u64(*seed);
+                let signs = |rng: &mut rand::rngs::StdRng, n: usize| ndarray::Array2::from_shape_fn((n, *rank), |_| if rng.random::<bool>() { 1.0 } else { -1.0 });
+                let (a, b) = (signs(&mut rng, r), signs(&mut rng, c));
+                let delta = a.dot(&b.t());
+                let size = delta.iter().map(|x| x * x).sum::<f64>().sqrt();
+                let target = ratio * w.iter().map(|x| x * x).sum::<f64>().sqrt();
+                Ok(delta.mapv(|x| x * target / size.max(f64::MIN_POSITIVE)))
+            }
+            Self::Group { .. } => Err("edits: a group's edits are several".into()),
         }
     }
 }
 
-/// `family.edits` native weight edits drawn from `seed` (`weight_faithfulness`).
-fn draw_weights(native: &OperatorProgram, family: &WeightFamily, seed: u64) -> Result<Vec<WeightDraw>, String> {
+/// Native weight edits that move `M` by every size, kept by a measured screen. Candidates are drawn
+/// from `seed`, uniformly over four families:
+/// * a head: its query, key and value rows and its output columns scaled by a factor of `SCALES` (0
+///   removes it), key and value only where the head has its own;
+/// * a group of 8, 16, 32 or 64 MLP neurons of one layer: their rows of the input maps (`c_fc`, and
+///   `gate_proj` where there is one) and their columns of `down_proj`, scaled by a factor of `SCALES`;
+/// * a head replaced by another head of its layer: its query, key, value and output blocks by the
+///   other's;
+/// * a random `ΔW` on one map (a map stored per head is one tensor, one of its blocks drawn): rank
+///   log-uniform from 1 to full, its Frobenius size log-uniform from 0.3 to 3 times `‖W‖_F`.
+/// `screen` measures each candidate's effect `KL(M_e ‖ M)` per token; the kept set is balanced over
+/// the effect bins (below 0.01, 0.01 to 0.1, 0.1 to 1, above 1 bit), `edits / 4` per bin in draw
+/// order, a bin short of its share filled from the others' remainder.
+fn draw_weights(native: &OperatorProgram, family: &WeightFamily, seed: u64, screen: &mut dyn FnMut(&WeightDraw) -> Result<f64, String>) -> Result<Vec<WeightDraw>, String> {
     use rand::RngExt;
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed ^ 0x5745_4947_4854);
-    let pool: Vec<usize> = native.operators.iter().enumerate().filter(|(_, op)| op.name.starts_with("blocks.") && op.rows.width() > 1 && op.cols.width() > 1 && op.diagonal().is_none()).map(|(i, _)| i).collect();
-    // A map stored per head (q0, q1, ...) is one tensor: tensors are drawn uniformly, then one of
-    // their blocks, so the many per-head blocks do not crowd out the MLPs' maps.
-    let mut tensors: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
-    for &i in &pool {
-        tensors.entry(native.operators[i].name.trim_end_matches(|c: char| c.is_ascii_digit())).or_default().push(i);
+    let names: std::collections::BTreeSet<&str> = native.operators.iter().map(|op| op.name.as_str()).collect();
+    let has = |name: &str| names.contains(name);
+    let count = |l: usize, prefix: &str| (0..).take_while(|h| has(&format!("blocks.{l}.{prefix}{h}"))).count();
+    let layers = (0..).take_while(|l| has(&format!("blocks.{l}.q0"))).count();
+    if layers == 0 {
+        return Err("edits: no attention maps of M to edit".into());
     }
-    let tensors: Vec<Vec<usize>> = tensors.into_values().collect();
-    if tensors.is_empty() {
-        return Err("edits: no map of M to edit".into());
+    let width = |name: &str, rows: bool| native.operators.iter().find(|op| op.name == name).map(|op| if rows { op.rows.width() } else { op.cols.width() });
+    // The maps a random ΔW may take: tensors uniformly, then one of their blocks.
+    let mut tensors: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for op in native.operators.iter().filter(|op| op.name.starts_with("blocks.") && op.rows.width() > 1 && op.cols.width() > 1 && op.diagonal().is_none()) {
+        tensors.entry(op.name.trim_end_matches(|c: char| c.is_ascii_digit())).or_default().push(&op.name);
     }
-    let normal = |rng: &mut rand::rngs::StdRng, n: usize| -> Vec<f64> {
-        let v: Vec<f64> = (0..n)
-            .map(|_| {
-                let (a, b): (f64, f64) = (rng.random::<f64>().max(f64::MIN_POSITIVE), rng.random());
-                (-2.0 * a.ln()).sqrt() * (std::f64::consts::TAU * b).cos()
-            })
-            .collect();
-        let norm = v.iter().map(|x| x * x).sum::<f64>().sqrt();
-        v.into_iter().map(|x| x / norm).collect()
+    let tensors: Vec<Vec<&str>> = tensors.into_values().collect();
+    let all = |name: String, rows: bool, alpha: f64| -> Result<WeightDraw, String> {
+        let n = width(&name, rows).ok_or_else(|| format!("edits: M has no operator {name}"))?;
+        Ok(WeightDraw::Units { operator: name, rows, units: (0..n).collect(), alpha })
     };
-    let mut out = Vec::with_capacity(family.edits);
-    for _ in 0..family.edits {
-        let blocks = &tensors[rng.random_range(0..tensors.len())];
-        let op = &native.operators[blocks[rng.random_range(0..blocks.len())]];
-        let (r, c) = (op.rows.width(), op.cols.width());
-        let operator = op.name.clone();
-        if rng.random_range(0..2) == 0 {
-            let rows = rng.random_range(0..2) == 0;
-            let n = if rows { r } else { c };
-            let k = (1usize << rng.random_range(0..=4usize)).min(n);
-            let mut units: Vec<usize> = (0..n).collect();
-            for j in 0..k {
-                let t = rng.random_range(j..n);
-                units.swap(j, t);
+    let candidates = family.candidates.unwrap_or(4 * family.edits);
+    const BINS: [f64; 3] = [0.01, 0.1, 1.0];
+    let share = family.edits.div_ceil(BINS.len() + 1);
+    let (mut kept, mut spare): (Vec<Vec<WeightDraw>>, Vec<WeightDraw>) = (vec![Vec::new(); BINS.len() + 1], Vec::new());
+    for i in 0..candidates {
+        if kept.iter().all(|b| b.len() >= share) {
+            break;
+        }
+        let l = rng.random_range(0..layers);
+        let (heads, groups) = (count(l, "q"), count(l, "k"));
+        let alpha = interchange::SCALES[rng.random_range(0..interchange::SCALES.len())];
+        let (name, edits) = match rng.random_range(0..4) {
+            0 => {
+                let h = rng.random_range(0..heads);
+                let mut edits = vec![all(format!("blocks.{l}.q{h}"), true, alpha)?, all(format!("blocks.{l}.o{h}"), false, alpha)?];
+                if groups == heads {
+                    edits.push(all(format!("blocks.{l}.k{h}"), true, alpha)?);
+                    edits.push(all(format!("blocks.{l}.v{h}"), true, alpha)?);
+                }
+                ("head".to_string(), edits)
             }
-            units.truncate(k);
-            out.push(WeightDraw::Units { operator, rows, units, alpha: interchange::SCALES[rng.random_range(0..interchange::SCALES.len())] });
+            1 => {
+                let fc = format!("blocks.{l}.c_fc");
+                let n = width(&fc, true).ok_or_else(|| format!("edits: M has no operator {fc}"))?;
+                let k = (8usize << rng.random_range(0..4usize)).min(n);
+                let mut units: Vec<usize> = (0..n).collect();
+                for j in 0..k {
+                    let t = rng.random_range(j..n);
+                    units.swap(j, t);
+                }
+                units.truncate(k);
+                let mut edits = vec![WeightDraw::Units { operator: fc, rows: true, units: units.clone(), alpha }];
+                if has(&format!("blocks.{l}.gate_proj")) {
+                    edits.push(WeightDraw::Units { operator: format!("blocks.{l}.gate_proj"), rows: true, units: units.clone(), alpha });
+                }
+                edits.push(WeightDraw::Units { operator: format!("blocks.{l}.down_proj"), rows: false, units, alpha });
+                ("neurons".to_string(), edits)
+            }
+            2 if heads > 1 => {
+                let h = rng.random_range(0..heads);
+                let other = (h + 1 + rng.random_range(0..heads - 1)) % heads;
+                let maps: &[&str] = if groups == heads { &["q", "k", "v", "o"] } else { &["q", "o"] };
+                let edits = maps.iter().map(|m| WeightDraw::Replaced { operator: format!("blocks.{l}.{m}{h}"), with: format!("blocks.{l}.{m}{other}") }).collect();
+                ("head replaced".to_string(), edits)
+            }
+            _ => {
+                let blocks = &tensors[rng.random_range(0..tensors.len())];
+                let operator = blocks[rng.random_range(0..blocks.len())].to_string();
+                let full = width(&operator, true).zip(width(&operator, false)).map(|(r, c)| r.min(c)).unwrap_or(1);
+                let rank = ((full as f64).powf(rng.random::<f64>()).round() as usize).clamp(1, full);
+                let ratio = 0.3 * 10f64.powf(rng.random::<f64>());
+                ("random".to_string(), vec![WeightDraw::Random { operator, rank, ratio, seed: rng.random::<u64>() }])
+            }
+        };
+        let mut draw = WeightDraw::Group { family: name, screen_bits: 0.0, edits };
+        let bits = screen(&draw)?;
+        if let WeightDraw::Group { screen_bits, .. } = &mut draw {
+            *screen_bits = bits;
+        }
+        let bin = BINS.iter().filter(|b| bits >= **b).count();
+        log::info!("edits: weight candidate {i}: {} → bin {bin}", draw.kind());
+        if kept[bin].len() < share {
+            kept[bin].push(draw);
         } else {
-            let size = interchange::SIZES[rng.random_range(0..interchange::SIZES.len())];
-            let (u, v) = (normal(&mut rng, r), normal(&mut rng, c));
-            let scale = size * op.matrix().iter().map(|x| x * x).sum::<f64>().sqrt() / (r.min(c) as f64).sqrt();
-            out.push(WeightDraw::RankOne { operator, scale, u, v });
+            spare.push(draw);
         }
     }
+    let mut out: Vec<WeightDraw> = kept.into_iter().flatten().collect();
+    out.extend(spare.into_iter().take(family.edits.saturating_sub(out.len())));
+    out.truncate(family.edits);
     Ok(out)
 }
 
@@ -592,7 +701,20 @@ fn edit_faithfulness(
                 typical: experiments.typical_norms().into_iter().collect(),
                 experiments: batches.iter().map(|(_, _, drawn, _)| drawn.clone()).collect(),
                 weights: match &settings.weights {
-                    Some(family) => draw_weights(native, family, settings.seed)?,
+                    Some(family) => {
+                        // The screen's tokens: the range's last two held-out sequences, apart from the
+                        // first `sequences` the edits are scored on; the effect KL(M_e ‖ M) per token.
+                        let rows = &held_out[end.saturating_sub(2).max(first)..end];
+                        let batch = interchange::Batch::new(rows.to_vec(), rows.to_vec())?;
+                        let clean: Vec<interchange::Experiment> = (0..rows.len()).map(|base| interchange::Experiment { base, source: base, explained: vec![true; 2 * layers.len()], patch: None, position: 0 }).collect();
+                        let reference = gam_mpd::artifact::Artifact::native(native)?;
+                        let mut screen = |draw: &WeightDraw| -> Result<f64, String> {
+                            let compiled = gam_mpd::weight_edit::compile(native, &reference, &draw.edits(native)?)?.ok_or("edits: M cannot take an edit of its own maps")?;
+                            let bits = interchange::Interchange::new(device, &compiled.model, layers, &reference, &[], explanation.reads.clone(), settings.numeric_bytes, 256)?.evaluate(&batch, &clean, false)?.bits;
+                            Ok(bits.iter().flatten().sum::<f64>() / bits.iter().map(Vec::len).sum::<usize>().max(1) as f64)
+                        };
+                        draw_weights(native, family, settings.seed, &mut screen)?
+                    }
                     None => Vec::new(),
                 },
             };
@@ -793,9 +915,8 @@ fn weight_faithfulness(
     let mut records = Vec::new();
     for (i, draw) in draws.iter().enumerate() {
         let (operator, kind) = (draw.operator(), draw.kind());
-        let edit = gam_mpd::weight_edit::WeightEdit { native: operator.to_string(), delta: draw.delta(native)? };
-        let Some(compiled) = gam_mpd::weight_edit::compile(native, artifact, &[edit])? else {
-            records.push(json!({"operator": operator, "kind": kind, "applicable": false}));
+        let Some(compiled) = gam_mpd::weight_edit::compile(native, artifact, &draw.edits(native)?)? else {
+            records.push(json!({"operator": operator, "kind": kind, "family": draw.family().0, "screen_bits": draw.family().1, "applicable": false}));
             continue;
         };
         let edited = interchange(&compiled.model, &compiled.explanation)?;
@@ -805,7 +926,7 @@ fn weight_faithfulness(
         let ignoring = interchange(&compiled.model, artifact)?.evaluate(&batch, &clean, false)?.bits;
         let effect = interchange(&compiled.model, &gam_mpd::artifact::Artifact::native(native)?)?.evaluate(&batch, &clean, false)?.bits;
         let record = json!({
-            "operator": operator, "kind": kind, "applicable": true, "owned": compiled.owned,
+            "operator": operator, "kind": kind, "family": draw.family().0, "screen_bits": draw.family().1, "applicable": true, "owned": compiled.owned,
             "mean_bits_per_token": mean(&gap), "effect_mean_bits_per_token": mean(&effect),
             "ignoring_mean_bits_per_token": mean(&ignoring), "response_mean_bits_per_token": mean(&response),
         });
