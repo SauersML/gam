@@ -16,7 +16,7 @@ calls = []
 
 
 class Checker:
-    def __init__(self, model, export=None, memory_gib=None):
+    def __init__(self, model, export=None, memory_gib=None, views=None):
         self.model, self.path = model, None
 
     def request(self, message):

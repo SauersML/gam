@@ -590,6 +590,10 @@ def rescore(args, score) -> dict:
     return summary
 
 
+def views_of(args) -> dict | None:
+    return {"vpd": args.vpd_view} if getattr(args, "vpd_view", None) else None
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--mode", choices=["grpo", "dpo", "bestofn", "sft", "eval", "rescore"], required=True)
@@ -600,6 +604,7 @@ def main():
     ap.add_argument("--scorer", choices=sorted(SCORERS), default="checker")
     ap.add_argument("--score-workers", type=int, default=1, help="checker servers per target model, each scoring whole behaviors in parallel")
     ap.add_argument("--checker", help="the checker binary (mpd_graph_2951; score.py's GRAPH_CHECKER); on MATS name target/release/examples/mpd_graph_2951 so the job builds it")
+    ap.add_argument("--vpd-view", help="VPD's decomposition export for the checker's vpd view (programs with PD.vpd pieces are invalid without it; vpd4l: ~/mpd-data/engine/vpd4l_decomposition)")
     ap.add_argument("--checker-gib", type=int, help="the checker server's memory lease on the Mac (score.py's default otherwise)")
     ap.add_argument("--export", help="the target model's export directory for the checker (score.py's EXPORTS entry otherwise)")
     ap.add_argument("--out", required=True)
@@ -651,7 +656,7 @@ def main():
     if args.mode == "rescore":  # no policy: scores saved programs again
         if args.checker:
             os.environ["GRAPH_CHECKER"] = str(Path(args.checker).resolve())
-        scorer.WORKERS, scorer.EXPORT, scorer.MEMORY_GIB = args.score_workers, args.export, args.checker_gib
+        scorer.WORKERS, scorer.EXPORT, scorer.MEMORY_GIB, scorer.VIEWS = args.score_workers, args.export, args.checker_gib, views_of(args)
         print(json.dumps(rescore(args, SCORERS[args.scorer])))
         return
     use_vllm = args.sampler == "vllm" or (args.sampler == "auto" and torch.cuda.is_available() and __import__("importlib").util.find_spec("vllm") is not None)
@@ -668,7 +673,7 @@ def main():
     if args.checker:
         os.environ["GRAPH_CHECKER"] = str(Path(args.checker).resolve())
     score = SCORERS[args.scorer]
-    scorer.WORKERS, scorer.EXPORT, scorer.MEMORY_GIB = args.score_workers, args.export, args.checker_gib
+    scorer.WORKERS, scorer.EXPORT, scorer.MEMORY_GIB, scorer.VIEWS = args.score_workers, args.export, args.checker_gib, views_of(args)
     root = Path(args.behaviors)
     pool, heldout_prompts = split_prompts(behaviors(root, args.model, "train"), args.prompt_holdout, out / "behaviors")
     sets = {"heldout_behaviors": behaviors(root, args.model, "heldout"), "heldout_prompts": heldout_prompts}
