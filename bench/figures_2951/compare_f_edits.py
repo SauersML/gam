@@ -113,7 +113,8 @@ reference = next((r['manifest'] for r in rows if r['model'] == 'vpd4l' and r.get
 # bits) plus its causal-importance network priced at its Laplace start (77.2M bits); gaps on the vpd4l
 # manifest from mpd_battery_2951 site_edits (each form's masks recomputed under each edit).
 for form, label in (('published', 'VPD as published (CI reads the edited M, both ways)'), ('causal', 'VPD, causal CI on the edited M'), ('autonomous', 'VPD autonomous (causal CI on its own run)')):
-    path = f'{MANIFEST_DIR}/vpd/EDITS_vpd_{form}.json'
+    # On the weight-edit manifest (s2) where scored, else s1.
+    path = next((f for f in (f'{MANIFEST_DIR}/vpd_s2/EDITS_vpd_{form}.json', f'{MANIFEST_DIR}/vpd/EDITS_vpd_{form}.json') if os.path.exists(f)), f'{MANIFEST_DIR}/vpd/EDITS_vpd_{form}.json')
     r = L(path)
     row = {'model': 'vpd4l', 'method': label, 'edits': path if r else None, 'manifest': experiments_of(r),
            'description_bits': 11.4e6 + 77.2e6, 'description_note': '11.4M subcomponents + 77.2M CI network', 'active': '213 subcomponents unmasked per token'}
