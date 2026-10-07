@@ -145,6 +145,7 @@ def check_rescore():
         seen.extend((it["seed"], it["experiments"], json.dumps(it["options"])) for it in items)
         return [{"valid": True, "total_bits": 2 * float(it["source"].split("=")[1]), "exec_error_bits": 2 * float(it["source"].split("=")[1])} for it in items]
 
+    train.ir_signature = lambda source, model: source  # stand-in programs: each its own score
     args = types.SimpleNamespace(samples_from=[str(d / "eval_samples.jsonl")], score_options='{"families": ["swap"]}', eval_seed=5, eval_experiments=16, out=str(d), rescore_tag="t",
                                  behaviors=str(d), model="vpd4l", summary_only=False)
     s = train.rescore(args, score)["heldout_behaviors/r"]

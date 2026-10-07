@@ -545,6 +545,15 @@ def evaluate(sets: dict[str, list[dict]], pol, sampler, score, args, adapter: Pa
     return summary
 
 
+def ir_signature(source: str, model: str) -> str:
+    """What the checker's score depends on without a reader: the traced program (nodes, edges, Python
+    token count and types, validity and error)."""
+    import mech
+
+    ir = mech.trace(source, model)
+    return json.dumps({k: ir.get(k) for k in ("valid", "error", "nodes", "edges", "python_tokens", "token_types", "standin")}, sort_keys=True)
+
+
 def rescore(args, score) -> dict:
     """Every program of earlier evaluations (--samples-from eval_samples.jsonl files) scored again under
     --eval-seed / --eval-experiments and --score-options (extra checker request keys, e.g. held-out
@@ -570,7 +579,16 @@ def rescore(args, score) -> dict:
         todo = list({key(r): r for r in rows if r["behavior_path"] == bpath and key(r) not in done}.values())  # each distinct program once
         if not todo:
             continue
-        scores = score([{"source": r["source"], "behavior": behaviors_by_path[bpath], "seed": args.eval_seed, "experiments": args.eval_experiments, "options": options} for r in todo])
+        reps, rep_of = {}, []
+        for r in todo:  # programs with the same traced IR get the same checker score (no reader term)
+            sig = ir_signature(r["source"], behaviors_by_path[bpath]["model"]) if not os.environ.get("GRAPH_READER") else r["source"]
+            rep_of.append(reps.setdefault(sig, len(reps)))
+        firsts = {}
+        for i, j in enumerate(rep_of):
+            firsts.setdefault(j, i)
+        unique = [todo[firsts[j]] for j in range(len(reps))]
+        scored = score([{"source": r["source"], "behavior": behaviors_by_path[bpath], "seed": args.eval_seed, "experiments": args.eval_experiments, "options": options} for r in unique])
+        scores = [scored[j] for j in rep_of]
         with open(done_path, "a") as f:
             for r, x in zip(todo, scores):
                 rec = {**r, "score_before": r["score"], "score": x, "options": options, "seed": args.eval_seed, "experiments": args.eval_experiments}
