@@ -86,10 +86,7 @@ Program:
 
 """
 
-TASK = {
-    "continue": "The question below gives an experiment on the target model and the target model's most probable next tokens without the experiment (each token as a JSON string, so spaces and newlines are explicit, then its probability). Your reply begins with the text the target model reads. Continue that text with one token: the target model's next token under the experiment, drawn with the probabilities the target model gives the tokens.",
-    "choice": "The question below gives an experiment on the target model, the text it reads, and its most probable next tokens without the experiment (each token as a JSON string, so spaces and newlines are explicit, then its probability), as lettered options with a last option for every other token. Answer with the letter of the option the target model produces under the experiment, choosing each letter with the probability the target model gives that option.",
-}
+TASK = ("The question below gives an experiment on the target model and the target model's most probable next tokens without the experiment (each token as a JSON string, so spaces and newlines are explicit, then its probability). Your reply begins with the text the target model reads. Continue that text with one token: the target model's next token under the experiment, drawn with the probabilities the target model gives the tokens.")
 
 ITEM = """Experiment: {words}
 
@@ -97,18 +94,6 @@ Without the experiment:
 {listing}
 every other token: {other:.3g}"""
 
-CHOICE_ITEM = """Experiment: {words}
-
-The target model reads this text (between <<< and >>>):
-<<<{text}>>>
-
-Options, with their probabilities without the experiment:
-{listing}
-{other_label}. every other token {other:.3g}
-
-Which option does the target model produce under the experiment? Answer with its letter."""
-
-LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
 
 def _runs(index: list[int]) -> str:
@@ -203,10 +188,9 @@ class Prompter:
     and ends with the text M reads (the answer slot is after it); candidates(it) are the candidates'
     reader tokens."""
 
-    def __init__(self, tokenizer, shared_vocab: bool, answer: str = "continue"):
+    def __init__(self, tokenizer, shared_vocab: bool):
         self.tok = tokenizer
         self.shared = shared_vocab
-        self.answer = answer
         marker = "\u0000U\u0000"
         rendered = tokenizer.apply_chat_template([{"role": "system", "content": SYSTEM}, {"role": "user", "content": marker}],
                                                  add_generation_prompt=True, enable_thinking=False, tokenize=False)
@@ -227,22 +211,15 @@ class Prompter:
         return text
 
     def prefix(self, source: str) -> list[int]:
-        return self.template(self.head) + self.enc(INSTRUCTIONS.replace("{task}", TASK[self.answer]).replace("{source}", source))
+        return self.template(self.head) + self.enc(INSTRUCTIONS.replace("{task}", TASK).replace("{source}", source))
 
     def item(self, it: dict) -> list[int]:
-        if self.answer == "choice":
-            cands = it["candidates"]
-            listing = "\n".join(f"{LETTERS[j]}. {json.dumps(c['text'], ensure_ascii=False)} {c['clean']:.3g}" for j, c in enumerate(cands))
-            user = CHOICE_ITEM.format(words=words(it["experiment"]), text=self.shown(it["text"]), listing=listing, other_label=LETTERS[len(cands)], other=it["clean_other"])
-            return self.enc(user) + self.template(self.mid)
         listing = "\n".join(f"{json.dumps(c['text'], ensure_ascii=False)} {c['clean']:.3g}" for c in it["candidates"])
         user = ITEM.format(words=words(it["experiment"]), listing=listing, other=it["clean_other"])
         text = list(it["token_ids"]) if self.shared else self.enc(self.shown(it["text"]))
         return self.enc(user) + self.template(self.mid) + text
 
     def candidates(self, it: dict) -> list[list[int]]:
-        if self.answer == "choice":  # the letters of the candidates and of "every other token"
-            return [self.enc(LETTERS[j]) for j in range(len(it["candidates"]) + 1)]
         if self.shared:
             return [[int(c["token_id"])] for c in it["candidates"]]
         return [self.enc(c["text"]) for c in it["candidates"]]
@@ -354,10 +331,10 @@ class CachedReader:
 class Scorer:
     """One loaded reader backend and its prompter; bits per (text, item), memoized by content."""
 
-    def __init__(self, backend, target: str, answer: str = "continue"):
+    def __init__(self, backend, target: str):
         self.backend = backend
         shared = target.lower().startswith("qwen3") and "qwen3" in backend.model_id.lower()
-        self.prompter = Prompter(backend.tokenizer, shared, answer)
+        self.prompter = Prompter(backend.tokenizer, shared)
         self.memo: dict[tuple[str, str], float] = {}
         self.rest: dict[tuple[str, str], float] = {}  # the reader's q(other) per (text, item), for diagnosis
         self._vocab = None
@@ -390,8 +367,8 @@ class Scorer:
                 "candidates": [(c.get("token_id"), c.get("text"), c["clean"], c["p"]) for c in it["candidates"]]}
         return hashlib.sha1(text.encode()).hexdigest(), hashlib.sha1(json.dumps(read, sort_keys=True).encode()).hexdigest()
 
-    def key(self, text: str, it: dict) -> tuple[str, str, str]:
-        return (self.prompter.answer,) + self._key(text, it)
+    def key(self, text: str, it: dict) -> tuple[str, str]:
+        return self._key(text, it)
 
     def bits(self, texts: list[str], items: list[dict]) -> np.ndarray:
         """[len(texts), len(items)] bits."""
@@ -399,8 +376,7 @@ class Scorer:
         todo = [(a, b) for a in range(len(texts)) for b in range(len(items)) if self.key(texts[a], items[b]) not in self.memo]
         if todo:
             pr = self.prompter
-            choice = pr.answer == "choice"
-            vocab = None if (pr.shared or choice) else self.vocabulary()
+            vocab = None if pr.shared else self.vocabulary()
             bodies = {b: pr.item(items[b]) for b in {b for _, b in todo}}
             cands = {b: pr.candidates(items[b]) for b in bodies}
             for a in sorted({a for a, _ in todo}):
@@ -412,7 +388,7 @@ class Scorer:
                     body = bodies[b]
                     slot = len(body) - 1
                     suffixes.append(body)
-                    reads.append([(slot, None if vocab is not None else [c[0] for c in cands[b]])])  # choice: the letters
+                    reads.append([(slot, None if vocab is not None else [c[0] for c in cands[b]])])
                     where.append((b, None))
                     for k, c in enumerate(cands[b]):
                         if len(c) > 1:
@@ -430,10 +406,7 @@ class Scorer:
                         extra[(b, k)] = math.exp(float(sum(float(x[0]) for x in r)))
                 for b in mine:
                     it = items[b]
-                    if choice:  # the letters' probabilities, normalized over the K + 1 options
-                        lab = np.exp(first[b] - first[b].max())
-                        q = (lab / lab.sum())[:-1]
-                    elif vocab is not None:
+                    if vocab is not None:
                         full = np.exp(first[b])
                         strings = [c["text"] for c in it["candidates"]]
                         raw = [(full[vocab.starting(t)].sum() + extra.get((b, k), 0.0)) if t else 0.0 for k, t in enumerate(strings)]
@@ -515,10 +488,8 @@ def main():
     ap.add_argument("--max-batch", type=int, default=32, help="sequences per forward pass")
     ap.add_argument("--device", help="cuda, mps or cpu (default: cuda when present, else cpu)")
     ap.add_argument("--dtype", choices=["float32", "bfloat16"], help="default: bfloat16 on a GPU, float32 on the CPU")
-    ap.add_argument("--answer", choices=["continue", "choice"], default="continue",
-                    help="continue: the reader continues the text M reads; choice: it answers with the letter of a candidate or of every other token")
     args = ap.parse_args()
-    scorer = Scorer(CachedReader(args.model, args.batch_tokens, args.max_batch, args.seed, args.device, args.dtype), args.target, args.answer)
+    scorer = Scorer(CachedReader(args.model, args.batch_tokens, args.max_batch, args.seed, args.device, args.dtype), args.target)
     if args.command == "serve":
         host, sep, port = args.listen.rpartition(":")
         server = socketserver.TCPServer((host, int(port)), _Handler) if sep and port.isdigit() else socketserver.UnixStreamServer(args.listen, _Handler)
