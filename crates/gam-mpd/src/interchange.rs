@@ -393,6 +393,19 @@ pub enum Operation {
     Cut { to: usize },
 }
 
+/// One weight edit's scores ([`Interchange::weight_scores`]), each a mean over tokens in bits.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WeightScores {
+    /// `KL(M_e ‖ P_e)`.
+    pub gap: f64,
+    /// `KL(M_e ‖ P)`, `P` left unedited.
+    pub ignoring: f64,
+    /// `KL(M_e ‖ M)`.
+    pub effect: f64,
+    /// `KL(p_e ‖ p̃_e)` ([`Interchange::response`]).
+    pub response: f64,
+}
+
 /// The candidate weight edits measured per evaluation ([`Interchange::draw_weight_edits`]).
 const WEIGHT_SCREEN_CHUNK: usize = 32;
 
@@ -3477,6 +3490,48 @@ impl Interchange {
         }).collect())
     }
 
+    /// Whether `P` takes weight edit `edit` of the table: it applies every map the edit changes (by
+    /// name, through an owning operator, or as a summed block's use). An edit `P` does not take is
+    /// unsupported: [`Interchange::weight_scores`] reports it absent, never as a score.
+    pub fn weight_edit_supported(&self, edit: usize) -> Result<bool, String> {
+        let e = self.p_sites.parts.weights.get(edit).ok_or_else(|| error(format!("weight edit {edit}: not in the table")))?;
+        let held = |native: &str| self.p_sites.parts.matrices.get(native).is_some_and(|u| !u.is_empty());
+        Ok(e.entries.iter().all(|x| held(&x.native)) && e.factors.iter().all(|f| held(&f.native)))
+    }
+
+    /// Per weight edit of the table (`edits` its indices), its scores on `batch`'s base sequences
+    /// (every token, the means per token in bits), through the one path training's experiments
+    /// take (`Patch::Weights`: coordinate edits scale the represented entries at every use of the
+    /// map in each model, fixed deltas add their terms there): `None` for an edit `P` does not take
+    /// ([`Interchange::weight_edit_supported`]), else the gap `KL(M_e ‖ P_e)`, the edit-ignoring
+    /// baseline `KL(M_e ‖ P)`, the effect `KL(M_e ‖ M)` and the response diagnostic
+    /// ([`Interchange::response`]).
+    pub fn weight_scores(&self, batch: &Batch, edits: &[usize]) -> Result<Vec<Option<WeightScores>>, String> {
+        let (m, p) = self.models();
+        let blocks = m.blocks();
+        let mean = |bits: &[Vec<f64>]| bits.iter().flatten().sum::<f64>() / bits.iter().map(Vec::len).sum::<usize>().max(1) as f64;
+        let unedited = |sites: &Arc<Sites>| -> Arc<Sites> {
+            let mut next = (**sites).clone();
+            next.parts.unedited = true;
+            Arc::new(next)
+        };
+        let p_unedited = Model { program: &self.p, sites: unedited(&self.p_sites), prefixes: None };
+        let m_unedited = Model { program: &self.m, sites: unedited(&self.m_sites), prefixes: None };
+        let mut out = Vec::with_capacity(edits.len());
+        for &e in edits {
+            if !self.weight_edit_supported(e)? {
+                out.push(None);
+                continue;
+            }
+            let block = self.p_sites.parts.weights[e].block;
+            let experiments: Vec<Experiment> = (0..batch.base.len()).map(|n| Experiment { base: n, source: n, explained: vec![true; blocks], patch: Some(Patch::Weights { edit: e, block }), position: 0 }).collect();
+            let targets = self.targets(batch, &experiments)?;
+            let score = |model: &Model<'_>| -> Result<f64, String> { Ok(mean(&evaluate_probed((&m, model), &self.head, (batch, &experiments), Some(&targets), false, None)?.bits)) };
+            out.push(Some(WeightScores { gap: score(&p)?, ignoring: score(&p_unedited)?, effect: score(&m_unedited)?, response: mean(&self.response(batch, &experiments)?) }));
+        }
+        Ok(out)
+    }
+
     /// `P` applies no edits of parts from now on, `M` still does: with `P` = `M`
     /// (`Artifact::native`), an edit's score is then `KL(M_e ‖ M)`, the size of the change the edit
     /// makes to `M`, over the same tokens as its `KL(M_e ‖ P_e)`.
@@ -3639,9 +3694,8 @@ impl Interchange {
         self.response_from(self, batch, experiments)
     }
 
-    /// [`Interchange::response`] where the edit is compiled into this interchange's models (a native
-    /// weight edit, `weight_edit::compile`) and `clean` holds the models before it: the clean runs
-    /// `p_0` and `q_0` are `clean`'s, the edited ones this interchange's.
+    /// [`Interchange::response`] with the clean runs `p_0` and `q_0` `clean`'s and the edited ones
+    /// this interchange's.
     pub fn response_from(&self, clean: &Interchange, batch: &Batch, experiments: &[Experiment]) -> Result<Vec<Vec<f64>>, String> {
         let (m, p) = self.models();
         let (m_clean, p_clean) = clean.models();

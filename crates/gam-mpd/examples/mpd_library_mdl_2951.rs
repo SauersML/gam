@@ -365,31 +365,65 @@ impl WeightDraw {
         }
     }
 
-    /// The edits `ΔW` of `M`'s operators (`native` its program) the draw makes, one per operator edited
-    /// (a group's several).
-    fn edits(&self, native: &OperatorProgram) -> Result<Vec<gam_mpd::weight_edit::WeightEdit>, String> {
-        match self {
-            Self::Group { edits, .. } => Ok(edits.iter().map(|e| e.edits(native)).collect::<Result<Vec<_>, _>>()?.into_iter().flatten().collect()),
-            _ => Ok(vec![gam_mpd::weight_edit::WeightEdit { native: self.operator(), delta: self.delta(native)? }]),
-        }
+    /// The draw as one entry of the edit table every model and every scoring shares
+    /// (`weight_edit::Drawn`, applied by `interchange`'s `Patch::Weights`): units of rows or columns
+    /// scaled are coordinate edits; a head's four maps replaced by another head's is the coordinate
+    /// edit it computes (the replaced head's output columns scaled 0, the other head's 2, so each
+    /// model replaces its own head); every other edit is a fixed delta.
+    fn drawn(&self, native: &OperatorProgram) -> Result<gam_mpd::weight_edit::Drawn, String> {
+        use gam_mpd::weight_edit::{Drawn, Kind};
+        let (mut entries, mut factors) = (Vec::new(), Vec::new());
+        self.collect(native, &mut entries, &mut factors)?;
+        let block_of = |name: &str| -> Result<usize, String> {
+            let l: usize = name.split('.').nth(1).and_then(|l| l.parse().ok()).ok_or_else(|| format!("edits: {name} is no block's map"))?;
+            let part = name.split('.').nth(2).unwrap_or("");
+            Ok(if ["c_fc", "gate_proj", "up_proj", "down_proj"].contains(&part) { 2 * l + 1 } else { 2 * l })
+        };
+        let blocks: std::collections::BTreeSet<usize> = entries.iter().map(|e| e.native.as_str()).chain(factors.iter().map(|f| f.native.as_str())).map(block_of).collect::<Result<_, _>>()?;
+        let [block] = blocks.into_iter().collect::<Vec<_>>()[..] else { return Err(format!("edits: {} edits maps of several blocks", self.operator())) };
+        let kind = match self.family().0.as_str() {
+            "head" => Kind::Head,
+            "neurons" => Kind::Neurons,
+            "head replaced" => Kind::HeadReplaced,
+            _ if entries.is_empty() => Kind::Random,
+            _ if block % 2 == 1 => Kind::Neurons,
+            _ => Kind::Head,
+        };
+        Ok(Drawn { kind, block, entries, factors, effect: None })
     }
 
-    /// The draw as an explanation compiles it (`weight_edit::compile_entries`): its coordinate edits
-    /// (units of rows or columns scaled) entry-wise, every other edit as `ΔW`.
-    fn compiled(&self, native: &OperatorProgram) -> Result<(Vec<gam_mpd::weight_edit::WeightEdit>, Vec<gam_mpd::weight_edit::EntryEdit>), String> {
+    /// The draw's coordinate edits and fixed deltas ([`WeightDraw::drawn`]).
+    fn collect(&self, native: &OperatorProgram, entries: &mut Vec<gam_mpd::weight_edit::EntryEdit>, factors: &mut Vec<gam_mpd::weight_edit::Factored>) -> Result<(), String> {
+        use gam_mpd::weight_edit::{EntryEdit, Factored};
+        let columns = |name: &str| native.operators.iter().find(|op| op.name == name).map(|op| op.cols.width()).ok_or_else(|| format!("edits: M has no operator {name}"));
         match self {
-            Self::Group { edits, .. } => {
-                let (mut deltas, mut entries) = (Vec::new(), Vec::new());
-                for e in edits {
-                    let (d, x) = e.compiled(native)?;
-                    deltas.extend(d);
-                    entries.extend(x);
+            Self::Group { family, edits, .. } if family == "head replaced" => {
+                let pairs: Vec<(&str, &str)> = edits.iter().map(|e| if let Self::Replaced { operator, with } = e { Ok((operator.as_str(), with.as_str())) } else { Err("edits: a head replacement with a map not replaced".to_string()) }).collect::<Result<_, _>>()?;
+                let map = |name: &str| name.rsplit('.').next().and_then(|p| p.chars().next());
+                let mut maps: Vec<char> = pairs.iter().filter_map(|(op, _)| map(op)).collect();
+                maps.sort_unstable();
+                if maps != ['k', 'o', 'q', 'v'] {
+                    return Err(format!("edits: a head replacement of {maps:?}, not of the head's four maps"));
                 }
-                Ok((deltas, entries))
+                let (o, with) = pairs.iter().find(|(op, _)| map(op) == Some('o')).copied().ok_or("edits: no output map")?;
+                entries.push(EntryEdit { native: o.to_string(), rows: false, units: (0..columns(o)?).collect(), alpha: 0.0 });
+                entries.push(EntryEdit { native: with.to_string(), rows: false, units: (0..columns(with)?).collect(), alpha: 2.0 });
             }
-            Self::Units { operator, rows, units, alpha } => Ok((Vec::new(), vec![gam_mpd::weight_edit::EntryEdit { native: operator.clone(), rows: *rows, units: units.clone(), alpha: *alpha }])),
-            _ => Ok((self.edits(native)?, Vec::new())),
+            Self::Group { edits, .. } => {
+                for e in edits {
+                    e.collect(native, entries, factors)?;
+                }
+            }
+            Self::Units { operator, rows, units, alpha } => entries.push(EntryEdit { native: operator.clone(), rows: *rows, units: units.clone(), alpha: *alpha }),
+            _ => {
+                // ΔW through its smaller side: `I` there and `ΔW` (or its transpose) on the other.
+                let delta = self.delta(native)?;
+                let (r, c) = delta.dim();
+                let native = self.operator();
+                factors.push(if r <= c { Factored { native, left: ndarray::Array2::eye(r), right: delta.t().to_owned() } } else { Factored { native, left: delta, right: ndarray::Array2::eye(c) } });
+            }
         }
+        Ok(())
     }
 
     /// The edit `ΔW` of one of `M`'s operators (`native` its program).
@@ -724,12 +758,11 @@ fn edit_faithfulness(
                         // first `sequences` the edits are scored on; the effect KL(M_e ‖ M) per token.
                         let rows = &held_out[end.saturating_sub(2).max(first)..end];
                         let batch = interchange::Batch::new(rows.to_vec(), rows.to_vec())?;
-                        let clean: Vec<interchange::Experiment> = (0..rows.len()).map(|base| interchange::Experiment { base, source: base, explained: vec![true; 2 * layers.len()], patch: None, position: 0 }).collect();
                         let reference = gam_mpd::artifact::Artifact::native(native)?;
+                        let mut probe = interchange::Interchange::new(device, native, layers, &reference, &[], explanation.reads.clone(), settings.numeric_bytes, 256)?;
                         let mut screen = |draw: &WeightDraw| -> Result<f64, String> {
-                            let compiled = gam_mpd::weight_edit::compile(native, &reference, &draw.edits(native)?)?.ok_or("edits: M cannot take an edit of its own maps")?;
-                            let bits = interchange::Interchange::new(device, &compiled.model, layers, &reference, &[], explanation.reads.clone(), settings.numeric_bytes, 256)?.evaluate(&batch, &clean, false)?.bits;
-                            Ok(bits.iter().flatten().sum::<f64>() / bits.iter().map(Vec::len).sum::<usize>().max(1) as f64)
+                            probe.set_weight_edits(vec![draw.drawn(native)?])?;
+                            Ok(probe.weight_effects(&batch, &[0])?[0])
                         };
                         draw_weights(native, family, settings.seed, &mut screen)?
                     }
@@ -896,13 +929,13 @@ fn edit_faithfulness(
 
 /// Native weight edits of `M`'s maps (`EditSettings::weights`), the same for every explanation,
 /// drawn once into the manifest (`draw_weights`: heads and neuron groups scaled, heads replaced,
-/// random ΔW, kept by a measured screen). Each is compiled into `M` and into `P`
-/// (`weight_edit::compile_entries`: `M` computes with `W + ΔW`; `P` takes coordinate edits entry-wise
-/// inside every slice and leftover where it sums slices, and `ΔW` through its owners otherwise) and
-/// scored on `rows` with `P` autonomous: the gap `KL(M_e ‖ P_e)`, the effect `KL(M_e ‖ M)`, the
-/// edit-ignoring baseline `KL(M_e ‖ P)` and the response diagnostic, in bits per token, with the
-/// share of the edit `P` took (`Compiled::owned`); an explanation holding no copy of the edited map
-/// counts it as not applicable.
+/// random ΔW, kept by a measured screen), scored on `rows` with `P` autonomous through the path
+/// training's experiments take (`Interchange::weight_scores`, `Patch::Weights` with the draws as the
+/// table, [`WeightDraw::drawn`]): coordinate edits scale the represented entries of every owner of
+/// the edited map in each model, fixed deltas add their terms there. Per edit the gap
+/// `KL(M_e ‖ P_e)`, the effect `KL(M_e ‖ M)`, the edit-ignoring baseline `KL(M_e ‖ P)` and the
+/// response diagnostic, in bits per token; an edit of a map `P` applies nowhere is unsupported:
+/// recorded as such, without scores, and left out of every mean (null when none is supported).
 fn weight_faithfulness(
     device: &Device,
     (native, layers): (&OperatorProgram, &[LayerNodes]),
@@ -915,44 +948,26 @@ fn weight_faithfulness(
     if rows.is_empty() {
         return Err("edits: no rows to score the weight edits on".into());
     }
-    // An explanation that records no owners may compute M's maps as sums of gated slices
-    // (library_vpd): the compile takes their uses.
-    let mut artifact = artifact.clone();
-    if artifact.owners.is_empty() {
-        artifact.owners = gam_mpd::library_vpd::uses(native, layers, &artifact)?;
-    }
-    let artifact = &artifact;
     let batch = interchange::Batch::new(rows.to_vec(), rows.to_vec())?;
-    let clean: Vec<interchange::Experiment> = (0..rows.len()).map(|base| interchange::Experiment { base, source: base, explained: vec![true; 2 * layers.len()], patch: None, position: 0 }).collect();
-    let interchange = |model: &OperatorProgram, explanation: &gam_mpd::artifact::Artifact| interchange::Interchange::new(device, model, layers, explanation, &[], reads.to_vec(), settings.numeric_bytes, 256);
-    let unedited = interchange(native, artifact)?;
-    let mean = |bits: &[Vec<f64>]| bits.iter().flatten().sum::<f64>() / bits.iter().map(Vec::len).sum::<usize>().max(1) as f64;
+    let mut experiments = interchange::Interchange::new(device, native, layers, artifact, &[], reads.to_vec(), settings.numeric_bytes, 256)?;
+    experiments.set_weight_edits(draws.iter().map(|d| d.drawn(native)).collect::<Result<_, _>>()?)?;
     let mut records = Vec::new();
     for (i, draw) in draws.iter().enumerate() {
-        let (operator, kind) = (draw.operator(), draw.kind());
-        let (deltas, entries) = draw.compiled(native)?;
-        let Some(compiled) = gam_mpd::weight_edit::compile_entries(native, artifact, &deltas, &entries)? else {
-            records.push(json!({"operator": operator, "kind": kind, "family": draw.family().0, "screen_bits": draw.family().1, "applicable": false}));
-            continue;
+        let (operator, kind, (family, screen)) = (draw.operator(), draw.kind(), draw.family());
+        let record = match experiments.weight_scores(&batch, &[i])?.pop().flatten() {
+            None => json!({"operator": operator, "kind": kind, "family": family, "screen_bits": screen, "supported": false}),
+            Some(s) => json!({
+                "operator": operator, "kind": kind, "family": family, "screen_bits": screen, "supported": true,
+                "mean_bits_per_token": s.gap, "effect_mean_bits_per_token": s.effect, "ignoring_mean_bits_per_token": s.ignoring, "response_mean_bits_per_token": s.response,
+            }),
         };
-        let edited = interchange(&compiled.model, &compiled.explanation)?;
-        let gap = edited.evaluate(&batch, &clean, false)?.bits;
-        let response = edited.response_from(&unedited, &batch, &clean)?;
-        drop(edited);
-        let ignoring = interchange(&compiled.model, artifact)?.evaluate(&batch, &clean, false)?.bits;
-        let effect = interchange(&compiled.model, &gam_mpd::artifact::Artifact::native(native)?)?.evaluate(&batch, &clean, false)?.bits;
-        let record = json!({
-            "operator": operator, "kind": kind, "family": draw.family().0, "screen_bits": draw.family().1, "applicable": true, "owned": compiled.owned,
-            "mean_bits_per_token": mean(&gap), "effect_mean_bits_per_token": mean(&effect),
-            "ignoring_mean_bits_per_token": mean(&ignoring), "response_mean_bits_per_token": mean(&response),
-        });
         log::info!("edits: weight edit {i} ({:.0} s): {record}", started.elapsed().as_secs_f64());
         records.push(record);
     }
-    let applicable: Vec<&Value> = records.iter().filter(|r| r["applicable"] == json!(true)).collect();
-    let average = |key: &str| applicable.iter().filter_map(|r| r[key].as_f64()).sum::<f64>() / applicable.len().max(1) as f64;
+    let supported: Vec<&Value> = records.iter().filter(|r| r["supported"] == json!(true)).collect();
+    let average = |key: &str| if supported.is_empty() { Value::Null } else { json!(supported.iter().filter_map(|r| r[key].as_f64()).sum::<f64>() / supported.len() as f64) };
     Ok(json!({
-        "edits": records.len(), "not_applicable": records.len() - applicable.len(), "sequences": rows.len(),
+        "edits": records.len(), "supported": supported.len(), "unsupported": records.len() - supported.len(), "sequences": rows.len(),
         "mean_bits_per_token": average("mean_bits_per_token"), "effect_mean_bits_per_token": average("effect_mean_bits_per_token"),
         "ignoring_mean_bits_per_token": average("ignoring_mean_bits_per_token"), "response_mean_bits_per_token": average("response_mean_bits_per_token"),
         "records": records,
