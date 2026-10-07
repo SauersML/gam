@@ -51,12 +51,15 @@ def main():
     ap.add_argument("--min-neurons", type=int, default=768)
     ap.add_argument("--workers", type=int, default=1)
     ap.add_argument("--out", type=Path, default=Path.home() / "mpd-data/graph_oracle/runs/r6")
+    ap.add_argument("--heads-only", action="store_true", help="rank heads only (a native MLP's numbers cost more than most behaviors' signal)")
     ap.add_argument("--stages", default="prefix,removal,addition", help="which stages run after the prefixes (removal, addition)")
     ap.add_argument("--prefixes", default="1,2,4,8,12,16,24,32", help="prefix lengths scored besides the empty program")
     a = ap.parse_args()
     beh_path = a.behavior.expanduser()
     beh = json.loads(beh_path.read_text())
     rank = ranking(json.loads(a.patch.expanduser().read_text()), beh["model"])
+    if a.heads_only:
+        rank = [u for u in rank if u[0] == "head"]
     out = a.out.expanduser()
     out.mkdir(parents=True, exist_ok=True)
     log_path = out / f"{beh['id']}.jsonl"
