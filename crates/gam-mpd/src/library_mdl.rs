@@ -1952,13 +1952,12 @@ impl Mlp {
     }
 }
 
-/// A stage of gated components (`library_vpd`): the gate node `z = input·Aᵀ + c` in the flat
+/// A stage of gated components (`library_vpd`), whose gate node is `z = input·Aᵀ + c` in the flat
 /// program (`A` the identity over the components' read norms for an own gate, the gate rows `g`
-/// for a direction gate), its input node, the threshold operator `c` and the direction operator
+/// for a direction gate): its input node, the threshold operator `c` and the direction operator
 /// `g` (none for an own gate), and per component the read groups of the slices it runs when on
 /// (its rank in rank-one equivalents is the number of those still active).
 struct GatedStage {
-    gate: usize,
     input: usize,
     threshold: usize,
     direction: Option<usize>,
@@ -2027,7 +2026,7 @@ impl GatedStage {
                 Some(a) => flat.nodes.iter().position(|n| matches!(n, Node::Transposed { input, operator } if *input == gate && *operator == a)).ok_or_else(|| format!("{prefix}: no gate through the assignment"))?,
                 None => gate,
             };
-            stages.push(Self { gate, input, threshold, direction, slices, component_gate, assign });
+            stages.push(Self { input, threshold, direction, slices, component_gate, assign });
             Ok(())
         };
         let mut attention = blocks(index_of(program, &format!("{name}.attn.read"))?)?;
