@@ -219,18 +219,21 @@ pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes], decompositio
         // stacked read, the gate, the gate's softness, the gated activations; returns (gated node,
         // gate node, softness node).
         let stage_nodes = |nodes: &mut Vec<Node>, input: usize, (read, gate_a, gate_b, soft): (usize, usize, usize, usize)| -> (usize, usize, usize) {
-            nodes.push(Node::Affine { terms: vec![(input, read)], bias: None });
-            let a = nodes.len() - 1;
-            let z = if direction {
+            // A direction gate and its softness come before the reads they gate, so each row reads
+            // only its components on (`DeviceProgram`'s gated reads); an own gate reads them.
+            let (a, z, s) = if direction {
                 nodes.push(Node::Affine { terms: vec![(input, gate_a)], bias: Some(gate_b) });
-                nodes.len() - 1
+                nodes.push(Node::Constant { operator: soft });
+                nodes.push(Node::Affine { terms: vec![(input, read)], bias: None });
+                (nodes.len() - 1, nodes.len() - 3, nodes.len() - 2)
             } else {
+                nodes.push(Node::Affine { terms: vec![(input, read)], bias: None });
+                let a = nodes.len() - 1;
                 nodes.push(Node::GroupNorm { input: a });
                 nodes.push(Node::Affine { terms: vec![(nodes.len() - 1, gate_a)], bias: Some(gate_b) });
-                nodes.len() - 1
+                nodes.push(Node::Constant { operator: soft });
+                (a, nodes.len() - 2, nodes.len() - 1)
             };
-            nodes.push(Node::Constant { operator: soft });
-            let s = nodes.len() - 1;
             nodes.push(Node::Gated { value: a, gate: z, scale: Some(s) });
             (nodes.len() - 1, z, s)
         };
@@ -307,8 +310,12 @@ pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes], decompositio
             nodes.push(Node::Param { index: heads });
             nodes.push(Node::Concat { parts: (0..heads).collect() });
             let c = nodes.len() - 1;
-            nodes.push(Node::Affine { terms: vec![(c, base)], bias: None });
-            let a_o = nodes.len() - 1;
+            // The o reads after their gate when the gate does not read them (no own norm gates), so
+            // each row reads only its components on (`DeviceProgram`'s gated reads).
+            let late = (!o_own.is_empty() && !direction).then(|| {
+                nodes.push(Node::Affine { terms: vec![(c, base)], bias: None });
+                nodes.len() - 1
+            });
             // The gate columns of the o carriers: from the attention input stage's gate (recomputed
             // here from x), then the own o gates.
             let (mut gate_parts, mut soft_parts) = (Vec::new(), Vec::new());
@@ -339,7 +346,7 @@ pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes], decompositio
                 if direction {
                     nodes.push(Node::Affine { terms: vec![(c, first)], bias: Some(first + 1) });
                 } else {
-                    nodes.push(Node::GroupNorm { input: a_o });
+                    nodes.push(Node::GroupNorm { input: late.ok_or_else(|| error(format!("layer {l}: own o gates without the o reads")))? });
                     nodes.push(Node::Affine { terms: vec![(nodes.len() - 1, select)], bias: None });
                     nodes.push(Node::Affine { terms: vec![(nodes.len() - 1, first)], bias: Some(first + 1) });
                 }
@@ -348,6 +355,10 @@ pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes], decompositio
                 soft_parts.push(nodes.len() - 1);
             }
             let (z, s) = joined(&mut nodes, gate_parts, soft_parts);
+            let a_o = late.unwrap_or_else(|| {
+                nodes.push(Node::Affine { terms: vec![(c, base)], bias: None });
+                nodes.len() - 1
+            });
             nodes.push(Node::Gated { value: a_o, gate: z, scale: Some(s) });
             nodes.push(Node::Affine { terms: vec![(nodes.len() - 1, base + 1)], bias: None });
             let mut inputs = reads_cols.clone();
@@ -392,8 +403,11 @@ pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes], decompositio
         nodes.push(Node::Affine { terms: vec![(gated, base + 1)], bias: None });
         nodes.push(Node::Pointwise { input: nodes.len() - 1, laws: laws.clone() });
         let act = nodes.len() - 1;
-        nodes.push(Node::Affine { terms: vec![(act, base + 2)], bias: None });
-        let a_dn = nodes.len() - 1;
+        // The down reads after their gate when the gate does not read them (as the o reads').
+        let late = (!d_own.is_empty() && !direction).then(|| {
+            nodes.push(Node::Affine { terms: vec![(act, base + 2)], bias: None });
+            nodes.len() - 1
+        });
         let (mut gate_parts, mut soft_parts) = (Vec::new(), Vec::new());
         let carried: Vec<usize> = dn_carriers.iter().filter(|b| f_comps.contains(b)).map(|b| f_comps.iter().position(|a| a == b).unwrap_or(0)).collect();
         if !carried.is_empty() {
@@ -413,7 +427,7 @@ pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes], decompositio
             if direction {
                 nodes.push(Node::Affine { terms: vec![(act, first)], bias: Some(first + 1) });
             } else {
-                nodes.push(Node::GroupNorm { input: a_dn });
+                nodes.push(Node::GroupNorm { input: late.ok_or_else(|| error(format!("layer {l}: own down gates without the down reads")))? });
                 nodes.push(Node::Affine { terms: vec![(nodes.len() - 1, select)], bias: None });
                 nodes.push(Node::Affine { terms: vec![(nodes.len() - 1, first)], bias: Some(first + 1) });
             }
@@ -422,6 +436,10 @@ pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes], decompositio
             soft_parts.push(nodes.len() - 1);
         }
         let (z, s) = joined(&mut nodes, gate_parts, soft_parts);
+        let a_dn = late.unwrap_or_else(|| {
+            nodes.push(Node::Affine { terms: vec![(act, base + 2)], bias: None });
+            nodes.len() - 1
+        });
         nodes.push(Node::Gated { value: a_dn, gate: z, scale: Some(s) });
         nodes.push(Node::Affine { terms: vec![(nodes.len() - 1, base + 3)], bias: None });
         let rule = Rule { name: format!("{name}.mlp"), inputs: vec![h2_interface.clone()], output: nodes.len() - 1, nodes };
