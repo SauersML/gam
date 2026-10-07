@@ -89,9 +89,18 @@ ev = torch.tensor(tok[1024:1032, :512].astype(np.int64), device=dev)
 train_rows, batch, seq = int(os.environ.get('DESCENT_TRAIN_ROWS', '1024')), 8, 256
 # VPD's mean active (causal importance > 0) slices per token at each MLP map, rows 1024..1031,
 # from M's clean inputs (fitmath proto.log); 129 in total.
+# The VPD start's thresholds match VPD's per-map counts scaled down to the budget when the budget is
+# below VPD's total (START_SCALE, set once both tables exist): a start above the budget made the dual
+# step push every threshold up at once, and gates pushed far below threshold get no gradient back
+# (the whole model from 237 active at K = 64 and 128 ended at 10-15 active, unable to recover).
 VPD_COUNTS = {'h.0.mlp.c_fc': 18.62, 'h.0.mlp.down_proj': 20.20, 'h.1.mlp.c_fc': 4.23,
               'h.1.mlp.down_proj': 3.20, 'h.2.mlp.c_fc': 7.16, 'h.2.mlp.down_proj': 7.77,
               'h.3.mlp.c_fc': 26.43, 'h.3.mlp.down_proj': 41.07}
+VPD_ATTN_COUNTS = {'h.0.attn.q_proj': 0.91, 'h.0.attn.k_proj': 1.25, 'h.0.attn.v_proj': 1.9, 'h.0.attn.o_proj': 2.47,
+                   'h.1.attn.q_proj': 1.0, 'h.1.attn.k_proj': 1.22, 'h.1.attn.v_proj': 3.6, 'h.1.attn.o_proj': 5.07,
+                   'h.2.attn.q_proj': 4.28, 'h.2.attn.k_proj': 4.22, 'h.2.attn.v_proj': 10.16, 'h.2.attn.o_proj': 15.76,
+                   'h.3.attn.q_proj': 1.99, 'h.3.attn.k_proj': 2.04, 'h.3.attn.v_proj': 7.74, 'h.3.attn.o_proj': 12.9}
+START_SCALE = min(1.0, K / (sum(VPD_COUNTS.values()) + (sum(VPD_ATTN_COUNTS.values()) if attn else 0.0)))
 
 @torch.no_grad()
 def site_inputs(ids):
@@ -167,7 +176,7 @@ for n in mlp:
             idx = torch.randperm(flat.numel(), device=dev)[:2_000_000]
             tau = torch.full_like(s, torch.quantile(flat[idx], q).item())
         else:
-            q = 1 - VPD_COUNTS[n] / V.shape[1]
+            q = 1 - START_SCALE * VPD_COUNTS[n] / V.shape[1]
             flat = r.reshape(-1)
             idx = torch.randperm(flat.numel(), device=dev)[:2_000_000]
             tau = torch.full_like(s, torch.quantile(flat[idx], q).item())
@@ -296,10 +305,7 @@ if EDGES:
 # reads restricted to the head (the frame R (R^T R)^-1 has dual R); thresholds one per map, at the
 # quantile of r matching VPD's mean active count at that map (VPD_ATTN_COUNTS, from its masks on M's
 # inputs, rows 1024..1031, vpd_fair_mlp.py with FAIR_SITES=all).
-VPD_ATTN_COUNTS = {'h.0.attn.q_proj': 0.91, 'h.0.attn.k_proj': 1.25, 'h.0.attn.v_proj': 1.9, 'h.0.attn.o_proj': 2.47,
-                   'h.1.attn.q_proj': 1.0, 'h.1.attn.k_proj': 1.22, 'h.1.attn.v_proj': 3.6, 'h.1.attn.o_proj': 5.07,
-                   'h.2.attn.q_proj': 4.28, 'h.2.attn.k_proj': 4.22, 'h.2.attn.v_proj': 10.16, 'h.2.attn.o_proj': 15.76,
-                   'h.3.attn.q_proj': 1.99, 'h.3.attn.k_proj': 2.04, 'h.3.attn.v_proj': 7.74, 'h.3.attn.o_proj': 12.9}
+
 NH, HD = T.n_head, T.hd
 
 
@@ -357,7 +363,7 @@ for n in attn:
         c = head_coefficients(x, V, o)
         r = c.abs() * U.norm(dim=-1)[:, None, :]
         s_ = 0.1 * r.pow(2).mean(1).sqrt().clamp_min(1e-12)                     # [H, C]
-        q = 1 - VPD_ATTN_COUNTS.get(n, 1.0) / (NH * V.shape[-1])
+        q = 1 - START_SCALE * VPD_ATTN_COUNTS.get(n, 1.0) / (NH * V.shape[-1])
         flat = r.reshape(-1); idx = torch.randperm(flat.numel(), device=dev)[:2_000_000]
         tau = torch.full_like(s_, torch.quantile(flat[idx], q).item())
         err = (head_output(c, U, o) - x @ W.T).abs().max().item()
@@ -825,7 +831,7 @@ if attn:
         for l in range(4):
             n = f'h.{l}.attn.v_proj'; r = cap[n]
             A[n]['s'] = 0.1 * r.pow(2).mean(1).sqrt().clamp_min(1e-12)
-            q = 1 - VPD_ATTN_COUNTS.get(n, 1.0) / r.shape[0] / r.shape[2]
+            q = 1 - START_SCALE * VPD_ATTN_COUNTS.get(n, 1.0) / r.shape[0] / r.shape[2]
             flat = r.reshape(-1); idx = torch.randperm(flat.numel(), device=dev)[:2_000_000]
             A[n]['tau'] = torch.full_like(A[n]['s'], torch.quantile(flat[idx], q).item()).requires_grad_()
         if ARM == 'share':
