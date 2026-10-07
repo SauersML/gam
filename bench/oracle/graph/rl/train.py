@@ -124,13 +124,17 @@ def init_adapter(path: str | None, out: Path) -> str | None:
 
 def baselines(b: dict) -> dict[str, str]:
     """Programs the oracle is compared with on behavior b, scored on the same experiments: g-int's
-    references (the empty and the full program, e2e/programs.py) and the search baseline's final
-    programs (e2e/search.py's runs/search/<behavior>.<mode>.json)."""
+    references (the empty and the full program, e2e/programs.py), g-mech's example programs for b
+    (examples/index.json) and the search baseline's final programs (runs/search/<behavior>.<mode>.json)."""
     sys.path.insert(0, str(HERE.parent / "e2e"))
     import programs
 
     refs = programs.references(b["model"])
     out = {"empty": refs["empty"], "full": refs["full"]}
+    index = json.loads((HERE.parent / "examples/index.json").read_text())
+    for name, entry in sorted(index.items()):  # g-mech's hand-written or measured example programs for this behavior
+        if entry.get("behavior") == b["id"]:
+            out["example_" + name] = (HERE.parent / "examples" / f"{name}.py").read_text()
     for p in sorted(SEARCH.glob(f"{b['id']}.*.json")):
         out["search_" + p.stem[len(b["id"]) + 1 :]] = json.loads(p.read_text())["source"]
     return out
@@ -403,8 +407,9 @@ def repair(chosen: list[dict], best: list[dict], pol, sampler, score, args, adap
 
 def sft_examples(args, pol, pool: list[dict]) -> tuple[list, list]:
     """--mode sft's data as token ids (prompt, completion): program examples, the oracle's input for a
-    TRAINING behavior -> the best program of that behavior among --programs files (g-int's
-    {"behavior", "source", "score"} layout; behaviors outside the training pool are never used), and
+    TRAINING behavior -> the best program of that behavior among scored --programs files (g-int's
+    {"behavior", "source", "score"} layout) plus every unscored one (printed examples); behaviors outside
+    the training pool are never used; and
     --data examples (JSONL of {"messages": [user, assistant]} or {"prompt", "completion"}, e.g.
     g-predict's prediction questions). The completion ends with <|im_end|>."""
     import glob
@@ -414,10 +419,14 @@ def sft_examples(args, pol, pool: list[dict]) -> tuple[list, list]:
     for pattern in args.programs or []:
         for path in sorted(glob.glob(os.path.expanduser(pattern))):
             r = json.loads(Path(path).read_text())
-            if r.get("behavior") in by_id and r.get("source") and (r["behavior"] not in best or r["score"]["total_bits"] < best[r["behavior"]]["score"]["total_bits"]):
+            if r.get("behavior") not in by_id or not r.get("source"):
+                continue
+            if "score" not in r:  # an unscored program (a printed hand-written example): always an example
+                best[path] = r
+            elif r["behavior"] not in best or r["score"]["total_bits"] < best[r["behavior"]]["score"]["total_bits"]:
                 best[r["behavior"]] = r
     end = [pol.end]
-    programs = [(pol.prompt_ids(render(by_id[k])), pol.tok.encode("```python\n" + r["source"].strip() + "\n```", add_special_tokens=False) + end) for k, r in sorted(best.items())]
+    programs = [(pol.prompt_ids(render(by_id[r["behavior"]])), pol.tok.encode("```python\n" + r["source"].strip() + "\n```", add_special_tokens=False) + end) for _, r in sorted(best.items())]
     questions = []
     for path in args.data or []:
         for line in open(os.path.expanduser(path)):
