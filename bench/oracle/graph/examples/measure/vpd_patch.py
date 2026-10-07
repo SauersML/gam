@@ -3,7 +3,8 @@ head and every MLP, the model runs on each prompt's counterfactual with that one
 taken from the clean prompt (every position), and recovery = KL(M_clean || M_counterfactual) -
 KL(M_clean || M_patched), bits per target token, full vocabulary.
 
-  MPD_MEM_GIB=6 mem-lease 6 ~/mpd-data/venv/bin/python vpd_patch.py BEHAVIOR.json OUT.json
+  MPD_MEM_GIB=6 mem-lease 6 ~/mpd-data/venv/bin/python vpd_patch.py OUT_DIR BEHAVIOR.json [...]
+(OUT_DIR/patch_<behavior id>.json per behavior)
 """
 
 import json
@@ -21,11 +22,18 @@ import vpd_model as VM  # noqa: E402
 
 @torch.no_grad()
 def main():
-    behavior, out = Path(sys.argv[1]), Path(sys.argv[2])
+    out_dir = Path(sys.argv[1])
+    out_dir.mkdir(parents=True, exist_ok=True)
     dev = VL.device()
     t = VL.Model(dev).t
+    for behavior in sys.argv[2:]:
+        beh = json.loads(Path(behavior).read_text())
+        if any(p.get("counterfactual") for p in beh["prompts"]):
+            patch(t, dev, beh, out_dir / f"patch_{beh['id']}.json")
+
+
+def patch(t, dev, beh: dict, out: Path):
     H, D = t.n_head, t.hd
-    beh = json.loads(behavior.read_text())
     prompts = [p for p in beh["prompts"] if p.get("counterfactual")]
     T = max(len(p["token_ids"]) for p in prompts)
 

@@ -6,5 +6,6 @@
  "vpd4l_sva_nounpp": {"model": "vpd4l", "behavior": "sva.nounpp", "family": "sva", "split": "heldout"},
  "vpd4l_bracket_close_call": {"model": "vpd4l", "behavior": "bracket_close.call", "family": "bracket_close", "split": "train"},
  "vpd4l_greater_than_war": {"model": "vpd4l", "behavior": "greater_than.war", "family": "greater_than", "split": "train"},
- "vpd4l_pronoun_gender_said": {"model": "vpd4l", "behavior": "pronoun_gender.said", "family": "pronoun_gender", "split": "train"}
+ "vpd4l_pronoun_gender_said": {"model": "vpd4l", "behavior": "pronoun_gender.said", "family": "pronoun_gender", "split": "train"},
+ "qwen3_ioi_argument": {"model": "qwen3-0.6b", "behavior": "ioi.argument", "family": "ioi", "split": "heldout"}
 }
