@@ -37,7 +37,8 @@ def main():
     assert [r["behavior"] for r in out] == [f"b{i % 4}" for i in range(16)]
     assert sorted(calls) == sorted({(f"b{i % 4}", 1 + i % 2, 4) for i in range(16)}), calls
     check_repair()
-    print("ok: checker scorer order, behaviors and one batch per (behavior, seed); repair keeps a revision only when it lowers S")
+    check_evaluate()
+    print("ok: checker scorer order, behaviors and one batch per (behavior, seed); repair keeps a revision only when it lowers S; evaluation summary")
 
 
 def check_repair():
@@ -57,6 +58,36 @@ def check_repair():
     replaced = train.repair([{"id": "a"}, {"id": "b"}], best, pol, sampler, score, args, Path("."), 0)
     assert replaced == {0} and best[0]["score"]["total_bits"] == 30.0 and best[0]["completion"] == [30] and best[1]["score"]["total_bits"] == 10.0, (replaced, best)
     assert "line 1: syntax error" in shown[0] and "bad(" in shown[0] and shown[0].startswith("input a")
+
+
+def check_evaluate():
+    """train.evaluate scores the policy's programs and the baselines under the evaluation seed only, and
+    its summary averages per set: mean single-sample S, best of N, each baseline over the behaviors that have it."""
+    import io
+    import json
+
+    import train
+
+    seen = []
+    train.render = lambda b: b["id"]
+    train.baselines = lambda b: {"empty": "X = 100"} if b["id"] == "a" else {}
+    tok = types.SimpleNamespace(decode=lambda c, skip_special_tokens=True: f"```python\nX = {c[0]}\n```")
+    pol = types.SimpleNamespace(tok=tok, prompt_ids=lambda text: [0])
+    sampler = lambda prompts, n, adapter, version: [[[10], [30]] for _ in prompts]  # noqa: E731
+
+    def score(items):
+        seen.extend((it["seed"], it.get("experiments")) for it in items)
+        return [{"valid": True, "total_bits": float(it["source"].split("=")[1])} for it in items]
+
+    args = types.SimpleNamespace(samples=2, eval_seed=7, eval_experiments=16, baselines=True)
+    log = io.StringIO()
+    out = train.evaluate({"heldout_behaviors": [{"id": "a"}, {"id": "b"}], "heldout_prompts": []}, pol, sampler, score, args, Path("."), 0, log, 3)
+    s = out["heldout_behaviors"]
+    assert s["mean_bits"] == 20.0 and s["best_of_n_bits"] == 10.0 and s["baselines"] == {"empty": 100.0}, s
+    assert s["oracle_mean_bits_on_baseline_behaviors"] == {"empty": 20.0} and "heldout_prompts" not in out
+    assert set(seen) == {(7, 16)}, seen
+    rows = [json.loads(line) for line in log.getvalue().splitlines()]
+    assert [r.get("behavior") for r in rows[:2]] == ["a", "b"] and rows[-1]["step"] == 3
 
 
 if __name__ == "__main__":
