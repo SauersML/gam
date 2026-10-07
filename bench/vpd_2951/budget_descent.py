@@ -17,6 +17,9 @@ Starts:
   vpd  VPD's MLP slices (s-55ea3f9b), one threshold per map set so the active count on the fit
        tokens matches VPD's causal-importance count at that map (fitmath's KL 3.28 start), then
        trained per slice
+  vpdgroup  as vpd, with each down_proj slice tied to the gate of the c_fc slice of its layer whose
+       firing is nearest its own (below)
+Gate arms (DESCENT_ARM): own (above) or dir, a separate signed gate direction per slice (below).
 Training rows 0..1023 of tokens.f64, held-out evaluation rows 1024..1031 (4096 tokens), where VPD's
 causal-importance masks give KL 0.737 at 129 active MLP slices per token.
 Usage: budget_descent.py START K STEPS OUT.json GATE EVAL SECONDS GAM TARGET VPD TOKENS
@@ -38,6 +41,9 @@ if not (vpd_model.TARGET_DIR / 'model_step_99999.safetensors').exists():  # the 
     vpd_model.load_file = lambda f: torch.load(f.replace('.safetensors', '.pt'), map_location='cpu', weights_only=True)
 VPD_DIR, TOKENS = (Path(sys.argv[10]) if sys.argv[10].endswith('.pth') else Path(sys.argv[10]).parent), sys.argv[11]
 import os
+# DESCENT_ARM=dir: each slice's gate reads its own direction g_i (signed), z = (g_i.x - tau_i)/s_i,
+# with g_i started at the slice's read v_i ||u_i||, signed so its firing on M's fit tokens is kept.
+ARM = os.environ.get('DESCENT_ARM', 'own')
 dev = os.environ.get('DESCENT_DEV') or ('cuda' if torch.cuda.is_available() else 'mps')
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.manual_seed(0)
@@ -63,10 +69,11 @@ def site_inputs(ids):
     return {n: torch.cat(v) for n, v in xs.items()}
 
 X = site_inputs(torch.tensor(tok[0:16, :512].astype(np.int64), device=dev))
-if start == 'vpd' and str(VPD_DIR).endswith('.pth'):
+vpdlike = start in ('vpd', 'vpdgroup')
+if vpdlike and str(VPD_DIR).endswith('.pth'):
     raw = torch.load(str(VPD_DIR), map_location='cpu', weights_only=True, mmap=True)
     load = lambda k: raw['_components.' + k.rsplit('.', 1)[0].replace('.', '-') + '.' + k.rsplit('.', 1)[1]].float().to(dev)
-elif start == 'vpd':
+elif vpdlike:
     shapes = {k: v['shape'] for k, v in json.load(open(VPD_DIR / 'export.json'))['files'].items()}
     load = lambda k: torch.tensor(np.fromfile(VPD_DIR / f'{k}.f64', dtype='<f8').reshape(shapes[k]), dtype=torch.float32, device=dev)
 P = {}
@@ -92,26 +99,56 @@ for n in mlp:
             idx = torch.randperm(flat.numel(), device=dev)[:2_000_000]
             tau = torch.full_like(s, torch.quantile(flat[idx], q).item())
     P[n] = {'V': V.clone().requires_grad_(), 'U': U.clone().requires_grad_(), 'tau': tau.clone().requires_grad_(), 's': s}
+    if ARM == 'dir':
+        with torch.no_grad():
+            c = X[n] @ V
+            sgn = torch.sign((c * (r > tau).float()).sum(0)); sgn[sgn == 0] = 1
+            P[n]['G'] = (V * (sgn * U.norm(dim=1))[None, :]).clone().requires_grad_()
     print(n, 'slices', V.shape[1], 'sum error', float((V @ U - W.T).abs().max()), flush=True)
+# vpdgroup: a down_proj slice whose firing on M's fit tokens is closer (Hamming distance) to one of
+# its layer's c_fc slices than to never firing is tied to that c_fc slice: one gate, the c_fc
+# slice's own, for the group. A group on counts 1 + its tied down slices (rank-one equivalents).
+GROUP, MULT = {}, {}
+if start == 'vpdgroup':
+    with torch.no_grad():
+        for l in range(4):
+            fc, dn = f'h.{l}.mlp.c_fc', f'h.{l}.mlp.down_proj'
+            on = lambda m: (((X[m] @ P[m]['V']).abs() * P[m]['U'].norm(dim=1)) > P[m]['tau']).float()
+            gf, gd = on(fc), on(dn)
+            mism = gf.sum(0)[:, None] + gd.sum(0)[None, :] - 2 * (gf.T @ gd)
+            bm, best = mism.min(0)
+            owner = torch.where(bm < gd.sum(0), best, torch.full_like(best, -1))
+            GROUP[dn] = (fc, owner)
+            MULT[fc] = 1 + torch.bincount(owner[owner >= 0], minlength=gf.shape[1]).float()
+            print(dn, 'tied', int((owner >= 0).sum()), 'of', owner.numel(), 'to', int((MULT[fc] > 1).sum()), 'c_fc slices', flush=True)
 del X
 
-state = {'mode': 'M', 'soft': [], 'hard': []}
+state = {'mode': 'M', 'soft': [], 'hard': [], 'gates': {}}
 SQ2 = math.sqrt(2)
 def make(n):
-    st = T.site(n); p = P[n]
+    st = T.site(n); p = P[n]; grp = GROUP.get(n); mult = MULT.get(n)
+    if grp is not None:
+        tied, own = grp[1] >= 0, grp[1].clamp_min(0)
     def fwd(x):
         if state['mode'] == 'M':
             return x @ st.W.T
         c = x @ p['V']
         if state['mode'] == 'all':
             return c @ p['U']
-        z = (c.abs() * p['U'].norm(dim=1) - p['tau']) / p['s']
+        z = ((x @ p['G'] if ARM == 'dir' else c.abs() * p['U'].norm(dim=1)) - p['tau']) / p['s']
         hard = (z > 0).float()
-        state['hard'].append(hard.sum(-1).reshape(-1))
+        phi = 0.5 * (1 + torch.erf(z / SQ2))
+        w = 1.0
+        if grp is not None:
+            fh, fp = state['gates'][grp[0]]
+            hard = torch.where(tied, fh[..., own], hard); phi = torch.where(tied, fp[..., own], phi)
+            w = (~tied).float()
+        if mult is not None:
+            state['gates'][n] = (hard, phi); w = mult
+        state['hard'].append((hard * w).sum(-1).reshape(-1))
         if state['mode'] == 'hard':
             return (c * hard) @ p['U']
-        phi = 0.5 * (1 + torch.erf(z / SQ2))
-        state['soft'].append(phi.sum(-1).reshape(-1))
+        state['soft'].append((phi * w).sum(-1).reshape(-1))
         g = phi if gate == 'mf' else hard + phi - phi.detach()
         return (c * g) @ p['U']
     return fwd
@@ -141,7 +178,7 @@ def evaluate():
     out['per_map'] = [round(float(x), 2) for x in np.mean(r['per_map'], 0)]
     return out
 
-params = [P[n][w] for n in mlp for w in ('V', 'U')]
+params = [P[n][w] for n in mlp for w in (('V', 'U', 'G') if ARM == 'dir' else ('V', 'U'))]
 # Adam steps of 0.3% of each tensor's root mean square, thresholds 1% of their site's noise scale x 10.
 groups = [{'params': [q], 'lr': 3e-3 * q.detach().pow(2).mean().sqrt().item()} for q in params]
 groups += [{'params': [P[n]['tau']], 'lr': 0.1 * P[n]['s'].mean().item()} for n in mlp]
