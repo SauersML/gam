@@ -249,6 +249,42 @@ type Active = Option<Arc<Indices>>;
 /// `rows × k` cotangent.
 type Packed = BTreeMap<usize, (Arc<Indices>, Tensor)>;
 
+/// A reverse call's gradient sums ([`DeviceProgram::vjp_values_dense_edited`]), each operator's,
+/// and those `fresh`: made by this call and not yet written, their memory unset. A fresh sum's
+/// first write of the whole sum replaces it (β = 0), where adding into zeros would cost a memset
+/// pass each; a write of part of it zeroes it first.
+#[derive(Default)]
+struct Sums {
+    values: BTreeMap<usize, Tensor>,
+    fresh: BTreeSet<usize>,
+}
+
+impl Sums {
+    /// `op`'s sum ready for a write and the write's β (`whole`: the write covers the whole sum), or
+    /// `None` without a sum of `op`.
+    fn ready(&mut self, d: &Device, op: usize, whole: bool) -> Result<Option<(&mut Tensor, f64)>, String> {
+        let Some(sum) = self.values.get_mut(&op) else { return Ok(None) };
+        if !self.fresh.remove(&op) {
+            return Ok(Some((sum, 1.0)));
+        }
+        if whole {
+            return Ok(Some((sum, 0.0)));
+        }
+        *sum = d.zeros(sum.rows(), sum.cols()).map_err(error)?;
+        Ok(Some((sum, 1.0)))
+    }
+
+    /// The sums, those never written made zero.
+    fn finish(mut self, d: &Device) -> Result<BTreeMap<usize, Tensor>, String> {
+        for op in std::mem::take(&mut self.fresh) {
+            if let Some(sum) = self.values.get_mut(&op) {
+                *sum = d.zeros(sum.rows(), sum.cols()).map_err(error)?;
+            }
+        }
+        Ok(self.values)
+    }
+}
+
 /// A group of sibling heads and its stacked operators.
 struct Fused {
     heads: Heads,
@@ -2244,7 +2280,7 @@ impl DeviceProgram {
                 }
             }
         }
-        let (mut kept, _, packed) = self.reverse_seeds(trace, seeds, keep, arithmetic, &BTreeSet::new(), &mut |_, _| Ok(()), &mut BTreeMap::new())?;
+        let (mut kept, _, packed) = self.reverse_seeds(trace, seeds, keep, arithmetic, &BTreeSet::new(), &mut |_, _| Ok(()), &mut Sums::default())?;
         for (node, (ids, part)) in packed {
             kept.insert(node, self.unpack(trace.rows, node, &ids, &part)?);
         }
@@ -2265,7 +2301,7 @@ impl DeviceProgram {
         if self.head.operator.is_some() {
             return Err("device: values VJP requires resident-value compilation".into());
         }
-        let (mut kept, _, packed) = self.reverse_seeds(trace, seeds, keep, arithmetic, &BTreeSet::new(), &mut |_, _| Ok(()), &mut BTreeMap::new())?;
+        let (mut kept, _, packed) = self.reverse_seeds(trace, seeds, keep, arithmetic, &BTreeSet::new(), &mut |_, _| Ok(()), &mut Sums::default())?;
         for (node, (ids, part)) in packed {
             kept.insert(node, self.unpack(trace.rows, node, &ids, &part)?);
         }
@@ -2283,7 +2319,7 @@ impl DeviceProgram {
         arithmetic: Arithmetic,
         edited: &BTreeSet<usize>,
         hook: &mut dyn FnMut(usize, &mut Tensor) -> Result<(), String>,
-        parameters: &mut BTreeMap<usize, Tensor>,
+        parameters: &mut Sums,
     ) -> Result<(BTreeMap<usize, Tensor>, BTreeMap<usize, Tensor>, Packed), String> {
         if keep
             .iter()
@@ -2708,7 +2744,7 @@ impl DeviceProgram {
         (cot, half): (&Tensor, &mut Option<Tensor>),
         (grads, needed): (&mut [Option<Tensor>], &[bool]),
         arithmetic: Arithmetic,
-        parameters: &mut BTreeMap<usize, Tensor>,
+        parameters: &mut Sums,
     ) -> Result<(), String> {
         let d = &self.device;
         let group = &self.fused[g];
@@ -2717,7 +2753,7 @@ impl DeviceProgram {
         for (argument, operator) in &heads.rest {
             self.pull_term((&mut *grads, needed), trace.rows, (cot, &mut *half), *argument, *operator, arithmetic)?;
         }
-        let wanted: Vec<(usize, usize)> = heads.projection_operators.iter().enumerate().filter(|(_, (op, _))| parameters.contains_key(op)).map(|(i, (op, _))| (i, *op)).collect();
+        let wanted: Vec<(usize, usize)> = heads.projection_operators.iter().enumerate().filter(|(_, (op, _))| parameters.values.contains_key(op)).map(|(i, (op, _))| (i, *op)).collect();
         if !needed[heads.input] && wanted.is_empty() {
             return Ok(());
         }
@@ -2739,8 +2775,12 @@ impl DeviceProgram {
             d.gemm(&mut stacked, 1.0, self.operand(&g_p, &mut half_p, arithmetic)?, Op::T, x, Op::N, 0.0, arithmetic).map_err(error)?;
             for (i, op) in wanted {
                 let rows = d.rows_of(&stacked, i * heads.width, heads.width).map_err(error)?;
-                let gradient = parameters.get_mut(&op).ok_or("device: a projection's gradient slot")?;
-                d.axpy(gradient, 1.0, &rows).map_err(error)?;
+                let (gradient, beta) = parameters.ready(d, op, true)?.ok_or("device: a projection's gradient slot")?;
+                if beta == 0.0 {
+                    *gradient = rows;
+                } else {
+                    d.axpy(gradient, 1.0, &rows).map_err(error)?;
+                }
             }
         }
         if !needed[heads.input] {
@@ -2778,8 +2818,9 @@ impl DeviceProgram {
     /// `hook` maps the cotangent of the edited value to that of the value the node computed (the
     /// transpose of the edit) before the node's own rule reads it; the hook keeps any other part
     /// of the edit's transpose itself (`interchange`). The operators' gradients are added into
-    /// `gradients`, an operator's entry made zero where it has none (a pass's sums over its calls,
-    /// each added in place by its products), and the kept nodes' cotangents returned.
+    /// `gradients`, an operator's entry made where it has none (a pass's sums over its calls, each
+    /// added in place by its products; a new entry's first write sets it, [`Sums`]), and the kept
+    /// nodes' cotangents returned.
     pub fn vjp_values_dense_edited(
         &self,
         trace: &DeviceTrace,
@@ -2797,6 +2838,7 @@ impl DeviceProgram {
         if requested.len() != trainable.len() {
             return Err("device: duplicate trainable operator".into());
         }
+        let mut fresh = BTreeSet::new();
         for &op in &requested {
             if self
                 .operators
@@ -2820,7 +2862,8 @@ impl DeviceProgram {
                 Some(sum) if sum.dim() != shape => return Err("device: a gradient sum of another shape".into()),
                 Some(_) => {}
                 None => {
-                    gradients.insert(op, self.device.zeros(shape.0, shape.1).map_err(error)?);
+                    gradients.insert(op, self.device.empty(shape.0, shape.1).map_err(error)?);
+                    fresh.insert(op);
                 }
             }
         }
@@ -2867,9 +2910,9 @@ impl DeviceProgram {
         // every other product. The gradient sums are shared by every block a pass reverses, and a
         // block run by another program (`M`'s, in a hybrid) numbers its operators its own way: its
         // products must not meet the slots of `P`'s operators of the same indices.
-        let mut own: BTreeMap<usize, Tensor> = requested.iter().filter_map(|op| gradients.remove(op).map(|t| (*op, t))).collect();
+        let mut own = Sums { values: requested.iter().filter_map(|op| gradients.remove(op).map(|t| (*op, t))).collect(), fresh };
         let summed = self.reverse_into(trace, seeds, (keep, &retained), arithmetic, (edited, hook), &mut own);
-        gradients.extend(own);
+        gradients.extend(own.finish(&self.device)?);
         summed
     }
 
@@ -2882,13 +2925,13 @@ impl DeviceProgram {
         (keep, retained): (&[usize], &[usize]),
         arithmetic: Arithmetic,
         (edited, hook): (&BTreeSet<usize>, &mut dyn FnMut(usize, &mut Tensor) -> Result<(), String>),
-        gradients: &mut BTreeMap<usize, Tensor>,
+        gradients: &mut Sums,
     ) -> Result<BTreeMap<usize, Tensor>, String> {
         let seeded: BTreeSet<usize> = seeds.keys().copied().collect();
         let (mut nodes, mut rounded, packed) = self.reverse_seeds(trace, seeds, retained, arithmetic, edited, hook, gradients)?;
         // One scalar constant is uploaded; all reductions and gradient arrays stay
         // on the device. Reuse the same broadcast across every column occurrence.
-        let has_columns = gradients.keys().any(|op| self.operators.contains_key(&(*op, Role::Column)));
+        let has_columns = gradients.values.keys().any(|op| self.operators.contains_key(&(*op, Role::Column)));
         let ones = if has_columns {
             let one = self.device.upload_vec(1, 1, vec![1.0]).map_err(error)?;
             Some(self.device.broadcast_rows(&one, trace.rows).map_err(error)?)
@@ -2900,22 +2943,26 @@ impl DeviceProgram {
                 let d = &self.device;
                 let c = if arithmetic == Arithmetic::Bf16 && part.storage() == Storage::F32 { d.bf16_copy(part).map_err(error)? } else { d.copy(part).map_err(error)? };
                 for (input, op) in terms {
-                    let Some(gradient) = gradients.get_mut(op) else { continue };
-                    if gradient.storage() == Storage::Bf16 || matches!(self.steps[*input], Step::Feature { .. }) {
+                    let Some(storage) = gradients.values.get(op).map(Tensor::storage) else { continue };
+                    if storage == Storage::Bf16 || matches!(self.steps[*input], Step::Feature { .. }) {
                         let dense = self.unpack(trace.rows, node, ids, part)?;
                         let x = trace.rounded_value(*input, arithmetic)?;
-                        d.gemm(gradient, 1.0, self.operand(&dense, &mut None, arithmetic)?, Op::T, x.as_deref().map_or(trace.value(*input), Ok)?, Op::N, 1.0, arithmetic).map_err(error)?;
+                        let (gradient, beta) = gradients.ready(d, *op, true)?.ok_or("device: a gradient slot")?;
+                        d.gemm(gradient, 1.0, self.operand(&dense, &mut None, arithmetic)?, Op::T, x.as_deref().map_or(trace.value(*input), Ok)?, Op::N, beta, arithmetic).map_err(error)?;
                     } else if !ids.is_empty() {
+                        let (gradient, _) = gradients.ready(d, *op, false)?.ok_or("device: a gradient slot")?;
                         let mut rows = d.empty(ids.len(), gradient.cols()).map_err(error)?;
                         let x = trace.rounded_value(*input, arithmetic)?;
                         d.gemm(&mut rows, 1.0, &c, Op::T, x.as_deref().map_or(trace.value(*input), Ok)?, Op::N, 0.0, arithmetic).map_err(error)?;
                         d.scatter_rows(gradient, ids, &rows, true).map_err(error)?;
                     }
                 }
-                if let Some(gradient) = bias.and_then(|op| gradients.get_mut(&op)).filter(|_| !ids.is_empty()) {
-                    let mut rows = d.empty(ids.len(), 1).map_err(error)?;
-                    d.gemm(&mut rows, 1.0, &c, Op::T, ones.as_ref().ok_or("device: missing column reduction workspace")?, Op::N, 0.0, arithmetic).map_err(error)?;
-                    d.scatter_rows(gradient, ids, &rows, true).map_err(error)?;
+                if let Some(op) = bias.filter(|_| !ids.is_empty()) {
+                    if let Some((gradient, _)) = gradients.ready(d, op, false)? {
+                        let mut rows = d.empty(ids.len(), 1).map_err(error)?;
+                        d.gemm(&mut rows, 1.0, &c, Op::T, ones.as_ref().ok_or("device: missing column reduction workspace")?, Op::N, 0.0, arithmetic).map_err(error)?;
+                        d.scatter_rows(gradient, ids, &rows, true).map_err(error)?;
+                    }
                 }
                 if keep.contains(&node) {
                     nodes.insert(node, self.unpack(trace.rows, node, ids, part)?);
@@ -2929,12 +2976,13 @@ impl DeviceProgram {
             if let Step::Affine { terms, .. } = step {
                 for (input, op) in terms {
                     let active = self.reverse_active(trace, (node, *input), (edited, &seeded));
-                    if let Some(gradient) = gradients.get_mut(op) {
+                    if let Some(storage) = gradients.values.get(op).map(Tensor::storage) {
                         match active {
                             // Only the columns read have a nonzero gradient (`cotᵀ x`, x zero elsewhere
                             // on the rows the cotangent is not zero).
-                            Some(ids) if gradient.storage() != Storage::Bf16 => {
+                            Some(ids) if storage != Storage::Bf16 => {
                                 if !ids.is_empty() {
+                                    let (gradient, _) = gradients.ready(&self.device, *op, false)?.ok_or("device: a gradient slot")?;
                                     let x = self.device.gather_columns(trace.value(*input)?, &ids).map_err(error)?;
                                     let mut part = self.device.empty(gradient.rows(), ids.len()).map_err(error)?;
                                     self.device.gemm(&mut part, 1.0, self.operand(cot, &mut half, arithmetic)?, Op::T, &x, Op::N, 0.0, arithmetic).map_err(error)?;
@@ -2943,17 +2991,18 @@ impl DeviceProgram {
                             }
                             _ => {
                                 let x = trace.rounded_value(*input, arithmetic)?;
+                                let (gradient, beta) = gradients.ready(&self.device, *op, true)?.ok_or("device: a gradient slot")?;
                                 self.device
-                                    .gemm(gradient, 1.0, self.operand(cot, &mut half, arithmetic)?, Op::T, x.as_deref().map_or(trace.value(*input), Ok)?, Op::N, 1.0, arithmetic)
+                                    .gemm(gradient, 1.0, self.operand(cot, &mut half, arithmetic)?, Op::T, x.as_deref().map_or(trace.value(*input), Ok)?, Op::N, beta, arithmetic)
                                     .map_err(error)?;
                             }
                         }
                     }
                 }
             } else if let Step::Transposed { input, operator } = step {
-                if let Some(gradient) = gradients.get_mut(operator) {
+                if let Some((gradient, beta)) = gradients.ready(&self.device, *operator, true)? {
                     let x = trace.rounded_value(*input, arithmetic)?;
-                    self.device.gemm(gradient, 1.0, x.as_deref().map_or(trace.value(*input), Ok)?, Op::T, self.operand(cot, &mut half, arithmetic)?, Op::N, 1.0, arithmetic).map_err(error)?;
+                    self.device.gemm(gradient, 1.0, x.as_deref().map_or(trace.value(*input), Ok)?, Op::T, self.operand(cot, &mut half, arithmetic)?, Op::N, beta, arithmetic).map_err(error)?;
                 }
             }
             let column = match step {
@@ -2961,10 +3010,10 @@ impl DeviceProgram {
                 Step::Constant { operator } => Some(*operator),
                 _ => None,
             };
-            if let Some(gradient) = column.and_then(|op| gradients.get_mut(&op)) {
+            if let Some((gradient, beta)) = match column { Some(op) => gradients.ready(&self.device, op, true)?, None => None } {
                 self.device.gemm(gradient, 1.0, self.operand(cot, &mut half, arithmetic)?, Op::T,
                     ones.as_ref().ok_or("device: missing column reduction workspace")?, Op::N,
-                    1.0, arithmetic).map_err(error)?;
+                    beta, arithmetic).map_err(error)?;
             }
         }
         nodes.retain(|node, _| keep.contains(node));
@@ -3796,7 +3845,6 @@ mod gated_tests {
         for (direction, soft) in [(false, false), (true, false), (false, true), (true, true)] {
             let (program, family) = layer(direction, soft, 3);
             let host = program.execute(&family, false).unwrap();
-            let SlotValues::Raw(x) = &family.slots[0] else { panic!("raw rows") };
             // The definition, by hand.
             let interfaces = program.interfaces().unwrap();
             let a = &host.values[1];
@@ -3817,7 +3865,6 @@ mod gated_tests {
                 }
             }
             assert!(soft || (off > 0 && off < family.rows * WIDTHS.len()), "some components are off: {off}");
-            let _ = x;
             let artifact = crate::artifact::Artifact::native(&program).unwrap();
             let decoded = crate::artifact::Artifact::from_bytes(&artifact.to_bytes().unwrap(), &program.declarations).unwrap();
             assert_eq!(decoded.program.nodes, program.nodes, "the code keeps the gated nodes");
