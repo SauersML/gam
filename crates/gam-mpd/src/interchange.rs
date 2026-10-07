@@ -1979,6 +1979,7 @@ fn run<E: BlockEngine>(engines: [&E; 2], plan: &Plan, keep: bool) -> Result<(Ten
     let key = |l: usize, k: usize| (plan.paths[plan.lanes[l].path].tokens.to_vec(), k);
     let restored: Vec<bool> = match store {
         Some(store) => {
+            store.borrow_mut().settle(d)?;
             let store = store.borrow();
             (0..plan.lanes.len()).map(|l| ends[l].is_some_and(|k| store.rows.contains_key(&key(l, k)))).collect()
         }
@@ -2037,18 +2038,14 @@ fn run<E: BlockEngine>(engines: [&E; 2], plan: &Plan, keep: bool) -> Result<(Ten
                 if restored[l] {
                     let store = store.borrow();
                     let held = match &**store.rows.get(&key(l, b)).ok_or_else(|| error("a kept prefix gone"))? {
-                        KeptValues::Single(v) => d.upload_f32(rows.len(), width, v),
+                        KeptValues::Single(v) => d.upload_f32_overlapped(rows.len(), width, v),
                         KeptValues::Double(v) => d.upload_vec(rows.len(), width, v.clone()),
                     }
                     .map_err(error)?;
                     d.set_rows(&mut stream, rows.start, &held).map_err(error)?;
                 } else {
                     let taken = d.rows_of(&stream, rows.start, rows.len()).map_err(error)?;
-                    let values = match taken.storage() {
-                        Storage::F64 => KeptValues::Double(d.download(&taken).map_err(error)?.into_iter().collect()),
-                        Storage::F32 | Storage::Bf16 => KeptValues::Single(d.download_f32(&taken).map_err(error)?),
-                    };
-                    store.borrow_mut().keep(key(l, b), values);
+                    store.borrow_mut().pending.push((key(l, b), taken));
                 }
             }
         }
@@ -2540,13 +2537,33 @@ impl Drop for DiskTargets {
 /// stream rows after the last block `M` runs on it before a patch, an edit, a `P` block or another
 /// lane's read reaches it (`Plan::prefix_ends`), by its tokens and that block. `M` is fixed, so those
 /// rows are the same at every scoring of the collection; [`run`] restores them in place of running
-/// the blocks again. The rows are kept in the stream's own precision (f32, else float64).
+/// the blocks again. The rows are kept in the stream's own precision (f32, else float64). A scoring
+/// copies the rows it keeps on the device (`pending`), and the next reads them back
+/// ([`PrefixStore::settle`]): reading each at once would wait for the device in the middle of the
+/// forward pass, and the step's own read of its scores waits for the copies anyway.
 pub struct PrefixStore {
     governor: MemoryGovernor,
     rows: HashMap<(Vec<u32>, usize), Governed<KeptValues>>,
+    pending: Vec<((Vec<u32>, usize), Tensor)>,
 }
 
 impl PrefixStore {
+    fn new(governor: &MemoryGovernor) -> Self {
+        Self { governor: governor.clone(), rows: HashMap::new(), pending: Vec::new() }
+    }
+
+    /// The rows the last scoring copied, read back and kept.
+    fn settle(&mut self, d: &Device) -> Result<(), String> {
+        for (key, taken) in std::mem::take(&mut self.pending) {
+            let values = match taken.storage() {
+                Storage::F64 => KeptValues::Double(d.download(&taken).map_err(error)?.into_iter().collect()),
+                Storage::F32 | Storage::Bf16 => KeptValues::Single(d.download_f32(&taken).map_err(error)?),
+            };
+            self.keep(key, values);
+        }
+        Ok(())
+    }
+
     fn keep(&mut self, key: (Vec<u32>, usize), values: KeptValues) {
         let bytes = match &values {
             KeptValues::Single(v) => 4 * v.len(),
@@ -2557,16 +2574,16 @@ impl PrefixStore {
         }
     }
 
-    /// The prefixes kept.
+    /// The prefixes kept, with those copied and not yet read back.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.rows.len()
+        self.rows.len() + self.pending.len()
     }
 
     /// Whether none is kept.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.rows.is_empty()
+        self.rows.is_empty() && self.pending.is_empty()
     }
 }
 
@@ -3100,7 +3117,7 @@ impl Interchange {
     /// otherwise repeated at every scoring.
     pub fn keep_targets(&mut self, governor: &MemoryGovernor) {
         *self.kept.get_mut() = Some(TargetStore { governor: governor.clone(), batches: HashMap::new(), disk: DiskTargets::new() });
-        self.prefixes = Some(RefCell::new(PrefixStore { governor: governor.clone(), rows: HashMap::new() }));
+        self.prefixes = Some(RefCell::new(PrefixStore::new(governor)));
     }
 
     /// `M`'s prefixes kept ([`PrefixStore`]): none before [`Interchange::keep_targets`].
