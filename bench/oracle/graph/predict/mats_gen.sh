@@ -10,7 +10,7 @@ set -Eeuo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 MODEL=$1 OUT=$2 WIN=$3 SPLIT=$4 PSPLIT=$5 TEXTS=$6 TASK=$7
 shift 7
-PY=$HOME/oracle-venv/bin/python
+PY=${PY:-$HOME/oracle-venv/bin/python}
 [ -x "$PY" ] || PY=python3
 export HF_HUB_OFFLINE=1
 mkdir -p "$(dirname "$OUT")"

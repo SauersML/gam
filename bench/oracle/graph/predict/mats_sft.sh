@@ -11,7 +11,7 @@ set -Eeuo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 ORACLE=$1 OUT=$2 TRAIN=$3 STEPS=$4 HOURS=$5
 shift 5
-PY=$HOME/oracle-venv/bin/python
+PY=${PY:-$HOME/oracle-venv/bin/python}
 [ -x "$PY" ] || PY=python3
 if [ ! -d "$ORACLE" ]; then
     export HF_HUB_OFFLINE=1

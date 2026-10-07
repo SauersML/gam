@@ -3,7 +3,7 @@
 #   eval_pair.sh ORACLE_DIR 'HELDOUT_GLOB' ADAPTERS OUT_DIR
 set -Eeuo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
-PY=$HOME/oracle-venv/bin/python
+PY=${PY:-$HOME/oracle-venv/bin/python}
 [ -x "$PY" ] || PY=python3
 mkdir -p "$4"
 $PY "$here/eval_kl.py" --model "$1" --heldout "$2" --out "$4/eval_kl_base.json"
