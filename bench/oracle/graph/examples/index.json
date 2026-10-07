@@ -51,5 +51,10 @@
  "vpd4l_sva_rc": {"model": "vpd4l", "behavior": "sva.rc", "family": "sva", "split": "heldout"},
  "vpd4l_sva_within_rc": {"model": "vpd4l", "behavior": "sva.within_rc", "family": "sva", "split": "heldout"},
  "vpd4l_syllogism_all_are": {"model": "vpd4l", "behavior": "syllogism.all_are", "family": "syllogism", "split": "train"},
- "vpd4l_word_successor_ordinal": {"model": "vpd4l", "behavior": "word_successor.ordinal", "family": "word_successor", "split": "train"}
+ "vpd4l_word_successor_ordinal": {"model": "vpd4l", "behavior": "word_successor.ordinal", "family": "word_successor", "split": "train"},
+ "qwen3_acronym_three_word": {"model": "qwen3-0.6b", "behavior": "acronym.three_word", "family": "acronym", "split": "train"},
+ "qwen3_alphabet_lower": {"model": "qwen3-0.6b", "behavior": "alphabet.lower", "family": "alphabet", "split": "train"},
+ "qwen3_alphabet_upper": {"model": "qwen3-0.6b", "behavior": "alphabet.upper", "family": "alphabet", "split": "train"},
+ "qwen3_greater_than_war": {"model": "qwen3-0.6b", "behavior": "greater_than.war", "family": "greater_than", "split": "train"},
+ "qwen3_sva_simple": {"model": "qwen3-0.6b", "behavior": "sva.simple", "family": "sva", "split": "heldout"}
 }
