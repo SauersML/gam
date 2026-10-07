@@ -88,8 +88,9 @@ def save_peft(adapters_path, out_dir, base: str, rank: int, alpha: float):
 
 
 def load(pattern):
+    """Questions by type from every file matching the comma-separated glob patterns."""
     by_type = {}
-    for path in sorted(glob.glob(pattern)):
+    for path in sorted(p for part in pattern.split(",") for p in glob.glob(part)):
         for line in open(path):
             q = json.loads(line)
             by_type.setdefault(q["type"], []).append(q)
@@ -210,7 +211,7 @@ def main():
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     tok = AutoTokenizer.from_pretrained(args.model)
-    model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.bfloat16).to(dev)
+    model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.bfloat16, **({"device_map": "cuda"} if dev.type == "cuda" else {})).to(dev)
     for p in model.parameters():
         p.requires_grad_(False)
     adapters = wrap(model, args.rank, args.alpha)

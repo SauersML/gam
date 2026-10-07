@@ -99,7 +99,10 @@ class Qwen3:
         torch.backends.cudnn.allow_tf32 = False
         self.dev, self.dtype = dev, dtype
         self.wide = torch.float64 if dev.type != "mps" else torch.float32
-        self.model = AutoModelForCausalLM.from_pretrained(path, dtype=dtype).to(dev).eval()
+        if dev.type == "cuda":  # straight to the GPU (Qwen3-8B in float32 is 32 GB; no host copy)
+            self.model = AutoModelForCausalLM.from_pretrained(path, dtype=dtype, device_map="cuda").eval()
+        else:
+            self.model = AutoModelForCausalLM.from_pretrained(path, dtype=dtype).to(dev).eval()
         self.tok = AutoTokenizer.from_pretrained(path)
         self.inner = self.model.model
         self.layers = list(self.inner.layers)
@@ -667,6 +670,10 @@ def main():
     ap.add_argument("--piece-split", default="train", choices=("train", "heldout"),
                     help="ask about training pieces (and whole blocks) or only held-out pieces (held_out_units)")
     ap.add_argument("--row-range", default="", help="A:B, draw texts from rows A..B-1 only (e.g. vpd4l Pile rows 0:3584 train, 3584:4096 held out)")
+    ap.add_argument("--uv", default="", help="vpd4l: VPD's subcomponents (vpd_labels.py export_uv; default ~/mpd-data/oracle/vpd/uv.safetensors)")
+    ap.add_argument("--vpd-target", default="", help="vpd4l: the target run directory t-9d2b8f02 (default ~/mpd-data/vpd/t-9d2b8f02)")
+    ap.add_argument("--behavior-split", default="", help="only the behaviors of this split (train or heldout)")
+    ap.add_argument("--tf32", action="store_true", help="TF32 matmuls (Qwen3-8B as target: about 3x faster, ~1e-3 relative rounding)")
     ap.add_argument("--per-behavior", type=int, default=64, help="prefixes per behavior (--behaviors)")
     ap.add_argument("--transcoders", default="", help="circuit-tracer transcoder directory (layer_{l}.safetensors)")
     ap.add_argument("--tc-layers", default="", help="layers whose transcoder features are asked about, e.g. 3,9,14,20,25")
@@ -674,11 +681,15 @@ def main():
     torch.set_grad_enabled(False)
     dev = device()
     if args.target == "vpd4l":
-        from vpd4l import Vpd4l
+        import vpd4l
 
-        m = Vpd4l(dev)
+        if args.vpd_target:
+            vpd4l.VM.TARGET_DIR = Path(args.vpd_target)
+        m = vpd4l.Vpd4l(dev, **({"uv": Path(args.uv)} if args.uv else {}), **({"tokenizer": Path(args.vpd_target) / "tokenizer.json"} if args.vpd_target else {}))
     else:
         m = Qwen3(args.model, dev)
+    if args.tf32:
+        torch.backends.cuda.matmul.allow_tf32 = True
     if args.transcoders and args.tc_layers:
         m.load_transcoders(args.transcoders, [int(x) for x in args.tc_layers.split(",")])
     w = Writer(m)
@@ -695,7 +706,8 @@ def main():
             else:
                 windows = np.memmap(args.windows, dtype="<u4", mode="r").reshape(-1, 128)
             lo, hi = (int(x) for x in args.row_range.split(":")) if args.row_range else (0, len(windows))
-            order = lo + np.random.default_rng(args.seed + 1).permutation(hi - lo)  # disjoint ranges keep splits apart
+            # One fixed text order for every task, so tasks at offsets k * texts read disjoint texts.
+            order = lo + np.random.default_rng(1234).permutation(hi - lo)  # disjoint ranges keep splits apart
             for s in range(args.offset, args.offset + args.texts, args.batch):
                 Tn = lengths[(s // args.batch) % len(lengths)]
                 rows = order[s : s + args.batch]
@@ -713,6 +725,8 @@ def main():
                 print(json.dumps({"texts": texts, "questions": written, "T": Tn, "texts_per_s": round(rate, 2), "questions_per_s": round(rate * 8, 1)}), flush=True)
         if args.behaviors:
             seqs = load_behaviors(Path(args.behaviors), m.tok, args.per_behavior, np.random.default_rng(args.seed + 2))
+            if args.behavior_split:
+                seqs = [item for item in seqs if item[2] == args.behavior_split]
             by_len = {}
             for item in seqs:
                 by_len.setdefault((len(item[1]), item[2]), []).append(item)

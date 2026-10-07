@@ -1,25 +1,25 @@
 #!/usr/bin/env bash
-# Prediction data and the oracle's first SFT on one MATS L40 (#2951):
-#   MATS_QOS=debug MATS_GPUS=1 mats-run predict-sft1 8 64 2 -- bash /Users/user/gam/bench/oracle/graph/predict/mats_sft.sh \
-#       /Users/user/mpd-data/cluster/predict-sft1 /Users/user/mpd-data/qwen3_fineweb/train/windows_T128.u32 \
-#       /Users/user/mpd-data/qwen3_fineweb/heldout/windows_T128.u32 TRAIN_TEXTS STEPS [TARGET_DIR ORACLE_DIR]
-# On a RunPod pod (rp-run) pass the Mac's Hugging Face snapshot paths of Qwen3-0.6B and Qwen3-8B as
-# TARGET_DIR and ORACLE_DIR (rp-run fetches them on the pod) and write OUT under mpd-data/runpod/NAME/.
-# generate.py writes a held-out shard (FineWeb held-out texts) and a training shard (training texts) on the
-# GPU, then sft.py trains Qwen3-8B + LoRA on them in the job's remaining time and evaluates base vs trained.
+# The oracle's prediction SFT and its held-out evaluation on one MATS L40 (#2951):
+#   MATS_GPUS=1 mats-run predict-sft-q06 8 40 6 -- bash /Users/user/gam/bench/oracle/graph/predict/mats_sft.sh \
+#       Qwen/Qwen3-8B /Users/user/mpd-data/cluster/predict-sft-q06 'TRAIN_GLOB[,GLOB...]' STEPS HOURS \
+#       prompts=GLOB pieces=GLOB behaviors=GLOB
+# sft.py trains (chat format, PEFT export in OUT/peft) for at most HOURS and scores answer-token bits per
+# held-out set with a learning curve; eval_kl.py then scores the answers as distributions (KL against
+# M's measured one, beside the no-change answer) for the base and the trained oracle on every set.
+# ORACLE may be a Hugging Face id in the cluster's cache or a snapshot directory (a RunPod pod).
 set -Eeuo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
-OUT=$1 TRAIN=$2 HELD=$3 TEXTS=$4 STEPS=$5 SNAP=${6:-} ORACLE=${7:-Qwen/Qwen3-8B}
+ORACLE=$1 OUT=$2 TRAIN=$3 STEPS=$4 HOURS=$5
+shift 5
 PY=$HOME/oracle-venv/bin/python
 [ -x "$PY" ] || PY=python3
-if [ -z "$SNAP" ]; then
+if [ ! -d "$ORACLE" ]; then
     export HF_HUB_OFFLINE=1
-    SNAP=$($PY -c "from huggingface_hub import snapshot_download; print(snapshot_download('Qwen/Qwen3-0.6B'))")
+    ORACLE=$($PY -c "from huggingface_hub import snapshot_download; print(snapshot_download('$ORACLE'))")
 fi
-mkdir -p "$OUT/data"
-[ -s "$OUT/data/heldout_000.jsonl" ] || $PY "$here/generate.py" --model "$SNAP" --windows "$HELD" --out "$OUT/data/heldout_000.jsonl" --texts 256 --batch 32 --split heldout --seed 1000
-[ -s "$OUT/data/train_000.jsonl" ] || $PY "$here/generate.py" --model "$SNAP" --windows "$TRAIN" --out "$OUT/data/train_000.jsonl" --texts "$TEXTS" --batch 64 --split train --seed 0
-HOURS=$($PY -c "print(round(1.6 - $SECONDS / 3600, 3))")  # leaves time for eval_kl.py
-$PY "$here/sft.py" --model "$ORACLE" --train "$OUT/data/train_*.jsonl" --heldout "$OUT/data/heldout_*.jsonl" --out "$OUT/sft" --steps "$STEPS" --hours "$HOURS"
-$PY "$here/eval_kl.py" --model "$ORACLE" --heldout "$OUT/data/heldout_*.jsonl" --out "$OUT/sft/eval_kl_base.json"
-$PY "$here/eval_kl.py" --model "$ORACLE" --adapters "$OUT/sft/adapters.safetensors" --heldout "$OUT/data/heldout_*.jsonl" --out "$OUT/sft/eval_kl_trained.json"
+sets=()
+for spec in "$@"; do sets+=(--heldout "$spec"); done
+mkdir -p "$OUT"
+$PY "$here/sft.py" --model "$ORACLE" --train "$TRAIN" "${sets[@]}" --out "$OUT" --steps "$STEPS" --hours "$HOURS"
+$PY "$here/eval_kl.py" --model "$ORACLE" "${sets[@]}" --out "$OUT/eval_kl_base.json"
+$PY "$here/eval_kl.py" --model "$ORACLE" --adapters "$OUT/adapters.safetensors" "${sets[@]}" --out "$OUT/eval_kl_trained.json"
