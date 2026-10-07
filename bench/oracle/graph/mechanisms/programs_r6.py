@@ -30,12 +30,16 @@ def head(l, h):
 
 
 def features(l, ids):
-    return (f"f{l}", f"PD.tc[{l}][{', '.join(map(str, ids))}]", 2 * l + 1)
+    """ids None (no measured table on this machine): a placeholder that --heads-only drops."""
+    return (f"f{l}", f"PD.tc[{l}][{', '.join(map(str, ids))}]" if ids is not None else f"PD.tc[{l}][unmeasured]", 2 * l + 1)
 
 
 def top_features(behavior: str, layer: int, k: int) -> list[int]:
     """The k features of a layer with the largest measured single-feature recovery (qwen_tc_patch.py)."""
-    d = json.loads((TC / f"tc_{behavior}.json").read_text())
+    path = TC / f"tc_{behavior}.json"
+    if not path.exists():
+        return None
+    d = json.loads(path.read_text())
     fs = sorted(d["layers"][str(layer)], key=lambda f: -f["recovery_bits"])
     return [f["feature"] for f in fs[:k]]
 
@@ -105,6 +109,7 @@ def main():
     ap.add_argument("--memory-gib", type=int, default=16)
     ap.add_argument("--out", type=Path, default=Path.home() / "mpd-data/graph_oracle/runs/r6")
     ap.add_argument("--heads-only", action="store_true", help="skip programs with transcoder features and do not load the view")
+    ap.add_argument("--transcoders", type=Path, default=TRANSCODERS, help="layer_<l>.safetensors per layer (only the layers used need be present)")
     a = ap.parse_args()
     out = a.out.expanduser()
     out.mkdir(parents=True, exist_ok=True)
@@ -112,7 +117,7 @@ def main():
     if a.heads_only:
         progs = {b: [(n, nodes) for n, nodes in ps if not any(x[1].startswith("PD.tc") for x in nodes)] for b, ps in progs.items()}
     names = [b for b in progs if not a.behaviors or b in a.behaviors.split(",")]
-    views = None if a.heads_only else {"transcoders": TRANSCODERS}
+    views = None if a.heads_only else {"transcoders": a.transcoders}
     with score.Checker("qwen3-0.6b", memory_gib=a.memory_gib, views=views, device=a.device or None) as c:
         for b in names:
             path = a.root.expanduser() / "qwen3-0.6b" / f"{b}.json"
