@@ -41,6 +41,7 @@ def mock(items: list[dict]) -> list[dict]:
 
 _CHECKERS = {}
 WORKERS = 1
+EXPORT = None
 
 
 def checker(items: list[dict]) -> list[dict]:
@@ -61,7 +62,7 @@ def checker(items: list[dict]) -> list[dict]:
     def run(w: int, model: str, path: str, ks: list[int]):
         c = _CHECKERS.get((model, w))
         if c is None:
-            c = _CHECKERS[(model, w)] = score.Checker(model)
+            c = _CHECKERS[(model, w)] = score.Checker(model, EXPORT) if EXPORT else score.Checker(model)
             c.loaded = None
         if c.loaded != path:
             c.behavior(path)

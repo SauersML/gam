@@ -358,6 +358,8 @@ def main():
     ap.add_argument("--behaviors", default=str(BEHAVIORS))
     ap.add_argument("--scorer", choices=sorted(SCORERS), default="checker")
     ap.add_argument("--score-workers", type=int, default=1, help="checker servers per target model, each scoring whole behaviors in parallel")
+    ap.add_argument("--checker", help="the checker binary (mpd_graph_2951; score.py's GRAPH_CHECKER); on MATS name target/release/examples/mpd_graph_2951 so the job builds it")
+    ap.add_argument("--export", help="the target model's export directory for the checker (score.py's EXPORTS entry otherwise)")
     ap.add_argument("--out", required=True)
     ap.add_argument("--steps", type=int, default=1)
     ap.add_argument("--hours", type=float, help="stop and save after this many hours")
@@ -398,8 +400,10 @@ def main():
     pol = Policy(args, dev)
     if sampler is None:
         sampler = HfSampler(pol, args.max_tokens)
+    if args.checker:
+        os.environ["GRAPH_CHECKER"] = str(Path(args.checker).resolve())
     score = SCORERS[args.scorer]
-    scorer.WORKERS = args.score_workers
+    scorer.WORKERS, scorer.EXPORT = args.score_workers, args.export
     root = Path(args.behaviors)
     pool, heldout_prompts = split_prompts(behaviors(root, args.model, "train"), args.prompt_holdout, out / "behaviors")
     sets = {"heldout_behaviors": behaviors(root, args.model, "heldout"), "heldout_prompts": heldout_prompts}
