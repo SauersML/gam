@@ -67,12 +67,15 @@ def main() -> None:
     ap.add_argument("--device", default=None)
     ap.add_argument("--target", default="vpd4l")
     ap.add_argument("--port", type=int, default=47000 + os.getpid() % 1000)
+    ap.add_argument("--batch-tokens", type=int, help="reader_score.py's tokens per forward pass (memory)")
     ap.add_argument("--out", type=Path)
     a = ap.parse_args()
     results = json.loads(a.results.read_text())
     command = [sys.executable, str(READER), "serve", "--model", a.model, "--target", a.target, "--listen", f"127.0.0.1:{a.port}"]
     if a.device:
         command += ["--device", a.device]
+    if a.batch_tokens:
+        command += ["--batch-tokens", str(a.batch_tokens)]
     server = subprocess.Popen(command, stderr=open(a.results.with_suffix(".reader.log"), "w"))
     try:
         for _ in range(1800):

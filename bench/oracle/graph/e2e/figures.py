@@ -113,16 +113,18 @@ def modes(results: dict, labels: dict[str, str], out: Path, title: str) -> Path:
     forms = sorted({k.split("|")[1] for k in results})
     names = [n for n in labels if any(k.startswith(n + "|") for k in results)]
     fig, ax = plt.subplots(figsize=(14, 0.9 * len(names) + 2.2))
-    for form, color in zip(forms, COLORS):
-        pts = [(results[f"{n}|{form}"]["total_bits"] / results[f"{n}|{form}"]["N"], i) for i, n in enumerate(names) if f"{n}|{form}" in results]
+    for j, (form, color) in enumerate(zip(forms, COLORS)):
+        shift = (j - (len(forms) - 1) / 2) * 0.22  # forms side by side within a row, so equal totals stay visible
+        pts = [(results[f"{n}|{form}"]["total_bits"] / results[f"{n}|{form}"]["N"], i + shift) for i, n in enumerate(names)
+               if f"{n}|{form}" in results]
         ax.scatter([x for x, _ in pts], [i for _, i in pts], s=140, color=color, label=f"{form} stand-ins", zorder=3,
                    edgecolor="white", linewidth=2)
     ax.set_yticks(range(len(names)), [labels[n] for n in names])
     ax.invert_yaxis()
-    ax.set_xscale("log")
-    ax.set_xlabel("total score, bits per scored token (log scale, lower is better)")
+    ax.set_xlim(left=0)
+    ax.set_xlabel("total score, bits per scored token (lower is better)")
     ax.set_title(title, loc="left")
-    ax.legend(frameon=False, loc="lower right", fontsize=17)
+    ax.legend(frameon=False, loc="upper right", fontsize=17)
     fig.tight_layout()
     out.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out, dpi=110)
