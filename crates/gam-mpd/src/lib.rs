@@ -48,6 +48,8 @@ pub mod library_mdl;
 pub mod library_readout;
 // The graph oracle's checker: a program's nodes and edges executed against M under verbatim experiments.
 pub mod graph;
+// The graph checker's runs on Metal or CUDA.
+pub mod graph_device;
 #[cfg(test)]
 mod graph_tests;
 #[cfg(test)]

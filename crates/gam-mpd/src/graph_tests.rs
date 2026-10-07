@@ -533,3 +533,46 @@ fn position_stand_ins_are_each_positions_mean_output() {
     assert!(max(&clean.1) < 1e-9, "empty program under position means of identical prompts: {:?}", clean.1);
     assert_eq!(score.opaque_numbers, 0);
 }
+
+#[test]
+fn device_path_on_the_host_backend_is_the_host_run() {
+    let f = fixture("graph_device");
+    let library = Library::new(&f.device, &f.device, &f.native, &f.layers, &f.artifact, 1 << 28, 64).expect("library");
+    let weights = Weights::of(&library);
+    let stats = Stats::measure(&weights, &f.sequences).expect("stats");
+    let cf = counterfactuals(&f.sequences);
+    let counterfactual = std::sync::Arc::new(reference(&weights, &stats, &Batch::new(&cf).expect("cf batch")).expect("reference"));
+    let mut state = crate::graph_device::DeviceState::new(Device::host());
+    let plain = Batch::new(&f.sequences).expect("batch");
+    let mut with_reference = plain.clone();
+    with_reference.reference = Some(counterfactual.clone());
+    let rows: Vec<usize> = (0..plain.tokens.len()).collect();
+    let node = |id: &str, layer: usize, kind: &str, index: Option<Index>| NodeIr { id: id.into(), pieces: vec![PieceIr { view: "native".into(), layer, kind: kind.into(), index }], rule: None };
+    let partial = Program { model: "tiny".into(), valid: true, nodes: vec![node("h", 1, "head", Some(Index::One(0))), node("n", 0, "mlp", Some(Index::Many(vec![1, 4, 9]))), node("big", 1, "mlp", Some(Index::Many((0..14).collect())))], ..Program::default() };
+    let full = Graph::parse(&full_program(), &weights).expect("full");
+    let some = Graph::parse(&partial, &weights).expect("partial");
+    let cases = [
+        ("model", full.model(&weights), &plain),
+        ("full", full.program(&weights, true), &with_reference),
+        ("empty", Graph::empty().program(&weights, true), &with_reference),
+        ("partial nodes", some.program(&weights, false), &with_reference),
+        ("partial edges", some.program(&weights, true), &with_reference),
+        ("partial model", some.model(&weights), &plain),
+    ];
+    for (name, circuit, batch) in cases {
+        let host = execute(&weights, &stats, &circuit, batch, &rows, &BTreeMap::new(), false).expect("host");
+        let (e, all) = crate::graph::standins_of(&weights, &stats, &circuit, batch, false).expect("stand-ins");
+        let is_model = batch.reference.is_none() && circuit.is_model();
+        let job = crate::graph_device::Run { tokens: &batch.tokens, spans: &batch.spans, scored: &rows, swaps: &BTreeMap::new(), capture: false, standins: (!is_model).then_some((&e, &all[..])) };
+        let device = crate::graph_device::run_on(&mut state, &weights, &circuit, &job).expect("device");
+        let kl = max(&kl_bits(&host.log_probabilities, &device.log_probabilities));
+        assert!(kl < 1e-9, "{name}: KL(host ‖ device) = {kl:e} bits");
+    }
+    // A capture is the host's Reference.
+    let circuit = Graph::empty().model(&weights);
+    let cf_batch = Batch::new(&cf).expect("cf batch");
+    let job = crate::graph_device::Run { tokens: &cf_batch.tokens, spans: &cf_batch.spans, scored: &[], swaps: &BTreeMap::new(), capture: true, standins: None };
+    let captured = crate::graph_device::run_on(&mut state, &weights, &circuit, &job).expect("capture").captured().expect("captured");
+    let gap = |a: &ndarray::Array2<f64>, b: &ndarray::Array2<f64>| (a - b).iter().fold(0.0f64, |m, v| m.max(v.abs()));
+    assert!(gap(&captured.active[1], &counterfactual.active[1]) < 1e-9 && gap(&captured.reads[1][0], &counterfactual.reads[1][0]) < 1e-9 && gap(&captured.attention_inputs[0], &counterfactual.attention_inputs[0]) < 1e-9);
+}

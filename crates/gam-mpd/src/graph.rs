@@ -435,7 +435,7 @@ impl Weights {
         library.graph_weights()
     }
 
-    fn width(&self) -> usize {
+    pub(crate) fn width(&self) -> usize {
         self.embedding.ncols()
     }
 
@@ -464,7 +464,7 @@ pub enum Block {
 
 impl Block {
     /// The read site: `2l` a layer's attention, `2l + 1` its MLP; the logits read at `2L`.
-    fn site(&self) -> usize {
+    pub(crate) fn site(&self) -> usize {
         match self {
             Self::Heads { layer, .. } | Self::AttnSlices { layer, .. } => 2 * layer,
             Self::Neurons { layer, .. } | Self::Features { layer, .. } | Self::Slices { layer, .. } => 2 * layer + 1,
@@ -1205,7 +1205,7 @@ pub fn reference(weights: &Weights, stats: &Stats, batch: &Batch) -> Result<Refe
     let circuit = Graph::empty().model(weights);
     let mut plain = batch.clone();
     plain.reference = None;
-    run(weights, stats, &circuit, &plain, &[], &BTreeMap::new(), false, &Interventions::default(), true)?.captured.ok_or_else(|| "no captured run".to_string())
+    run(weights, stats, &circuit, &plain, &[], &BTreeMap::new(), false, &Interventions::default(), true)?.captured().ok_or_else(|| "no captured run".to_string())
 }
 
 /// `M`'s run on `batch` recorded per piece ([`Reference`]) under the site operations `draw`
@@ -1219,7 +1219,7 @@ pub fn reference_under(weights: &Weights, stats: &Stats, batch: &Batch, draw: &S
     let mut plain = batch.clone();
     plain.reference = None;
     let ops = Interventions::resolve(&own, &circuit, weights, &plain, units, None, None)?;
-    run(weights, stats, &circuit, &plain, &[], &BTreeMap::new(), false, &ops, true)?.captured.ok_or_else(|| "no captured run".to_string())
+    run(weights, stats, &circuit, &plain, &[], &BTreeMap::new(), false, &ops, true)?.captured().ok_or_else(|| "no captured run".to_string())
 }
 
 /// One run: the logits' log-probabilities at the scored rows (rows × vocabulary) and every
@@ -1231,6 +1231,18 @@ pub struct Execution {
     /// Per (unit, route slot) its normed input, at the sites `Interventions::record` lists.
     pub normed: BTreeMap<(usize, usize), Array2<f64>>,
     captured: Option<Reference>,
+}
+
+impl Execution {
+    /// A run's outcome from the device path (`graph_device`).
+    pub(crate) fn of(log_probabilities: Array2<f64>, writes: Vec<Option<Array2<f64>>>, captured: Option<Reference>) -> Self {
+        Self { log_probabilities, writes, recorded: None, normed: BTreeMap::new(), captured }
+    }
+
+    /// The run's capture ([`Reference`]), when it made one.
+    pub(crate) fn captured(self) -> Option<Reference> {
+        self.captured
+    }
 }
 
 fn project(x: &Array2<f64>, map: &Array2<f64>, norm: Option<&(Array1<f64>, f64)>) -> Array2<f64> {
@@ -1395,21 +1407,14 @@ pub fn execute_with(weights: &Weights, stats: &Stats, circuit: &Circuit, batch: 
     run(weights, stats, circuit, batch, scored, swaps, record, ops, false)
 }
 
-/// [`execute_with`], with `capture` recording every head's read and every MLP's activations and
-/// write ([`Reference`]; every unit must compute, each layer's heads and MLP one unit each).
-/// Stand-ins: with `batch.reference`, each unit's write in that run (counterfactual stand-ins),
-/// else each piece applied to its average input ([`Stats`]).
-fn run(weights: &Weights, stats: &Stats, circuit: &Circuit, batch: &Batch, scored: &[usize], swaps: &BTreeMap<usize, Array2<f64>>, record: bool, ops: &Interventions, capture: bool) -> Result<Execution, String> {
-    let (rows, d) = (batch.tokens.len(), weights.width());
-    let vocabulary = weights.embedding.nrows();
-    if let Some(t) = batch.tokens.iter().find(|t| **t as usize >= vocabulary) {
-        return Err(format!("token {t} outside the vocabulary of {vocabulary}"));
-    }
-    let embed = weights.embedding.select(Axis(0), &batch.tokens.iter().map(|t| *t as usize).collect::<Vec<_>>());
-    let units = circuit.units.len();
+/// The stand-ins a run of `circuit` on `batch` reads (`embed`'s and each unit's, rows × width):
+/// each unit's write in `batch.reference` (counterfactual stand-ins), else each piece applied to its
+/// average input ([`Stats`]); zeros for `M` itself (every unit computing, every edge kept), which
+/// reads none, and while recording.
+pub(crate) fn standins_of(weights: &Weights, stats: &Stats, circuit: &Circuit, batch: &Batch, record: bool) -> Result<(Array2<f64>, Vec<Array2<f64>>), String> {
+    let (rows, d, units) = (batch.tokens.len(), weights.width(), circuit.units.len());
     let broadcast = |v: &Array1<f64>| Array2::from_shape_fn((rows, d), |(_, c)| v[c]);
-    let (embed_standin, standins): (Array2<f64>, Vec<Array2<f64>>) = match &batch.reference {
-        // `M` itself (every unit computing, every edge kept) reads no stand-in.
+    Ok(match &batch.reference {
         _ if record || (batch.reference.is_none() && circuit.is_model()) => (Array2::zeros((rows, d)), vec![Array2::zeros((rows, d)); units]),
         Some(r) => {
             if r.embed.nrows() != rows {
@@ -1424,7 +1429,31 @@ fn run(weights: &Weights, stats: &Stats, circuit: &Circuit, batch: &Batch, score
             }
             (broadcast(&e), circuit.units.iter().map(|u| stand_in(weights, stats, &u.block).map(|v| broadcast(&v))).collect::<Result<_, _>>()?)
         }
-    };
+    })
+}
+
+/// [`execute_with`], with `capture` recording every head's read and every MLP's activations and
+/// write ([`Reference`]; every unit must compute, each layer's heads and MLP one unit each).
+/// Stand-ins: with `batch.reference`, each unit's write in that run (counterfactual stand-ins),
+/// else each piece applied to its average input ([`Stats`]).
+fn run(weights: &Weights, stats: &Stats, circuit: &Circuit, batch: &Batch, scored: &[usize], swaps: &BTreeMap<usize, Array2<f64>>, record: bool, ops: &Interventions, capture: bool) -> Result<Execution, String> {
+    let (rows, d) = (batch.tokens.len(), weights.width());
+    let vocabulary = weights.embedding.nrows();
+    if let Some(t) = batch.tokens.iter().find(|t| **t as usize >= vocabulary) {
+        return Err(format!("token {t} outside the vocabulary of {vocabulary}"));
+    }
+    let embed = weights.embedding.select(Axis(0), &batch.tokens.iter().map(|t| *t as usize).collect::<Vec<_>>());
+    let units = circuit.units.len();
+    let (embed_standin, standins) = standins_of(weights, stats, circuit, batch, record)?;
+    let broadcast = |v: &Array1<f64>| Array2::from_shape_fn((rows, d), |(_, c)| v[c]);
+    // The device runs what it covers (`graph_device`); everything else runs here.
+    if !record && ops.is_empty() && batch.blocks.iter().all(Vec::is_empty) {
+        let is_model = batch.reference.is_none() && circuit.is_model();
+        let job = crate::graph_device::Run { tokens: &batch.tokens, spans: &batch.spans, scored, swaps, capture, standins: (!is_model).then_some((&embed_standin, &standins[..])) };
+        if let Some(out) = crate::graph_device::run(weights, circuit, &job) {
+            return out;
+        }
+    }
     let mut captured = capture.then(|| Reference {
         embed: embed.clone(),
         reads: weights.layers.iter().map(|l| vec![Array2::zeros((0, 0)); l.heads.len()]).collect(),
@@ -1700,7 +1729,7 @@ fn run(weights: &Weights, stats: &Stats, circuit: &Circuit, batch: &Batch, score
 /// computing (a `OnceLock`) never returns, which deadlocked a vpd4l batch.
 fn par_dot(a: &Array2<f64>, b: ndarray::ArrayView2<f64>) -> Array2<f64> {
     const BLOCK: usize = 64;
-    if let Some(out) = device_dot(a, b) {
+    if let Some(out) = crate::graph_device::dot(a, b) {
         return out;
     }
     if a.nrows() <= BLOCK || rayon::current_thread_index().is_some() {
@@ -1711,75 +1740,12 @@ fn par_dot(a: &Array2<f64>, b: ndarray::ArrayView2<f64>) -> Array2<f64> {
     out
 }
 
-/// The device the large products run on ([`use_device`]), with its copy of the unembedding (keyed
-/// by the host matrix's address and shape: the unembedding is never edited).
-struct Gemm {
-    device: gam_gpu::tensor::Device,
-    unembedding: Option<(usize, (usize, usize), gam_gpu::tensor::Tensor)>,
-}
-
-static GEMM: std::sync::OnceLock<std::sync::Mutex<Gemm>> = std::sync::OnceLock::new();
-
-/// Runs the executor's large matrix products on `device` (Metal or CUDA, in its arithmetic) for the
-/// rest of the process: `M` and every program alike, so their outcomes stay comparable. Products
-/// below `2^22` multiply-adds stay on the host. Returns false when a device was already set.
-pub fn use_device(device: gam_gpu::tensor::Device) -> bool {
-    GEMM.set(std::sync::Mutex::new(Gemm { device, unembedding: None })).is_ok()
-}
-
-/// `a · b` on the device set by [`use_device`], or `None` (no device, a small product, or a device
-/// error, after which the host multiplies).
-fn device_dot(a: &Array2<f64>, b: ndarray::ArrayView2<f64>) -> Option<Array2<f64>> {
-    let gemm = GEMM.get()?;
-    if a.nrows() * a.ncols() * b.ncols() < 1 << 22 {
-        return None;
-    }
-    let state = gemm.lock().ok()?;
-    let product = |w: &gam_gpu::tensor::Tensor, op: gam_gpu::tensor::Op| -> Result<Array2<f64>, gam_gpu::gpu_error::GpuError> {
-        let d = &state.device;
-        let x = d.upload(a.view())?;
-        let mut out = d.zeros(a.nrows(), b.ncols())?;
-        d.gemm(&mut out, 1.0, &x, gam_gpu::tensor::Op::N, w, op, 0.0, device_arithmetic(d))?;
-        d.download(&out)
-    };
-    // A transposed view of a stored matrix multiplies as the stored matrix with `Op::T`.
-    let stored = b.t();
-    let result = if stored.is_standard_layout() {
-        state.device.upload(stored).and_then(|w| product(&w, gam_gpu::tensor::Op::T))
-    } else {
-        state.device.upload(b).and_then(|w| product(&w, gam_gpu::tensor::Op::N))
-    };
-    result.ok()
-}
-
-fn device_arithmetic(device: &gam_gpu::tensor::Device) -> gam_gpu::tensor::Arithmetic {
-    match device.storage() {
-        gam_gpu::tensor::Storage::F64 => gam_gpu::tensor::Arithmetic::F64,
-        _ => gam_gpu::tensor::Arithmetic::F32,
-    }
-}
-
-/// `last · Uᵀ` on the device set by [`use_device`], its copy of the unembedding `U` kept.
-fn device_logits(last: &Array2<f64>, unembedding: &Array2<f64>) -> Option<Array2<f64>> {
-    let gemm = GEMM.get()?;
-    let mut state = gemm.lock().ok()?;
-    let key = (unembedding.as_ptr() as usize, unembedding.dim());
-    if state.unembedding.as_ref().is_none_or(|(p, d, _)| (*p, *d) != key) {
-        let t = state.device.upload(unembedding.view()).ok()?;
-        state.unembedding = Some((key.0, key.1, t));
-    }
-    let d = &state.device;
-    let w = &state.unembedding.as_ref()?.2;
-    let x = d.upload(last.view()).ok()?;
-    let mut out = d.zeros(last.nrows(), unembedding.nrows()).ok()?;
-    d.gemm(&mut out, 1.0, &x, gam_gpu::tensor::Op::N, w, gam_gpu::tensor::Op::T, 0.0, device_arithmetic(d)).ok()?;
-    d.download(&out).ok()
-}
+pub use crate::graph_device::use_device;
 
 /// Next-token log-probabilities of final streams (rows × width) through the final norm (its own
 /// RMS) and the unembedding, normalized in float64.
 pub fn log_probabilities(weights: &Weights, last: &Array2<f64>) -> Result<Array2<f64>, String> {
-    let mut logits = match device_logits(last, &weights.unembedding) {
+    let mut logits = match crate::graph_device::logits(last, &weights.unembedding) {
         Some(l) => l,
         None => par_dot(last, weights.unembedding.t()),
     };
@@ -1833,7 +1799,7 @@ pub enum WeightEdit {
 impl WeightEdit {
     fn matrix<'a>(weights: &'a mut Weights, layer: usize, head: Option<usize>, matrix: Matrix) -> Result<&'a mut Array2<f64>, String> {
         let lw = weights.layers.get_mut(layer).ok_or("no such layer")?;
-        Ok(match (head, matrix) {
+        let m = match (head, matrix) {
             (Some(h), m) => {
                 let w = lw.heads.get_mut(h).ok_or("no such head")?;
                 match m {
@@ -1847,7 +1813,10 @@ impl WeightEdit {
             (None, Matrix::Gate) => &mut lw.mlp.as_mut().ok_or("no MLP")?.gate,
             (None, Matrix::Down) => &mut lw.mlp.as_mut().ok_or("no MLP")?.out,
             _ => return Err("a head matrix without a head".into()),
-        })
+        };
+        // The device's resident copies of matrices of this shape are uploaded again.
+        crate::graph_device::edited(m);
+        Ok(m)
     }
 
     /// Applies the edit; returns what restores the weights.
@@ -2348,6 +2317,11 @@ pub struct Interventions {
 }
 
 impl Interventions {
+    /// Whether the run has no row interventions at all.
+    fn is_empty(&self) -> bool {
+        self.after.is_empty() && self.inputs.is_empty() && self.cuts.is_empty() && self.record.is_empty()
+    }
+
     /// The operations after `point` (a site, `None` before every site, on `embed`).
     fn after(&self, point: Option<usize>, st: &mut Streams, embed_standin: &Array2<f64>, standins: &[Array2<f64>]) -> Result<(), String> {
         for (_, op) in self.after.iter().filter(|(p, _)| *p == point) {
