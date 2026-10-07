@@ -8,6 +8,7 @@
 //! EXPORT SETTINGS.json OUT.json host|gpu masks DECOMPOSITION
 //! EXPORT SETTINGS.json OUT.json host|gpu lookahead DECOMPOSITION
 //! EXPORT SETTINGS.json OUT.json host|gpu site_edits DECOMPOSITION
+//! EXPORT SETTINGS.json OUT.json host|gpu adversarial DECOMPOSITION
 //! EXPORT SETTINGS.json OUT.json host|gpu start DECOMPOSITION
 //!
 //! `price_charged` prices VPD's causal-importance network beside its subcomponents
@@ -16,12 +17,12 @@
 //! `lookahead` tests whether VPD's masks read the future (`explanation_battery::vpd_lookahead`):
 //! 16 cuts per held-out row, 3 counterfactual futures each, VPD's network and a causal control.
 //!
-//! `site_edits` scores VPD on the edits driver's shared manifest (`explanation_battery::vpd_site_edits`):
-//! the experiments `mpd_library_mdl_2951`'s edits mode draws (`interchange::Interchange::sample_ops`:
-//! swaps, zeroings, scalings and pushes, PER_BASE per held-out sequence, the settings' seed and
-//! batches, each base's donor the next sequence of its batch, pushes at the typical norms of `M`'s
-//! runs of the first batch), drawn here from `M`'s interchange, applied to `M` and to VPD published,
-//! with causal masks, and autonomous and causal.
+//! `site_edits` scores VPD on the edits driver's immutable manifest (settings `manifest`,
+//! `explanation_battery::vpd_site_edits`): its experiments (swaps, zeroings, scalings, pushes and
+//! cuts), typical norms and pushed directions as they stand, applied to `M` and to VPD published,
+//! with causal masks, and autonomous and causal. `adversarial` searches pushes against each of the
+//! three forms as the edits driver searches them against an explanation (settings `adversarial`,
+//! `explanation_battery::vpd_adversarial`), at the manifest's typical norms.
 //!
 //! `masks` measures where VPD's masks come from (`explanation_battery::vpd_mask_sources`): held-out
 //! KL with masks from `M`'s activations, from them through a causal network, with every mask 1,
@@ -95,10 +96,88 @@ struct Settings {
     /// export's rows outside the held-out ones (as `mpd_library_mdl_2951` takes them).
     #[serde(default)]
     training_sequences: Option<usize>,
-    /// For `site_edits`: the edits driver's immutable experiment manifest (`mpd_library_mdl_2951`
-    /// EditSettings::manifest), whose experiments and typical norms are applied as they stand.
+    /// For `site_edits` and `adversarial`: the edits driver's immutable experiment manifest
+    /// (`mpd_library_mdl_2951` EditSettings::manifest), whose experiments, typical norms and pushed
+    /// directions are applied as they stand.
     #[serde(default)]
     manifest: Option<String>,
+    /// For `adversarial`: the edits driver's adversarial pushes (its EditSettings::adversarial).
+    #[serde(default)]
+    adversarial: Option<Adversarial>,
+}
+
+/// Adversarial pushes as the edits driver searches them (`gam_mpd::adversary`): from `seed`,
+/// `searches` searches on the manifest's held-out sequences `[first, end)`, each of at most `steps`
+/// steps of `probes` probes.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Adversarial {
+    seed: u64,
+    sequences: [usize; 2],
+    searches: usize,
+    steps: usize,
+    probes: usize,
+}
+
+/// The 64-bit FNV-1a digest of `words` in hexadecimal, the edits driver's digest of a manifest's
+/// rows and directions.
+fn digest(words: impl IntoIterator<Item = u64>) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for w in words {
+        for byte in w.to_le_bytes() {
+            h = (h ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3);
+        }
+    }
+    format!("{h:016x}")
+}
+
+/// The edits driver's immutable experiment manifest (`mpd_library_mdl_2951` EditSettings::manifest)
+/// at `path`, checked to be drawn on the held-out rows it names (their token ids' digest): its
+/// record, those rows, its batch size and its typical norms.
+struct Manifest {
+    path: String,
+    record: Value,
+    held: Vec<Vec<u32>>,
+    batch_sequences: usize,
+    typical: BTreeMap<interchange::SharedSite, f64>,
+}
+
+impl Manifest {
+    fn read(path: &str, bases: &[Vec<u32>]) -> Result<Self, String> {
+        let record: Value = serde_json::from_slice(&std::fs::read(path).map_err(|e| format!("{path}: {e}"))?).map_err(|e| format!("{path}: {e}"))?;
+        let [first, end]: [usize; 2] = serde_json::from_value(record["sequences"].clone()).map_err(|e| format!("{path}: sequences: {e}"))?;
+        let held = bases.get(first..end).ok_or_else(|| format!("{path}: its sequences outside the held-out rows"))?.to_vec();
+        let batch_sequences = record["batch_sequences"].as_u64().ok_or_else(|| format!("{path}: no batch size"))? as usize;
+        if record["rows"].as_str() != Some(digest(held.iter().flat_map(|s| s.iter().map(|t| u64::from(*t)).chain([u64::MAX]))).as_str()) || batch_sequences == 0 {
+            return Err(format!("{path} was drawn on other rows"));
+        }
+        let typical = serde_json::from_value::<Vec<(interchange::SharedSite, f64)>>(record["typical"].clone()).map_err(|e| format!("{path}: typical: {e}"))?.into_iter().collect();
+        Ok(Self { path: path.to_string(), record, held, batch_sequences, typical })
+    }
+
+    /// The pushed directions: the stored ones (`push`), checked against their digest; for a
+    /// manifest written before they were stored, the seed's (`seeded`) on this platform, equal to
+    /// the drawing machine's up to the last bits of its ln and cos, with a warning when their digest
+    /// differs.
+    fn directions(&self, seeded: impl FnOnce(u64) -> Result<Vec<Vec<f64>>, String>) -> Result<Vec<Vec<f64>>, String> {
+        let stored: Vec<Vec<f64>> = serde_json::from_value(self.record.get("push").cloned().unwrap_or(json!([]))).map_err(|e| format!("{}: push: {e}", self.path))?;
+        let directions = if stored.is_empty() { seeded(self.record["seed"].as_u64().ok_or_else(|| format!("{}: no seed", self.path))?)? } else { stored.clone() };
+        let here = digest(directions.iter().flatten().map(|v| v.to_bits()));
+        if self.record["directions"].as_str() != Some(here.as_str()) {
+            if !stored.is_empty() {
+                return Err(format!("{}: its stored directions do not match their digest", self.path));
+            }
+            log::warn!("{}: the seed's pushed directions here have digest {here}, the manifest's {}", self.path, self.record["directions"]);
+        }
+        Ok(directions)
+    }
+
+    /// The report's record of the manifest scored, with the directions pushed.
+    fn report(&self, directions: &[Vec<f64>]) -> Result<Value, String> {
+        let r = &self.record;
+        Ok(json!({"file": self.path, "sha256": sha256(Path::new(&self.path))?, "directions": {"manifest": r["directions"], "here": digest(directions.iter().flatten().map(|v| v.to_bits()))},
+            "sequences": r["sequences"], "seed": r["seed"], "families": r["families"], "edits_per_sequence": r["edits_per_sequence"], "batch_sequences": self.batch_sequences}))
+    }
 }
 
 #[derive(Deserialize)]
@@ -221,7 +300,7 @@ fn circuits(device: &Device, export: &Path, layers: &[gam_mpd::run_check::LayerN
 fn main() -> Result<(), String> {
     log_to_stderr();
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let usage = "EXPORT SETTINGS.json OUT.json host|gpu library [ARTIFACT] | vpd DECOMPOSITION | circuits PAIRS.json [DECOMPOSITION] | price|price_charged DECOMPOSITION [START] | masks DECOMPOSITION | lookahead DECOMPOSITION | site_edits DECOMPOSITION | start DECOMPOSITION | fit DECOMPOSITION START";
+    let usage = "EXPORT SETTINGS.json OUT.json host|gpu library [ARTIFACT] | vpd DECOMPOSITION | circuits PAIRS.json [DECOMPOSITION] | price|price_charged DECOMPOSITION [START] | masks DECOMPOSITION | lookahead DECOMPOSITION | site_edits DECOMPOSITION | adversarial DECOMPOSITION | start DECOMPOSITION | fit DECOMPOSITION START";
     let (export, settings_path, out, mode, kind, extra, more) = match &args[..] {
         [e, s, o, m, k] => (e, s, o, m, k.as_str(), None, None),
         [e, s, o, m, k, a] => (e, s, o, m, k.as_str(), Some(Path::new(a)), None),
@@ -316,52 +395,34 @@ fn main() -> Result<(), String> {
         log::info!("battery done in {:.0} s: {out}", started.elapsed().as_secs_f64());
         return Ok(());
     }
-    if kind == "site_edits" {
+    if kind == "site_edits" || kind == "adversarial" {
         let decomposition = extra.ok_or(usage)?;
         let vpd = Vpd::new(&device, export, Decomposition::load(decomposition)?, settings.numeric_bytes)?;
-        // The edits driver's immutable manifest: its experiments, batch by batch, and its typical
-        // norms, on the same held-out rows (their tokens' digest), seed and pushed directions. The
-        // sites a draw picks from depend on the sites the drawing explanation holds, so only the
-        // manifest's own experiments are the driver's.
-        let path = settings.manifest.as_deref().ok_or("site_edits: the edits driver's manifest in the settings (`manifest`)")?;
-        let m: Value = serde_json::from_slice(&std::fs::read(path).map_err(|e| format!("{path}: {e}"))?).map_err(|e| format!("{path}: {e}"))?;
-        let digest = |words: &mut dyn Iterator<Item = u64>| -> String {
-            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-            for w in words {
-                for byte in w.to_le_bytes() {
-                    h = (h ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3);
-                }
+        let m = Manifest::read(settings.manifest.as_deref().ok_or("site_edits, adversarial: the edits driver's manifest in the settings (`manifest`)")?, bases)?;
+        if kind == "site_edits" {
+            let directions = m.directions(|seed| {
+                let mut drawing = Interchange::new(&device, &native, &layers, &Artifact::native(&native)?, &[], interchange::reads(&native, &layers)?, settings.numeric_bytes, 256)?;
+                drawing.set_directions(interchange::DIRECTIONS, seed);
+                Ok(drawing.push_directions())
+            })?;
+            let experiments: Vec<Vec<interchange::Experiment>> = serde_json::from_value(m.record["experiments"].clone()).map_err(|e| format!("{}: experiments: {e}", m.path))?;
+            let chunks: Vec<&[Vec<u32>]> = m.held.chunks(m.batch_sequences).collect();
+            if chunks.len() != experiments.len() {
+                return Err(format!("site_edits: {} has {} batches for {} of the held-out rows", m.path, experiments.len(), chunks.len()));
             }
-            format!("{h:016x}")
-        };
-        let [m_first, m_end]: [usize; 2] = serde_json::from_value(m["sequences"].clone()).map_err(|e| format!("{path}: sequences: {e}"))?;
-        let held = bases.get(m_first..m_end).ok_or("site_edits: the manifest's sequences outside the held-out rows")?;
-        let rows = digest(&mut held.iter().flat_map(|s| s.iter().map(|t| u64::from(*t)).chain([u64::MAX])));
-        let mut drawing = Interchange::new(&device, &native, &layers, &Artifact::native(&native)?, &[], interchange::reads(&native, &layers)?, settings.numeric_bytes, 256)?;
-        let seed = m["seed"].as_u64().ok_or("site_edits: the manifest's seed")?;
-        drawing.set_directions(interchange::DIRECTIONS, seed);
-        let directions = drawing.push_directions();
-        drop(drawing);
-        let batch_sequences = m["batch_sequences"].as_u64().ok_or("site_edits: the manifest's batch size")? as usize;
-        if m["rows"].as_str() != Some(rows.as_str()) || batch_sequences == 0 {
-            return Err(format!("site_edits: {path} was drawn on other rows"));
+            let batches: Vec<(Vec<Vec<u32>>, Vec<interchange::Experiment>)> = chunks.into_iter().map(<[Vec<u32>]>::to_vec).zip(experiments).collect();
+            report["manifest"] = m.report(&directions)?;
+            report["site_edits"] = battery::vpd_site_edits(&vpd, export, decomposition, &batches, (&m.typical, &directions), settings.numeric_bytes)?;
+        } else {
+            // The edits driver's adversarial pushes (its `adversarial` settings), each search on one of
+            // the manifest's held-out sequences [first, end), pushing one typical norm of the manifest.
+            let a = settings.adversarial.as_ref().ok_or("adversarial: the searches in the settings (`adversarial`)")?;
+            let [first, end] = a.sequences;
+            let rows = m.held.get(first..end).filter(|r| !r.is_empty()).ok_or("adversarial: sequences outside the manifest's held-out rows")?;
+            report["manifest"] = json!({"file": m.path, "sha256": sha256(Path::new(&m.path))?});
+            report["adversarial_settings"] = json!({"seed": a.seed, "sequences": a.sequences, "searches": a.searches, "steps": a.steps, "probes": a.probes});
+            report["adversarial"] = battery::vpd_adversarial(&vpd, export, decomposition, rows, &m.typical, (a.seed, a.searches, a.steps, a.probes), settings.numeric_bytes)?;
         }
-        // The directions are the seed's on every machine up to the last bits of the platform's ln
-        // and cos (a manifest drawn on macOS, scored on Linux), so their digest is reported beside
-        // the manifest's, not required to equal it.
-        let here = digest(&mut directions.iter().flatten().map(|v| v.to_bits()));
-        if m["directions"].as_str() != Some(here.as_str()) {
-            log::warn!("site_edits: the pushed directions' digest {here} differs from the manifest's {} (the seed's directions on this platform)", m["directions"]);
-        }
-        let experiments: Vec<Vec<interchange::Experiment>> = serde_json::from_value(m["experiments"].clone()).map_err(|e| format!("{path}: experiments: {e}"))?;
-        let typical: BTreeMap<interchange::SharedSite, f64> = serde_json::from_value::<Vec<(interchange::SharedSite, f64)>>(m["typical"].clone()).map_err(|e| format!("{path}: typical: {e}"))?.into_iter().collect();
-        let chunks: Vec<&[Vec<u32>]> = held.chunks(batch_sequences).collect();
-        if chunks.len() != experiments.len() {
-            return Err(format!("site_edits: {path} has {} batches for {} of the held-out rows", experiments.len(), chunks.len()));
-        }
-        let batches: Vec<(Vec<Vec<u32>>, Vec<interchange::Experiment>)> = chunks.into_iter().map(<[Vec<u32>]>::to_vec).zip(experiments).collect();
-        report["manifest"] = json!({"file": path, "sha256": sha256(Path::new(path))?, "directions": {"manifest": m["directions"], "here": here}, "sequences": m["sequences"], "seed": seed, "families": m["families"], "edits_per_sequence": m["edits_per_sequence"], "batch_sequences": batch_sequences});
-        report["site_edits"] = battery::vpd_site_edits(&vpd, export, decomposition, &batches, (&typical, &directions), settings.numeric_bytes)?;
         report["seconds"] = json!(started.elapsed().as_secs_f64());
         save(&report)?;
         log::info!("battery done in {:.0} s: {out}", started.elapsed().as_secs_f64());

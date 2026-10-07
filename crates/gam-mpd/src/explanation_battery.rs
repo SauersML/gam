@@ -49,7 +49,7 @@ use rand::{RngExt, SeedableRng, rngs::StdRng};
 use rayon::prelude::*;
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     f64::consts::LN_2,
     path::{Path, PathBuf},
     sync::Arc,
@@ -2461,8 +2461,9 @@ fn site_plan(d: &Device, layout: &Layout, heads: usize, e: &interchange::Experim
 }
 
 /// Node `node`'s value with `steps` applied, in `trace` (the run being edited) and `donor` (the
-/// same program's own unedited run of the batch, whose donor rows a swap reads).
-fn apply_steps(d: &Device, node: usize, steps: &[SiteStep], trace: &DeviceTrace, donor: &DeviceTrace) -> Result<Tensor, String> {
+/// same program's own unedited run of the batch, whose donor rows a swap or a cut reads; none where
+/// the steps read no donor).
+fn apply_steps(d: &Device, node: usize, steps: &[SiteStep], trace: &DeviceTrace, donor: Option<&DeviceTrace>) -> Result<Tensor, String> {
     let mut v = d.copy(trace.value(node)?).map_err(error)?;
     for step in steps {
         let current = d.copy(&v).map_err(error)?;
@@ -2479,6 +2480,7 @@ fn apply_steps(d: &Device, node: usize, steps: &[SiteStep], trace: &DeviceTrace,
                 d.axpy_rows(&mut v, s, 1.0, (step.push.as_ref().ok_or_else(|| error("a push without its vectors"))?, 0), n).map_err(error)?;
             }
             interchange::Operation::Swap => {
+                let donor = donor.ok_or_else(|| error("a swap without its donor's run"))?;
                 d.axpy_rows(&mut v, s, -1.0, (&current, s), n).map_err(error)?;
                 d.axpy_rows(&mut v, s, 1.0, (donor.value(node)?, step.donor), n).map_err(error)?;
                 if let Some(base) = step.base {
@@ -2488,6 +2490,7 @@ fn apply_steps(d: &Device, node: usize, steps: &[SiteStep], trace: &DeviceTrace,
             }
             interchange::Operation::Cut { .. } => {
                 let c = step.cut.as_ref().ok_or_else(|| error("a cut without its read"))?;
+                let donor = donor.ok_or_else(|| error("a cut without its donor's run"))?;
                 let rows = |t: &DeviceTrace, node: usize, at: usize| -> Result<Array2<f64>, String> { d.download(&d.rows_of(t.value(node)?, at, n).map_err(error)?).map_err(error) };
                 let x = rows(trace, c.entering, s)? + &(rows(donor, c.output, step.donor)? - &rows(donor, c.before, step.donor)?) - &(rows(trace, c.output, s)? - &rows(trace, c.before, s)?);
                 let mut read = x.clone();
@@ -2502,19 +2505,161 @@ fn apply_steps(d: &Device, node: usize, steps: &[SiteStep], trace: &DeviceTrace,
     Ok(v)
 }
 
+/// A site plan: per node the steps applied to its value ([`site_plan`]).
+type Plan = BTreeMap<usize, Vec<SiteStep>>;
+
+/// What VPD's three forms need beyond [`Vpd`]: the causal-importance network with causal attention
+/// (`importance_model`) and its mask nodes, and each block's input norm (attention blocks `rms1`,
+/// MLP blocks `rms2`: gain and epsilon), which a cut recomputes.
+struct FormParts {
+    causal: DeviceProgram,
+    causal_outputs: Vec<usize>,
+    norms: Vec<(Array1<f64>, f64)>,
+}
+
+impl FormParts {
+    fn new(vpd: &Vpd, export: &Path, decomposition: &Path, numeric_bytes: usize) -> Result<Self, String> {
+        let d = vpd.e.program.device().clone();
+        let (causal, causal_outputs) = {
+            let Decomposition { sites, ci } = Decomposition::load(decomposition)?;
+            let (built, outputs) = importance_model(export, &sites, ci, true)?;
+            (Side::compile(&d, &built.program, numeric_bytes)?, outputs)
+        };
+        let export = Export::open(export)?;
+        let epsilon = export.record["config"]["norm_eps"].as_f64().ok_or_else(|| error("config.norm_eps"))?;
+        let norms = (0..2 * vpd.layout.streams.len()).map(|b| Ok((export.tensor(&format!("blocks.{}.rms{}.gain", b / 2, 1 + b % 2))?.row(0).to_owned(), epsilon))).collect::<Result<_, String>>()?;
+        Ok(Self { causal, causal_outputs, norms })
+    }
+}
+
+/// `M` and VPD's three forms on one family of sequences of `length` rows, each run unedited or
+/// under a site plan. The forms: 0 `published`, masks from VPD's causal-importance network on `M`'s
+/// activations (the edited `M`'s under an edit), the network attending both ways; 1 `causal`, the
+/// same network with causal attention; 2 `autonomous` (`own_causal_1`), masks from the causal
+/// network on VPD's own activations (its run with every mask 1, edited) and then VPD run with them,
+/// edited, reading nothing of `M`. The remainder is dropped (VPD's setting).
+struct FormRuns<'a> {
+    vpd: &'a Vpd,
+    parts: &'a FormParts,
+    family: FamilyInputs,
+    length: usize,
+    ones: Vec<Tensor>,
+}
+
+/// The unedited runs a swap or a cut reads its donor's values from, one per program a form runs:
+/// published, causal, all-on, autonomous.
+type Donors = [DeviceTrace; 4];
+
+impl<'a> FormRuns<'a> {
+    fn new(vpd: &'a Vpd, parts: &'a FormParts, sequences: &[Vec<u32>]) -> Result<Self, String> {
+        let views: Vec<&[u32]> = sequences.iter().map(Vec::as_slice).collect();
+        let family = sequence_family(&views)?;
+        let length = views.first().map(|v| v.len()).ok_or_else(|| error("no sequences to run"))?;
+        let d = vpd.e.program.device();
+        let ones = vpd.sites.iter().map(|&(_, c, _)| d.upload(Array2::<f64>::ones((family.rows, c)).view()).map_err(error)).collect::<Result<_, _>>()?;
+        Ok(Self { vpd, parts, family, length, ones })
+    }
+
+    /// VPD's mask and remainder slots, the masks `masks` and every remainder off.
+    fn given(&self, masks: &[Tensor]) -> Result<BTreeMap<usize, Tensor>, String> {
+        let d = self.vpd.e.program.device();
+        let mut out = BTreeMap::new();
+        for (s, &(_, _, width)) in self.vpd.sites.iter().enumerate() {
+            out.insert(self.vpd.layout.masks[s], d.copy(&masks[s]).map_err(error)?);
+            out.insert(self.vpd.layout.deltas[s], d.zeros(self.family.rows, width).map_err(error)?);
+        }
+        Ok(out)
+    }
+
+    /// A network's masks (its mask nodes `outputs`) with its reads of `M`'s site inputs replaced by
+    /// `inputs` (none: `M`'s own, the network's own run of `M`).
+    fn masks(&self, (network, outputs): (&DeviceProgram, &[usize]), inputs: Option<BTreeMap<usize, Tensor>>) -> Result<Vec<Tensor>, String> {
+        let d = network.device();
+        let none = BTreeSet::<usize>::new();
+        let trace = match inputs {
+            None => network.forward(&self.family)?,
+            Some(inputs) => network.forward_edited(&self.family, BTreeMap::new(), &none, |_, _| Ok(()), |node, _| inputs.get(&node).map(|v| d.copy(v).map_err(error)).transpose())?,
+        };
+        outputs.iter().map(|n| Ok(d.copy(trace.value(*n)?).map_err(error)?)).collect()
+    }
+
+    /// The site inputs a run (`trace`) holds at its nodes `own`, keyed by `M`'s.
+    fn inputs_from(&self, trace: &DeviceTrace, own: &[usize]) -> Result<BTreeMap<usize, Tensor>, String> {
+        let d = self.vpd.e.program.device();
+        own.iter().zip(&self.vpd.m_layout.inputs).map(|(o, m)| Ok((*m, d.copy(trace.value(*o)?).map_err(error)?))).collect()
+    }
+
+    /// `M`'s run, under `plan` (a swap's or a cut's donor values from `donor`, `M`'s unedited run)
+    /// or unedited.
+    fn m_run(&self, edit: Option<(&Plan, Option<&DeviceTrace>)>) -> Result<DeviceTrace, String> {
+        let program = &self.vpd.m.program;
+        let d = program.device();
+        match edit {
+            Some((plan, donor)) => program.forward_edited(&self.family, BTreeMap::new(), &BTreeSet::new(), |_, _| Ok(()), |node, trace| plan.get(&node).map(|steps| apply_steps(d, node, steps, trace, donor)).transpose()),
+            None => program.forward(&self.family),
+        }
+    }
+
+    /// VPD's run with `masks`, under `plan` (donor values from `donor`) or unedited.
+    fn e_run(&self, masks: &[Tensor], edit: Option<(&Plan, Option<&DeviceTrace>)>) -> Result<DeviceTrace, String> {
+        let program = &self.vpd.e.program;
+        let d = program.device();
+        match edit {
+            Some((plan, donor)) => program.forward_edited(&self.family, self.given(masks)?, &BTreeSet::new(), |_, _| Ok(()), |node, trace| plan.get(&node).map(|steps| apply_steps(d, node, steps, trace, donor)).transpose()),
+            None => program.forward_given(&self.family, self.given(masks)?),
+        }
+    }
+
+    /// Form `form`'s run, `m` `M`'s run under the same edit (whose site inputs the published and
+    /// causal forms' masks read): under `plan` (donor values from the forms' unedited runs `donors`,
+    /// which only swaps and cuts read) or unedited.
+    fn form(&self, form: usize, m: &DeviceTrace, edit: Option<(&Plan, Option<&Donors>)>) -> Result<DeviceTrace, String> {
+        let vpd = self.vpd;
+        let causal = (&self.parts.causal, self.parts.causal_outputs.as_slice());
+        let with = |i: usize| edit.map(|(plan, donors)| (plan, donors.map(|t| &t[i])));
+        let read_m = || -> Result<Option<BTreeMap<usize, Tensor>>, String> { edit.map(|_| self.inputs_from(m, &vpd.m_layout.inputs)).transpose() };
+        match form {
+            0 => self.e_run(&self.masks((&vpd.importance, &vpd.outputs), read_m()?)?, with(0)),
+            1 => self.e_run(&self.masks(causal, read_m()?)?, with(1)),
+            _ => {
+                let all_on = self.e_run(&self.ones, with(2))?;
+                self.e_run(&self.masks(causal, Some(self.inputs_from(&all_on, &vpd.layout.inputs)?))?, with(3))
+            }
+        }
+    }
+
+    /// The forms' unedited runs (`m` `M`'s), the donors of their swaps and cuts.
+    fn donors(&self, m: &DeviceTrace) -> Result<Donors, String> {
+        let all_on = self.e_run(&self.ones, None)?;
+        let autonomous = self.e_run(&self.masks((&self.parts.causal, &self.parts.causal_outputs), Some(self.inputs_from(&all_on, &self.vpd.layout.inputs)?))?, None)?;
+        Ok([self.form(0, m, None)?, self.form(1, m, None)?, all_on, autonomous])
+    }
+
+    /// `KL(target ‖ other)` in bits at every row of sequence `s` of the family, from two final normed
+    /// streams.
+    fn kl_bits(&self, target: &Tensor, other: &Tensor, s: usize) -> Result<Vec<f64>, String> {
+        let (d, head) = (self.vpd.m.program.device(), &self.vpd.m.head);
+        let logits = |hidden: &Tensor| -> Result<Tensor, String> {
+            let part = d.rows_of(hidden, s * self.length, self.length).map_err(error)?;
+            let mut out = d.zeros(self.length, head.rows()).map_err(error)?;
+            d.gemm(&mut out, 1.0, &part, Op::N, head, Op::T, 0.0, self.vpd.e.program.arithmetic()).map_err(error)?;
+            Ok(out)
+        };
+        let target = logits(target)?;
+        let mut other = logits(other)?;
+        Ok(d.kl_rows(&target, &mut other, None).map_err(error)?.iter().map(|n| n / LN_2).collect())
+    }
+}
+
 /// VPD under the edits driver's shared operations (`interchange::Interchange::sample_ops`: swaps,
 /// zeroings, scalings, pushes and cuts at sites every explanation shares with `M`), the experiments
 /// `batches` (each a batch of held-out sequences of `length` rows with its drawn experiments)
-/// applied verbatim to `M` and to VPD in three forms, each running its own computation under the
-/// edit: `published`, masks from VPD's causal-importance network on `M`'s activations (the edited
-/// `M`'s), the network attending both ways; `causal`, the same network with causal attention; and
-/// `autonomous` (`own_causal_1`), masks from the causal network on VPD's own activations (its run
-/// with every mask 1, edited) and then VPD run with them, edited, reading nothing of `M`. A swap
-/// reads the donor's value from the same program's own unedited run of the batch. The remainder is
-/// dropped (VPD's setting). Per form and family: `KL(M_e ‖ VPD_e)` in bits per token over every
-/// scored token (from the edited one on) and at the edited token, and those gaps binned by the
-/// edit's effect on `M` at the edited token, `KL(M_e ‖ M)`, as the edits driver reports them; and
-/// per experiment its effect, for checking that these are the driver's experiments.
+/// applied verbatim to `M` and to VPD in three forms ([`FormRuns`]), each running its own
+/// computation under the edit. A swap reads the donor's value from the same program's own unedited
+/// run of the batch. Per form and family: `KL(M_e ‖ VPD_e)` in bits per token over every scored
+/// token (from the edited one on) and at the edited token, and those gaps binned by the edit's
+/// effect on `M` at the edited token, `KL(M_e ‖ M)`, as the edits driver reports them; and per
+/// experiment its effect, for checking that these are the driver's experiments.
 pub fn vpd_site_edits(
     vpd: &Vpd,
     export: &Path,
@@ -2525,80 +2670,25 @@ pub fn vpd_site_edits(
 ) -> Result<Value, String> {
     let d = vpd.e.program.device().clone();
     let heads = vpd.layout.head_reads.first().map_or(0, Vec::len);
-    let (causal, causal_outputs) = {
-        let Decomposition { sites, ci } = Decomposition::load(decomposition)?;
-        let (built, outputs) = importance_model(export, &sites, ci, true)?;
-        (Side::compile(&d, &built.program, numeric_bytes)?, outputs)
-    };
-    // Each block's input norm (attention blocks rms1, MLP blocks rms2), which a cut recomputes.
-    let norms: Vec<(Array1<f64>, f64)> = {
-        let export = Export::open(export)?;
-        let epsilon = export.record["config"]["norm_eps"].as_f64().ok_or_else(|| error("config.norm_eps"))?;
-        (0..2 * vpd.layout.streams.len()).map(|b| Ok((export.tensor(&format!("blocks.{}.rms{}.gain", b / 2, 1 + b % 2))?.row(0).to_owned(), epsilon))).collect::<Result<_, String>>()?
-    };
+    let parts = FormParts::new(vpd, export, decomposition, numeric_bytes)?;
     const FORMS: [&str; 3] = ["published", "causal", "autonomous"];
     const BINS: [f64; 3] = [0.01, 0.1, 1.0];
     // Per form, per family: every scored token's bits, the edited tokens' bits, and per effect bin
     // the scored tokens' bits summed and counted, the edited tokens' bits summed, the experiments.
     let mut scores: Vec<BTreeMap<&'static str, Scores>> = vec![BTreeMap::new(); FORMS.len()];
     let mut records = Vec::new();
-    let arithmetic = vpd.e.program.arithmetic();
-    let none = std::collections::BTreeSet::<usize>::new();
     for (sequences, experiments) in batches {
-        let views: Vec<&[u32]> = sequences.iter().map(Vec::as_slice).collect();
-        let family = sequence_family(&views)?;
-        let length = views[0].len();
-        let rows = family.rows;
-        let given = |masks: &[Tensor]| -> Result<BTreeMap<usize, Tensor>, String> {
-            let mut out = BTreeMap::new();
-            for (s, &(_, _, width)) in vpd.sites.iter().enumerate() {
-                out.insert(vpd.layout.masks[s], d.copy(&masks[s]).map_err(error)?);
-                out.insert(vpd.layout.deltas[s], d.zeros(rows, width).map_err(error)?);
-            }
-            Ok(out)
-        };
-        let ones: Vec<Tensor> = vpd.sites.iter().map(|&(_, c, _)| d.upload(Array2::<f64>::ones((rows, c)).view()).map_err(error)).collect::<Result<_, _>>()?;
-        // The network's masks with its reads of M's site inputs replaced by `inputs` (none: M's own).
-        let masks_of = |network: &DeviceProgram, outputs: &[usize], inputs: Option<BTreeMap<usize, Tensor>>| -> Result<Vec<Tensor>, String> {
-            let trace = match inputs {
-                None => network.forward(&family)?,
-                Some(inputs) => network.forward_edited(&family, BTreeMap::new(), &none, |_, _| Ok(()), |node, _| inputs.get(&node).map(|v| d.copy(v).map_err(error)).transpose())?,
-            };
-            outputs.iter().map(|n| Ok(d.copy(trace.value(*n)?).map_err(error)?)).collect()
-        };
-        let inputs_from = |trace: &DeviceTrace, own: &[usize]| -> Result<BTreeMap<usize, Tensor>, String> {
-            own.iter().zip(&vpd.m_layout.inputs).map(|(o, m)| Ok((*m, d.copy(trace.value(*o)?).map_err(error)?))).collect()
-        };
-        // Per sequence of the batch, the logits of a final normed stream.
-        let logits = |hidden: &Tensor, s: usize| -> Result<Tensor, String> {
-            let part = d.rows_of(hidden, s * length, length).map_err(error)?;
-            let mut out = d.zeros(length, vpd.m.head.rows()).map_err(error)?;
-            d.gemm(&mut out, 1.0, &part, Op::N, &vpd.m.head, Op::T, 0.0, arithmetic).map_err(error)?;
-            Ok(out)
-        };
-        let kl_bits = |target: &Tensor, other: &Tensor, s: usize| -> Result<Vec<f64>, String> {
-            let target = logits(target, s)?;
-            let mut other = logits(other, s)?;
-            Ok(d.kl_rows(&target, &mut other, None).map_err(error)?.iter().map(|n| n / LN_2).collect())
-        };
-        // Each program's unedited run of the batch: the swaps' donors.
-        let m_clean = vpd.m.program.forward(&family)?;
-        let e_run = |masks: &[Tensor], plan: Option<&BTreeMap<usize, Vec<SiteStep>>>, donor: Option<&DeviceTrace>| -> Result<DeviceTrace, String> {
-            match (plan, donor) {
-                (Some(plan), Some(donor)) => vpd.e.program.forward_edited(&family, given(masks)?, &none, |_, _| Ok(()), |node, trace| plan.get(&node).map(|steps| apply_steps(&d, node, steps, trace, donor)).transpose()),
-                _ => vpd.e.program.forward_given(&family, given(masks)?),
-            }
-        };
-        let published_clean = e_run(&masks_of(&vpd.importance, &vpd.outputs, None)?, None, None)?;
-        let causal_clean = e_run(&masks_of(&causal, &causal_outputs, None)?, None, None)?;
-        let all_on_clean = e_run(&ones, None, None)?;
-        let autonomous_clean = e_run(&masks_of(&causal, &causal_outputs, Some(inputs_from(&all_on_clean, &vpd.layout.inputs)?))?, None, None)?;
+        let runs = FormRuns::new(vpd, &parts, sequences)?;
+        let length = runs.length;
+        // Each program's unedited run of the batch: the swaps' and cuts' donors.
+        let m_clean = runs.m_run(None)?;
+        let donors = runs.donors(&m_clean)?;
         for e in experiments {
-            let m_plan = site_plan(&d, &vpd.m_layout, heads, e, length, (typical, directions, &norms))?;
-            let e_plan = site_plan(&d, &vpd.layout, heads, e, length, (typical, directions, &norms))?;
-            let m_edited = vpd.m.program.forward_edited(&family, BTreeMap::new(), &none, |_, _| Ok(()), |node, trace| m_plan.get(&node).map(|steps| apply_steps(&d, node, steps, trace, &m_clean)).transpose())?;
+            let m_plan = site_plan(&d, &vpd.m_layout, heads, e, length, (typical, directions, &parts.norms))?;
+            let e_plan = site_plan(&d, &vpd.layout, heads, e, length, (typical, directions, &parts.norms))?;
+            let m_edited = runs.m_run(Some((&m_plan, Some(&m_clean))))?;
             let m_hidden = m_edited.value(vpd.m.hidden)?;
-            let effect = kl_bits(m_hidden, m_clean.value(vpd.m.hidden)?, e.base)?[e.position];
+            let effect = runs.kl_bits(m_hidden, m_clean.value(vpd.m.hidden)?, e.base)?[e.position];
             let family_name: &'static str = match &e.patch {
                 None => "clean",
                 Some(interchange::Patch::Ops { family, .. }) => match family {
@@ -2611,16 +2701,13 @@ pub fn vpd_site_edits(
                 },
                 Some(_) => "read",
             };
-            let published = e_run(&masks_of(&vpd.importance, &vpd.outputs, Some(inputs_from(&m_edited, &vpd.m_layout.inputs)?))?, Some(&e_plan), Some(&published_clean))?;
-            let causal_run = e_run(&masks_of(&causal, &causal_outputs, Some(inputs_from(&m_edited, &vpd.m_layout.inputs)?))?, Some(&e_plan), Some(&causal_clean))?;
-            let all_on = e_run(&ones, Some(&e_plan), Some(&all_on_clean))?;
-            let autonomous = e_run(&masks_of(&causal, &causal_outputs, Some(inputs_from(&all_on, &vpd.layout.inputs)?))?, Some(&e_plan), Some(&autonomous_clean))?;
             let mut gaps = Vec::new();
-            for (f, run) in [published, causal_run, autonomous].iter().enumerate() {
-                let bits = kl_bits(m_hidden, run.value(vpd.e.hidden)?, e.base)?;
+            for (f, entries) in scores.iter_mut().enumerate() {
+                let run = runs.form(f, &m_edited, Some((&e_plan, Some(&donors))))?;
+                let bits = runs.kl_bits(m_hidden, run.value(vpd.e.hidden)?, e.base)?;
                 let scored = &bits[e.position..];
                 let bin = BINS.iter().filter(|b| effect >= **b).count();
-                let entry = scores[f].entry(family_name).or_insert_with(|| (Vec::new(), Vec::new(), vec![(0.0, 0, 0.0, 0); BINS.len() + 1]));
+                let entry = entries.entry(family_name).or_insert_with(|| (Vec::new(), Vec::new(), vec![(0.0, 0, 0.0, 0); BINS.len() + 1]));
                 entry.0.extend_from_slice(scored);
                 entry.1.push(scored[0]);
                 let b = &mut entry.2[bin];
@@ -2654,6 +2741,91 @@ pub fn vpd_site_edits(
         out.insert((*name).to_string(), json!({"families": families}));
     }
     out.insert("experiments".into(), Value::Array(records));
+    Ok(Value::Object(out))
+}
+
+/// VPD's three forms against adversarial pushes ([`crate::adversary`]), searched as the edits
+/// driver searches them against an explanation: per search a sequence of `rows`, a stream site, a
+/// row and a starting direction from `seed` alone (`adversary::draw`, the same for every
+/// explanation), then per form the ascent (`adversary::ascend`, at most `steps` steps of `probes`
+/// probes) of the form's gap `KL(M_e ‖ VPD_e)` (bits per token from the row on) over the direction
+/// of a push of one typical norm (`typical`, the manifest's) at that site and row alone, applied
+/// verbatim to `M` and to the form, whose masks are recomputed under each push; every step's
+/// candidates run at once as a family of copies of the sequence. Per form and search: the form's
+/// clean error over the same rows (which every gap includes), the random start's and the found
+/// push's gaps and their excess over the clean error, and the found push's effect on `M`,
+/// `KL(M_e ‖ M)` over the same rows; per form the means.
+pub fn vpd_adversarial(
+    vpd: &Vpd,
+    export: &Path,
+    decomposition: &Path,
+    rows: &[Vec<u32>],
+    typical: &BTreeMap<interchange::SharedSite, f64>,
+    (seed, searches, steps, probes): (u64, usize, usize, usize),
+    numeric_bytes: usize,
+) -> Result<Value, String> {
+    let d = vpd.e.program.device().clone();
+    let heads = vpd.layout.head_reads.first().map_or(0, Vec::len);
+    let parts = FormParts::new(vpd, export, decomposition, numeric_bytes)?;
+    let length = rows.first().map(Vec::len).ok_or_else(|| error("adversarial: no rows to search on"))?;
+    let blocks = 2 * vpd.layout.streams.len();
+    let draws = crate::adversary::draw(seed, searches, rows.len(), length, blocks, vpd.m.head.cols())?;
+    const FORMS: [&str; 3] = ["published", "causal", "autonomous"];
+    let mut records: Vec<Vec<Value>> = vec![Vec::new(); FORMS.len()];
+    for (search, draw) in draws.iter().enumerate() {
+        let sequence = &rows[draw.sequence];
+        let mean_from = |bits: &[f64]| bits[draw.position..].iter().sum::<f64>() / (length - draw.position) as f64;
+        // Pushes along `candidates`, candidate `c` on copy `c` of the sequence, as one plan per program.
+        let pushed = |candidates: &[Vec<f64>]| {
+            let runs = FormRuns::new(vpd, &parts, &vec![sequence.clone(); candidates.len()])?;
+            let (mut m_plan, mut e_plan) = (Plan::new(), Plan::new());
+            for c in 0..candidates.len() {
+                let push = interchange::Experiment {
+                    base: c,
+                    source: c,
+                    explained: vec![true; blocks],
+                    patch: Some(interchange::Patch::Ops { family: interchange::Family::Push, ops: vec![interchange::SiteOp { site: draw.site, operation: interchange::Operation::Push { direction: c, size: 1 }, onward: false }] }),
+                    position: draw.position,
+                };
+                for (layout, plan) in [(&vpd.m_layout, &mut m_plan), (&vpd.layout, &mut e_plan)] {
+                    for (node, steps) in site_plan(&d, layout, heads, &push, length, (typical, candidates, &parts.norms))? {
+                        plan.entry(node).or_default().extend(steps);
+                    }
+                }
+            }
+            Ok::<_, String>((runs, m_plan, e_plan))
+        };
+        let one = FormRuns::new(vpd, &parts, std::slice::from_ref(sequence))?;
+        let m_clean = one.m_run(None)?;
+        for (f, form_records) in records.iter_mut().enumerate() {
+            let clean = mean_from(&one.kl_bits(m_clean.value(vpd.m.hidden)?, one.form(f, &m_clean, None)?.value(vpd.e.hidden)?, 0)?);
+            let found = crate::adversary::ascend(seed, search, &draw.start, steps, probes, |candidates| {
+                let (runs, m_plan, e_plan) = pushed(&candidates)?;
+                let m_edited = runs.m_run(Some((&m_plan, None)))?;
+                let run = runs.form(f, &m_edited, Some((&e_plan, None)))?;
+                (0..candidates.len()).map(|c| -> Result<f64, String> { Ok(mean_from(&runs.kl_bits(m_edited.value(vpd.m.hidden)?, run.value(vpd.e.hidden)?, c)?)) }).collect()
+            })?;
+            let (runs, m_plan, _) = pushed(std::slice::from_ref(&found.direction))?;
+            let effect = mean_from(&runs.kl_bits(runs.m_run(Some((&m_plan, None)))?.value(vpd.m.hidden)?, m_clean.value(vpd.m.hidden)?, 0)?);
+            let (start, end) = (found.path[0], *found.path.last().unwrap_or(&found.path[0]));
+            log::info!("vpd adversarial {} search {search}: {start:.4} → {end:.4} bits per token (clean {clean:.4}) at {:?}, row {}, {} steps", FORMS[f], draw.site, draw.position, found.path.len() - 1);
+            form_records.push(json!({
+                "sequence": draw.sequence, "site": draw.site, "position": draw.position, "clean_bits_per_token": clean,
+                "random_bits_per_token": start, "adversarial_bits_per_token": end,
+                "random_excess_bits_per_token": start - clean, "adversarial_excess_bits_per_token": end - clean,
+                "effect_bits_per_token": effect, "steps": found.path.len() - 1, "saturated": found.saturated, "path": found.path,
+            }));
+        }
+    }
+    let mut out = serde_json::Map::new();
+    for (name, searches) in FORMS.iter().zip(records) {
+        let mean = |key: &str| searches.iter().filter_map(|r| r[key].as_f64()).sum::<f64>() / searches.len().max(1) as f64;
+        out.insert((*name).to_string(), json!({
+            "clean_bits_per_token": mean("clean_bits_per_token"), "random_bits_per_token": mean("random_bits_per_token"), "adversarial_bits_per_token": mean("adversarial_bits_per_token"),
+            "random_excess_bits_per_token": mean("random_excess_bits_per_token"), "adversarial_excess_bits_per_token": mean("adversarial_excess_bits_per_token"),
+            "effect_bits_per_token": mean("effect_bits_per_token"), "searches": searches,
+        }));
+    }
     Ok(Value::Object(out))
 }
 
