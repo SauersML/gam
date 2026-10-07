@@ -385,6 +385,37 @@ fn following(down: &Array2<f64>, up: &Array2<f64>, first: usize) -> Vec<Vec<usiz
         .collect()
 }
 
+/// The co-firing groups of a layer's neurons for the mixed arm (descent's rot arm, 489cf5e569): in
+/// order of decreasing mean absolute activation, each neuron not yet grouped takes the `MIXING − 1`
+/// free neurons whose activations (the columns of `hidden`, one row per fitting token) are most
+/// correlated with its own; the last group holds the rest.
+const MIXING: usize = 32;
+
+fn cofiring(hidden: &Array2<f64>) -> Vec<Vec<usize>> {
+    let correlation = fast_ata(&standardized(hidden));
+    let n = hidden.ncols();
+    let rows = hidden.nrows().max(1) as f64;
+    let size: Vec<f64> = (0..n).map(|j| hidden.column(j).iter().map(|v| v.abs()).sum::<f64>() / rows).collect();
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|a, b| size[*b].total_cmp(&size[*a]).then(a.cmp(b)));
+    let mut free = vec![true; n];
+    let mut groups = Vec::new();
+    for first in order {
+        if !free[first] {
+            continue;
+        }
+        let mut others: Vec<usize> = (0..n).filter(|&j| free[j] && j != first).collect();
+        others.sort_by(|a, b| correlation[[first, *b]].total_cmp(&correlation[[first, *a]]).then(a.cmp(b)));
+        others.truncate(MIXING - 1);
+        let group: Vec<usize> = std::iter::once(first).chain(others).collect();
+        for &j in &group {
+            free[j] = false;
+        }
+        groups.push(group);
+    }
+    groups
+}
+
 /// `magnitudes` with each column centred and scaled to unit variance over the rows (zero where a
 /// column is constant).
 fn standardized(magnitudes: &Array2<f64>) -> Array2<f64> {
@@ -723,7 +754,8 @@ impl Units {
 /// MLP neuron one (its c_fc row and down_proj column), arms `per_slice_own` (every slice its own
 /// component, an o or down_proj slice gated on its own read), `grouped_own` and
 /// `grouped_direction` (the grouped components gated by their first read slice, in units of its
-/// spread). Gates start at `τ = 0`, widths the reads' spreads on the fitting rows, as for the
+/// spread), and `grouped_mixed` (`grouped_own`'s MLP components rotated and gate-shared within
+/// co-firing groups of neurons, [`cofiring`]). Gates start at `τ = 0`, widths the reads' spreads on the fitting rows, as for the
 /// frames. Heads must own their keys and values (no grouped-query sharing).
 fn unit_start(native: &OperatorProgram, layers: &[LayerNodes], value: &dyn Fn(usize) -> Result<Array2<f64>, String>, dir: &Path, axes: bool) -> Result<Value, String> {
     std::fs::create_dir_all(dir).map_err(error)?;
@@ -731,6 +763,8 @@ fn unit_start(native: &OperatorProgram, layers: &[LayerNodes], value: &dyn Fn(us
     let (mut per_slice, mut grouped, mut direction) = (Vec::new(), Vec::new(), Vec::new());
     // The shared arm's candidates, by index in `per_slice` (the privileged-axes start).
     let mut shared: Vec<(usize, Vec<usize>)> = Vec::new();
+    // The mixed arm's candidates, by index in `grouped`, and its mixing groups.
+    let (mut mixed_candidates, mut mixing): (Vec<(usize, Vec<usize>)>, Vec<Vec<[usize; 2]>>) = (Vec::new(), Vec::new());
     for (l, layer) in layers.iter().enumerate() {
         let site = |k: usize| KINDS.len() * l + k;
         let heads = layer.reads.len();
@@ -842,6 +876,7 @@ fn unit_start(native: &OperatorProgram, layers: &[LayerNodes], value: &dyn Fn(us
             shared.extend(following(&hidden.dot(&layer_sites[5].v).mapv(f64::abs), &up_magnitudes, first).into_iter().enumerate().map(|(i, c)| (first_down + i, c)));
         }
         // The MLP: per neuron its c_fc row and down_proj column.
+        let mut neuron_component = vec![None; up.nrows()];
         for n in (0..up.nrows()).filter(|_| !by_axes) {
             let (ins, outs) = (units[4].of(n), units[5].of(n));
             for &i in &ins {
@@ -852,8 +887,26 @@ fn unit_start(native: &OperatorProgram, layers: &[LayerNodes], value: &dyn Fn(us
             }
             let slices: Vec<[usize; 2]> = ins.iter().map(|&i| [site(4), i]).chain(outs.iter().map(|&i| [site(5), i])).collect();
             if let Some(&i) = ins.first() {
+                neuron_component[n] = Some(grouped.len());
                 grouped.push(component(json!({"own": [site(4), i]}), own_width(&h2, read_of(4, i).view(), 1.0), &slices));
                 direction.push(component(direction_read(&h2, read_of(4, i).view(), site(4)), 1.0, &slices));
+            }
+        }
+        // The mixed arm: the neurons' components in co-firing groups, each group's c_fc slices and
+        // its down_proj slices rotated within the group (library_vpd's mixing), and each component
+        // free to take the gate of any other in its group (blocks of any rank in the group's span).
+        if !by_axes {
+            for group in cofiring(&hidden) {
+                let members: Vec<usize> = group.iter().filter_map(|&n| neuron_component[n]).collect();
+                for &b in &members {
+                    mixed_candidates.push((b, members.iter().copied().filter(|&c| c != b).collect()));
+                }
+                for k in [4, 5] {
+                    let slices: Vec<[usize; 2]> = group.iter().flat_map(|&n| units[k].of(n)).map(|i| [site(k), i]).collect();
+                    if slices.len() > 1 {
+                        mixing.push(slices);
+                    }
+                }
             }
         }
         for (k, s) in layer_sites.iter().enumerate() {
@@ -872,10 +925,15 @@ fn unit_start(native: &OperatorProgram, layers: &[LayerNodes], value: &dyn Fn(us
     for (b, c) in shared {
         per_slice_shared[b]["candidates"] = json!(c);
     }
+    let mut grouped_mixed = grouped.clone();
+    for (b, c) in mixed_candidates {
+        grouped_mixed[b]["candidates"] = json!(c);
+    }
     let arms = json!([
         {"arm": "per_slice_own", "components": per_slice},
         {"arm": "per_slice_own_shared", "components": per_slice_shared},
         {"arm": "grouped_own", "components": grouped},
+        {"arm": "grouped_mixed", "components": grouped_mixed, "mixing": mixing},
         {"arm": "grouped_direction", "components": direction}
     ]);
     std::fs::write(dir.join("start.json"), arms.to_string()).map_err(error)?;
