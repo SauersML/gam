@@ -2507,8 +2507,10 @@ fn complexity_terms(scorer: &mut Scorer, device_posterior: &DevicePosterior, exp
                 };
                 let k = scorer.at(stage.width)?;
                 let width = device_posterior.iterate(k)?.column(0).to_vec();
-                let (expected, gate_terms, assigned, width_terms) = gated_expected(d, arithmetic, trace.value(stage.input)?, gate, (&bias.0, &bias.1, &width), &rank, assign.as_ref())?;
-                terms.push((k, width_terms.insert_axis(ndarray::Axis(1)) * per, Array2::zeros((width.len(), 1))));
+                // The widths enter the count (what the pass executes) but take no pull from it:
+                // nothing keeps a width positive, and the pull drove widths to where the toy fit
+                // diverged (resid_mlp_1l, K = 55: 28.3 → 38.6 bits per token over 8 epochs at λ ≈ 8,500).
+                let (expected, gate_terms, assigned, _) = gated_expected(d, arithmetic, trace.value(stage.input)?, gate, (&bias.0, &bias.1, &width), &rank, assign.as_ref())?;
                 if let (Some(op), Some(g)) = (stage.assign, assigned) {
                     assignment_terms.push((op, g * per));
                 }
