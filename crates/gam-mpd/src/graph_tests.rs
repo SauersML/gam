@@ -22,7 +22,10 @@ struct Fixture {
 }
 
 fn fixture(tag: &str) -> Fixture {
-    let dir = tiny_export(tag, LAYERS);
+    fixture_of(tiny_export(tag, LAYERS))
+}
+
+fn fixture_of(dir: std::path::PathBuf) -> Fixture {
     let imported = import_language_model(&dir, 6, 12).expect("import");
     let native = split_sites(&imported.program).expect("split");
     let layers = layer_nodes(&native, LAYERS).expect("layers");
@@ -482,4 +485,33 @@ fn library_parts_resolve_to_their_vpd_subcomponents() {
     let mut mixed = lib.clone();
     mixed.nodes[1] = node("O", vec![piece("vpd", "o_proj", Index::One(0))]);
     assert!(Graph::parse(&mixed, &weights).is_err(), "library and VPD views of one attention");
+}
+
+#[test]
+fn qwen3_like_model_full_graph_and_counterfactual_empty_graph() {
+    // Grouped-query attention, head norms on queries and keys, SiLU-gated MLPs.
+    let f = fixture_of(crate::test_support::tiny_qwen3_export("graph_qwen3", LAYERS));
+    let library = Library::new(&f.device, &f.device, &f.native, &f.layers, &f.artifact, 1 << 28, 64).expect("library");
+    let weights = Weights::of(&library);
+    assert!(weights.layers[0].heads[0].query_norm.is_some() && weights.layers[0].mlp.as_ref().is_some_and(|m| m.up.is_some()));
+    let clean = library.log_probabilities(&library.run(&f.sequences, &BTreeMap::new()).expect("run").last).expect("log p");
+    let cf = counterfactuals(&f.sequences);
+    let target = library.log_probabilities(&library.run(&cf, &BTreeMap::new()).expect("run").last).expect("log p");
+    let stats = Stats::measure(&weights, &f.sequences).expect("stats");
+    let mut batch = Batch::new(&f.sequences).expect("batch");
+    batch.reference = Some(std::sync::Arc::new(reference(&weights, &stats, &Batch::new(&cf).expect("cf batch")).expect("reference")));
+    let rows: Vec<usize> = (0..batch.tokens.len()).collect();
+    let full = Graph::parse(&full_program(), &weights).expect("parse");
+    for (name, circuit, expected) in [("full", full.program(&weights, true), &clean), ("empty", Graph::empty().program(&weights, true), &target)] {
+        let run = execute(&weights, &stats, &circuit, &batch, &rows, &BTreeMap::new(), false).expect("execute");
+        let kl = max(&kl_bits(expected, &run.log_probabilities));
+        assert!(kl < 1e-9, "{name}: KL = {kl:e} bits");
+    }
+    // Opaque numbers count a key-value pair shared by two query heads once.
+    let one = Program { model: "tiny".into(), valid: true, nodes: vec![NodeIr { id: "h".into(), pieces: vec![PieceIr { view: "native".into(), layer: 0, kind: "head".into(), index: None }], rule: None }], ..Program::default() };
+    let g = Graph::parse(&one, &weights).expect("parse");
+    let h = &weights.layers[0].heads[0];
+    let per_query = h.query.len() + h.output.len() + h.query_norm.as_ref().map_or(0, |(g, _)| g.len());
+    let shared = h.key.len() + h.value.len() + h.key_norm.as_ref().map_or(0, |(g, _)| g.len());
+    assert_eq!(g.opaque_numbers(&weights), 2 * per_query + shared);
 }
