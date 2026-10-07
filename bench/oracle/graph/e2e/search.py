@@ -340,6 +340,22 @@ def prefix_search(pool: Pool, model: str, experiments: int, seed: int, block: in
         i = min(range(len(fine)), key=lambda i: objective(rs[i]))
         if objective(rs[i]) < objective(best):
             current, best = ranked[:fine[i]], rs[i]
+    if len(current) > max_prune:  # coarse pruning: drop a whole group (a head, a layer's native neurons, a matrix's subcomponents)
+        group = lambda u: u if u[0] == "head" else (u[0], u[1]) if u[0] == "mlp" else (u[0], u[1], u[2])
+        while True:
+            groups = sorted({group(u) for u in current}, key=str)
+            if len(groups) < 2:
+                break
+            moves = [[u for u in current if group(u) != g] for g in groups]
+            rs = pool.score([source(m) for m in moves], experiments, seed)
+            i = min(range(len(moves)), key=lambda i: objective(rs[i]))
+            log(f"group prune: {len(moves)} candidates; best drops {groups[i]} {objective(rs[i]):.6g} vs {objective(best):.6g}")
+            if objective(rs[i]) >= objective(best):
+                break
+            trajectory.append({"drop_group": str(groups[i]), "score": rs[i]})
+            current, best = moves[i], rs[i]
+            if checkpoint:
+                checkpoint({"units": [name(u) for u in current], "source": source(current), "score": best, "trajectory": trajectory, "partial": True})
     while 1 < len(current) <= max_prune:
         moves = [[v for v in current if v != u] for u in current]
         rs = pool.score([source(m) for m in moves], experiments, seed)
