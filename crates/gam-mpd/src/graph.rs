@@ -1711,6 +1711,9 @@ fn run(weights: &Weights, stats: &Stats, circuit: &Circuit, batch: &Batch, score
 /// computing (a `OnceLock`) never returns, which deadlocked a vpd4l batch.
 fn par_dot(a: &Array2<f64>, b: ndarray::ArrayView2<f64>) -> Array2<f64> {
     const BLOCK: usize = 64;
+    if let Some(out) = device_dot(a, b) {
+        return out;
+    }
     if a.nrows() <= BLOCK || rayon::current_thread_index().is_some() {
         return a.dot(&b);
     }
@@ -1719,10 +1722,78 @@ fn par_dot(a: &Array2<f64>, b: ndarray::ArrayView2<f64>) -> Array2<f64> {
     out
 }
 
+/// The device the large products run on ([`use_device`]), with its copy of the unembedding (keyed
+/// by the host matrix's address and shape: the unembedding is never edited).
+struct Gemm {
+    device: gam_gpu::tensor::Device,
+    unembedding: Option<(usize, (usize, usize), gam_gpu::tensor::Tensor)>,
+}
+
+static GEMM: std::sync::OnceLock<std::sync::Mutex<Gemm>> = std::sync::OnceLock::new();
+
+/// Runs the executor's large matrix products on `device` (Metal or CUDA, in its arithmetic) for the
+/// rest of the process: `M` and every program alike, so their outcomes stay comparable. Products
+/// below `2^22` multiply-adds stay on the host. Returns false when a device was already set.
+pub fn use_device(device: gam_gpu::tensor::Device) -> bool {
+    GEMM.set(std::sync::Mutex::new(Gemm { device, unembedding: None })).is_ok()
+}
+
+/// `a · b` on the device set by [`use_device`], or `None` (no device, a small product, or a device
+/// error, after which the host multiplies).
+fn device_dot(a: &Array2<f64>, b: ndarray::ArrayView2<f64>) -> Option<Array2<f64>> {
+    let gemm = GEMM.get()?;
+    if a.nrows() * a.ncols() * b.ncols() < 1 << 22 {
+        return None;
+    }
+    let state = gemm.lock().ok()?;
+    let product = |w: &gam_gpu::tensor::Tensor, op: gam_gpu::tensor::Op| -> Result<Array2<f64>, gam_gpu::gpu_error::GpuError> {
+        let d = &state.device;
+        let x = d.upload(a.view())?;
+        let mut out = d.zeros(a.nrows(), b.ncols())?;
+        d.gemm(&mut out, 1.0, &x, gam_gpu::tensor::Op::N, w, op, 0.0, device_arithmetic(d))?;
+        d.download(&out)
+    };
+    // A transposed view of a stored matrix multiplies as the stored matrix with `Op::T`.
+    let stored = b.t();
+    let result = if stored.is_standard_layout() {
+        state.device.upload(stored).and_then(|w| product(&w, gam_gpu::tensor::Op::T))
+    } else {
+        state.device.upload(b).and_then(|w| product(&w, gam_gpu::tensor::Op::N))
+    };
+    result.ok()
+}
+
+fn device_arithmetic(device: &gam_gpu::tensor::Device) -> gam_gpu::tensor::Arithmetic {
+    match device.storage() {
+        gam_gpu::tensor::Storage::F64 => gam_gpu::tensor::Arithmetic::F64,
+        _ => gam_gpu::tensor::Arithmetic::F32,
+    }
+}
+
+/// `last · Uᵀ` on the device set by [`use_device`], its copy of the unembedding `U` kept.
+fn device_logits(last: &Array2<f64>, unembedding: &Array2<f64>) -> Option<Array2<f64>> {
+    let gemm = GEMM.get()?;
+    let mut state = gemm.lock().ok()?;
+    let key = (unembedding.as_ptr() as usize, unembedding.dim());
+    if state.unembedding.as_ref().is_none_or(|(p, d, _)| (*p, *d) != key) {
+        let t = state.device.upload(unembedding.view()).ok()?;
+        state.unembedding = Some((key.0, key.1, t));
+    }
+    let d = &state.device;
+    let w = &state.unembedding.as_ref()?.2;
+    let x = d.upload(last.view()).ok()?;
+    let mut out = d.zeros(last.nrows(), unembedding.nrows()).ok()?;
+    d.gemm(&mut out, 1.0, &x, gam_gpu::tensor::Op::N, w, gam_gpu::tensor::Op::T, 0.0, device_arithmetic(d)).ok()?;
+    d.download(&out).ok()
+}
+
 /// Next-token log-probabilities of final streams (rows × width) through the final norm (its own
 /// RMS) and the unembedding, normalized in float64.
 pub fn log_probabilities(weights: &Weights, last: &Array2<f64>) -> Result<Array2<f64>, String> {
-    let mut logits = par_dot(last, weights.unembedding.t());
+    let mut logits = match device_logits(last, &weights.unembedding) {
+        Some(l) => l,
+        None => par_dot(last, weights.unembedding.t()),
+    };
     for (mut row, x) in logits.outer_iter_mut().zip(last.outer_iter()) {
         row *= rms_scale(x, weights.final_norm.epsilon);
         let values = gam_math::categorical::log_softmax(row.as_slice().ok_or("a contiguous row")?).map_err(|e| e.to_string())?;

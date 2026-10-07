@@ -211,7 +211,16 @@ fn handle(request: &Value, weights: &mut Option<Weights>, checker: &mut Option<C
             *checker = None;
             *export = Some(path.into());
             let w = load(Path::new(path))?;
-            let answer = json!({"ok": true, "layers": w.layers.len(), "heads": w.layers.first().map_or(0, |l| l.heads.len()), "neurons": w.layers.first().and_then(|l| l.mlp.as_ref()).map_or(0, |m| m.gate.nrows()), "vocabulary": w.embedding.nrows(), "width": w.embedding.ncols()});
+            // "device": "gpu" runs the executor's large products on the single-precision device
+            // (Metal on the Mac, CUDA elsewhere) for the rest of the process.
+            let device = match request["device"].as_str() {
+                Some("gpu") => {
+                    let d = Device::single_precision(gam_gpu::GpuPolicy::Required).map_err(error)?.ok_or("no single-precision device")?;
+                    gam_mpd::graph::use_device(d)
+                }
+                _ => false,
+            };
+            let answer = json!({"ok": true, "device": device, "layers": w.layers.len(), "heads": w.layers.first().map_or(0, |l| l.heads.len()), "neurons": w.layers.first().and_then(|l| l.mlp.as_ref()).map_or(0, |m| m.gate.nrows()), "vocabulary": w.embedding.nrows(), "width": w.embedding.ncols()});
             *weights = Some(w);
             Ok(answer)
         }
