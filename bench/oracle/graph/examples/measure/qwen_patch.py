@@ -6,7 +6,8 @@ target tokens, full vocabulary, against KL(M_clean || M_counterfactual) unpatche
 the unpatched KL minus the patched KL. These are the pieces a program must declare when undeclared
 pieces carry their counterfactual values.
 
-  HF_HUB_OFFLINE=1 MPD_MEM_GIB=8 mem-lease 8 ~/mpd-data/venv/bin/python qwen_patch.py BEHAVIOR.json OUT.json
+  HF_HUB_OFFLINE=1 MPD_MEM_GIB=8 mem-lease 8 ~/mpd-data/venv/bin/python qwen_patch.py OUT_DIR BEHAVIOR.json [...]
+(OUT_DIR/patch_<behavior id>.json per behavior)
 """
 
 import json
@@ -20,12 +21,19 @@ from transformers import AutoModelForCausalLM
 
 @torch.no_grad()
 def main():
-    behavior, out = Path(sys.argv[1]), Path(sys.argv[2])
+    out_dir = Path(sys.argv[1])
+    out_dir.mkdir(parents=True, exist_ok=True)
     dev = torch.device("mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu")
     model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-0.6B", dtype=torch.float32).to(dev).eval()
+    for behavior in sys.argv[2:]:
+        beh = json.loads(Path(behavior).read_text())
+        if any(p.get("counterfactual") for p in beh["prompts"]):
+            patch(model, dev, beh, out_dir / f"patch_{beh['id']}.json")
+
+
+def patch(model, dev, beh: dict, out: Path):
     cfg = model.config
     H, D = cfg.num_attention_heads, cfg.head_dim
-    beh = json.loads(behavior.read_text())
     prompts = [p for p in beh["prompts"] if p.get("counterfactual")]
     T = max(len(p["token_ids"]) for p in prompts)
 
@@ -61,9 +69,10 @@ def main():
                 return saved_mlp[layer]
         return hook
 
+    handles = []
     for l, block in enumerate(model.model.layers):
-        block.self_attn.o_proj.register_forward_pre_hook(pre_o(l))
-        block.mlp.register_forward_hook(post_mlp(l))
+        handles.append(block.self_attn.o_proj.register_forward_pre_hook(pre_o(l)))
+        handles.append(block.mlp.register_forward_hook(post_mlp(l)))
 
     def log_probs(ids):
         hidden = model.model(ids).last_hidden_state[rows, cols]
@@ -90,6 +99,8 @@ def main():
         best = sorted(heads[-H:], key=lambda x: -x["recovery_bits"])[:3]
         print(l, [(x["head"], round(x["recovery_bits"], 3)) for x in best], "mlp", round(mlps[-1]["recovery_bits"], 3), flush=True)
         out.write_text(json.dumps({"behavior": beh["id"], "base_bits": base, "heads": heads, "mlps": mlps}))
+    for h in handles:
+        h.remove()
 
 
 if __name__ == "__main__":
