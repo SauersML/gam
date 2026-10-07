@@ -2442,9 +2442,12 @@ impl Checker {
         }
         let prompts = h;
         let w = &self.weights;
-        for v in w.embedding.row(0).iter().chain(w.unembedding.row(w.unembedding.nrows() - 1).iter()).chain(w.layers.iter().flat_map(|l| l.mlp.iter().flat_map(|m| m.out.row(0).to_vec()))) {
-            absorb(&v.to_le_bytes());
+        let mut sample: Vec<f64> = w.embedding.row(0).to_vec();
+        sample.extend(w.unembedding.row(w.unembedding.nrows() - 1).iter());
+        for l in &w.layers {
+            sample.extend(l.mlp.iter().flat_map(|m| m.out.row(0).to_vec()));
         }
+        sample.iter().for_each(|v| absorb(&v.to_le_bytes()));
         absorb(key.as_bytes());
         Some(std::path::Path::new(&dir).join(format!("{}_{prompts:016x}", self.behavior.id)).join(format!("{h:016x}.f64")))
     }
