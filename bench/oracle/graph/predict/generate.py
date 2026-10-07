@@ -116,10 +116,9 @@ class Qwen3:
         torch.backends.cudnn.allow_tf32 = False
         self.dev, self.dtype = dev, dtype
         self.wide = torch.float64 if dev.type != "mps" else torch.float32
-        if dev.type == "cuda":  # straight to the GPU (Qwen3-8B in float32 is 32 GB; no host copy)
-            self.model = AutoModelForCausalLM.from_pretrained(path, dtype=dtype, device_map="cuda").eval()
-        else:
-            self.model = AutoModelForCausalLM.from_pretrained(path, dtype=dtype).to(dev).eval()
+        # Loaded in bfloat16, the checkpoints' own storage type, then widened on the device: the same values
+        # as a float32 load, with half the host memory (Qwen3-8B: 16 GB, not 32).
+        self.model = AutoModelForCausalLM.from_pretrained(path, dtype=torch.bfloat16).to(dev).to(dtype).eval()
         self.tok = AutoTokenizer.from_pretrained(path)
         self.inner = self.model.model
         self.layers = list(self.inner.layers)

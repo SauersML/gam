@@ -211,7 +211,7 @@ def main():
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     tok = AutoTokenizer.from_pretrained(args.model)
-    model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.bfloat16, **({"device_map": "cuda"} if dev.type == "cuda" else {})).to(dev)
+    model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.bfloat16).to(dev)
     for p in model.parameters():
         p.requires_grad_(False)
     adapters = wrap(model, args.rank, args.alpha)

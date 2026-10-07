@@ -129,7 +129,7 @@ def main():
     dev = torch.device("cuda" if torch.cuda.is_available() else "mps")
     tok = AutoTokenizer.from_pretrained(args.model)
     tok.padding_side = "left"
-    model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.bfloat16, **({"device_map": "cuda"} if dev.type == "cuda" else {})).to(dev).eval()
+    model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.bfloat16).to(dev).eval()
     if args.adapters:
         from safetensors.torch import load_file
 
