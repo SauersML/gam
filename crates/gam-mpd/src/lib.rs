@@ -94,6 +94,8 @@ pub mod interchange;
 pub mod explanation_battery;
 // VPD's MLP subcomponents as parts that edits act on.
 pub mod vpd_parts;
+/// VPD's slices with intrinsic gates: the start of the main line on vpd4l.
+pub mod vpd_start;
 #[cfg(test)]
 mod interchange_tests;
 

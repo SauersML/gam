@@ -1859,6 +1859,12 @@ fn divergence_and_seed(d: &Device, m: &Tensor, e: &Tensor, head: &Tensor, length
     Ok((total, out))
 }
 
+/// The sum over a batch's tokens of `KL(M ‖ E)` in bits, from the final normed streams `m` of `M`
+/// and `e` of `E` (sequences of `length` rows) through `side`'s unembedding.
+pub fn divergence_bits(d: &Device, m: &Tensor, e: &Tensor, side: &Side, length: usize) -> Result<f64, String> {
+    Ok(divergence_and_seed(d, m, e, &side.head, length, false, side.program.arithmetic())?.0 / LN_2)
+}
+
 /// The causal-importance masks of every site on `family`, as the raw slots of the whole program
 /// (the remainder dropped: VPD's intended setting), on the device: each mask the importance
 /// network's output itself (`Strategy::Ci`) and every `δ` zero.

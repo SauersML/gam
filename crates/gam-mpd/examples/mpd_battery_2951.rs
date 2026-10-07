@@ -7,6 +7,7 @@
 //! EXPORT SETTINGS.json OUT.json host|gpu price_charged DECOMPOSITION [START]
 //! EXPORT SETTINGS.json OUT.json host|gpu masks DECOMPOSITION
 //! EXPORT SETTINGS.json OUT.json host|gpu lookahead DECOMPOSITION
+//! EXPORT SETTINGS.json OUT.json host|gpu start DECOMPOSITION
 //! EXPORT SETTINGS.json OUT.json host|gpu fit DECOMPOSITION START
 //!
 //! `price_charged` prices VPD's causal-importance network beside its subcomponents
@@ -212,7 +213,7 @@ fn circuits(device: &Device, export: &Path, layers: &[gam_mpd::run_check::LayerN
 fn main() -> Result<(), String> {
     log_to_stderr();
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let usage = "EXPORT SETTINGS.json OUT.json host|gpu library [ARTIFACT] | vpd DECOMPOSITION | circuits PAIRS.json [DECOMPOSITION] | price|price_charged DECOMPOSITION [START] | masks DECOMPOSITION | lookahead DECOMPOSITION | fit DECOMPOSITION START";
+    let usage = "EXPORT SETTINGS.json OUT.json host|gpu library [ARTIFACT] | vpd DECOMPOSITION | circuits PAIRS.json [DECOMPOSITION] | price|price_charged DECOMPOSITION [START] | masks DECOMPOSITION | lookahead DECOMPOSITION | start DECOMPOSITION | fit DECOMPOSITION START";
     let (export, settings_path, out, mode, kind, extra, more) = match &args[..] {
         [e, s, o, m, k] => (e, s, o, m, k.as_str(), None, None),
         [e, s, o, m, k, a] => (e, s, o, m, k.as_str(), Some(Path::new(a)), None),
@@ -299,6 +300,21 @@ fn main() -> Result<(), String> {
             progress["fit"] = state.clone();
             save(&progress)
         })?;
+        report["seconds"] = json!(started.elapsed().as_secs_f64());
+        save(&report)?;
+        log::info!("battery done in {:.0} s: {out}", started.elapsed().as_secs_f64());
+        return Ok(());
+    }
+    if kind == "start" {
+        // VPD's slices with intrinsic gates (`gam_mpd::vpd_start`), fitted on the first
+        // training_sequences rows outside the held-out ones; the grouped components beside OUT.
+        let decomposition = extra.ok_or(usage)?;
+        let vpd = Vpd::new(&device, export, Decomposition::load(decomposition)?, settings.numeric_bytes)?;
+        let fit: Vec<Vec<u32>> = all_rows[..first].iter().chain(&all_rows[end..]).take(training).cloned().collect();
+        if training == 0 || fit.len() != training {
+            return Err("the start needs training_sequences rows outside the held-out ones".into());
+        }
+        report["start"] = gam_mpd::vpd_start::vpd_start(&vpd, &fit, bases, settings.batch_sequences, &Path::new(out).with_extension("components.json"))?;
         report["seconds"] = json!(started.elapsed().as_secs_f64());
         save(&report)?;
         log::info!("battery done in {:.0} s: {out}", started.elapsed().as_secs_f64());
