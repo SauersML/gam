@@ -80,7 +80,7 @@ class Policy:
 
         self.dev = dev
         self.tok = AutoTokenizer.from_pretrained(args.base)
-        dtype = torch.bfloat16 if dev.type == "cuda" else torch.float32
+        dtype = torch.float32 if dev.type == "cpu" else torch.bfloat16
         base = AutoModelForCausalLM.from_pretrained(args.base, dtype=dtype).to(dev)
         if args.init:
             self.model = PeftModel.from_pretrained(base, args.init, adapter_name="default", is_trainable=True)
