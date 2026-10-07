@@ -562,7 +562,7 @@ def rescore(args, score) -> dict:
     key = lambda r: (r["run"], r["step"], r["set"], r["behavior"], r["program"], r["source"])  # noqa: E731
     done = {key(r): r for r in map(json.loads, open(done_path))} if done_path.exists() else {}
     for bpath in sorted(behaviors_by_path, key=str):
-        todo = [r for r in rows if r["behavior_path"] == bpath and key(r) not in done]
+        todo = list({key(r): r for r in rows if r["behavior_path"] == bpath and key(r) not in done}.values())  # each distinct program once
         if not todo:
             continue
         scores = score([{"source": r["source"], "behavior": behaviors_by_path[bpath], "seed": args.eval_seed, "experiments": args.eval_experiments, "options": options} for r in todo])
@@ -574,13 +574,18 @@ def rescore(args, score) -> dict:
     summary = {}
     log = open(out / f"rescore_{args.rescore_tag}_summary.jsonl", "w")
     for name in sorted({r["set"] for r in rows}):
-        groups = {}
+        groups, shared = {}, {}
         for r in rows:
-            if r["set"] == name:
-                x = done[key(r)]["score"]
-                g = groups.setdefault((r["run"], r["step"], r["behavior_path"]), (behaviors_by_path[r["behavior_path"]], [], {}))
-                (g[1].append((r["source"], x)) if r["program"] == "oracle" else g[2].__setitem__(r["program"], x))
-        summary[name] = summarize(name, -1, [g for g in groups.values() if g[1]], log)
+            if r["set"] != name:
+                continue
+            x = done[key(r)]["score"]
+            if r["program"] == "oracle":
+                groups.setdefault((r["run"], r["behavior"]), (behaviors_by_path[r["behavior_path"]], [], {}))[1].append((r["source"], x))
+            else:  # baselines are the same programs on the same experiments for every run: shared by behavior
+                shared.setdefault(r["behavior"], {})[r["program"]] = x
+        for run in sorted({k[0] for k in groups}):
+            mine = [(b, progs, shared.get(bid, {})) for (rn, bid), (b, progs, _) in sorted(groups.items()) if rn == run]
+            summary[f"{name}/{run}"] = summarize(f"{name}/{run}", -1, mine, log)
     log.write(json.dumps({"summary": summary, "options": options}) + "\n")
     return summary
 

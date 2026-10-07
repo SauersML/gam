@@ -1,6 +1,6 @@
 """R4's table and figure (#2951): does the oracle write good programs for held-out behaviors?
 
-  r4_table.py NAME=RUN_DIR [NAME=RUN_DIR ...] [--set heldout_behaviors] [--out PNG] [--tsv TSV]
+  r4_table.py NAME=RUN_DIR|NAME=SUMMARY.jsonl@SET ... [--set heldout_behaviors] [--out PNG] [--tsv TSV]
 
 Per oracle run (its latest evaluation in RUN_DIR/eval.jsonl, or rescore_<tag>_summary.jsonl given as the
 path): the valid share of sampled programs, the share below the empty program's S, the signal its best
@@ -41,8 +41,9 @@ def main():
     runs = {}
     for spec in a.runs:
         name, path = spec.split("=", 1)
+        path, _, which = path.partition("@")  # NAME=summary.jsonl@SET for a rescore summary's per-run set
         p = Path(path).expanduser()
-        runs[name] = rows_of(p / "eval.jsonl" if p.is_dir() else p, a.set)
+        runs[name] = rows_of(p / "eval.jsonl" if p.is_dir() else p, which or a.set)
     behaviors = sorted({r["behavior"] for rs in runs.values() for r in rs})
     table = ["method\tbehavior\tvalid_share\tbelow_empty_share\tbest_recovered\tbest_bits\tcost_per_behavior"]
     recovered = {}
