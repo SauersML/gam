@@ -60,8 +60,10 @@ BEHAVIORS = Path.home() / "mpd-data/graph_oracle/behaviors"
 def render(behavior: dict) -> str:
     try:
         import prompt
-    except ImportError:  # prompt.py has not landed: description and examples only
-        lines = [f"Target model: {behavior['model']}. Behavior: {behavior['description']}", "Example prompts:"]
+    except ImportError:  # prompt.py has not landed: mech's own reference, the description and examples
+        import mech
+
+        lines = [mech.__doc__.split("trace(source")[0], f"Target model: {behavior['model']}. Behavior: {behavior['description']}", "Example prompts:"]
         lines += [f"- {p['text']!r}" for p in behavior["prompts"][:4]]
         lines.append("Write one Python program using only `from mech import ...` that explains how the model produces this behavior.")
         return "\n".join(lines)
@@ -183,6 +185,7 @@ class HfSampler:
 
     def __init__(self, policy: Policy, max_tokens: int):
         self.policy, self.max_tokens = policy, max_tokens
+        self.logprob_sums = None
 
     @torch.no_grad()
     def __call__(self, prompts: list[list[int]], n: int, adapter: Path, version: int) -> list[list[list[int]]]:
@@ -212,8 +215,9 @@ class VllmSampler:
         from vllm import SamplingParams
         from vllm.lora.request import LoRARequest
 
-        params = SamplingParams(n=n, temperature=1.0, top_p=1.0, top_k=-1, max_tokens=self.max_tokens, stop_token_ids=[self.end])
+        params = SamplingParams(n=n, temperature=1.0, top_p=1.0, top_k=-1, max_tokens=self.max_tokens, stop_token_ids=[self.end], logprobs=0)
         outs = self.llm.generate([{"prompt_token_ids": p} for p in prompts], params, lora_request=LoRARequest(f"policy{version}", version + 1, str(adapter)), use_tqdm=False)
+        self.logprob_sums = [sum(d[t].logprob for d, t in zip(c.logprobs, c.token_ids)) for o in outs for c in o.outputs]
         return [[list(c.token_ids) for c in o.outputs] for o in outs]
 
 
@@ -251,12 +255,14 @@ def dpo_update(pol: Policy, prompts, winners, losers, beta: float, micro: int) -
 
 
 def grpo_update(pol: Policy, prompts, completions, advantage, beta: float, micro: int) -> dict:
-    total, kl = 0.0, 0.0
+    total, kl, sums = 0.0, 0.0, []
     for idx in micro_batches(len(prompts), micro):
         ps, cs = [prompts[i] for i in idx], [completions[i] for i in idx]
         adv = torch.tensor([advantage[i] for i in idx], device=pol.dev, dtype=torch.float32)
         cur, mask = pol.token_logprobs(ps, cs)
-        loss = -(adv * (cur * mask).sum(1)).sum() / len(prompts)
+        episode = (cur * mask).sum(1)
+        sums += episode.detach().tolist()
+        loss = -(adv * episode).sum() / len(prompts)
         if beta > 0:
             ref, _ = pol.token_logprobs(ps, cs, ref=True)
             d = ref - cur
@@ -265,7 +271,7 @@ def grpo_update(pol: Policy, prompts, completions, advantage, beta: float, micro
             kl += float(k3.detach().sum()) / len(prompts)
         loss.backward()
         total += float(loss.detach())
-    return {"loss": total, "kl_sum_per_episode": kl}
+    return {"loss": total, "kl_sum_per_episode": kl, "logprob_sums": sums}
 
 
 def main():
@@ -366,6 +372,9 @@ def main():
                         optimizer.step()
                         optimizer.zero_grad(set_to_none=True)
                 stats["kept"] = len(keep)
+            sums = stats.pop("logprob_sums", None)
+            if sums is not None and sampler.logprob_sums is not None:  # on-policy check: the sampler's log pi(y) against the trainer's, per token
+                stats["sampler_trainer_logprob_gap_per_token"] = float(np.sum(np.abs(np.array(sums) - np.array(sampler.logprob_sums))) / max(1, sum(len(c) for c in flat_c)))
             if args.mode != "bestofn":
                 stats["grad_norm"] = float(torch.nn.utils.clip_grad_norm_(pol.params, 1.0))
                 optimizer.step()

@@ -30,11 +30,16 @@ def mock(items: list[dict]) -> list[dict]:
         trace = mech.trace
     except ImportError:
         trace = None
+    if trace is not None:  # each trace is a sandboxed child process
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(8) as ex:
+            irs = list(ex.map(lambda it: trace(it["source"], it["behavior"]["model"]), items))
     out = []
-    for it in items:
-        source, model = it["source"], it["behavior"]["model"]
+    for k, it in enumerate(items):
+        source = it["source"]
         if trace is not None:
-            ir = trace(source, model)
+            ir = irs[k]
             valid, error, tokens, types = ir["valid"], ir.get("error"), ir.get("python_tokens", 0), ir.get("token_types", 1)
         else:  # mech.py has not landed: parseability only
             try:
