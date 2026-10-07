@@ -385,3 +385,60 @@ fn vpd_mlp_view_reads_the_hidden_stream_through_its_edges() {
     bad.edges.push(edge("a1", "D", "input"));
     assert!(Graph::parse(&bad, &weights).is_err());
 }
+
+#[test]
+fn vpd_attention_view_reads_queries_keys_values_through_its_edges() {
+    let f = fixture("graph_vpd_attention");
+    let library = Library::new(&f.device, &f.device, &f.native, &f.layers, &f.artifact, 1 << 28, 64).expect("library");
+    let mut weights = Weights::of(&library);
+    // One subcomponent per output coordinate of q, k, v and per input coordinate of o (exact).
+    let lw = &weights.layers[1];
+    let stack = |m: &dyn Fn(&crate::graph::HeadWeights) -> ndarray::Array2<f64>| ndarray::concatenate(ndarray::Axis(0), &lw.heads.iter().map(m).collect::<Vec<_>>().iter().map(|a| a.view()).collect::<Vec<_>>()).expect("stack");
+    let (wq, wk, wv) = (stack(&|h| h.query.clone()), stack(&|h| h.key.clone()), stack(&|h| h.value.clone()));
+    let wo = ndarray::concatenate(ndarray::Axis(1), &lw.heads.iter().map(|h| h.output.view()).collect::<Vec<_>>()).expect("hstack");
+    let exact_in = |w: &ndarray::Array2<f64>| (ndarray::Array2::eye(w.nrows()), w.t().to_owned());
+    weights.vpd_attention.insert(1, crate::graph::VpdAttention { q: exact_in(&wq), k: exact_in(&wk), v: exact_in(&wv), o: (wo.t().to_owned(), ndarray::Array2::eye(wo.ncols())) });
+    let piece = |layer: usize, view: &str, kind: &str, index: Option<Index>| PieceIr { view: view.into(), layer, kind: kind.into(), index };
+    let all = |n: usize| Some(Index::Many((0..n).collect()));
+    let nodes = vec![
+        NodeIr { id: "a0".into(), pieces: vec![piece(0, "native", "head", None)], rule: None },
+        NodeIr { id: "m0".into(), pieces: vec![piece(0, "native", "mlp", None)], rule: None },
+        NodeIr { id: "QKV".into(), pieces: vec![piece(1, "vpd", "q_proj", all(wq.nrows())), piece(1, "vpd", "k_proj", all(wk.nrows())), piece(1, "vpd", "v_proj", all(wv.nrows()))], rule: None },
+        NodeIr { id: "O".into(), pieces: vec![piece(1, "vpd", "o_proj", all(wo.ncols()))], rule: None },
+        NodeIr { id: "m1".into(), pieces: vec![piece(1, "native", "mlp", None)], rule: None },
+    ];
+    let edge = |from: &str, to: &str| EdgeIr { from: from.into(), to: to.into(), route: "input".into() };
+    let mut edges = Vec::new();
+    for (to, writers) in [("a0", vec!["embed"]), ("m0", vec!["embed", "a0"]), ("QKV", vec!["embed", "a0", "m0"]), ("m1", vec!["embed", "a0", "m0", "O"]), ("logits", vec!["embed", "a0", "m0", "O", "m1"])] {
+        edges.extend(writers.into_iter().map(|w| edge(w, to)));
+    }
+    let cut = Program { model: "tiny".into(), valid: true, nodes, edges, ..Program::default() };
+    let mut joined = cut.clone();
+    joined.edges.push(edge("QKV", "O"));
+    let cf = counterfactuals(&f.sequences);
+    let stats = Stats::measure(&weights, &f.sequences).expect("stats");
+    let mut batch = Batch::new(&f.sequences).expect("batch");
+    batch.reference = Some(std::sync::Arc::new(reference(&weights, &stats, &Batch::new(&cf).expect("cf batch")).expect("reference")));
+    let rows: Vec<usize> = (0..batch.tokens.len()).collect();
+    let clean = library.log_probabilities(&library.run(&f.sequences, &BTreeMap::new()).expect("run").last).expect("log p");
+    let run_of = |program: &Program, edges: bool| {
+        let graph = Graph::parse(program, &weights).expect("parse");
+        execute(&weights, &stats, &graph.program(&weights, edges), &batch, &rows, &BTreeMap::new(), false).expect("execute").log_probabilities
+    };
+    assert!(max(&kl_bits(&clean, &run_of(&joined, true))) < 1e-9, "every edge");
+    assert!(max(&kl_bits(&clean, &run_of(&cut, false))) < 1e-9, "node level");
+    let model = Graph::parse(&cut, &weights).expect("parse").model(&weights);
+    let plain = Batch::new(&f.sequences).expect("batch");
+    assert!(max(&kl_bits(&clean, &execute(&weights, &stats, &model, &plain, &rows, &BTreeMap::new(), false).expect("execute").log_probabilities)) < 1e-9, "M");
+    // Without QKV >> O, O reads the counterfactual queries, keys and values: layer 1's heads patched from x'.
+    let reads = library.run(&cf, &BTreeMap::new()).expect("cf run").reads;
+    let patched = library.log_probabilities(&library.run(&f.sequences, &[(2, reads[2].clone()), (3, reads[3].clone())].into()).expect("patched").last).expect("log p");
+    let kl = max(&kl_bits(&patched, &run_of(&cut, true)));
+    assert!(kl < 1e-9, "KL(heads patched from x' ‖ O without its q/k/v edge) = {kl:e} bits");
+    let mut bad = cut.clone();
+    bad.edges.push(edge("QKV", "logits"));
+    assert!(Graph::parse(&bad, &weights).is_err(), "q/k/v subcomponents write no residual");
+    let mut mixed = cut.clone();
+    mixed.nodes.push(NodeIr { id: "h".into(), pieces: vec![piece(1, "native", "head", Some(Index::One(0)))], rule: None });
+    assert!(Graph::parse(&mixed, &weights).is_err(), "heads and VPD subcomponents of one attention");
+}

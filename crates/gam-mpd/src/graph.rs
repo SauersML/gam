@@ -211,6 +211,38 @@ pub struct Weights {
     /// Per layer with a VPD view of its MLP, VPD's subcomponents of `c_fc` and `down_proj`
     /// (`attach_vpd`).
     pub vpd: BTreeMap<usize, VpdMlp>,
+    /// Per layer with a VPD view of its attention, VPD's subcomponents of `q_proj`, `k_proj`,
+    /// `v_proj` and `o_proj` (`attach_vpd`).
+    pub vpd_attention: BTreeMap<usize, VpdAttention>,
+}
+
+/// VPD's subcomponents of one attention's four matrices, each `U` (subcomponents × out) and `V`
+/// (in × subcomponents) as in [`VpdMlp`]; `q`, `k`, `v` read the normed stream and write the heads'
+/// concatenated queries, keys and values, `o` reads the heads' concatenated reads.
+#[derive(Clone, Debug)]
+pub struct VpdAttention {
+    pub q: (Array2<f64>, Array2<f64>),
+    pub k: (Array2<f64>, Array2<f64>),
+    pub v: (Array2<f64>, Array2<f64>),
+    pub o: (Array2<f64>, Array2<f64>),
+}
+
+/// Subcomponents `picked` of a matrix `w` (out × in) with factors `(U, V)` applied to the rows of
+/// `x` (rows × in); with `rest`, every other subcomponent and the remainder, `x wᵀ − named`.
+fn sliced(factors: &(Array2<f64>, Array2<f64>), w: &Array2<f64>, picked: &[usize], rest: bool, x: &Array2<f64>) -> Array2<f64> {
+    let named = x.dot(&factors.1.select(Axis(1), picked)).dot(&factors.0.select(Axis(0), picked));
+    if rest { x.dot(&w.t()) - named } else { named }
+}
+
+/// A layer's heads as the four native matrices VPD decomposes: the query, key and value maps
+/// stacked over heads (heads × head width, by width) and the output columns side by side.
+fn attention_maps(layer: &LayerWeights) -> [Array2<f64>; 4] {
+    let stack = |f: &dyn Fn(&HeadWeights) -> &Array2<f64>| {
+        let views: Vec<_> = layer.heads.iter().map(|h| f(h).view()).collect();
+        ndarray::concatenate(Axis(0), &views).expect("heads of one width")
+    };
+    let outputs: Vec<_> = layer.heads.iter().map(|h| h.output.view()).collect();
+    [stack(&|h| &h.query), stack(&|h| &h.key), stack(&|h| &h.value), ndarray::concatenate(Axis(1), &outputs).expect("heads of one width")]
 }
 
 /// VPD's subcomponents of one MLP's two matrices (`explanation_battery::Factors`): subcomponent `i`
@@ -267,6 +299,11 @@ impl Features {
 }
 
 impl Weights {
+    /// `M`'s blocks with no decomposition views attached.
+    pub fn new(layers: Vec<LayerWeights>, final_norm: Norm, unembedding: Array2<f64>, embedding: Array2<f64>) -> Self {
+        Self { layers, final_norm, unembedding, embedding, transcoders: BTreeMap::new(), vpd: BTreeMap::new(), vpd_attention: BTreeMap::new() }
+    }
+
     /// Attaches the transcoder view: `dir/layer_{l}.safetensors` per layer that has one.
     pub fn attach_transcoders(&mut self, dir: &std::path::Path) -> Result<usize, String> {
         let mut attached = 0;
@@ -292,6 +329,20 @@ impl Weights {
         let mut attached = 0;
         for l in 0..self.layers.len() {
             let find = |kind: Kind| factors.iter().find(|f| f.layer == l && f.kind == kind);
+            if let (Some(q), Some(k), Some(v), Some(o)) = (find(Kind::Query), find(Kind::Key), find(Kind::Value), find(Kind::Output)) {
+                let lw = &self.layers[l];
+                if lw.heads.iter().any(|h| h.query_norm.is_some() || h.key_norm.is_some()) {
+                    return Err(format!("layer {l}: the VPD view reads attention without head norms"));
+                }
+                let [wq, wk, wv, wo] = attention_maps(lw);
+                for (name, f, w) in [("q", q, &wq), ("k", k, &wk), ("v", v, &wv), ("o", o, &wo)] {
+                    if f.u.ncols() != w.nrows() || f.v.nrows() != w.ncols() {
+                        return Err(format!("layer {l}: VPD's {name}_proj factors do not fit its {} × {} matrix", w.nrows(), w.ncols()));
+                    }
+                }
+                let pair = |f: &crate::explanation_battery::Factors| (f.u.clone(), f.v.clone());
+                self.vpd_attention.insert(l, VpdAttention { q: pair(q), k: pair(k), v: pair(v), o: pair(o) });
+            }
             let (Some(fc), Some(down), Some(mlp)) = (find(Kind::Up), find(Kind::Down), self.layers[l].mlp.as_ref()) else { continue };
             if mlp.up.is_some() {
                 return Err(format!("layer {l}: the VPD view reads a plain (ungated) MLP"));
@@ -354,13 +405,16 @@ pub enum Block {
     /// VPD subcomponents of the MLP's `c_fc` (`fc`) and `down_proj` (`down`); with `rest`, every
     /// other subcomponent of both and the remainders.
     Slices { layer: usize, fc: Vec<usize>, down: Vec<usize>, rest: bool },
+    /// VPD subcomponents of the attention's `q_proj`, `k_proj`, `v_proj` and `o_proj`; with `rest`,
+    /// every other subcomponent of the four and the remainders.
+    AttnSlices { layer: usize, q: Vec<usize>, k: Vec<usize>, v: Vec<usize>, o: Vec<usize>, rest: bool },
 }
 
 impl Block {
     /// The read site: `2l` a layer's attention, `2l + 1` its MLP; the logits read at `2L`.
     fn site(&self) -> usize {
         match self {
-            Self::Heads { layer, .. } => 2 * layer,
+            Self::Heads { layer, .. } | Self::AttnSlices { layer, .. } => 2 * layer,
             Self::Neurons { layer, .. } | Self::Features { layer, .. } | Self::Slices { layer, .. } => 2 * layer + 1,
         }
     }
@@ -368,12 +422,26 @@ impl Block {
     /// Whether the block writes the residual stream (a VPD node of `c_fc` subcomponents alone writes
     /// only its MLP's hidden pre-activation).
     fn writes_residual(&self) -> bool {
-        !matches!(self, Self::Slices { down, rest: false, .. } if down.is_empty())
+        match self {
+            Self::Slices { down, rest, .. } => *rest || !down.is_empty(),
+            Self::AttnSlices { o, rest, .. } => *rest || !o.is_empty(),
+            _ => true,
+        }
+    }
+
+    /// The residual routes the block reads (a VPD attention node: those its q, k, v subcomponents
+    /// read; a down_proj-only VPD node: none).
+    fn reads(&self) -> Vec<Route> {
+        match self {
+            Self::AttnSlices { q, k, v, rest, .. } => [(Route::Query, q), (Route::Key, k), (Route::Value, v)].into_iter().filter(|(_, p)| *rest || !p.is_empty()).map(|(r, _)| r).collect(),
+            Self::Slices { fc, rest, .. } if fc.is_empty() && !rest => Vec::new(),
+            other => other.routes().to_vec(),
+        }
     }
 
     fn routes(&self) -> &'static [Route] {
         match self {
-            Self::Heads { .. } => &[Route::Query, Route::Key, Route::Value],
+            Self::Heads { .. } | Self::AttnSlices { .. } => &[Route::Query, Route::Key, Route::Value],
             Self::Neurons { .. } | Self::Features { .. } | Self::Slices { .. } => &[Route::Input],
         }
     }
@@ -384,6 +452,7 @@ impl Block {
             Self::Neurons { neurons, .. } => neurons.is_empty(),
             Self::Features { features, rest, .. } => features.is_empty() && !rest,
             Self::Slices { fc, down, rest, .. } => fc.is_empty() && down.is_empty() && !rest,
+            Self::AttnSlices { q, k, v, o, rest, .. } => q.is_empty() && k.is_empty() && v.is_empty() && o.is_empty() && !rest,
         }
     }
 }
@@ -519,6 +588,24 @@ impl Graph {
                         }
                         Block::Features { layer: l, features: indices(&piece.index, t.count, "feature")?, rest: false }
                     }
+                    ("vpd", kind @ ("q_proj" | "k_proj" | "v_proj" | "o_proj")) => {
+                        let a = weights.vpd_attention.get(&l).ok_or_else(|| format!("{}: layer {l}'s attention has no VPD view", node.id))?;
+                        if piece.index.is_none() {
+                            return Err(format!("{}: name the {kind} subcomponents of layer {l}", node.id));
+                        }
+                        let (q, k, v, o) = (&a.q.0, &a.k.0, &a.v.0, &a.o.0);
+                        let count = match kind {
+                            "q_proj" => q.nrows(),
+                            "k_proj" => k.nrows(),
+                            "v_proj" => v.nrows(),
+                            _ => o.nrows(),
+                        };
+                        let picked = indices(&piece.index, count, kind)?;
+                        let mut lists: [Vec<usize>; 4] = Default::default();
+                        lists[["q_proj", "k_proj", "v_proj", "o_proj"].iter().position(|k| *k == kind).unwrap_or(3)] = picked;
+                        let [q, k, v, o] = lists;
+                        Block::AttnSlices { layer: l, q, k, v, o, rest: false }
+                    }
                     ("vpd", kind @ ("c_fc" | "down_proj")) => {
                         let v = weights.vpd.get(&l).ok_or_else(|| format!("{}: layer {l}'s MLP has no VPD view", node.id))?;
                         let (count, fc) = if kind == "c_fc" { (v.fc_u.nrows(), true) } else { (v.down_u.nrows(), false) };
@@ -548,6 +635,13 @@ impl Graph {
                         fc.extend(f);
                         down.extend(dn);
                         Block::Slices { layer, fc, down, rest: false }
+                    }
+                    (Some(Block::AttnSlices { layer, mut q, mut k, mut v, mut o, .. }), Block::AttnSlices { layer: m, q: q2, k: k2, v: v2, o: o2, .. }) if layer == m => {
+                        q.extend(q2);
+                        k.extend(k2);
+                        v.extend(v2);
+                        o.extend(o2);
+                        Block::AttnSlices { layer, q, k, v, o, rest: false }
                     }
                     _ => return Err(format!("{}: a node's pieces must lie at one site (one layer's heads or one layer's MLP)", node.id)),
                 });
@@ -594,9 +688,25 @@ impl Graph {
                         }
                     }
                 }
+                Block::AttnSlices { layer, q, k, v, o, .. } => {
+                    for (kind, list) in [(2usize, q), (3, k), (4, v), (5, o)] {
+                        list.sort_unstable();
+                        if !list.windows(2).all(|w| w[0] < w[1]) {
+                            return Err(format!("{}: a subcomponent listed twice", node.id));
+                        }
+                        for &i in list.iter() {
+                            if !sliced.insert((*layer, kind, i)) {
+                                return Err(format!("{}: subcomponent {i} of layer {layer} is in two nodes", node.id));
+                            }
+                        }
+                    }
+                }
             }
-            if let Some((l, _, _)) = sliced.iter().find(|(l, _, _)| owned.iter().any(|(m, head, _)| m == l && !head) || featured.iter().any(|(m, _)| m == l)) {
+            if let Some((l, _, _)) = sliced.iter().find(|(l, kind, _)| *kind < 2 && (owned.iter().any(|(m, head, _)| m == l && !head) || featured.iter().any(|(m, _)| m == l))) {
                 return Err(format!("{}: layer {l}'s MLP appears in more than one view", node.id));
+            }
+            if let Some((l, _, _)) = sliced.iter().find(|(l, kind, _)| *kind >= 2 && owned.iter().any(|(m, head, _)| m == l && *head)) {
+                return Err(format!("{}: layer {l}'s attention appears both as heads and as VPD subcomponents", node.id));
             }
             // One view per site: a layer's MLP is read through its neurons or its transcoder.
             if let Some((l, _)) = featured.iter().find(|(l, _)| owned.iter().any(|(m, head, _)| m == l && !head)) {
@@ -626,27 +736,28 @@ impl Graph {
             if let (Writer::Unit(w), Some(r)) = (writer, reader)
                 && blocks[w].site() == read_site
             {
-                match (&blocks[w], &blocks[r]) {
-                    (Block::Slices { fc, .. }, Block::Slices { down, .. }) if !fc.is_empty() && !down.is_empty() && route == Route::Input => {
-                        if !internal.contains(&(w, r)) {
-                            internal.push((w, r));
-                        }
-                        continue;
-                    }
-                    _ => return Err(format!("edge {} >> {}: within one site only c_fc subcomponents feed down_proj subcomponents", e.from, e.to)),
+                let joins = match (&blocks[w], &blocks[r]) {
+                    (Block::Slices { fc, .. }, Block::Slices { down, .. }) => !fc.is_empty() && !down.is_empty(),
+                    (Block::AttnSlices { q, k, v, .. }, Block::AttnSlices { o, .. }) => !(q.is_empty() && k.is_empty() && v.is_empty()) && !o.is_empty(),
+                    _ => false,
+                };
+                if !joins || route != Route::Input {
+                    return Err(format!("edge {} >> {}: within one site only c_fc subcomponents feed down_proj subcomponents and q/k/v subcomponents feed o_proj subcomponents", e.from, e.to));
                 }
+                if !internal.contains(&(w, r)) {
+                    internal.push((w, r));
+                }
+                continue;
             }
             if let Writer::Unit(w) = writer
                 && (blocks[w].site() >= read_site || !blocks[w].writes_residual())
             {
                 return Err(format!("edge {} >> {}: the writer does not write the residual stream before the reader reads", e.from, e.to));
             }
-            if let Some(Block::Slices { fc, .. }) = reader.map(|r| &blocks[r])
-                && fc.is_empty()
-            {
-                return Err(format!("edge {} >> {}: down_proj subcomponents read only their MLP's hidden stream", e.from, e.to));
+            let routes: Vec<Route> = reader.map_or(vec![Route::Input], |r| blocks[r].reads());
+            if routes.is_empty() {
+                return Err(format!("edge {} >> {}: the reader's subcomponents read only their site's own stream (down_proj, o_proj)", e.from, e.to));
             }
-            let routes = reader.map_or(&[Route::Input][..], |r| blocks[r].routes());
             // `a >> head` (route input) feeds all of a head's inputs.
             let expanded: Vec<Route> = if route == Route::Input && !routes.contains(&Route::Input) { routes.to_vec() } else { vec![route] };
             for route in expanded {
@@ -686,9 +797,24 @@ impl Graph {
                     .collect()
             };
             let (heads, neurons) = (taken(true), taken(false));
-            let rest: Vec<usize> = (0..layer.heads.len()).filter(|h| !heads.contains(h)).collect();
-            if !rest.is_empty() {
-                out.push(Block::Heads { layer: l, heads: rest });
+            // A VPD-view attention: every undeclared subcomponent of its four matrices and the
+            // remainders.
+            let attention: Vec<[&Vec<usize>; 4]> = self.blocks.iter().filter_map(|b| match b {
+                Block::AttnSlices { layer, q, k, v, o, .. } if *layer == l => Some([q, k, v, o]),
+                _ => None,
+            }).collect();
+            if !attention.is_empty() {
+                let gather = |m: usize| -> Vec<usize> {
+                    let mut all: Vec<usize> = attention.iter().flat_map(|a| a[m].iter().copied()).collect();
+                    all.sort_unstable();
+                    all
+                };
+                out.push(Block::AttnSlices { layer: l, q: gather(0), k: gather(1), v: gather(2), o: gather(3), rest: true });
+            } else {
+                let rest: Vec<usize> = (0..layer.heads.len()).filter(|h| !heads.contains(h)).collect();
+                if !rest.is_empty() {
+                    out.push(Block::Heads { layer: l, heads: rest });
+                }
             }
             // A transcoder-view MLP: the MLP minus the declared features (every other feature and
             // the exact error piece).
@@ -791,6 +917,10 @@ impl Graph {
                 Block::Features { features, .. } => count += features.len() * (2 * d + 1),
                 // A subcomponent's two vectors: width and hidden.
                 Block::Slices { layer, fc, down, .. } => count += (fc.len() + down.len()) * (d + weights.neurons(*layer)),
+                Block::AttnSlices { layer, q, k, v, o, .. } => {
+                    let width: usize = weights.layers[*layer].heads.iter().map(|h| h.query.nrows()).sum();
+                    count += (q.len() + k.len() + v.len() + o.len()) * (d + width);
+                }
             }
         }
         // Counterfactual stand-ins are the model's own values and cost nothing; average stand-ins
@@ -800,7 +930,7 @@ impl Graph {
             for block in self.complement(weights) {
                 count += match block {
                     Block::Heads { heads, .. } => heads.len() * d,
-                    Block::Neurons { .. } | Block::Features { .. } | Block::Slices { .. } => d,
+                    Block::Neurons { .. } | Block::Features { .. } | Block::Slices { .. } | Block::AttnSlices { .. } => d,
                 };
             }
         }
@@ -906,6 +1036,8 @@ pub struct Reference {
     pub mlp: Vec<Array2<f64>>,
     /// Per layer its MLP's normed input `x̂` (rows × width): transcoder features read it.
     pub inputs: Vec<Array2<f64>>,
+    /// Per layer its attention's normed input (rows × width): VPD q, k, v subcomponents read it.
+    pub attention_inputs: Vec<Array2<f64>>,
 }
 
 impl Reference {
@@ -938,6 +1070,12 @@ impl Reference {
                 let mlp = weights.layers[*layer].mlp.as_ref().ok_or("a VPD view of a layer without an MLP")?;
                 let vpd = weights.vpd.get(layer).ok_or_else(|| format!("layer {layer} has no VPD view"))?;
                 Ok(vpd.down(mlp, down, *rest, self.active.get(*layer).ok_or("an MLP the reference did not record")?))
+            }
+            Block::AttnSlices { layer, o, rest, .. } => {
+                let a = weights.vpd_attention.get(layer).ok_or_else(|| format!("layer {layer}'s attention has no VPD view"))?;
+                let reads = self.reads.get(*layer).ok_or("an attention the reference did not record")?;
+                let z = ndarray::concatenate(Axis(1), &reads.iter().map(|r| r.view()).collect::<Vec<_>>()).map_err(|e| e.to_string())?;
+                Ok(sliced(&a.o, &attention_maps(&weights.layers[*layer])[3], o, *rest, &z))
             }
             Block::Features { layer, features, rest } => {
                 let t = weights.transcoders.get(layer).ok_or_else(|| format!("layer {layer} has no transcoder"))?;
@@ -1093,6 +1231,7 @@ fn features_write(weights: &Weights, layer: usize, features: &[usize], rest: boo
 /// A block's stand-in write (width): its pieces applied with `weights` to their stored inputs.
 fn stand_in(weights: &Weights, stats: &Stats, block: &Block) -> Result<Array1<f64>, String> {
     Ok(match block {
+        Block::AttnSlices { .. } => return Err("average stand-ins do not cover VPD attention subcomponents (use counterfactual stand-ins)".into()),
         Block::Slices { layer, down, rest, .. } => {
             let mlp = weights.layers[*layer].mlp.as_ref().ok_or("a VPD view of a layer without an MLP")?;
             let vpd = weights.vpd.get(layer).ok_or_else(|| format!("layer {layer} has no VPD view"))?;
@@ -1180,6 +1319,7 @@ fn run(weights: &Weights, stats: &Stats, circuit: &Circuit, batch: &Batch, score
         active: vec![Array2::zeros((0, 0)); weights.layers.len()],
         mlp: vec![Array2::zeros((0, 0)); weights.layers.len()],
         inputs: vec![Array2::zeros((0, 0)); weights.layers.len()],
+        attention_inputs: vec![Array2::zeros((0, 0)); weights.layers.len()],
     });
     let mut order: Vec<usize> = (0..circuit.units.len()).collect();
     order.sort_by_key(|&u| circuit.units[u].block.site());
@@ -1283,6 +1423,85 @@ fn run(weights: &Weights, stats: &Stats, circuit: &Circuit, batch: &Batch, score
                 slice_writes.insert(u, vpd.down(mlp, down, *rest, &pre));
             }
         }
+        // A VPD-view attention likewise: each reader of the queries, keys and values (a unit with
+        // o_proj subcomponents) takes the counterfactual ones plus the q/k/v writes it reads, runs
+        // the heads' attention on them and writes through its o_proj subcomponents.
+        let attention: Vec<usize> = order[at..end].iter().copied().filter(|&u| matches!(circuit.units[u].block, Block::AttnSlices { .. })).collect();
+        if let Some(&first) = attention.first() {
+            let Block::AttnSlices { layer, .. } = circuit.units[first].block else { unreachable!() };
+            let lw = &weights.layers[layer];
+            let vpd = weights.vpd_attention.get(&layer).ok_or_else(|| format!("layer {layer}'s attention has no VPD view"))?;
+            let maps = attention_maps(lw);
+            let x_ref = match &batch.reference {
+                Some(r) => r.attention_inputs.get(layer).cloned().ok_or("an attention the reference did not record")?,
+                // `M` (every unit computing and read) needs no reference: the deltas sum to its own
+                // queries, keys and values. A program under average stand-ins fails at its
+                // complement's stand-in (`stand_in`).
+                None => Array2::zeros((rows, d)),
+            };
+            let factors = [&vpd.q, &vpd.k, &vpd.v];
+            let refs: Vec<Array2<f64>> = (0..3).map(|m| x_ref.dot(&maps[m].t())).collect();
+            let mut deltas: BTreeMap<usize, Vec<Array2<f64>>> = BTreeMap::new();
+            for &u in &attention {
+                let unit = &circuit.units[u];
+                if !unit.computes || swaps.contains_key(&u) {
+                    continue;
+                }
+                let Block::AttnSlices { q, k, v, rest, .. } = &unit.block else { unreachable!() };
+                let routes = unit.block.routes();
+                let mut inputs: Vec<Array2<f64>> = routes.iter().map(|r| input(&unit.routes[r.slot()], &st)).collect();
+                ops.cut_inputs(site, unit, routes, &mut inputs, &st)?;
+                let mut ds = Vec::with_capacity(3);
+                for (m, list) in [q, k, v].into_iter().enumerate() {
+                    let mut x_hat = lw.attention.apply(&inputs[m]);
+                    ops.normed(site, u, m, &mut x_hat, &mut normed_kept);
+                    ds.push(sliced(factors[m], &maps[m], list, *rest, &x_hat) - sliced(factors[m], &maps[m], list, *rest, &x_ref));
+                }
+                deltas.insert(u, ds);
+            }
+            for &u in &attention {
+                let unit = &circuit.units[u];
+                if !unit.computes || swaps.contains_key(&u) {
+                    continue;
+                }
+                let Block::AttnSlices { o, rest, .. } = &unit.block else { unreachable!() };
+                if o.is_empty() && !rest {
+                    slice_writes.insert(u, Array2::zeros((rows, d)));
+                    continue;
+                }
+                let mut qkv = refs.clone();
+                for (&w, ds) in &deltas {
+                    let reads = match &unit.hidden {
+                        Incoming::AllBut(cut) => !cut.contains(&Writer::Unit(w)),
+                        Incoming::Only(kept) => kept.contains(&Writer::Unit(w)),
+                    };
+                    if reads {
+                        for (x, dx) in qkv.iter_mut().zip(ds) {
+                            *x += dx;
+                        }
+                    }
+                }
+                let mut z = Array2::<f64>::zeros((rows, maps[3].ncols()));
+                let (mut qc, mut kc, mut vc) = (0, 0, 0);
+                for hw in &lw.heads {
+                    let (qw, kw, vw) = (hw.query.nrows(), hw.key.nrows(), hw.value.nrows());
+                    for (n, &(start, length)) in batch.spans.iter().enumerate() {
+                        let positions: Vec<u32> = (0..length as u32).collect();
+                        let span = start..start + length;
+                        let qs = qkv[0].slice(s![span.clone(), qc..qc + qw]).to_owned();
+                        let ks = qkv[1].slice(s![span.clone(), kc..kc + kw]).to_owned();
+                        let (qs, ks) = (rotate(&qs, hw.rotary, &positions, false), rotate(&ks, hw.rotary, &positions, false));
+                        let mut a = probabilities(qs.view(), ks.view(), &positions, 0, hw.scale, hw.causal);
+                        if let Some(b) = batch.blocks.get(n).filter(|b| !b.is_empty()) {
+                            block_attention(&mut a, b);
+                        }
+                        z.slice_mut(s![span.clone(), vc..vc + vw]).assign(&a.dot(&qkv[2].slice(s![span, vc..vc + vw])));
+                    }
+                    (qc, kc, vc) = (qc + qw, kc + kw, vc + vw);
+                }
+                slice_writes.insert(u, sliced(&vpd.o, &maps[3], o, *rest, &z));
+            }
+        }
         for &u in &order[at..end] {
             let unit = &circuit.units[u];
             if !unit.computes {
@@ -1310,6 +1529,7 @@ fn run(weights: &Weights, stats: &Stats, circuit: &Circuit, batch: &Batch, score
                         for (h, z) in heads.iter().zip(reads) {
                             c.reads[*layer][*h] = z;
                         }
+                        c.attention_inputs[*layer] = weights.layers[*layer].attention.apply(&inputs[0]);
                     }
                     w
                 }
@@ -1342,7 +1562,7 @@ fn run(weights: &Weights, stats: &Stats, circuit: &Circuit, batch: &Batch, score
                     normed(0, &mut x_hat);
                     features_write(weights, *layer, features, *rest, &x_hat)?
                 }
-                Block::Slices { .. } => return Err("a VPD block outside its site's pass".into()),
+                Block::Slices { .. } | Block::AttnSlices { .. } => return Err("a VPD block outside its site's pass".into()),
             };
             st.writes[u] = Some(write);
         }
@@ -1581,6 +1801,8 @@ pub fn sample(weights: &Weights, graph: &Graph, counterfactual: bool, count: usi
         };
         match block {
             Block::Heads { layer, heads } => WeightEdit::Head { layer, head: heads[rng.random_range(0..heads.len())], factor },
+            // VPD attention subcomponents are not native weights: an aimed edit takes one of the layer's heads.
+            Block::AttnSlices { layer, .. } => WeightEdit::Head { layer, head: rng.random_range(0..weights.layers[layer].heads.len()), factor },
             // Transcoder features and VPD subcomponents are not native weights: an aimed edit takes
             // their layer's MLP.
             Block::Features { layer, .. } | Block::Slices { layer, .. } => WeightEdit::Neurons { layer, neurons: (0..weights.neurons(layer)).collect(), factor },
@@ -2120,6 +2342,9 @@ impl SiteUnits {
             match block {
                 Block::Heads { layer, heads } => {
                     out.extend(heads.iter().map(|h| SharedSite::Head(first[*layer] + h)));
+                    out.insert(SharedSite::Attention(*layer));
+                }
+                Block::AttnSlices { layer, .. } => {
                     out.insert(SharedSite::Attention(*layer));
                 }
                 Block::Neurons { layer, .. } | Block::Features { layer, .. } | Block::Slices { layer, .. } => {
