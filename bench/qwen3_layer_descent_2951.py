@@ -56,7 +56,7 @@ X = fit_inputs(torch.tensor(train[:32].astype(np.int64), device=dev))  # 8192 to
 Hh = F.silu(X @ Wg.T) * (X @ Wu.T)
 P = {}
 def whitened_svd(W, Y):
-    y = Y.double().cpu().numpy(); Wn = W.double().cpu().numpy()
+    y = Y.cpu().double().numpy(); Wn = W.cpu().double().numpy()
     C = y.T @ y / y.shape[0]; C += 1e-6 * np.trace(C) / C.shape[0] * np.eye(C.shape[0])
     lam, Q = sl.eigh(C)
     Us, S, Vt = sl.svd(Wn @ ((Q * np.sqrt(lam)) @ Q.T), full_matrices=False)
