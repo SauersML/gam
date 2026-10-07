@@ -917,7 +917,7 @@ impl Reference {
                 let mut out = Array2::<f64>::zeros((rows, weights.width()));
                 for &h in heads {
                     let z = self.reads.get(*layer).and_then(|r| r.get(h)).ok_or("a head the reference did not record")?;
-                    out += &z.dot(&weights.layers[*layer].heads[h].output.t());
+                    out += &par_dot(z, weights.layers[*layer].heads[h].output.t());
                 }
                 Ok(out)
             }
@@ -982,7 +982,7 @@ pub struct Execution {
 }
 
 fn project(x: &Array2<f64>, map: &Array2<f64>, norm: Option<&(Array1<f64>, f64)>) -> Array2<f64> {
-    let mut out = x.dot(&map.t());
+    let mut out = par_dot(x, map.t());
     if let Some((gain, epsilon)) = norm {
         for mut row in out.outer_iter_mut() {
             let r = rms_scale(row.view(), *epsilon);
@@ -1009,7 +1009,7 @@ fn heads_write(layer: &LayerWeights, heads: &[usize], inputs: [&Array2<f64>; 3],
     let (mut recorded, mut reads) = (Vec::new(), Vec::new());
     for &h in heads {
         let w = &layer.heads[h];
-        let (q, k, v) = (project(&q_hat, &w.query, w.query_norm.as_ref()), project(&k_hat, &w.key, w.key_norm.as_ref()), v_hat.dot(&w.value.t()));
+        let (q, k, v) = (project(&q_hat, &w.query, w.query_norm.as_ref()), project(&k_hat, &w.key, w.key_norm.as_ref()), par_dot(&v_hat, w.value.t()));
         let mut z = Array2::<f64>::zeros(v.dim());
         let mut mixed = Array1::<f64>::zeros(d);
         for (n, &(start, length)) in spans.iter().enumerate() {
@@ -1029,7 +1029,7 @@ fn heads_write(layer: &LayerWeights, heads: &[usize], inputs: [&Array2<f64>; 3],
         if record {
             recorded.push(mixed / rows as f64);
         }
-        out += &z.dot(&w.output.t());
+        out += &par_dot(&z, w.output.t());
         if capture {
             reads.push(z);
         }
@@ -1059,18 +1059,18 @@ fn block_attention(a: &mut Array2<f64>, blocks: &[[usize; 4]]) {
 
 /// Neurons `neurons` of an MLP on the normed stream `x_hat` (rows × width).
 fn neurons_write(mlp: &MlpWeights, neurons: &[usize], x_hat: &Array2<f64>) -> Array2<f64> {
-    neurons_active(mlp, neurons, x_hat).dot(&mlp.out.select(Axis(1), neurons).t())
+    par_dot(&neurons_active(mlp, neurons, x_hat), mlp.out.select(Axis(1), neurons).t())
 }
 
 /// The activations of neurons `neurons` (rows × neurons).
 fn neurons_active(mlp: &MlpWeights, neurons: &[usize], x_hat: &Array2<f64>) -> Array2<f64> {
     let gate = mlp.gate.select(Axis(0), neurons);
-    let mut h = x_hat.dot(&gate.t());
+    let mut h = par_dot(x_hat, gate.t());
     let bias = mlp.bias.select(Axis(0), neurons);
     h += &bias.view().insert_axis(Axis(0));
     h.mapv_inplace(|g| mlp.law.apply(g));
     if let Some(up) = &mlp.up {
-        let mut u = x_hat.dot(&up.select(Axis(0), neurons).t());
+        let mut u = par_dot(x_hat, up.select(Axis(0), neurons).t());
         u += &mlp.up_bias.select(Axis(0), neurons).view().insert_axis(Axis(0));
         h *= &u;
     }
@@ -1326,7 +1326,7 @@ fn run(weights: &Weights, stats: &Stats, circuit: &Circuit, batch: &Batch, score
                             active_stats[*layer][i] = mean[k];
                         }
                     }
-                    let write = active.dot(&mlp.out.select(Axis(1), neurons).t());
+                    let write = par_dot(&active, mlp.out.select(Axis(1), neurons).t());
                     if let Some(c) = captured.as_mut() {
                         if neurons.len() != mlp.gate.nrows() {
                             return Err("a capture needs each MLP whole in one unit".into());
@@ -1361,10 +1361,22 @@ fn run(weights: &Weights, stats: &Stats, circuit: &Circuit, batch: &Batch, score
     Ok(Execution { log_probabilities, writes: st.writes, recorded: record.then_some((head_stats, mlp_stats, active_stats)), normed: normed_kept, captured })
 }
 
+/// `a · b`, row blocks of `a` on parallel threads: one run's products use every core when few runs
+/// are pending (a weight edit's group, a counterfactual run every program of a batch waits for).
+fn par_dot(a: &Array2<f64>, b: ndarray::ArrayView2<f64>) -> Array2<f64> {
+    const BLOCK: usize = 64;
+    if a.nrows() <= BLOCK {
+        return a.dot(&b);
+    }
+    let mut out = Array2::<f64>::zeros((a.nrows(), b.ncols()));
+    out.axis_chunks_iter_mut(Axis(0), BLOCK).into_par_iter().zip(a.axis_chunks_iter(Axis(0), BLOCK).into_par_iter()).for_each(|(mut o, x)| o.assign(&x.dot(&b)));
+    out
+}
+
 /// Next-token log-probabilities of final streams (rows × width) through the final norm (its own
 /// RMS) and the unembedding, normalized in float64.
 pub fn log_probabilities(weights: &Weights, last: &Array2<f64>) -> Result<Array2<f64>, String> {
-    let mut logits = last.dot(&weights.unembedding.t());
+    let mut logits = par_dot(last, weights.unembedding.t());
     for (mut row, x) in logits.outer_iter_mut().zip(last.outer_iter()) {
         row *= rms_scale(x, weights.final_norm.epsilon);
         let values = gam_math::categorical::log_softmax(row.as_slice().ok_or("a contiguous row")?).map_err(|e| e.to_string())?;
