@@ -245,6 +245,13 @@ pub struct DeviceProgram {
     /// zero on the others, which the gate multiplies by zero (a component's reads downstream of
     /// its gate), and its cotangent's pull reads those entries alone.
     gated_reads: Vec<Option<usize>>,
+    /// Per affine node read or written on per-row lists and the arithmetic of its pass, the
+    /// measured seconds of its product per listed entry and of its dense product per row
+    /// ([`DeviceProgram::listed_pays`]).
+    list_costs: Mutex<std::collections::HashMap<(usize, std::mem::Discriminant<Arithmetic>), (f64, f64)>>,
+    /// Every product that can run on per-row lists runs on them, unmeasured
+    /// ([`DeviceProgram::read_listed`]).
+    always_listed: bool,
 }
 
 /// The columns of an exactly-zero node (`DeviceProgram::exact_zeros`) a product reads: those
@@ -417,6 +424,9 @@ pub struct DeviceTrace {
     active: BTreeMap<(usize, usize), Active>,
     /// Per gated node read on per-row lists, its lists ([`DeviceProgram::row_lists`]).
     lists: BTreeMap<usize, Arc<RowLists>>,
+    /// The affine nodes whose forward product ran on per-row lists ([`DeviceProgram::listed_pays`]);
+    /// their reverse pulls and gradients run on them too.
+    listed_nodes: BTreeSet<usize>,
     /// Bfloat16 copies of node values a bfloat16 forward pass's and the reverse passes' products read
     /// ([`DeviceTrace::rounded_value`]), kept until [`DeviceTrace::release_rounded`].
     rounded: Mutex<BTreeMap<usize, Arc<Tensor>>>,
@@ -919,7 +929,7 @@ impl DeviceProgram {
                 _ => None,
             })
             .collect();
-        Ok(Self { device: device.clone(), steps, widths, head, edited_head_nodes, operators, batch: Mutex::new(None), rotary_tables: Mutex::new(Vec::new()), bf16: false, arithmetic: Arithmetic::F64, fused, grouped, revisions: BTreeMap::new(), rounded: Mutex::new(BTreeMap::new()), exact_zeros, dead, sole, listed, gated_reads })
+        Ok(Self { device: device.clone(), steps, widths, head, edited_head_nodes, operators, batch: Mutex::new(None), rotary_tables: Mutex::new(Vec::new()), bf16: false, arithmetic: Arithmetic::F64, fused, grouped, revisions: BTreeMap::new(), rounded: Mutex::new(BTreeMap::new()), exact_zeros, dead, sole, listed, gated_reads, list_costs: Mutex::new(std::collections::HashMap::new()), always_listed: false })
     }
 
     /// Operator `op`'s device copy changed: every group reading it runs node by node until
@@ -1208,6 +1218,12 @@ impl DeviceProgram {
         self.exact_zeros.iter_mut().for_each(|z| *z = false);
         self.listed.iter_mut().for_each(|l| *l = None);
         self.gated_reads.iter_mut().for_each(|g| *g = None);
+    }
+
+    /// Every product that can run on per-row lists runs on them from now on, whatever their
+    /// measured cost (`DeviceProgram::listed_pays`): the lists' arithmetic as the tests check it.
+    pub fn read_listed(&mut self) {
+        self.always_listed = true;
     }
 
     /// How many entries of gated node `gated`'s value the pass that made `trace` listed, its rows'
@@ -1515,14 +1531,14 @@ impl DeviceProgram {
     }
 
     /// The gradient `cotᵀ x` of affine node `node`'s term from its input `input`, from per-row
-    /// lists alone, in the gradient's storage (f32 or f64): for a gated read (its cotangent zero
+    /// lists alone when its forward ran on them, in the gradient's storage (f32 or f64): for a
+    /// gated read (its cotangent zero
     /// off its lists) row `c` of the operator sums `cot[r, c] x[r, :]` over the rows `r` whose
     /// component of `c` is on, and for a write from a gated node (its value zero off its lists)
     /// column `c` sums `x[r, c] cot[r, :]` over them. Each gated node's rows per component
     /// (`by_group`) are made once a reverse. `None` for the dense product.
-    fn listed_gradient(&self, trace: &DeviceTrace, (node, input): (usize, usize), cot: &Tensor, (storage, arithmetic): (Storage, Arithmetic), (edited, seeded): (&BTreeSet<usize>, &BTreeSet<usize>), by_group: &mut BTreeMap<usize, Arc<RowLists>>) -> Result<Option<Tensor>, String> {
-        // As the lists' products (`listed_operand`): a bfloat16 pass takes the dense product.
-        if storage == Storage::Bf16 || arithmetic == Arithmetic::Bf16 || cot.storage() != storage || matches!(self.steps[input], Step::Feature { .. }) {
+    fn listed_gradient(&self, trace: &DeviceTrace, (node, input): (usize, usize), cot: &Tensor, storage: Storage, (edited, seeded): (&BTreeSet<usize>, &BTreeSet<usize>), by_group: &mut BTreeMap<usize, Arc<RowLists>>) -> Result<Option<Tensor>, String> {
+        if storage == Storage::Bf16 || !trace.listed_nodes.contains(&node) || cot.storage() != storage || matches!(self.steps[input], Step::Feature { .. }) {
             return Ok(None);
         }
         let read = self.gated_reads[node].filter(|r| trace.lists.contains_key(r) && !seeded.contains(&node) && !edited.contains(&node));
@@ -1548,18 +1564,9 @@ impl DeviceProgram {
         gradient.map(Some).map_err(error)
     }
 
-    /// `A` held dense in f32 or f64 in `x`'s storage, for a product on per-row lists in
-    /// `arithmetic`; `None` for the dense product. The lists' products read `A`'s rows per listed
-    /// entry without reuse across rows, so they are bound by memory where the dense product is
-    /// bound by arithmetic: on an A40 at vpd4l's MLP sizes (768 → 3072, 2048 rank-one columns,
-    /// 4096 rows; mpd_gated_block_bench_2951) the forward with 1% of the entries on took 12.3 ms
-    /// against the dense f32 forward's 13.6 and with 3% 17.8 against 13.8, and only at 0.2% did it
-    /// match the bfloat16 tensor-core forward (9.6 against 9.8 ms). A pass in bfloat16 (the
-    /// training passes on CUDA) therefore takes the dense products.
-    fn listed_operand(&self, operator: usize, x: &Tensor, arithmetic: Arithmetic) -> Result<Option<&Tensor>, String> {
-        if arithmetic == Arithmetic::Bf16 {
-            return Ok(None);
-        }
+    /// `A` held dense in f32 or f64 in `x`'s storage, for a product on per-row lists; `None` for
+    /// the dense product.
+    fn listed_operand(&self, operator: usize, x: &Tensor) -> Result<Option<&Tensor>, String> {
         Ok(match self.held(operator, Role::Product)? {
             Held::Dense(a) if a.storage() != Storage::Bf16 && a.storage() == x.storage() => Some(a),
             _ => None,
@@ -1571,28 +1578,90 @@ impl DeviceProgram {
     /// components on in that row only. `None` for the dense product.
     fn gated_read(&self, trace: &mut DeviceTrace, node: usize, (argument, operator): (usize, usize)) -> Result<Option<Tensor>, String> {
         let Some(gated) = self.gated_reads[node] else { return Ok(None) };
-        if self.listed_operand(operator, trace.value(argument)?, self.arithmetic)?.is_none() {
+        if self.listed_operand(operator, trace.value(argument)?)?.is_none() {
             return Ok(None);
         }
         let Some(lists) = self.row_lists(trace, gated)? else { return Ok(None) };
         let x = trace.value(argument)?;
-        let a = self.listed_operand(operator, x, self.arithmetic)?.ok_or("device: a listed operand")?;
-        self.device.sampled_product(x, a, &lists).map(Some).map_err(error)
+        let a = self.listed_operand(operator, x)?.ok_or("device: a listed operand")?;
+        let out = self.listed_or_dense(trace, (node, argument, operator), lists.len(), || self.device.sampled_product(x, a, &lists).map_err(error))?;
+        if out.is_some() {
+            trace.listed_nodes.insert(node);
+        }
+        Ok(out)
+    }
+
+    /// Whether affine node `node`'s product on per-row lists of `entries` listed entries costs less
+    /// than its dense product over `rows` rows in `arithmetic`, from the seconds each took when the
+    /// node first ran both in that arithmetic ([`DeviceProgram::listed_or_dense`]); `None` before.
+    /// The lists' products read `A`'s rows per listed entry without reuse across rows, so they are
+    /// bound by memory where the dense product is bound by arithmetic, and which is cheaper depends
+    /// on the device, the arithmetic and the share of entries on: on an A40 at vpd4l's MLP sizes
+    /// (768 → 3072, 2048 rank-one columns, 4096 rows; mpd_gated_block_bench_2951) the forward with
+    /// 1% of the entries on took 12.3 ms against the dense f32 forward's 13.6 and with 3% 17.8
+    /// against 13.8, and only at 0.2% did it match the bfloat16 tensor-core forward (9.6 against
+    /// 9.8 ms).
+    fn listed_pays(&self, node: usize, arithmetic: Arithmetic, entries: usize, rows: usize) -> Result<Option<bool>, String> {
+        let costs = self.list_costs.lock().map_err(|_| "device: poisoned list costs".to_string())?;
+        Ok(costs.get(&(node, std::mem::discriminant(&arithmetic))).map(|&(per_entry, per_row)| entries as f64 * per_entry < rows as f64 * per_row))
+    }
+
+    /// Affine node `node`'s first term `(argument, operator)` from `listed` (its product on per-row
+    /// lists of `entries` entries) when that costs less than the dense product
+    /// ([`DeviceProgram::listed_pays`]), else `None` for the dense product. The first time the node
+    /// runs in the pass's arithmetic with entries listed, both run twice, each timed to a device
+    /// synchronization the second time (the first takes the kernels' one-time setup), and their
+    /// costs are kept: seconds per listed entry and per row.
+    fn listed_or_dense(&self, trace: &DeviceTrace, (node, argument, operator): (usize, usize, usize), entries: usize, listed: impl Fn() -> Result<Tensor, String>) -> Result<Option<Tensor>, String> {
+        let rows = trace.rows;
+        if self.always_listed {
+            return listed().map(Some);
+        }
+        match self.listed_pays(node, self.arithmetic, entries, rows)? {
+            Some(true) => return listed().map(Some),
+            Some(false) => return Ok(None),
+            None if entries == 0 || rows == 0 => return listed().map(Some),
+            None => {}
+        }
+        let d = &self.device;
+        let dense = || -> Result<Tensor, String> {
+            let rounded = self.forward_operand(trace, argument, operator)?;
+            self.product(rounded.as_deref().map_or(trace.value(argument), Ok)?, operator, false, (rows, self.widths[node]), self.arithmetic)
+        };
+        let timed = |f: &dyn Fn() -> Result<Tensor, String>| -> Result<(Tensor, f64), String> {
+            drop(f()?);
+            d.synchronize().map_err(error)?;
+            let started = std::time::Instant::now();
+            let out = f()?;
+            d.synchronize().map_err(error)?;
+            Ok((out, started.elapsed().as_secs_f64()))
+        };
+        let (out, listed_seconds) = timed(&listed)?;
+        let (_, dense_seconds) = timed(&dense)?;
+        self.list_costs
+            .lock()
+            .map_err(|_| "device: poisoned list costs".to_string())?
+            .insert((node, std::mem::discriminant(&self.arithmetic)), (listed_seconds / entries as f64, dense_seconds / rows as f64));
+        Ok((listed_seconds < dense_seconds).then_some(out))
     }
 
     /// The product of affine node `node`'s term `(argument, operator)` when `argument` is a gated
     /// node read on per-row lists ([`DeviceProgram::listed`]): row `r` sums `A`'s columns of the
     /// components on in that row only (`v Aᵀ` from `v`'s listed entries). `None` for the dense
     /// product.
-    fn listed_write(&self, trace: &mut DeviceTrace, (argument, operator): (usize, usize)) -> Result<Option<Tensor>, String> {
-        if self.listed[argument].is_none() || self.listed_operand(operator, trace.value(argument)?, self.arithmetic)?.is_none() {
+    fn listed_write(&self, trace: &mut DeviceTrace, node: usize, (argument, operator): (usize, usize)) -> Result<Option<Tensor>, String> {
+        if self.listed[argument].is_none() || self.listed_operand(operator, trace.value(argument)?)?.is_none() {
             return Ok(None);
         }
         let Some(lists) = self.row_lists(trace, argument)? else { return Ok(None) };
         let d = &self.device;
         let v = trace.value(argument)?;
-        let a = self.listed_operand(operator, v, self.arithmetic)?.ok_or("device: a listed operand")?;
-        d.listed_product(v, &lists, &d.transpose(a).map_err(error)?).map(Some).map_err(error)
+        let a = self.listed_operand(operator, v)?.ok_or("device: a listed operand")?;
+        let out = self.listed_or_dense(trace, (node, argument, operator), lists.len(), || d.listed_product(v, &lists, &d.transpose(a).map_err(error)?).map_err(error))?;
+        if out.is_some() {
+            trace.listed_nodes.insert(node);
+        }
+        Ok(out)
     }
 
     /// `x Aᵀ` (`A` held dense) from the columns `ids` of `x` and of `A`, the dense product on every
@@ -1900,6 +1969,7 @@ impl DeviceProgram {
             segments: span.segments.clone(),
             active: BTreeMap::new(),
             lists: BTreeMap::new(),
+            listed_nodes: BTreeSet::new(),
             rounded: Mutex::new(BTreeMap::new()),
         };
         for (index, step) in self.steps.iter().enumerate() {
@@ -1969,7 +2039,7 @@ impl DeviceProgram {
                     let gated = match terms.first() {
                         Some(&(argument, operator)) if !hook => match self.gated_read(&mut trace, index, (argument, operator))? {
                             Some(out) => Some(out),
-                            None if !hooks.before(argument) => self.listed_write(&mut trace, (argument, operator))?,
+                            None if !hooks.before(argument) => self.listed_write(&mut trace, index, (argument, operator))?,
                             None => None,
                         },
                         _ => None,
@@ -2604,7 +2674,7 @@ impl DeviceProgram {
                     for (i, (argument, operator)) in terms.iter().enumerate() {
                         // A cotangent of the argument kept or edited is the dense one.
                         let observed = keep.contains(argument) || edited.contains(argument);
-                        if needed[*argument] && !matches!(self.steps[*argument], Step::Feature { .. }) && let Some(term) = self.listed_pull(trace, (index, *argument, *operator), &cot, (observed, edited, &seeded), arithmetic)? {
+                        if needed[*argument] && !matches!(self.steps[*argument], Step::Feature { .. }) && let Some(term) = self.listed_pull(trace, (index, *argument, *operator), &cot, (observed, edited, &seeded))? {
                             add(&mut g, *argument, term)?;
                             continue;
                         }
@@ -2864,17 +2934,21 @@ impl DeviceProgram {
     /// Affine node `node`'s pull of `cot` through its term `(argument, operator)` on per-row lists:
     /// to a gated node it writes from, `cot A` at that node's listed entries only (the gate zeroes
     /// the rest of its value's cotangent), and from a gated read's cotangent, zero off its lists,
-    /// `cot A` from the listed entries alone. `None` for the dense pull: the argument's cotangent
-    /// kept or edited (`observed`), or this node's cotangent seeded or edited.
-    fn listed_pull(&self, trace: &DeviceTrace, (node, argument, operator): (usize, usize, usize), cot: &Tensor, (observed, edited, seeded): (bool, &BTreeSet<usize>, &BTreeSet<usize>), arithmetic: Arithmetic) -> Result<Option<Tensor>, String> {
+    /// `cot A` from the listed entries alone, when its forward ran on them. `None` for the dense
+    /// pull: the argument's cotangent kept or edited (`observed`), or this node's cotangent seeded
+    /// or edited.
+    fn listed_pull(&self, trace: &DeviceTrace, (node, argument, operator): (usize, usize, usize), cot: &Tensor, (observed, edited, seeded): (bool, &BTreeSet<usize>, &BTreeSet<usize>)) -> Result<Option<Tensor>, String> {
         let d = &self.device;
+        if !trace.listed_nodes.contains(&node) {
+            return Ok(None);
+        }
         if let Some(lists) = self.gated_reads[node].and_then(|r| trace.lists.get(&r)).filter(|_| !seeded.contains(&node) && !edited.contains(&node))
-            && let Some(a) = self.listed_operand(operator, cot, arithmetic)?
+            && let Some(a) = self.listed_operand(operator, cot)?
         {
             return d.listed_product(cot, lists, a).map(Some).map_err(error);
         }
         if let Some(lists) = trace.lists.get(&argument).filter(|_| !observed && self.listed[argument].is_some())
-            && let Some(a) = self.listed_operand(operator, cot, arithmetic)?
+            && let Some(a) = self.listed_operand(operator, cot)?
         {
             return d.sampled_product(cot, &d.transpose(a).map_err(error)?, lists).map(Some).map_err(error);
         }
@@ -3186,7 +3260,7 @@ impl DeviceProgram {
             if let Step::Affine { terms, .. } = step {
                 for (input, op) in terms {
                     if let Some(storage) = gradients.values.get(op).map(Tensor::storage)
-                        && let Some(part) = self.listed_gradient(trace, (node, *input), cot, (storage, arithmetic), (edited, &seeded), &mut by_group)?
+                        && let Some(part) = self.listed_gradient(trace, (node, *input), cot, storage, (edited, &seeded), &mut by_group)?
                     {
                         let (gradient, beta) = gradients.ready(&self.device, *op, true)?.ok_or("device: a gradient slot")?;
                         if beta == 0.0 {
@@ -4111,6 +4185,7 @@ mod gated_tests {
                 };
                 let mut lowered = DeviceProgram::compile_values(device, &program).unwrap();
                 lowered.set_arithmetic(arithmetic);
+                lowered.read_listed();
                 let trace = lowered.forward(&family).unwrap();
                 close("the output", &device.download(trace.value(program.output).unwrap()).unwrap(), &host.values[program.output]);
                 // The write reads each row's components on only: with hard gates those whose gate is
@@ -4126,6 +4201,14 @@ mod gated_tests {
                 let dense = lowered.forward(&family).unwrap();
                 let (dense_nodes, dense_gradients) = lowered.vjp_values_dense(&dense, seeds(), &[0], &trainable, arithmetic).unwrap();
                 close("the dense read's cotangent", &device.download(&dense_nodes[&0]).unwrap(), &device.download(&nodes[&0]).unwrap());
+                // Unforced, the first pass times the listed and the dense products and later passes
+                // take the cheaper: every pass gives the output.
+                let mut measured = DeviceProgram::compile_values(device, &program).unwrap();
+                measured.set_arithmetic(arithmetic);
+                for _ in 0..2 {
+                    let pass = measured.forward(&family).unwrap();
+                    close("a measured pass's output", &device.download(pass.value(program.output).unwrap()).unwrap(), &host.values[program.output]);
+                }
                 for op in &trainable {
                     close(&program.operators[*op].name, &device.download(&gradients[op]).unwrap(), &device.download(&dense_gradients[op]).unwrap());
                 }
@@ -4189,6 +4272,7 @@ mod gated_tests {
             };
             let mut lowered = DeviceProgram::compile_values(device, &program).unwrap();
             lowered.set_arithmetic(arithmetic);
+            lowered.read_listed();
             let trace = lowered.forward(&family).unwrap();
             close("the output", &device.download(trace.value(9).unwrap()).unwrap(), &host.values[9]);
             // The second reads: the host's where the row's component is on, zero elsewhere.

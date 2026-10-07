@@ -1653,13 +1653,16 @@ impl Device {
         let mut out = self.zeros(x.rows, a.rows)?;
         match &*self.backend {
             Backend::Host => {
+                // Rows on the rayon pool, each its listed entries' dot products.
                 let (xv, av, k, n) = (host(x)?, host(a)?, x.cols, a.rows);
-                let (columns, row_of) = (host_indices(&lists.columns)?, host_indices(&lists.row_of)?);
-                let o = host_mut(&mut out)?;
-                for (&c, &r) in columns.iter().zip(row_of) {
-                    let (r, c) = (r as usize, c as usize);
-                    o[r * n + c] = xv[r * k..(r + 1) * k].iter().zip(&av[c * k..(c + 1) * k]).map(|(p, q)| p * q).sum();
-                }
+                let (offsets, columns) = (host_indices(&lists.offsets)?, host_indices(&lists.columns)?);
+                host_mut(&mut out)?.par_chunks_mut(n.max(1)).take(x.rows).enumerate().for_each(|(r, row)| {
+                    let xr = &xv[r * k..(r + 1) * k];
+                    for &c in &columns[offsets[r] as usize..offsets[r + 1] as usize] {
+                        let c = c as usize;
+                        row[c] = xr.iter().zip(&av[c * k..(c + 1) * k]).map(|(p, q)| p * q).sum();
+                    }
+                });
             }
             #[cfg(target_os = "linux")]
             Backend::Cuda(engine) => engine.sampled_product(x, a, lists, &mut out)?,
@@ -1677,14 +1680,17 @@ impl Device {
         }
         match &*self.backend {
             Backend::Host => {
+                // Rows on the rayon pool, each adding its listed entries' rows of A in turn (A's rows
+                // read whole, in order).
                 let (vv, av, n, m) = (host(v)?, host(a)?, v.cols, a.cols);
                 let (offsets, columns) = (host_indices(&lists.offsets)?, host_indices(&lists.columns)?);
                 let mut out = vec![0.0; v.rows * m];
-                for (r, row) in out.chunks_mut(m.max(1)).take(v.rows).enumerate() {
-                    for (j, o) in row.iter_mut().enumerate() {
-                        *o = columns[offsets[r] as usize..offsets[r + 1] as usize].iter().map(|&c| vv[r * n + c as usize] * av[c as usize * m + j]).sum();
+                out.par_chunks_mut(m.max(1)).take(v.rows).enumerate().for_each(|(r, row)| {
+                    for &c in &columns[offsets[r] as usize..offsets[r + 1] as usize] {
+                        let (s, ar) = (vv[r * n + c as usize], &av[c as usize * m..(c as usize + 1) * m]);
+                        row.iter_mut().zip(ar).for_each(|(o, &t)| *o += s * t);
                     }
-                }
+                });
                 Ok(Tensor { rows: v.rows, cols: m, data: Data::Host(out) })
             }
             #[cfg(target_os = "linux")]
@@ -1710,13 +1716,15 @@ impl Device {
                 if groups.iter().any(|&g| g as usize >= lists.rows) {
                     return Err(shape(format!("a group of {} lists", lists.rows)));
                 }
+                // Columns on the rayon pool, each adding its group's rows of y in turn.
                 let mut out = vec![0.0; n * m];
-                for (c, row) in out.chunks_mut(m.max(1)).take(n).enumerate() {
+                out.par_chunks_mut(m.max(1)).take(n).enumerate().for_each(|(c, row)| {
                     let g = groups[c] as usize;
-                    for (j, o) in row.iter_mut().enumerate() {
-                        *o = rows[offsets[g] as usize..offsets[g + 1] as usize].iter().map(|&r| vv[r as usize * n + c] * yv[r as usize * m + j]).sum();
+                    for &r in &rows[offsets[g] as usize..offsets[g + 1] as usize] {
+                        let (s, yr) = (vv[r as usize * n + c], &yv[r as usize * m..(r as usize + 1) * m]);
+                        row.iter_mut().zip(yr).for_each(|(o, &t)| *o += s * t);
                     }
-                }
+                });
                 Ok(Tensor { rows: n, cols: m, data: Data::Host(out) })
             }
             #[cfg(target_os = "linux")]
@@ -1731,7 +1739,8 @@ impl Device {
         match &*self.backend {
             Backend::Host => {
                 let v = host(t)?;
-                let out = (0..t.len()).map(|i| v[(i % t.rows) * t.cols + i / t.rows]).collect();
+                let mut out = vec![0.0; t.len()];
+                out.par_chunks_mut(t.rows.max(1)).take(t.cols).enumerate().for_each(|(c, row)| row.iter_mut().enumerate().for_each(|(r, o)| *o = v[r * t.cols + c]));
                 Ok(Tensor { rows: t.cols, cols: t.rows, data: Data::Host(out) })
             }
             #[cfg(target_os = "linux")]
