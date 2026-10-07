@@ -2121,8 +2121,6 @@ struct Charged {
     program: DeviceProgram,
     outputs: Vec<usize>,
     trainable: Vec<usize>,
-    /// The trainable operators' names, in `trainable`'s order.
-    names: Vec<String>,
     posterior: crate::device_posterior::DevicePosterior,
     parameters: usize,
     groups: usize,
@@ -2157,7 +2155,6 @@ impl Charged {
             trainable.push(op);
             means.push(values);
         }
-        let names: Vec<String> = trainable.iter().map(|op| built.program.operators[*op].name.clone()).collect();
         let mut network = Side::compile(&device, &built.program, usize::MAX)?;
         drop(built);
         network.prepare_dense_parameters(&trainable)?;
@@ -2225,7 +2222,7 @@ impl Charged {
         let variance_nats = sizes.iter().map(|n| 0.5 * (*n as f64).ln()).sum();
         let divergence: f64 = posterior.divergences()?.iter().sum();
         log::info!("charged network: Laplace start, divergence {:.0} bits, variance {:.0} bits", divergence / LN_2, variance_nats / LN_2);
-        Ok(Self { program: network, outputs, trainable, names, posterior, parameters, groups: sizes.len(), variance_nats })
+        Ok(Self { program: network, outputs, trainable, posterior, parameters, groups: sizes.len(), variance_nats })
     }
 }
 
