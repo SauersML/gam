@@ -81,7 +81,9 @@ def ranked_subcomponents(path: Path) -> list[tuple]:
     """Every VPD subcomponent ("sub", layer, matrix, index), largest measured removal effect first (g-mech's
     measure/vpd_induction_removal.py output: sites -> {"kl_bits": [per subcomponent]})."""
     sites = json.loads(Path(path).read_text())["sites"]
-    subs = [(kl, ("sub", int(key.split(".")[1]), key.split(".")[-1], i)) for key, v in sites.items() for i, kl in enumerate(v["kl_bits"])]
+    # a removal scan's "kl_bits", or vpd_cf_ranking.py's "cf_write_change"
+    subs = [(kl, ("sub", int(key.split(".")[1]), key.split(".")[-1], i)) for key, v in sites.items()
+            for i, kl in enumerate(v.get("kl_bits") or v["cf_write_change"])]
     return [u for kl, u in sorted(subs, key=lambda x: -x[0])]
 
 
