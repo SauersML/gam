@@ -79,7 +79,7 @@ class Checker:
         self.behavior_record = json.loads(path.read_text())
         return self.request({"op": "behavior", "path": str(path)})
 
-    def score(self, program, experiments=32, seed=0, routing="edges", N=None, reader=True, reader_top=8):
+    def score(self, program, experiments=32, seed=0, routing="edges", N=None, reader=True, reader_top=8, stand_in="input"):
         """Every score term (design.txt section 5). `program` is Python source or an IR dict. An untraceable
         source is scored as the empty program, flagged invalid. The reader term comes from the reader_score
         server at GRAPH_READER (host:port); without one it is left out (reader_error_bits None) and the items
@@ -93,7 +93,8 @@ class Checker:
         else:
             ir = program
         answer = self.request({"op": "score", "program": ir, "experiments": experiments, "seed": seed,
-                               "routing": routing, "N": N, "reader_top": reader_top if reader else 0})
+                               "routing": routing, "N": N, "reader_top": reader_top if reader else 0,
+                               "stand_in": stand_in})
         items = answer.pop("items", None)
         answer["reader_error_bits"] = None
         if reader and items:

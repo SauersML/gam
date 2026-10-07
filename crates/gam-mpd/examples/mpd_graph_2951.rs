@@ -162,6 +162,9 @@ fn handle(request: &Value, weights: &mut Option<Weights>, checker: &mut Option<C
             let seed = request["seed"].as_u64().unwrap_or(0);
             let edges = request["routing"].as_str().unwrap_or("edges") == "edges";
             let n = request["N"].as_f64();
+            // "stand_in": "input" (design: each neuron applied to its layer's mean input) or
+            // "output" (each neuron's mean activation through its down column).
+            c.stats.mean_output = request["stand_in"].as_str() == Some("output");
             let (score, outcomes) = c.score(&program, count, seed, edges, n)?;
             let mut answer = serde_json::to_value(&score).map_err(error)?;
             let k = request["reader_top"].as_u64().unwrap_or(0) as usize;

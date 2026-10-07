@@ -543,6 +543,12 @@ pub struct Stats {
     pub tokens: BTreeMap<u32, f64>,
     pub heads: Vec<Vec<Array1<f64>>>,
     pub mlps: Vec<Array1<f64>>,
+    /// Per layer each neuron's mean activation, and whether a neuron's stand-in is its mean
+    /// activation through its current down column (`D h̄`, the mean of its write; edits of its down
+    /// column reach it, edits of its gate and up rows do not) instead of the neuron applied to its
+    /// layer's mean input.
+    pub activations: Vec<Array1<f64>>,
+    pub mean_output: bool,
 }
 
 impl Stats {
@@ -556,11 +562,12 @@ impl Stats {
         }
         let graph = Graph::empty();
         let circuit = graph.model(weights);
-        let mut stats = Self { tokens, heads: Vec::new(), mlps: Vec::new() };
+        let mut stats = Self { tokens, heads: Vec::new(), mlps: Vec::new(), activations: Vec::new(), mean_output: false };
         let run = execute(weights, &stats, &circuit, &batch, &[], &BTreeMap::new(), true)?;
         let recorded = run.recorded.ok_or("no recorded inputs")?;
         stats.heads = recorded.0;
         stats.mlps = recorded.1;
+        stats.activations = recorded.2;
         Ok(stats)
     }
 }
@@ -605,7 +612,7 @@ impl Batch {
 pub struct Execution {
     pub log_probabilities: Array2<f64>,
     pub writes: Vec<Option<Array2<f64>>>,
-    recorded: Option<(Vec<Vec<Array1<f64>>>, Vec<Array1<f64>>)>,
+    recorded: Option<(Vec<Vec<Array1<f64>>>, Vec<Array1<f64>>, Vec<Array1<f64>>)>,
 }
 
 fn project(x: &Array2<f64>, map: &Array2<f64>, norm: Option<&(Array1<f64>, f64)>) -> Array2<f64> {
@@ -655,6 +662,11 @@ fn heads_write(layer: &LayerWeights, heads: &[usize], inputs: [&Array2<f64>; 3],
 
 /// Neurons `neurons` of an MLP on the normed stream `x_hat` (rows × width).
 fn neurons_write(mlp: &MlpWeights, neurons: &[usize], x_hat: &Array2<f64>) -> Array2<f64> {
+    neurons_active(mlp, neurons, x_hat).dot(&mlp.out.select(Axis(1), neurons).t())
+}
+
+/// The activations of neurons `neurons` (rows × neurons).
+fn neurons_active(mlp: &MlpWeights, neurons: &[usize], x_hat: &Array2<f64>) -> Array2<f64> {
     let gate = mlp.gate.select(Axis(0), neurons);
     let mut h = x_hat.dot(&gate.t());
     let bias = mlp.bias.select(Axis(0), neurons);
@@ -665,7 +677,7 @@ fn neurons_write(mlp: &MlpWeights, neurons: &[usize], x_hat: &Array2<f64>) -> Ar
         u += &mlp.up_bias.select(Axis(0), neurons).view().insert_axis(Axis(0));
         h *= &u;
     }
-    h.dot(&mlp.out.select(Axis(1), neurons).t())
+    h
 }
 
 /// A block's stand-in write (width): its pieces applied with `weights` to their stored inputs.
@@ -680,6 +692,10 @@ fn stand_in(weights: &Weights, stats: &Stats, block: &Block) -> Array1<f64> {
                 out += &w.output.dot(&w.value.dot(&input));
             }
             out
+        }
+        Block::Neurons { layer, neurons } if stats.mean_output => {
+            let mlp = weights.layers[*layer].mlp.as_ref().expect("a neuron block has an MLP");
+            mlp.out.select(Axis(1), neurons).dot(&stats.activations[*layer].select(Axis(0), neurons))
         }
         Block::Neurons { layer, neurons } => {
             let lw = &weights.layers[*layer];
@@ -713,6 +729,7 @@ pub fn execute(weights: &Weights, stats: &Stats, circuit: &Circuit, batch: &Batc
     let mut standin_stream = embed_standin.clone();
     let mut writes: Vec<Option<Array2<f64>>> = vec![None; circuit.units.len()];
     let (mut head_stats, mut mlp_stats) = (vec![vec![Array1::<f64>::zeros(d); 0]; weights.layers.len()], vec![Array1::<f64>::zeros(d); weights.layers.len()]);
+    let mut active_stats: Vec<Array1<f64>> = (0..weights.layers.len()).map(|l| Array1::zeros(weights.neurons(l))).collect();
     if record {
         for (l, layer) in weights.layers.iter().enumerate() {
             head_stats[l] = vec![Array1::zeros(d); layer.heads.len()];
@@ -771,10 +788,16 @@ pub fn execute(weights: &Weights, stats: &Stats, circuit: &Circuit, batch: &Batc
                 }
                 Block::Neurons { layer, neurons } => {
                     let lw = &weights.layers[*layer];
+                    let mlp = lw.mlp.as_ref().ok_or("a neuron block without an MLP")?;
+                    let active = neurons_active(mlp, neurons, &lw.mlp_norm.apply(&inputs[0]));
                     if record {
                         mlp_stats[*layer] = lw.mlp_norm.unit(&inputs[0]).mean_axis(Axis(0)).ok_or("no rows")?;
+                        let mean = active.mean_axis(Axis(0)).ok_or("no rows")?;
+                        for (k, &i) in neurons.iter().enumerate() {
+                            active_stats[*layer][i] = mean[k];
+                        }
                     }
-                    neurons_write(lw.mlp.as_ref().ok_or("a neuron block without an MLP")?, neurons, &lw.mlp_norm.apply(&inputs[0]))
+                    active.dot(&mlp.out.select(Axis(1), neurons).t())
                 }
             });
         }
@@ -789,7 +812,7 @@ pub fn execute(weights: &Weights, stats: &Stats, circuit: &Circuit, batch: &Batc
     }
     let last = input(&circuit.logits, &stream, &standin_stream, &writes).select(Axis(0), scored);
     let log_probabilities = log_probabilities(weights, &last)?;
-    Ok(Execution { log_probabilities, writes, recorded: record.then_some((head_stats, mlp_stats)) })
+    Ok(Execution { log_probabilities, writes, recorded: record.then_some((head_stats, mlp_stats, active_stats)) })
 }
 
 /// Next-token log-probabilities of final streams (rows × width) through the final norm (its own
@@ -1276,7 +1299,8 @@ impl Checker {
 
     /// `M`'s outcome under `e`, cached.
     pub fn model_outcome(&mut self, graph: &Graph, e: &Experiment) -> Result<Array2<f64>, String> {
-        let key = Self::key(graph, e);
+        // A cut hands the reader the writer's stand-in, so the stand-in form is part of the key.
+        let key = format!("{}{}", if self.stats.mean_output { "mean output; " } else { "" }, Self::key(graph, e));
         if let Some(hit) = self.cache.get(&key) {
             return Ok(hit.clone());
         }
