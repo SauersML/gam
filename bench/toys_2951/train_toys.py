@@ -231,7 +231,7 @@ def resid_mlp_truth(E, Wi, Wo, xs):
 # ---------------------------------------------------------------------------- gated copy
 
 
-def gated_copy(out: Path, seed: int):
+def gated_copy(out: Path, seed: int, signed: bool = True):
     """A high-rank operation at a known place: built, not trained. Two gated copies of a subspace,
     y_A = c_A a (a in [-1, 1]^8) and y_B = c_B b (b in [-1, 1]^4), c_A and c_B each 1 with
     probability 1/4, else 0, beside 8 sparse features passed through a ReLU, y_f = ReLU(f) (f_j
@@ -240,7 +240,9 @@ def gated_copy(out: Path, seed: int):
     +-e_i: one neuron of the pair fires on a token with c = 1, by the sign of a_i. The bias -G is
     a stream coordinate held at 1. The task's targets carry Gaussian noise of standard deviation
     SIGMA, the Gaussian head's task residual (the built model is otherwise exact). Seeds permute
-    the neurons."""
+    the neurons. Unsigned (gated_copy_pos): a in [0, 1]^8 and b in [0, 1]^4, coordinate i one neuron
+    ReLU(a_i + G c - G) written e_i, so every neuron of a copy fires on every token with c = 1 (a
+    split into neurons then costs as many bits per token as the whole copy)."""
     copies, features, G, SIGMA = [("A", 8), ("B", 4)], 8, 2.0, 0.05
     gen = torch.Generator().manual_seed(1)
     rows = HELD_OUT + TRAIN_ROWS
@@ -252,14 +254,14 @@ def gated_copy(out: Path, seed: int):
     stream = np.zeros((rows, d))
     stream[:, one] = 1.0
     stream[:, gate0:pay0] = (torch.rand(rows, len(copies), generator=gen) < 0.25).double().numpy()
-    stream[:, pay0:f0] = (torch.rand(rows, width, generator=gen) * 2 - 1).double().numpy()
+    stream[:, pay0:f0] = (torch.rand(rows, width, generator=gen) * (2 if signed else 1) - (1 if signed else 0)).double().numpy()
     stream[:, f0:y0] = sparse_features(gen, rows, features, 0.1, 0.0, 1.0).double().numpy()
-    neurons = 2 * width + features
+    neurons = (2 if signed else 1) * width + features
     up, down = np.zeros((neurons, d)), np.zeros((d, neurons))
     owner, n, at = [], 0, 0
     for k, (_, r) in enumerate(copies):
         for i in range(r):
-            for sign in (1.0, -1.0):
+            for sign in (1.0, -1.0) if signed else (1.0,):
                 up[n, pay0 + at + i] = sign
                 up[n, gate0 + k] = G
                 up[n, one] = -G
@@ -294,7 +296,7 @@ def gated_copy(out: Path, seed: int):
         active.append(xs[:, f0 + j] > 0)
     record = {
         "model": out.name, "kind": "language_model", "real_valued": "gated_copy", "config": config, "seed": seed,
-        "task": f"two gated copies of a subspace (ranks {', '.join(str(r) for _, r in copies)}, each on with probability 1/4) beside {features} sparse ReLU features; built, not trained",
+        "task": f"two {'' if signed else 'unsigned '}gated copies of a subspace (ranks {', '.join(str(r) for _, r in copies)}, each on with probability 1/4) beside {features} sparse ReLU features; built, not trained",
         "spd_published": "none (a toy of this gate)",
     }
     finish(out, files, record, mechanisms, np.stack(active, 1))
@@ -706,6 +708,7 @@ if __name__ == "__main__":
         "resid_mlp_2l": lambda: resid_mlp(out, 2, seed),
         "resid_mlp_3l": lambda: resid_mlp(out, 3, seed),
         "gated_copy": lambda: gated_copy(out, seed),
+        "gated_copy_pos": lambda: gated_copy(out, seed, signed=False),
         "modadd_113": lambda: modadd(out, seed),
         "induction": lambda: induction(out, seed),
     }[name]()
