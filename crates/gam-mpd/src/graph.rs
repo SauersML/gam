@@ -208,6 +208,38 @@ pub struct Weights {
     pub embedding: Array2<f64>,
     /// Per layer with a transcoder view, its features (`attach_transcoders`).
     pub transcoders: BTreeMap<usize, Features>,
+    /// Per layer with a VPD view of its MLP, VPD's subcomponents of `c_fc` and `down_proj`
+    /// (`attach_vpd`).
+    pub vpd: BTreeMap<usize, VpdMlp>,
+}
+
+/// VPD's subcomponents of one MLP's two matrices (`explanation_battery::Factors`): subcomponent `i`
+/// of `c_fc` is `U_fc[i] ⊗ V_fc[:, i]` (`U_fc` subcomponents × hidden, `V_fc` width ×
+/// subcomponents), of `down_proj` `U_down[j] ⊗ V_down[:, j]` (`U_down` subcomponents × width,
+/// `V_down` hidden × subcomponents). Each matrix is its subcomponents plus a remainder, the
+/// current weights minus their sum, so native edits land in the remainder.
+#[derive(Clone, Debug)]
+pub struct VpdMlp {
+    pub fc_u: Array2<f64>,
+    pub fc_v: Array2<f64>,
+    pub down_u: Array2<f64>,
+    pub down_v: Array2<f64>,
+}
+
+impl VpdMlp {
+    /// The hidden pre-activation `c_fc` subcomponents `fc` write from normed inputs `x_hat`
+    /// (rows × hidden); with `rest` every other subcomponent and the remainder, `W x̂ − Σ`.
+    fn fc(&self, mlp: &MlpWeights, fc: &[usize], rest: bool, x_hat: &Array2<f64>) -> Array2<f64> {
+        let named = x_hat.dot(&self.fc_v.select(Axis(1), fc)).dot(&self.fc_u.select(Axis(0), fc));
+        if rest { x_hat.dot(&mlp.gate.t()) - named } else { named }
+    }
+
+    /// The residual write of `down_proj` subcomponents `down` from hidden activations `h`; with
+    /// `rest` every other subcomponent and the remainder.
+    fn down(&self, mlp: &MlpWeights, down: &[usize], rest: bool, h: &Array2<f64>) -> Array2<f64> {
+        let named = h.dot(&self.down_v.select(Axis(1), down)).dot(&self.down_u.select(Axis(0), down));
+        if rest { h.dot(&mlp.out.t()) - named } else { named }
+    }
 }
 
 /// One layer's transcoder (circuit-tracer's single-layer ReLU transcoder, `library_transcoder`):
@@ -248,6 +280,27 @@ impl Weights {
                 return Err(format!("{}: width {} for a model of width {}", path.display(), t.width, self.width()));
             }
             self.transcoders.insert(l, Features { path, count: t.features, rows: BTreeMap::new() });
+            attached += 1;
+        }
+        Ok(attached)
+    }
+
+    /// Attaches VPD's view of the MLPs from a decomposition export (`explanation_battery::load_factors`).
+    pub fn attach_vpd(&mut self, dir: &std::path::Path) -> Result<usize, String> {
+        use crate::explanation_battery::Kind;
+        let factors = crate::explanation_battery::load_factors(dir)?;
+        let mut attached = 0;
+        for l in 0..self.layers.len() {
+            let find = |kind: Kind| factors.iter().find(|f| f.layer == l && f.kind == kind);
+            let (Some(fc), Some(down), Some(mlp)) = (find(Kind::Up), find(Kind::Down), self.layers[l].mlp.as_ref()) else { continue };
+            if mlp.up.is_some() {
+                return Err(format!("layer {l}: the VPD view reads a plain (ungated) MLP"));
+            }
+            let (n, d) = mlp.gate.dim();
+            if fc.u.ncols() != n || fc.v.nrows() != d || down.u.ncols() != d || down.v.nrows() != n {
+                return Err(format!("layer {l}: VPD's MLP factors do not fit the MLP ({n} × {d})"));
+            }
+            self.vpd.insert(l, VpdMlp { fc_u: fc.u.clone(), fc_v: fc.v.clone(), down_u: down.u.clone(), down_v: down.v.clone() });
             attached += 1;
         }
         Ok(attached)
@@ -298,6 +351,9 @@ pub enum Block {
     Heads { layer: usize, heads: Vec<usize> },
     Neurons { layer: usize, neurons: Vec<usize> },
     Features { layer: usize, features: Vec<usize>, rest: bool },
+    /// VPD subcomponents of the MLP's `c_fc` (`fc`) and `down_proj` (`down`); with `rest`, every
+    /// other subcomponent of both and the remainders.
+    Slices { layer: usize, fc: Vec<usize>, down: Vec<usize>, rest: bool },
 }
 
 impl Block {
@@ -305,14 +361,20 @@ impl Block {
     fn site(&self) -> usize {
         match self {
             Self::Heads { layer, .. } => 2 * layer,
-            Self::Neurons { layer, .. } | Self::Features { layer, .. } => 2 * layer + 1,
+            Self::Neurons { layer, .. } | Self::Features { layer, .. } | Self::Slices { layer, .. } => 2 * layer + 1,
         }
+    }
+
+    /// Whether the block writes the residual stream (a VPD node of `c_fc` subcomponents alone writes
+    /// only its MLP's hidden pre-activation).
+    fn writes_residual(&self) -> bool {
+        !matches!(self, Self::Slices { down, rest: false, .. } if down.is_empty())
     }
 
     fn routes(&self) -> &'static [Route] {
         match self {
             Self::Heads { .. } => &[Route::Query, Route::Key, Route::Value],
-            Self::Neurons { .. } | Self::Features { .. } => &[Route::Input],
+            Self::Neurons { .. } | Self::Features { .. } | Self::Slices { .. } => &[Route::Input],
         }
     }
 
@@ -321,6 +383,7 @@ impl Block {
             Self::Heads { heads, .. } => heads.is_empty(),
             Self::Neurons { neurons, .. } => neurons.is_empty(),
             Self::Features { features, rest, .. } => features.is_empty() && !rest,
+            Self::Slices { fc, down, rest, .. } => fc.is_empty() && down.is_empty() && !rest,
         }
     }
 }
@@ -365,6 +428,9 @@ pub struct Unit {
     pub computes: bool,
     /// Per route slot, what it reads.
     pub routes: [Incoming; 3],
+    /// For a VPD MLP block: the units of its site whose `c_fc` writes its `down_proj` subcomponents
+    /// read (the hidden pre-activation; the rest at their counterfactual values).
+    pub hidden: Incoming,
 }
 
 /// A program or `M` as units in site order of computation plus the logits' input. The program's
@@ -382,7 +448,7 @@ impl Circuit {
     /// Whether this is `M` itself: every unit computing, every edge kept (no stand-in is read).
     pub fn is_model(&self) -> bool {
         let all = |i: &Incoming| matches!(i, Incoming::AllBut(cut) if cut.is_empty());
-        all(&self.logits) && self.units.iter().all(|u| u.computes && u.routes.iter().all(all))
+        all(&self.logits) && self.units.iter().all(|u| u.computes && u.routes.iter().all(all) && all(&u.hidden))
     }
 }
 
@@ -395,6 +461,9 @@ pub struct Graph {
     pub edges: Vec<(Writer, Option<usize>, Route)>,
     /// The program's stand-ins: counterfactual (the default) or global averages (diagnostic).
     pub counterfactual: bool,
+    /// Edges within one MLP site, (writer node, reader node): `c_fc` subcomponents to `down_proj`
+    /// subcomponents through the hidden pre-activation.
+    pub internal: Vec<(usize, usize)>,
 }
 
 fn indices(index: &Option<Index>, count: usize, what: &str) -> Result<Vec<usize>, String> {
@@ -426,6 +495,7 @@ impl Graph {
         let mut blocks = Vec::new();
         let mut owned: BTreeSet<(usize, bool, usize)> = BTreeSet::new();
         let mut featured: BTreeSet<(usize, usize)> = BTreeSet::new();
+        let mut sliced: BTreeSet<(usize, usize, usize)> = BTreeSet::new();
         for node in &program.nodes {
             if node.id == "embed" || node.id == "logits" || ids.contains(&node.id) {
                 return Err(format!("node id {} is reserved or repeated", node.id));
@@ -449,7 +519,16 @@ impl Graph {
                         }
                         Block::Features { layer: l, features: indices(&piece.index, t.count, "feature")?, rest: false }
                     }
-                    (view, kind) => return Err(format!("{}: {view} piece of kind {kind} is not resolved (native heads and neurons, transcoder features)", node.id)),
+                    ("vpd", kind @ ("c_fc" | "down_proj")) => {
+                        let v = weights.vpd.get(&l).ok_or_else(|| format!("{}: layer {l}'s MLP has no VPD view", node.id))?;
+                        let (count, fc) = if kind == "c_fc" { (v.fc_u.nrows(), true) } else { (v.down_u.nrows(), false) };
+                        if piece.index.is_none() {
+                            return Err(format!("{}: name the {kind} subcomponents of layer {l}", node.id));
+                        }
+                        let picked = indices(&piece.index, count, kind)?;
+                        if fc { Block::Slices { layer: l, fc: picked, down: Vec::new(), rest: false } } else { Block::Slices { layer: l, fc: Vec::new(), down: picked, rest: false } }
+                    }
+                    (view, kind) => return Err(format!("{}: {view} piece of kind {kind} is not resolved (native heads and neurons, transcoder features, VPD c_fc and down_proj subcomponents)", node.id)),
                 };
                 block = Some(match (block, next) {
                     (None, b) => b,
@@ -464,6 +543,11 @@ impl Graph {
                     (Some(Block::Features { layer, mut features, .. }), Block::Features { layer: m, features: more, .. }) if layer == m => {
                         features.extend(more);
                         Block::Features { layer, features, rest: false }
+                    }
+                    (Some(Block::Slices { layer, mut fc, mut down, .. }), Block::Slices { layer: m, fc: f, down: dn, .. }) if layer == m => {
+                        fc.extend(f);
+                        down.extend(dn);
+                        Block::Slices { layer, fc, down, rest: false }
                     }
                     _ => return Err(format!("{}: a node's pieces must lie at one site (one layer's heads or one layer's MLP)", node.id)),
                 });
@@ -496,6 +580,23 @@ impl Graph {
                     }
                     featured.extend(features.iter().map(|&f| (*layer, f)));
                 }
+                Block::Slices { layer, fc, down, .. } => {
+                    fc.sort_unstable();
+                    down.sort_unstable();
+                    for (kind, list) in [(0usize, &*fc), (1, &*down)] {
+                        if !list.windows(2).all(|w| w[0] < w[1]) {
+                            return Err(format!("{}: a subcomponent listed twice", node.id));
+                        }
+                        for &i in list {
+                            if !sliced.insert((*layer, kind, i)) {
+                                return Err(format!("{}: subcomponent {i} of layer {layer} is in two nodes", node.id));
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some((l, _, _)) = sliced.iter().find(|(l, _, _)| owned.iter().any(|(m, head, _)| m == l && !head) || featured.iter().any(|(m, _)| m == l)) {
+                return Err(format!("{}: layer {l}'s MLP appears in more than one view", node.id));
             }
             // One view per site: a layer's MLP is read through its neurons or its transcoder.
             if let Some((l, _)) = featured.iter().find(|(l, _)| owned.iter().any(|(m, head, _)| m == l && !head)) {
@@ -509,6 +610,7 @@ impl Graph {
         }
         let final_site = 2 * layers;
         let mut edges = Vec::new();
+        let mut internal = Vec::new();
         for e in &program.edges {
             let route = Route::parse(&e.route)?;
             let writer = match e.from.as_str() {
@@ -520,10 +622,29 @@ impl Graph {
                 id => Some(ids.iter().position(|i| i == id).ok_or_else(|| format!("edge to unknown node {id}"))?),
             };
             let read_site = reader.map_or(final_site, |r| blocks[r].site());
-            if let Writer::Unit(w) = writer
-                && blocks[w].site() >= read_site
+            // Within one VPD MLP: c_fc subcomponents to down_proj subcomponents (the hidden stream).
+            if let (Writer::Unit(w), Some(r)) = (writer, reader)
+                && blocks[w].site() == read_site
             {
-                return Err(format!("edge {} >> {}: the writer does not write before the reader reads", e.from, e.to));
+                match (&blocks[w], &blocks[r]) {
+                    (Block::Slices { fc, .. }, Block::Slices { down, .. }) if !fc.is_empty() && !down.is_empty() && route == Route::Input => {
+                        if !internal.contains(&(w, r)) {
+                            internal.push((w, r));
+                        }
+                        continue;
+                    }
+                    _ => return Err(format!("edge {} >> {}: within one site only c_fc subcomponents feed down_proj subcomponents", e.from, e.to)),
+                }
+            }
+            if let Writer::Unit(w) = writer
+                && (blocks[w].site() >= read_site || !blocks[w].writes_residual())
+            {
+                return Err(format!("edge {} >> {}: the writer does not write the residual stream before the reader reads", e.from, e.to));
+            }
+            if let Some(Block::Slices { fc, .. }) = reader.map(|r| &blocks[r])
+                && fc.is_empty()
+            {
+                return Err(format!("edge {} >> {}: down_proj subcomponents read only their MLP's hidden stream", e.from, e.to));
             }
             let routes = reader.map_or(&[Route::Input][..], |r| blocks[r].routes());
             // `a >> head` (route input) feeds all of a head's inputs.
@@ -542,12 +663,12 @@ impl Graph {
             Some("global") => false,
             Some(other) => return Err(format!("unknown stand-in {other} (counterfactual or global)")),
         };
-        Ok(Self { ids, blocks, edges, counterfactual })
+        Ok(Self { ids, blocks, edges, counterfactual, internal })
     }
 
     /// The empty program: every piece a stand-in.
     pub fn empty() -> Self {
-        Self { ids: Vec::new(), blocks: Vec::new(), edges: Vec::new(), counterfactual: true }
+        Self { ids: Vec::new(), blocks: Vec::new(), edges: Vec::new(), counterfactual: true, internal: Vec::new() }
     }
 
     /// Every piece of `weights` not in a node, per site: the heads of each layer, then its neurons.
@@ -581,6 +702,19 @@ impl Graph {
                 out.push(Block::Features { layer: l, features, rest: true });
                 continue;
             }
+            // A VPD-view MLP: every undeclared subcomponent of both matrices and the remainders.
+            let slices: Vec<(&Vec<usize>, &Vec<usize>)> = self.blocks.iter().filter_map(|b| match b {
+                Block::Slices { layer, fc, down, .. } if *layer == l => Some((fc, down)),
+                _ => None,
+            }).collect();
+            if !slices.is_empty() {
+                let mut fc: Vec<usize> = slices.iter().flat_map(|(f, _)| f.iter().copied()).collect();
+                let mut down: Vec<usize> = slices.iter().flat_map(|(_, d)| d.iter().copied()).collect();
+                fc.sort_unstable();
+                down.sort_unstable();
+                out.push(Block::Slices { layer: l, fc, down, rest: true });
+                continue;
+            }
             let rest: Vec<usize> = (0..weights.neurons(l)).filter(|i| !neurons.contains(i)).collect();
             if !rest.is_empty() {
                 out.push(Block::Neurons { layer: l, neurons: rest });
@@ -607,10 +741,12 @@ impl Graph {
                 for &route in block.routes() {
                     routes[route.slot()] = routed(Some(n), route);
                 }
-                Unit { block: block.clone(), computes: true, routes }
+                // A node reads its own c_fc subcomponents; others' through declared same-site edges.
+                let hidden = if edges { Incoming::Only(self.internal.iter().filter(|(_, r)| *r == n).map(|(w, _)| Writer::Unit(*w)).chain([Writer::Unit(n)]).collect()) } else { Incoming::all() };
+                Unit { block: block.clone(), computes: true, routes, hidden }
             })
             .collect();
-        units.extend(self.complement(weights).into_iter().map(|block| Unit { block, computes: false, routes: [Incoming::all(), Incoming::all(), Incoming::all()] }));
+        units.extend(self.complement(weights).into_iter().map(|block| Unit { block, computes: false, routes: [Incoming::all(), Incoming::all(), Incoming::all()], hidden: Incoming::all() }));
         Circuit { units, logits: routed(None, Route::Input), nodes: self.blocks.len(), counterfactual: self.counterfactual }
     }
 
@@ -653,6 +789,8 @@ impl Graph {
                 }
                 // A feature's encoder row, bias and decoder row.
                 Block::Features { features, .. } => count += features.len() * (2 * d + 1),
+                // A subcomponent's two vectors: width and hidden.
+                Block::Slices { layer, fc, down, .. } => count += (fc.len() + down.len()) * (d + weights.neurons(*layer)),
             }
         }
         // Counterfactual stand-ins are the model's own values and cost nothing; average stand-ins
@@ -662,7 +800,7 @@ impl Graph {
             for block in self.complement(weights) {
                 count += match block {
                     Block::Heads { heads, .. } => heads.len() * d,
-                    Block::Neurons { .. } | Block::Features { .. } => d,
+                    Block::Neurons { .. } | Block::Features { .. } | Block::Slices { .. } => d,
                 };
             }
         }
@@ -795,6 +933,11 @@ impl Reference {
                 } else {
                     Ok(active.select(Axis(1), neurons).dot(&mlp.out.select(Axis(1), neurons).t()))
                 }
+            }
+            Block::Slices { layer, down, rest, .. } => {
+                let mlp = weights.layers[*layer].mlp.as_ref().ok_or("a VPD view of a layer without an MLP")?;
+                let vpd = weights.vpd.get(layer).ok_or_else(|| format!("layer {layer} has no VPD view"))?;
+                Ok(vpd.down(mlp, down, *rest, self.active.get(*layer).ok_or("an MLP the reference did not record")?))
             }
             Block::Features { layer, features, rest } => {
                 let t = weights.transcoders.get(layer).ok_or_else(|| format!("layer {layer} has no transcoder"))?;
@@ -950,6 +1093,14 @@ fn features_write(weights: &Weights, layer: usize, features: &[usize], rest: boo
 /// A block's stand-in write (width): its pieces applied with `weights` to their stored inputs.
 fn stand_in(weights: &Weights, stats: &Stats, block: &Block) -> Result<Array1<f64>, String> {
     Ok(match block {
+        Block::Slices { layer, down, rest, .. } => {
+            let mlp = weights.layers[*layer].mlp.as_ref().ok_or("a VPD view of a layer without an MLP")?;
+            let vpd = weights.vpd.get(layer).ok_or_else(|| format!("layer {layer} has no VPD view"))?;
+            let x_hat = (&stats.mlps[*layer] * &weights.layers[*layer].mlp_norm.gain).insert_axis(Axis(0));
+            let mut h = x_hat.dot(&mlp.gate.t()) + &mlp.bias.view().insert_axis(Axis(0));
+            h.mapv_inplace(|t| mlp.law.apply(t));
+            vpd.down(mlp, down, *rest, &h).row(0).to_owned()
+        }
         Block::Features { layer, features, rest } => {
             let x_hat = (&stats.mlps[*layer] * &weights.layers[*layer].mlp_norm.gain).insert_axis(Axis(0));
             features_write(weights, *layer, features, *rest, &x_hat)?.row(0).to_owned()
@@ -1076,6 +1227,62 @@ fn run(weights: &Weights, stats: &Stats, circuit: &Circuit, batch: &Batch, score
     while at < order.len() {
         let site = circuit.units[order[at]].block.site();
         let end = order[at..].iter().position(|&u| circuit.units[u].block.site() != site).map_or(order.len(), |k| at + k);
+        // A VPD-view MLP computes its units together: each reader's hidden pre-activation is the
+        // counterfactual one plus the c_fc writes it reads (on x minus on x').
+        let mut slice_writes: BTreeMap<usize, Array2<f64>> = BTreeMap::new();
+        let slices: Vec<usize> = order[at..end].iter().copied().filter(|&u| matches!(circuit.units[u].block, Block::Slices { .. })).collect();
+        if let Some(&first) = slices.first() {
+            let Block::Slices { layer, .. } = circuit.units[first].block else { unreachable!() };
+            let mlp = weights.layers[layer].mlp.as_ref().ok_or("a VPD view of a layer without an MLP")?;
+            let vpd = weights.vpd.get(&layer).ok_or_else(|| format!("layer {layer} has no VPD view"))?;
+            let norm = &weights.layers[layer].mlp_norm;
+            let x_ref = match &batch.reference {
+                Some(r) => r.inputs.get(layer).cloned().ok_or("an MLP the reference did not record")?,
+                None => broadcast(&(&stats.mlps[layer] * &norm.gain)),
+            };
+            let fc_of = |b: &Block, x: &Array2<f64>| match b {
+                Block::Slices { fc, rest, .. } => vpd.fc(mlp, fc, *rest, x),
+                _ => unreachable!(),
+            };
+            let mut pre_ref = x_ref.dot(&mlp.gate.t());
+            pre_ref += &mlp.bias.view().insert_axis(Axis(0));
+            let mut deltas: BTreeMap<usize, Array2<f64>> = BTreeMap::new();
+            for &u in &slices {
+                let unit = &circuit.units[u];
+                if !unit.computes || swaps.contains_key(&u) {
+                    continue;
+                }
+                let routes = unit.block.routes();
+                let mut inputs: Vec<Array2<f64>> = routes.iter().map(|r| input(&unit.routes[r.slot()], &st)).collect();
+                ops.cut_inputs(site, unit, routes, &mut inputs, &st)?;
+                let mut x_hat = norm.apply(&inputs[0]);
+                ops.normed(site, u, 0, &mut x_hat, &mut normed_kept);
+                deltas.insert(u, fc_of(&unit.block, &x_hat) - fc_of(&unit.block, &x_ref));
+            }
+            for &u in &slices {
+                let unit = &circuit.units[u];
+                if !unit.computes || swaps.contains_key(&u) {
+                    continue;
+                }
+                let Block::Slices { down, rest, .. } = &unit.block else { unreachable!() };
+                if down.is_empty() && !rest {
+                    slice_writes.insert(u, Array2::zeros((rows, d)));
+                    continue;
+                }
+                let mut pre = pre_ref.clone();
+                for (&w, delta) in &deltas {
+                    let reads = match &unit.hidden {
+                        Incoming::AllBut(cut) => !cut.contains(&Writer::Unit(w)),
+                        Incoming::Only(kept) => kept.contains(&Writer::Unit(w)),
+                    };
+                    if reads {
+                        pre += delta;
+                    }
+                }
+                pre.mapv_inplace(|t| mlp.law.apply(t));
+                slice_writes.insert(u, vpd.down(mlp, down, *rest, &pre));
+            }
+        }
         for &u in &order[at..end] {
             let unit = &circuit.units[u];
             if !unit.computes {
@@ -1083,6 +1290,10 @@ fn run(weights: &Weights, stats: &Stats, circuit: &Circuit, batch: &Batch, score
             }
             if let Some(value) = swaps.get(&u) {
                 st.writes[u] = Some(value.clone());
+                continue;
+            }
+            if let Some(w) = slice_writes.remove(&u) {
+                st.writes[u] = Some(w);
                 continue;
             }
             let routes = unit.block.routes();
@@ -1131,6 +1342,7 @@ fn run(weights: &Weights, stats: &Stats, circuit: &Circuit, batch: &Batch, score
                     normed(0, &mut x_hat);
                     features_write(weights, *layer, features, *rest, &x_hat)?
                 }
+                Block::Slices { .. } => return Err("a VPD block outside its site's pass".into()),
             };
             st.writes[u] = Some(write);
         }
@@ -1357,8 +1569,9 @@ pub fn sample(weights: &Weights, graph: &Graph, counterfactual: bool, count: usi
         };
         match block {
             Block::Heads { layer, heads } => WeightEdit::Head { layer, head: heads[rng.random_range(0..heads.len())], factor },
-            // Transcoder features are not native weights: an aimed edit takes their layer's MLP.
-            Block::Features { layer, .. } => WeightEdit::Neurons { layer, neurons: (0..weights.neurons(layer)).collect(), factor },
+            // Transcoder features and VPD subcomponents are not native weights: an aimed edit takes
+            // their layer's MLP.
+            Block::Features { layer, .. } | Block::Slices { layer, .. } => WeightEdit::Neurons { layer, neurons: (0..weights.neurons(layer)).collect(), factor },
             Block::Neurons { layer, neurons } => {
                 // Granularity: one neuron, a group of 8, or every neuron of the block.
                 let picked = match rng.random_range(0..3) {
@@ -1897,7 +2110,7 @@ impl SiteUnits {
                     out.extend(heads.iter().map(|h| SharedSite::Head(first[*layer] + h)));
                     out.insert(SharedSite::Attention(*layer));
                 }
-                Block::Neurons { layer, .. } | Block::Features { layer, .. } => {
+                Block::Neurons { layer, .. } | Block::Features { layer, .. } | Block::Slices { layer, .. } => {
                     out.insert(SharedSite::Mlp(*layer));
                 }
             }

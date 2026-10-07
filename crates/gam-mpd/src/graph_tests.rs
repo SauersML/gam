@@ -312,3 +312,76 @@ fn attention_block_hides_the_prefix_like_running_the_suffix_alone() {
     let open = execute(&weights, &stats, &Graph::empty().model(&weights), &Batch::new(&f.sequences).expect("batch"), &rows, &BTreeMap::new(), false).expect("execute");
     assert!(max(&kl_bits(&expected, &open.log_probabilities)) > 1e-6, "the prefix changes nothing unmasked");
 }
+
+/// VPD's view of layer 1's MLP, one subcomponent per hidden unit in each matrix (exact: the
+/// remainders are zero).
+fn exact_vpd(weights: &Weights) -> crate::graph::VpdMlp {
+    let mlp = weights.layers[1].mlp.as_ref().expect("an MLP");
+    let n = mlp.gate.nrows();
+    crate::graph::VpdMlp { fc_u: ndarray::Array2::eye(n), fc_v: mlp.gate.t().to_owned(), down_u: mlp.out.t().to_owned(), down_v: ndarray::Array2::eye(n) }
+}
+
+#[test]
+fn vpd_mlp_view_reads_the_hidden_stream_through_its_edges() {
+    let f = fixture("graph_vpd");
+    let library = Library::new(&f.device, &f.device, &f.native, &f.layers, &f.artifact, 1 << 28, 64).expect("library");
+    let mut weights = Weights::of(&library);
+    let vpd = exact_vpd(&weights);
+    weights.vpd.insert(1, vpd);
+    let piece = |layer: usize, view: &str, kind: &str, index: Option<Index>| PieceIr { view: view.into(), layer, kind: kind.into(), index };
+    let node = |id: &str, p: PieceIr| NodeIr { id: id.into(), pieces: vec![p], rule: None };
+    let all: Vec<usize> = (0..16).collect();
+    let nodes = vec![
+        node("a0", piece(0, "native", "head", None)),
+        node("m0", piece(0, "native", "mlp", None)),
+        node("a1", piece(1, "native", "head", None)),
+        node("F", piece(1, "vpd", "c_fc", Some(Index::Many(all.clone())))),
+        node("D", piece(1, "vpd", "down_proj", Some(Index::Many(all)))),
+    ];
+    let edge = |from: &str, to: &str, route: &str| EdgeIr { from: from.into(), to: to.into(), route: route.into() };
+    let mut edges = Vec::new();
+    for (to, writers) in [("a0", vec!["embed"]), ("m0", vec!["embed", "a0"]), ("a1", vec!["embed", "a0", "m0"]), ("F", vec!["embed", "a0", "m0", "a1"]), ("logits", vec!["embed", "a0", "m0", "a1", "D"])] {
+        for w in writers {
+            edges.push(edge(w, to, "input"));
+        }
+    }
+    let cut = Program { model: "tiny".into(), valid: true, nodes, edges: edges.clone(), ..Program::default() };
+    let mut joined = cut.clone();
+    joined.edges.push(edge("F", "D", "input"));
+    let cf = counterfactuals(&f.sequences);
+    let stats = Stats::measure(&weights, &f.sequences).expect("stats");
+    let mut batch = Batch::new(&f.sequences).expect("batch");
+    batch.reference = Some(std::sync::Arc::new(reference(&weights, &stats, &Batch::new(&cf).expect("cf batch")).expect("reference")));
+    let rows: Vec<usize> = (0..batch.tokens.len()).collect();
+    let clean = library.log_probabilities(&library.run(&f.sequences, &BTreeMap::new()).expect("run").last).expect("log p");
+    let run_of = |program: &Program, edges: bool| {
+        let graph = Graph::parse(program, &weights).expect("parse");
+        execute(&weights, &stats, &graph.program(&weights, edges), &batch, &rows, &BTreeMap::new(), false).expect("execute").log_probabilities
+    };
+    // Every edge, the hidden one included: M. M itself with VPD nodes: M.
+    assert!(max(&kl_bits(&clean, &run_of(&joined, true))) < 1e-9);
+    assert!(max(&kl_bits(&clean, &run_of(&cut, false))) < 1e-9);
+    let model = Graph::parse(&cut, &weights).expect("parse").model(&weights);
+    assert!(max(&kl_bits(&clean, &execute(&weights, &stats, &model, &batch, &rows, &BTreeMap::new(), false).expect("execute").log_probabilities)) < 1e-9);
+    // Without F >> D, D reads the counterfactual hidden activations: layer 1's MLP patched from x'.
+    let cf_stream = library.run(&cf, &BTreeMap::new()).expect("cf run").streams[3].clone();
+    let lw = &weights.layers[1];
+    let mlp = lw.mlp.as_ref().expect("an MLP");
+    let mut x_hat = cf_stream.clone();
+    for mut row in x_hat.outer_iter_mut() {
+        let r = crate::operator_program::rms_scale(row.view(), lw.mlp_norm.epsilon);
+        row.zip_mut_with(&lw.mlp_norm.gain, |v, g| *v *= r * g);
+    }
+    let mut active = x_hat.dot(&mlp.gate.t()) + &mlp.bias.view().insert_axis(ndarray::Axis(0));
+    active.mapv_inplace(|t| mlp.law.apply(t));
+    let patched = library.log_probabilities(&library.run_with(&f.sequences, &BTreeMap::new(), &[(1, active)].into()).expect("patched").last).expect("log p");
+    let kl = max(&kl_bits(&patched, &run_of(&cut, true)));
+    assert!(kl < 1e-9, "KL(MLP patched from x' ‖ D without its hidden edge) = {kl:e} bits");
+    // A c_fc node writes no residual; down_proj subcomponents read no residual.
+    let mut bad = cut.clone();
+    bad.edges.push(edge("F", "logits", "input"));
+    assert!(Graph::parse(&bad, &weights).is_err());
+    let mut bad = cut.clone();
+    bad.edges.push(edge("a1", "D", "input"));
+    assert!(Graph::parse(&bad, &weights).is_err());
+}
