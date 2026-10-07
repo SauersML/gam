@@ -54,7 +54,7 @@
 //!
 //! With `vpd` (`{"decomposition": D, "start": S, "arm": A}`), every block is VPD's slices with
 //! intrinsic gates (`library_vpd`), arm `A` of the start file `S` that `mpd_battery_2951 start`
-//! writes (`per_slice_own`, `grouped_own`, `grouped_direction`). With `parts DIR`, nothing is
+//! writes (`per_slice_own`, `grouped_own`, `grouped_direction`). An optional `"gate": "ramp"` gives a ramp arm with learned widths; the main arms (`hard`, the default) are evaluated with the hard gate. With `parts DIR`, nothing is
 //! fitted: the components at the posterior mean of `OUT/checkpoint.bin` (the start's values when
 //! there is none) are written to `DIR` as the toy gate's parts (`library_vpd::dump_parts`: per
 //! component its slices' writes and reads on `M`'s operators, its gate, and its hard gate on every
@@ -123,6 +123,9 @@ struct VpdStart {
     decomposition: PathBuf,
     start: PathBuf,
     arm: String,
+    /// The gates' law (`library_vpd::Gate`): `hard` (the default) or `ramp`.
+    #[serde(default)]
+    gate: gam_mpd::library_vpd::Gate,
 }
 
 #[derive(Deserialize)]
@@ -946,7 +949,7 @@ fn main() -> Result<(), String> {
             let files = transcoder_files(&device, &native, &layers, transcoders, &train, settings.fit.batch_sequences, out)?;
             library_mdl::explanation_with(&native, &layers, &files)?
         }
-        (None, Some(vpd)) => gam_mpd::library_vpd::explanation(&native, &layers, &vpd.decomposition, &vpd.start, &vpd.arm)?,
+        (None, Some(vpd)) => gam_mpd::library_vpd::explanation_with_gate(&native, &layers, &vpd.decomposition, &vpd.start, &vpd.arm, vpd.gate)?,
         (None, None) => library_mdl::explanation(&native, &layers)?,
     };
     let explanation = match &settings.blocks {

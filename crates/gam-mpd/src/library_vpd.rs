@@ -19,15 +19,19 @@
 //! the heads' rows of those slices' writes. A write-side slice (o, down_proj) of a component gated
 //! at the block's input takes that gate's column (a fixed selection of the gate's columns).
 //!
-//! Each component's gate has a width `w_b`, a trainable parameter of the explanation (per stage
-//! the operator `{stage}.width`, one entry per component, started at the standard deviation of the
-//! component's gate read over the start's fitting tokens, the data's own scale): the gate's
-//! strength is `Φ(z_b / w_b)`, at the weight sample of each pass, so the posterior's noise in the
-//! read, the threshold and a direction enters through the sample and the fit's expected gate is
-//! `E_q[Φ(z_b / w_b)]`. F moves `w_b` with every other parameter. A component counts as active
-//! where `z_b > 0`. A threshold fixed at a nearly hard gate (`Φ(z_b / σ_b)`, `σ_b` the threshold's
-//! posterior deviation, about 10⁻³ after the Laplace start) left the vpd4l fits' line steps at
-//! 1e-11 to 1e-17 against a transcoder fit's 1e-6 (decomp-vpd4l-b, -c at 6387505b50).
+//! The gate ([`Gate`]). Every Gated node's scale is its stage's operator `{stage}.width` (one
+//! entry per component), read as a constant:
+//! - `Gate::Hard`, the main arms: the explanation is evaluated with the hard gate `H(z_b)` (the
+//!   width holds [`HARD`]) and trained with its expectation under the posterior, `E_q[H(z_b)]`:
+//!   around a pass with a gradient `library_mdl` writes the threshold's posterior deviation `σ_b`
+//!   into the width and the threshold's mean into the threshold, so the gate is `Φ(z_b / σ_b)`, the
+//!   threshold integrated exactly and the reads and a direction by the pass's weight sample. The
+//!   width is no parameter; its operator holds no prior group.
+//! - `Gate::Ramp`, a labelled partial-strength arm: the width is a trainable parameter (its own
+//!   prior group, started at the standard deviation of the component's gate read over the start's
+//!   fitting tokens), a pass with a gradient gates by `Φ(z_b / w_b)` and every scoring by the ramp
+//!   `clamp(z_b / w_b, 0, 1)` (`DeviceProgram::set_ramp`).
+//! A component counts as active where `z_b > 0`.
 //!
 //! Prior groups: per slice its read row and its write column (over every head for q, k and v),
 //! per direction gate its row, and per stage of a layer its thresholds and its widths (one group
@@ -126,9 +130,29 @@ fn index_of(program: &OperatorProgram, name: &str) -> Result<usize, String> {
     }
 }
 
+/// A gate's law in the explanation (module note).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Gate {
+    /// Evaluated hard, `H(z)`; trained by its expectation under the posterior.
+    #[default]
+    Hard,
+    /// A learned width, evaluated by the ramp `clamp(z / w, 0, 1)`.
+    Ramp,
+}
+
+/// The width a hard gate's stage holds while it is evaluated: `Φ(z / s)` at `s = 10⁻³⁰` (a normal
+/// float32; the gate kernels hold `z / s` to ±40) is `H(z)` for every `|z| > 10⁻²⁹`.
+pub const HARD: f64 = 1e-30;
+
 /// One arm's explanation of the split native program `native` with its `layers`, from VPD's
-/// `decomposition` and the start file `start` (`vpd_start`'s components, arm `arm`).
+/// `decomposition` and the start file `start` (`vpd_start`'s components, arm `arm`), with hard gates.
 pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes], decomposition: &Path, start: &Path, arm: &str) -> Result<Explanation, String> {
+    explanation_with_gate(native, layers, decomposition, start, arm, Gate::Hard)
+}
+
+/// [`explanation`] with the gate law `gate`.
+pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], decomposition: &Path, start: &Path, arm: &str, gate: Gate) -> Result<Explanation, String> {
     let factors = load_factors(decomposition)?;
     let records: Vec<ArmRecord> = serde_json::from_slice(&std::fs::read(start).map_err(|e| error(format!("{}: {e}", start.display())))?).map_err(error)?;
     let components = records.into_iter().find(|r| r.arm == arm).ok_or_else(|| error(format!("{}: no arm {arm}", start.display())))?.components;
@@ -253,10 +277,13 @@ pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes], decompositio
                     ops.push(dense(&format!("{prefix}.threshold"), units(count)?, Interface::constant(), c)?);
                 }
             }
-            let widths = comps.iter().map(|&b| components[b].width.filter(|w| w.is_finite() && *w > 0.0).ok_or_else(|| error(format!("component {b}: no positive gate width in the start file (rerun mpd_battery_2951 start)")))).collect::<Result<Vec<f64>, String>>()?;
+            let widths = match gate {
+                Gate::Hard => vec![HARD; count],
+                Gate::Ramp => comps.iter().map(|&b| components[b].width.filter(|w| w.is_finite() && *w > 0.0).ok_or_else(|| error(format!("component {b}: no positive gate width in the start file (rerun mpd_battery_2951 start)")))).collect::<Result<Vec<f64>, String>>()?,
+            };
             // A shared own gate's width on the squared norm has the norm's slope at the threshold:
             // d‖·‖²/d‖·‖ = 2τ there (2w for a threshold below one width).
-            let width = |b: usize| if share && !direction { 2.0 * widths[b] * components[comps[b]].tau.max(widths[b]) } else { widths[b] };
+            let width = |b: usize| if share && !direction && gate == Gate::Ramp { 2.0 * widths[b] * components[comps[b]].tau.max(widths[b]) } else { widths[b] };
             ops.push(dense(&format!("{prefix}.width"), units(count)?, Interface::constant(), Array2::from_shape_fn((count, 1), |(b, _)| width(b)))?);
             if share && direction {
                 ops.push(dense(&format!("{prefix}.assign"), units(count)?, units(count)?, Array2::eye(count))?);
@@ -594,12 +621,12 @@ pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes], decompositio
     }
     // Each shared component's gate is a choice among its candidates: ln K nats to send.
     let choices: f64 = shares.iter().flat_map(|s| s.candidates.iter()).map(|c| (c.len() as f64).ln()).sum();
-    let built = groups_of(artifact, layers, direction)?;
+    let built = groups_of(artifact, layers, direction, gate)?;
     Ok(Explanation { shares, fixed_nats: built.fixed_nats + choices, ..built })
 }
 
 /// The prior groups, trainable operators and layers of the built artifact (module note).
-fn groups_of(artifact: Artifact, layers: &[LayerNodes], direction: bool) -> Result<Explanation, String> {
+fn groups_of(artifact: Artifact, layers: &[LayerNodes], direction: bool, gate: Gate) -> Result<Explanation, String> {
     let program = &artifact.program;
     let named = |name: &str| index_of(program, name);
     let mut groups: Vec<Group> = Vec::new();
@@ -683,7 +710,9 @@ fn groups_of(artifact: Artifact, layers: &[LayerNodes], direction: bool) -> Resu
                 groups.push(Group { name: format!("{name}.{prefix}.thresholds"), cells: vec![Cells { operator: t, rows: (0..rows_of(t)).collect(), cols: 0..1 }] });
                 thresholds.push(groups.len() - 1);
             }
-            if let Ok(w) = named(&format!("{name}.{prefix}.width")) {
+            if let Ok(w) = named(&format!("{name}.{prefix}.width"))
+                && gate == Gate::Ramp
+            {
                 trainable.push(w);
                 groups.push(Group { name: format!("{name}.{prefix}.widths"), cells: vec![Cells { operator: w, rows: (0..rows_of(w)).collect(), cols: 0..1 }] });
                 thresholds.push(groups.len() - 1);
@@ -736,7 +765,9 @@ fn groups_of(artifact: Artifact, layers: &[LayerNodes], direction: bool) -> Resu
                 groups.push(Group { name: format!("{name}.mlp.{prefix}.thresholds"), cells: vec![Cells { operator: t, rows: (0..rows_of(t)).collect(), cols: 0..1 }] });
                 layer.thresholds.push(groups.len() - 1);
             }
-            if let Ok(w) = named(&format!("{name}.mlp.{prefix}.width")) {
+            if let Ok(w) = named(&format!("{name}.mlp.{prefix}.width"))
+                && gate == Gate::Ramp
+            {
                 trainable.push(w);
                 groups.push(Group { name: format!("{name}.mlp.{prefix}.widths"), cells: vec![Cells { operator: w, rows: (0..rows_of(w)).collect(), cols: 0..1 }] });
                 layer.thresholds.push(groups.len() - 1);

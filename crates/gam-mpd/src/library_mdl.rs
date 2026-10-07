@@ -289,6 +289,15 @@ pub struct Share {
 /// (d6ad2537cb), its own gate holds `e⁶ / (e⁶ + K − 1)` of the relaxed assignment (98% at K = 8).
 const OWN_LOGIT: f64 = 6.0;
 
+/// Where a training pass's gate thresholds sit ([`Scorer::train_gates`]): at the iterate, at the
+/// posterior's average or at the iterate before the pending move.
+#[derive(Clone, Copy)]
+enum Center {
+    Iterate,
+    Average,
+    Previous,
+}
+
 /// How a fit writes a shared stage's assignment ([`Assignment`]): relaxed (each component's
 /// softmax over its candidates) in a training pass, as before the pending move in that move's
 /// test, or hardened (each component on its largest candidate alone) in every evaluation.
@@ -1662,6 +1671,12 @@ pub struct HeldOut {
     pub read_patch: Option<f64>,
     pub joint_patch: Option<f64>,
     pub layers: Vec<LayerCount>,
+    /// The held-out data term per scored token at the posterior mean with every gated component
+    /// forced on (`library_vpd`; none for other explanations): zero exactly while the components'
+    /// slices still sum to `M`'s maps. A native weight edit acts on `M`'s maps, so a drift from
+    /// them is an error in every weight edit's prediction.
+    #[serde(default)]
+    pub all_on_bits_per_token: Option<f64>,
 }
 
 /// The largest share of the fit's training time its per-epoch held-out evaluations may take: the
@@ -2071,6 +2086,11 @@ struct Scorer {
     mlps: Vec<Option<Mlp>>,
     /// Per layer its stages of gated components (`library_vpd`), none for a layer of functions.
     stages: Vec<Vec<GatedStage>>,
+    /// The hard gates' stages (`library_vpd::Gate::Hard`: a width that is no parameter), each its
+    /// width and threshold operators and its gates ([`Scorer::train_gates`]), and whether the
+    /// explanation's gates are ramps (`library_vpd::Gate::Ramp`).
+    hard_gates: Vec<(usize, usize, usize)>,
+    ramp: bool,
     /// Each trainable operator's position in `Explanation::trainable`.
     position: BTreeMap<usize, usize>,
     /// The blocks the explanation explains ([`scope`]), when not all of them ([`scoped`]): every
@@ -2134,10 +2154,54 @@ impl Scorer {
         experiments.keep_targets(gam_runtime::resource::MemoryGovernor::global());
         let (flat, _, _) = interchange::sites(&explanation.artifact, &sites)?;
         let mlps: Vec<Option<Mlp>> = (0..sites.len()).map(|l| Mlp::of(&flat, l)).collect::<Result<_, _>>()?;
-        let stages = mlps.iter().enumerate().map(|(l, mlp)| if mlp.is_some() { Ok(Vec::new()) } else { GatedStage::of(&flat, explanation, l) }).collect::<Result<_, String>>()?;
-        let position = explanation.trainable.iter().enumerate().map(|(i, op)| (*op, i)).collect();
+        let stages: Vec<Vec<GatedStage>> = mlps.iter().enumerate().map(|(l, mlp)| if mlp.is_some() { Ok(Vec::new()) } else { GatedStage::of(&flat, explanation, l) }).collect::<Result<_, String>>()?;
+        let position: BTreeMap<usize, usize> = explanation.trainable.iter().enumerate().map(|(i, op)| (*op, i)).collect();
         let scope = Some(scope(explanation)).filter(|blocks| !blocks.iter().all(|b| *b));
-        Ok(Self { experiments, mlps, stages, position, scope, families: settings.families.clone(), edits: std::cell::RefCell::new(BTreeMap::new()), assignments, written: None, version: 0, assignment_step: None, assignment_budget: Vec::new() })
+        let program = &explanation.artifact.program;
+        let hard_gates = stages.iter().flatten().filter(|s| !position.contains_key(&s.width)).map(|s| (s.width, s.threshold, program.operators[s.width].rows.width())).collect();
+        let ramp = stages.iter().flatten().any(|s| position.contains_key(&s.width));
+        let mut scorer = Self { experiments, mlps, stages, hard_gates, ramp, position, scope, families: settings.families.clone(), edits: std::cell::RefCell::new(BTreeMap::new()), assignments, written: None, version: 0, assignment_step: None, assignment_budget: Vec::new() };
+        scorer.train_gates(None)?;
+        Ok(scorer)
+    }
+
+    /// The gates' law for a pass ([`library_vpd::Gate`]): with `posterior`, for a pass that takes a
+    /// gradient, every hard stage's width holds its thresholds' posterior deviations `σ_b` and its
+    /// thresholds their means about `center` (the iterate, the average or the iterate before the
+    /// pending move, whatever the pass samples around), so its gate is `Φ(z_b / σ_b)`, the hard
+    /// gate's expectation with the threshold integrated exactly and the reads and a direction by
+    /// the pass's weight sample; a ramp explanation gates by `Φ(z / w)`. With none, the evaluation
+    /// law: every hard stage at `library_vpd::HARD` (the hard gate `H(z_b)`), a ramp explanation by
+    /// its ramp (`DeviceProgram::set_ramp`).
+    fn train_gates(&mut self, posterior: Option<(&DevicePosterior, Center)>) -> Result<(), String> {
+        if self.ramp {
+            self.experiments.explanation_mut().set_ramp(posterior.is_none());
+        }
+        if self.hard_gates.is_empty() {
+            return Ok(());
+        }
+        for (width, threshold, gates) in self.hard_gates.clone() {
+            let (deviations, mean) = match posterior {
+                Some((posterior, center)) => {
+                    let j = self.at(threshold)?;
+                    let (average, log_sd) = posterior.values(j)?;
+                    let mean = match center {
+                        Center::Iterate => posterior.iterate(j)?,
+                        Center::Average => average,
+                        Center::Previous => posterior.previous_iterate(j)?,
+                    };
+                    (log_sd.mapv(f64::exp), Some(mean))
+                }
+                None => (Array2::from_elem((gates, 1), crate::library_vpd::HARD), None),
+            };
+            let program = self.experiments.explanation_mut();
+            let device = program.device().clone();
+            program.replace_dense_parameter(width, device.upload(deviations.view()).map_err(error)?)?;
+            if let Some(mean) = mean {
+                program.replace_dense_parameter(threshold, device.upload(mean.view()).map_err(error)?)?;
+            }
+        }
+        self.experiments.explanation_mut().refresh_fused()
     }
 
     /// Writes the shared stages' assignments into `P`'s program under `relaxation`, unless they
@@ -2365,7 +2429,10 @@ impl Scorer {
             _ => None,
         };
         let evaluation = if gradient {
-            self.reversed(|e| e.evaluate_probed(batch, experiments, Some(targets), gradient, probe))?
+            self.train_gates(Some((posterior, if sample.is_some() { Center::Iterate } else { Center::Average })))?;
+            let evaluation = self.reversed(|e| e.evaluate_probed(batch, experiments, Some(targets), gradient, probe));
+            self.train_gates(None)?;
+            evaluation?
         } else {
             self.experiments.evaluate_probed(batch, experiments, Some(targets), gradient, probe)?
         };
@@ -2517,7 +2584,11 @@ fn complexity_terms(scorer: &mut Scorer, device_posterior: &DevicePosterior, exp
                 };
                 // The gates' widths enter the count (what the pass executes) but take no pull from
                 // it: nothing keeps a width positive.
-                let width = device_posterior.iterate(scorer.at(stage.width)?)?.column(0).to_vec();
+                // A hard gate has no width (`library_vpd::Gate::Hard`): its count is `Φ(m / σ)`.
+                let width = match scorer.at(stage.width) {
+                    Ok(i) => device_posterior.iterate(i)?.column(0).to_vec(),
+                    Err(_) => vec![0.0; explanation.artifact.program.operators[stage.width].rows.width()],
+                };
                 let extra = followed.as_ref().map(|(m, s2, w)| (m, s2, w.as_slice()));
                 let (expected, gate_terms, assigned, components) = gated_expected(d, arithmetic, trace.value(stage.input)?, gate, (&bias.0, &bias.1, &width), &rank, (assign.as_ref(), extra))?;
                 followed = Some(components);
@@ -2817,7 +2888,11 @@ fn step_accepted(
     for (part, k) in parts.iter().zip(keys) {
         let targets = scorer.experiments.targets(batch, part)?;
         device_posterior.previous_into(scorer.experiments.explanation_mut(), k)?;
-        let evaluation = scorer.reversed(|e| e.evaluate_probed(batch, part, Some(&targets), false, None))?;
+        // The step's own side is a training pass; this side gates as it does.
+        scorer.train_gates(Some((device_posterior, Center::Previous)))?;
+        let evaluation = scorer.reversed(|e| e.evaluate_probed(batch, part, Some(&targets), false, None));
+        scorer.train_gates(None)?;
+        let evaluation = evaluation?;
         if evaluation.bits.iter().flatten().any(|b| !b.is_finite()) {
             return Err("nonfinite explanation divergence before the move".into());
         }
@@ -2990,6 +3065,27 @@ fn held_out_on(
         let (bits, _, _) = scorer.evaluate_device(device_posterior, (batch, experiments), Some(noise_seed(settings.seed, 0, b)), targets, (false, false))?;
         bits.iter().for_each(|b| sampled.add(b));
     }
+    // Every gated component on: at the mean with each stage's thresholds raised out of reach
+    // (`z = read + 10³⁰`), restored by the next write of the means.
+    let thresholds: Vec<usize> = scorer.stages.iter().flatten().map(|s| s.threshold).collect();
+    let all_on = if thresholds.is_empty() {
+        None
+    } else {
+        device_posterior.mean_into(scorer.experiments.explanation_mut())?;
+        for &t in &thresholds {
+            let program = scorer.experiments.explanation_mut();
+            let rows = explanation.artifact.program.operators[t].rows.width();
+            let on = program.device().upload(Array2::from_elem((rows, 1), 1e30).view()).map_err(error)?;
+            program.replace_dense_parameter(t, on)?;
+        }
+        scorer.experiments.explanation_mut().refresh_fused()?;
+        let mut all_on = Mean::default();
+        for (batch, experiments, targets) in batches {
+            let evaluation = scorer.experiments.evaluate_resident(batch, experiments, targets, false)?;
+            evaluation.bits.iter().for_each(|b| all_on.add(b));
+        }
+        all_on.mean()
+    };
     device_posterior.rounded_into(scorer.experiments.explanation_mut())?;
     for (batch, experiments, targets) in batches {
         let evaluation = scorer.experiments.evaluate_resident(batch, experiments, targets, false)?;
@@ -3020,6 +3116,7 @@ fn held_out_on(
         read_patch: read.mean(),
         joint_patch: joint.mean(),
         layers: activity(scorer, explanation, (posterior, device_posterior), sequences, settings)?,
+        all_on_bits_per_token: all_on,
     })
 }
 
@@ -4530,7 +4627,10 @@ fn laplace_sums(scorer: &mut Scorer, device_posterior: &DevicePosterior, draws: 
         let key = noise_seed(settings.seed, 0, b);
         scorer.write_assignments(Relaxation::Soft)?;
         device_posterior.sample_into(scorer.experiments.explanation_mut(), key)?;
-        let mut factor = scorer.reversed(|e| e.fisher_probe_resident(&batch, &experiments, probe_key(key)))?;
+        scorer.train_gates(Some((device_posterior, Center::Average)))?;
+        let factor = scorer.reversed(|e| e.fisher_probe_resident(&batch, &experiments, probe_key(key)));
+        scorer.train_gates(None)?;
+        let mut factor = factor?;
         scorer.strip(&mut factor);
         for (op, u) in &factor {
             let u = wide.convert(u).map_err(error)?;
@@ -4628,7 +4728,10 @@ fn removal_curvature(scorer: &mut Scorer, posterior: &DevicePosterior, draws: &[
         lap(2, &mut timed);
         // One forward pass at the batch's sample, reversed twice: the divergence's gradient (in
         // bits) and a draw of the Gauss–Newton factor.
-        let mut evaluation = scorer.reversed(|e| e.evaluate_probed(&batch, &experiments, Some(&targets), true, Some(probe_key(key))))?;
+        scorer.train_gates(Some((posterior, Center::Average)))?;
+        let evaluation = scorer.reversed(|e| e.evaluate_probed(&batch, &experiments, Some(&targets), true, Some(probe_key(key))));
+        scorer.train_gates(None)?;
+        let mut evaluation = evaluation?;
         let mut factor = evaluation.factor.take().ok_or("no Gauss–Newton factor")?;
         scorer.strip(&mut evaluation.gradient);
         scorer.strip(&mut factor.gradient);

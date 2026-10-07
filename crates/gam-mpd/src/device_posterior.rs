@@ -600,6 +600,12 @@ impl DevicePosterior {
 
     /// The weight sample of `key` around the iterate before the pending move, into `program`
     /// (the old side of the move's test).
+    /// Operator `i`'s iterate before the pending move.
+    pub fn previous_iterate(&self, i: usize) -> Result<Array2<f64>, String> {
+        let pending = self.pending.as_ref().ok_or_else(|| error("no pending move"))?;
+        self.fitting.download(pending.means.get(i).ok_or_else(|| error("no such trainable operator"))?).map_err(error)
+    }
+
     pub fn previous_into(&self, program: &mut DeviceProgram, key: u64) -> Result<(), String> {
         let pending = self.pending.as_ref().ok_or_else(|| error("no pending move"))?;
         self.sample_of(program, key, &pending.means)
