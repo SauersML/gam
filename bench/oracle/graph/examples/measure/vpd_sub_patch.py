@@ -1,7 +1,9 @@
 """Which VPD subcomponents of vpd4l carry a behavior's answer, and how many of each block pay for
 themselves (for R2's VPD-view programs). For every subcomponent i at every site, the counterfactual
 run gets i's clean contribution in place of its own ((x_clean . v_i - x . v_i) u_i added at the site,
-every position) and recovery = KL(M_clean || M_cf) - KL(M_clean || M_patched), bits per target token.
+every position) and recovery = KL(M_clean || M_cf) - KL(M_clean || M_patched), bits per target token;
+measured for the CANDIDATES subcomponents per site whose contribution changes most between the two
+runs (sum over positions of |(x_clean - x_cf) . v_i| x |u_i|; the others are recorded as 0).
 Then per block (a layer's attention: q/k/v/o_proj; its MLP: c_fc/down_proj) the top-k subcomponents
 by recovery are patched together for k = 1, 2, 4, ..., and the k minimizing KL + their opaque price
 ((d_in + d_out) weights x 1/2 log2 N bits / N per token, N = 2^24) is the block's best k.
@@ -27,6 +29,7 @@ import vpd_model as VM  # noqa: E402
 
 N = 2**24
 REPLICAS = 16
+CANDIDATES = 256  # per site: the subcomponents whose contribution changes most between the runs
 ATTN, MLP = ("q_proj", "k_proj", "v_proj", "o_proj"), ("c_fc", "down_proj")
 
 
@@ -98,6 +101,8 @@ def measure(run: Runner, beh: dict) -> dict:
     cols = torch.tensor([c for p in prompts for c in p["target_positions"]], device=dev)
     clean = {}
     lp_clean = run.forward(t.wte[clean_ids], 0, {}, None, rows, cols, record=clean)
+    cfrec = {}
+    run.forward(t.wte[cf_ids], 0, {}, None, rows, cols, record=cfrec)
     p_clean = lp_clean.exp()
     entering = [t.wte[cf_ids]]  # the counterfactual residual entering each layer
     for i in range(t.n_layer - 1):
@@ -111,12 +116,16 @@ def measure(run: Runner, beh: dict) -> dict:
     recovery = {}
     for l in range(t.n_layer):
         for kind in ATTN + MLP:
-            U, _ = run.uv[site_name(l, kind)]
-            count, out = U.shape[0], []
-            for s in range(0, count, REPLICAS):
-                sets = [torch.tensor([i], device=dev) for i in range(s, min(s + REPLICAS, count))]
+            U, V = run.uv[site_name(l, kind)]
+            change = ((clean[(l, kind)] - cfrec[(l, kind)]) @ V).abs().sum((0, 1)) * U.norm(dim=1)
+            candidates = torch.argsort(change, descending=True)[:CANDIDATES].tolist()
+            out = [0.0] * U.shape[0]
+            for s in range(0, len(candidates), REPLICAS):
+                sets = [torch.tensor([i], device=dev) for i in candidates[s : s + REPLICAS]]
                 x = entering[l].repeat(len(sets), 1, 1)
-                out += (base - kl(run.forward(x, l, {(l, kind): sets}, clean, rows, cols, len(sets)), len(sets))).tolist()
+                gains = (base - kl(run.forward(x, l, {(l, kind): sets}, clean, rows, cols, len(sets)), len(sets))).tolist()
+                for i, g in zip(candidates[s : s + REPLICAS], gains):
+                    out[i] = g
             recovery[f"{l}.{kind}"] = out
     d, m = t.wte.shape[1], run.uv[site_name(0, "c_fc")][0].shape[1]
     price = {k: (d + (m if k in MLP else d)) * 0.5 * math.log2(N) / N for k in ATTN + MLP}
