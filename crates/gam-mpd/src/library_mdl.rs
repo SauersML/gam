@@ -2063,6 +2063,12 @@ impl Scorer {
         self.position.get(&operator).copied().ok_or_else(|| format!("operator {operator} is not trainable"))
     }
 
+    /// Before a batch: the device buffers kept from the last batch's tensors go back to the driver
+    /// (`Device::release_recycled`), so the buffers kept are those of this batch's shapes.
+    fn next_batch(&self) {
+        self.experiments.models().1.program.device().release_recycled();
+    }
+
     /// The batch's experiments from `draw`: the fixed collection's for that batch.
     /// With edit families (`Settings::families`), each base's patched experiment takes a family
     /// drawn uniformly from them, from draws of the base's own keyed by its index as its source's
@@ -3592,6 +3598,7 @@ pub fn fit_from(
         let mut parts = (0.0, 0usize);
         for (b, draw) in draws.iter().enumerate() {
             let step_started = Instant::now();
+            scorer.next_batch();
             let batch = draw.batch(sequences)?;
             let experiments = scorer.experiments(draw, sequences)?;
             let key = training_key(settings.seed, epoch, b);
@@ -3868,6 +3875,7 @@ fn laplace_sums(scorer: &mut Scorer, device_posterior: &DevicePosterior, draws: 
     };
     let mut sums: BTreeMap<usize, Tensor> = BTreeMap::new();
     for (b, draw) in draws.iter().enumerate() {
+        scorer.next_batch();
         let batch = draw.batch(sequences)?;
         let experiments = scorer.experiments(draw, sequences)?;
         // The factor alone, at the batch's weight sample with its probe keyed from the same seed:
@@ -3947,6 +3955,7 @@ fn removal_curvature(scorer: &mut Scorer, posterior: &DevicePosterior, draws: &[
     let mut sums: BTreeMap<usize, Tensor> = BTreeMap::new();
     let mut pending = Vec::new();
     for (b, draw) in draws.iter().enumerate() {
+        scorer.next_batch();
         let key = noise_seed(settings.seed, stream, b);
         let mut timed = Instant::now();
         let mut lap = |part: usize, timed: &mut Instant| {
@@ -4065,6 +4074,7 @@ fn collection_divergence(
     let (mut rise, mut slack) = (0.0, against.map_or(0.0, |(accepted, _)| accepted.iter().sum::<f64>()));
     let (mut preparing, mut targeting, mut scoring) = (0.0, 0.0, 0.0);
     for (k, b) in sequence.into_iter().enumerate() {
+        scorer.next_batch();
         let draw = &draws[b];
         // Removal zeroes entries, so the remaining entries see the same noise as the full posterior.
         let key = noise_seed(settings.seed, 0, b);

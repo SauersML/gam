@@ -281,6 +281,20 @@ enum Data {
     Metal(crate::metal::stream::Buffer),
 }
 
+/// A CUDA tensor's buffer goes back to its stream's kept buffers when the tensor goes
+/// (`cuda::recycle`), for that stream's next allocation of its size.
+#[cfg(target_os = "linux")]
+impl Drop for Tensor {
+    fn drop(&mut self) {
+        match std::mem::replace(&mut self.data, Data::Host(Vec::new())) {
+            Data::Cuda(values) => cuda::recycle(values),
+            Data::Cuda32(values) => cuda::recycle(values),
+            Data::CudaBf16(values) => cuda::recycle(values),
+            Data::Host(values) => drop(values),
+        }
+    }
+}
+
 impl Tensor {
     /// Change the row-major shape without moving values or allocating device memory.
     /// This is a reshape, not a transpose; ownership prevents stale shape aliases.
@@ -914,6 +928,17 @@ impl Device {
             #[cfg(target_os = "linux")]
             Backend::Cuda(engine) => Ok(Graph { graph: engine.end_capture()? }),
             _ => Err(GpuError::NoDeviceKernel { reason: format!("{} records no graphs", self.name()) }),
+        }
+    }
+
+    /// Returns the device buffers kept for reuse to the driver (CUDA: those of the tensors dropped
+    /// since, kept for the stream's next allocations of their sizes): a caller's boundary before work
+    /// of other shapes, such as the next batch, so that the buffers kept are those the work at hand
+    /// makes again.
+    pub fn release_recycled(&self) {
+        #[cfg(target_os = "linux")]
+        if let Backend::Cuda(engine) = &*self.backend {
+            engine.release_recycled();
         }
     }
 
@@ -5323,9 +5348,59 @@ extern "C" __global__ void group_divergence(u64 n, int scaled, const double* ref
     /// [`Landing`]'s buffers.
     const LANDINGS: usize = 4;
 
+    /// The device buffers of tensors dropped on an engine's stream, kept for that stream's next
+    /// allocations of the same size: a stream-ordered allocation and its free cost about 3.4 µs of
+    /// host time together (4090 trace), a training step made about 3,200 of each, and most are of
+    /// sizes the step frees and makes again (each block's, each antithetic half's). Keyed by the
+    /// stream's handle; only an engine's own stream keeps buffers (registered at its first
+    /// allocation). A buffer is taken again only by an allocation queued on the same stream after
+    /// every use of it, the order the driver's own reuse keeps. Kept buffers go back to the driver at
+    /// [`Engine::release_recycled`] (a caller's batch boundary, an allocation the driver refuses, the
+    /// engine's end); none is kept or taken while a capture records, a buffer recorded in a graph
+    /// being the graph's.
+    #[derive(Default)]
+    struct Recycled {
+        buffers: HashMap<usize, Vec<cudarc::driver::sys::CUdeviceptr>>,
+        paused: bool,
+    }
+
+    /// Every stream's [`Recycled`] buffers.
+    fn recycled() -> &'static std::sync::Mutex<HashMap<usize, Recycled>> {
+        static RECYCLED: std::sync::OnceLock<std::sync::Mutex<HashMap<usize, Recycled>>> = std::sync::OnceLock::new();
+        RECYCLED.get_or_init(Default::default)
+    }
+
+    fn stream_key(stream: &CudaStream) -> usize {
+        stream.cu_stream() as usize
+    }
+
+    /// `values`' buffer kept for its stream's next allocation of its size when the stream keeps
+    /// buffers ([`Recycled`]); freed otherwise.
+    pub(super) fn recycle<T>(values: CudaSlice<T>) {
+        let bytes = values.len() * std::mem::size_of::<T>();
+        let Ok(mut kept) = recycled().lock() else { return };
+        match kept.get_mut(&stream_key(values.stream())) {
+            Some(stream) if !stream.paused && bytes > 0 => stream.buffers.entry(bytes).or_default().push(values.leak()),
+            _ => {
+                drop(kept);
+                drop(values);
+            }
+        }
+    }
+
     /// [`Staging`]'s buffers and their bytes: an upload longer than one buffer passes through several.
     const STAGES: usize = 16;
     const STAGE_BYTES: usize = 4 << 20;
+
+    impl Drop for Engine {
+        /// The stream's kept buffers go back to the driver, and the stream keeps none after.
+        fn drop(&mut self) {
+            self.release_recycled();
+            if let Ok(mut kept) = recycled().lock() {
+                kept.remove(&stream_key(&self.stream));
+            }
+        }
+    }
 
     impl Drop for Staging {
         /// A buffer is freed only after its last copy finished (a failed wait is logged: a drop
@@ -5582,7 +5657,7 @@ extern "C" __global__ void group_divergence(u64 n, int scaled, const double* ref
             }
             let mut workspace = self.capture_workspace.lock().map_err(|_| shape("poisoned capture workspace".to_string()))?;
             if workspace.is_none() {
-                *workspace = Some(self.stream.alloc_zeros::<u8>(CAPTURE_WORKSPACE).gpu_ctx("tensor capture workspace")?);
+                *workspace = Some(self.alloc_zeros::<u8>(CAPTURE_WORKSPACE).gpu_ctx("tensor capture workspace")?);
             }
             let buffer = workspace.as_ref().ok_or_else(|| shape("missing capture workspace".to_string()))?;
             let (pointer, record) = buffer.device_ptr(&self.stream);
@@ -5592,6 +5667,7 @@ extern "C" __global__ void group_divergence(u64 n, int scaled, const double* ref
                 .result()
                 .gpu_ctx("tensor capture cuBLAS workspace")?;
             self.capturing.store(true, Ordering::Release);
+            self.pause_recycling(true);
             // Relaxed: allocations (a temporary's) may be recorded; the stream is this thread's.
             let started = self.stream.begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED).gpu_ctx("tensor graph capture");
             if started.is_err() {
@@ -5615,6 +5691,7 @@ extern "C" __global__ void group_divergence(u64 n, int scaled, const double* ref
         /// cuBLAS back on its own workspace pool (resetting its stream does that).
         fn restore_after_capture(&self) -> Result<(), GpuError> {
             self.capturing.store(false, Ordering::Release);
+            self.pause_recycling(false);
             // SAFETY: the handle is this engine's, bound to this stream since its creation.
             unsafe { cudarc::cublas::result::set_stream(*self.blas.handle(), self.stream.cu_stream() as _) }.gpu_ctx("tensor cuBLAS workspace reset")
         }
@@ -5632,10 +5709,10 @@ extern "C" __global__ void group_divergence(u64 n, int scaled, const double* ref
             self.host_transfer()?;
             // An empty tensor still holds one (unread) value: the driver allocates nothing smaller.
             if values.is_empty() {
-                return self.stream.alloc_zeros::<T>(1).gpu_ctx("tensor alloc");
+                return self.alloc_zeros::<T>(1).gpu_ctx("tensor alloc");
             }
             // SAFETY: the staged copies below write all of its values before any kernel reads them.
-            let mut out = unsafe { self.stream.alloc::<T>(values.len()) }.gpu_ctx("tensor alloc")?;
+            let mut out = unsafe { self.alloc::<T>(values.len()) }.gpu_ctx("tensor alloc")?;
             // SAFETY: `values` is `size_of_val(values)` initialized bytes of plain data (`DeviceRepr`).
             let bytes = unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values)) };
             let (dst, record) = out.device_ptr_mut(&self.stream);
@@ -5650,7 +5727,7 @@ extern "C" __global__ void group_divergence(u64 n, int scaled, const double* ref
         pub(super) fn upload_overlapped<T: DeviceRepr + ValidAsZeroBits>(&self, values: &[T]) -> Result<CudaSlice<T>, GpuError> {
             self.host_transfer()?;
             if values.is_empty() {
-                return self.stream.alloc_zeros::<T>(1).gpu_ctx("tensor alloc");
+                return self.alloc_zeros::<T>(1).gpu_ctx("tensor alloc");
             }
             // SAFETY: `values` is `size_of_val(values)` initialized bytes of plain data (`DeviceRepr`).
             let bytes = unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values)) };
@@ -5660,7 +5737,7 @@ extern "C" __global__ void group_divergence(u64 n, int scaled, const double* ref
             if landing.buffers.get(turn).is_none_or(|(buffer, _)| buffer.len() < bytes.len()) {
                 // A landing buffer of at least these bytes, made on the stream and valid on every
                 // stream once the stream has reached it (rare: the first upload of each size up).
-                let buffer = self.stream.alloc_zeros::<u8>(bytes.len()).gpu_ctx("tensor landing alloc")?;
+                let buffer = self.alloc_zeros::<u8>(bytes.len()).gpu_ctx("tensor landing alloc")?;
                 self.stream.synchronize().gpu_ctx("tensor landing alloc")?;
                 if landing.buffers.len() == turn {
                     landing.buffers.push((buffer, None));
@@ -5680,7 +5757,7 @@ extern "C" __global__ void group_divergence(u64 n, int scaled, const double* ref
             let arrived = self.copies.record_event(None).gpu_ctx("tensor landing event")?;
             self.stream.wait(&arrived).gpu_ctx("tensor landing wait")?;
             // SAFETY: the copy below writes all of its values before any kernel reads them.
-            let mut out = unsafe { self.stream.alloc::<T>(values.len()) }.gpu_ctx("tensor alloc")?;
+            let mut out = unsafe { self.alloc::<T>(values.len()) }.gpu_ctx("tensor alloc")?;
             {
                 let (dst, record) = out.device_ptr_mut(&self.stream);
                 let (src, src_record) = buffer.device_ptr(&self.stream);
@@ -5736,16 +5813,81 @@ extern "C" __global__ void group_divergence(u64 n, int scaled, const double* ref
             Ok(self.download(&out)?.chunks_exact(3).map(|v|[v[0],v[1],v[2]]).collect())
         }
 
+        /// `len` values of `T` on the stream: a kept buffer of their size ([`Recycled`]), else the
+        /// driver's, which is asked again with every kept buffer returned when it refuses.
+        ///
+        /// # Safety
+        /// The values are unset, as `CudaStream::alloc`'s.
+        // SAFETY: the caller writes every value before any is read, as with `CudaStream::alloc`.
+        unsafe fn alloc<T: DeviceRepr>(&self, len: usize) -> Result<CudaSlice<T>, cudarc::driver::DriverError> {
+            let bytes = len * std::mem::size_of::<T>();
+            if let Some(buffer) = self.take_recycled(bytes) {
+                // SAFETY: a buffer of `bytes` bytes allocated on this stream, every use of it queued
+                // on the stream before this allocation's.
+                return Ok(unsafe { self.stream.upgrade_device_ptr::<T>(buffer, len) });
+            }
+            // SAFETY: as the caller's.
+            let first = unsafe { self.stream.alloc::<T>(len) };
+            if first.is_err() && self.release_recycled() > 0 {
+                // SAFETY: as the caller's.
+                return unsafe { self.stream.alloc::<T>(len) };
+            }
+            first
+        }
+
+        /// [`Engine::alloc`]'s buffer set to zero.
+        fn alloc_zeros<T: DeviceRepr + ValidAsZeroBits>(&self, len: usize) -> Result<CudaSlice<T>, cudarc::driver::DriverError> {
+            // SAFETY: zeroed before any kernel reads it.
+            let mut values = unsafe { self.alloc::<T>(len) }?;
+            self.stream.memset_zeros(&mut values)?;
+            Ok(values)
+        }
+
+        /// A kept buffer of `bytes` bytes on this stream, registering the stream at its first call.
+        fn take_recycled(&self, bytes: usize) -> Option<cudarc::driver::sys::CUdeviceptr> {
+            let mut kept = recycled().lock().ok()?;
+            let stream = kept.entry(stream_key(&self.stream)).or_default();
+            if stream.paused {
+                return None;
+            }
+            stream.buffers.get_mut(&bytes)?.pop()
+        }
+
+        /// Every buffer this stream keeps returned to the driver; the count returned.
+        pub(super) fn release_recycled(&self) -> usize {
+            let buffers = match recycled().lock() {
+                Ok(mut kept) => kept.get_mut(&stream_key(&self.stream)).map(|stream| std::mem::take(&mut stream.buffers)).unwrap_or_default(),
+                Err(_) => return 0,
+            };
+            let mut count = 0;
+            for (bytes, pointers) in buffers {
+                for pointer in pointers {
+                    // SAFETY: a buffer of `bytes` bytes allocated on this stream that no tensor
+                    // holds; dropping it frees it in stream order.
+                    drop(unsafe { self.stream.upgrade_device_ptr::<u8>(pointer, bytes) });
+                    count += 1;
+                }
+            }
+            count
+        }
+
+        /// Stops (or resumes) keeping and taking buffers on this stream, around a capture.
+        fn pause_recycling(&self, paused: bool) {
+            if let Ok(mut kept) = recycled().lock() {
+                kept.entry(stream_key(&self.stream)).or_default().paused = paused;
+            }
+        }
+
         pub(super) fn zeros(&self, n: usize) -> Result<CudaSlice<f64>, GpuError> {
-            self.stream.alloc_zeros::<f64>(n.max(1)).gpu_ctx("tensor alloc")
+            self.alloc_zeros::<f64>(n.max(1)).gpu_ctx("tensor alloc")
         }
 
         pub(super) fn zeros32(&self, n: usize) -> Result<CudaSlice<f32>, GpuError> {
-            self.stream.alloc_zeros::<f32>(n.max(1)).gpu_ctx("tensor alloc")
+            self.alloc_zeros::<f32>(n.max(1)).gpu_ctx("tensor alloc")
         }
 
         pub(super) fn zeros16(&self, n: usize) -> Result<CudaSlice<u16>, GpuError> {
-            self.stream.alloc_zeros::<u16>(n.max(1)).gpu_ctx("tensor alloc")
+            self.alloc_zeros::<u16>(n.max(1)).gpu_ctx("tensor alloc")
         }
 
         /// A `rows × cols` tensor in `storage` for a kernel that writes every entry: f32 left
@@ -5755,7 +5897,7 @@ extern "C" __global__ void group_divergence(u64 n, int scaled, const double* ref
                 return self.tensor(storage, rows, cols);
             }
             // SAFETY: the caller's kernel writes all `rows · cols` values before any is read.
-            let data = Data::Cuda32(unsafe { self.stream.alloc::<f32>((rows * cols).max(1)) }.gpu_ctx("tensor alloc")?);
+            let data = Data::Cuda32(unsafe { self.alloc::<f32>((rows * cols).max(1)) }.gpu_ctx("tensor alloc")?);
             Ok(Tensor { rows, cols, data })
         }
 
@@ -5772,7 +5914,7 @@ extern "C" __global__ void group_divergence(u64 n, int scaled, const double* ref
         pub(super) fn copy<T: DeviceRepr + ValidAsZeroBits>(&self, slice: &CudaSlice<T>) -> Result<CudaSlice<T>, GpuError> {
             // SAFETY: the copy writes every value before any is read (an empty slice's one value is
             // never read).
-            let mut out = unsafe { self.stream.alloc::<T>(slice.len().max(1)) }.gpu_ctx("tensor alloc")?;
+            let mut out = unsafe { self.alloc::<T>(slice.len().max(1)) }.gpu_ctx("tensor alloc")?;
             self.stream.memcpy_dtod(slice, &mut out).gpu_ctx("tensor copy")?;
             Ok(out)
         }
@@ -5780,7 +5922,7 @@ extern "C" __global__ void group_divergence(u64 n, int scaled, const double* ref
         pub(super) fn copy_range<T: DeviceRepr + ValidAsZeroBits>(&self, slice: &CudaSlice<T>, lo: usize, hi: usize) -> Result<CudaSlice<T>, GpuError> {
             // SAFETY: the copy writes every value before any is read (an empty range's one value is
             // never read).
-            let mut out = unsafe { self.stream.alloc::<T>((hi - lo).max(1)) }.gpu_ctx("tensor alloc")?;
+            let mut out = unsafe { self.alloc::<T>((hi - lo).max(1)) }.gpu_ctx("tensor alloc")?;
             if hi > lo {
                 self.stream.memcpy_dtod(&slice.slice(lo..hi), &mut out).gpu_ctx("tensor row copy")?;
             }
@@ -5948,7 +6090,7 @@ extern "C" __global__ void group_divergence(u64 n, int scaled, const double* ref
             let workspace = if total <= 64 * 1024 * 1024 { &mut *cached } else { &mut temporary };
             let lower = |t: &Tensor, slot: &mut Option<CudaSlice<f32>>, convert: bool| -> Result<(), GpuError> {
                 if slot.as_ref().is_none_or(|s| s.len() < t.len().max(1)) {
-                    *slot = Some(self.stream.alloc_zeros::<f32>(t.len().max(1)).gpu_ctx("tensor f32 alloc")?);
+                    *slot = Some(self.alloc_zeros::<f32>(t.len().max(1)).gpu_ctx("tensor f32 alloc")?);
                 }
                 if !convert || t.is_empty() { return Ok(()); }
                 let out = slot.as_mut().ok_or_else(|| shape("missing GEMM scratch".to_string()))?;
@@ -6084,7 +6226,7 @@ extern "C" __global__ void group_divergence(u64 n, int scaled, const double* ref
             }
             let needed = lt.plans.get(&key).map_or(0, |p| p.heuristic.workspaceSize);
             if lt.workspace.as_ref().is_none_or(|w| w.len() < needed.max(1)) {
-                lt.workspace = Some(self.stream.alloc_zeros::<u8>(needed.max(1)).gpu_ctx("tensor cublasLt workspace")?);
+                lt.workspace = Some(self.alloc_zeros::<u8>(needed.max(1)).gpu_ctx("tensor cublasLt workspace")?);
             }
             let (alpha, one) = (alpha as f32, 1.0_f32);
             let plan = lt.plans.get(&key).ok_or_else(|| shape("a cublasLt plan".to_string()))?;
@@ -6119,7 +6261,7 @@ extern "C" __global__ void group_divergence(u64 n, int scaled, const double* ref
         /// `count` values of `source` from `offset`, rounded to bfloat16 (`to_bf16`).
         fn round_half(&self, source: &CudaSlice<f32>, offset: usize, count: usize) -> Result<CudaSlice<u16>, GpuError> {
             // SAFETY: `to_bf16` writes all `count` values before any is read (none when it is 0).
-            let mut out = unsafe { self.stream.alloc::<u16>(count.max(1)) }.gpu_ctx("tensor bf16 alloc")?;
+            let mut out = unsafe { self.alloc::<u16>(count.max(1)) }.gpu_ctx("tensor bf16 alloc")?;
             if count > 0 {
                 let n = count as u64;
                 let f = self.kernel("to_bf16", Storage::F32)?;
@@ -6213,7 +6355,7 @@ extern "C" __global__ void group_divergence(u64 n, int scaled, const double* ref
         /// An f32 tensor's buffer left unset for a kernel that writes every value.
         fn unset32(&self, rows: usize, cols: usize) -> Result<Tensor, GpuError> {
             // SAFETY: the caller's kernel writes all values before any is read.
-            let data = Data::Cuda32(unsafe { self.stream.alloc::<f32>((rows * cols).max(1)) }.gpu_ctx("tensor alloc")?);
+            let data = Data::Cuda32(unsafe { self.alloc::<f32>((rows * cols).max(1)) }.gpu_ctx("tensor alloc")?);
             Ok(Tensor { rows, cols, data })
         }
 
@@ -6237,7 +6379,7 @@ extern "C" __global__ void group_divergence(u64 n, int scaled, const double* ref
 
         fn unset16(&self, rows: usize, cols: usize) -> Result<Tensor, GpuError> {
             // SAFETY: as `unset32`.
-            let data = Data::CudaBf16(unsafe { self.stream.alloc::<u16>((rows * cols).max(1)) }.gpu_ctx("tensor alloc")?);
+            let data = Data::CudaBf16(unsafe { self.alloc::<u16>((rows * cols).max(1)) }.gpu_ctx("tensor alloc")?);
             Ok(Tensor { rows, cols, data })
         }
 
@@ -6544,7 +6686,7 @@ extern "C" __global__ void group_divergence(u64 n, int scaled, const double* ref
             // copies one element within the source rows into its own output slot.
             unsafe { self.stream.launch_builder(&f).arg(&n).arg(&cols).arg(&width).arg(&start)
                 .input(input, storage)?.output(&mut output, storage)?.launch(cfg_elements(n)) }.gpu_ctx("tensor column copy")?;
-            Ok(output.data)
+            Ok(std::mem::replace(&mut output.data, Data::Host(Vec::new())))
         }
 
         pub(super) fn set_columns<T>(
@@ -6636,7 +6778,7 @@ extern "C" __global__ void group_divergence(u64 n, int scaled, const double* ref
         pub(super) fn row_fill(&self, mask: &Tensor, starts: &Indices, offsets: &Indices, entries: usize) -> Result<(Indices, Indices), GpuError> {
             let storage = mask.storage();
             let (rows, groups) = (u32_of(mask.rows)?, u32_of(mask.cols)?);
-            let (mut columns, mut row_of) = (self.stream.alloc_zeros::<u32>(entries.max(1)).gpu_ctx("tensor alloc")?, self.stream.alloc_zeros::<u32>(entries.max(1)).gpu_ctx("tensor alloc")?);
+            let (mut columns, mut row_of) = (self.alloc_zeros::<u32>(entries.max(1)).gpu_ctx("tensor alloc")?, self.alloc_zeros::<u32>(entries.max(1)).gpu_ctx("tensor alloc")?);
             let f = self.kernel("row_fill", storage)?;
             // SAFETY: `offsets` are the prefix sums of row_counts' counts, so each row writes inside
             // its own `entries`-long span.
@@ -7406,7 +7548,7 @@ extern "C" __global__ void group_divergence(u64 n, int scaled, const double* ref
             let (n, slot) = (divergence.rows as u64, slot as u64);
             let blocks = n.div_ceil(u64::from(BLOCK)).max(1);
             // SAFETY: the first stage writes all `2 · blocks` partials before the second reads them.
-            let mut partials = unsafe { self.stream.alloc::<f64>(2 * blocks as usize) }.gpu_ctx("tensor alloc")?;
+            let mut partials = unsafe { self.alloc::<f64>(2 * blocks as usize) }.gpu_ctx("tensor alloc")?;
             let f = self.function("group_code_length")?;
             let mut builder = self.stream.launch_builder(&f);
             builder.arg(&n).arg(&slot).arg(slice(divergence)?).arg(slice(weight)?).arg(slice(constant)?).arg(&mut partials);
@@ -7468,7 +7610,7 @@ extern "C" __global__ void group_divergence(u64 n, int scaled, const double* ref
             let storage = a.storage();
             let mut keys = self.tensor(storage, blocks, width)?;
             let mut sizes = self.tensor(storage, blocks, width)?;
-            let mut order = self.stream.alloc_zeros::<u32>(blocks * width).gpu_ctx("tensor alloc")?;
+            let mut order = self.alloc_zeros::<u32>(blocks * width).gpu_ctx("tensor alloc")?;
             let f = self.kernel("select_sets", storage)?;
             let width32 = width as u32;
             let cfg = LaunchConfig { grid_dim: (blocks as u32, 1, 1), block_dim: (BLOCK, 1, 1), shared_mem_bytes: 0 };
@@ -7617,23 +7759,23 @@ extern "C" __global__ void group_divergence(u64 n, int scaled, const double* ref
             let cells = if probe.is_some() && !half { rows * chunk } else { 1 };
             // SAFETY: with a probe, each chunk's `head_chunk` writes the roots of its rows × count
             // classes before the product reads them; without one, no kernel touches them.
-            let mut roots = unsafe { self.stream.alloc::<f32>(cells.max(1)) }.gpu_ctx("tensor alloc")?;
+            let mut roots = unsafe { self.alloc::<f32>(cells.max(1)) }.gpu_ctx("tensor alloc")?;
             let mut root_sums = self.zeros(if probe.is_some() { rows } else { 1 })?;
             // SAFETY: with a probe, each chunk's `head_chunk` writes every row's before `scale_rows`
             // reads it; without one, no kernel touches it.
-            let mut root_factor = unsafe { self.stream.alloc::<f32>(rows.max(1)) }.gpu_ctx("tensor alloc")?;
+            let mut root_factor = unsafe { self.alloc::<f32>(rows.max(1)) }.gpu_ctx("tensor alloc")?;
             // SAFETY: each chunk's product writes its logits whole (β = 0) before `head_chunk` reads
             // them, and `fill` writes every row's largest before any is read.
-            let mut logits = unsafe { self.stream.alloc::<f32>((rows * chunk).max(1)) }.gpu_ctx("tensor alloc")?;
+            let mut logits = unsafe { self.alloc::<f32>((rows * chunk).max(1)) }.gpu_ctx("tensor alloc")?;
             // SAFETY: as `logits`.
-            let mut largest = unsafe { self.stream.alloc::<f32>(rows.max(1)) }.gpu_ctx("tensor alloc")?;
+            let mut largest = unsafe { self.alloc::<f32>(rows.max(1)) }.gpu_ctx("tensor alloc")?;
             let (n_rows, lowest) = (rows as u64, f64::NEG_INFINITY);
             let fill = self.kernel("fill", Storage::F32)?;
             // SAFETY: `fill(n, v, x)` writes n floats.
             unsafe { self.stream.launch_builder(&fill).arg(&n_rows).arg(&lowest).arg(&mut largest).launch(cfg_elements(n_rows)) }.gpu_ctx("tensor fill")?;
             let mut sums = self.zeros(rows)?;
             // SAFETY: each chunk's `head_chunk` writes every row's factor before `scale_rows` reads it.
-            let mut factor = unsafe { self.stream.alloc::<f32>(rows.max(1)) }.gpu_ctx("tensor alloc")?;
+            let mut factor = unsafe { self.alloc::<f32>(rows.max(1)) }.gpu_ctx("tensor alloc")?;
             let (rows32, width32) = (u32::try_from(rows).map_err(|_| shape("head rows exceed u32".to_string()))?, width as u32);
             let want = i32::from(expected.is_some());
             let (t, n_op) = (cublasOperation_t::CUBLAS_OP_T, cublasOperation_t::CUBLAS_OP_N);
@@ -7644,9 +7786,9 @@ extern "C" __global__ void group_divergence(u64 n, int scaled, const double* ref
             // SAFETY: with `half`, each chunk's `head_chunk` writes the rows × count
             // exponentials (with `expected`) and roots (with a probe) before a product reads them;
             // otherwise no kernel touches them.
-            let mut half_e = unsafe { self.stream.alloc::<u16>(half_cells(expected.is_some())) }.gpu_ctx("tensor bf16 alloc")?;
+            let mut half_e = unsafe { self.alloc::<u16>(half_cells(expected.is_some())) }.gpu_ctx("tensor bf16 alloc")?;
             // SAFETY: as `half_e`.
-            let mut half_roots = unsafe { self.stream.alloc::<u16>(half_cells(probe.is_some())) }.gpu_ctx("tensor bf16 alloc")?;
+            let mut half_roots = unsafe { self.alloc::<u16>(half_cells(probe.is_some())) }.gpu_ctx("tensor bf16 alloc")?;
             let chunk_kernel = self.kernel("head_chunk", Storage::F32)?;
             let rescale = self.kernel("scale_rows", Storage::F32)?;
             for (index, start) in (0..classes).step_by(chunk).enumerate() {
