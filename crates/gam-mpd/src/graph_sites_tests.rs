@@ -2,7 +2,7 @@
 //! export (#2951): identical for `M` and a program that declares every piece, and equal to `M`'s
 //! own weight edits and donor runs where those define the same experiment.
 use crate::{
-    graph::{Batch, Circuit, EdgeIr, Graph, NodeIr, PieceIr, Program, SiteDraw, SiteUnits, Stats, WeightEdit, Weights, execute, kl_bits, op_rows, reference, reference_under, run_sites, sample},
+    graph::{Batch, Behavior, Checker, Circuit, Counterfactual, EdgeIr, Graph, NodeIr, PieceIr, Program, Prompt, SiteDraw, SiteUnits, Stats, WeightEdit, Weights, execute, kl_bits, op_rows, reference, reference_under, run_sites, sample},
     import::import_language_model,
     interchange::{self, Family, Operation, SharedSite, SiteOp},
     library_mdl,
@@ -275,4 +275,47 @@ fn aimed_sites_are_the_programs() {
     let graph = Graph::parse(&program, &weights).expect("parse");
     let aimed = SiteUnits::default().aimed_sites(&weights, &graph);
     assert_eq!(aimed, vec![SharedSite::Stream(2), SharedSite::Head(heads), SharedSite::Attention(1), SharedSite::Input(2)]);
+}
+
+/// A behavior of the tiny export's sequences, each with the next one as its counterfactual.
+fn behavior(sequences: &[Vec<u32>]) -> Behavior {
+    let prompts = sequences
+        .iter()
+        .enumerate()
+        .map(|(i, s)| Prompt { text: String::new(), token_ids: s.clone(), target_positions: vec![s.len() - 2, s.len() - 1], counterfactual: Some(Counterfactual { text: String::new(), token_ids: sequences[(i + 1) % sequences.len()].clone() }) })
+        .collect();
+    Behavior { id: "tiny".into(), model: "tiny".into(), family: String::new(), description: String::new(), frequency: None, prompts, split: "train".into(), model_accuracy: None }
+}
+
+/// Scoring programs together (parallel runs, M once per experiment, edits grouped) gives each the
+/// score it gets alone, site operations included; an invalid program is flagged and scored as the
+/// empty program.
+#[test]
+fn batch_scores_equal_single_scores() {
+    let (weights, sequences) = model("graph_sites_batch");
+    let units = units(&weights);
+    let mut checker = Checker::new(weights, behavior(&sequences)).expect("checker");
+    let pool = vec![
+        draw(Family::Zero, &[(SharedSite::Head(1), Operation::Scale(0))], 0, true),
+        draw(Family::Swap, &[(SharedSite::Mlp(0), Operation::Swap), (SharedSite::Input(2), Operation::Swap)], 3, true),
+        draw(Family::Push, &[(SharedSite::Stream(1), Operation::Push { direction: 0, size: 1 })], 5, false),
+    ];
+    checker.sites = SiteUnits { pool, ..units };
+    let node = |id: &str, layer: usize, kind: &str, index: usize| NodeIr { id: id.into(), pieces: vec![PieceIr { view: "native".into(), layer, kind: kind.into(), index: Some(crate::graph::Index::One(index)) }], rule: None };
+    let mut partial = Program { model: "tiny".into(), valid: true, ..Program::default() };
+    partial.nodes = vec![node("h", 1, "head", 0), node("m", 0, "mlp", 2)];
+    partial.edges = vec![EdgeIr { from: "embed".into(), to: "m".into(), route: "input".into() }, EdgeIr { from: "m".into(), to: "h".into(), route: "value".into() }, EdgeIr { from: "h".into(), to: "logits".into(), route: "input".into() }];
+    let mut invalid = partial.clone();
+    invalid.edges.push(EdgeIr { from: "h".into(), to: "m".into(), route: "input".into() });
+    let programs = vec![full_program(), partial.clone(), Program { model: "tiny".into(), valid: true, ..Program::default() }, invalid];
+    let batch = checker.score_batch(&programs, 30, 3, true, None, 4).expect("batch");
+    assert!(batch.iter().any(|(_, m)| m.iter().any(|x| x.0.family().starts_with("site_"))), "no site operation drawn");
+    for (program, (together, measured)) in programs.iter().zip(&batch) {
+        let (alone, _) = checker.score(program, 30, 3, true, None).expect("alone");
+        assert_eq!(together.valid, alone.valid);
+        assert!((together.exec_error_bits - alone.exec_error_bits).abs() <= 1e-6 * alone.exec_error_bits.max(1.0), "batch {} vs alone {}", together.exec_error_bits, alone.exec_error_bits);
+        assert!(measured.iter().all(|x| x.2.as_ref().is_some_and(|c| c.tokens.iter().all(|t| t.len() == 4))), "every experiment has its reader candidates");
+    }
+    assert!(!batch[3].0.valid && batch[3].0.error.is_some());
+    assert!(batch[0].0.exec_error_bits / batch[0].0.n < 1e-9, "the full program is M");
 }
