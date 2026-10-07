@@ -34,10 +34,10 @@ use crate::{
     artifact::{Argument, Artifact, Callee},
     explanation_battery::{KINDS, Kind, load_factors},
     library_mdl::{Cells, Explanation, Group, Layer, mean_squares},
-    operator_program::{Interface, LabelKind, Node, Operator, OperatorProgram, Provenance, Rule, exact_precision},
+    operator_program::{FamilyInputs, Interface, LabelKind, Node, Operator, OperatorProgram, Provenance, Rule, Trace, exact_precision},
     run_check::LayerNodes,
 };
-use ndarray::Array2;
+use ndarray::{Array2, Axis, s};
 use serde::Deserialize;
 use std::{collections::BTreeMap, path::Path};
 
@@ -599,4 +599,255 @@ fn joined(nodes: &mut Vec<Node>, gates: Vec<usize>, softs: Vec<usize>) -> (usize
 /// The interface of the concatenation of `parts`.
 fn concat_interface(parts: &[Interface]) -> Result<Interface, String> {
     Interface::new(parts.iter().flat_map(|p| p.groups().to_vec()).collect()).map_err(error)
+}
+
+/// `M`'s operator of each site kind, in [`KINDS`] order, by its export name.
+const EXPORT_NAMES: [&str; 6] = ["attn.q_proj", "attn.k_proj", "attn.v_proj", "attn.o_proj", "mlp.c_fc", "mlp.down_proj"];
+
+/// One component of [`dump_parts`]: per operator of `M` its slices' writes and reads (as columns),
+/// its gate, a direction gate's `g`, and its hard gate on every row.
+struct Dumped {
+    slices: BTreeMap<String, (Vec<Vec<f64>>, Vec<Vec<f64>>)>,
+    gate: serde_json::Value,
+    g: Option<Vec<f64>>,
+    on: Vec<bool>,
+}
+
+/// A stage's gate of one component: on per row, `τ_b`, and a direction gate's `g`.
+type StageGate = (Vec<bool>, f64, Option<Vec<f64>>);
+
+/// Native node `node`'s value in `P`'s run `trace`.
+fn node_value<'a>(artifact: &Artifact, trace: &'a Trace, node: usize) -> Result<&'a Array2<f64>, String> {
+    let at = artifact.place(node).ok_or_else(|| error(format!("P holds no node {node}")))?;
+    trace.values.get(at).ok_or_else(|| error(format!("no value of node {at}")))
+}
+
+fn push_slice(part: &mut Dumped, operator: String, write: Vec<f64>, read: Vec<f64>) {
+    let entry = part.slices.entry(operator).or_default();
+    entry.0.push(write);
+    entry.1.push(read);
+}
+
+fn set_gate(part: &mut Dumped, read: String, (on, tau, g): StageGate) {
+    let kind = if g.is_some() { "direction" } else { "own" };
+    part.gate = serde_json::json!({"kind": kind, "read": read, "tau": tau});
+    part.g = g;
+    part.on = on;
+}
+
+/// One arm's components as parts, in the layout of the toy gate's harness
+/// (`bench/toys_2951/score_toys.py`), at `artifact`'s values (a checkpoint's posterior mean, or
+/// the start's): per component its slices' writes `U` and reads `V` on each of `M`'s operators it
+/// spans (export names, `W = U Vᵀ`), its gate (own: `z = ‖V_bᵀx‖ − τ_b` over its reads at its
+/// stage; direction: `z = g_bᵀx − τ_b`, the threshold's constant folded into `τ_b`), and its hard
+/// gate `z > 0` on every row of `inputs` in `P`'s own run (`artifact` executed on the host; a down
+/// gate on its own read reads the MLP's activations recomputed from the gated `c_fc` reads, as the
+/// MLP's rule computes them). Written to `dir`: `parts.json`, each slice set's `U` (out × r) and
+/// `V` (in × r) and each direction's `g` as float64, and `active.f64` (rows × components). Heads are
+/// taken to own their k and v (no grouped-query sharing). Returns the number of components.
+pub fn dump_parts(native: &OperatorProgram, layers: &[LayerNodes], artifact: &Artifact, start: &Path, arm: &str, inputs: &FamilyInputs, dir: &Path) -> Result<usize, String> {
+    let records: Vec<ArmRecord> = serde_json::from_slice(&std::fs::read(start).map_err(|e| error(format!("{}: {e}", start.display())))?).map_err(error)?;
+    let components = records.into_iter().find(|r| r.arm == arm).ok_or_else(|| error(format!("{}: no arm {arm}", start.display())))?.components;
+    let read_site = |c: &Component| match &c.read {
+        Read::Own([site, _]) => *site,
+        Read::Direction { site, .. } => *site,
+    };
+    // Per layer and stage, the components gated there, as `explanation` orders them.
+    let mut at: BTreeMap<(usize, usize), Vec<usize>> = BTreeMap::new();
+    for (b, c) in components.iter().enumerate() {
+        let site = read_site(c);
+        at.entry((site / KINDS.len(), stage(site))).or_default().push(b);
+    }
+    let direction = components.iter().any(|c| matches!(c.read, Read::Direction { .. }));
+    let trace = artifact.execute(inputs)?;
+    let rows = inputs.rows;
+    let value = |node: usize| node_value(artifact, &trace, node);
+    let matrix = |name: &str| -> Result<Array2<f64>, String> { Ok(artifact.program.operators[index_of(&artifact.program, name)?].matrix()) };
+    let interfaces = native.interfaces().map_err(error)?;
+    // A stage's gates, per component of the stage (its rows of the stacked `read`, `widths` of
+    // them in order), from the stage's input `x`.
+    let gates = |x: &Array2<f64>, read: &Array2<f64>, widths: &[usize], prefix: &str| -> Result<Vec<StageGate>, String> {
+        let threshold = matrix(&format!("{prefix}.threshold"))?;
+        let mut out = Vec::with_capacity(widths.len());
+        if direction {
+            let g = matrix(&format!("{prefix}.direction"))?;
+            for k in 0..widths.len() {
+                let z = x.dot(&g.row(k)) + threshold[[k, 0]];
+                out.push((z.iter().map(|v| *v > 0.0).collect(), -threshold[[k, 0]], Some(g.row(k).to_vec())));
+            }
+        } else {
+            let a = x.dot(&read.t());
+            let mut first = 0;
+            for (k, &w) in widths.iter().enumerate() {
+                let norms = a.slice(s![.., first..first + w]).map_axis(Axis(1), |r| r.dot(&r).sqrt());
+                out.push((norms.iter().map(|n| n + threshold[[k, 0]] > 0.0).collect(), -threshold[[k, 0]], None));
+                first += w;
+            }
+        }
+        Ok(out)
+    };
+    let mut parts: Vec<Dumped> = components.iter().map(|_| Dumped { slices: BTreeMap::new(), gate: serde_json::Value::Null, g: None, on: vec![false; rows] }).collect();
+    for (l, layer) in layers.iter().enumerate() {
+        let name = format!("library.l{l}");
+        let site = |kind: Kind| KINDS.len() * l + KINDS.iter().position(|k| *k == kind).unwrap_or(0);
+        let slices_on = |b: usize, s: usize| components[b].slices.iter().filter(|[t, _]| *t == s).count();
+        let export = |s: usize| format!("blocks.{l}.{}", EXPORT_NAMES[s % KINDS.len()]);
+        // ---------------------------------------------------------------- the attention's input stage
+        let a_comps = at.get(&(l, 0)).cloned().unwrap_or_default();
+        let (q, k, v) = (site(Kind::Query), site(Kind::Key), site(Kind::Value));
+        // Per stacked row its component and site, as `explanation` stacks them.
+        let mut read_rows: Vec<(usize, usize)> = Vec::new();
+        let mut widths = Vec::new();
+        for &b in &a_comps {
+            let mut w = 0;
+            for s in [q, k, v] {
+                for _ in 0..slices_on(b, s) {
+                    read_rows.push((b, s));
+                    w += 1;
+                }
+            }
+            widths.push(w);
+        }
+        if !a_comps.is_empty() {
+            let read = matrix(&format!("{name}.attn.read"))?;
+            let heads = layer.reads.len();
+            let writes: Vec<Vec<Array2<f64>>> = (0..heads).map(|h| ["q", "k", "v"].iter().map(|p| matrix(&format!("{name}.h{h}.{p}"))).collect()).collect::<Result<_, _>>()?;
+            // A row's write is its column among its map's rows, in every head.
+            let mut column = [0usize; 3];
+            for (r, &(b, s)) in read_rows.iter().enumerate() {
+                let j = [q, k, v].iter().position(|t| *t == s).unwrap_or(0);
+                let c = column[j];
+                column[j] += 1;
+                let u: Vec<f64> = (0..heads).flat_map(|h| writes[h][j].column(c).to_vec()).collect();
+                push_slice(&mut parts[b], export(s), u, read.row(r).to_vec());
+            }
+            for (i, g) in gates(value(layer.normed_stream)?, &read, &widths, &format!("{name}.attn"))?.into_iter().enumerate() {
+                let b = a_comps[i];
+                let first = read_rows.iter().find(|(c, _)| *c == b).map_or(q, |(_, s)| *s);
+                set_gate(&mut parts[b], export(first), g);
+            }
+        }
+        // ---------------------------------------------------------------- the attention's output
+        let o = site(Kind::Output);
+        let o_own = at.get(&(l, 1)).cloned().unwrap_or_default();
+        let o_carriers: Vec<usize> = a_comps.iter().copied().filter(|&b| slices_on(b, o) > 0).chain(o_own.iter().copied()).collect();
+        if !o_carriers.is_empty() {
+            let (read, write) = (matrix(&format!("{name}.o.read"))?, matrix(&format!("{name}.o.write"))?);
+            let (mut r, mut own_rows, mut own_widths) = (0, Vec::new(), Vec::new());
+            for &b in &o_carriers {
+                let n = slices_on(b, o);
+                for _ in 0..n {
+                    push_slice(&mut parts[b], export(o), write.column(r).to_vec(), read.row(r).to_vec());
+                    if o_own.contains(&b) {
+                        own_rows.push(r);
+                    }
+                    r += 1;
+                }
+                if o_own.contains(&b) {
+                    own_widths.push(n);
+                }
+            }
+            if !o_own.is_empty() {
+                // The o gates on their own read read every head's output, concatenated.
+                let heads: Vec<&Array2<f64>> = layer.reads.iter().map(|&n| value(n)).collect::<Result<_, _>>()?;
+                let views: Vec<_> = heads.iter().map(|h| h.view()).collect();
+                let concat = ndarray::concatenate(Axis(1), &views).map_err(error)?;
+                for (i, g) in gates(&concat, &read.select(Axis(0), &own_rows), &own_widths, &format!("{name}.o"))?.into_iter().enumerate() {
+                    set_gate(&mut parts[o_own[i]], export(o), g);
+                }
+            }
+        }
+        // ---------------------------------------------------------------- the MLP
+        let (fc, dn) = (site(Kind::Up), site(Kind::Down));
+        let f_comps = at.get(&(l, 2)).cloned().unwrap_or_default();
+        let d_own = at.get(&(l, 3)).cloned().unwrap_or_default();
+        if f_comps.is_empty() {
+            continue;
+        }
+        let (fc_read, fc_write) = (matrix(&format!("{name}.mlp.fc_read"))?, matrix(&format!("{name}.mlp.fc_write"))?);
+        let (dn_read, dn_write) = (matrix(&format!("{name}.mlp.dn_read"))?, matrix(&format!("{name}.mlp.dn_write"))?);
+        let (mut r, mut f_widths) = (0, Vec::new());
+        for &b in &f_comps {
+            let n = slices_on(b, fc);
+            for _ in 0..n {
+                push_slice(&mut parts[b], export(fc), fc_write.column(r).to_vec(), fc_read.row(r).to_vec());
+                r += 1;
+            }
+            f_widths.push(n);
+        }
+        let h2 = value(layer.normed)?;
+        let f_gates = gates(h2, &fc_read, &f_widths, &format!("{name}.mlp.fc"))?;
+        let dn_carriers: Vec<usize> = f_comps.iter().copied().filter(|&b| slices_on(b, dn) > 0).chain(d_own.iter().copied()).collect();
+        let (mut r, mut own_rows, mut own_widths) = (0, Vec::new(), Vec::new());
+        for &b in &dn_carriers {
+            let n = slices_on(b, dn);
+            for _ in 0..n {
+                push_slice(&mut parts[b], export(dn), dn_write.column(r).to_vec(), dn_read.row(r).to_vec());
+                if d_own.contains(&b) {
+                    own_rows.push(r);
+                }
+                r += 1;
+            }
+            if d_own.contains(&b) {
+                own_widths.push(n);
+            }
+        }
+        if !d_own.is_empty() {
+            // The activations in P's run: the c_fc reads gated per component, written, through the
+            // MLP's law.
+            let mut gated = h2.dot(&fc_read.t());
+            let mut first = 0;
+            for (k, &w) in f_widths.iter().enumerate() {
+                for (row, on) in f_gates[k].0.iter().enumerate() {
+                    if !on {
+                        gated.slice_mut(s![row, first..first + w]).fill(0.0);
+                    }
+                }
+                first += w;
+            }
+            let mut act = gated.dot(&fc_write.t());
+            let Node::Pointwise { input: pre, laws } = &native.nodes[layer.active] else {
+                return Err(error(format!("layer {l}: the MLP activation is not one pointwise law")));
+            };
+            for (group, law) in laws.iter().enumerate() {
+                let law = *law;
+                act.slice_mut(s![.., interfaces[*pre].range(group)]).mapv_inplace(|t| law.apply(t));
+            }
+            for (i, g) in gates(&act, &dn_read.select(Axis(0), &own_rows), &own_widths, &format!("{name}.mlp.dn"))?.into_iter().enumerate() {
+                set_gate(&mut parts[d_own[i]], export(dn), g);
+            }
+        }
+        for (i, g) in f_gates.into_iter().enumerate() {
+            set_gate(&mut parts[f_comps[i]], export(fc), g);
+        }
+    }
+    std::fs::create_dir_all(dir).map_err(error)?;
+    let write = |file: &str, values: &[f64]| -> Result<(), String> {
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        std::fs::write(dir.join(file), bytes).map_err(error)
+    };
+    let mut records = Vec::with_capacity(parts.len());
+    for (b, part) in parts.iter().enumerate() {
+        let mut slices = serde_json::Map::new();
+        for (op, (us, vs)) in &part.slices {
+            // U as out × r and V as in × r, row-major.
+            let (out, input) = (us[0].len(), vs[0].len());
+            let u: Vec<f64> = (0..out).flat_map(|i| us.iter().map(move |c| c[i])).collect();
+            let v: Vec<f64> = (0..input).flat_map(|i| vs.iter().map(move |c| c[i])).collect();
+            write(&format!("p{b}.{op}.U.f64"), &u)?;
+            write(&format!("p{b}.{op}.V.f64"), &v)?;
+            slices.insert(op.clone(), serde_json::json!({"U": format!("p{b}.{op}.U.f64"), "V": format!("p{b}.{op}.V.f64"), "rank": us.len()}));
+        }
+        let mut gate = part.gate.clone();
+        if let Some(g) = &part.g {
+            write(&format!("p{b}.g.f64"), g)?;
+            gate["g"] = serde_json::json!(format!("p{b}.g.f64"));
+        }
+        records.push(serde_json::json!({"name": format!("component {b}"), "slices": slices, "gate": gate}));
+    }
+    let active: Vec<f64> = (0..rows).flat_map(|row| parts.iter().map(move |p| if p.on[row] { 1.0 } else { 0.0 })).collect();
+    write("active.f64", &active)?;
+    let record = serde_json::json!({"parts": records, "active": "active.f64", "kept": ["wte", "lm_head"], "fitter": format!("library_vpd, arm {arm}")});
+    std::fs::write(dir.join("parts.json"), serde_json::to_vec_pretty(&record).map_err(error)?).map_err(error)?;
+    Ok(parts.len())
 }

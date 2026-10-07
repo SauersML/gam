@@ -2,7 +2,7 @@
 //! description length on interchange experiments (`gam_mpd::library_mdl`, #2951), on an export's
 //! token rows, and scored on held-out rows after every epoch.
 //!
-//! MODEL SETTINGS.json OUT host|gpu [artifact | edits EDITS.json]
+//! MODEL SETTINGS.json OUT host|gpu [artifact | edits EDITS.json | parts DIR]
 //!
 //! `MODEL` is an engine export (`export.json` and its token rows), or a Hugging Face checkpoint
 //! directory (`config.json` and its safetensors, one file or sharded) whose token rows come from
@@ -52,7 +52,11 @@
 //!
 //! With `vpd` (`{"decomposition": D, "start": S, "arm": A}`), every block is VPD's slices with
 //! intrinsic gates (`library_vpd`), arm `A` of the start file `S` that `mpd_battery_2951 start`
-//! writes (`per_slice_own`, `grouped_own`, `grouped_direction`).
+//! writes (`per_slice_own`, `grouped_own`, `grouped_direction`). With `parts DIR`, nothing is
+//! fitted: the components at the posterior mean of `OUT/checkpoint.bin` (the start's values when
+//! there is none) are written to `DIR` as the toy gate's parts (`library_vpd::dump_parts`: per
+//! component its slices' writes and reads on `M`'s operators, its gate, and its hard gate on every
+//! held-out token in `P`'s own run).
 //!
 //! With `transcoders` (`{"dir": D, "layers": [l, ...]}`, `D/layer_{l}.safetensors` circuit-tracer
 //! transcoder files), those layers' MLPs are the transcoders' features (`library_transcoder`, with
@@ -68,7 +72,7 @@ use gam_mpd::{
     engine::{log_to_stderr, sha256},
     import::{hugging_face_language_model, hugging_face_language_model_prefix, import_language_model},
     interchange, library_mdl, library_transcoder,
-    operator_program::{OperatorProgram, SlotValues},
+    operator_program::{FamilyInputs, OperatorProgram, SequenceLayout, SlotValues},
     run_check::{LayerNodes, layer_nodes, split_sites},
 };
 use gam_runtime::warm_start::Fingerprinter;
@@ -747,11 +751,12 @@ fn save(path: &Path, value: &Value) -> Result<(), String> {
 fn main() -> Result<(), String> {
     log_to_stderr();
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let (export, settings_path, out, mode, read_artifact, edits) = match &args[..] {
-        [export, settings, out, mode] => (export, settings, out, mode, false, None),
-        [export, settings, out, mode, artifact] if artifact == "artifact" => (export, settings, out, mode, true, None),
-        [export, settings, out, mode, edits, file] if edits == "edits" => (export, settings, out, mode, false, Some(Path::new(file))),
-        _ => return Err("EXPORT SETTINGS.json OUT host|gpu [artifact | edits EDITS.json]".into()),
+    let (export, settings_path, out, mode, read_artifact, edits, parts_dir) = match &args[..] {
+        [export, settings, out, mode] => (export, settings, out, mode, false, None, None),
+        [export, settings, out, mode, artifact] if artifact == "artifact" => (export, settings, out, mode, true, None, None),
+        [export, settings, out, mode, edits, file] if edits == "edits" => (export, settings, out, mode, false, Some(Path::new(file)), None),
+        [export, settings, out, mode, parts, dir] if parts == "parts" => (export, settings, out, mode, false, None, Some(Path::new(dir))),
+        _ => return Err("EXPORT SETTINGS.json OUT host|gpu [artifact | edits EDITS.json | parts DIR]".into()),
     };
     let (export, settings_path, out) = (Path::new(export), Path::new(settings_path), Path::new(out));
     let settings: Settings = serde_json::from_slice(&std::fs::read(settings_path).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
@@ -765,7 +770,7 @@ fn main() -> Result<(), String> {
         return Err("held-out sequences must be a nonempty range, and training sequences nonempty".into());
     }
     let checkpoint = out.join("checkpoint.bin");
-    if (out.exists() || read_artifact) && edits.is_none() && !checkpoint.exists() {
+    if (out.exists() || read_artifact) && edits.is_none() && parts_dir.is_none() && !checkpoint.exists() {
         return Err("a fresh output directory, or one holding this fit's checkpoint, required".into());
     }
     let device = match mode.as_str() {
@@ -829,6 +834,21 @@ fn main() -> Result<(), String> {
     if let Some(file) = edits {
         let settings: EditSettings = serde_json::from_slice(&std::fs::read(file).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
         return edit_faithfulness(&device, (&native, &layers), &explanation, &identity, held_out, &settings, out);
+    }
+    if let Some(dir) = parts_dir {
+        let vpd = settings.vpd.as_ref().ok_or("parts: the settings' vpd start is required")?;
+        let artifact = match checkpoint.exists() {
+            true => library_mdl::checkpoint_artifact(&explanation, &checkpoint, library_mdl::Literals::of(&device))?,
+            false => explanation.artifact.clone(),
+        };
+        // The held-out sequences, every position, as one family.
+        let ids: Vec<u32> = held_out.iter().flatten().copied().collect();
+        let sequence = held_out.iter().enumerate().flat_map(|(s, q)| std::iter::repeat(s as u32).take(q.len())).collect();
+        let position = held_out.iter().flat_map(|q| 0..q.len() as u32).collect();
+        let family = FamilyInputs { rows: ids.len(), slots: vec![SlotValues::Tokens(ids)], layout: Some(SequenceLayout { sequence, position }) };
+        let count = gam_mpd::library_vpd::dump_parts(&native, &layers, &artifact, &vpd.start, &vpd.arm, &family, dir)?;
+        log::info!("parts: {count} components on {} held-out tokens written to {}", family.rows, dir.display());
+        return Ok(());
     }
     if read_artifact {
         let artifact = library_mdl::checkpoint_artifact(&explanation, &checkpoint, library_mdl::Literals::of(&device))?;
