@@ -12,8 +12,10 @@ Starts:
           (its gate row, up row and down column).
 Thresholds start 3 s below zero (every gate on, P = M) with s = 0.1 x the root mean square of r on
 M's fit tokens. Training uses the expected gate Phi((r - tau)/s), evaluation the hard gate.
-Objective: KL(M || P) in bits per token + lambda log E[k], E[k] = expected rank-one equivalents
-per token, lambda <- max(0, lambda + 0.01 log(E[k] / K)) (budget_descent.py's fixed rule).
+Objective: KL(M || P) / A + lambda log E[k], E[k] = expected rank-one equivalents per token, A the
+held-out KL of M with this layer's MLP removed (the layer's whole effect, measured at the start), and
+lambda <- max(0, lambda + 0.01 log(E[k] / K)) (budget_descent.py's fixed rule, here in units of the
+layer's effect, so that the step does not depend on how much the one layer matters).
 Training: FineWeb windows of 256 tokens (qwen3_fineweb train), batch 8; held-out evaluation on the
 first 8 windows of 512 tokens of the held-out shard (4096 tokens).
 Usage: qwen3_layer_descent.py START K LAYER OUT.json EVAL SECONDS TRAIN_U32 HELDOUT_U32 [MODEL]"""
@@ -92,6 +94,8 @@ def gated(r, p):
 def fwd(x):
     if state['mode'] == 'M':
         return published(x)
+    if state['mode'] == 'zero':
+        return torch.zeros_like(x)
     if start == 'svd':
         def apply(m, y):
             p = P[m]; c = y @ p['V']
@@ -117,16 +121,23 @@ def run(ids, mode):
 
 @torch.no_grad()
 def evaluate():
-    r = {'kl': [], 'kl_soft': [], 'kl_all_on': [], 'active': [], 'active_soft': []}
+    r = {'kl': [], 'kl_soft': [], 'kl_all_on': [], 'active': [], 'active_soft': [], 'per_map': []}
     for i in range(0, ev.shape[0], 2):
         ids = ev[i:i + 2]
         lm = run(ids, 'M')
         lp = run(ids, 'hard'); r['kl'].append(kl_bits(lm, lp).mean().item())
         r['active'].append(torch.stack(state['hard']).sum(0).mean().item())
+        r['per_map'].append([h.mean().item() for h in state['hard']])
         lp = run(ids, 'soft'); r['kl_soft'].append(kl_bits(lm, lp).mean().item())
         r['active_soft'].append(torch.stack(state['soft']).sum(0).mean().item())
         lp = run(ids, 'all'); r['kl_all_on'].append(kl_bits(lm, lp).mean().item())
-    return {k: float(np.mean(v)) for k, v in r.items()}
+    out = {k: float(np.mean(v)) for k, v in r.items() if k != 'per_map'}
+    out['per_map'] = [round(float(x), 2) for x in np.mean(r['per_map'], 0)]
+    return out
+
+@torch.no_grad()
+def ablated():
+    return float(np.mean([kl_bits(run(ev[i:i + 2], 'M'), run(ev[i:i + 2], 'zero')).mean().item() for i in range(0, ev.shape[0], 2)]))
 
 trainable = [p[k] for p in P.values() for k in ('V', 'U', 'G', 'Up', 'D') if k in p]
 # Adam steps of 0.3% of each tensor's root mean square; thresholds 1% of their noise scale x 10.
@@ -134,7 +145,9 @@ groups = [{'params': [q], 'lr': 3e-3 * q.detach().pow(2).mean().sqrt().item()} f
 groups += [{'params': [p['tau']], 'lr': 0.1 * p['s'].mean().item()} for p in P.values()]
 opt = torch.optim.Adam(groups)
 lam, rng = 0.0, np.random.default_rng(0)
-log = {'model': name, 'layer': layer, 'start': start, 'K': K, 'trace': []}
+A = ablated()
+print('KL with the layer\'s MLP removed', A, flush=True)
+log = {'model': name, 'layer': layer, 'start': start, 'K': K, 'kl_ablated': A, 'trace': []}
 e = evaluate(); print('start', e, flush=True); log['trace'].append({'step': 0, **e})
 t0 = time.time()
 step = 0
@@ -146,7 +159,7 @@ while True:
     kl = kl_bits(lm, lp).mean()
     ek = torch.stack(state['soft']).sum(0).mean()
     hk = torch.stack(state['hard']).sum(0).mean().item()
-    opt.zero_grad(); (kl + lam * torch.log(ek)).backward(); opt.step()
+    opt.zero_grad(); (kl / A + lam * torch.log(ek)).backward(); opt.step()
     lam = max(0.0, lam + 0.01 * math.log(ek.item() / K))
     step += 1
     last = time.time() - t0 > LIMIT
