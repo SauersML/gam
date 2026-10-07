@@ -223,38 +223,6 @@ def _transformers_token_log_probs(self, prompts: list[list[int]], at: list[list[
 TransformersBackend.token_log_probs = _transformers_token_log_probs
 
 
-def _transformers_next_log_probs(self, prompts: list[list[int]], ids: list[list[int]]) -> list[np.ndarray]:
-    """log p(t | prompt) for each token t in ids[i], at the position after prompt i: one forward pass per
-    prompt (left padded, batched by length), the output layer at the last position only."""
-    torch = self.torch
-    order = sorted(range(len(prompts)), key=lambda i: len(prompts[i]))
-    out: list[np.ndarray | None] = [None] * len(prompts)
-    start = 0
-    while start < len(order):
-        stop = start + 1
-        while stop < len(order) and (stop + 1 - start) * len(prompts[order[stop]]) <= self.batch_tokens:
-            stop += 1
-        chunk = order[start:stop]
-        width = len(prompts[chunk[-1]])
-        tokens = torch.full((len(chunk), width), self.pad, dtype=torch.long)
-        mask = torch.zeros((len(chunk), width), dtype=torch.long)
-        for row, i in enumerate(chunk):
-            tokens[row, width - len(prompts[i]):] = torch.tensor(prompts[i])
-            mask[row, width - len(prompts[i]):] = 1
-        positions = (mask.cumsum(1) - 1).clamp(min=0)
-        with torch.no_grad():
-            d = self.device
-            logits = self.model(input_ids=tokens.to(d), attention_mask=mask.to(d), position_ids=positions.to(d), logits_to_keep=1).logits[:, -1, :]
-            lp = torch.log_softmax(logits.double(), -1).cpu().numpy()
-        for row, i in enumerate(chunk):
-            out[i] = lp[row, ids[i]]
-        start = stop
-    return out
-
-
-TransformersBackend.next_log_probs = _transformers_next_log_probs
-
-
 class VllmBackend:
     """A frozen open-weights instruct model served by vllm.LLM on the GPUs of this machine."""
 
@@ -279,18 +247,6 @@ class VllmBackend:
         params = self.SamplingParams(max_tokens=1, temperature=0.0, seed=self.seed, prompt_logprobs=0)
         outputs = self.llm.generate([{"prompt_token_ids": p} for p in prompts], params, use_tqdm=False)
         return [np.array([o.prompt_logprobs[j][p[j]].logprob for j in js]) for o, p, js in zip(outputs, prompts, at)]
-
-    def next_log_probs(self, prompts: list[list[int]], ids: list[list[int]]) -> list[np.ndarray]:
-        """log p(t | prompt) for each token t in ids[i]: the prompt extended by t, read as the prompt
-        log-probability of its last token (the extensions of one prompt share it in the cache)."""
-        flat = [(i, t) for i, ts in enumerate(ids) for t in ts]
-        lps = self.token_log_probs([prompts[i] + [t] for i, t in flat], [[len(prompts[i])] for i, _ in flat])
-        out = [np.empty(len(ts)) for ts in ids]
-        fill = [0] * len(ids)
-        for (i, _), lp in zip(flat, lps):
-            out[i][fill[i]] = lp[0]
-            fill[i] += 1
-        return out
 
     def distributions(self, users: list[str], k: int) -> list[np.ndarray]:
         # Each label's log-probability after the prompt, read as the last prompt token's log-probability

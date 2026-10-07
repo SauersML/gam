@@ -20,28 +20,28 @@ Reader prompt (the reader's chat template, thinking off):
   assistant  the text M reads, verbatim and unmarked (so the reader's natural continuation is the answer);
              the answer slot is the position after it
 The reader's probability of a candidate is its probability of continuing the text with that candidate.
-The program part comes first, so vLLM's prefix cache shares it across the program's items.
+The program part comes first: CachedReader runs it once and repeats its key/value cache across the
+program's items.
 - Qwen3 targets share the reader's tokenizer: the text is M's own token ids and every candidate is one
   reader token, so the candidates are disjoint and q(other) = 1 - sum q(candidates) exactly.
 - Other targets (vpd4l): the text is encoded with the reader's tokenizer and a candidate is the event that
-  the reader's continuation text starts with the candidate's string s. With the transformers backend,
-  P(s) = the reader's probability of every first token whose string starts with s, plus, when the reader's
-  own tokens of s are several, the probability of that token sequence (other splits of s are left out).
-  With vLLM (no whole distribution), P(s) = the probability of the reader's own tokens of s alone, which
-  misses first tokens longer than s ("PACKAGE" for the candidate "PACK"). A candidate whose event
-  contains another's (s a prefix of s') gets q(s) = P(s) - sum over the nearest such s' of P(s'); the
-  candidates are then disjoint and q(other) is the reader's remaining mass.
+  the reader's continuation text starts with the candidate's string s: P(s) = the reader's probability of
+  every first token whose string starts with s (from its whole next-token distribution), plus, when the
+  reader's own tokens of s are several, the probability of that token sequence (other splits of s are
+  left out). A candidate whose event contains another's (s a prefix of s') gets q(s) = P(s) - sum over
+  the nearest such s' of P(s'); the candidates are then disjoint and q(other) is the reader's remaining
+  mass.
 q(other) and corrected candidates are floored at K * 2^-24, the rounding scale of a sum of K float32
-probabilities (vLLM returns float32 log-probabilities).
+probabilities.
 
 Baselines, scored on the same items: the empty program (the reader alone, the same prompt with an empty
 program block) and the program's code with every docstring, string statement and comment removed
 (`strip_english`). english_saved_bits = N (mean bits of the code alone - mean bits of the program): the
 measured value of the English.
 
-  reader_score.py score --backend vllm --model Qwen/Qwen3-8B --target vpd4l --programs P.jsonl
+  reader_score.py score --model Qwen/Qwen3-8B --target vpd4l --programs P.jsonl
                         --items ITEMS.jsonl --out OUT.json [--N 16777216]
-  reader_score.py serve --backend vllm --model Qwen/Qwen3-8B --target qwen3-0.6b --listen HOST:PORT
+  reader_score.py serve --model Qwen/Qwen3-8B --target qwen3-0.6b --listen HOST:PORT
 P.jsonl lines {"id", "source"[, "valid"]}; an invalid program is read as the empty program (design.txt).
 serve answers JSON lines {"op": "score", "programs": [...], "items": [...], "N": int} with
 {"ok": {"results": [...], "reader": ..., "items_per_second": ...}}.
@@ -63,8 +63,6 @@ from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-import reader as R  # noqa: E402
 
 LN2 = math.log(2.0)
 N_DEFAULT = 2**24
@@ -220,6 +218,76 @@ def kl_bits(p: np.ndarray, p_other: float, q: np.ndarray) -> float:
     return kl / LN2
 
 
+class CachedReader:
+    """A frozen Hugging Face causal LM read under a shared prefix: the prefix (a program's text) runs once
+    and its key/value cache is repeated across a batch of suffixes (the items), right padded, so a
+    program's items pay only for their own tokens. bfloat16 on CUDA, float32 elsewhere (Mac tests).
+    vLLM is not used: its prompt log-probabilities bypass its prefix cache (sampling_params.py sets
+    skip_reading_prefix_cache whenever prompt_logprobs is requested), so every extension prompt was a
+    full prefill with output logits at every position."""
+
+    name = "cached"
+
+    def __init__(self, model: str, batch_tokens: int, max_batch: int, seed: int = 0):
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        torch.manual_seed(seed)
+        self.torch, self.model_id, self.seed = torch, model, seed
+        self.batch_tokens, self.max_batch = batch_tokens, max_batch
+        self.tokenizer = AutoTokenizer.from_pretrained(model)
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        dtype = torch.bfloat16 if self.device.type == "cuda" else torch.float32
+        self.model = AutoModelForCausalLM.from_pretrained(model, dtype=dtype).to(self.device).eval()
+        self.pad = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id
+
+    def describe(self) -> dict:
+        return {"backend": self.name, "model": self.model_id, "seed": self.seed, "dtype": str(self.model.dtype), "device": self.device.type}
+
+    def read(self, prefix: list[int], suffixes: list[list[int]], reads: list[list[tuple[int, list[int] | None]]]) -> list[list[np.ndarray]]:
+        """For suffix i and each (j, ids) in reads[i]: log p(t | prefix + suffix[: j + 1]) for t in ids, or
+        the whole distribution when ids is None (float64)."""
+        import copy
+
+        torch = self.torch
+        d = self.device
+        with torch.no_grad():
+            pre = self.model.model(input_ids=torch.tensor([prefix], device=d), use_cache=True)
+            cache = pre.past_key_values
+        P = len(prefix)
+        order = sorted(range(len(suffixes)), key=lambda i: len(suffixes[i]))
+        out: list[list[np.ndarray] | None] = [None] * len(suffixes)
+        start = 0
+        while start < len(order):
+            stop = start + 1
+            while stop < len(order) and stop - start < self.max_batch and (stop + 1 - start) * (P + len(suffixes[order[stop]])) <= self.batch_tokens:
+                stop += 1
+            chunk = order[start:stop]
+            width = len(suffixes[chunk[-1]])
+            ids = torch.full((len(chunk), width), self.pad, dtype=torch.long)
+            mask = torch.zeros((len(chunk), P + width), dtype=torch.long)
+            mask[:, :P] = 1
+            for row, i in enumerate(chunk):
+                ids[row, : len(suffixes[i])] = torch.tensor(suffixes[i])
+                mask[row, P : P + len(suffixes[i])] = 1
+            c = copy.deepcopy(cache)
+            c.batch_repeat_interleave(len(chunk))
+            positions = torch.arange(P, P + width)
+            with torch.no_grad():
+                hidden = self.model.model(input_ids=ids.to(d), attention_mask=mask.to(d), position_ids=positions[None].expand(len(chunk), -1).to(d),
+                                          cache_position=positions.to(d), past_key_values=c, use_cache=True).last_hidden_state
+                for row, i in enumerate(chunk):
+                    js = [j for j, _ in reads[i]]
+                    lp = torch.log_softmax(self.model.lm_head(hidden[row, js]).double(), -1)
+                    res = []
+                    for r, (_, want) in enumerate(reads[i]):
+                        res.append(lp[r].cpu().numpy() if want is None else lp[r, want].cpu().numpy())
+                    out[i] = res
+            del c, hidden
+            start = stop
+        return out
+
+
 class Scorer:
     """One loaded reader backend and its prompter; bits per (text, item), memoized by content."""
 
@@ -264,31 +332,43 @@ class Scorer:
         todo = [(a, b) for a in range(len(texts)) for b in range(len(items)) if self._key(texts[a], items[b]) not in self.memo]
         if todo:
             pr = self.prompter
-            prefixes = {a: pr.prefix(texts[a]) for a in {a for a, _ in todo}}
+            vocab = None if pr.shared else self.vocabulary()
             bodies = {b: pr.item(items[b]) for b in {b for _, b in todo}}
             cands = {b: pr.candidates(items[b]) for b in bodies}
-            prompts = [prefixes[a] + bodies[b] for a, b in todo]
-            aggregate = not pr.shared and self.backend.name == "transformers"
-            if aggregate:  # the reader's whole next-token distribution, for string events
-                vocab = self.vocabulary()
-                first = self.backend.next_log_probs(prompts, [vocab.ids] * len(prompts))
-            else:
-                first = self.backend.next_log_probs(prompts, [[c[0] for c in cands[b] if len(c) == 1] for _, b in todo])
-            multi = [(j, k, c) for j, (_, b) in enumerate(todo) for k, c in enumerate(cands[b]) if len(c) > 1]
-            longer = self.backend.token_log_probs([prompts[j] + c for j, _, c in multi], [list(range(len(prompts[j]), len(prompts[j]) + len(c))) for j, _, c in multi]) if multi else []
-            extra = {(j, k): math.exp(float(lp.sum())) for (j, k, _), lp in zip(multi, longer)}
-            for j, (a, b) in enumerate(todo):
-                it = items[b]
-                if aggregate:
-                    full = np.exp(first[j])
-                    strings = [c["text"] for c in it["candidates"]]
-                    raw = [(full[vocab.starting(t)].sum() + extra.get((j, k), 0.0)) if t else 0.0 for k, t in enumerate(strings)]
-                    q = disjoint(strings, raw)
-                else:
-                    s_ = iter(np.exp(first[j]))
-                    q = disjoint(cands[b], [float(next(s_)) if len(c) == 1 else extra[(j, k)] for k, c in enumerate(cands[b])])
-                p = np.array([c["p"] for c in it["candidates"]], dtype=np.float64)
-                self.memo[self._key(texts[a], it)] = kl_bits(p, float(it["other"]), q)
+            for a in sorted({a for a, _ in todo}):
+                mine = [b for a_, b in todo if a_ == a]
+                # Per item: its body read at the answer slot (the candidates' tokens, or the whole
+                # distribution for string events), then one extension per multi-token candidate.
+                suffixes, reads, where = [], [], []
+                for b in mine:
+                    body = bodies[b]
+                    slot = len(body) - 1
+                    suffixes.append(body)
+                    reads.append([(slot, None if vocab is not None else [c[0] for c in cands[b]])])
+                    where.append((b, None))
+                    for k, c in enumerate(cands[b]):
+                        if len(c) > 1:
+                            suffixes.append(body + c[:-1])
+                            reads.append([(slot + j, [c[j]]) for j in range(len(c))])
+                            where.append((b, k))
+                got = self.backend.read(pr.prefix(texts[a]), suffixes, reads)
+                first, extra = {}, {}
+                for (b, k), r in zip(where, got):
+                    if k is None:
+                        first[b] = r[0]
+                    else:
+                        extra[(b, k)] = math.exp(float(sum(float(x[0]) for x in r)))
+                for b in mine:
+                    it = items[b]
+                    if vocab is not None:
+                        full = np.exp(first[b])
+                        strings = [c["text"] for c in it["candidates"]]
+                        raw = [(full[vocab.starting(t)].sum() + extra.get((b, k), 0.0)) if t else 0.0 for k, t in enumerate(strings)]
+                        q = disjoint(strings, raw)
+                    else:
+                        q = disjoint(cands[b], list(np.exp(first[b])))
+                    p = np.array([c["p"] for c in it["candidates"]], dtype=np.float64)
+                    self.memo[self._key(texts[a], it)] = kl_bits(p, float(it["other"]), q)
         for a, text in enumerate(texts):
             for b, it in enumerate(items):
                 out[a, b] = self.memo[self._key(text, it)]
@@ -331,7 +411,7 @@ class _Handler(socketserver.StreamRequestHandler):
                     raise ValueError(f"unknown op {request.get('op')!r} (have score)")
                 s = self.server.scorer
                 results = s.score(request["programs"], request["items"], int(request.get("N", N_DEFAULT)), bool(request.get("baselines", True)))
-                reply = {"ok": {"results": results, "reader": R.describe(s.backend)}}
+                reply = {"ok": {"results": results, "reader": s.backend.describe()}}
             except Exception as e:  # the reply carries the failure; the service keeps running
                 reply = {"error": f"{type(e).__name__}: {e}"}
             reply["seconds"] = time.time() - start
@@ -342,7 +422,6 @@ class _Handler(socketserver.StreamRequestHandler):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("command", choices=["score", "serve"])
-    ap.add_argument("--backend", required=True, choices=["vllm", "transformers"])
     ap.add_argument("--model", default="Qwen/Qwen3-8B")
     ap.add_argument("--target", required=True, help="qwen3-0.6b (shared tokenizer) or vpd4l")
     ap.add_argument("--programs")
@@ -352,17 +431,15 @@ def main():
     ap.add_argument("--no-baselines", action="store_true")
     ap.add_argument("--listen")
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--batch-tokens", type=int, default=8192)
-    ap.add_argument("--tensor-parallel-size", type=int, default=1)
-    ap.add_argument("--max-model-len", type=int, default=16384)
-    ap.add_argument("--gpu-memory-utilization", type=float, default=0.85)
+    ap.add_argument("--batch-tokens", type=int, default=65536, help="tokens per forward pass, the shared prefix counted per sequence (memory)")
+    ap.add_argument("--max-batch", type=int, default=32, help="sequences per forward pass")
     args = ap.parse_args()
-    scorer = Scorer(R.make_backend(args), args.target)
+    scorer = Scorer(CachedReader(args.model, args.batch_tokens, args.max_batch, args.seed), args.target)
     if args.command == "serve":
         host, sep, port = args.listen.rpartition(":")
         server = socketserver.TCPServer((host, int(port)), _Handler) if sep and port.isdigit() else socketserver.UnixStreamServer(args.listen, _Handler)
         server.scorer = scorer
-        print(f"reader scorer {R.describe(scorer.backend)} target {args.target} listening on {args.listen}", file=sys.stderr, flush=True)
+        print(f"reader scorer {scorer.backend.describe()} target {args.target} listening on {args.listen}", file=sys.stderr, flush=True)
         server.serve_forever()
     programs = [json.loads(line) for line in open(args.programs) if line.strip()]
     items = [json.loads(line) for line in open(args.items) if line.strip()]
@@ -370,7 +447,7 @@ def main():
     results = scorer.score(programs, items, args.N, not args.no_baselines)
     seconds = time.time() - start
     texts = len(programs) * (3 if not args.no_baselines else 1)
-    summary = {"reader": R.describe(scorer.backend), "target": args.target, "programs": len(programs), "items": len(items), "seconds": seconds,
+    summary = {"reader": scorer.backend.describe(), "target": args.target, "programs": len(programs), "items": len(items), "seconds": seconds,
                "item_reads_per_second": texts * len(items) / seconds, "results": results}
     Path(args.out).write_text(json.dumps(summary, indent=1))
     for r in results:
