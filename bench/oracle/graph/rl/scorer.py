@@ -12,6 +12,7 @@ dicts in design.txt section 5's format ({"total_bits", "exec_error_bits", "reade
 
 from __future__ import annotations
 
+import json
 import math
 import sys
 from pathlib import Path
@@ -71,11 +72,12 @@ def checker(items: list[dict]) -> list[dict]:
             load_behavior(c, path)
             c.loaded = path
         def key(k):
-            return items[k].get("seed", 0), items[k].get("uniform_seeds") or 0, items[k].get("experiments") or 32
+            return items[k].get("seed", 0), items[k].get("uniform_seeds") or 0, items[k].get("experiments") or 32, json.dumps(items[k].get("options"), sort_keys=True)
 
-        for seed, uniform, experiments in sorted({key(k) for k in ks}):  # one batch request per seed: M once per experiment, the programs in parallel
-            batch = [k for k in ks if key(k) == (seed, uniform, experiments)]
-            for k, r in zip(batch, c.score_batch([items[k]["source"] for k in batch], experiments=experiments, seed=seed, uniform_seeds=uniform or None)):
+        for seed, uniform, experiments, options in sorted({key(k) for k in ks}):  # one batch request per seed: M once per experiment, the programs in parallel
+            batch = [k for k in ks if key(k) == (seed, uniform, experiments, options)]
+            extra = {"options": json.loads(options)} if json.loads(options) else {}
+            for k, r in zip(batch, c.score_batch([items[k]["source"] for k in batch], experiments=experiments, seed=seed, uniform_seeds=uniform or None, **extra)):
                 out[k] = r
 
     per_worker = [[] for _ in range(WORKERS)]

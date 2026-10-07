@@ -22,7 +22,7 @@ class Checker:
     def request(self, message):
         self.path = message["path"]
 
-    def score_batch(self, sources, experiments=32, seed=0, uniform_seeds=None):
+    def score_batch(self, sources, experiments=32, seed=0, uniform_seeds=None, **options):
         calls.append((self.path, seed, len(sources)))
         return [{"total_bits": len(x) + seed, "valid": True, "behavior": self.path} for x in sources]
 
@@ -39,7 +39,8 @@ def main():
     check_repair()
     check_evaluate()
     check_sft_examples()
-    print("ok: checker scorer order, behaviors and one batch per (behavior, seed); repair keeps a revision only when it lowers S; evaluation summary; SFT data uses each training behavior's best program only")
+    check_rescore()
+    print("ok: checker scorer order, behaviors and one batch per (behavior, seed); repair keeps a revision only when it lowers S; evaluation summary; SFT data uses each training behavior's best program only; rescore")
 
 
 def check_repair():
@@ -117,6 +118,33 @@ def check_sft_examples():
     programs, questions = train.sft_examples(args, pol, [{"id": "a"}, {"id": "b"}])
     assert len(programs) == 1 and programs[0][1] == [len("```python\nA2\n```"), 0], programs
     assert questions == [([hash("Q") % 97], [3, 0])], questions
+
+
+
+def check_rescore():
+    """train.rescore scores saved programs again with the given seed, experiments and checker options and
+    summarizes them against the rescored empty program."""
+    import json
+    import tempfile
+
+    import train
+
+    d = Path(tempfile.mkdtemp())
+    (d / "b.json").write_text(json.dumps({"id": "b", "model": "vpd4l", "prompts": []}))
+    rows = [{"set": "heldout_behaviors", "step": 0, "run": "r", "behavior": "b", "behavior_path": str(d / "b.json"), "program": p, "source": f"X = {v}", "score": {"total_bits": 0.0}}
+            for p, v in (("oracle", 10), ("oracle", 40), ("empty", 50))]
+    (d / "eval_samples.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    seen = []
+
+    def score(items):
+        seen.extend((it["seed"], it["experiments"], json.dumps(it["options"])) for it in items)
+        return [{"valid": True, "total_bits": 2 * float(it["source"].split("=")[1]), "exec_error_bits": 2 * float(it["source"].split("=")[1])} for it in items]
+
+    args = types.SimpleNamespace(samples_from=[str(d / "eval_samples.jsonl")], score_options='{"families": ["swap"]}', eval_seed=5, eval_experiments=16, out=str(d), rescore_tag="t")
+    s = train.rescore(args, score)["heldout_behaviors"]
+    assert s["best_of_n_bits"] == 20.0 and s["baselines"] == {"empty": 100.0} and abs(s["best_recovered"] - 0.8) < 1e-12, s
+    assert set(seen) == {(5, 16, '{"families": ["swap"]}')}, seen
+    assert sum(1 for _ in open(d / "rescore_t.jsonl")) == 3
 
 
 if __name__ == "__main__":
