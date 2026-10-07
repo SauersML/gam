@@ -232,22 +232,31 @@ fn arms(vpd: &Vpd, fit: &Fit) -> Result<Vec<Arm>, String> {
             let inverse = eigh(gram.view(), SymmetricAssembly::Mirrored, None).map_err(|e| error(format!("{e:?}")))?.psd_map(0.0, |v| 1.0 / v).map_err(|e| error(format!("{e:?}")))?;
             let coefficients = inverse.dot(&fast_atb(x, &seed_masks));
             let scores = x.dot(&coefficients);
+            // Each seed's own read as a direction (`v_i` and no constant), and its values.
+            let d_in = x.ncols() - 1;
+            let own_coefficients = Array2::from_shape_fn((d_in + 1, seed_list.len()), |(j, k)| if j < d_in { vpd.factors[seed_list[k].0].v[[j, seed_list[k].1]] } else { 0.0 });
+            let own_scores = x.dot(&own_coefficients);
             let first = own.components.len();
             for (k, &(s, i)) in seed_list.iter().enumerate() {
                 let labels: Vec<bool> = fit.masks[s].column(i).iter().map(|m| *m > 0.0).collect();
-                // The regression's direction, or where it is flat on the fitting rows (a mask on at
-                // every row regresses onto the constant alone, a gate that never switches), the
-                // slice's own read `v_iᵀx`, signed: a direction gate always has a slope.
-                let mut read: Vec<f64> = coefficients.column(k).to_vec();
-                let mut values: Vec<f64> = scores.column(k).to_vec();
-                if !(deviation(values.iter().copied()) > 0.0) {
-                    let width = x.ncols() - 1;
-                    read = (0..=width).map(|j| if j < width { vpd.factors[s].v[[j, i]] } else { 0.0 }).collect();
-                    values = x.rows().into_iter().map(|row| row.iter().zip(&read).map(|(a, b)| a * b).sum()).collect();
-                }
-                let width = deviation(values.iter().copied());
-                let values32: Vec<f32> = values.iter().map(|v| *v as f32).collect();
-                let (tau, _) = best_threshold(&values32, &labels);
+                // The direction gate reads the regression's direction or the slice's own read
+                // `v_iᵀx` (signed), whichever disagrees with VPD's mask on fewer fitting rows at its
+                // best threshold (the regression on ties): a mask on at nearly every row regresses
+                // onto the constant alone, a direction of no slope (toys saw such a gate, g = 0 and
+                // c = 1, saturate and λ climb to 5.6e8), and the start's widths for this arm went
+                // down to 3e-9.
+                let candidate = |read: Vec<f64>, values: ndarray::ArrayView1<f64>| {
+                    let values32: Vec<f32> = values.iter().map(|v| *v as f32).collect();
+                    let (tau, errors) = best_threshold(&values32, &labels);
+                    (read, tau, errors, deviation(values.iter().copied()))
+                };
+                let regression = candidate(coefficients.column(k).to_vec(), scores.column(k));
+                let own_read = candidate(own_coefficients.column(k).to_vec(), own_scores.column(k));
+                let (read, tau, _, width) = if own_read.2 < regression.2 || !(regression.3 > 0.0) { own_read } else { regression };
+                // In units of its read's spread on the fitting rows: `g`, the constant and `τ` over
+                // that spread and the width 1, the same gate with its parameters at the data's scale
+                // (a direction of spread 3e-9 would otherwise take curvature near 1/w² in `g`).
+                let (read, tau, width): (Vec<f64>, f64, f64) = (read.iter().map(|g| g / width).collect(), tau / width, 1.0);
                 for arm in [&mut own, &mut direction] {
                     arm.holder[s][i] = Some(first + k);
                 }
