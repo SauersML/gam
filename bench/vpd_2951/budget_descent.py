@@ -786,9 +786,9 @@ def attn_v(l, h, pattern):
         # v_proj's leftover, gated on its own read at the key position, mixed by the pattern like any value.
         dv = residual(n, h).view(B_, T_, NH, HD).transpose(1, 2)                 # [B, H, T, HD]
         y = y + pattern @ dv
-    for b, A_, B_ in state['wedits_P'].get(n, ()):
+    for b, Ae, Be in state['wedits_P'].get(n, ()):
         # A weight edit of v_proj adds Delta W x to the values, which the pattern mixes like any value.
-        dv = ((h[b] @ B_) @ A_.T).view(T_, NH, HD).transpose(0, 1)               # [H, T, HD]
+        dv = ((h[b] @ Be) @ Ae.T).view(T_, NH, HD).transpose(0, 1)               # [H, T, HD]
         y = y.index_add(0, torch.tensor([b], device=y.device), (pattern[b] @ dv)[None])
     return y.transpose(1, 2).reshape(B_, T_, -1)
 
