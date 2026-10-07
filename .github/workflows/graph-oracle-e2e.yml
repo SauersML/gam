@@ -18,7 +18,7 @@ on:
 
 concurrency:
   group: graph-oracle-e2e-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false  # pushes come every few minutes: finish the running check, keep only the newest pending one
 
 permissions:
   contents: read
