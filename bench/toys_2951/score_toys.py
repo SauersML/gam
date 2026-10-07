@@ -15,6 +15,7 @@ TOY_DIR is a toy that train_toys.py wrote. A PARTS_DIR holds parts.json and its 
    "active": FILE,                optional: rows x parts hard gates on the held-out rows (the
                                   fitter's own; required for the transformer toys)
    "description_bits": float,     optional: the fitter's description length of P
+   "kept": [OPERATOR],            optional: operators P runs as M's own (not compared)
    "fitter": str}
 
 Every part is on at a row iff its gate z > 0 (H(0) = 0), read in P's own run. Operators no part
@@ -183,17 +184,20 @@ def numerical_rank(m: np.ndarray) -> int:
 
 def score(toy: Toy, parts: Parts, seed: int = 0) -> dict:
     fitted = [{op: parts.weight(p, op) for op in p["slices"]} for p in parts.parts]
+    # operators the explanation runs as M's own (`kept`) are not compared
+    kept = set(parts.record.get("kept", []))
+    deltas = [{op: d for op, d in m["deltas"].items() if op not in kept} for m in toy.mechanisms]
     # (a) recovery
     recovery, matched = [], set()
-    for m in toy.mechanisms:
-        cos = [cosine(m["deltas"], f) for f in fitted]
+    for m, delta in zip(toy.mechanisms, deltas):
+        cos = [cosine(delta, f) for f in fitted]
         b = int(np.argmax(cos)) if cos else -1
-        truth_rank = {op: numerical_rank(d) for op, d in m["deltas"].items()}
+        truth_rank = {op: numerical_rank(d) for op, d in delta.items()}
         part_rank = {op: parts.parts[b]["slices"][op][0].shape[1] for op in parts.parts[b]["slices"]} if b >= 0 else {}
         recovery.append({"mechanism": m["name"], "part": parts.parts[b]["name"] if b >= 0 else None, "cosine": cos[b] if b >= 0 else 0.0,
                          "rank_right": all(part_rank.get(op) == r for op, r in truth_rank.items()) and set(part_rank) == set(truth_rank)})
         matched.add(b)
-    best_for_part = [max((cosine(m["deltas"], f) for m in toy.mechanisms), default=0.0) for f in fitted]
+    best_for_part = [max((cosine(d, f) for d in deltas), default=0.0) for f in fitted]
     cosines = np.array([r["cosine"] for r in recovery])
     out = {
         "parts": len(parts.parts),
