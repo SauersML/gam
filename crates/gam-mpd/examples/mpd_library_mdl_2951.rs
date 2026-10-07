@@ -41,7 +41,9 @@
 //! effect at the edited token (`by_effect`: below 0.01, 0.01–0.1, 0.1–1 and above 1 bits), so a
 //! comparison can rest on the edits that change `M`. With `weights`, native weight edits of `M`'s
 //! maps follow (`weight_faithfulness`), compiled into `M` and into `P` through `P`'s owners
-//! (`gam_mpd::weight_edit`), reported under `weights`. The experiments are an immutable manifest
+//! (`gam_mpd::weight_edit`), reported under `weights`. With `adversarial`, pushes searched to
+//! maximize the gap against the scored explanation (`adversarial_search`), applied verbatim to both
+//! models, are reported under `adversarial` with their effect on `M`. The experiments are an immutable manifest
 //! (`Manifest`, `EditSettings::manifest`): drawn and written once, then scored as written by any
 //! binary, so explanations compare on the manifest file's SHA-256 (`manifest.sha256` in the
 //! report).
@@ -248,6 +250,19 @@ struct EditSettings {
     /// Native weight edits of `M`'s maps, scored after the operations (`weight_faithfulness`).
     #[serde(default)]
     weights: Option<WeightFamily>,
+    /// Adversarial pushes searched against the scored explanation (`adversarial_search`).
+    #[serde(default)]
+    adversarial: Option<AdversarialSettings>,
+}
+
+/// Adversarial pushes (`EditSettings::adversarial`): `searches` of them, each of `steps` steps
+/// estimating the gradient from `probes` directions.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdversarialSettings {
+    searches: usize,
+    steps: usize,
+    probes: usize,
 }
 
 /// Native weight edits (`EditSettings::weights`): `edits` of them, each drawn from the settings'
@@ -567,6 +582,16 @@ fn edit_faithfulness(
     for (_, batch, drawn, _) in &batches {
         responses.push(experiments.response(batch, drawn)?);
     }
+    // Adversarial pushes against P, searched before P stops applying edits; the drawn operations'
+    // directions are restored after.
+    let adversarial = match &settings.adversarial {
+        Some(family) => {
+            let found = adversarial_search(&mut experiments, &held_out[first..end], family, settings.seed, 2 * layers.len())?;
+            experiments.set_directions(interchange::DIRECTIONS, settings.seed);
+            Some(found)
+        }
+        None => None,
+    };
     // The edits' effect on M, KL(M_e ‖ M), over the same tokens: the same experiments with P = M
     // applying no edit.
     // The edit-ignoring baseline: P's clean prediction against M's edited outcome, KL(M_e ‖ P),
@@ -622,6 +647,24 @@ fn edit_faithfulness(
         }
     }
     std::fs::write(out.join(format!("EDITS_{}.experiments.jsonl", settings.name)), records).map_err(|e| e.to_string())?;
+    // Each adversarial push's effect on M, KL(M_e ‖ M), with P = M applying no edit.
+    let adversarial = match adversarial {
+        Some((mut searches, finals)) => {
+            for (record, (sequence, site, position, theta)) in searches.iter_mut().zip(finals) {
+                reference.set_push_directions(vec![theta]);
+                let batch = interchange::Batch::new(vec![held_out[first + sequence].clone()], vec![held_out[first + sequence].clone()])?;
+                let push = interchange::Experiment { base: 0, source: 0, explained: vec![true; 2 * layers.len()], patch: Some(interchange::Patch::Ops { family: interchange::Family::Push, ops: vec![interchange::SiteOp { site, operation: interchange::Operation::Push { direction: 0, size: 1 }, onward: false }] }), position };
+                let bits = &reference.evaluate(&batch, &[push], false)?.bits[0];
+                record["effect_bits_per_token"] = json!(bits.iter().sum::<f64>() / bits.len().max(1) as f64);
+            }
+            let mean = |key: &str| searches.iter().filter_map(|r| r[key].as_f64()).sum::<f64>() / searches.len().max(1) as f64;
+            Some(json!({
+                "random_bits_per_token": mean("random_bits_per_token"), "adversarial_bits_per_token": mean("adversarial_bits_per_token"),
+                "effect_bits_per_token": mean("effect_bits_per_token"), "searches": searches,
+            }))
+        }
+        None => None,
+    };
     drop(reference);
     let weights = match &settings.weights {
         Some(family) => {
@@ -674,6 +717,7 @@ fn edit_faithfulness(
         "seed": settings.seed,
         "manifest": manifest,
         "weights": weights,
+        "adversarial": adversarial,
         "device": device.name(),
         "source_revision": option_env!("GAM_BUILD_GIT_SHA"),
         "families": families,
@@ -749,6 +793,96 @@ fn weight_faithfulness(
         "ignoring_mean_bits_per_token": average("ignoring_mean_bits_per_token"), "response_mean_bits_per_token": average("response_mean_bits_per_token"),
         "records": records,
     }))
+}
+
+/// One adversarial search's record and its found push (its held-out sequence in the range, site,
+/// row and direction).
+type Found = (Vec<Value>, Vec<(usize, interchange::SharedSite, usize, Vec<f64>)>);
+
+/// Adversarial pushes against the explanation (`EditSettings::adversarial`), applied verbatim to `M`
+/// and `P` like every push: per search a held-out sequence of `rows`, a stream site and a row
+/// (after the first) drawn from `seed`, and a push of one typical norm at that row along a unit
+/// direction `θ`, started at a random one. Each step ascends the gap `KL(M_e ‖ P_e)` (bits per
+/// scored token) on the sphere of directions: its gradient there is estimated by central
+/// differences along `probes` random tangent directions `u` (`θ` turned by ±0.05 rad toward `u`),
+/// then `θ` turns toward the estimated gradient by the best of π/16, π/8, π/4 and π/2, kept only
+/// where it raises the gap. Every candidate is one experiment of a batch, scored by
+/// `Interchange::evaluate`, so each step's gradient comes through both models' own runs.
+fn adversarial_search(experiments: &mut interchange::Interchange, rows: &[Vec<u32>], family: &AdversarialSettings, seed: u64, blocks: usize) -> Result<Found, String> {
+    use rand::RngExt;
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed ^ 0x4144_5645_5253);
+    let width = experiments.push_directions().first().map(Vec::len).ok_or("edits: no pushed directions")?;
+    let streams: Vec<interchange::SharedSite> = experiments.shared_sites().into_iter().filter(|s| matches!(s, interchange::SharedSite::Stream(_))).collect();
+    let length = rows.first().map(Vec::len).ok_or("edits: no rows to search on")?;
+    if streams.is_empty() || length < 2 {
+        return Err("edits: no stream site or row to push".into());
+    }
+    let unit = |v: Vec<f64>| -> Vec<f64> {
+        let norm = v.iter().map(|x| x * x).sum::<f64>().sqrt();
+        v.into_iter().map(|x| x / norm).collect()
+    };
+    let normal = |rng: &mut rand::rngs::StdRng| -> Vec<f64> {
+        (0..width)
+            .map(|_| {
+                let (a, b): (f64, f64) = (rng.random::<f64>().max(f64::MIN_POSITIVE), rng.random());
+                (-2.0 * a.ln()).sqrt() * (std::f64::consts::TAU * b).cos()
+            })
+            .collect()
+    };
+    let turn = |t: &[f64], u: &[f64], angle: f64| -> Vec<f64> { t.iter().zip(u).map(|(x, y)| angle.cos() * x + angle.sin() * y).collect() };
+    let (mut records, mut finals) = (Vec::new(), Vec::new());
+    for search in 0..family.searches {
+        let sequence = rng.random_range(0..rows.len());
+        let site = streams[rng.random_range(0..streams.len())];
+        let position = rng.random_range(1..length);
+        let batch = interchange::Batch::new(vec![rows[sequence].clone()], vec![rows[sequence].clone()])?;
+        let score = |experiments: &mut interchange::Interchange, candidates: Vec<Vec<f64>>| -> Result<Vec<f64>, String> {
+            let count = candidates.len();
+            experiments.set_push_directions(candidates);
+            let drawn: Vec<interchange::Experiment> = (0..count)
+                .map(|c| interchange::Experiment { base: 0, source: 0, explained: vec![true; blocks], patch: Some(interchange::Patch::Ops { family: interchange::Family::Push, ops: vec![interchange::SiteOp { site, operation: interchange::Operation::Push { direction: c, size: 1 }, onward: false }] }), position })
+                .collect();
+            Ok(experiments.evaluate(&batch, &drawn, false)?.bits.iter().map(|b| b.iter().sum::<f64>() / b.len().max(1) as f64).collect())
+        };
+        let mut theta = unit(normal(&mut rng));
+        let mut current = score(experiments, vec![theta.clone()])?[0];
+        let start = current;
+        let mut path = vec![current];
+        for _ in 0..family.steps {
+            let delta = 0.05;
+            let probes: Vec<Vec<f64>> = (0..family.probes)
+                .map(|_| {
+                    let u = normal(&mut rng);
+                    let along = u.iter().zip(&theta).map(|(a, b)| a * b).sum::<f64>();
+                    unit(u.iter().zip(&theta).map(|(a, b)| a - along * b).collect())
+                })
+                .collect();
+            let candidates: Vec<Vec<f64>> = probes.iter().flat_map(|u| [turn(&theta, u, delta), turn(&theta, u, -delta)]).collect();
+            let f = score(experiments, candidates)?;
+            let mut g = vec![0.0; width];
+            for (j, u) in probes.iter().enumerate() {
+                let slope = (f[2 * j] - f[2 * j + 1]) / (2.0 * delta);
+                g.iter_mut().zip(u).for_each(|(gk, uk)| *gk += slope * uk);
+            }
+            if g.iter().all(|v| *v == 0.0) {
+                break;
+            }
+            let ascent = unit(g);
+            let turns: Vec<Vec<f64>> = [16.0, 8.0, 4.0, 2.0].iter().map(|k| turn(&theta, &ascent, std::f64::consts::PI / k)).collect();
+            let f = score(experiments, turns.clone())?;
+            if let Some((best, value)) = f.iter().copied().enumerate().max_by(|a, b| a.1.total_cmp(&b.1))
+                && value > current
+            {
+                theta = turns[best].clone();
+                current = value;
+            }
+            path.push(current);
+        }
+        log::info!("edits: adversarial search {search}: {start:.4} → {current:.4} bits per token at {site:?}, row {position}");
+        records.push(json!({"sequence": sequence, "site": site, "position": position, "random_bits_per_token": start, "adversarial_bits_per_token": current, "path": path}));
+        finals.push((sequence, site, position, theta));
+    }
+    Ok((records, finals))
 }
 
 fn save(path: &Path, value: &Value) -> Result<(), String> {

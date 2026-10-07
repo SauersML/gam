@@ -2936,6 +2936,12 @@ impl Interchange {
                 v.into_iter().map(|x| x / norm).collect()
             })
             .collect();
+        self.set_push_directions(directions);
+    }
+
+    /// `directions` as the directions [`Operation::Push`] adds (index `i` the `i`-th), the same for
+    /// every model: an adversarial search's candidates.
+    pub fn set_push_directions(&mut self, directions: Vec<Vec<f64>>) {
         let directions = Arc::new(directions);
         for sites in [&mut self.m_sites, &mut self.p_sites] {
             let mut next = (**sites).clone();
