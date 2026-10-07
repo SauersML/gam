@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 
 parts_cols = ["toy / explanation", "parts", "recovered/known", "mean cos", "norm ratio", "rank right", "distinct", "spurious",
-              "active P/truth", "gate prec/rec", "P/M bits"]
+              "active P/truth", "gate prec/rec", "effect covered/on", "P/M bits"]
 edit_cols = ["toy / explanation", "clean gap", "gap swap/zero/scale/push", "effect swap/zero/scale/push"]
 parts_rows, edit_rows = [], []
 for f in sys.argv[1:]:
@@ -33,6 +33,7 @@ for f in sys.argv[1:]:
         str(r["parts_matching_no_mechanism_cos_0.5"]),
         f"{a.get('P_active_per_token', float('nan')):.2f}/{a.get('truth_active_per_token', float('nan')):.2f}",
         f"{a.get('matched_gate_precision', float('nan')):.2f}/{a.get('matched_gate_recall', float('nan')):.2f}",
+        f"{a.get('matched_effect_covered', float('nan')):.2f}/{a.get('matched_on_rate', float('nan')):.2f}",
         f"{d['P_bits'] / d['M_bits']:.2f}",
     ])
 for cols, rows in [(parts_cols, parts_rows), (edit_cols, edit_rows)]:

@@ -25,7 +25,9 @@ PARTS_DIR, as JSON on stdout and in PARTS_DIR/SCORE_<toy>.json:
      mechanism's (SPD's ML2R for a whole part), and whether its rank on each operator equals the
      mechanism's; distinct parts matched; parts matching no mechanism.
  (b) active parts per token against the mechanisms' (truth_active), and per recovered mechanism the
-     agreement of its part's gate with its activity (precision, recall).
+     agreement of its part's gate with its activity (precision, recall) and, where the toy has its
+     mechanisms' measured effect per token (truth_effect), the share of that effect on the tokens
+     its gate is on and the share of tokens it is on.
  (c) description: P's parameters and bits (the fitter's description_bits when given, else 32 bits
      per parameter) against M's parameters of the decomposed maps at 32 bits.
 Held-out verbatim edits are the engine's (engine_edits.py), on the same explanation.
@@ -59,6 +61,8 @@ class Toy:
         self.operators = [n for n in blocks if np.any(self.weight(n))]
         self.mechanisms = [{**m, "deltas": {op: load(dir_, e) for op, e in m["operators"].items()}} for m in self.truth["mechanisms"]]
         self.active = load(dir_, self.truth["active"]).astype(bool)
+        # each mechanism's measured effect per token (train_toys.py effects:TOY), when written
+        self.effect = load(dir_, self.truth["effect"]) if "effect" in self.truth else None
         self.m_params = sum(int(np.prod(self.shapes[op])) for op in self.operators)
 
     def weight(self, op: str) -> np.ndarray:
@@ -149,6 +153,15 @@ def score(toy: Toy, parts: Parts) -> dict:
     if agree:
         act["matched_gate_precision"] = float(np.mean([a[0] for a in agree]))
         act["matched_gate_recall"] = float(np.mean([a[1] for a in agree]))
+    # Against the measured effect: per recovered mechanism, the share of its effect on the tokens
+    # its part's gate is on, and the share of tokens it is on (the truth's on/off is not used).
+    if toy.effect is not None:
+        effect = toy.effect[:rows]
+        covered = [(float(effect[gates[:, r["part"]], i].sum() / max(effect[:, i].sum(), 1e-300)), float(gates[:, r["part"]].mean()))
+                   for i, r in enumerate(recovery) if r["cosine"] >= 0.9]
+        if covered:
+            act["matched_effect_covered"] = float(np.mean([c[0] for c in covered]))
+            act["matched_on_rate"] = float(np.mean([c[1] for c in covered]))
     out["activity"] = act
     return out
 

@@ -534,9 +534,67 @@ def finish(out: Path, files: dict, record: dict, mechanisms: list, active: np.nd
     print(f"wrote {out}: {len(mechanisms)} mechanisms", flush=True)
 
 
+def effects(out: Path):
+    """Each known mechanism's measured effect per held-out token: KL(M || M without it), in bits,
+    M without it being M's weights less the mechanism's deltas on every operator it spans (for a
+    real-valued toy, of the Gaussian predictive distributions in units of the task residual).
+    Written as truth_effect.f64 (tokens x mechanisms), beside truth_active.f64: a gate is graded
+    by the share of a mechanism's effect it covers, with no line drawn between active and not."""
+    record = json.loads((out / "export.json").read_text())
+    truth = json.loads((out / "truth.json").read_text())
+    rows = truth["active"]["shape"][0]
+    deltas = [{op: np.fromfile(out / e["file"], dtype="<f8").reshape(e["shape"]) for op, e in m["operators"].items()} for m in truth["mechanisms"]]
+    W = {k: np.fromfile(out / f"{k}.f64", dtype="<f8").reshape(v["shape"]) for k, v in record["files"].items() if k != "tokens"}
+    if "real_valued" in record:
+        c = record["config"]
+        stream = W["wte"][:rows]
+
+        def outputs(weights):
+            r = stream
+            for l in range(c["n_layers"]):
+                if any(np.any(weights[f"blocks.{l}.attn.{k}_proj"]) for k in "qkvo"):
+                    raise SystemExit("a real-valued toy's attention is zero")
+                pre = r @ weights[f"blocks.{l}.mlp.c_fc"].T
+                r = r + (np.maximum(pre, 0.0) if c["mlp_act"] == "relu" else pre) @ weights[f"blocks.{l}.mlp.down_proj"].T
+            y = r @ weights["gaussian_head"].T + (weights["gaussian_head.bias"][0] if "gaussian_head.bias" in weights else 0.0)
+            return np.maximum(y, 0.0) if c["head"]["relu"] else y
+
+        base = outputs(W)
+        effect = np.stack([((base - outputs({k: v - d.get(k, 0.0) for k, v in W.items()})) ** 2).sum(1) / (2 * math.log(2)) for d in deltas], 1)
+    else:
+        mlp_on = any(np.any(W[f"blocks.{l}.mlp.c_fc"]) for l in range(record["config"]["n_layers"]))
+        model, _, tokens = load_lm(out, mlp_on=mlp_on)
+        T = tokens.shape[1]
+        held = tokens[: rows // T]
+        names = {"wte": lambda m: m.wte, "lm_head": lambda m: m.lm_head}
+        for l in range(record["config"]["n_layers"]):
+            for name, get in [("attn.q_proj", lambda m, l=l: m.q[l]), ("attn.k_proj", lambda m, l=l: m.k[l]), ("attn.v_proj", lambda m, l=l: m.v[l]),
+                              ("attn.o_proj", lambda m, l=l: m.o[l]), ("mlp.c_fc", lambda m, l=l: m.up[l]), ("mlp.down_proj", lambda m, l=l: m.down[l])]:
+                names[f"blocks.{l}.{name}"] = get
+        with torch.no_grad():
+            base = torch.log_softmax(model(held).double(), -1)
+            effect = []
+            for d in deltas:
+                saved = {op: names[op](model).detach().clone() for op in d}
+                for op, delta in d.items():
+                    names[op](model).sub_(torch.tensor(delta, dtype=names[op](model).dtype))
+                lp = torch.log_softmax(model(held).double(), -1)
+                effect.append(((base.exp() * (base - lp)).sum(-1).reshape(-1) / math.log(2)).numpy())
+                for op, value in saved.items():
+                    names[op](model).copy_(value)
+            effect = np.stack(effect, 1)
+    effect.astype("<f8").tofile(out / "truth_effect.f64")
+    truth["effect"] = {"file": "truth_effect.f64", "shape": list(effect.shape)}
+    (out / "truth.json").write_text(json.dumps(truth, indent=1))
+    print(f"{out}: mean effect per mechanism {np.round(effect.mean(0), 4).tolist()[:12]}", flush=True)
+
+
 if __name__ == "__main__":
     # TOY or TOY@sSEED (a further seed of the toy, written to TOY_sSEED)
     toy, root = sys.argv[1], Path(sys.argv[2])
+    if toy.startswith("effects:"):
+        effects(root / toy[8:])
+        sys.exit(0)
     if toy == "truth:modadd_113":
         # a trained export whose truth was not written: its record, rows and truth again (the
         # split is the training's, from the same seed)
