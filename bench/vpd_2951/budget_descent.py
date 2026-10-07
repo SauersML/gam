@@ -420,14 +420,14 @@ def make(n):
         if state['mode'] == 'M':
             return x @ st.W.T
         c = x @ p['V']
-        un = p['U'].norm(dim=1)
+        un = un0 = p['U'].norm(dim=1)
         for b, kind, G, a in state['entry'].get(n, ()):
             if kind == 'in':
                 # Input coordinates G of every part's read scaled by 1 + a.
                 c = c.index_add(0, torch.tensor([b], device=c.device), (a * (x[b][..., G] @ p['V'][G]))[None])
             else:
                 # Every part's write norm with output coordinates G scaled (its own read is |c| ||u||).
-                un_b = (un.pow(2) + ((1 + a) ** 2 - 1) * p['U'][:, G].pow(2).sum(1)).clamp_min(0).sqrt()
+                un_b = (un0.pow(2) + ((1 + a) ** 2 - 1) * p['U'][:, G].pow(2).sum(1)).clamp_min(0).sqrt()
                 un = un.expand(c.shape[0], 1, -1).clone() if un.dim() == 1 else un
                 un[b] = un_b
         if state['mode'] == 'all':
