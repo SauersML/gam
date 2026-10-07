@@ -567,7 +567,7 @@ fn main() -> Result<(), String> {
                     Some(Patch::Read { .. }) => 0,
                     Some(Patch::Reads { .. }) => 1,
                     // The battery draws no edits of parts.
-                    Some(Patch::Ops { .. }) => continue,
+                    Some(Patch::Ops { .. } | Patch::Weights { .. }) => continue,
                 };
                 per_source[family][s].0 += bits.iter().sum::<f64>();
                 per_source[family][s].1 += bits.len();

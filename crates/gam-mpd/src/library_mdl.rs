@@ -2347,13 +2347,42 @@ impl Scorer {
 
     /// With push among the families, the scorer with the pushed directions set from the seed and
     /// each shared site's typical norm measured on `M`'s runs of the first batch of the training
-    /// `sequences` (the unit of a push's size, the same for every explanation and fit).
-    fn prepared(mut self, sequences: &[Vec<u32>], settings: &Settings) -> Result<Self, String> {
+    /// `sequences` (the unit of a push's size, the same for every explanation and fit). With weight
+    /// edits among them, the table they draw from: [`WEIGHT_CANDIDATES`] native edits of `M`
+    /// (`weight_edit::candidates`, random ones sized on the same batch's inputs), each measured on
+    /// `M` alone on the first [`WEIGHT_SCREEN`] training sequences (`KL(M_e ‖ M)` per token), and
+    /// [`WEIGHT_EDITS`] of them kept stratified by that effect (`weight_edit::stratified`, bins at
+    /// `weight_edit::EFFECT_EDGES`), so edits that move `M` much are as common as those that
+    /// barely do. The table depends on `M`, the seed and the sequences alone: every explanation
+    /// faces the same edits.
+    fn prepared(mut self, native: &OperatorProgram, sequences: &[Vec<u32>], settings: &Settings) -> Result<Self, String> {
+        let n = settings.batch_sequences.min(sequences.len());
+        let batch = Batch::new(sequences[..n].to_vec(), sequences[..n].to_vec())?;
         if self.families.contains(&interchange::Family::Push) {
-            let n = settings.batch_sequences.min(sequences.len());
-            let batch = Batch::new(sequences[..n].to_vec(), sequences[..n].to_vec())?;
             self.experiments.set_directions(interchange::DIRECTIONS, settings.seed);
             self.experiments.measure_typical(&batch)?;
+        }
+        if self.families.contains(&interchange::Family::Weight) {
+            let started = Instant::now();
+            let inputs = self.experiments.matrix_inputs(&batch, WEIGHT_INPUT_ROWS)?;
+            let mut drawn = crate::weight_edit::candidates(native, &inputs, settings.seed, WEIGHT_CANDIDATES)?;
+            self.experiments.set_weight_edits(drawn.clone())?;
+            let k = WEIGHT_SCREEN.min(sequences.len());
+            let screen = Batch::new(sequences[..k].to_vec(), sequences[..k].to_vec())?;
+            let all: Vec<usize> = (0..drawn.len()).collect();
+            for chunk in all.chunks(WEIGHT_SCREEN_CHUNK) {
+                for (i, effect) in chunk.iter().zip(self.experiments.weight_effects(&screen, chunk)?) {
+                    drawn[*i].effect = Some(effect);
+                }
+            }
+            let kept = crate::weight_edit::stratified(drawn, WEIGHT_EDITS, &crate::weight_edit::EFFECT_EDGES)?;
+            let mut census: BTreeMap<String, usize> = BTreeMap::new();
+            for d in &kept {
+                let bin = crate::weight_edit::EFFECT_EDGES.iter().filter(|e| d.effect.unwrap_or(0.0) >= **e).count();
+                *census.entry(format!("{:?} bin {bin}", d.kind)).or_default() += 1;
+            }
+            log::info!("library weight edits: {} of {WEIGHT_CANDIDATES} candidates kept, {census:?}; {:.1} s", kept.len(), started.elapsed().as_secs_f64());
+            self.experiments.set_weight_edits(kept)?;
         }
         Ok(self)
     }
@@ -2995,6 +3024,16 @@ fn factor_half(key: u64) -> bool {
 /// 0–2 (it measured B ≈ 145 batches, β₁ = 0.986).
 const MOMENTUM_DECAY: f64 = 0.99;
 
+/// The native weight edits a fit with weight edits among its families draws from
+/// (`Scorer::prepared`): the candidates drawn, the edits kept, the rows of each matrix's inputs a
+/// random edit is sized on, the sequences each candidate's effect is measured on, and the
+/// candidates measured per evaluation.
+const WEIGHT_CANDIDATES: usize = 1024;
+const WEIGHT_EDITS: usize = 256;
+const WEIGHT_INPUT_ROWS: usize = 512;
+const WEIGHT_SCREEN: usize = 2;
+const WEIGHT_SCREEN_CHUNK: usize = 32;
+
 /// A running mean of bits over scored tokens.
 #[derive(Clone, Copy, Debug, Default)]
 struct Mean {
@@ -3090,7 +3129,7 @@ fn held_out_on(
                     match patch {
                         Patch::Read { .. } => read.add(bits),
                         Patch::Reads { .. } => joint.add(bits),
-                        Patch::Ops { .. } => {}
+                        Patch::Ops { .. } | Patch::Weights { .. } => {}
                     }
                 }
             }
@@ -4067,7 +4106,7 @@ pub fn fit_from(
     if draws.len() < 2 {
         return Err("the convergence test needs at least two training batches".into());
     }
-    let mut scorer = Scorer::new(device, native, explanation, settings)?.prepared(sequences, settings)?;
+    let mut scorer = Scorer::new(device, native, explanation, settings)?.prepared(native, sequences, settings)?;
     // The fixed collection: its scored tokens N and its realized families.
     let (mut tokens, mut families) = (0, BTreeMap::new());
     for draw in &draws {
@@ -4994,7 +5033,7 @@ pub fn removal_step(device: &Device, native: &OperatorProgram, explanation: &Exp
     settings.validate()?;
     let length = sequences.first().map_or(0, Vec::len);
     let draws = draws(sequences.len(), settings.batch_sequences, settings.seed)?;
-    let mut scorer = Scorer::new(device, native, explanation, settings)?.prepared(sequences, settings)?;
+    let mut scorer = Scorer::new(device, native, explanation, settings)?.prepared(native, sequences, settings)?;
     let mut tokens = 0;
     for draw in &draws {
         tokens += scorer.experiments(draw, sequences)?.iter().map(|e| length - e.position).sum::<usize>();
@@ -5018,7 +5057,7 @@ pub fn start_posterior(device: &Device, native: &OperatorProgram, explanation: &
     settings.validate()?;
     let length = sequences.first().map_or(0, Vec::len);
     let draws = draws(sequences.len(), settings.batch_sequences, settings.seed)?;
-    let mut scorer = Scorer::new(device, native, explanation, settings)?.prepared(sequences, settings)?;
+    let mut scorer = Scorer::new(device, native, explanation, settings)?.prepared(native, sequences, settings)?;
     let mut tokens = 0;
     for draw in &draws {
         tokens += scorer.experiments(draw, sequences)?.iter().map(|e| length - e.position).sum::<usize>();
@@ -5061,7 +5100,7 @@ pub fn removal_replay(device: &Device, native: &OperatorProgram, explanation: &E
     settings.validate()?;
     let length = sequences.first().map_or(0, Vec::len);
     let draws = draws(sequences.len(), settings.batch_sequences, settings.seed)?;
-    let mut scorer = Scorer::new(device, native, explanation, settings)?.prepared(sequences, settings)?;
+    let mut scorer = Scorer::new(device, native, explanation, settings)?.prepared(native, sequences, settings)?;
     let mut tokens = 0;
     for draw in &draws {
         tokens += scorer.experiments(draw, sequences)?.iter().map(|e| length - e.position).sum::<usize>();
@@ -5091,7 +5130,7 @@ pub fn removal_changes(device: &Device, native: &OperatorProgram, explanation: &
     settings.validate()?;
     let length = sequences.first().map_or(0, Vec::len);
     let draws = draws(sequences.len(), settings.batch_sequences, settings.seed)?;
-    let mut scorer = Scorer::new(device, native, explanation, settings)?.prepared(sequences, settings)?;
+    let mut scorer = Scorer::new(device, native, explanation, settings)?.prepared(native, sequences, settings)?;
     let mut tokens = 0;
     for draw in &draws {
         tokens += scorer.experiments(draw, sequences)?.iter().map(|e| length - e.position).sum::<usize>();
@@ -6761,7 +6800,7 @@ mod tests {
         let settings = Settings { families: vec![Family::Read, Family::Swap, Family::Zero, Family::Scale, Family::Push, Family::Cut], epochs: Some(2), ..settings() };
         let device = Device::host();
         let (train, held) = sequences.split_at(4);
-        let scorer = Scorer::new(&device, &native, &explanation, &settings).unwrap().prepared(train, &settings).unwrap();
+        let scorer = Scorer::new(&device, &native, &explanation, &settings).unwrap().prepared(&native, train, &settings).unwrap();
         let mut kinds = (0, 0);
         for draw in draws(train.len(), settings.batch_sequences, settings.seed).unwrap() {
             let experiments = scorer.experiments(&draw, train).unwrap();

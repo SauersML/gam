@@ -1978,6 +1978,7 @@ impl Experiment {
                 interchange::Family::Push => "site_push",
                 interchange::Family::Cut => "site_cut",
                 interchange::Family::Read => "site_read",
+                interchange::Family::Weight => "site_weight",
             },
         }
     }

@@ -542,6 +542,7 @@ fn edit_faithfulness(
         Some(interchange::Patch::Ops { family: interchange::Family::Scale, .. }) => "scale",
         Some(interchange::Patch::Ops { family: interchange::Family::Push, .. }) => "push",
         Some(interchange::Patch::Ops { family: interchange::Family::Cut, .. }) => "cut",
+        Some(interchange::Patch::Weights { .. }) => "weight",
         Some(_) => "read",
     };
     // Per family: every scored token's bits, the edited tokens' bits, and the experiments.

@@ -338,6 +338,10 @@ pub enum Patch {
     /// Operations on sites every explanation shares with `M` ([`SiteOp`]), applied verbatim to both
     /// models, drawn as `family` draws them; a swap reads the experiment's source sequence.
     Ops { family: Family, ops: Vec<SiteOp> },
+    /// The native weight edit `edit` of the table [`Interchange::set_weight_edits`] holds, at
+    /// every row from the experiment's position on, its matrices all in block `block`: each model
+    /// adds `ΔW·x` at its uses of each edited matrix ([`MatrixUse`]).
+    Weights { edit: usize, block: usize },
 }
 
 /// A site every explanation shares with `M`, each model holding it at its own node: the stream
@@ -413,7 +417,7 @@ impl Patch {
         match self {
             Self::Read { variable } => std::slice::from_ref(variable),
             Self::Reads { variables } => variables,
-            Self::Ops { .. } => &[],
+            Self::Ops { .. } | Self::Weights { .. } => &[],
         }
     }
 }
@@ -496,7 +500,7 @@ pub fn draw_site_ops(rng: &mut impl RngExt, family: Family, length: usize, share
             Family::Push => !matches!(s, SharedSite::Head(_)) && typical.contains_key(s),
             // A cut starts at an attention's or an MLP's output before the last block.
             Family::Cut => matches!(s, SharedSite::Attention(_) | SharedSite::Mlp(_)) && s.block(head_blocks).is_some_and(|b| b + 1 < blocks),
-            Family::Read => false,
+            Family::Read | Family::Weight => false,
         })
         .collect();
     if sites.is_empty() || length == 0 || (family == Family::Push && directions == 0) {
@@ -533,7 +537,7 @@ pub fn draw_site_ops(rng: &mut impl RngExt, family: Family, length: usize, share
                 }
                 continue;
             }
-            Family::Read => return Err(error("a read patch is not an operation on a site")),
+            Family::Read | Family::Weight => return Err(error(format!("{family:?}: not an operation on a site"))),
         };
         ops.push(SiteOp { site: *site, operation, onward });
     }
@@ -553,6 +557,8 @@ pub enum Family {
     Scale,
     Push,
     Cut,
+    /// Native weight edits ([`Patch::Weights`]), drawn from [`Interchange::set_weight_edits`]'s table.
+    Weight,
 }
 
 /// Where a model applies edits of parts: per block, for an MLP block, the node its parts read
@@ -575,6 +581,98 @@ pub struct PartSites {
     /// ([`Interchange::set_directions`]), the same for every model.
     typical: Arc<BTreeMap<SharedSite, f64>>,
     directions: Arc<Vec<Vec<f64>>>,
+    /// Per native matrix (by `M`'s operator name) where the model applies an edit of it
+    /// ([`matrix_uses`]), and the native weight edits experiments draw from
+    /// ([`Interchange::set_weight_edits`]), the same for every model.
+    matrices: Arc<BTreeMap<String, Vec<MatrixUse>>>,
+    weights: Arc<Vec<crate::weight_edit::Drawn>>,
+}
+
+/// Where a model applies a native weight edit of one block of one of `M`'s matrices: the node
+/// holding the map's input and the node its output adds into (an affine node), the native block's
+/// rows and columns, the columns of the output and of the input they sit at, the nodes' widths,
+/// whether the model holds the block transposed (its output then indexed by the native columns),
+/// and the factor the edit is divided by (the product of an owner's scalar factors). The edit's
+/// block `ΔB` joins the output as the term `ΔB·x` on the input, at every row the edit covers.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MatrixUse {
+    pub input: usize,
+    pub output: usize,
+    pub native_rows: Range<usize>,
+    pub native_cols: Range<usize>,
+    pub out_at: usize,
+    pub in_at: usize,
+    pub widths: (usize, usize),
+    pub transposed: bool,
+    pub factor: f64,
+}
+
+/// Per native matrix (by name) the uses of its blocks in `artifact`, whose flat program is `flat`
+/// (`mapped_inlined`), for the edits of [`Patch::Weights`]: every node of `flat` applying an
+/// operator named as one of `M`'s (`native`'s) of the same shape, and every owner's block
+/// (`Artifact::owners`): an operator's, at each node of its rule body applying it, or a summed
+/// block's, at its use's input and output nodes (`Owner::uses`). A matrix the artifact holds no
+/// block of has no use: an edit of it changes `M` alone.
+pub fn matrix_uses(native: &OperatorProgram, artifact: &Artifact, flat: &OperatorProgram) -> Result<BTreeMap<String, Vec<MatrixUse>>, String> {
+    let shapes: HashMap<&str, (usize, usize)> = native.operators.iter().map(|op| (op.name.as_str(), (op.rows.width(), op.cols.width()))).collect();
+    let interfaces = flat.interfaces().map_err(error)?;
+    let width = |n: usize| interfaces.get(n).map(|i| i.width()).ok_or_else(|| error("a matrix use outside the program"));
+    let owned: BTreeSet<&str> = artifact.owners.iter().map(|o| o.operator.as_str()).collect();
+    let mut out: BTreeMap<String, Vec<MatrixUse>> = BTreeMap::new();
+    for (n, node) in flat.nodes.iter().enumerate() {
+        let Node::Affine { terms, .. } = node else { continue };
+        for (input, op) in terms {
+            let o = &flat.operators[*op];
+            let shape = (o.rows.width(), o.cols.width());
+            if owned.contains(o.name.as_str()) || shapes.get(o.name.as_str()) != Some(&shape) {
+                continue;
+            }
+            out.entry(o.name.clone()).or_default().push(MatrixUse { input: *input, output: n, native_rows: 0..shape.0, native_cols: 0..shape.1, out_at: 0, in_at: 0, widths: (width(n)?, width(*input)?), transposed: false, factor: 1.0 });
+        }
+    }
+    let program = &artifact.program;
+    let named: BTreeMap<&str, usize> = program.operators.iter().enumerate().map(|(i, op)| (op.name.as_str(), i)).collect();
+    // Per owner's use: the observation paths of its input and output nodes.
+    let mut found: Vec<(&crate::artifact::Owner, f64)> = Vec::new();
+    let mut paths: Vec<Vec<usize>> = Vec::new();
+    for owner in &artifact.owners {
+        if !shapes.contains_key(owner.native.as_str()) {
+            continue;
+        }
+        let call = invocation(program, &owner.body, &owner.site)?;
+        let body = call.last().and_then(|n| call_rule(program, &call[..call.len() - 1], *n)).ok_or_else(|| error(format!("{}: no rule {}", owner.site, owner.body)))?;
+        let factor = crate::weight_edit::scalar_factor(artifact, owner)?;
+        let at = |node: usize| -> Vec<usize> { call.iter().copied().chain([node]).collect() };
+        match owner.uses {
+            Some((input, output)) => {
+                found.push((owner, factor));
+                paths.extend([at(input), at(output)]);
+            }
+            None => {
+                let op = *named.get(owner.operator.as_str()).ok_or_else(|| error(format!("{}: no operator {}", owner.site, owner.operator)))?;
+                for (n, node) in program.rules[body].nodes.iter().enumerate() {
+                    let Node::Affine { terms, .. } = node else { continue };
+                    for (input, _) in terms.iter().filter(|t| t.1 == op) {
+                        found.push((owner, factor));
+                        paths.extend([at(*input), at(n)]);
+                    }
+                }
+            }
+        }
+    }
+    if paths.is_empty() {
+        return Ok(out);
+    }
+    let (observing, _, observed) = mapped_inlined_observed(program, &paths)?;
+    if observing.nodes.len() != flat.nodes.len() || observed.len() != paths.len() {
+        return Err(error("the observed program differs from the flat program"));
+    }
+    for ((owner, factor), pair) in found.into_iter().zip(observed.chunks(2)) {
+        let (input, output) = (pair[0], pair[1]);
+        let use_of = MatrixUse { input, output, native_rows: owner.native_rows.clone(), native_cols: owner.native_cols.clone(), out_at: owner.rows.start, in_at: owner.cols.start, widths: (width(output)?, width(input)?), transposed: owner.transposed, factor };
+        out.entry(owner.native.clone()).or_default().push(use_of);
+    }
+    Ok(out)
 }
 
 /// A block's input norm `N(s) = γ ⊙ s · (mean(s²) + ε)^{-1/2} + β` of the stream `s` entering it
@@ -712,6 +810,9 @@ impl Experiment {
         if let Patch::Ops { ops, .. } = patch {
             return ops.iter().map(|o| o.site.block(heads)).min().flatten().map(Some).ok_or_else(|| error("operations of no site"));
         }
+        if let Patch::Weights { block, .. } = patch {
+            return Ok(Some(*block));
+        }
         let chosen = patch.variables();
         let block = |i: &usize| values.get(*i).map(|v| v.block).ok_or_else(|| error("a patch of an unknown variable"));
         let first = block(chosen.first().ok_or_else(|| error("a joint read patch of no variable"))?)?;
@@ -801,7 +902,7 @@ pub fn subset(rng: &mut impl RngExt, candidates: &[usize]) -> Vec<usize> {
 /// The realized count of each family among `experiments`: clean with `P` alone, clean under a
 /// hybrid, single read patches of attention and of MLP variables, and joint read patches.
 pub fn census(experiments: &[Experiment], variables: &[ReadVariable]) -> BTreeMap<&'static str, usize> {
-    let mut counts: BTreeMap<&'static str, usize> = ["clean_alone", "clean_hybrid", "read_attention", "read_mlp", "read_joint", "swap", "zero", "scale", "push", "cut"].into_iter().map(|k| (k, 0)).collect();
+    let mut counts: BTreeMap<&'static str, usize> = ["clean_alone", "clean_hybrid", "read_attention", "read_mlp", "read_joint", "swap", "zero", "scale", "push", "cut", "weight"].into_iter().map(|k| (k, 0)).collect();
     for e in experiments {
         let family = match &e.patch {
             None if e.explained.iter().all(|x| *x) => "clean_alone",
@@ -815,6 +916,7 @@ pub fn census(experiments: &[Experiment], variables: &[ReadVariable]) -> BTreeMa
             Some(Patch::Ops { family: Family::Push, .. }) => "push",
             Some(Patch::Ops { family: Family::Cut, .. }) => "cut",
             Some(Patch::Ops { .. }) => "ops",
+            Some(Patch::Weights { .. }) => "weight",
         };
         *counts.entry(family).or_default() += 1;
     }
@@ -1121,6 +1223,45 @@ pub struct Edits {
     probes: BTreeMap<usize, Vec<(usize, usize, usize)>>,
     cuts: BTreeMap<usize, CutReads>,
     recorded: Option<Records>,
+    /// Native weight edits by the node their terms add to ([`MatrixUse`]), and per input node of
+    /// a term the cotangents the terms carry back to it in a reverse pass (which reaches a term's
+    /// output before its input).
+    weights: BTreeMap<usize, Vec<WeightTerm>>,
+    carried: RefCell<BTreeMap<usize, Vec<(Vec<usize>, Tensor)>>>,
+}
+
+/// One edit's term `x R Wᵀ` at a matrix use's output, `x` the use's input at the call's rows
+/// `rows`: `R` (input width × rank) holds the edit's input-side factor at the use's input columns
+/// and `W` (output width × rank) its output-side factor at the output columns, divided by the
+/// use's factor, both zero elsewhere.
+struct WeightTerm {
+    input: usize,
+    rows: Vec<usize>,
+    read: Tensor,
+    write: Tensor,
+}
+
+/// `added` (one row per entry of `rows`, distinct) added to the rows `rows` of `t`, on the device.
+fn add_device_rows(d: &Device, t: &mut Tensor, rows: &[usize], added: &Tensor) -> Result<(), String> {
+    let ranges = single(rows.iter().copied());
+    let mut h = d.gather_ranges(t, &ranges).map_err(error)?;
+    d.axpy(&mut h, 1.0, added).map_err(error)?;
+    d.scatter_ranges(t, &ranges, &h).map_err(error)
+}
+
+/// The arithmetic of a device's products, as [`Interchange::new`] sets the models'.
+fn arithmetic_of(d: &Device) -> Arithmetic {
+    if d.float64() { Arithmetic::F64 } else { Arithmetic::F32 }
+}
+
+/// `x R Wᵀ` for `x` the rows `rows` of `input` (`R`, `W` a [`WeightTerm`]'s factors).
+fn weight_term(d: &Device, input: &Tensor, rows: &[usize], read: &Tensor, write: &Tensor) -> Result<Tensor, String> {
+    let x = d.gather_ranges(input, &single(rows.iter().copied())).map_err(error)?;
+    let mut low = d.empty(rows.len(), read.cols()).map_err(error)?;
+    d.gemm(&mut low, 1.0, &x, Op::N, read, Op::N, 0.0, arithmetic_of(d)).map_err(error)?;
+    let mut out = d.empty(rows.len(), write.rows()).map_err(error)?;
+    d.gemm(&mut out, 1.0, &low, Op::N, write, Op::T, 0.0, arithmetic_of(d)).map_err(error)?;
+    Ok(out)
 }
 
 /// One node's patches ([`Edits`]) in the order of their (patched row, source row): the patched
@@ -1173,6 +1314,7 @@ impl Edits {
         let mut adds: BTreeMap<usize, (Vec<usize>, Vec<Vec<f64>>)> = BTreeMap::new();
         let mut probes: BTreeMap<usize, Vec<(usize, usize, usize)>> = BTreeMap::new();
         let mut cuts: BTreeMap<usize, CutReads> = BTreeMap::new();
+        let mut weight_rows: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
         for (row, edit) in edits {
             let sites = sites.ok_or_else(|| error("an edit in a model without edit sites"))?;
             if sites.unedited {
@@ -1203,6 +1345,7 @@ impl Edits {
                     let (node, _) = sites.shared.get(site).copied().ok_or_else(|| error(format!("{site:?}: not held by the model")))?;
                     probes.entry(node).or_default().push((*row, *cut, *role));
                 }
+                Edit::Weight { edit, .. } => weight_rows.entry(*edit).or_default().push(*row),
                 Edit::CutRead { cut, block, .. } => {
                     let (read, norm) = sites.reads.get(*block).ok_or_else(|| error(format!("block {block}: no read")))?;
                     let norm = norm.clone().ok_or_else(|| error(format!("block {block}: an input norm a cut cannot recompute")))?;
@@ -1214,6 +1357,29 @@ impl Edits {
         out.adds = adds.into_iter().map(|(node, (rows, vectors))| (node, (rows, ndarray::Array2::from_shape_fn((vectors.len(), vectors[0].len()), |(i, c)| vectors[i][c])))).collect();
         out.probes = probes;
         out.cuts = cuts;
+        // Each weight edit's term at every use of each matrix it edits, over its rows.
+        if let Some(sites) = sites.filter(|s| !weight_rows.is_empty() && !s.unedited) {
+            for (e, rows) in weight_rows {
+                let drawn = sites.weights.get(e).ok_or_else(|| error(format!("weight edit {e}: not in the table")))?;
+                for f in &drawn.factors {
+                    for u in sites.matrices.get(&f.native).into_iter().flatten() {
+                        let rank = f.left.ncols();
+                        // The input side indexes the native columns, the output side the rows (the
+                        // other way round for a block held transposed).
+                        let ((inward, in_native), (outward, out_native)) = if u.transposed { ((&f.left, &u.native_rows), (&f.right, &u.native_cols)) } else { ((&f.right, &u.native_cols), (&f.left, &u.native_rows)) };
+                        let (out_width, in_width) = u.widths;
+                        if inward.ncols() != rank || u.in_at + in_native.len() > in_width || u.out_at + out_native.len() > out_width || in_native.end > inward.nrows() || out_native.end > outward.nrows() {
+                            return Err(error(format!("{}: an edit's factors do not fit its use", f.native)));
+                        }
+                        let mut read = ndarray::Array2::zeros((in_width, rank));
+                        read.slice_mut(ndarray::s![u.in_at..u.in_at + in_native.len(), ..]).assign(&inward.slice(ndarray::s![in_native.clone(), ..]));
+                        let mut write = ndarray::Array2::zeros((out_width, rank));
+                        write.slice_mut(ndarray::s![u.out_at..u.out_at + out_native.len(), ..]).assign(&(&outward.slice(ndarray::s![out_native.clone(), ..]) / u.factor));
+                        out.weights.entry(u.output).or_default().push(WeightTerm { input: u.input, rows: rows.clone(), read: d.upload(read.view()).map_err(error)?, write: d.upload(write.view()).map_err(error)? });
+                    }
+                }
+            }
+        }
         Ok(out)
     }
 
@@ -1248,12 +1414,15 @@ impl Edits {
             let (keep, take) = (d.upload_vec(rows.len(), width, keep).map_err(error)?, d.upload_vec(rows.len(), width, take).map_err(error)?);
             nodes.insert(node, Patches { rows, sources, keep, take });
         }
-        Ok(Self { nodes, adds: BTreeMap::new(), probes: BTreeMap::new(), cuts: BTreeMap::new(), recorded: None })
+        Ok(Self { nodes, adds: BTreeMap::new(), probes: BTreeMap::new(), cuts: BTreeMap::new(), recorded: None, weights: BTreeMap::new(), carried: RefCell::new(BTreeMap::new()) })
     }
 
     /// The nodes the call edits.
+    /// The nodes the call edits, and the inputs of its weight edits' terms (whose cotangents
+    /// take the terms' share, [`Edits::transpose`]).
     pub fn nodes(&self) -> BTreeSet<usize> {
-        self.nodes.keys().chain(self.adds.keys()).chain(self.probes.keys()).chain(self.cuts.keys()).copied().collect()
+        let inputs = self.weights.values().flatten().map(|t| t.input);
+        self.nodes.keys().chain(self.adds.keys()).chain(self.probes.keys()).chain(self.cuts.keys()).chain(self.weights.keys()).copied().chain(inputs).collect()
     }
 
     /// Add the cuts' cotangents of the stream entering the block ([`Edits::transpose`]) to its
@@ -1269,7 +1438,7 @@ impl Edits {
 
     /// Whether the forward pass changes node `node`'s value or records it (a cut's probe).
     pub fn changes(&self, node: usize) -> bool {
-        self.nodes.contains_key(&node) || self.adds.contains_key(&node) || self.probes.contains_key(&node) || self.cuts.contains_key(&node)
+        self.nodes.contains_key(&node) || self.adds.contains_key(&node) || self.probes.contains_key(&node) || self.cuts.contains_key(&node) || self.weights.contains_key(&node)
     }
 
     /// The additions at node `node` on its value `value` (the call's rows), `value_of` giving the
@@ -1278,6 +1447,10 @@ impl Edits {
     pub fn write<'v>(&self, d: &Device, node: usize, value: &mut Tensor, value_of: impl Fn(usize) -> Result<&'v Tensor, String>) -> Result<(), String> {
         if let Some((rows, vectors)) = self.adds.get(&node) {
             add_rows(d, value, rows, vectors)?;
+        }
+        for t in self.weights.get(&node).into_iter().flatten() {
+            let term = weight_term(d, value_of(t.input)?, &t.rows, &t.read, &t.write)?;
+            add_device_rows(d, value, &t.rows, &term)?;
         }
         // The probes and cuts stay on the device: a read-back here held the device idle while the
         // host computed the replaced rows (about 110 ms of a 686 ms vpd4l step, decomp's grouped
@@ -1337,6 +1510,15 @@ impl Edits {
         if let Some(value) = t.as_mut() {
             self.apply(d, node, value)?;
         }
+        for term in self.weights.get(&node).into_iter().flatten() {
+            let Some(dx) = dv.get(term.input).and_then(Option::as_ref) else { continue };
+            let added = weight_term(d, dx, &term.rows, &term.read, &term.write)?;
+            let value = match t {
+                Some(value) => value,
+                None => t.insert(d.zeros(rows, width).map_err(error)?),
+            };
+            add_device_rows(d, value, &term.rows, &added)?;
+        }
         let rows_of = |t: &Tensor, at: &[usize]| -> Result<Tensor, String> { d.gather_ranges(t, &single(at.iter().copied())).map_err(error) };
         if let Some(probes) = self.probes.get(&node) {
             let recorded = self.recorded.as_ref().ok_or_else(|| error("a cut outside a plan"))?;
@@ -1373,6 +1555,17 @@ impl Edits {
     /// `ḡ ⊙ (1 − m)` and its source row receives `ḡ ⊙ m`, every patched row read before any row
     /// is written and the sources' shares added in order, each round of distinct rows at once.
     pub fn transpose(&self, d: &Device, node: usize, g: &mut Tensor) -> Result<(), String> {
+        // A weight edit's term `x R Wᵀ` added to this node: its input takes `ḡ W Rᵀ` at the term's
+        // rows, carried to the input's own visit (later in the pass); the node keeps `ḡ`.
+        for t in self.weights.get(&node).into_iter().flatten() {
+            let back = weight_term(d, g, &t.rows, &t.write, &t.read)?;
+            self.carried.borrow_mut().entry(t.input).or_default().push((t.rows.clone(), back));
+        }
+        if let Some(carried) = self.carried.borrow_mut().remove(&node) {
+            for (rows, back) in carried {
+                add_device_rows(d, g, &rows, &back)?;
+            }
+        }
         // A cut's read row was replaced by N(y): its cotangent goes through N's transpose to the
         // stream entering the block (added by its reverse, `add_entering`) and to the cut site's
         // donor and base values (carried to the site's block), and none to the read's own rule.
@@ -1725,6 +1918,8 @@ pub(crate) enum Edit {
     /// donor (1), and its replacement of block `block`'s read at row `at` (`Operation::Cut`).
     Probe { cut: usize, site: SharedSite, role: usize, at: usize },
     CutRead { cut: usize, block: usize, at: usize },
+    /// The native weight edit `edit` ([`Patch::Weights`]) at row `at`.
+    Weight { edit: usize, at: usize },
 }
 
 impl<'t> Path<'t> {
@@ -1741,7 +1936,7 @@ impl<'t> Path<'t> {
     fn first_change(&self, block: usize) -> Option<usize> {
         let patched = self.patched(block).map(|_| self.position);
         let edited = self.edits.iter().filter(|(b, _)| *b == block).filter_map(|(_, edit)| match edit {
-            Edit::Op { at, .. } | Edit::CutRead { at, .. } => Some(*at),
+            Edit::Op { at, .. } | Edit::CutRead { at, .. } | Edit::Weight { at, .. } => Some(*at),
             Edit::Probe { .. } => None,
             Edit::OpAt { .. } => Some(0),
         });
@@ -2024,7 +2219,7 @@ impl<'t> Plan<'t> {
             let path = &self.paths[self.lanes[l].path];
             for (_, edit) in path.edits.iter().filter(|(b, _)| *b == block) {
                 let at = match edit {
-                    Edit::Op { at, .. } | Edit::Probe { at, .. } | Edit::CutRead { at, .. } => *at,
+                    Edit::Op { at, .. } | Edit::Probe { at, .. } | Edit::CutRead { at, .. } | Edit::Weight { at, .. } => *at,
                     _ => path.position,
                 };
                 let edit = match edit {
@@ -2313,6 +2508,7 @@ fn paths<'t>(batch: &'t Batch, experiments: &'t [Experiment], values: &[Value], 
                 }
                 (None, edits)
             }
+            (Some(Patch::Weights { edit, block }), Some(_)) => (None, (e.position..batch.length).map(|at| (*block, Edit::Weight { edit: *edit, at })).collect()),
             (Some(patch), Some(block)) => {
                 paths.push(Path { tokens: &batch.source[e.source], explained, end: block + 1, position: 0, patch: None, edits: Vec::new() });
                 (Some((block, patch.variables(), paths.len() - 1)), Vec::new())
@@ -2990,6 +3186,8 @@ impl Interchange {
         let (m_norms, p_norms) = (norms(&m_flat, &m_reads, &m_streams), norms(&p_flat, &p_reads, &p_streams));
         let mut m_sites = Sites::new(&m, &m_flat, m_streams, m_reads, &[], m_values)?;
         let mut p_sites = Sites::new(&p, &p_flat, p_streams, p_reads, trainable, p_values)?;
+        m_sites.parts.matrices = Arc::new(matrix_uses(native, &Artifact::native(native)?, &m_flat)?);
+        p_sites.parts.matrices = Arc::new(matrix_uses(native, explanation, &p_flat)?);
         m_sites.parts.reads = m_norms;
         p_sites.parts.reads = p_norms;
         let head_blocks: Vec<usize> = layers.iter().enumerate().flat_map(|(l, layer)| layer.reads.iter().map(move |_| 2 * l)).collect();
@@ -3111,9 +3309,106 @@ impl Interchange {
 
     /// One experiment's operations of `family` on sequences of `length` tokens and its position, as
     /// [`Interchange::sample_ops`] draws them.
+    /// A weight edit ([`Family::Weight`]) is one of the table's ([`Interchange::set_weight_edits`]),
+    /// uniform, at every row.
     pub fn draw_ops(&self, rng: &mut impl RngExt, family: Family, length: usize) -> Result<(Patch, usize), String> {
         let parts = &self.m_sites.parts;
+        if family == Family::Weight {
+            if parts.weights.is_empty() {
+                return Err(error("a weight edit drawn before the table was set (set_weight_edits)"));
+            }
+            let edit = rng.random_range(0..parts.weights.len());
+            return Ok((Patch::Weights { edit, block: parts.weights[edit].block }, 0));
+        }
         draw_site_ops(rng, family, length, &self.shared_sites(), &parts.head_blocks, &parts.typical, parts.directions.len(), self.m_sites.entries.len())
+    }
+
+    /// `edits` as the native weight edits experiments of [`Family::Weight`] draw from (index `i` the
+    /// `i`-th, [`Patch::Weights`]), the same for every model. Each edited matrix must be one of
+    /// `M`'s, its factors of its shape, and its uses in `M` inside the edit's block.
+    pub fn set_weight_edits(&mut self, edits: Vec<crate::weight_edit::Drawn>) -> Result<(), String> {
+        let m = self.models().0;
+        for (i, e) in edits.iter().enumerate() {
+            let (start, end) = (m.entry(e.block), m.end(e.block));
+            for f in &e.factors {
+                let uses = self.m_sites.parts.matrices.get(&f.native).filter(|u| !u.is_empty()).ok_or_else(|| error(format!("weight edit {i}: {} is not one of M's matrices", f.native)))?;
+                for u in uses {
+                    if (f.left.nrows(), f.right.nrows()) != (u.native_rows.end, u.native_cols.end) || f.left.ncols() != f.right.ncols() {
+                        return Err(error(format!("weight edit {i}: factors of {:?} and {:?} for {} of {} x {}", f.left.dim(), f.right.dim(), f.native, u.native_rows.end, u.native_cols.end)));
+                    }
+                    if u.input <= start || u.output > end {
+                        return Err(error(format!("weight edit {i}: {} is applied outside block {}", f.native, e.block)));
+                    }
+                }
+            }
+        }
+        let table = Arc::new(edits);
+        for sites in [&mut self.m_sites, &mut self.p_sites] {
+            let mut next = (**sites).clone();
+            next.parts.weights = Arc::clone(&table);
+            *sites = Arc::new(next);
+        }
+        Ok(())
+    }
+
+    /// The native weight edits experiments draw from ([`Interchange::set_weight_edits`]).
+    pub fn weight_edits(&self) -> &[crate::weight_edit::Drawn] {
+        &self.m_sites.parts.weights
+    }
+
+    /// Per matrix of `M` (by name) the inputs of its first use on `M`'s runs of `batch`'s base
+    /// sequences after their first token, at most `rows` of them (the first sequences' first): what
+    /// sizes a random weight edit against the matrix's own output (`weight_edit::candidates`).
+    pub fn matrix_inputs(&self, batch: &Batch, rows: usize) -> Result<BTreeMap<String, ndarray::Array2<f64>>, String> {
+        let (m, _) = self.models();
+        let (d, length) = (m.device(), batch.length());
+        let n = batch.base.len();
+        let ranges: Vec<Range<usize>> = (0..n).map(|i| i * length..(i + 1) * length).collect();
+        let mut later: Vec<Range<usize>> = Vec::new();
+        let mut taken = 0;
+        for i in 0..n {
+            let more = (length.saturating_sub(1)).min(rows - taken);
+            if more == 0 {
+                break;
+            }
+            later.push(i * length + 1..i * length + 1 + more);
+            taken += more;
+        }
+        let tokens: Vec<&[u32]> = batch.base.iter().map(Vec::as_slice).collect();
+        let mut stream = d.zeros(n * length, BlockEngine::width(&m)).map_err(error)?;
+        let mut out = BTreeMap::new();
+        for b in 0..m.blocks() {
+            let (start, end) = (m.entry(b), m.end(b));
+            let trace = m.forward(b, &mut stream, &ranges, &tokens, None, true)?.ok_or_else(|| error("a block kept no tape"))?;
+            for (name, uses) in self.m_sites.parts.matrices.iter() {
+                if let Some(u) = uses.first().filter(|u| u.input > start && u.output <= end) {
+                    out.insert(name.clone(), d.download(&d.gather_ranges(trace.value(u.input)?, &later).map_err(error)?).map_err(error)?);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Per weight edit of the table, `edits` its indices, its effect on `M`: `KL(M_e ‖ M)` in bits
+    /// per token over `batch`'s base sequences (every token).
+    pub fn weight_effects(&self, batch: &Batch, edits: &[usize]) -> Result<Vec<f64>, String> {
+        let (m, _) = self.models();
+        let blocks = m.blocks();
+        let table = &self.m_sites.parts.weights;
+        let mut experiments = Vec::with_capacity(edits.len() * batch.base.len());
+        for &e in edits {
+            let block = table.get(e).ok_or_else(|| error(format!("weight edit {e}: not in the table")))?.block;
+            experiments.extend((0..batch.base.len()).map(|n| Experiment { base: n, source: n, explained: vec![true; blocks], patch: Some(Patch::Weights { edit: e, block }), position: 0 }));
+        }
+        let targets = targets(&m, &self.head, batch, &experiments)?;
+        let mut unedited = (*self.m_sites).clone();
+        unedited.parts.unedited = true;
+        let clean = Model { program: &self.m, sites: Arc::new(unedited), prefixes: None };
+        let evaluation = evaluate(&m, &clean, &self.head, batch, &targets, &experiments, false)?;
+        Ok(evaluation.bits.chunks(batch.base.len().max(1)).map(|per| {
+            let tokens: usize = per.iter().map(Vec::len).sum();
+            per.iter().flatten().sum::<f64>() / tokens.max(1) as f64
+        }).collect())
     }
 
     /// `P` applies no edits of parts from now on, `M` still does: with `P` = `M`
@@ -3402,7 +3697,7 @@ mod tests {
         let take = ndarray::array![[1.0, 0.0, 1.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
         let keep = take.mapv(|m: f64| 1.0 - m);
         let patches = Patches { rows: rows.clone(), sources: sources.clone(), keep: d.upload(keep.view()).unwrap(), take: d.upload(take.view()).unwrap() };
-        let edits = Edits { nodes: BTreeMap::from([(7, patches)]), adds: BTreeMap::new(), probes: BTreeMap::new(), cuts: BTreeMap::new(), recorded: None };
+        let edits = Edits { nodes: BTreeMap::from([(7, patches)]), adds: BTreeMap::new(), probes: BTreeMap::new(), cuts: BTreeMap::new(), recorded: None, weights: BTreeMap::new(), carried: RefCell::new(BTreeMap::new()) };
         let start = ndarray::Array2::from_shape_fn((6, 3), |(r, c)| 1.0 + r as f64 * 0.37 - c as f64 * 1.9);
         // Applied one at a time, every source read first.
         let mut applied = start.clone();

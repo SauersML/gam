@@ -769,3 +769,64 @@ fn operations_on_shared_sites_are_the_same_on_both_models() {
     let edited = experiments.iter().filter(|e| e.patch.is_some()).count();
     assert!(moved * 10 >= edited * 8, "{moved} of {edited} operations move M");
 }
+
+/// Native weight edits ([`Patch::Weights`], `weight_edit::candidates`) on the scoped starting
+/// library, which computes `M` exactly: every edit scores zero (each model adds the edit's term
+/// `ΔW·x` at its own uses of the edited maps, `M`'s attention maps by name and the MLPs' through
+/// their owners), nearly every edit moves `M`, and with `P`'s maps moved off `M`'s the gradient of
+/// the edits' bits matches central differences (the term's cotangent reaching the maps that make
+/// its input).
+#[test]
+fn weight_edits_are_the_same_on_both_models() {
+    use super::interchange::Family;
+    let dir = crate::test_support::tiny_qwen3_export("interchange_weights", 2);
+    let imported = crate::import::import_language_model(&dir, 6, 12).expect("the tiny export imports");
+    std::fs::remove_dir_all(dir).expect("the tiny export is removed");
+    let native = split_sites(&imported.program).expect("the native sites");
+    let layers = layer_nodes(&native, 2).expect("the layers");
+    let explanation = crate::library_mdl::scoped(&crate::library_mdl::explanation(&native, &layers).expect("the library"), &[1, 3]).expect("scoped");
+    let SlotValues::Tokens(tokens) = &imported.family.slots[0] else { panic!("a token slot") };
+    let sequences: Vec<Vec<u32>> = tokens.chunks(12).map(<[u32]>::to_vec).collect();
+    let d = Device::host();
+    let blocks: Vec<crate::run_check::LayerNodes> = explanation.layers.iter().map(|l| l.sites.clone()).collect();
+    let variables = reads(&native, &blocks).expect("the reads");
+    let mut x = Interchange::new(&d, &native, &blocks, &explanation.artifact, &explanation.trainable, variables, 1 << 30, 64).expect("the experiments");
+    let batch = Batch::new(sequences[..3].to_vec(), sequences[3..6].to_vec()).expect("the batch");
+    let inputs = x.matrix_inputs(&batch, 16).expect("the inputs");
+    let drawn = crate::weight_edit::candidates(&native, &inputs, 5, 24).expect("the edits");
+    let kinds: std::collections::BTreeSet<_> = drawn.iter().map(|e| e.kind).collect();
+    assert!(kinds.len() >= 5, "{kinds:?}");
+    let described: Vec<String> = drawn.iter().map(|e| format!("{:?} {}", e.kind, e.factors.iter().map(|f| f.native.as_str()).collect::<Vec<_>>().join("+"))).collect();
+    let count = drawn.len();
+    x.set_weight_edits(drawn).expect("the table");
+    let experiments = x.sample_ops(&mut rand::rngs::StdRng::seed_from_u64(3), &batch, &[Family::Weight], 8, &[1, 2, 0], false).expect("the draw");
+    assert_eq!(census(&experiments, x.variables())["weight"], 24);
+    for gradient in [false, true] {
+        let bits = x.evaluate(&batch, &experiments, gradient).expect("evaluate").bits;
+        assert!(bits.iter().flatten().all(|b| b.abs() <= 1e-9), "{bits:?}");
+    }
+    let effects = x.weight_effects(&batch, &(0..count).collect::<Vec<_>>()).expect("the effects");
+    assert!(effects.iter().filter(|e| **e > 1e-6).count() * 10 >= count * 9, "{:?}", described.iter().zip(&effects).collect::<Vec<_>>());
+    // P's maps moved off M's: the analytic gradient against central differences.
+    let start: Vec<Array2<f64>> = explanation.trainable.iter().map(|&op| explanation.artifact.program.operators[op].matrix()).collect();
+    let moved: Vec<Array2<f64>> = start.iter().enumerate().map(|(k, v)| Array2::from_shape_fn(v.dim(), |(i, j)| v[[i, j]] * (1.0 + 0.2 * noise(7919 * k + 31 * i + j)))).collect();
+    x.load(&moved).expect("load");
+    let gradient = x.evaluate(&batch, &experiments, true).expect("evaluate").gradient;
+    let total = |x: &mut Interchange, values: &[Array2<f64>]| -> f64 {
+        x.load(values).expect("load");
+        x.evaluate(&batch, &experiments, false).expect("evaluate").bits.iter().flatten().sum()
+    };
+    let delta = 1e-5;
+    for (k, value) in moved.iter().enumerate() {
+        let (rows, cols) = value.dim();
+        let (i, j) = ((7 * k + 1) % rows, (3 * k + 2) % cols);
+        let mut up = moved.clone();
+        up[k][[i, j]] += delta;
+        let mut down = moved.clone();
+        down[k][[i, j]] -= delta;
+        let numeric = (total(&mut x, &up) - total(&mut x, &down)) / (2.0 * delta);
+        let analytic = gradient[k][[i, j]];
+        let scale = analytic.abs().max(numeric.abs()).max(1.0);
+        assert!((analytic - numeric).abs() <= 1e-6 * scale, "trainable {k} entry ({i}, {j}): analytic {analytic}, numeric {numeric}");
+    }
+}
