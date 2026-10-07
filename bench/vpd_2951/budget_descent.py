@@ -1160,7 +1160,9 @@ for step in range(steps):
             ratio = torch.cat([(a.abs() / b.abs()).reshape(-1)[b.abs().reshape(-1) > 0] for a, b in zip(gF, gk) if a is not None and b is not None])
             lam = max(ratio.median().item(), 1e-12) if ratio.numel() else 1e-3
         opt.zero_grad(); (objective + lam * (ek - K)).backward(); opt.step()
-        lam = lam * math.exp((ek.item() - K) / (K * B_H))
+        # The relative violation, capped at +1 as it is bounded by -1 below, so lambda rises no faster than
+        # it can fall (an uncapped rise ran away at K = 64 while the count started at 3.7 K).
+        lam = lam * math.exp(min((ek.item() - K) / K, 1.0) / B_H)
         g_f = None
     elif DUAL == 'fixed':
         opt.zero_grad(); (objective + lam * torch.log(ek)).backward(); opt.step()
