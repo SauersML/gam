@@ -46,7 +46,7 @@ out.write_text(json.dumps({
             "families": ["swap", "zero", "scale", "push"]}}))
 EOF
   $binary $root/$toy $settings $root/fit/out_${toy} host > $root/fit/fit_${toy}.log 2>&1
-  $py $here/engine_edits.py $binary $root/$toy $root/fit/out_${toy} $settings checkpoint.bin > /dev/null
+  $py $here/engine_edits.py $binary $root/$toy $root/fit/out_${toy} $settings checkpoint.bin $root/engine/${toy}_native/MANIFEST_native.json > /dev/null
 done
 $py $here/table_toys.py $root/refs/*/*/SCORE_*.json $root/start/*/parts/SCORE_*.json
 for f in $root/engine/*/SCORE_*_edits.json $root/fit/out_*/SCORE_*_edits.json; do
