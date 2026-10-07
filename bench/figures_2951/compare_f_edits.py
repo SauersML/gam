@@ -172,11 +172,12 @@ reference = next((r['manifest'] for r in rows if r['model'] == 'vpd4l' and r.get
 # VPD (vpdstart, 10-06): description = its subcomponents' KL(q || p) at 2^24 (vpd-pricing-n2p24b, 11.4M
 # bits) plus its causal-importance network priced at its Laplace start (77.2M bits); gaps on the vpd4l
 # manifest from mpd_battery_2951 site_edits (each form's masks recomputed under each edit).
-for form, label in (('published', 'VPD as published (CI reads the edited M, both ways)'), ('causal', 'VPD, causal CI on the edited M'), ('autonomous', 'VPD autonomous (causal CI on its own run)')):
+for form, label in (('published', 'VPD as published (CI reads the edited M, both ways)'), ('causal', 'VPD, causal CI on the edited M'), ('autonomous', 'VPD autonomous (causal CI on its own run)'),
+                    ('published_mlp', "VPD as published, MLP only (M's attention)")):
     # On the weight-edit manifest (s2) where scored, else s1.
     path = next((f for f in (f'{MANIFEST_DIR}/vpd_s2/EDITS_vpd_{form}.json', f'{MANIFEST_DIR}/vpd/EDITS_vpd_{form}.json') if os.path.exists(f)), f'{MANIFEST_DIR}/vpd/EDITS_vpd_{form}.json')
     r = L(path)
-    strong = strong_weights(f'{MANIFEST_DIR}/vpd_s3/EDITS_vpd_{form}.json')
+    strong = strong_weights(next((f for f in (f'{MANIFEST_DIR}/vpd_s3_mlp/EDITS_vpd_{form}.json', f'{MANIFEST_DIR}/vpd_s3/EDITS_vpd_{form}.json') if os.path.exists(f)), ''))
     pushed = adversarial(f'{MANIFEST_DIR}/vpd/vpd_adversarial5.json', form)
     row = {'model': 'vpd4l', 'method': label, 'edits': path if r else None, 'manifest': experiments_of(r), **({'strong_weights': strong} if strong else {}), **({'adversarial': pushed} if pushed else {}),
            'description_bits': 11.4e6 + 77.2e6, 'description_note': '11.4M subcomponents + 77.2M CI network', 'active': '213 subcomponents unmasked per token'}
@@ -212,14 +213,13 @@ for r in rows:
         r['description_bits_total'] = r['description_bits'] + (r.get('attention_bits') or 0)
         if r.get('gap') is not None:
             r['F_edits'] = r['description_bits_total'] / N + r['gap']
-# The strong weight edits compared only on the edits every arm scored on them supports.
-weighed = [r for r in rows if r.get('strong_weights')]
-common = set.intersection(*[supported_edits(r['strong_weights']['file'])[0] for r in weighed]) if weighed else set()
-for r in weighed:
-    r['strong_weights'] = strong_weights(r['strong_weights']['file'], common)
-if weighed:
-    print(f"strong weight edits: compared on the {len(common)} edits all {len(weighed)} arms support; supported per arm:",
-          {r['method'][:40]: (r['strong_weights']['supported'], r['strong_weights']['of']) for r in weighed})
+# The strong weight edits pairwise: each arm on the edits it supports (an unsupported edit is
+# absent, never zero), and VPD as published on those same edits beside it.
+vpd_file = next((r['strong_weights']['file'] for r in rows if r.get('strong_weights') and r['method'].startswith('VPD as published (')), None)
+for r in rows:
+    w = r.get('strong_weights')
+    if w and vpd_file and w['file'] != vpd_file:
+        w['vpd_same_edits'] = strong_weights(vpd_file, supported_edits(w['file'])[0])
 json.dump(rows, open('/Users/user/mpd-data/compare/f_edits_table.json', 'w'), indent=1)
 for r in rows:
     print(r['model'], '|', r['method'], '| gap', r.get('gap') and round(r['gap'], 3), '| description', r.get('description_bits_total') and f"{r['description_bits_total']:.4g}",
@@ -231,6 +231,20 @@ for r in rows:
           '| strong weight edits', (lambda w: w and {'all': {k: (round(v, 4) if isinstance(v, float) else v) for k, v in w['all'].items()}, 'supported': (w['supported'], w['of']), 'compared': w['compared'],
                                                      'families': {f: (v['edits'], v['gap'] and round(v['gap'], 3), v['ignoring'] and round(v['ignoring'], 3), v['effect'] and round(v['effect'], 3)) for f, v in w['families'].items()},
                                                      'bins': {b: (v['edits'], v['gap'] and round(v['gap'], 3), v['ignoring'] and round(v['ignoring'], 3)) for b, v in w['bins'].items()}})(r.get('strong_weights')), '| bins', {k: (n, round(g, 3)) for k, (n, g) in (r.get('gap_by_effect') or {}).items()}, r.get('refused', ''))
+def strong_line(r):
+    w = r['strong_weights']
+    v = w.get('vpd_same_edits')
+    fam = lambda x: {f: (round(y['gap'], 3), round(y['ignoring'], 3)) for f, y in x['families'].items() if y['edits']}
+    return f"{r['method'][:60]:60s} | {w['compared']} of {w['of']} edits | gap {w['all']['gap']:.3f} vs ignoring {w['all']['ignoring']:.3f} | {fam(w)}" + (f" | VPD as published on the same edits: gap {v['all']['gap']:.3f} vs {v['all']['ignoring']:.3f}" if v else '')
+weighed = [r for r in rows if r.get('strong_weights')]
+print('\nStrong weight edits, every edit (VPD and the arms that take every edit):')
+for r in weighed:
+    if r['strong_weights']['compared'] == r['strong_weights']['of']:
+        print(strong_line(r))
+print('\nStrong weight edits, arms that take fewer (each beside VPD as published on the same edits):')
+for r in weighed:
+    if r['strong_weights']['compared'] < r['strong_weights']['of']:
+        print(strong_line(r))
 if len(sys.argv) > 1:
     plt.rcParams.update({'font.size': 14})
     models = [m for m in ('vpd4l', 'Qwen3-0.6B') if any(r['model'] == m and r.get('F_edits') is not None for r in rows)]
