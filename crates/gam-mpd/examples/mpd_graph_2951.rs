@@ -39,7 +39,10 @@ fn load(export: &Path) -> Result<Weights, String> {
     let layers = layer_nodes(&native, layer_count)?;
     let artifact = library_mdl::explanation(&native, &layers)?.artifact;
     let device = Device::host();
-    let library = Library::new(&device, &device, &native, &layers, &artifact, 1 << 30, 256)?;
+    // The library's operator values on the host: at most four times the export's tensors (Qwen3-0.6B
+    // holds 6.6 GB of them, past the 1 GiB that served vpd4l).
+    let tensors: u64 = std::fs::read_dir(export).map_err(error)?.flatten().filter(|e| e.path().extension().is_some_and(|x| x == "f64")).filter_map(|e| e.metadata().ok()).map(|m| m.len()).sum();
+    let library = Library::new(&device, &device, &native, &layers, &artifact, (4 * tensors).max(1 << 30) as usize, 256)?;
     Ok(Weights::of(&library))
 }
 
