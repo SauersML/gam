@@ -924,9 +924,29 @@ pub enum Node {
     /// such as the first token (an attention sink) run by `M`'s own block while a library's
     /// functions run every other token. The two inputs share one interface.
     Select { inside: usize, outside: usize, positions: Vec<u32> },
+    /// Per row, each group of `input`'s interface reduced to its Euclidean norm: rows × groups, one
+    /// unit per group. A gated component's own gate pre-activation `‖V_bᵀx‖` (then less its
+    /// threshold, an affine bias).
+    GroupNorm { input: usize },
+    /// `value` with each group `b` of its interface times `gate`'s column `b` passed through the
+    /// Heaviside step `H(z) = 1{z > 0}`: exactly zero on every component whose gate is not positive,
+    /// with slope zero in the gate. With `scale` (rows × groups, positive) the expected gate
+    /// `Φ(z / s)` in its place, through which the gate and the scale take cotangents (a fit's
+    /// training pass; `library_complexity`'s local reparameterization gives `s`).
+    Gated { value: usize, gate: usize, scale: Option<usize> },
 }
 
-const NODE_KINDS: usize = 19;
+const NODE_KINDS: usize = 21;
+
+/// `H(z) = 1{z > 0}`, a [`Node::Gated`] gate's weight.
+pub(crate) fn gated_step(z: f64) -> f64 {
+    if z > 0.0 { 1.0 } else { 0.0 }
+}
+
+/// `Φ(z / s)`, a [`Node::Gated`] gate's expected weight.
+pub(crate) fn gated_cdf(z: f64, s: f64) -> f64 {
+    gam_gpu::tensor::GateFunction::Cdf.host(z, s)
+}
 
 /// The rows of `inputs` whose position in their sequence is one of `positions` ([`Node::Select`]).
 pub(crate) fn selected_rows(inputs: &FamilyInputs, positions: &[u32]) -> Result<Vec<usize>, ProgramError> {
@@ -1052,6 +1072,8 @@ impl Node {
             Self::RmsNorm { .. } => 16,
             Self::Transposed { .. } => 17,
             Self::Select { .. } => 18,
+            Self::GroupNorm { .. } => 19,
+            Self::Gated { .. } => 20,
         }
     }
 
@@ -1073,6 +1095,8 @@ impl Node {
             }
             Self::Pointwise { input, .. } | Self::Readout { input, .. } => vec![*input],
             Self::Select { inside, outside, .. } => vec![*inside, *outside],
+            Self::GroupNorm { input } => vec![*input],
+            Self::Gated { value, gate, scale } => std::iter::once(*value).chain([*gate]).chain(*scale).collect(),
         }
     }
 
@@ -2051,6 +2075,54 @@ impl OperatorProgram {
                 };
                 Ok((pick(value(*inside), value(*outside)), radius))
             }
+            Node::GroupNorm { input } => {
+                let (x, interface) = (value(*input), &interfaces[*input]);
+                let groups = interface.group_count();
+                let mut out = Array2::zeros((rows, groups));
+                let mut radius = band(*input).map(|_| Array2::zeros((rows, groups)));
+                for g in 0..groups {
+                    let range = interface.range(g);
+                    for r in 0..rows {
+                        let norm = x.slice(s![r, range.clone()]).iter().map(|v| v * v).sum::<f64>().sqrt();
+                        out[[r, g]] = norm;
+                        if let (Some(radius), Some(b)) = (radius.as_mut(), band(*input)) {
+                            // The norm is 1-Lipschitz in its group; its rounding is relative.
+                            let moved = b.slice(s![r, range.clone()]).iter().map(|v| v * v).sum::<f64>().sqrt();
+                            radius[[r, g]] = inflate(moved + UNIT_ROUNDOFF * (range.len() as f64 + 2.0) * norm, 2);
+                        }
+                    }
+                }
+                Ok((out, radius))
+            }
+            Node::Gated { value: v, gate, scale } => {
+                let (x, z, interface) = (value(*v), value(*gate), &interfaces[*v]);
+                let mut out = x.clone();
+                let mut radius = band(*v).cloned();
+                for g in 0..interface.group_count() {
+                    for r in 0..rows {
+                        let weight = match scale {
+                            Some(s) => gated_cdf(z[[r, g]], value(*s)[[r, g]]),
+                            None => gated_step(z[[r, g]]),
+                        };
+                        // A gate within its band of zero may be either side: the group may be on or off.
+                        let unsure = scale.is_none() && band(*gate).is_some_and(|b| z[[r, g]].abs() <= b[[r, g]]);
+                        for c in interface.range(g) {
+                            out[[r, c]] *= weight;
+                            if let Some(radius) = radius.as_mut() {
+                                radius[[r, c]] = if unsure {
+                                    inflate(x[[r, c]].abs() + radius[[r, c]], 2)
+                                } else if scale.is_some() {
+                                    // Φ is ≤ 1 and moves at most |x| by its whole range.
+                                    inflate(x[[r, c]].abs() + radius[[r, c]], 2)
+                                } else {
+                                    radius[[r, c]] * weight
+                                };
+                            }
+                        }
+                    }
+                }
+                Ok((out, radius))
+            }
             Node::Transposed { input, operator } => {
                 let a = self.operators[*operator].matrix_cow();
                 let x = value(*input);
@@ -2662,6 +2734,14 @@ fn interface_of(index: usize, node: &Node, out: &[Interface], scope: &Scope<'_>)
             }
             out[*inside].clone()
         }
+        Node::GroupNorm { input } => Interface::uniform(out[*input].group_count(), 1, LabelKind::Unit, 0)?,
+        Node::Gated { value, gate, scale } => {
+            let groups = out[*value].group_count();
+            if out[*gate].width() != groups || scale.is_some_and(|s| out[s].width() != groups) {
+                return Err(ProgramError::Interface(format!("gated node {index}: its gate is not one column per group of its value")));
+            }
+            out[*value].clone()
+        }
         Node::Outer { left, right } => {
             let (l, r) = (&out[*left], &out[*right]);
             let groups = l
@@ -2735,6 +2815,14 @@ pub fn remap_node(node: &mut Node, nodes: &[usize], operators: &[usize], bases: 
         Node::Select { inside, outside, .. } => {
             *inside = nodes[*inside];
             *outside = nodes[*outside];
+        }
+        Node::GroupNorm { input } => *input = nodes[*input],
+        Node::Gated { value, gate, scale } => {
+            *value = nodes[*value];
+            *gate = nodes[*gate];
+            if let Some(s) = scale.as_mut() {
+                *s = nodes[*s];
+            }
         }
         Node::Attend { query, key, value, .. } => {
             *query = nodes[*query];
@@ -3270,6 +3358,13 @@ fn encode_node(out: &mut BitString, node: &Node, index: usize, code: &NodeCode<'
                 encode_prefix_integer(out, u64::from(*p) + 1)?;
             }
         }
+        Node::GroupNorm { input } => encode_fixed_index(out, *input, refs)?,
+        Node::Gated { value, gate, scale } => {
+            encode_fixed_index(out, *value, refs)?;
+            encode_fixed_index(out, *gate, refs)?;
+            // The scale as a prefix integer: 1 for none, the node plus 2 otherwise.
+            encode_prefix_integer(out, scale.map_or(1, |s| s as u64 + 2))?;
+        }
     }
     Ok(())
 }
@@ -3374,12 +3469,25 @@ fn decode_node(reader: &mut BitReader<'_>, index: usize, code: &NodeCode<'_>, in
             Node::RmsNorm { input, epsilon: *reals.first().ok_or_else(|| ProgramError::Code("an rms norm without epsilon".to_string()))? }
         }
         17 => Node::Transposed { input: decode_fixed_index(reader, refs)?, operator: decode_fixed_index(reader, ops)? },
-        _ => {
+        18 => {
             let (inside, outside) = (decode_fixed_index(reader, refs)?, decode_fixed_index(reader, refs)?);
             let count = decode_prefix_integer(reader)? - 1;
             let positions = (0..count).map(|_| u32::try_from(decode_prefix_integer(reader)? - 1).map_err(|e| ProgramError::Code(e.to_string()))).collect::<Result<_, _>>()?;
             Node::Select { inside, outside, positions }
         }
+        19 => Node::GroupNorm { input: decode_fixed_index(reader, refs)? },
+        20 => {
+            let (value, gate) = (decode_fixed_index(reader, refs)?, decode_fixed_index(reader, refs)?);
+            let scale = match decode_prefix_integer(reader)? {
+                1 => None,
+                s => Some(usize::try_from(s - 2).map_err(|e| ProgramError::Code(e.to_string()))?),
+            };
+            if scale.is_some_and(|s| s >= index) {
+                return Err(ProgramError::Code("a gated node's scale after it".to_string()));
+            }
+            Node::Gated { value, gate, scale }
+        }
+        other => return Err(ProgramError::Code(format!("node kind {other}"))),
     })
 }
 

@@ -374,6 +374,65 @@ pub enum GroupAxis {
 #[cfg(target_os = "linux")]
 const WIDE_SEGMENTS: usize = 256 * 32;
 
+/// The entrywise maps of a gate ([`Device::gate_function`]), with `z = x / s` for the scaled ones:
+/// `Sqrt` `√x` (a group's norm from its squared sum), `Step` the Heaviside `H(x) = 1{x > 0}`,
+/// `Cdf` `Φ(z)` (an expected gate), `CdfSlope` its derivative in `x`, `φ(z) / s`, and `CdfScaleSlope`
+/// its derivative in `s`, `−φ(z) z / s`, and `Ratio` `x / s`, zero where `s` is (a norm's
+/// cotangent over the norm).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GateFunction {
+    Sqrt,
+    Step,
+    Cdf,
+    CdfSlope,
+    CdfScaleSlope,
+    Ratio,
+}
+
+impl GateFunction {
+    fn code(self) -> u32 {
+        match self {
+            Self::Sqrt => 0,
+            Self::Step => 1,
+            Self::Cdf => 2,
+            Self::CdfSlope => 3,
+            Self::CdfScaleSlope => 4,
+            Self::Ratio => 5,
+        }
+    }
+
+    fn scaled(self) -> bool {
+        matches!(self, Self::Cdf | Self::CdfSlope | Self::CdfScaleSlope | Self::Ratio)
+    }
+
+    /// The map in float64 (the host's, and the kernels' reference).
+    #[must_use]
+    pub fn host(self, x: f64, s: f64) -> f64 {
+        let z = x / s;
+        let density = (-0.5 * z * z).exp() * 0.398_942_280_401_432_7;
+        match self {
+            Self::Sqrt => x.sqrt(),
+            Self::Step => {
+                if x > 0.0 {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
+            Self::Cdf => 0.5 * libm::erfc(-z * std::f64::consts::FRAC_1_SQRT_2),
+            Self::CdfSlope => density / s,
+            Self::CdfScaleSlope => -density * z / s,
+            Self::Ratio => {
+                if s == 0.0 {
+                    0.0
+                } else {
+                    x / s
+                }
+            }
+        }
+    }
+}
+
 pub struct GroupMap {
     ids: Indices,
     axis: GroupAxis,
@@ -2123,6 +2182,28 @@ impl Device {
             Backend::Cuda(engine) => engine.block_products(left, right, blocks),
             #[cfg(target_os = "macos")]
             Backend::Metal(engine) => engine.block_products(left, right, blocks),
+        }
+    }
+
+    /// `f(x)` entrywise for a gate's maps ([`GateFunction`]); `s` is the scale of the ones that take
+    /// one (entrywise, `x`'s shape) and is ignored by the others.
+    pub fn gate_function(&self, function: GateFunction, x: &Tensor, s: Option<&Tensor>) -> Result<Tensor, GpuError> {
+        if let Some(s) = s {
+            same(x, s, "gate scale")?;
+        }
+        if function.scaled() && s.is_none() {
+            return Err(shape(format!("{function:?} needs a scale")));
+        }
+        match &*self.backend {
+            Backend::Host => {
+                let (xv, sv) = (host(x)?, s.map(host).transpose()?);
+                let out = xv.iter().enumerate().map(|(i, &t)| function.host(t, sv.map_or(1.0, |s| s[i]))).collect();
+                Ok(Tensor { rows: x.rows, cols: x.cols, data: Data::Host(out) })
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) => engine.gate_function(function, x, s),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(engine) => engine.gate_function(function, x, s),
         }
     }
 
@@ -4084,6 +4165,24 @@ extern "C" __global__ void block_products(u64 n, unsigned int cols, unsigned int
         for (unsigned int c = offsets[block]; c < offsets[block + 1]; c++)
             sum += left[row * cols + c] * right[row * cols + c];
         out[i] = sum;
+    }
+}
+
+// A gate's entrywise maps (`GateFunction`, `code`): √x, H(x), Φ(z), φ(z)/s, −φ(z) z/s with z = x/s
+// (s read only when `scaled`).
+extern "C" __global__ void gate_function(u64 n, unsigned int code, const double* x, const double* s, int scaled, double* out) {
+    GRID_STRIDE(i, n) {
+        double t = x[i], sd = scaled ? s[i] : 1.0, z = t / sd, density = exp(-0.5 * z * z) * 0.3989422804014327;
+        double v;
+        switch (code) {
+            case 0: v = sqrt(t); break;
+            case 1: v = t > 0.0 ? 1.0 : 0.0; break;
+            case 2: v = normcdf(z); break;
+            case 3: v = density / sd; break;
+            case 4: v = -density * z / sd; break;
+            default: v = sd == 0.0 ? 0.0 : t / sd; break;
+        }
+        out[i] = v;
     }
 }
 
@@ -6891,6 +6990,20 @@ extern "C" __global__ void group_divergence(u64 n, int scaled, const double* ref
             Ok(out)
         }
 
+        pub(super) fn gate_function(&self, function: super::GateFunction, x: &Tensor, s: Option<&Tensor>) -> Result<Tensor, GpuError> {
+            let storage = x.storage();
+            if storage == Storage::Bf16 || s.is_some_and(|s| s.storage() != storage) {
+                return Err(shape("gate_function: float32 or float64, the scale stored alike".to_string()));
+            }
+            let mut out = self.output(storage, x.rows, x.cols)?;
+            let (n, code, scaled) = (x.len() as u64, function.code(), i32::from(s.is_some()));
+            let f = self.kernel("gate_function", storage)?;
+            // SAFETY: equal-length buffers; `s` stands in for itself as `x` when absent (not read).
+            unsafe { self.stream.launch_builder(&f).arg(&n).arg(&code).input(x, storage)?.input(s.unwrap_or(x), storage)?.arg(&scaled).output(&mut out, storage)?.launch(cfg_elements(n)) }
+                .gpu_ctx("tensor gate_function")?;
+            Ok(out)
+        }
+
         pub(super) fn adam(&self, w: &mut Tensor, (m, v): (&mut Tensor, &mut Tensor), g: &Tensor, (rate, beta1, beta2, epsilon): (f64, f64, f64, f64), (c1, c2): (f64, f64)) -> Result<(), GpuError> {
             let n = w.len() as u64;
             let storage = w.storage();
@@ -7850,6 +7963,25 @@ kernel void t_fisher_probe(device float* probabilities [[buffer(0)]], device con
 }
 
 // n: rows · blocks; extra: blocks.
+// A gate's entrywise maps (`GateFunction`, p.a the code): √x, H(x), Φ(z), φ(z)/s, −φ(z) z/s with
+// z = x/s (s read only when p.b).
+kernel void t_gate_function(device const float* x [[buffer(0)]], device const float* s [[buffer(1)]], device float* out [[buffer(2)]],
+                            constant P& p [[buffer(3)]], uint gid [[thread_position_in_grid]], uint grid [[threads_per_grid]]) {
+    ELEMENTS {
+        float t = x[i], sd = p.b ? s[i] : 1.0f, z = t / sd, density = exp(-0.5f * z * z) * 0.39894228040143268f;
+        float v;
+        switch (p.a) {
+            case 0: v = sqrt(t); break;
+            case 1: v = t > 0.0f ? 1.0f : 0.0f; break;
+            case 2: v = 0.5f * gam_erfc(-z * 0.70710678118654752f); break;
+            case 3: v = density / sd; break;
+            case 4: v = -density * z / sd; break;
+            default: v = sd == 0.0f ? 0.0f : t / sd; break;
+        }
+        out[i] = v;
+    }
+}
+
 kernel void t_block_products(device const float* left [[buffer(0)]], device const float* right [[buffer(1)]], device const uint* offsets [[buffer(2)]],
                              device float* out [[buffer(3)]], constant P& p [[buffer(4)]],
                              uint gid [[thread_position_in_grid]], uint grid [[threads_per_grid]]) {
@@ -8375,6 +8507,7 @@ kernel void t_group_divergence(device float* sums [[buffer(0)]], device const fl
         "t_kl_rows",
         "t_fisher_probe",
         "t_block_products",
+        "t_gate_function",
         "t_softmax_quadratic",
         "t_argmax_rows",
         "t_fill_entries",
@@ -8732,6 +8865,13 @@ kernel void t_group_divergence(device float* sums [[buffer(0)]], device const fl
             let p = P { cols: u32_of(left.cols)?, extra: u32_of(blocks.len())?, ..P::default() };
             let buffers = [whole(buffer(left)?), whole(buffer(right)?), whole(index_buffer(&blocks.offsets)?), whole(buffer(&out)?)];
             self.elements("t_block_products", &buffers, out.len(), p)?;
+            Ok(out)
+        }
+
+        pub(super) fn gate_function(&self, function: super::GateFunction, x: &Tensor, s: Option<&Tensor>) -> Result<Tensor, GpuError> {
+            let out = self.tensor(x.rows, x.cols)?;
+            let p = P { a: function.code(), b: u32::from(s.is_some()), ..P::default() };
+            self.elements("t_gate_function", &[whole(buffer(x)?), whole(buffer(s.unwrap_or(x))?), whole(buffer(&out)?)], x.len(), p)?;
             Ok(out)
         }
 

@@ -28,7 +28,7 @@
 use super::device_attention::Segment;
 use super::device_heads::{self, Buffer, Heads, Stacked};
 use super::operator_program::{Basis, FamilyInputs, Law, Node, Operator, OperatorBody, OperatorProgram, Rotary, SlotValues};
-use gam_gpu::tensor::{Arithmetic, Device, Indices, Op, PointwiseLaw, Storage, Tensor};
+use gam_gpu::tensor::{Arithmetic, ColumnBlocks, Device, GateFunction, Indices, Op, PointwiseLaw, Storage, Tensor};
 use ndarray::{Array1, Array2};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -121,6 +121,11 @@ enum Step {
         left: usize,
         right: usize,
     },
+    /// Each group of `input`'s columns (`blocks`) to its Euclidean norm (`Node::GroupNorm`).
+    GroupNorm { input: usize, blocks: ColumnBlocks, of: Arc<Indices> },
+    /// `value`'s group `b` (`blocks`; `of` the group of each column) times `H(gate_b)`, or
+    /// `Φ(gate_b / scale_b)` with a scale (`Node::Gated`).
+    Gated { value: usize, gate: usize, scale: Option<usize>, blocks: ColumnBlocks, of: Arc<Indices> },
     /// `inside`'s rows at `positions`, `outside`'s elsewhere (`Node::Select`).
     Select {
         inside: usize,
@@ -184,6 +189,8 @@ fn step_arguments(step: &Step) -> Vec<usize> {
         Step::Pointwise { input, .. } | Step::Gain { input, .. } | Step::RmsNorm { input, .. } | Step::Readout { input } | Step::Transposed { input, .. } => vec![*input],
         Step::Hadamard { left, right } => vec![*left, *right],
         Step::Select { inside, outside, .. } => vec![*inside, *outside],
+        Step::GroupNorm { input, .. } => vec![*input],
+        Step::Gated { value, gate, scale, .. } => std::iter::once(*value).chain([*gate]).chain(*scale).collect(),
         Step::Attend { query, key, value, .. } => vec![*query, *key, *value],
         Step::Concat { parts } => parts.clone(),
     }
@@ -282,6 +289,14 @@ struct PreparedBatch {
     positions: Arc<Vec<u32>>,
     /// Whether its sequences are runs of positions of any length ([`DeviceProgram::forward_span_segments`]).
     segmented: bool,
+}
+
+/// An interface's groups as column blocks and, per column, its group (a group norm's and a gated
+/// node's layout).
+fn group_layout(device: &Device, interface: &super::operator_program::Interface) -> Result<(ColumnBlocks, Arc<Indices>), String> {
+    let widths: Vec<usize> = (0..interface.group_count()).map(|g| interface.range(g).len()).collect();
+    let groups: Vec<u32> = widths.iter().enumerate().flat_map(|(g, w)| std::iter::repeat_n(g as u32, *w)).collect();
+    Ok((device.column_blocks(&widths).map_err(error)?, Arc::new(device.upload_indices(&groups).map_err(error)?)))
 }
 
 /// `segments` cover rows `0..rows` in order, each run's rows at consecutive positions `p..` and
@@ -724,6 +739,14 @@ impl DeviceProgram {
                     Step::Pointwise { input: *input, codes: device.upload_indices(&codes).map_err(error)? }
                 }
                 Node::Hadamard { left, right } => Step::Hadamard { left: *left, right: *right },
+                Node::GroupNorm { input } => {
+                    let (blocks, of) = group_layout(device, &interfaces[*input])?;
+                    Step::GroupNorm { input: *input, blocks, of }
+                }
+                Node::Gated { value, gate, scale } => {
+                    let (blocks, of) = group_layout(device, &interfaces[*value])?;
+                    Step::Gated { value: *value, gate: *gate, scale: *scale, blocks, of }
+                }
                 Node::Select { inside, outside, positions } => Step::Select { inside: *inside, outside: *outside, positions: positions.clone() },
                 Node::RmsNorm { input, epsilon } => Step::RmsNorm { input: *input, epsilon: *epsilon },
                 Node::Attend { query, key, value, scale, rotary, causal } => {
@@ -811,7 +834,11 @@ impl DeviceProgram {
             };
             fused.push(Fused { heads, stacked, sources, live: true, changed: BTreeSet::new(), disabled: false, source_matches: true });
         }
-        let exact_zeros = program.nodes.iter().map(|n| matches!(n, Node::Pointwise { laws, .. } if !laws.is_empty() && laws.iter().all(|l| matches!(l, Law::Relu)))).collect();
+        let exact_zeros = program
+            .nodes
+            .iter()
+            .map(|n| matches!(n, Node::Pointwise { laws, .. } if !laws.is_empty() && laws.iter().all(|l| matches!(l, Law::Relu))) || matches!(n, Node::Gated { scale: None, .. }))
+            .collect();
         let dead = (0..program.nodes.len())
             .map(|n| {
                 let mut dead: Option<Vec<u32>> = None;
@@ -1407,6 +1434,16 @@ impl DeviceProgram {
         if arithmetic == Arithmetic::Bf16 && gathered.storage() == Storage::F32 { d.bf16_copy(&gathered).map_err(error) } else { Ok(gathered) }
     }
 
+    /// A gated node's weights per row and group: `H(gate)`, or `Φ(gate / scale)` with a scale.
+    fn gate_weights(&self, trace: &DeviceTrace, gate: usize, scale: Option<usize>) -> Result<Tensor, String> {
+        let d = &self.device;
+        match scale {
+            Some(s) => d.gate_function(GateFunction::Cdf, trace.value(gate)?, Some(trace.value(s)?)),
+            None => d.gate_function(GateFunction::Step, trace.value(gate)?, None),
+        }
+        .map_err(error)
+    }
+
     /// The affine term `(argument, operator)` as a new `rows × width` tensor, the values zeros plus
     /// [`DeviceProgram::add_term`] make: in one pass ([`Device::scaled`]) where the term is added by
     /// an axpy (a one-hot feature's gathered rows, an identity operator), else added into zeros.
@@ -1772,6 +1809,16 @@ impl DeviceProgram {
                 Step::Hadamard { left, right } => {
                     let mut out = d.empty(rows, width).map_err(error)?;
                     d.hadamard(&mut out, trace.value(*left)?, trace.value(*right)?, false).map_err(error)?;
+                    value(out)
+                }
+                Step::GroupNorm { input, blocks, .. } => {
+                    let x = trace.value(*input)?;
+                    value(d.gate_function(GateFunction::Sqrt, &d.block_products(x, x, blocks).map_err(error)?, None).map_err(error)?)
+                }
+                Step::Gated { value: v, gate, scale, of, .. } => {
+                    let weights = self.gate_weights(&trace, *gate, *scale)?;
+                    let mut out = d.empty(rows, width).map_err(error)?;
+                    d.hadamard(&mut out, trace.value(*v)?, &d.gather_columns(&weights, of).map_err(error)?, false).map_err(error)?;
                     value(out)
                 }
                 Step::Select { inside, outside, positions } => {
@@ -2376,6 +2423,32 @@ impl DeviceProgram {
                         .map_err(error)?;
                     add(&mut g, *input, term)?;
                 }
+                Step::GroupNorm { input, of, .. } => {
+                    let (x, norms) = (trace.value(*input)?, trace.value(index)?);
+                    let ratio = d.gate_function(GateFunction::Ratio, &cot, Some(norms)).map_err(error)?;
+                    let mut gx = d.empty(trace.rows, self.widths[*input]).map_err(error)?;
+                    d.hadamard(&mut gx, x, &d.gather_columns(&ratio, of).map_err(error)?, false).map_err(error)?;
+                    add(&mut g, *input, gx)?;
+                }
+                Step::Gated { value: v, gate, scale, blocks, of, .. } => {
+                    if needed[*v] {
+                        let weights = self.gate_weights(trace, *gate, *scale)?;
+                        let mut gv = d.empty(trace.rows, self.widths[*v]).map_err(error)?;
+                        d.hadamard(&mut gv, &cot, &d.gather_columns(&weights, of).map_err(error)?, false).map_err(error)?;
+                        add(&mut g, *v, gv)?;
+                    }
+                    if let Some(s) = scale {
+                        let (z, sd) = (trace.value(*gate)?, trace.value(*s)?);
+                        let along = d.block_products(&cot, trace.value(*v)?, blocks).map_err(error)?;
+                        for (node, slope) in [(*gate, GateFunction::CdfSlope), (*s, GateFunction::CdfScaleSlope)] {
+                            if needed[node] {
+                                let mut term = d.empty(trace.rows, along.cols()).map_err(error)?;
+                                d.hadamard(&mut term, &along, &d.gate_function(slope, z, Some(sd)).map_err(error)?, false).map_err(error)?;
+                                add(&mut g, node, term)?;
+                            }
+                        }
+                    }
+                }
                 Step::Hadamard { left, right } => {
                     // A raw input's cotangent goes nowhere unless it is kept (a mask's).
                     let wanted = |n: usize| {
@@ -2458,20 +2531,31 @@ impl DeviceProgram {
         let d = &self.device;
         let rows = trace.rows;
         match &self.steps[index] {
-            Step::Pointwise { input, .. } if self.exact_zeros[index] => {
-                if !needed[*input] {
+            Step::Pointwise { .. } | Step::Gated { .. } if self.exact_zeros[index] => {
+                // The input's cotangent on the same columns: through the ReLU's slope, or a gated
+                // value's read columns times their components' H.
+                let (input, term) = if let Step::Gated { value, gate, of, .. } = &self.steps[index] {
+                    let spread = d.gather_columns(&self.gate_weights(trace, *gate, None)?, of).map_err(error)?;
+                    let weights = d.gather_columns(&spread, ids).map_err(error)?;
+                    let mut term = d.empty(part.rows(), part.cols()).map_err(error)?;
+                    d.hadamard(&mut term, part, &weights, false).map_err(error)?;
+                    (*value, term)
+                } else {
+                    let input = step_arguments(&self.steps[index])[0];
+                    let z = d.gather_columns(trace.value(input)?, ids).map_err(error)?;
+                    let codes = d.upload_indices(&vec![law_of(Law::Relu).code(); ids.len()]).map_err(error)?;
+                    (input, d.law_slopes(part, &z, &codes, gelu_tanh_constant()).map_err(error)?)
+                };
+                if !needed[input] {
                     return Ok(());
                 }
-                let z = d.gather_columns(trace.value(*input)?, ids).map_err(error)?;
-                let codes = d.upload_indices(&vec![law_of(Law::Relu).code(); ids.len()]).map_err(error)?;
-                let term = d.law_slopes(part, &z, &codes, gelu_tanh_constant()).map_err(error)?;
-                if self.sole[*input] == Some(index) && !seeded.contains(input) && !edited.contains(input) && matches!(self.steps[*input], Step::Affine { .. }) {
-                    packed.insert(*input, (Arc::clone(ids), term));
+                if self.sole[input] == Some(index) && !seeded.contains(&input) && !edited.contains(&input) && matches!(self.steps[input], Step::Affine { .. }) {
+                    packed.insert(input, (Arc::clone(ids), term));
                 } else {
-                    if g[*input].is_none() {
-                        g[*input] = Some(d.zeros(rows, self.widths[*input]).map_err(error)?);
+                    if g[input].is_none() {
+                        g[input] = Some(d.zeros(rows, self.widths[input]).map_err(error)?);
                     }
-                    let target = g[*input].as_mut().ok_or("device: cotangent slot")?;
+                    let target = g[input].as_mut().ok_or("device: cotangent slot")?;
                     d.scatter_columns(target, ids, &term, true).map_err(error)?;
                 }
                 Ok(())
@@ -3041,6 +3125,37 @@ impl DeviceProgram {
                         Some(select_rows(d, &chosen, di, dout.unwrap_or(&zero))?)
                     }
                 },
+                Step::GroupNorm { input, blocks, .. } => match dv[*input].as_ref() {
+                    Some(dx) => {
+                        let along = d.block_products(trace.value(*input)?, dx, blocks).map_err(error)?;
+                        Some(d.gate_function(GateFunction::Ratio, &along, Some(trace.value(index)?)).map_err(error)?)
+                    }
+                    None => None,
+                },
+                Step::Gated { value: v, gate, scale, of, .. } => {
+                    let soft = |n: usize| scale.and_then(|_| dv[n].as_ref());
+                    let (dx, dz, ds) = (dv[*v].as_ref(), soft(*gate), scale.and_then(|s| dv[s].as_ref()));
+                    if dx.is_none() && dz.is_none() && ds.is_none() {
+                        None
+                    } else {
+                        let mut out = d.zeros(rows, width).map_err(error)?;
+                        if let Some(dx) = dx {
+                            let weights = self.gate_weights(trace, *gate, *scale)?;
+                            d.hadamard(&mut out, dx, &d.gather_columns(&weights, of).map_err(error)?, true).map_err(error)?;
+                        }
+                        if let Some(s) = scale {
+                            let (z, sd) = (trace.value(*gate)?, trace.value(*s)?);
+                            let mut moved = d.zeros(rows, sd.cols()).map_err(error)?;
+                            for (t, slope) in [(dz, GateFunction::CdfSlope), (ds, GateFunction::CdfScaleSlope)] {
+                                if let Some(t) = t {
+                                    d.hadamard(&mut moved, t, &d.gate_function(slope, z, Some(sd)).map_err(error)?, true).map_err(error)?;
+                                }
+                            }
+                            d.hadamard(&mut out, trace.value(*v)?, &d.gather_columns(&moved, of).map_err(error)?, true).map_err(error)?;
+                        }
+                        Some(out)
+                    }
+                }
                 Step::Hadamard { left, right } => match (dv[*left].as_ref(), dv[*right].as_ref()) {
                     (None, None) => None,
                     (dl, dr) => {
@@ -3604,6 +3719,156 @@ mod sparse_read_tests {
             for op in 0..3 {
                 close("the dense read's gradient", &device, &dense_gradients[&op], &device.download(&gradients[&op]).unwrap());
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod gated_tests {
+    use super::*;
+    use crate::operator_program::{Declarations, FamilyInputs, Group, Interface, Label, LabelKind, SequenceLayout, Slot, SlotValues, exact_precision};
+    use ndarray::Array2;
+    use rand::{RngExt, SeedableRng, rngs::StdRng};
+
+    const D: usize = 6;
+    const WIDTHS: [usize; 5] = [1, 2, 1, 3, 1];
+    const OUT: usize = 4;
+
+    fn reads() -> Interface {
+        Interface::new(WIDTHS.iter().enumerate().map(|(b, w)| Group { width: *w, label: Label::new(LabelKind::Unit, b as u32) }).collect()).unwrap()
+    }
+
+    /// A gated layer: reads `a = V x` in components of widths 1, 2, 1, 3, 1, its gate `z` either a
+    /// component's own read norm `‖a_b‖ − τ_b` or a direction `g_bᵀx − τ_b`, the gated reads
+    /// (`H(z)`, or `Φ(z / s)` with the scale `s` a raw slot), written back by `U`. Thresholds put
+    /// some components off on some rows.
+    fn layer(direction: bool, soft: bool, seed: u64) -> (OperatorProgram, FamilyInputs) {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let mut normal = |r: usize, c: usize| Array2::from_shape_fn((r, c), |_| rng.random::<f64>() - 0.5);
+        let (r, b) = (WIDTHS.iter().sum::<usize>(), WIDTHS.len());
+        let units = Interface::uniform(b, 1, LabelKind::Unit, 0).unwrap();
+        let dense = |name: &str, rows: Interface, cols: Interface, v: Array2<f64>| Arc::new(Operator::dense(name, rows, cols, v.clone(), exact_precision(v.iter().copied()).unwrap(), Default::default()).unwrap());
+        let tau = Array2::from_shape_fn((b, 1), |(i, _)| -0.25 - 0.05 * i as f64);
+        let mut operators = vec![
+            dense("V", reads(), Interface::native(D).unwrap(), normal(r, D)),
+            dense("U", Interface::native(OUT).unwrap(), reads(), normal(OUT, r)),
+            dense("minus_tau", units.clone(), Interface::constant(), tau),
+            Arc::new(Operator::identity("I", units.clone())),
+        ];
+        let mut nodes = vec![Node::Raw { slot: 0 }, Node::Affine { terms: vec![(0, 0)], bias: None }];
+        let gate = if direction {
+            operators.push(dense("G", units.clone(), Interface::native(D).unwrap(), normal(b, D)));
+            nodes.push(Node::Affine { terms: vec![(0, 4)], bias: Some(2) });
+            nodes.len() - 1
+        } else {
+            nodes.push(Node::GroupNorm { input: 1 });
+            nodes.push(Node::Affine { terms: vec![(nodes.len() - 1, 3)], bias: Some(2) });
+            nodes.len() - 1
+        };
+        let mut slots = vec![Slot::Raw { width: D }];
+        let scale = soft.then(|| {
+            slots.push(Slot::Raw { width: b });
+            nodes.push(Node::Raw { slot: 1 });
+            nodes.len() - 1
+        });
+        nodes.push(Node::Gated { value: 1, gate, scale });
+        nodes.push(Node::Affine { terms: vec![(nodes.len() - 1, 1)], bias: None });
+        let output = nodes.len() - 1;
+        let program = OperatorProgram { declarations: Declarations { domains: vec![], slots, parameters: 0 }, operators, bases: vec![], rules: vec![], nodes, output };
+        let rows = 24;
+        let mut values = vec![SlotValues::Raw(normal(rows, D))];
+        if soft {
+            values.push(SlotValues::Raw(Array2::from_shape_fn((rows, b), |(i, j)| 0.2 + 0.05 * ((i + j) % 4) as f64)));
+        }
+        let layout = SequenceLayout { sequence: vec![0; rows], position: (0..rows as u32).collect() };
+        (program, FamilyInputs { rows, slots: values, layout: Some(layout) })
+    }
+
+    /// The host's gated layer is its definition (exact zeros where a component's gate is not
+    /// positive), and every device's forward, the input's cotangent and the gradients of V, U, the
+    /// thresholds and the gate rows equal the host's derivatives and the device's own dense read;
+    /// with hard gates the write reads only the active components' columns. The program's code
+    /// keeps the nodes.
+    #[test]
+    fn a_gated_layer_is_its_definition_on_every_device() {
+        let mut devices = crate::device_program_tests::devices();
+        devices.extend(Device::single_precision(gam_gpu::GpuPolicy::Auto).unwrap());
+        for (direction, soft) in [(false, false), (true, false), (false, true), (true, true)] {
+            let (program, family) = layer(direction, soft, 3);
+            let host = program.execute(&family, false).unwrap();
+            let SlotValues::Raw(x) = &family.slots[0] else { panic!("raw rows") };
+            // The definition, by hand.
+            let interfaces = program.interfaces().unwrap();
+            let a = &host.values[1];
+            let gate = program.nodes.iter().position(|n| matches!(n, Node::Gated { .. })).unwrap();
+            let Node::Gated { gate: z, scale, .. } = program.nodes[gate] else { unreachable!() };
+            let z = &host.values[z];
+            let mut off = 0;
+            for row in 0..family.rows {
+                for (b, range) in (0..WIDTHS.len()).map(|b| (b, interfaces[1].range(b))) {
+                    let weight = match scale {
+                        Some(s) => crate::operator_program::gated_cdf(z[[row, b]], host.values[s][[row, b]]),
+                        None => f64::from(u8::from(z[[row, b]] > 0.0)),
+                    };
+                    off += usize::from(weight == 0.0);
+                    for c in range {
+                        assert_eq!(host.values[gate][[row, c]], a[[row, c]] * weight);
+                    }
+                }
+            }
+            assert!(soft || (off > 0 && off < family.rows * WIDTHS.len()), "some components are off: {off}");
+            let _ = x;
+            let artifact = crate::artifact::Artifact::native(&program).unwrap();
+            let decoded = crate::artifact::Artifact::from_bytes(&artifact.to_bytes().unwrap(), &program.declarations).unwrap();
+            assert_eq!(decoded.program.nodes, program.nodes, "the code keeps the gated nodes");
+            let seed = Array2::from_shape_fn((family.rows, OUT), |(i, j)| ((i * 7 + j * 3) % 11) as f64 / 11.0 - 0.5);
+            let host_cot = crate::derivatives::vjp_seeded(&program, &family, &host, BTreeMap::from([(program.output, seed.clone())]), None).unwrap();
+            let trainable: Vec<usize> = (0..program.operators.len()).filter(|&op| program.operators[op].name != "I").collect();
+            for device in &devices {
+                let (tolerance, arithmetic) = if device.float64() { (1e-12, Arithmetic::F64) } else { (1e-4, Arithmetic::F32) };
+                let close = |what: &str, got: &Array2<f64>, want: &Array2<f64>| {
+                    let scale = want.iter().fold(1.0_f64, |m, v| m.max(v.abs()));
+                    let err = (got - want).iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+                    assert!(err <= tolerance * scale, "{} direction {direction} soft {soft}: {what} differs by {err}", device.name());
+                };
+                let mut lowered = DeviceProgram::compile_values(device, &program).unwrap();
+                lowered.set_arithmetic(arithmetic);
+                let trace = lowered.forward(&family).unwrap();
+                close("the output", &device.download(trace.value(program.output).unwrap()).unwrap(), &host.values[program.output]);
+                if !soft {
+                    let read = lowered.columns_read(&trace, program.output, gate);
+                    assert!(read.is_some_and(|n| n < WIDTHS.iter().sum::<usize>()), "{}: the write reads the active components only ({read:?})", device.name());
+                }
+                let seeds = || BTreeMap::from([(program.output, device.upload(seed.view()).unwrap())]);
+                let (nodes, gradients) = lowered.vjp_values_dense(&trace, seeds(), &[0], &trainable, arithmetic).unwrap();
+                close("the input's cotangent", &device.download(&nodes[&0]).unwrap(), host_cot[0].as_ref().unwrap());
+                lowered.read_densely();
+                let dense = lowered.forward(&family).unwrap();
+                let (dense_nodes, dense_gradients) = lowered.vjp_values_dense(&dense, seeds(), &[0], &trainable, arithmetic).unwrap();
+                close("the dense read's cotangent", &device.download(&dense_nodes[&0]).unwrap(), &device.download(&nodes[&0]).unwrap());
+                for op in &trainable {
+                    close(&program.operators[*op].name, &device.download(&gradients[op]).unwrap(), &device.download(&dense_gradients[op]).unwrap());
+                }
+            }
+        }
+    }
+
+    /// The tangent pass is the reverse pass's transpose through gated layers (hard and soft gates):
+    /// along the input and the scale, `⟨J t, s⟩ = ⟨t, Jᵀ s⟩` on the host.
+    #[test]
+    fn a_gated_layers_tangent_is_its_reverse_transposed() {
+        for (direction, soft) in [(false, false), (true, false), (false, true), (true, true)] {
+            let (program, family) = layer(direction, soft, 5);
+            let host = program.execute(&family, false).unwrap();
+            let mut rng = StdRng::seed_from_u64(9);
+            let raws: Vec<usize> = program.nodes.iter().enumerate().filter(|(_, n)| matches!(n, Node::Raw { .. })).map(|(i, _)| i).collect();
+            let tangents: BTreeMap<usize, Array2<f64>> = raws.iter().map(|&n| (n, Array2::from_shape_fn(host.values[n].dim(), |_| rng.random::<f64>() - 0.5))).collect();
+            let seed = Array2::from_shape_fn(host.values[program.output].dim(), |_| rng.random::<f64>() - 0.5);
+            let forward = crate::derivatives::jvp_seeded(&program, &family, &host, &BTreeMap::new(), &tangents).unwrap();
+            let along: f64 = forward.iter().zip(&seed).map(|(a, b)| a * b).sum();
+            let cot = crate::derivatives::vjp_seeded(&program, &family, &host, BTreeMap::from([(program.output, seed)]), None).unwrap();
+            let back: f64 = raws.iter().map(|&n| cot[n].as_ref().map_or(0.0, |c| c.iter().zip(&tangents[&n]).map(|(a, b)| a * b).sum::<f64>())).sum();
+            assert!((along - back).abs() <= 1e-12 * along.abs().max(1.0), "direction {direction} soft {soft}: {along} against {back}");
         }
     }
 }

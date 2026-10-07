@@ -576,6 +576,24 @@ extern "C" __global__ void fisher_probe(unsigned int rows, unsigned int cols, fl
     for (unsigned int c = threadIdx.x; c < cols; c += BLOCK) q[c] = sqrtf(q[c]) * fisher_sign(key, first + r, c) - q[c] * dot;
 }
 
+// A gate's entrywise maps (`GateFunction`, `code`): √x, H(x), Φ(z), φ(z)/s, −φ(z) z/s with z = x/s
+// (s read only when `scaled`).
+extern "C" __global__ void gate_function(u64 n, unsigned int code, const float* x, const float* s, int scaled, float* out) {
+    GRID_STRIDE(i, n) {
+        float t = x[i], sd = scaled ? s[i] : 1.0f, z = t / sd, density = expf(-0.5f * z * z) * 0.398942280401432678f;
+        float v;
+        switch (code) {
+            case 0: v = sqrtf(t); break;
+            case 1: v = t > 0.0f ? 1.0f : 0.0f; break;
+            case 2: v = normcdff(z); break;
+            case 3: v = density / sd; break;
+            case 4: v = -density * z / sd; break;
+            default: v = sd == 0.0f ? 0.0f : t / sd; break;
+        }
+        out[i] = v;
+    }
+}
+
 extern "C" __global__ void block_products(u64 n, unsigned int cols, unsigned int blocks,
     const float* left, const float* right, const unsigned int* offsets, float* out) {
     GRID_STRIDE(i, n) {

@@ -345,7 +345,9 @@ impl Structure {
                 | Node::Gain { .. }
                 | Node::Attend { .. }
                 | Node::RmsNorm { .. }
-                | Node::Select { .. } => {}
+                | Node::Select { .. }
+                | Node::GroupNorm { .. }
+                | Node::Gated { .. } => {}
             }
         }
         if let Some(op) = trainable.iter().find(|op| !uses.contains_key(op)) {
@@ -499,6 +501,10 @@ impl Structure {
                 Node::Attend { value, .. } => zero[*value].clone(),
                 // Zero only where both inputs are; claimed for no column.
                 Node::Select { .. } => vec![Kill::none(); w],
+                // A norm of a group is zero only where its whole group is; claimed for none.
+                Node::GroupNorm { .. } => vec![Kill::none(); w],
+                // Zero where its value is (the gate only multiplies).
+                Node::Gated { value, .. } => zero[*value].clone(),
                 Node::Param { .. } | Node::Call { .. } => return Err(error("a call in the flat program")),
             };
             if z.len() != w {
@@ -636,6 +642,26 @@ impl Structure {
                 Node::Gain { input, .. } => {
                     for (i, ui) in u.iter().enumerate() {
                         unread[*input][i].meet(ui, &Kill::none(), None);
+                    }
+                }
+                Node::GroupNorm { input } => {
+                    // Every input coordinate reaches every norm through its group: read wherever
+                    // any norm is.
+                    let k = every(&u, None);
+                    for i in 0..self.widths[*input] {
+                        unread[*input][i].meet(&k, &Kill::none(), None);
+                    }
+                }
+                Node::Gated { value, gate, scale } => {
+                    for (i, ui) in u.iter().enumerate() {
+                        unread[*value][i].meet(ui, &Kill::none(), None);
+                    }
+                    // A gate decides every column of its group: read wherever any output is.
+                    let k = every(&u, None);
+                    for n in std::iter::once(*gate).chain(*scale) {
+                        for i in 0..self.widths[n] {
+                            unread[n][i].meet(&k, &Kill::none(), None);
+                        }
                     }
                 }
                 Node::RmsNorm { input, .. } => {

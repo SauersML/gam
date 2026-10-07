@@ -162,6 +162,47 @@ pub fn jvp_seeded(
                 }
                 out
             }),
+            Node::GroupNorm { input } => tangent_of(&dv, *input).map(|dx| {
+                let (x, interface) = (value(*input), &interfaces[*input]);
+                let norms = value(index);
+                let mut out = zero();
+                for g in 0..interface.group_count() {
+                    for row in 0..rows {
+                        let n = norms[[row, g]];
+                        if n > 0.0 {
+                            out[[row, g]] = interface.range(g).map(|c| x[[row, c]] * dx[[row, c]]).sum::<f64>() / n;
+                        }
+                    }
+                }
+                out
+            }),
+            Node::Gated { value: v, gate, scale } => {
+                let (dx, dz, ds) = (tangent_of(&dv, *v), scale.and_then(|_| tangent_of(&dv, *gate)), scale.and_then(|s| tangent_of(&dv, s)));
+                if dx.is_none() && dz.is_none() && ds.is_none() {
+                    None
+                } else {
+                    let (x, z, interface) = (value(*v), value(*gate), &interfaces[*v]);
+                    let mut out = zero();
+                    for g in 0..interface.group_count() {
+                        for row in 0..rows {
+                            let (weight, moved) = match scale {
+                                Some(s) => {
+                                    let (zv, sv) = (z[[row, g]], value(*s)[[row, g]]);
+                                    let slope = |f: gam_gpu::tensor::GateFunction| f.host(zv, sv);
+                                    let moved = dz.as_ref().map_or(0.0, |t| t[[row, g]]) * slope(gam_gpu::tensor::GateFunction::CdfSlope)
+                                        + ds.as_ref().map_or(0.0, |t| t[[row, g]]) * slope(gam_gpu::tensor::GateFunction::CdfScaleSlope);
+                                    (crate::operator_program::gated_cdf(zv, sv), moved)
+                                }
+                                None => (crate::operator_program::gated_step(z[[row, g]]), 0.0),
+                            };
+                            for c in interface.range(g) {
+                                out[[row, c]] = dx.as_ref().map_or(0.0, |t| t[[row, c]]) * weight + x[[row, c]] * moved;
+                            }
+                        }
+                    }
+                    Some(out)
+                }
+            }
             Node::Select { inside, outside, positions } => {
                 let selected = crate::operator_program::selected_rows(inputs, positions)?;
                 match (tangent_of(&dv, *inside), tangent_of(&dv, *outside)) {
@@ -444,6 +485,51 @@ pub(crate) fn vjp_seeded(
             Node::Hadamard { left, right } => {
                 add(&mut g, *left, &cot * value(*right));
                 add(&mut g, *right, &cot * value(*left));
+            }
+            Node::GroupNorm { input } => {
+                let (x, interface) = (value(*input), &interfaces[*input]);
+                let norms = value(index);
+                let mut gx = Array2::<f64>::zeros(x.dim());
+                for g in 0..interface.group_count() {
+                    for row in 0..rows {
+                        let n = norms[[row, g]];
+                        if n > 0.0 {
+                            for c in interface.range(g) {
+                                gx[[row, c]] = cot[[row, g]] * x[[row, c]] / n;
+                            }
+                        }
+                    }
+                }
+                add(&mut g, *input, gx);
+            }
+            Node::Gated { value: v, gate, scale } => {
+                let (x, z, interface) = (value(*v), value(*gate), &interfaces[*v]);
+                let groups = interface.group_count();
+                let mut gx = Array2::<f64>::zeros(x.dim());
+                let (mut gz, mut gs) = (Array2::<f64>::zeros((rows, groups)), Array2::<f64>::zeros((rows, groups)));
+                for b in 0..groups {
+                    for row in 0..rows {
+                        let weight = match scale {
+                            Some(s) => crate::operator_program::gated_cdf(z[[row, b]], value(*s)[[row, b]]),
+                            None => crate::operator_program::gated_step(z[[row, b]]),
+                        };
+                        let mut along = 0.0;
+                        for c in interface.range(b) {
+                            gx[[row, c]] = cot[[row, c]] * weight;
+                            along += cot[[row, c]] * x[[row, c]];
+                        }
+                        if let Some(s) = scale {
+                            let (zv, sv) = (z[[row, b]], value(*s)[[row, b]]);
+                            gz[[row, b]] = along * gam_gpu::tensor::GateFunction::CdfSlope.host(zv, sv);
+                            gs[[row, b]] = along * gam_gpu::tensor::GateFunction::CdfScaleSlope.host(zv, sv);
+                        }
+                    }
+                }
+                add(&mut g, *v, gx);
+                if let Some(s) = scale {
+                    add(&mut g, *gate, gz);
+                    add(&mut g, *s, gs);
+                }
             }
             Node::Select { inside, outside, positions } => {
                 let selected = crate::operator_program::selected_rows(inputs, positions)?;
