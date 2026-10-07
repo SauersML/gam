@@ -25,7 +25,10 @@ gate sharing across the slices of a layer (below).
 Objective (DESCENT_F=1): F, the bits-back code length per training token (below); otherwise KL alone.
 Wiring (DESCENT_EDGES=1, own arm): the MLP parts' reads of the residual stream are an explicit, fitted
 graph (below), each kept edge charged its index bits.
-Dual step (DESCENT_DUAL): measured (default, library_mdl's rule, below) or fixed (lambda <- lambda +
+Dual step (DESCENT_DUAL): measured (default, library_mdl's rule, below); anneal, the measured rule
+toward a budget K_t that falls geometrically from the start's expected count to K over one pass of
+the training rows (a continuation from the start, so that an exact start is not cut down at once); or
+fixed (lambda <- lambda +
 0.01 log(E[k] / K) on the loss KL + lambda log E[k], the first runs' rule).
 Training rows 0..1023 of tokens.f64, held-out evaluation rows 1024..1031 (4096 tokens), where VPD's
 causal-importance masks give KL 0.737 at 129 active MLP slices per token.
@@ -465,6 +468,12 @@ for step in range(steps):
     objective = kl + (desc + edge_bits) / N
     ek = torch.stack(state['soft']).sum(0).mean()
     hk = torch.stack(state['hard']).sum(0).mean().item()
+    if DUAL == 'anneal':
+        if step == 0:
+            K0 = max(ek.item(), K)
+        Kt = K0 * (K / K0) ** min(1.0, step / B)
+    else:
+        Kt = K
     if DUAL == 'fixed':
         opt.zero_grad(); (objective + lam * torch.log(ek)).backward(); opt.step()
         lam = max(0.0, lam + 0.01 * math.log(ek.item() / K))
@@ -481,12 +490,12 @@ for step in range(steps):
             q.grad = (torch.zeros_like(q) if a is None else a) + (0 if b is None else lam * b)
         opt.step()
         if square > 0:
-            lam = max(0.0, lam + abs(along) / square / (K * B) * (ek.item() - K))
+            lam = max(0.0, lam + abs(along) / square / (Kt * B) * (ek.item() - Kt))
     last = step == steps - 1 or time.time() - t0 > LIMIT
     if (step + 1) % EVAL == 0 or last:
         draw(True)
         e = evaluate(final=last)
-        rec = {'step': step + 1, 'lambda': lam, 'train_kl': kl.item(), 'description_bits': desc.item(), 'train_edge_bits': float(edge_bits),
+        rec = {'step': step + 1, 'lambda': lam, 'K_t': Kt, 'train_kl': kl.item(), 'description_bits': desc.item(), 'train_edge_bits': float(edge_bits),
                'train_F': objective.item(), 'train_k_soft': ek.item(), 'train_k_hard': hk, **e,
                'seconds': time.time() - t0}
         log['trace'].append(rec); print(rec, flush=True)

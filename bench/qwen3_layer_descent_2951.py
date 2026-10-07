@@ -15,7 +15,10 @@ M's fit tokens. Training uses the expected gate Phi((r - tau)/s), evaluation the
 Objective: KL(M || P) / A + lambda log E[k], E[k] = expected rank-one equivalents per token, A the
 held-out KL of M with this layer's MLP removed (the layer's whole effect, measured at the start), and
 lambda <- max(0, lambda + 0.01 log(E[k] / K)) (budget_descent.py's fixed rule, here in units of the
-layer's effect, so that the step does not depend on how much the one layer matters).
+layer's effect, so that the step does not depend on how much the one layer matters). With
+DESCENT_DUAL=anneal the step aims at a budget K_t that falls geometrically from the start's count to K
+over one pass of the training windows instead of at K from the first step (a continuation from the
+exact start; the fixed target cut every neuron at once).
 Training: FineWeb windows of 256 tokens (qwen3_fineweb train), batch 8; held-out evaluation on the
 first 8 windows of 512 tokens of the held-out shard (4096 tokens).
 Usage: qwen3_layer_descent.py START K LAYER OUT.json EVAL SECONDS TRAIN_U32 HELDOUT_U32 [MODEL]"""
@@ -159,13 +162,16 @@ while True:
     kl = kl_bits(lm, lp).mean()
     ek = torch.stack(state['soft']).sum(0).mean()
     hk = torch.stack(state['hard']).sum(0).mean().item()
+    if step == 0:
+        K0 = max(ek.item(), K)
+    Kt = K0 * (K / K0) ** min(1.0, step * batch / rows) if os.environ.get('DESCENT_DUAL') == 'anneal' else K
     opt.zero_grad(); (kl / A + lam * torch.log(ek)).backward(); opt.step()
-    lam = max(0.0, lam + 0.01 * math.log(ek.item() / K))
+    lam = max(0.0, lam + 0.01 * math.log(ek.item() / Kt))
     step += 1
     last = time.time() - t0 > LIMIT
     if step % EVAL == 0 or last:
         e = evaluate()
-        rec = {'step': step, 'lambda': lam, 'train_kl': kl.item(), 'train_k_soft': ek.item(), 'train_k_hard': hk, **e,
+        rec = {'step': step, 'lambda': lam, 'K_t': Kt, 'train_kl': kl.item(), 'train_k_soft': ek.item(), 'train_k_hard': hk, **e,
                'seconds': time.time() - t0}
         log['trace'].append(rec); print(rec, flush=True)
         json.dump(log, open(out, 'w'), indent=1)
