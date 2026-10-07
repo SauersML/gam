@@ -184,7 +184,7 @@ fn own_width(rows: &Array2<f64>, g: ndarray::ArrayView1<f64>, copies: f64) -> f6
 
 /// A direction gate reading `g` on `rows`, signed so that its mean on the rows is not negative and
 /// written in units of its spread there (`g` over the spread, width 1), with no constant.
-fn direction(rows: &Array2<f64>, g: ndarray::ArrayView1<f64>, site: usize) -> Value {
+fn direction_read(rows: &Array2<f64>, g: ndarray::ArrayView1<f64>, site: usize) -> Value {
     let values = rows.dot(&g);
     let sign = if values.sum() >= 0.0 { 1.0 } else { -1.0 };
     let scale = spread(values.iter().copied());
@@ -313,13 +313,13 @@ pub fn frame_start(native: &OperatorProgram, layers: &[LayerNodes], fitting: &Fa
                 for i in 0..frame.atoms.nrows() {
                     let slices = [[site(0), i], [site(1), i], [site(2), i]];
                     own.push(component(json!({"own": [site(0), i]}), own_width(&x, dual.row(i), 3.0), &slices));
-                    direction.push(component(direction(&x, dual.row(i), site(0)), 1.0, &slices));
+                    direction.push(component(direction_read(&x, dual.row(i), site(0)), 1.0, &slices));
                 }
             }
             if let Some((frame, dual)) = &o_frame {
                 for i in 0..frame.atoms.nrows() {
                     own.push(component(json!({"own": [site(3), i]}), own_width(&heads_out, dual.row(i), 1.0), &[[site(3), i]]));
-                    direction.push(component(direction(&heads_out, dual.row(i), site(3)), 1.0, &[[site(3), i]]));
+                    direction.push(component(direction_read(&heads_out, dual.row(i), site(3)), 1.0, &[[site(3), i]]));
                 }
             }
             match &mlp {
@@ -327,18 +327,18 @@ pub fn frame_start(native: &OperatorProgram, layers: &[LayerNodes], fitting: &Fa
                     let hidden = value(layer.active)?;
                     for i in 0..*ups {
                         own.push(component(json!({"own": [site(4), i]}), own_width(&h2, up_dual.row(i), 1.0), &[[site(4), i]]));
-                        direction.push(component(direction(&h2, up_dual.row(i), site(4)), 1.0, &[[site(4), i]]));
+                        direction.push(component(direction_read(&h2, up_dual.row(i), site(4)), 1.0, &[[site(4), i]]));
                     }
                     for i in 0..*downs {
                         own.push(component(json!({"own": [site(5), i]}), own_width(&hidden, down_dual.row(i), 1.0), &[[site(5), i]]));
-                        direction.push(component(direction(&hidden, down_dual.row(i), site(5)), 1.0, &[[site(5), i]]));
+                        direction.push(component(direction_read(&hidden, down_dual.row(i), site(5)), 1.0, &[[site(5), i]]));
                     }
                 }
                 Some((m, _, None)) => {
                     for n in 0..*m {
                         let slices = [[site(4), n], [site(5), n]];
                         own.push(component(json!({"own": [site(4), n]}), own_width(&h2, up.row(n), 1.0), &slices));
-                        direction.push(component(direction(&h2, up.row(n), site(4)), 1.0, &slices));
+                        direction.push(component(direction_read(&h2, up.row(n), site(4)), 1.0, &slices));
                     }
                 }
                 _ => {}
