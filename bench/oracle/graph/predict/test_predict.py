@@ -164,3 +164,50 @@ def test_vpd_subcomponent_scale_is_the_weight_edit():
         site.W.copy_(W)
     assert (ours - ref).abs().max().item() < 1e-4
     assert (ours - m.log_probs(m.forward(t))).abs().max().item() > 1e-6  # the edit does something
+
+
+def test_concat_matches_separate_forwards(qwen):
+    t = torch.cat([tokens(), tokens().flip(1)])
+    a, b = qwen.new(2), qwen.new(2)
+    G.apply_scale(a, 0, ("head", 10, 3), 0.0)
+    G.apply_scale(a, 1, ("neurons", 4, (7, 8)), 2.0)
+    G.apply_scale(b, 0, ("mlp", 12), 0.5)
+    G.apply_scale(b, 1, ("attn", 2), 0.0)
+    joint = qwen.log_probs(qwen.forward(t.repeat(2, 1), G.Interventions.concat([a, b])))
+    apart = torch.cat([qwen.log_probs(qwen.forward(t, a)), qwen.log_probs(qwen.forward(t, b))])
+    assert (joint - apart).abs().max().item() < 1e-6
+
+
+def test_attend_weights_reproduce_the_head_read(qwen):
+    """The recorded attention weights of a head at the last position, applied to its values, give its read z."""
+    t = tokens()
+    rec = {"attend": {0: (5, 9)}}
+    qwen.forward(t, None, rec)
+    w = rec["attend_weights"][0]
+    assert abs(w.sum().item() - 1.0) < 1e-5
+    captured = {}
+    layer = qwen.layers[5]
+    handle = layer.input_layernorm.register_forward_hook(lambda mod, inp, out: captured.setdefault("x", out))
+    try:
+        qwen.forward(t, None, {})
+    finally:
+        handle.remove()
+    pos = torch.arange(t.shape[1])[None]
+    cos, sin = qwen.inner.rotary_emb(captured["x"], pos)
+    _, _, v = qwen.qkv(layer, captured["x"], cos, sin)
+    z_from_weights = w @ v[0, 9 // (qwen.H // qwen.KV)]
+    assert (z_from_weights - rec["z_last"][0, 5, 9]).abs().max().item() < 1e-4
+
+
+def test_draws_respect_the_piece_split(qwen):
+    rng = np.random.default_rng(0)
+    for split in ("train", "heldout"):
+        d = G.Draw(qwen, rng, split)
+        for _ in range(50):
+            p = d.uniform()
+            if p[0] == "head":
+                assert G.held_out_units("head", p[1], qwen.H)[p[2]] == (split == "heldout")
+            elif p[0] == "neurons":
+                assert all(G.held_out_units("neuron", p[1], qwen.Fn)[i] == (split == "heldout") for i in p[2])
+            else:
+                assert split == "train"  # whole blocks only in training shards
