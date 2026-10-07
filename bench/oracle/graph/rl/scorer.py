@@ -46,6 +46,7 @@ EXPORT = None
 BATCH = 4  # programs per score request (vpd4l: 11 programs of 16 experiments passed a 20 GiB lease on the Mac)
 MEMORY_GIB = None  # the checker server's lease (score.py's default when None)
 VIEWS = None  # decomposition views the checker attaches ({"vpd": DIR}; score.Checker's views)
+DEVICE = None  # "gpu": the checker's single-precision device path
 
 
 def checker(items: list[dict]) -> list[dict]:
@@ -69,7 +70,7 @@ def checker(items: list[dict]) -> list[dict]:
     def run(w: int, model: str, path: str, ks: list[int]):
         c = _CHECKERS.get((model, w))
         if c is None:
-            c = _CHECKERS[(model, w)] = score.Checker(model, EXPORT, memory_gib=MEMORY_GIB, views=VIEWS)
+            c = _CHECKERS[(model, w)] = score.Checker(model, EXPORT, memory_gib=MEMORY_GIB, views=VIEWS, **({"device": DEVICE} if DEVICE else {}))
             c.loaded = None
         if c.loaded != path:
             load_behavior(c, path)

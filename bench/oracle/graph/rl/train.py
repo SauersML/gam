@@ -610,6 +610,7 @@ def main():
     ap.add_argument("--score-workers", type=int, default=1, help="checker servers per target model, each scoring whole behaviors in parallel")
     ap.add_argument("--checker", help="the checker binary (mpd_graph_2951; score.py's GRAPH_CHECKER); on MATS name target/release/examples/mpd_graph_2951 so the job builds it")
     ap.add_argument("--vpd-view", help="VPD's decomposition export for the checker's vpd view (programs with PD.vpd pieces are invalid without it; vpd4l: ~/mpd-data/engine/vpd4l_decomposition)")
+    ap.add_argument("--checker-device", choices=["gpu"], help="run the checker's large products on the single-precision device (float32; compare scores only within one device)")
     ap.add_argument("--checker-gib", type=int, help="the checker server's memory lease on the Mac (score.py's default otherwise)")
     ap.add_argument("--export", help="the target model's export directory for the checker (score.py's EXPORTS entry otherwise)")
     ap.add_argument("--out", required=True)
@@ -662,7 +663,7 @@ def main():
     if args.mode == "rescore":  # no policy: scores saved programs again
         if args.checker:
             os.environ["GRAPH_CHECKER"] = str(Path(args.checker).resolve())
-        scorer.WORKERS, scorer.EXPORT, scorer.MEMORY_GIB, scorer.VIEWS = args.score_workers, args.export, args.checker_gib, views_of(args)
+        scorer.WORKERS, scorer.EXPORT, scorer.MEMORY_GIB, scorer.VIEWS, scorer.DEVICE = args.score_workers, args.export, args.checker_gib, views_of(args), args.checker_device
         print(json.dumps(rescore(args, SCORERS[args.scorer])))
         return
     use_vllm = args.sampler == "vllm" or (args.sampler == "auto" and torch.cuda.is_available() and __import__("importlib").util.find_spec("vllm") is not None)
@@ -679,7 +680,7 @@ def main():
     if args.checker:
         os.environ["GRAPH_CHECKER"] = str(Path(args.checker).resolve())
     score = SCORERS[args.scorer]
-    scorer.WORKERS, scorer.EXPORT, scorer.MEMORY_GIB, scorer.VIEWS = args.score_workers, args.export, args.checker_gib, views_of(args)
+    scorer.WORKERS, scorer.EXPORT, scorer.MEMORY_GIB, scorer.VIEWS, scorer.DEVICE = args.score_workers, args.export, args.checker_gib, views_of(args), args.checker_device
     root = Path(args.behaviors)
     pool, heldout_prompts = split_prompts(behaviors(root, args.model, "train"), args.prompt_holdout, out / "behaviors")
     sets = {"heldout_behaviors": behaviors(root, args.model, "heldout"), "heldout_prompts": heldout_prompts}

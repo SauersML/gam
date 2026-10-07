@@ -56,11 +56,12 @@ def reader_request(address, message):
 
 
 class Checker:
-    def __init__(self, model, export=None, memory_gib=None, threads=None, views=None):
+    def __init__(self, model, export=None, memory_gib=None, threads=None, views=None, device=None):
         """memory_gib: the server's mem-lease (vpd4l: a batch of 8 programs at 8 threads ran under 12 GiB and
         was killed under 8 GiB); threads: its rayon threads (RAYON_NUM_THREADS when unset, 6 by default: runs
         in parallel each hold their own streams and log-probabilities); views: decomposition views to attach,
-        {"vpd": DIR, "transcoders": DIR} (the server's load keys)."""
+        {"vpd": DIR, "transcoders": DIR} (the server's load keys); device: "gpu" runs the large products on
+        the single-precision device (the server's load key; float32, so compare scores within one device)."""
         # Qwen3-0.6B's load in float64 passed 16.3 GiB and was killed under a 16 GiB lease.
         memory_gib = memory_gib or (28 if model.startswith("qwen3") else 12)
         env = dict(os.environ)
@@ -71,7 +72,7 @@ class Checker:
         if not os.environ.get("MEM_LEASE_GIB"):
             command = ["mem-lease", str(memory_gib)] + command
         self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1, env=env)
-        self.request({"op": "load", "export": str(export), **{k: str(Path(v).expanduser()) for k, v in (views or {}).items()}})
+        self.request({"op": "load", "export": str(export), **{k: str(Path(v).expanduser()) for k, v in (views or {}).items()}, **({"device": device} if device else {})})
         self.behavior_record = None
 
     def request(self, message):
