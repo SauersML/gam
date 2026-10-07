@@ -1415,3 +1415,122 @@ def count_repeats(tok, rng):
         t = "Words: {s}.\nHow many times does {a} appear? Answer:"
         v.items.append(Item(t.format(s=" ".join(seq), a=a), " " + nums[n - 2], t.format(s=" ".join(alt), a=a), " " + nums[n - 3]))
     return [v]
+
+
+@family
+def syllogism(tok, rng):
+    """Conclude a categorical syllogism."""
+    cats = [("cats", "animal", "an"), ("roses", "flower", "a"), ("oaks", "tree", "a"), ("trucks", "vehicle", "a"),
+            ("hammers", "tool", "a"), ("violins", "instrument", "an"), ("apples", "fruit", "a"), ("sparrows", "bird", "a"),
+            ("salmon", "fish", "a"), ("carrots", "vegetable", "a")]
+    names = words(tok, NAMES_F + NAMES_M + ["Rex", "Fluffy", "Max", "Bella", "Spot"])
+    v = Variant("all_are", "Syllogism: 'All X are Y. N is one of the X. So N is a' is followed by Y; the counterfactual changes the category.")
+    for _ in range(400):
+        (x, y, art), (x2, y2, art2) = rng.sample(cats, 2)
+        if art != art2:
+            continue
+        n = rng.choice(names)
+        t = "All {x} are {y}s. {n} is one of the {x}. Therefore {n} is {art}"
+        v.items.append(Item(t.format(x=x, y=y, n=n, art=art), " " + y, t.format(x=x2, y=y2, n=n, art=art), " " + y2))
+    return [v]
+
+
+@family
+def transitive_compare(tok, rng):
+    """The extreme of a chain of comparisons."""
+    names = words(tok, NAMES_F + NAMES_M)
+    v = Variant("tallest", "Transitive comparison: two 'taller than' statements chain three people; the tallest is the one at the top of the chain; the counterfactual reverses the chain.")
+    for _ in range(400):
+        a, b, c = rng.sample(names, 3)
+        t = "{p} is taller than {q}. {q} is taller than {r}. The tallest of the three is"
+        v.items.append(Item(t.format(p=a, q=b, r=c), " " + a, t.format(p=c, q=b, r=a), " " + c))
+    return [v]
+
+
+@family
+def variable_assignment(tok, rng):
+    """Follow a chain of Python assignments."""
+    names = list("abcdxyzpqr")
+    v = Variant("chain", "Variable binding: a value is assigned and copied along a chain of variables; the printed value is the original; the counterfactual changes the value.")
+    for _ in range(400):
+        a, b, c = rng.sample(names, 3)
+        x, y = rng.sample(range(10, 100), 2)
+        t = "{a} = {x}\n{b} = {a}\n{c} = {b}\nprint({c})  # prints"
+        v.items.append(Item(t.format(a=a, b=b, c=c, x=x), f" {x}", t.format(a=a, b=b, c=c, x=y), f" {y}"))
+    return [v]
+
+
+@family
+def two_digit_add(tok, rng):
+    """Two-digit addition without carrying into a third digit."""
+    v = Variant("add", "Two-digit addition after two worked examples; the counterfactual changes one operand by one.")
+    for _ in range(400):
+        a, b = rng.randrange(10, 50), rng.randrange(10, 50)
+        b2 = b + 1
+        shots = "12 + 31 = 43\n25 + 14 = 39\n"
+        v.items.append(Item(shots + f"{a} + {b} =", f" {a + b}", shots + f"{a} + {b2} =", f" {a + b2}"))
+    return [v]
+
+
+@family
+def object_location(tok, rng):
+    """Where an object was put."""
+    names = words(tok, NAMES_F + NAMES_M)
+    places = ["box", "drawer", "basket", "bag", "cupboard", "closet", "fridge", "garage"]
+    objs = ["ball", "book", "key", "apple", "phone", "hat", "cup", "pen"]
+    v = Variant("put", "Object tracking: two objects are put in two places; asked where one object is, the answer is its place; the counterfactual swaps the two places.")
+    for _ in range(400):
+        n = rng.choice(names)
+        o1, o2 = rng.sample(objs, 2)
+        p1, p2 = rng.sample(places, 2)
+        t = "{n} put the {o1} in the {p1} and the {o2} in the {p2}. The {o1} is in the"
+        v.items.append(Item(t.format(n=n, o1=o1, o2=o2, p1=p1, p2=p2), " " + p1, t.format(n=n, o1=o1, o2=o2, p1=p2, p2=p1), " " + p2))
+    return [v]
+
+
+IMPORTS = [("numpy", "np"), ("pandas", "pd"), ("matplotlib.pyplot", "plt"), ("tensorflow", "tf"), ("seaborn", "sns"),
+           ("networkx", "nx"), ("scipy.stats", "stats"), ("torch.nn", "nn"), ("datetime", "dt"), ("plotly.express", "px")]
+
+
+@family
+def code_import_alias(tok, rng):
+    """The conventional alias of a Python import."""
+    rows = IMPORTS
+    v = Variant("alias", "Code convention: the conventional alias of an imported Python module, and its later use; several phrasings.")
+    ts = ["import {m} as", "import os\nimport {m} as", "# setup\nimport sys\nimport {m} as", "import json\nimport {m} as",
+          "from pathlib import Path\nimport {m} as", "import re\nimport {m} as", "#!/usr/bin/env python\nimport {m} as"]
+    for i, t in enumerate(ts):
+        for m, al in rows:
+            v.items.append(Item(t.format(m=m), " " + al, tmpl=i))
+    return [v]
+
+
+@family
+def unit_conversion(tok, rng):
+    """Convert a quantity between units by a factor of ten, a hundred or a thousand."""
+    units = [("meters", "centimeters", 100), ("kilometers", "meters", 1000), ("kilograms", "grams", 1000), ("liters", "milliliters", 1000),
+             ("centimeters", "millimeters", 10), ("dollars", "cents", 100)]
+    v = Variant("scale", "Unit conversion: after one worked example of the same units, a small quantity converted to the smaller unit; the counterfactual changes the quantity.")
+    for _ in range(400):
+        big, small, f = rng.choice(units)
+        q, q2 = rng.sample(range(2, 10), 2)
+        t = "1 {b} = {f} {s}\n{q} {b} ="
+        v.items.append(Item(t.format(b=big, f=f, s=small, q=q), f" {q * f}", t.format(b=big, f=f, s=small, q=q2), f" {q2 * f}"))
+    return [v]
+
+
+AUTHORS = [("Hamlet", "Shakespeare"), ("Macbeth", "Shakespeare"), ("Pride and Prejudice", "Austen"), ("Emma", "Austen"),
+           ("Oliver Twist", "Dickens"), ("Great Expectations", "Dickens"), ("War and Peace", "Tolstoy"), ("Anna Karenina", "Tolstoy"),
+           ("1984", "Orwell"), ("Animal Farm", "Orwell"), ("The Odyssey", "Homer"), ("The Iliad", "Homer"), ("Ulysses", "Joyce"),
+           ("Moby-Dick", "Melville"), ("Frankenstein", "Shelley"), ("Dracula", "Stoker"), ("Don Quixote", "Cervantes"),
+           ("The Divine Comedy", "Dante"), ("Faust", "Goethe"), ("Crime and Punishment", "Dostoevsky"), ("The Raven", "Poe"),
+           ("Leaves of Grass", "Whitman"), ("The Old Man and the Sea", "Hemingway"), ("The Great Gatsby", "Fitzgerald"),
+           ("Brave New World", "Huxley"), ("Lolita", "Nabokov"), ("Les Miserables", "Hugo"), ("The Hobbit", "Tolkien"),
+           ("Jane Eyre", "Bronte"), ("Walden", "Thoreau"), ("Candide", "Voltaire"), ("Beloved", "Morrison")]
+
+
+@family
+def author_of(tok, rng):
+    """The author of a famous work."""
+    return fact_variants(AUTHORS, [("written_by", "{X} was written by the author whose surname is"), ("few_shot", "Hamlet: Shakespeare\nEmma: Austen\n{X}:"),
+                                   ("qa", "Q: Who wrote {X}? Give the surname.\nA:")], "Factual recall: the surname of the author of a famous work.")
