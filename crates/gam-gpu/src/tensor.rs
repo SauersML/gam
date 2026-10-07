@@ -421,6 +421,7 @@ pub enum GateFunction {
 }
 
 impl GateFunction {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn code(self) -> u32 {
         match self {
             Self::Sqrt => 0,
