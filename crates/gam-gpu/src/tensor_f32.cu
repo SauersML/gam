@@ -644,6 +644,21 @@ extern "C" __global__ void listed_product(u64 total, unsigned int m, unsigned in
     }
 }
 
+// out[c, j] = Σ v[r, c] y[r, j] over the rows r listed for column c's group (v rows × n, y rows × m),
+// over the total = n × m entries of out.
+extern "C" __global__ void listed_product_t(u64 total, unsigned int m, unsigned int n, const float* v, const float* y, const unsigned int* offsets, const unsigned int* rows, const unsigned int* group_of, float* out) {
+    GRID_STRIDE(i, total) {
+        u64 c = i / m, j = i % m;
+        unsigned int g = group_of[c];
+        float s = 0.0f;
+        for (unsigned int e = offsets[g]; e < offsets[g + 1]; ++e) {
+            u64 r = rows[e];
+            s += v[r * n + c] * y[r * m + j];
+        }
+        out[i] = s;
+    }
+}
+
 // out = tᵀ over its n = rows × cols entries (t rows × cols).
 extern "C" __global__ void transpose(u64 n, unsigned int rows, unsigned int cols, const float* t, float* out) {
     GRID_STRIDE(i, n) out[i] = t[(i % rows) * cols + i / rows];

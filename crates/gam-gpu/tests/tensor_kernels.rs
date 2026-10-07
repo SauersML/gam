@@ -754,10 +754,10 @@ fn column_reads_and_writes_agree_with_the_host() {
     }
 }
 
-/// `row_lists`, `sampled_product`, `listed_product` and `transpose` on every device against the
-/// host's definitions: per row the columns of the groups whose mask entry is not zero (a NaN
-/// counts), `x Aᵀ` at exactly those entries and zero elsewhere, `v A` from the listed entries of
-/// `v` alone, and `tᵀ`. The values are small integers, so every sum is exact in float32 too and
+/// `row_lists`, `sampled_product`, `listed_product`, `listed_product_t` and `transpose` on every
+/// device against the host's definitions: per row the columns of the groups whose mask entry is
+/// not zero (a NaN counts), `x Aᵀ` at exactly those entries and zero elsewhere, `v A` and `vᵀ y`
+/// from the listed entries of `v` alone, and `tᵀ`. The values are small integers, so every sum is exact in float32 too and
 /// each device gives the definition bit for bit.
 #[test]
 fn row_lists_and_their_products_agree_with_the_host() {
@@ -778,12 +778,21 @@ fn row_lists_and_their_products_agree_with_the_host() {
     let b = Array2::from_shape_fn((n, m), |(c, j)| ((c * 5 + j) % 7) as f64 - 3.0);
     let sampled = Array2::from_shape_fn((rows, n), |(r, c)| if on(r, c) { x.row(r).dot(&a.row(c)) } else { 0.0 });
     let listed = Array2::from_shape_fn((rows, m), |(r, j)| (0..n).filter(|&c| on(r, c)).map(|c| v[[r, c]] * b[[c, j]]).sum::<f64>());
+    let y = Array2::from_shape_fn((rows, m), |(r, j)| ((r * 4 + j * 3) % 5) as f64 - 2.0);
+    let transposed = Array2::from_shape_fn((n, m), |(c, j)| (0..rows).filter(|&r| on(r, c)).map(|r| v[[r, c]] * y[[r, j]]).sum::<f64>());
     for device in every_device() {
         let lists = device.row_lists(&up(&device, &mask), &starts).expect("row lists");
         assert_eq!((lists.dim(), lists.len()), ((rows, n), (0..rows).flat_map(|r| (0..n).map(move |c| (r, c))).filter(|&(r, c)| on(r, c)).count()), "{}", device.name());
         assert_eq!(down(&device, &device.sampled_product(&up(&device, &x), &up(&device, &a), &lists).expect("sampled")), sampled, "{}: sampled product", device.name());
         assert_eq!(down(&device, &device.listed_product(&up(&device, &v), &lists, &up(&device, &b)).expect("listed")), listed, "{}: listed product", device.name());
         assert_eq!(down(&device, &device.transpose(&up(&device, &v)).expect("transpose")), v.t(), "{}: transpose", device.name());
+        // Per group its rows (the transposed mask's row lists, one column a row), and per column its
+        // group: vᵀ y from the listed entries of v alone.
+        let ones: Vec<u32> = (0..=rows as u32).collect();
+        let by_group = device.row_lists(&device.transpose(&up(&device, &mask)).expect("transpose"), &ones).expect("group lists");
+        let group_of: Vec<u32> = (0..n).map(|c| (0..widths.len()).find(|&g| (starts[g] as usize..starts[g + 1] as usize).contains(&c)).unwrap() as u32).collect();
+        let along = device.listed_product_t(&up(&device, &v), &by_group, &device.upload_indices(&group_of).expect("groups"), &up(&device, &y)).expect("listed transposed");
+        assert_eq!(down(&device, &along), transposed, "{}: transposed listed product", device.name());
         let none = device.row_lists(&up(&device, &Array2::zeros((rows, widths.len()))), &starts).expect("no lists");
         assert!(none.is_empty());
         assert_eq!(down(&device, &device.sampled_product(&up(&device, &x), &up(&device, &a), &none).expect("sampled")), Array2::<f64>::zeros((rows, n)));

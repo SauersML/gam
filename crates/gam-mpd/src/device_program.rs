@@ -1487,13 +1487,23 @@ impl DeviceProgram {
         if let Some(lists) = trace.lists.get(&gated) {
             return Ok(Some(Arc::clone(lists)));
         }
+        let Some(mask) = self.gate_mask(trace, gated)? else { return Ok(None) };
+        let lists = Arc::new(self.device.row_lists(&mask, starts).map_err(error)?);
+        trace.lists.insert(gated, Arc::clone(&lists));
+        Ok(Some(lists))
+    }
+
+    /// Gated node `gated`'s components on, rows × components: not zero exactly where `H(gate)` is
+    /// 1, or with a scale where `Φ(gate / scale) + φ(gate / scale) / scale` is not zero
+    /// ([`DeviceProgram::row_lists`]). `None` for a gate held in bfloat16.
+    fn gate_mask(&self, trace: &DeviceTrace, gated: usize) -> Result<Option<Tensor>, String> {
         let Step::Gated { gate, scale, .. } = &self.steps[gated] else { return Err(format!("device: node {gated} is not gated")) };
         let d = &self.device;
         let z = trace.value(*gate)?;
         if z.storage() == Storage::Bf16 {
             return Ok(None);
         }
-        let mask = match scale {
+        Ok(Some(match scale {
             None => d.gate_function(GateFunction::Step, z, None).map_err(error)?,
             Some(s) => {
                 let s = trace.value(*s)?;
@@ -1501,10 +1511,40 @@ impl DeviceProgram {
                 d.axpy(&mut mask, 1.0, &d.gate_function(GateFunction::CdfSlope, z, Some(s)).map_err(error)?).map_err(error)?;
                 mask
             }
+        }))
+    }
+
+    /// The gradient `cotᵀ x` of affine node `node`'s term from its input `input`, from per-row
+    /// lists alone, in the gradient's storage (f32 or f64): for a gated read (its cotangent zero
+    /// off its lists) row `c` of the operator sums `cot[r, c] x[r, :]` over the rows `r` whose
+    /// component of `c` is on, and for a write from a gated node (its value zero off its lists)
+    /// column `c` sums `x[r, c] cot[r, :]` over them. Each gated node's rows per component
+    /// (`by_group`) are made once a reverse. `None` for the dense product.
+    fn listed_gradient(&self, trace: &DeviceTrace, (node, input): (usize, usize), cot: &Tensor, storage: Storage, (edited, seeded): (&BTreeSet<usize>, &BTreeSet<usize>), by_group: &mut BTreeMap<usize, Arc<RowLists>>) -> Result<Option<Tensor>, String> {
+        if storage == Storage::Bf16 || cot.storage() != storage || matches!(self.steps[input], Step::Feature { .. }) {
+            return Ok(None);
+        }
+        let read = self.gated_reads[node].filter(|r| trace.lists.contains_key(r) && !seeded.contains(&node) && !edited.contains(&node));
+        let write = Some(input).filter(|i| self.listed[*i].is_some() && trace.lists.contains_key(i) && !edited.contains(i));
+        let Some(gated) = read.or(write) else { return Ok(None) };
+        let x = trace.value(input)?;
+        if x.storage() != storage {
+            return Ok(None);
+        }
+        let Step::Gated { of, .. } = &self.steps[gated] else { return Err(format!("device: node {gated} is not gated")) };
+        let d = &self.device;
+        let lists = match by_group.get(&gated) {
+            Some(lists) => Arc::clone(lists),
+            None => {
+                let Some(mask) = self.gate_mask(trace, gated)? else { return Ok(None) };
+                let ones: Vec<u32> = (0..=trace.rows as u32).collect();
+                let lists = Arc::new(d.row_lists(&d.transpose(&mask).map_err(error)?, &ones).map_err(error)?);
+                by_group.insert(gated, Arc::clone(&lists));
+                lists
+            }
         };
-        let lists = Arc::new(d.row_lists(&mask, starts).map_err(error)?);
-        trace.lists.insert(gated, Arc::clone(&lists));
-        Ok(Some(lists))
+        let gradient = if read.is_some() { d.listed_product_t(cot, &lists, of, x) } else { d.listed_product_t(x, &lists, of, cot).and_then(|t| d.transpose(&t)) };
+        gradient.map(Some).map_err(error)
     }
 
     /// `A` held dense in f32 or f64 in `x`'s storage, for a product on per-row lists; `None` for
@@ -3093,6 +3133,8 @@ impl DeviceProgram {
             let one = self.device.upload_vec(1, 1, vec![1.0]).map_err(error)?;
             Some(self.device.broadcast_rows(&one, trace.rows).map_err(error)?)
         } else { None };
+        // Per gated node read or written on per-row lists, its rows per component.
+        let mut by_group = BTreeMap::new();
         for (node, step) in self.steps.iter().enumerate() {
             if let (Some((ids, part)), Step::Affine { terms, bias }) = (packed.get(&node), step) {
                 // A packed cotangent ([`Packed`]): only its columns' rows of the operators and of the
@@ -3133,6 +3175,17 @@ impl DeviceProgram {
             let mut half = rounded.remove(&node);
             if let Step::Affine { terms, .. } = step {
                 for (input, op) in terms {
+                    if let Some(storage) = gradients.values.get(op).map(Tensor::storage)
+                        && let Some(part) = self.listed_gradient(trace, (node, *input), cot, storage, (edited, &seeded), &mut by_group)?
+                    {
+                        let (gradient, beta) = gradients.ready(&self.device, *op, true)?.ok_or("device: a gradient slot")?;
+                        if beta == 0.0 {
+                            *gradient = part;
+                        } else {
+                            self.device.axpy(gradient, 1.0, &part).map_err(error)?;
+                        }
+                        continue;
+                    }
                     let active = self.reverse_active(trace, (node, *input), (edited, &seeded));
                     if let Some(storage) = gradients.values.get(op).map(Tensor::storage) {
                         match active {

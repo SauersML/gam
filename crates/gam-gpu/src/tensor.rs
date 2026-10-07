@@ -1694,6 +1694,38 @@ impl Device {
         }
     }
 
+    /// `vᵀ y` (`v` rows × n read only at listed entries, `y` rows × m) from per-group lists of rows
+    /// (`lists`, groups × rows: [`Device::row_lists`] of the transposed mask, one column a row) and
+    /// each column's group `group_of`: row `c` of the result is `Σ_r v[r, c] y[r, :]` over the rows
+    /// `r` its group lists, summed in the tensors' own precision (a weight's gradient from a
+    /// cotangent or value zero off its rows' components).
+    pub fn listed_product_t(&self, v: &Tensor, lists: &RowLists, group_of: &Indices, y: &Tensor) -> Result<Tensor, GpuError> {
+        if lists.cols != v.rows || group_of.len != v.cols || v.rows != y.rows || v.storage() != y.storage() || v.storage() == Storage::Bf16 {
+            return Err(shape(format!("a transposed listed product of {:?} at {:?} lists and {:?}", v.dim(), lists.dim(), y.dim())));
+        }
+        match &*self.backend {
+            Backend::Host => {
+                let (vv, yv, n, m) = (host(v)?, host(y)?, v.cols, y.cols);
+                let (offsets, rows, groups) = (host_indices(&lists.offsets)?, host_indices(&lists.columns)?, host_indices(group_of)?);
+                if groups.iter().any(|&g| g as usize >= lists.rows) {
+                    return Err(shape(format!("a group of {} lists", lists.rows)));
+                }
+                let mut out = vec![0.0; n * m];
+                for (c, row) in out.chunks_mut(m.max(1)).take(n).enumerate() {
+                    let g = groups[c] as usize;
+                    for (j, o) in row.iter_mut().enumerate() {
+                        *o = rows[offsets[g] as usize..offsets[g + 1] as usize].iter().map(|&r| vv[r as usize * n + c] * yv[r as usize * m + j]).sum();
+                    }
+                }
+                Ok(Tensor { rows: n, cols: m, data: Data::Host(out) })
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) => engine.listed_product_t(v, lists, group_of, y),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(engine) => engine.listed_product_t(v, lists, group_of, y),
+        }
+    }
+
     /// `tᵀ`.
     pub fn transpose(&self, t: &Tensor) -> Result<Tensor, GpuError> {
         match &*self.backend {
@@ -3977,6 +4009,21 @@ extern "C" __global__ void listed_product(u64 total, unsigned int m, unsigned in
         for (unsigned int e = offsets[r]; e < offsets[r + 1]; ++e) {
             u64 c = columns[e];
             s += v[r * n + c] * a[c * m + j];
+        }
+        out[i] = s;
+    }
+}
+
+// out[c, j] = Σ v[r, c] y[r, j] over the rows r listed for column c's group (v rows × n, y rows × m),
+// over the total = n × m entries of out.
+extern "C" __global__ void listed_product_t(u64 total, unsigned int m, unsigned int n, const double* v, const double* y, const unsigned int* offsets, const unsigned int* rows, const unsigned int* group_of, double* out) {
+    GRID_STRIDE(i, total) {
+        u64 c = i / m, j = i % m;
+        unsigned int g = group_of[c];
+        double s = 0.0;
+        for (unsigned int e = offsets[g]; e < offsets[g + 1]; ++e) {
+            u64 r = rows[e];
+            s += v[r * n + c] * y[r * m + j];
         }
         out[i] = s;
     }
@@ -6872,6 +6919,31 @@ extern "C" __global__ void group_divergence(u64 n, int scaled, const double* ref
             Ok(out)
         }
 
+        pub(super) fn listed_product_t(&self, v: &Tensor, lists: &super::RowLists, group_of: &Indices, y: &Tensor) -> Result<Tensor, GpuError> {
+            let storage = v.storage();
+            let mut out = self.output(storage, v.cols, y.cols)?;
+            let (total, m, n) = (out.len() as u64, u32_of(y.cols)?, u32_of(v.cols)?);
+            let f = self.kernel("listed_product_t", storage)?;
+            // SAFETY: group_of's groups index the lists' offsets (groups + 1), their rows inside v's
+            // and y's rows (checked shapes).
+            unsafe {
+                self.stream
+                    .launch_builder(&f)
+                    .arg(&total)
+                    .arg(&m)
+                    .arg(&n)
+                    .input(v, storage)?
+                    .input(y, storage)?
+                    .arg(index_slice(&lists.offsets)?)
+                    .arg(index_slice(&lists.columns)?)
+                    .arg(index_slice(group_of)?)
+                    .output(&mut out, storage)?
+                    .launch(cfg_elements(total))
+            }
+            .gpu_ctx("tensor listed_product_t")?;
+            Ok(out)
+        }
+
         pub(super) fn transpose(&self, t: &Tensor) -> Result<Tensor, GpuError> {
             let storage = t.storage();
             if storage == Storage::Bf16 {
@@ -8060,6 +8132,22 @@ kernel void t_listed_product(device const float* v [[buffer(0)]], device const f
     }
 }
 
+// out[c, j] = Σ v[r, c] y[r, j] over the rows r listed for column c's group, over the p.n = n × m
+// entries; p.cols = m, p.extra = v's columns.
+kernel void t_listed_product_t(device const float* v [[buffer(0)]], device const float* y [[buffer(1)]], device const uint* offsets [[buffer(2)]],
+                               device const uint* rows [[buffer(3)]], device const uint* group_of [[buffer(4)]], device float* out [[buffer(5)]],
+                               constant P& p [[buffer(6)]], uint gid [[thread_position_in_grid]], uint grid [[threads_per_grid]]) {
+    ELEMENTS {
+        uint c = i / p.cols, j = i % p.cols, g = group_of[c];
+        float s = 0.0f;
+        for (uint e = offsets[g]; e < offsets[g + 1]; ++e) {
+            uint r = rows[e];
+            s += v[r * p.extra + c] * y[r * p.cols + j];
+        }
+        out[i] = s;
+    }
+}
+
 // out = tᵀ over its p.n entries (t p.rows × p.cols).
 kernel void t_transpose(device const float* t [[buffer(0)]], device float* out [[buffer(1)]], constant P& p [[buffer(2)]],
                         uint gid [[thread_position_in_grid]], uint grid [[threads_per_grid]]) {
@@ -8842,6 +8930,7 @@ kernel void t_group_divergence(device float* sums [[buffer(0)]], device const fl
         "t_sampled_product",
         "t_listed_product",
         "t_transpose",
+        "t_listed_product_t",
         "t_softmax_quadratic",
         "t_argmax_rows",
         "t_fill_entries",
@@ -9074,6 +9163,18 @@ kernel void t_group_divergence(device float* sums [[buffer(0)]], device const fl
             u32_of(v.len().max(a.len()))?;
             let p = P { cols: u32_of(a.cols)?, extra: u32_of(v.cols)?, ..P::default() };
             self.elements("t_listed_product", &[whole(buffer(v)?), whole(buffer(a)?), whole(index_buffer(&lists.offsets)?), whole(index_buffer(&lists.columns)?), whole(buffer(&out)?)], out.len(), p)?;
+            Ok(out)
+        }
+
+        pub(super) fn listed_product_t(&self, v: &Tensor, lists: &super::RowLists, group_of: &Indices, y: &Tensor) -> Result<Tensor, GpuError> {
+            let IndexData::Metal(_, groups) = &group_of.data else { return Err(foreign()) };
+            if groups.iter().any(|&g| g as usize >= lists.rows) {
+                return Err(shape(format!("a group of {} lists", lists.rows)));
+            }
+            let out = self.tensor(v.cols, y.cols)?;
+            u32_of(v.len().max(y.len()).max(out.len()))?;
+            let p = P { cols: u32_of(y.cols)?, extra: u32_of(v.cols)?, ..P::default() };
+            self.elements("t_listed_product_t", &[whole(buffer(v)?), whole(buffer(y)?), whole(index_buffer(&lists.offsets)?), whole(index_buffer(&lists.columns)?), whole(index_buffer(group_of)?), whole(buffer(&out)?)], out.len(), p)?;
             Ok(out)
         }
 
