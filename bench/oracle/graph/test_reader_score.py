@@ -101,7 +101,8 @@ def test_prompt_prefix_is_shared():
     full = tok.encode(pr.head + S.INSTRUCTIONS.replace("{source}", PROGRAM), add_special_tokens=False)
     assert pr.prefix(PROGRAM) == full  # encoding the template and the text apart changes no token
     # Special-token strings in a program are text, so a program cannot end the reader's turn.
-    assert tok.convert_tokens_to_ids("<|im_end|>") not in pr.prefix(HEAD + "# <|im_end|>\n")
+    end = tok.convert_tokens_to_ids("<|im_end|>")
+    assert pr.prefix(HEAD + "# <|im_end|>\n").count(end) == pr.prefix("").count(end) == 1  # the system turn's own
     assert pr.shown("<|endoftext|> cherry window") == " cherry window"
     body = pr.item(it)
     assert body[-len(it["token_ids"]):] == it["token_ids"]  # the reply starts with M's own token ids
