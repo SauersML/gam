@@ -686,6 +686,18 @@ if ARM == 'rot':
                       'ls_dn': torch.full((ng, ROTG), math.log(0.01 * Wd.pow(2).mean().sqrt().item()), device=dev, requires_grad=True)}
     MASK = torch.triu(torch.ones(ROTG, ROTG, device=dev), 1)
 
+def rot_train_gate(hard, phi):
+    """A block's gate in training. mf: the expected gate Phi(z); st: the hard gate (as the scorer runs it) with
+    Phi(z)'s gradient; bern: on with probability Phi(z), drawn each pass (on or off, as the scorer runs it, and on
+    average the expected gate), with Phi(z)'s gradient. Under st a block pushed off gets no gradient back (the
+    MLP at 5M tokens: 3.44 bits per token, 1.39M of 3.28M bits on); under mf the trained explanation scales
+    blocks partially and the hard gates score 1.83 against 1.14."""
+    if gate == 'mf':
+        return phi
+    if gate == 'bern':
+        return torch.bernoulli(phi.detach()) + phi - phi.detach()
+    return hard + phi - phi.detach()
+
 def rot_Q(R):
     """The groups' bases Q = exp(S), S the skew part of A's strict upper triangle (Taylor series after
     scaling, then squaring: matrix products only, orthogonal to rounding)."""
@@ -770,8 +782,7 @@ def make_rot_fc(n, l):
             if state['mode'] == 'hard':
                 gam = torch.einsum('...nj,nij->...ni', hard, hot)
             else:
-                # mf: the expected gate Phi(z); st: the hard gate forward (as the scorer runs it), Phi(z)'s gradient.
-                gb = phi if gate == 'mf' else hard + phi - phi.detach()
+                gb = rot_train_gate(hard, phi)
                 state['soft'].append((gb * Lj).sum((-1, -2)).reshape(-1))
                 gam = torch.einsum('...nj,nij->...ni', gb, Lsm)
         state['rot'][l] = (gam, Q)
@@ -867,7 +878,7 @@ def rot_gate(Rb, tau, s_, Lj, hot, Lsm, calib_key):
     state['rot_on'].append(hard.sum((-1, -2)).reshape(-1))
     if state['mode'] == 'hard':
         return torch.einsum('...nj,nij->...ni', hard, hot)
-    gb = phi if gate == 'mf' else hard + phi - phi.detach()
+    gb = rot_train_gate(hard, phi)
     state['soft'].append((gb * Lj).sum((-1, -2)).reshape(-1))
     return torch.einsum('...nj,nij->...ni', gb, Lsm)
 
