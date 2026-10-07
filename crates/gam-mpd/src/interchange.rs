@@ -1623,16 +1623,16 @@ impl<'t> Path<'t> {
         self.edits.iter().find(|(b, _)| *b == block).map(|(_, edit)| *edit)
     }
 
-    /// Whether the path changes a row before `row` at `block`: a patch or a part's edit at its
-    /// position, an operation or a cut's read at its row (a cut's probe records a value and changes
-    /// none).
-    fn changes_before(&self, block: usize, row: usize) -> bool {
-        self.patched(block).is_some() && self.position < row
-            || self.edits.iter().filter(|(b, _)| *b == block).any(|(_, edit)| match edit {
-                Edit::Op { at, .. } | Edit::CutRead { at, .. } => *at < row,
-                Edit::Probe { .. } => false,
-                Edit::OpAt { .. } => true,
-            })
+    /// The first row the path changes at `block`, if any: a patch at its position, an operation
+    /// or a cut's read at its row (a cut's probe records a value and changes none).
+    fn first_change(&self, block: usize) -> Option<usize> {
+        let patched = self.patched(block).map(|_| self.position);
+        let edited = self.edits.iter().filter(|(b, _)| *b == block).filter_map(|(_, edit)| match edit {
+            Edit::Op { at, .. } | Edit::CutRead { at, .. } => Some(*at),
+            Edit::Probe { .. } => None,
+            Edit::OpAt { .. } => Some(0),
+        });
+        patched.into_iter().chain(edited).min()
     }
 
     /// Whether the path changes no row at any block (a clean experiment's).
@@ -1707,16 +1707,20 @@ impl<'t> Plan<'t> {
                 }
             }
         }
-        // A forked lane shares its rows before its position with the path it forked from while
-        // both run the same hybrid and that path changes no row before that position (every edit
-        // acts from its path's position on); that path's lane at each block is an earlier lane.
+        // A forked lane shares its rows before t₀ with the path it forked from while both run the
+        // same hybrid, t₀ the first row either changes at the blocks the lane runs (every edit acts
+        // from a row on; a donor changes none, so its rows before its twin's first change are its
+        // twin's); that path's lane at each block is an earlier lane.
         for l in 0..lanes.len() {
             let (lane, path) = (&lanes[l], &paths[lanes[l].path]);
             let Some(parent) = lane.parent else { continue };
-            let (twin, t0) = (lanes[parent].path, path.position);
+            let twin = lanes[parent].path;
             let other = &paths[twin];
-            let alike = (lane.start..lane.end).all(|b| other.explained[b] == path.explained[b] && !other.changes_before(b, t0));
-            if t0 > 0 && other.tokens == path.tokens && other.end >= lane.end && alike {
+            if other.tokens != path.tokens || other.end < lane.end || (lane.start..lane.end).any(|b| other.explained[b] != path.explained[b]) {
+                continue;
+            }
+            let t0 = (lane.start..lane.end).flat_map(|b| [path.first_change(b), other.first_change(b)]).flatten().min().unwrap_or(length);
+            if t0 > 0 && t0 < length {
                 lanes[l].prefix = Some((twin, t0));
             }
         }
