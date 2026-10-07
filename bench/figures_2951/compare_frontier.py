@@ -11,8 +11,10 @@ Labels: description bits under the one convention of compare_f_edits.py, and, fo
 M's attention unchanged, that attention's own description at the Laplace start with its means held at M
 (compare-vpd4l-attn-price, ~/mpd-data/compare/attention_price.json), labelled separately.
 
-A point is drawn only from an EDITS file whose manifest (held-out sequences, seed, families, edits
-per sequence, source revision) equals the reference arm's; any other is refused with its difference.
+A point is drawn only from an EDITS file whose manifest (held-out sequences, seed, family names, edits
+per sequence) equals the reference arm's, scored by the same binary or by one whose experiments are
+checked to be the same draws (same families and positions, every edited token's effect KL(M_e || M)
+within 1e-3 bits); any other is refused with its difference.
 Points that other workstreams score (VPD as published, VPD fair, the decompositions at K = 213, 107,
 53) come from ~/mpd-data/compare/frontier_points.json: a list of {"label", "edits" (an EDITS json),
 "executed", "active", "description_bits"}.
@@ -30,7 +32,12 @@ RP = '/Users/user/mpd-data/runpod'
 EXTRA = '/Users/user/mpd-data/compare/frontier_points.json'
 ATTENTION_RANK_ONE = 4 * 4 * 768
 L = lambda p: json.load(open(p)) if p and os.path.exists(p) else None
-MANIFEST = ('sequences', 'seed', 'families', 'edits_per_sequence', 'source_revision')
+MANIFEST = ('sequences', 'seed', 'families', 'edits_per_sequence')
+
+
+def manifest(r):
+    """The manifest an EDITS file was scored on: rows, seed, experiments per sequence, family names."""
+    return {'sequences': r.get('sequences'), 'seed': r.get('seed'), 'edits_per_sequence': r.get('edits_per_sequence'), 'families': sorted(k for k in r['families'] if k != 'clean')}
 
 
 def gap(r):
@@ -71,7 +78,7 @@ for label, d, f, rec in arms:
     if not r or not rec:
         continue
     if ref is None:
-        ref = {k: r.get(k) for k in MANIFEST}
+        ref = dict(manifest(r), source_revision=r.get('source_revision'))
     k = features(d)
     active = sum(l['nonzero_per_token'] for l in rec['layers'] if l['functions'])
     attn = L('/Users/user/mpd-data/compare/attention_price.json')
@@ -81,7 +88,14 @@ for p in L(EXTRA) or []:
     r = L(p['edits'])
     if not r:
         continue
-    diff = {k: (r.get(k), ref.get(k)) for k in MANIFEST if ref and r.get(k) != ref.get(k)}
+    m = manifest(r)
+    diff = {k: (m.get(k), ref.get(k)) for k in MANIFEST if ref and m.get(k) != ref.get(k)}
+    # Another binary may score the same manifest only if its experiments are shown to be the same
+    # draws: the same families and positions, and the same effect KL(M_e || M) at every edited token.
+    if ref and r.get('source_revision') != ref['source_revision']:
+        c = r.get('manifest_check') or {}
+        if not (c.get('same_families_and_positions') and c.get('max_effect_difference_bits', 1.0) <= 1e-3):
+            diff['source_revision'] = (r.get('source_revision'), ref['source_revision'], c)
     if diff:
         print('refused (another manifest):', p['label'], diff)
         continue
