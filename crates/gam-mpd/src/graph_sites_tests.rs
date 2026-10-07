@@ -437,3 +437,45 @@ fn every_program_faces_the_same_experiments() {
     assert!(targets.pieces.windows(2).all(|w| w[0].1 >= w[1].1) && targets.cuts.windows(2).all(|w| w[0].1 >= w[1].1));
     assert!(targets.pieces.iter().any(|(b, _)| matches!(b, crate::graph::Block::Heads { .. })) && !targets.cuts.is_empty());
 }
+
+/// A quantized head keeps at most 2^b − 1 values per row (one bit: the sign at one magnitude) and
+/// a quantized neuron's rows likewise; restoring returns the exact weights.
+#[test]
+fn quantization_rounds_rows_and_restores() {
+    let (mut weights, _) = model("graph_sites_quantize");
+    let before = weights.clone();
+    let blocks = vec![(crate::graph::Block::Heads { layer: 0, heads: vec![0] }, Some(2)), (crate::graph::Block::Neurons { layer: 1, neurons: vec![0, 3] }, Some(1))];
+    let restore = weights.quantize(&blocks).expect("quantize");
+    let distinct = |row: ndarray::ArrayView1<f64>| {
+        let mut v: Vec<f64> = row.to_vec();
+        v.sort_by(f64::total_cmp);
+        v.dedup();
+        v.len()
+    };
+    assert!(weights.layers[0].heads[0].query.rows().into_iter().all(|r| distinct(r) <= 3));
+    assert!(weights.layers[0].heads[0].output.columns().into_iter().all(|c| distinct(c) <= 3));
+    let mlp = weights.layers[1].mlp.as_ref().expect("an MLP");
+    assert!(distinct(mlp.gate.row(3)) <= 3 && distinct(mlp.out.column(0)) <= 3);
+    assert_eq!(mlp.gate.row(1), before.layers[1].mlp.as_ref().expect("an MLP").gate.row(1), "an undeclared neuron stays exact");
+    restore.restore(&mut weights);
+    assert_eq!(weights.layers[0].heads[0].query, before.layers[0].heads[0].query);
+    assert_eq!(weights.layers[1].mlp.as_ref().map(|m| m.gate.clone()), before.layers[1].mlp.as_ref().map(|m| m.gate.clone()));
+}
+
+/// Each declared block gets a width no costlier than exact numbers, the score charges their sum,
+/// and the program runs with the quantized weights.
+#[test]
+fn widths_are_chosen_and_charged() {
+    let (weights, sequences) = model("graph_sites_widths");
+    let mut checker = Checker::new(weights, behavior(&sequences)).expect("checker");
+    let mut program = Program { model: "tiny".into(), valid: true, ..Program::default() };
+    program.nodes = vec![NodeIr { id: "h".into(), pieces: vec![PieceIr { view: "native".into(), layer: 1, kind: "head".into(), index: Some(crate::graph::Index::One(0)) }], rule: None }];
+    program.edges = vec![EdgeIr { from: "h".into(), to: "logits".into(), route: "input".into() }];
+    let (score, _) = checker.score(&program, 6, 1, true, None).expect("score");
+    assert_eq!(score.widths.len(), 1);
+    let w = &score.widths[0];
+    assert_eq!(w.node, "h");
+    assert!((score.opaque_bits - w.cost_bits).abs() < 1e-9);
+    assert!(w.cost_bits <= w.numbers as f64 * 0.5 * score.n.log2() + 1e-9);
+    assert!(w.bits.is_none_or(|b| crate::graph::WIDTHS.contains(&b) && w.scales > 0));
+}
