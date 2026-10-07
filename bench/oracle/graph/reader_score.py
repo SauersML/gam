@@ -94,10 +94,24 @@ Without the experiment:
 every other token: {other:.3g}"""
 
 
+def _runs(index: list[int]) -> str:
+    """Indices in mech's slice syntax, consecutive runs as start:stop (an edit of all 3,072 neurons of a
+    layer is "0:3072", not a 17,000-character list that fills the reader's context)."""
+    out, i = [], 0
+    while i < len(index):
+        j = i
+        while j + 1 < len(index) and index[j + 1] == index[j] + 1:
+            j += 1
+        out.append(str(index[i]) if j - i < 2 else f"{index[i]}:{index[j] + 1}")
+        out += [str(index[k]) for k in range(i + 1, j + 1)] if 0 < j - i < 2 else []
+        i = j + 1
+    return ", ".join(out)
+
+
 def piece_name(p: dict) -> str:
     """A piece of the program IR (design.txt section 5) in mech syntax."""
     view, layer, kind, index = p["view"], p["layer"], p["kind"], p.get("index")
-    idx = None if index is None else (", ".join(str(i) for i in index) if isinstance(index, list) else str(index))
+    idx = None if index is None else (_runs(index) if isinstance(index, list) else str(index))
     if view == "native":
         return f"L[{layer}].{kind}" + ("" if idx is None else f"[{idx}]")
     if view == "vpd":
