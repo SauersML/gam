@@ -7,6 +7,10 @@
 # the report is $OUT/parity.json.
 set -Eeuo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
+# The runner's system pip (22.0) fails to resolve torch's index ("assert len(weights) == expected_node_count").
+python3 -m venv "$RUNNER_TEMP/predict-venv"
+export PATH="$RUNNER_TEMP/predict-venv/bin:$PATH"
+python3 -m pip install -q --upgrade pip
 python3 -m pip install -q torch --index-url https://download.pytorch.org/whl/cpu
 python3 -m pip install -q transformers safetensors huggingface_hub numpy
 SNAP=$(python3 -c "from huggingface_hub import snapshot_download; print(snapshot_download('Qwen/Qwen3-0.6B'))")
