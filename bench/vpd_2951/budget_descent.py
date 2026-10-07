@@ -847,8 +847,10 @@ def make_rot_fc(n, l):
             if state['mode'] == 'hard':
                 gam = torch.einsum('...nj,nij->...ni', hard, hot)
             else:
-                state['soft'].append((phi * Lj).sum((-1, -2)).reshape(-1))
-                gam = torch.einsum('...nj,nij->...ni', phi, Lsm)
+                # mf: the expected gate Phi(z); st: the hard gate forward (as the scorer runs it), Phi(z)'s gradient.
+                gb = phi if gate == 'mf' else hard + phi - phi.detach()
+                state['soft'].append((gb * Lj).sum((-1, -2)).reshape(-1))
+                gam = torch.einsum('...nj,nij->...ni', gb, Lsm)
         state['rot'][l] = (gam, Q)
         return torch.einsum('...ni,nki->...nk', c * gam, Q).reshape(*sh, -1)[..., R['inv']]
     return fwd
