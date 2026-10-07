@@ -265,20 +265,14 @@ class Table:
 
     def edit_write(self, ex: dict) -> torch.Tensor | None:
         """The question's edit's direct write change at the marked token, in the residual stream:
-        (alpha - 1) sum_i a_i r_i over the edited subcomponents (the subcomponent, or for a _group variant
-        its group, with their activities at p), r_i the write lens's direction; None without a write (q, k)."""
-        layer, kind, c, j = ex["layer"], ex["kind"], ex["c"], ex["j"]
-        n = site_name(layer, kind)
+        (alpha - 1) sum_i a_i r_i over the edited subcomponents (Table.members, with their activities at p),
+        r_i the write lens's direction; None without a write (q, k)."""
+        n = site_name(ex["layer"], ex["kind"])
         if self.lens is None or f"{n}.write" not in self.lens:
             return None
-        meta, d = self.sites[(layer, kind)]
+        meta = self.sites[(ex["layer"], ex["kind"])][0]
         factor = -1.0 if ex["edit"] == "ablate" else meta.get("amplify", 1.5) - 1.0
-        if "group" in (ex.get("variant") or ""):
-            members, acts = d["group"][c, j].long(), d["group_act"][c, j].float()
-        else:
-            members = torch.tensor([self.number(layer, kind, c)])
-            acts = d["activity"][c, j, int(d["position"][c, j])].float().reshape(1)
-        return factor * (acts[:, None] * self.lens[f"{n}.write"][members].float()).sum(0)
+        return factor * sum(a * self.lens[f"{site}.write"][m].float() for site, m, a in self.members(ex))
 
     def residual_write(self, layer: int, kind: str, c: int) -> torch.Tensor | None:
         """Subcomponent c's write as its residual direction r (vpd_lens.py's write lens), or None (q, k)."""
@@ -297,18 +291,32 @@ class Table:
         w = float(self.lens[f"{n}.write"][c].float() @ self.lens["unembed"][int(token)].float())
         return (w - float(self.lens[f"{n}.write_centre"][c])) / float(self.lens[f"{n}.write_scale"][c])
 
-    def group_direct(self, layer: int, kind: str, c: int, members: torch.Tensor, acts: torch.Tensor, factor: float,
-                     peak: float, tokens: list[int]) -> list[float] | None:
-        """A group edit's direct effect on each token's logit through the write lens: the sum over the
-        members (site numbers) of factor * a_i * (w_i,X - centre_i), in subcomponent c's units (its largest
-        activity times its write scale), so a group of c alone gives lens_value's line; None without a write."""
-        n = site_name(layer, kind)
+    def members(self, ex: dict) -> list[tuple[str, int, float]]:
+        """The subcomponents the question's edit changes, (site name, number in its site, activity at p):
+        the subcomponent; for a _group variant its group of 8 (vpd_labels.py's `group`, `group_act`); for a
+        _sites variant one per layer at its kind's site (`sites_member`, `sites_act`)."""
+        layer, kind, c, j = ex["layer"], ex["kind"], ex["c"], ex["j"]
+        d = self.sites[(layer, kind)][1]
+        variant = ex.get("variant") or ""
+        if "sites" in variant:
+            return [(site_name(l_, kind), int(m), float(a)) for l_, (m, a) in enumerate(zip(d["sites_member"][c, j].tolist(), d["sites_act"][c, j].tolist()))]
+        if "group" in variant:
+            return [(site_name(layer, kind), int(m), float(a)) for m, a in zip(d["group"][c, j].tolist(), d["group_act"][c, j].tolist())]
+        return [(site_name(layer, kind), self.number(layer, kind, c), float(d["activity"][c, j, int(d["position"][c, j])]))]
+
+    def members_direct(self, ex: dict, factor: float, peak: float, tokens: list[int]) -> list[float] | None:
+        """A group or multi-site edit's direct effect on each token's logit through the write lens: the sum
+        over its members of factor * a_i * (w_i,X - centre_i), in the subcomponent's units (its largest
+        activity times its write scale), so an edit of it alone gives lens_value's line; None without a write."""
+        n = site_name(ex["layer"], ex["kind"])
         if self.lens is None or f"{n}.write" not in self.lens:
             return None
-        m = members.long()
-        w = self.lens[f"{n}.write"][m].float() @ self.lens["unembed"][torch.tensor(tokens)].float().T  # [G, X]
-        val = factor * acts.float()[:, None] * (w - self.lens[f"{n}.write_centre"][m].float()[:, None])
-        return (val.sum(0) / (peak * float(self.lens[f"{n}.write_scale"][self.number(layer, kind, c)]))).tolist()
+        E = self.lens["unembed"][torch.tensor(tokens)].float()
+        total = torch.zeros(len(tokens))
+        for site, m, a in self.members(ex):
+            w = self.lens[f"{site}.write"][m].float() @ E.T
+            total += factor * a * (w - float(self.lens[f"{site}.write_centre"][m]))
+        return (total / (peak * float(self.lens[f"{n}.write_scale"][self.number(ex["layer"], ex["kind"], ex["c"])]))).tolist()
 
 
 def effect_index(table: Table, keys: list) -> list[np.ndarray]:
@@ -324,10 +332,13 @@ def effect_index(table: Table, keys: list) -> list[np.ndarray]:
 
 
 # Row-edit variants (vpd_labels.py --edit row): where the edit acts and on what, in the question's words.
-VARIANT_WORDS = {"": " at the marked token only", "_from": " at every token of the text", "_group": " at the marked token only", "_groupfrom": " at every token of the text"}
+VARIANT_WORDS = {"": " at the marked token only", "_from": " at every token of the text", "_group": " at the marked token only", "_groupfrom": " at every token of the text",
+                 "_sites": " at the marked token only", "_sitesfrom": " at every token of the text"}
 GROUP = 8  # vpd_labels.py's group size
 WHO = {"": "the component is", "_from": "the component is", "_group": f"the component and the {GROUP - 1} other components of its site most active at the marked token are",
-       "_groupfrom": f"the component and the {GROUP - 1} other components of its site most active at the marked token are"}
+       "_groupfrom": f"the component and the {GROUP - 1} other components of its site most active at the marked token are",
+       "_sites": "the component and, at the site of its kind in every other layer, the component most active at the marked token are",
+       "_sitesfrom": "the component and, at the site of its kind in every other layer, the component most active at the marked token are"}
 
 
 def effect_bin(bits: float) -> int:
@@ -335,7 +346,7 @@ def effect_bin(bits: float) -> int:
 
 
 def examples(table: Table, layers: set[int], count: int, seed: int, stratified: bool = True, per_component: int = 1,
-             only: tuple[str, ...] = (), rule: int = 0, held: int = 0, side: str = "trained") -> list[dict]:
+             only: tuple[str, ...] = (), rule: int = 0, held: int = 0, side: str = "trained", texts: int = 0, text_side: str = "trained") -> list[dict]:
     """`count` questions, the kinds in turn (those the table's relations support, or `only` those). With
     per_component K > 1, each subcomponent an effect question draws is asked about at K of its strongest
     contexts (the drawn one and K - 1 others, in the following questions of that kind).
@@ -348,7 +359,9 @@ def examples(table: Table, layers: set[int], count: int, seed: int, stratified: 
     raised (one fact). A reader that cannot learn rule 1 from those inputs has a bug.
 
     held > 0: subcomponents split by their index in the table, c % held == 0 held out (side "heldout")
-    and the others trained on (side "trained"), in every layer.
+    and the others trained on (side "trained"), in every layer. texts > 0: texts split the same way by
+    their row in the pool, row % texts == 0 held out (text_side "heldout"): a question is kept only on its
+    side's texts, so the held-out evaluation can be on texts no training question showed.
 
     A row-edit table (vpd_labels.py --edit row) adds the effect question (how much the next-token
     distribution changes, in the effect bins, no change included) and asks continuations from its own
@@ -501,7 +514,7 @@ def examples(table: Table, layers: set[int], count: int, seed: int, stratified: 
         elif q == "continuation" and row:
             J = meta.get("continue", 1)
             j = rng.randrange(J)
-            edit, family = rng.choice(["ablate", "amplify"]), rng.choice(["row", "from"])
+            edit, family = rng.choice(["ablate", "amplify"]), rng.choice(["row", "from"] + (["groupfrom"] if "cont_groupfrom_ablate" in d else []))
             edited, clean = d[f"cont_{family}_{edit}"][c, j].tolist(), d["cont_clean"][c, j].tolist()
             text = lambda ids: json.dumps(table.tok.decode([i for i in ids if i >= 0]))  # noqa: E731
             # The same two options whatever the answer (their number and wording carry nothing of it).
@@ -509,8 +522,9 @@ def examples(table: Table, layers: set[int], count: int, seed: int, stratified: 
             p = int(d["position"][c, j])
             verb = "removed" if edit == "ablate" else f"made {meta.get('amplify', 1.5):g} times stronger"
             span = "at the marked token only" if family == "row" else "from the marked token on (every later token too)"
+            who = WHO["_group"] if family == "groupfrom" else WHO[""]
             ex.update(context=int(contexts[j]), position=p, j=j, options=options, answer=int(edited != clean), edit=edit, family=family,
-                      question=f"If the component is {verb} {span}, does the model's greedy continuation of the text after the marked token ({len(clean)} tokens) change?")
+                      question=f"If {who} {verb} {span}, does the model's greedy continuation of the text after the marked token ({len(clean)} tokens) change?")
         elif q == "continuation":
             cont = table.rel["continuations"]
             g = table.gid(layer, kind, c)
@@ -555,9 +569,11 @@ def examples(table: Table, layers: set[int], count: int, seed: int, stratified: 
             ex.update(layer=-1, kind="", c=-1, j=-1, context=ctx, position=p, options=[f"C{i + 1} (layer {l}, {k})" for i, (l, k, _) in enumerate(cands)],
                       candidates=[(l, k, cc, 1.0, "up") for l, k, cc in cands], answer=order.index(0),
                       question=f"At the marked token the model predicts {table.piece(att['token'][r])} next. Which of the listed components raises that prediction most?")
-        if q in ("direction", "top") and variant is not None and "group" in variant[1] and "group_act" in d:
-            ex["direct"] = table.group_direct(layer, kind, c, d["group"][c, j], d["group_act"][c, j],
-                                              -1.0 if ex["edit"] == "ablate" else meta.get("amplify", 1.5) - 1.0, peak, ex["option_ids"])
+        if q in ("direction", "top") and variant is not None and ("group" in variant[1] or "sites" in variant[1]) and ("group_act" in d or "sites_act" in d):
+            ex["direct"] = table.members_direct(ex, -1.0 if ex["edit"] == "ablate" else meta.get("amplify", 1.5) - 1.0, peak, ex["option_ids"])
+            ex["direct_count"] = len(table.members(ex))
+        if texts and ex.get("context") is not None and ((int(ex["context"]) % texts == 0) != (text_side == "heldout")):
+            continue  # a text of the other side of the text split
         if row and ex.get("edit") and ex["c"] >= 0 and q != "continuation":
             ex["effect"] = float(d[f"effect_{ex['edit']}{ex.get('variant', '')}"][ex["c"], ex["j"]])  # KL(M_e || M) at the edited token, bits
         elif row and ex.get("edit") and ex["c"] >= 0:
@@ -703,8 +719,8 @@ def prompt(table: Table, ex: dict, condition: str) -> tuple[str, str]:
                 # times the edit's factor minus one, over 9) times the lens value; weights and the stated activity only.
                 info += "\nThe edit's direct effect on the logit through the unembedding (change of its activity, in units of its largest, times the lens value): " + ", ".join(
                     f"{table.piece(t)}: {ex['change'] * v:+.2f}" for t, v in zip(ex["option_ids"], values)) + "."
-            elif values and values[0] is not None and ex.get("direct") is not None:  # a group edit: the sum over its members
-                info += f"\nThe edit's direct effect on the logit through the unembedding, summed over the {GROUP} edited components (each one's change of activity times its write's projection on the token, in units of this component's largest activity times its lens standard deviation): " + ", ".join(
+            elif values and values[0] is not None and ex.get("direct") is not None:  # a group or multi-site edit: the sum over its members
+                info += f"\nThe edit's direct effect on the logit through the unembedding, summed over the {ex.get('direct_count', GROUP)} edited components (each one's change of activity times its write's projection on the token, in units of this component's largest activity times its lens standard deviation): " + ", ".join(
                     f"{table.piece(t)}: {v:+.2f}" for t, v in zip(ex["option_ids"], ex["direct"])) + "."
         else:
             info += "\n".join(lens_text(table, l, k, c, f"C{i + 1}", reads=False) for i, (l, k, c, _, _) in enumerate(ex["candidates"]))
@@ -840,7 +856,7 @@ def train(args):
     held = {int(x) for x in args.heldout_layers.split(",") if x} if not args.heldout_every else set()
     table = table_of(args)
     data = examples(table, set(table.layers) - held, args.examples, args.seed, per_component=args.per_component, only=tuple(args.questions.split(",")) if args.questions else (), rule=args.rule,
-                    held=args.heldout_every, side="trained")
+                    held=args.heldout_every, side="trained", texts=args.heldout_texts, text_side="trained")
     oracle = Oracle(args.base, args.lora_rank, args.inject, dev, table.dims, table.depth)
     if args.init:  # warm start: an earlier run's adapter and maps (same base model); new kinds' maps start fresh
         oracle.load(Path(args.init))
@@ -926,7 +942,7 @@ def evaluate(args):
         for distribution in ("natural", "stratified"):
             data = examples(table, layers, args.examples, args.seed + 1, stratified=distribution == "stratified",
                             only=tuple(config["questions"].split(",")) if config.get("questions") else (), rule=3 if config.get("rule") is True else int(config.get("rule", 0)),
-                            held=every, side=side)
+                            held=every, side=side, texts=config.get("heldout_texts", 0), text_side="heldout")
             for s in range(0, len(data), config["batch"]):
                 batch = data[s : s + config["batch"]]
                 lq, valid = oracle.log_q(table, batch, config["condition"])
@@ -1019,6 +1035,7 @@ def main():
     t.add_argument("--heldout-layers", default="2")
     t.add_argument("--heldout-every", type=int, default=0, help="hold out the subcomponents whose table index is a multiple of N (every layer) instead of layers")
     t.add_argument("--examples", type=int, default=65536)
+    t.add_argument("--heldout-texts", type=int, default=0, help="hold out the texts whose pool row is a multiple of N: no training question shows them, every evaluation question does")
     t.add_argument("--save-every", type=int, default=0, help="also save the run every N steps as OUT/step_N (evaluate reads it)")
     t.add_argument("--init", help="an earlier run to start from (its adapter and maps)")
     t.add_argument("--per-component", type=int, default=1, help="effect questions per drawn subcomponent, at its strongest contexts")
