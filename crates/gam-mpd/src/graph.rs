@@ -3656,11 +3656,17 @@ impl Checker {
                         missing.push(r);
                     }
                 }
+                // The counterfactual runs programs will read, made here on this thread: made inside
+                // the parallel runs below, a run that waits on one (a OnceLock) can be stolen by the
+                // thread making it while that thread waits on the device's pool, and neither returns
+                // (a vpd4l score hung so).
+                for &r in &missing {
+                    self.prewarm(&runs[r].1)?;
+                }
                 let this = &*self;
                 // Each outcome with whether it is new to the cache.
                 let compute = |&r: &usize| -> Result<(String, Arc<Array2<f64>>, bool), String> {
                     let (_, e, key) = &runs[r];
-                    this.prewarm(e)?;
                     if let Some(m) = this.cache.get(key) {
                         return Ok((key.clone(), m.clone(), false));
                     }
