@@ -1,9 +1,10 @@
-"""VPD on the shared manifest (mpd_battery_2951 site_edits): check its experiments against the edits
-driver's (the same draws: per experiment its family, position and effect KL(M_e || M) at the edited
-token), write each form's scores as an EDITS-like file, and add the three VPD points to
-~/mpd-data/compare/frontier_points.json.
+"""VPD on the edits driver's immutable manifest (mpd_battery_2951 site_edits): check that the battery
+applies the manifest's operations as the driver does (per experiment its family, position and effect
+KL(M_e || M) at the edited token, against an EDITS experiments file the driver scored on the same
+manifest), write each form's scores as an EDITS-like file carrying the manifest's SHA-256, and add the
+three VPD points to ~/mpd-data/compare/frontier_points.json.
 
-usage: vpd_ops_points.py BATTERY_OUT.json REFERENCE_EDITS.experiments.jsonl"""
+usage: vpd_ops_points.py BATTERY_OUT.json DRIVER_EDITS.experiments.jsonl"""
 import json, sys, os
 out, ref = sys.argv[1], sys.argv[2]
 r = json.load(open(out))
@@ -20,7 +21,9 @@ points = [p for p in json.load(open('/Users/user/mpd-data/compare/frontier_point
 points = [p for p in points if not p['label'].startswith('VPD')]
 for form, label in labels.items():
     path = f'{D}/EDITS_vpd_{form}.json'
-    json.dump(dict(r['manifest'], families=r['site_edits'][form]['families'], manifest_check=check, source_revision=r.get('source_revision')), open(path, 'w'), indent=1)
+    m = r['manifest']
+    json.dump({'sequences': m['sequences'], 'seed': m['seed'], 'edits_per_sequence': m['edits_per_sequence'], 'manifest': {'file': m['file'], 'sha256': m['sha256']},
+               'families': r['site_edits'][form]['families'], 'manifest_check': check, 'source_revision': r.get('source_revision')}, open(path, 'w'), indent=1)
     # Executed per token, in rank-one units: every subcomponent (38,912, each computed before its
     # mask), the causal-importance network at each matrix's rank (input 2,048, 8 blocks of q, k, v,
     # o, fc1, fc2 at 2,048, head 2,048: 102,400), and the run its masks read: M's forward at its

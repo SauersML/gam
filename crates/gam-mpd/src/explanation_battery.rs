@@ -2672,7 +2672,7 @@ type Scores = (Vec<f64>, Vec<f64>, Vec<(f64, usize, f64, usize)>);
 /// embedding), or on the output of the block whose residual sum the node is (`base` the stream that
 /// block adds its output to: an attention's or an MLP's output, which the battery's programs do not
 /// hold apart), at `rows` rows from `start`, a swap reading the donor's own run from `donor`; a push
-/// adds `push` (`rows` × width).
+/// adds `push` (`rows` × width); a cut replaces a later block's read (`cut`).
 struct SiteStep {
     base: Option<usize>,
     operation: interchange::Operation,
@@ -2680,6 +2680,18 @@ struct SiteStep {
     rows: usize,
     donor: usize,
     push: Option<Tensor>,
+    cut: Option<CutStep>,
+}
+
+/// A cut's replaced read: the later block's read is `N(s + o(x′) − o(x))` at the rows (`s` the
+/// stream `entering` the block, `o` the site's output, `output − before` on the program's own run of
+/// the base `x` and of the donor `x′`, `N` the block's input norm with `gain` and `epsilon`).
+struct CutStep {
+    entering: usize,
+    output: usize,
+    before: usize,
+    gain: Array1<f64>,
+    epsilon: f64,
 }
 
 /// The node of a battery program (`layout`, `heads` per layer) that holds shared site `site`, and
@@ -2700,14 +2712,28 @@ fn battery_site(layout: &Layout, heads: usize, site: interchange::SharedSite) ->
     })
 }
 
+/// A site plan's units: the shared sites' typical norms (a push's size), the pushed directions, and
+/// each block's input norm.
+type Units<'a> = (&'a BTreeMap<interchange::SharedSite, f64>, &'a [Vec<f64>], &'a [(Array1<f64>, f64)]);
+
 /// The steps of experiment `e` (sequences of `length` rows) on a battery program, by node, each
 /// node's block outputs' steps before its own value's (the order the interchange's programs run
 /// them in, the output's node before the stream it enters).
-fn site_plan(d: &Device, layout: &Layout, heads: usize, e: &interchange::Experiment, length: usize, typical: &BTreeMap<interchange::SharedSite, f64>, directions: &[Vec<f64>]) -> Result<BTreeMap<usize, Vec<SiteStep>>, String> {
+fn site_plan(d: &Device, layout: &Layout, heads: usize, e: &interchange::Experiment, length: usize, (typical, directions, norms): Units) -> Result<BTreeMap<usize, Vec<SiteStep>>, String> {
     let mut plan: BTreeMap<usize, Vec<SiteStep>> = BTreeMap::new();
     let Some(interchange::Patch::Ops { ops, .. }) = &e.patch else { return Ok(plan) };
     for op in ops {
-        let (node, base) = battery_site(layout, heads, op.site)?;
+        let (mut node, base) = battery_site(layout, heads, op.site)?;
+        let mut cut = None;
+        if let interchange::Operation::Cut { to } = op.operation {
+            // The site's output is its node minus the stream its block adds it to; the cut's node
+            // is block `to`'s read.
+            let before = base.ok_or_else(|| error(format!("{:?}: a cut from a site that is not a block's output", op.site)))?;
+            let entering = if to % 2 == 0 { layout.streams.get(to / 2) } else { layout.attended.get(to / 2) }.copied().ok_or_else(|| error(format!("block {to}: no entering stream")))?;
+            let (gain, epsilon) = norms.get(to).cloned().ok_or_else(|| error(format!("block {to}: no input norm")))?;
+            cut = Some(CutStep { entering, output: node, before, gain, epsilon });
+            node = *layout.reads.get(to).ok_or_else(|| error(format!("block {to}: no read")))?;
+        }
         let rows = if op.onward { length - e.position } else { 1 };
         let push = match op.operation {
             interchange::Operation::Push { direction, size } => {
@@ -2717,10 +2743,10 @@ fn site_plan(d: &Device, layout: &Layout, heads: usize, e: &interchange::Experim
                 let values: Vec<f64> = (0..rows).flat_map(|_| unit.iter().map(move |u| scale * u)).collect();
                 Some(d.upload_vec(rows, unit.len(), values).map_err(error)?)
             }
-            interchange::Operation::Cut { .. } => return Err(error("a cut: not one of the shared manifest's operations")),
             _ => None,
         };
-        plan.entry(node).or_default().push(SiteStep { base, operation: op.operation, start: e.base * length + e.position, rows, donor: e.source * length + e.position, push });
+        let base = if cut.is_some() { None } else { base };
+        plan.entry(node).or_default().push(SiteStep { base, operation: op.operation, start: e.base * length + e.position, rows, donor: e.source * length + e.position, push, cut });
     }
     for steps in plan.values_mut() {
         steps.sort_by_key(|s| s.base.is_none());
@@ -2754,14 +2780,24 @@ fn apply_steps(d: &Device, node: usize, steps: &[SiteStep], trace: &DeviceTrace,
                     d.axpy_rows(&mut v, s, -1.0, (donor.value(base)?, step.donor), n).map_err(error)?;
                 }
             }
-            interchange::Operation::Cut { .. } => return Err(error("a cut: not one of the shared manifest's operations")),
+            interchange::Operation::Cut { .. } => {
+                let c = step.cut.as_ref().ok_or_else(|| error("a cut without its read"))?;
+                let rows = |t: &DeviceTrace, node: usize, at: usize| -> Result<Array2<f64>, String> { d.download(&d.rows_of(t.value(node)?, at, n).map_err(error)?).map_err(error) };
+                let x = rows(trace, c.entering, s)? + &(rows(donor, c.output, step.donor)? - &rows(donor, c.before, step.donor)?) - &(rows(trace, c.output, s)? - &rows(trace, c.before, s)?);
+                let mut read = x.clone();
+                for (mut out, row) in read.rows_mut().into_iter().zip(x.rows()) {
+                    let scale = 1.0 / (row.dot(&row) / row.len() as f64 + c.epsilon).sqrt();
+                    out.assign(&(&row * scale * &c.gain));
+                }
+                d.set_rows(&mut v, s, &d.upload(read.view()).map_err(error)?).map_err(error)?;
+            }
         }
     }
     Ok(v)
 }
 
 /// VPD under the edits driver's shared operations (`interchange::Interchange::sample_ops`: swaps,
-/// zeroings, scalings and pushes at sites every explanation shares with `M`), the experiments
+/// zeroings, scalings, pushes and cuts at sites every explanation shares with `M`), the experiments
 /// `batches` (each a batch of held-out sequences of `length` rows with its drawn experiments)
 /// applied verbatim to `M` and to VPD in three forms, each running its own computation under the
 /// edit: `published`, masks from VPD's causal-importance network on `M`'s activations (the edited
@@ -2787,6 +2823,12 @@ pub fn vpd_site_edits(
         let Decomposition { sites, ci } = Decomposition::load(decomposition)?;
         let (built, outputs) = importance_model(export, &sites, ci, true)?;
         (Side::compile(&d, &built.program, numeric_bytes)?, outputs)
+    };
+    // Each block's input norm (attention blocks rms1, MLP blocks rms2), which a cut recomputes.
+    let norms: Vec<(Array1<f64>, f64)> = {
+        let export = Export::open(export)?;
+        let epsilon = export.record["config"]["norm_eps"].as_f64().ok_or_else(|| error("config.norm_eps"))?;
+        (0..2 * vpd.layout.streams.len()).map(|b| Ok((export.tensor(&format!("blocks.{}.rms{}.gain", b / 2, 1 + b % 2))?.row(0).to_owned(), epsilon))).collect::<Result<_, String>>()?
     };
     const FORMS: [&str; 3] = ["published", "causal", "autonomous"];
     const BINS: [f64; 3] = [0.01, 0.1, 1.0];
@@ -2846,8 +2888,8 @@ pub fn vpd_site_edits(
         let all_on_clean = e_run(&ones, None, None)?;
         let autonomous_clean = e_run(&masks_of(&causal, &causal_outputs, Some(inputs_from(&all_on_clean, &vpd.layout.inputs)?))?, None, None)?;
         for e in experiments {
-            let m_plan = site_plan(&d, &vpd.m_layout, heads, e, length, typical, directions)?;
-            let e_plan = site_plan(&d, &vpd.layout, heads, e, length, typical, directions)?;
+            let m_plan = site_plan(&d, &vpd.m_layout, heads, e, length, (typical, directions, &norms))?;
+            let e_plan = site_plan(&d, &vpd.layout, heads, e, length, (typical, directions, &norms))?;
             let m_edited = vpd.m.program.forward_edited(&family, BTreeMap::new(), &none, |_, _| Ok(()), |node, trace| m_plan.get(&node).map(|steps| apply_steps(&d, node, steps, trace, &m_clean)).transpose())?;
             let m_hidden = m_edited.value(vpd.m.hidden)?;
             let effect = kl_bits(m_hidden, m_clean.value(vpd.m.hidden)?, e.base)?[e.position];
@@ -2858,6 +2900,7 @@ pub fn vpd_site_edits(
                     interchange::Family::Zero => "zero",
                     interchange::Family::Scale => "scale",
                     interchange::Family::Push => "push",
+                    interchange::Family::Cut => "cut",
                     _ => "other",
                 },
                 Some(_) => "read",

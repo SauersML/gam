@@ -7,7 +7,7 @@
 //! EXPORT SETTINGS.json OUT.json host|gpu price_charged DECOMPOSITION [START]
 //! EXPORT SETTINGS.json OUT.json host|gpu masks DECOMPOSITION
 //! EXPORT SETTINGS.json OUT.json host|gpu lookahead DECOMPOSITION
-//! EXPORT SETTINGS.json OUT.json host|gpu site_edits DECOMPOSITION PER_BASE
+//! EXPORT SETTINGS.json OUT.json host|gpu site_edits DECOMPOSITION
 //! EXPORT SETTINGS.json OUT.json host|gpu start DECOMPOSITION
 //! EXPORT SETTINGS.json OUT.json host|gpu fit DECOMPOSITION START
 //!
@@ -99,6 +99,10 @@ struct Settings {
     /// export's rows outside the held-out ones (as `mpd_library_mdl_2951` takes them).
     #[serde(default)]
     training_sequences: Option<usize>,
+    /// For `site_edits`: the edits driver's immutable experiment manifest (`mpd_library_mdl_2951`
+    /// EditSettings::manifest), whose experiments and typical norms are applied as they stand.
+    #[serde(default)]
+    manifest: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -221,7 +225,7 @@ fn circuits(device: &Device, export: &Path, layers: &[gam_mpd::run_check::LayerN
 fn main() -> Result<(), String> {
     log_to_stderr();
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let usage = "EXPORT SETTINGS.json OUT.json host|gpu library [ARTIFACT] | vpd DECOMPOSITION | circuits PAIRS.json [DECOMPOSITION] | price|price_charged DECOMPOSITION [START] | masks DECOMPOSITION | lookahead DECOMPOSITION | site_edits DECOMPOSITION PER_BASE | start DECOMPOSITION | fit DECOMPOSITION START";
+    let usage = "EXPORT SETTINGS.json OUT.json host|gpu library [ARTIFACT] | vpd DECOMPOSITION | circuits PAIRS.json [DECOMPOSITION] | price|price_charged DECOMPOSITION [START] | masks DECOMPOSITION | lookahead DECOMPOSITION | site_edits DECOMPOSITION | start DECOMPOSITION | fit DECOMPOSITION START";
     let (export, settings_path, out, mode, kind, extra, more) = match &args[..] {
         [e, s, o, m, k] => (e, s, o, m, k.as_str(), None, None),
         [e, s, o, m, k, a] => (e, s, o, m, k.as_str(), Some(Path::new(a)), None),
@@ -339,25 +343,42 @@ fn main() -> Result<(), String> {
     }
     if kind == "site_edits" {
         let decomposition = extra.ok_or(usage)?;
-        let per_base: usize = more.and_then(|p| p.to_str()).and_then(|p| p.parse().ok()).ok_or("site_edits: PER_BASE, the experiments per held-out sequence")?;
         let vpd = Vpd::new(&device, export, Decomposition::load(decomposition)?, settings.numeric_bytes)?;
-        // The experiments as the edits driver draws them, from M's own interchange: none of an
-        // explanation's parts enter the draw.
-        let families = [interchange::Family::Swap, interchange::Family::Zero, interchange::Family::Scale, interchange::Family::Push];
+        // The edits driver's immutable manifest: its experiments, batch by batch, and its typical
+        // norms, on the same held-out rows (their tokens' digest), seed and pushed directions. The
+        // sites a draw picks from depend on the sites the drawing explanation holds, so only the
+        // manifest's own experiments are the driver's.
+        let path = settings.manifest.as_deref().ok_or("site_edits: the edits driver's manifest in the settings (`manifest`)")?;
+        let m: Value = serde_json::from_slice(&std::fs::read(path).map_err(|e| format!("{path}: {e}"))?).map_err(|e| format!("{path}: {e}"))?;
+        let digest = |words: &mut dyn Iterator<Item = u64>| -> String {
+            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+            for w in words {
+                for byte in w.to_le_bytes() {
+                    h = (h ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3);
+                }
+            }
+            format!("{h:016x}")
+        };
+        let [m_first, m_end]: [usize; 2] = serde_json::from_value(m["sequences"].clone()).map_err(|e| format!("{path}: sequences: {e}"))?;
+        let held = bases.get(m_first..m_end).ok_or("site_edits: the manifest's sequences outside the held-out rows")?;
+        let rows = digest(&mut held.iter().flat_map(|s| s.iter().map(|t| u64::from(*t)).chain([u64::MAX])));
         let mut drawing = Interchange::new(&device, &native, &layers, &Artifact::native(&native)?, &[], interchange::reads(&native, &layers)?, settings.numeric_bytes, 256)?;
-        let first_batch: Vec<Vec<u32>> = bases.iter().take(settings.batch_sequences).cloned().collect();
-        drawing.set_directions(interchange::DIRECTIONS, settings.seed);
-        drawing.measure_typical(&Batch::new(first_batch.clone(), first_batch)?)?;
-        let mut rng = StdRng::seed_from_u64(settings.seed);
-        let mut batches = Vec::new();
-        for chunk in bases.chunks(settings.batch_sequences) {
-            let batch = Batch::new(chunk.to_vec(), chunk.to_vec())?;
-            let donors: Vec<usize> = (0..chunk.len()).map(|n| (n + 1) % chunk.len()).collect();
-            batches.push((chunk.to_vec(), drawing.sample_ops(&mut rng, &batch, &families, per_base, &donors, false)?));
-        }
-        let (typical, directions) = (drawing.typical_norms(), drawing.push_directions());
+        let seed = m["seed"].as_u64().ok_or("site_edits: the manifest's seed")?;
+        drawing.set_directions(interchange::DIRECTIONS, seed);
+        let directions = drawing.push_directions();
         drop(drawing);
-        report["manifest"] = json!({"sequences": [0, bases.len()], "seed": settings.seed, "families": ["swap", "zero", "scale", "push"], "edits_per_sequence": per_base, "batch_sequences": settings.batch_sequences});
+        let batch_sequences = m["batch_sequences"].as_u64().ok_or("site_edits: the manifest's batch size")? as usize;
+        if m["rows"].as_str() != Some(rows.as_str()) || m["directions"].as_str() != Some(digest(&mut directions.iter().flatten().map(|v| v.to_bits())).as_str()) || batch_sequences == 0 {
+            return Err(format!("site_edits: {path} was drawn on other rows or directions"));
+        }
+        let experiments: Vec<Vec<interchange::Experiment>> = serde_json::from_value(m["experiments"].clone()).map_err(|e| format!("{path}: experiments: {e}"))?;
+        let typical: BTreeMap<interchange::SharedSite, f64> = serde_json::from_value::<Vec<(interchange::SharedSite, f64)>>(m["typical"].clone()).map_err(|e| format!("{path}: typical: {e}"))?.into_iter().collect();
+        let chunks: Vec<&[Vec<u32>]> = held.chunks(batch_sequences).collect();
+        if chunks.len() != experiments.len() {
+            return Err(format!("site_edits: {path} has {} batches for {} of the held-out rows", experiments.len(), chunks.len()));
+        }
+        let batches: Vec<(Vec<Vec<u32>>, Vec<interchange::Experiment>)> = chunks.into_iter().map(<[Vec<u32>]>::to_vec).zip(experiments).collect();
+        report["manifest"] = json!({"file": path, "sha256": sha256(Path::new(path))?, "sequences": m["sequences"], "seed": seed, "families": m["families"], "edits_per_sequence": m["edits_per_sequence"], "batch_sequences": batch_sequences});
         report["site_edits"] = battery::vpd_site_edits(&vpd, export, decomposition, &batches, (&typical, &directions), settings.numeric_bytes)?;
         report["seconds"] = json!(started.elapsed().as_secs_f64());
         save(&report)?;
