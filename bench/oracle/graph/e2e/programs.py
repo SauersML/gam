@@ -12,6 +12,7 @@ must order the same way on one behavior.
 
 from __future__ import annotations
 
+import json
 import random
 import sys
 from pathlib import Path
@@ -29,11 +30,25 @@ def empty(model: str) -> str:
     return '"""The empty program: every piece of the model is replaced by its average over the prompts."""\n' + HEADER
 
 
-def hand(model: str) -> str:
-    found = sorted(GRAPH.glob(f"examples/{model.split('-')[0]}*native*.py"))
-    if not found:
-        raise FileNotFoundError(f"no hand-written example program for {model}")
-    return found[0].read_text()
+def hand_for(model: str, behavior: str | None = None, family: str | None = None) -> str | None:
+    """The hand-written example program (examples/index.json) for a behavior: the one written for that
+    behavior id, else one of the model's examples whose family shares the behavior family's first word
+    (induction_random ~ induction_text), native pieces first; None when there is none."""
+    index = json.loads((GRAPH / "examples/index.json").read_text())
+    mine = {k: v for k, v in index.items() if v["model"] == model and (GRAPH / f"examples/{k}.py").exists()}
+    exact = [k for k, v in mine.items() if behavior and v.get("behavior") == behavior]
+    near = sorted((k for k, v in mine.items() if family and v["family"].split("_")[0] == family.split("_")[0]),
+                  key=lambda k: ("native" not in k and "heads" not in k, k))
+    for k in exact + near:
+        return (GRAPH / f"examples/{k}.py").read_text()
+    return None
+
+
+def hand(model: str, behavior: str | None = None, family: str = "induction") -> str:
+    found = hand_for(model, behavior, family)
+    if found is None:
+        raise FileNotFoundError(f"no hand-written example program for {model} {behavior or family}")
+    return found
 
 
 def hand_heads(model: str) -> set[tuple[int, int]]:

@@ -148,12 +148,15 @@ def greedy(pool: Pool, model: str, mode: str, experiments: int, seed: int, min_n
         k = min(range(len(moves)), key=lambda i: results[i]["total_bits"])
         log(f"{mode} step {step}: {len(moves)} candidates in {time.time() - t:.0f} s; best {moves[k][2][0]} "
             f"{name(moves[k][2][1])} {results[k]['total_bits']:.6g} vs {best['total_bits']:.6g}")
+        candidates = [{"move": [m[2][0], name(m[2][1])], "total_bits": r["total_bits"], "exec_error_bits": r["exec_error_bits"],
+                       "opaque_bits": r["opaque_bits"]} for m, r in zip(moves, results)]
         if results[k]["total_bits"] >= best["total_bits"]:
+            trajectory.append({"step": step, "stopped": True, "candidates": candidates, "calls": pool.calls})
             break
         current, outside, best = moves[k][0], moves[k][1], results[k]
         trajectory.append({"step": step, "move": [moves[k][2][0], name(moves[k][2][1])], "units": [name(u) for u in current],
                            "total_bits": best["total_bits"], "exec_error_bits": best["exec_error_bits"],
-                           "opaque_bits": best["opaque_bits"], "calls": pool.calls})
+                           "opaque_bits": best["opaque_bits"], "calls": pool.calls, "candidates": candidates})
     return {"units": current, "source": source(current), "score": best, "trajectory": trajectory}
 
 
