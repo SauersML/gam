@@ -330,6 +330,10 @@ def head_output(c, U, o):
     return y.sum(0) if o else y.permute(1, 0, 2).reshape(c.shape[1], -1)
 
 
+# DESCENT_ATTN_FREE=1: the heads' slices start at the exact frames' reads and writes and then train
+# freely (no dual to recompute); with DESCENT_RESID each attention map's leftover keeps every part on
+# equal to M.
+ATTN_FREE = os.environ.get('DESCENT_ATTN_FREE') == '1'
 A = {}
 for n in attn:
     if start != 'vpd':
@@ -354,6 +358,8 @@ for n in attn:
         sv = torch.linalg.svdvals(F0.cpu().double())
         cond = (sv[:, 0] / sv[:, -1]).max().item()
     A[n] = {'F': F0.clone().requires_grad_(), 'V': V, 'U': U, 'tau': tau.clone().requires_grad_(), 's': s_, 'o': o}
+    if ATTN_FREE:
+        A[n]['V'], A[n]['U'] = V.clone().requires_grad_(), U.clone().requires_grad_()
     print(n, 'slices', NH * V.shape[-1], 'all-on error', err, 'worst head frame cond', round(cond, 1), flush=True)
 SHARE_A = {}
 # DESCENT_RESID=1 (MLP maps): a priced residual part per map. R = W^T - V U, recomputed from the current
@@ -370,9 +376,15 @@ with torch.no_grad():
     TYPICAL = {n: (X[n].norm(dim=-1).pow(2).mean().sqrt().item(), (X[n] @ T.site(n).W.T).norm(dim=-1).pow(2).mean().sqrt().item())
                for n in X}
 RES = {}
+def assembled(n):
+    """Map n's slices summed into one matrix [d_in, d_out] (an attention map's heads in place)."""
+    if n in P:
+        return P[n]['V'] @ P[n]['U']
+    p = A[n]; blocks = p['V'] @ p['U']                                           # [H, d_in_h, d_out_h]
+    return blocks.reshape(-1, blocks.shape[-1]) if p['o'] else blocks.permute(1, 0, 2).reshape(blocks.shape[1], -1)
 if RESID:
     with torch.no_grad():
-        for n in mlp:
+        for n in mlp + (attn if ATTN_FREE else []):
             W = T.site(n).W
             s_R = 0.1 * (X[n] @ W.T).norm(dim=-1).pow(2).mean().sqrt()
             RES[n] = {'tau': (3 * s_R).clone().requires_grad_(), 's': s_R, 'rank': float(min(W.shape)),
@@ -521,7 +533,8 @@ def make_attn(n):
             else:
                 state['soft'].append(soft.sum((0, 2)))
                 g = soft
-            return head_output(c * g, p['U'], p['o']).view(x.shape[0], x.shape[1], -1)
+            y = head_output(c * g, p['U'], p['o']).view(x.shape[0], x.shape[1], -1)
+            return y + residual(n, x) if n in RES else y
         if state['mode'] == 'all':
             g = 1.0
         else:
@@ -534,7 +547,8 @@ def make_attn(n):
                 phi = 0.5 * (1 + torch.erf(z / SQ2))
                 state['soft'].append(phi.sum((0, 2)))
                 g = phi if gate == 'mf' else hard + phi - phi.detach()
-        return head_output(c * g, p['U'], p['o']).view(x.shape[0], x.shape[1], -1)
+        y = head_output(c * g, p['U'], p['o']).view(x.shape[0], x.shape[1], -1)
+        return y + residual(n, x) if n in RES else y
     return fwd
 for n in attn: T.site(n)._forward = make_attn(n)
 
@@ -667,6 +681,10 @@ def attn_v(l, h, pattern):
             state['soft'].append(soft.sum((1, 3)).reshape(-1))
             g = soft if gate == 'mf' or SHARE_A else hard + soft - soft.detach()
     y = (m * g) @ p['U'][None]                                                 # [B, H, T, HD]
+    if n in RES:
+        # v_proj's leftover, gated on its own read at the key position, mixed by the pattern like any value.
+        dv = residual(n, h).view(B_, T_, NH, HD).transpose(1, 2)                 # [B, H, T, HD]
+        y = y + pattern @ dv
     for b, A_, B_ in state['wedits'].get(n, ()):
         # A weight edit of v_proj adds Delta W x to the values, which the pattern mixes like any value.
         dv = ((h[b] @ B_) @ A_.T).view(T_, NH, HD).transpose(0, 1)               # [H, T, HD]
@@ -728,7 +746,7 @@ if attn:
 
 def residual(n, x):
     """Map n's residual part on its input x: R = W^T - V U (or its posterior sample), gated on ||x R||."""
-    R = RES[n]['sample'] if RES[n].get('sample') is not None else T.site(n).W.T - P[n]['V'] @ P[n]['U']
+    R = RES[n]['sample'] if RES[n].get('sample') is not None else T.site(n).W.T - assembled(n)
     out = x @ R
     if state['mode'] == 'all':
         return out
@@ -820,7 +838,7 @@ def evaluate(final=False):
         for n in mlp:
             if not (NEURON_DOWN and n.endswith('down_proj')):
                 P[n]['V'], P[n]['U'] = frame(P[n]['F'], T.site(n).W)
-    for n in attn:
+    for n in attn if not ATTN_FREE else ():
         A[n]['V'], A[n]['U'] = head_frame(A[n]['F'], T.site(n).W, A[n]['o'])
     state['collect'] = {} if SHARE else None
     state['resid_on'] = {}
@@ -845,8 +863,8 @@ def evaluate(final=False):
     out = {k: float(np.mean(v)) for k, v in r.items() if k != 'per_map' and v}
     out['per_map'] = [round(float(x), 2) for x in np.mean(r['per_map'], 0)]
     if RES:
-        out['residual'] = {n: {'norm_rel_W': round(((T.site(n).W.T - P[n]['V'] @ P[n]['U']).norm() / T.site(n).W.norm()).item(), 4),
-                               'fires': round(float(np.mean(state['resid_on'].get(n, [0.0]))), 4)} for n in mlp}
+        out['residual'] = {n: {'norm_rel_W': round(((T.site(n).W.T - assembled(n)).norm() / T.site(n).W.norm()).item(), 4),
+                               'fires': round(float(np.mean(state['resid_on'].get(n, [0.0]))), 4)} for n in RES}
         if FMODE:
             out['residual_bits'] = residual_bits()
     state['resid_on'] = {}
@@ -891,7 +909,7 @@ rms = lambda q: q.detach().pow(2).mean().sqrt().item()
 FREEZE = os.environ.get('DESCENT_FREEZE') == '1'
 slots = [(P[n], w, rms(P[n][w])) for n in mlp for w in (('F',) if EXACT else ('V', 'U')) + (('G',) if ARM == 'dir' else ())
          if not (EXACT and NEURON_DOWN and n.endswith('down_proj') and w == 'F') and not (FREEZE and w in ('V', 'U', 'F'))]
-slots += [(A[n], 'F', rms(A[n]['F'])) for n in attn] + [(A[n], 'tau', 100 / 3 * A[n]['s'].mean().item()) for n in attn]
+slots += [(A[n], w, rms(A[n][w])) for n in attn for w in (('V', 'U') if ATTN_FREE else ('F',))] + [(A[n], 'tau', 100 / 3 * A[n]['s'].mean().item()) for n in attn]
 for l, S in SHARE_A.items():
     slots += [(S, 't', 100 / 3 * S['s'].mean().item()), (S, 'L_v', 20 / 3), (S, 'L_o', 20 / 3)]
 slots += [(P[n], 'tau', 100 / 3 * P[n]['s'].mean().item()) for n in mlp]
@@ -939,14 +957,14 @@ def draw(mean):
     for cont, key, mu, ls in leaves:
         cont[key] = mu if mean else mu + ls.exp() * torch.randn_like(mu)
     for n, Rn in RES.items():
-        mu_R = T.site(n).W.T - P[n]['V'] @ P[n]['U']
+        mu_R = T.site(n).W.T - assembled(n)
         Rn['mean'] = mu_R
         Rn['sample'] = mu_R if mean or not FMODE else mu_R + Rn['ls'].exp() * torch.randn_like(mu_R)
     if EXACT:
         for n in mlp:
             if not (NEURON_DOWN and n.endswith('down_proj')):
                 P[n]['V'], P[n]['U'] = frame(P[n]['F'], T.site(n).W)
-    for n in attn:
+    for n in attn if not ATTN_FREE else ():
         A[n]['V'], A[n]['U'] = head_frame(A[n]['F'], T.site(n).W, A[n]['o'])
 
 def description_bits():
