@@ -2846,6 +2846,17 @@ impl Interchange {
         Ok(Self { m, p, m_sites, p_sites, head, variables, trainable: trainable.to_vec(), kept: RefCell::new(None), prefixes: None })
     }
 
+    /// The shared sites' typical norms ([`Interchange::measure_typical`]), which size a push: the
+    /// same for every model, so another program applying the same operations reads them here.
+    pub fn typical_norms(&self) -> BTreeMap<SharedSite, f64> {
+        (*self.m_sites.parts.typical).clone()
+    }
+
+    /// The unit directions a push adds ([`Interchange::set_directions`]).
+    pub fn push_directions(&self) -> Vec<Vec<f64>> {
+        (*self.m_sites.parts.directions).clone()
+    }
+
     /// The shared sites both models hold ([`SharedSite`]).
     pub fn shared_sites(&self) -> Vec<SharedSite> {
         self.m_sites.parts.shared.keys().filter(|s| self.p_sites.parts.shared.contains_key(s)).copied().collect()

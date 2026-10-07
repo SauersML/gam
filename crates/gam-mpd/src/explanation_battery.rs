@@ -371,6 +371,8 @@ pub struct Layout {
     pub hidden: usize,
     /// Per block (each layer's attention, then its MLP) the normed stream its maps read.
     pub reads: Vec<usize>,
+    /// Per layer the stream after its attention block (the stream entering its MLP block).
+    pub attended: Vec<usize>,
     /// Per site the node its map reads (the output map: the heads' reads, concatenated).
     pub inputs: Vec<usize>,
     /// Per site of a decomposed program: its masked subcomponent activations `(x V) ⊙ m`, and the
@@ -426,6 +428,7 @@ fn build(export: &Export, config: &Config, factors: Option<&[Factors]>) -> Resul
         residual: 0,
         hidden: 0,
         reads: Vec::with_capacity(2 * config.layers),
+        attended: Vec::with_capacity(config.layers),
         inputs: vec![0; sites],
         activations: Vec::new(),
         masks: Vec::new(),
@@ -529,6 +532,7 @@ fn build(export: &Export, config: &Config, factors: Option<&[Factors]>) -> Resul
                 b.node(Node::Affine { terms: vec![(x, identity), (site_nodes.masked, u), (kept, identity)], bias: None })
             }
         };
+        layout.attended.push(attended);
         let h2 = norm(&mut b, attended, &format!("{prefix}rms2.gain"))?;
         layout.reads.push(h2);
         layout.inputs[site(Kind::Up)] = h2;
@@ -2656,6 +2660,252 @@ pub fn vpd_mask_sources(vpd: &Vpd, export: &Path, decomposition: &Path, held_out
             })
             .collect(),
     ))
+}
+
+/// A family's scores in [`vpd_site_edits`]: every scored token's bits, the edited tokens' bits, and
+/// per effect bin the scored tokens' bits summed and counted, the edited tokens' bits summed and the
+/// experiments.
+type Scores = (Vec<f64>, Vec<f64>, Vec<(f64, usize, f64, usize)>);
+
+/// One operation of a shared-site experiment as a battery program applies it at one node: the
+/// operation on the node's own value (`base` none: a stream, a head's output, a block's read, the
+/// embedding), or on the output of the block whose residual sum the node is (`base` the stream that
+/// block adds its output to: an attention's or an MLP's output, which the battery's programs do not
+/// hold apart), at `rows` rows from `start`, a swap reading the donor's own run from `donor`; a push
+/// adds `push` (`rows` × width).
+struct SiteStep {
+    base: Option<usize>,
+    operation: interchange::Operation,
+    start: usize,
+    rows: usize,
+    donor: usize,
+    push: Option<Tensor>,
+}
+
+/// The node of a battery program (`layout`, `heads` per layer) that holds shared site `site`, and
+/// the stream its value adds a block's output to when the site is that output.
+fn battery_site(layout: &Layout, heads: usize, site: interchange::SharedSite) -> Result<(usize, Option<usize>), String> {
+    use interchange::SharedSite as S;
+    let layers = layout.streams.len();
+    let after = |l: usize| if l + 1 < layers { layout.streams[l + 1] } else { layout.residual };
+    let attended = |l: usize| layout.attended.get(l).copied().ok_or_else(|| error(format!("layer {l}: no attended stream")));
+    Ok(match site {
+        S::Stream(b) if b % 2 == 0 => (attended(b / 2)?, None),
+        S::Stream(b) => (after(b / 2), None),
+        S::Head(h) => (*layout.head_reads.get(h / heads).and_then(|r| r.get(h % heads)).ok_or_else(|| error(format!("head {h}: not held")))?, None),
+        S::Attention(l) => (attended(l)?, Some(layout.streams[l])),
+        S::Mlp(l) => (after(l), Some(attended(l)?)),
+        S::Input(b) => (*layout.reads.get(b).ok_or_else(|| error(format!("block {b}: no read")))?, None),
+        S::Embedding => (layout.streams[0], None),
+    })
+}
+
+/// The steps of experiment `e` (sequences of `length` rows) on a battery program, by node, each
+/// node's block outputs' steps before its own value's (the order the interchange's programs run
+/// them in, the output's node before the stream it enters).
+fn site_plan(d: &Device, layout: &Layout, heads: usize, e: &interchange::Experiment, length: usize, typical: &BTreeMap<interchange::SharedSite, f64>, directions: &[Vec<f64>]) -> Result<BTreeMap<usize, Vec<SiteStep>>, String> {
+    let mut plan: BTreeMap<usize, Vec<SiteStep>> = BTreeMap::new();
+    let Some(interchange::Patch::Ops { ops, .. }) = &e.patch else { return Ok(plan) };
+    for op in ops {
+        let (node, base) = battery_site(layout, heads, op.site)?;
+        let rows = if op.onward { length - e.position } else { 1 };
+        let push = match op.operation {
+            interchange::Operation::Push { direction, size } => {
+                let unit = directions.get(direction).ok_or_else(|| error("a push of an unknown direction"))?;
+                let norm = typical.get(&op.site).copied().ok_or_else(|| error(format!("{:?}: no typical norm", op.site)))?;
+                let scale = interchange::SIZES.get(size).copied().ok_or_else(|| error("a push outside SIZES"))? * norm;
+                let values: Vec<f64> = (0..rows).flat_map(|_| unit.iter().map(move |u| scale * u)).collect();
+                Some(d.upload_vec(rows, unit.len(), values).map_err(error)?)
+            }
+            interchange::Operation::Cut { .. } => return Err(error("a cut: not one of the shared manifest's operations")),
+            _ => None,
+        };
+        plan.entry(node).or_default().push(SiteStep { base, operation: op.operation, start: e.base * length + e.position, rows, donor: e.source * length + e.position, push });
+    }
+    for steps in plan.values_mut() {
+        steps.sort_by_key(|s| s.base.is_none());
+    }
+    Ok(plan)
+}
+
+/// Node `node`'s value with `steps` applied, in `trace` (the run being edited) and `donor` (the
+/// same program's own unedited run of the batch, whose donor rows a swap reads).
+fn apply_steps(d: &Device, node: usize, steps: &[SiteStep], trace: &DeviceTrace, donor: &DeviceTrace) -> Result<Tensor, String> {
+    let mut v = d.copy(trace.value(node)?).map_err(error)?;
+    for step in steps {
+        let current = d.copy(&v).map_err(error)?;
+        let (s, n) = (step.start, step.rows);
+        match step.operation {
+            interchange::Operation::Scale(i) => {
+                let c = interchange::SCALES.get(i).copied().ok_or_else(|| error("a scale outside SCALES"))? - 1.0;
+                d.axpy_rows(&mut v, s, c, (&current, s), n).map_err(error)?;
+                if let Some(base) = step.base {
+                    d.axpy_rows(&mut v, s, -c, (trace.value(base)?, s), n).map_err(error)?;
+                }
+            }
+            interchange::Operation::Push { .. } => {
+                d.axpy_rows(&mut v, s, 1.0, (step.push.as_ref().ok_or_else(|| error("a push without its vectors"))?, 0), n).map_err(error)?;
+            }
+            interchange::Operation::Swap => {
+                d.axpy_rows(&mut v, s, -1.0, (&current, s), n).map_err(error)?;
+                d.axpy_rows(&mut v, s, 1.0, (donor.value(node)?, step.donor), n).map_err(error)?;
+                if let Some(base) = step.base {
+                    d.axpy_rows(&mut v, s, 1.0, (trace.value(base)?, s), n).map_err(error)?;
+                    d.axpy_rows(&mut v, s, -1.0, (donor.value(base)?, step.donor), n).map_err(error)?;
+                }
+            }
+            interchange::Operation::Cut { .. } => return Err(error("a cut: not one of the shared manifest's operations")),
+        }
+    }
+    Ok(v)
+}
+
+/// VPD under the edits driver's shared operations (`interchange::Interchange::sample_ops`: swaps,
+/// zeroings, scalings and pushes at sites every explanation shares with `M`), the experiments
+/// `batches` (each a batch of held-out sequences of `length` rows with its drawn experiments)
+/// applied verbatim to `M` and to VPD in three forms, each running its own computation under the
+/// edit: `published`, masks from VPD's causal-importance network on `M`'s activations (the edited
+/// `M`'s), the network attending both ways; `causal`, the same network with causal attention; and
+/// `autonomous` (`own_causal_1`), masks from the causal network on VPD's own activations (its run
+/// with every mask 1, edited) and then VPD run with them, edited, reading nothing of `M`. A swap
+/// reads the donor's value from the same program's own unedited run of the batch. The remainder is
+/// dropped (VPD's setting). Per form and family: `KL(M_e ‖ VPD_e)` in bits per token over every
+/// scored token (from the edited one on) and at the edited token, and those gaps binned by the
+/// edit's effect on `M` at the edited token, `KL(M_e ‖ M)`, as the edits driver reports them; and
+/// per experiment its effect, for checking that these are the driver's experiments.
+pub fn vpd_site_edits(
+    vpd: &Vpd,
+    export: &Path,
+    decomposition: &Path,
+    batches: &[(Vec<Vec<u32>>, Vec<interchange::Experiment>)],
+    (typical, directions): (&BTreeMap<interchange::SharedSite, f64>, &[Vec<f64>]),
+    numeric_bytes: usize,
+) -> Result<Value, String> {
+    let d = vpd.e.program.device().clone();
+    let heads = vpd.layout.head_reads.first().map_or(0, Vec::len);
+    let (causal, causal_outputs) = {
+        let Decomposition { sites, ci } = Decomposition::load(decomposition)?;
+        let (built, outputs) = importance_model(export, &sites, ci, true)?;
+        (Side::compile(&d, &built.program, numeric_bytes)?, outputs)
+    };
+    const FORMS: [&str; 3] = ["published", "causal", "autonomous"];
+    const BINS: [f64; 3] = [0.01, 0.1, 1.0];
+    // Per form, per family: every scored token's bits, the edited tokens' bits, and per effect bin
+    // the scored tokens' bits summed and counted, the edited tokens' bits summed, the experiments.
+    let mut scores: Vec<BTreeMap<&'static str, Scores>> = vec![BTreeMap::new(); FORMS.len()];
+    let mut records = Vec::new();
+    let arithmetic = vpd.e.program.arithmetic();
+    let none = std::collections::BTreeSet::<usize>::new();
+    for (sequences, experiments) in batches {
+        let views: Vec<&[u32]> = sequences.iter().map(Vec::as_slice).collect();
+        let family = sequence_family(&views)?;
+        let length = views[0].len();
+        let rows = family.rows;
+        let given = |masks: &[Tensor]| -> Result<BTreeMap<usize, Tensor>, String> {
+            let mut out = BTreeMap::new();
+            for (s, &(_, _, width)) in vpd.sites.iter().enumerate() {
+                out.insert(vpd.layout.masks[s], d.copy(&masks[s]).map_err(error)?);
+                out.insert(vpd.layout.deltas[s], d.zeros(rows, width).map_err(error)?);
+            }
+            Ok(out)
+        };
+        let ones: Vec<Tensor> = vpd.sites.iter().map(|&(_, c, _)| d.upload(Array2::<f64>::ones((rows, c)).view()).map_err(error)).collect::<Result<_, _>>()?;
+        // The network's masks with its reads of M's site inputs replaced by `inputs` (none: M's own).
+        let masks_of = |network: &DeviceProgram, outputs: &[usize], inputs: Option<BTreeMap<usize, Tensor>>| -> Result<Vec<Tensor>, String> {
+            let trace = match inputs {
+                None => network.forward(&family)?,
+                Some(inputs) => network.forward_edited(&family, BTreeMap::new(), &none, |_, _| Ok(()), |node, _| inputs.get(&node).map(|v| d.copy(v).map_err(error)).transpose())?,
+            };
+            outputs.iter().map(|n| Ok(d.copy(trace.value(*n)?).map_err(error)?)).collect()
+        };
+        let inputs_from = |trace: &DeviceTrace, own: &[usize]| -> Result<BTreeMap<usize, Tensor>, String> {
+            own.iter().zip(&vpd.m_layout.inputs).map(|(o, m)| Ok((*m, d.copy(trace.value(*o)?).map_err(error)?))).collect()
+        };
+        // Per sequence of the batch, the logits of a final normed stream.
+        let logits = |hidden: &Tensor, s: usize| -> Result<Tensor, String> {
+            let part = d.rows_of(hidden, s * length, length).map_err(error)?;
+            let mut out = d.zeros(length, vpd.m.head.rows()).map_err(error)?;
+            d.gemm(&mut out, 1.0, &part, Op::N, &vpd.m.head, Op::T, 0.0, arithmetic).map_err(error)?;
+            Ok(out)
+        };
+        let kl_bits = |target: &Tensor, other: &Tensor, s: usize| -> Result<Vec<f64>, String> {
+            let target = logits(target, s)?;
+            let mut other = logits(other, s)?;
+            Ok(d.kl_rows(&target, &mut other, None).map_err(error)?.iter().map(|n| n / LN_2).collect())
+        };
+        // Each program's unedited run of the batch: the swaps' donors.
+        let m_clean = vpd.m.program.forward(&family)?;
+        let e_run = |masks: &[Tensor], plan: Option<&BTreeMap<usize, Vec<SiteStep>>>, donor: Option<&DeviceTrace>| -> Result<DeviceTrace, String> {
+            match (plan, donor) {
+                (Some(plan), Some(donor)) => vpd.e.program.forward_edited(&family, given(masks)?, &none, |_, _| Ok(()), |node, trace| plan.get(&node).map(|steps| apply_steps(&d, node, steps, trace, donor)).transpose()),
+                _ => vpd.e.program.forward_given(&family, given(masks)?),
+            }
+        };
+        let published_clean = e_run(&masks_of(&vpd.importance, &vpd.outputs, None)?, None, None)?;
+        let causal_clean = e_run(&masks_of(&causal, &causal_outputs, None)?, None, None)?;
+        let all_on_clean = e_run(&ones, None, None)?;
+        let autonomous_clean = e_run(&masks_of(&causal, &causal_outputs, Some(inputs_from(&all_on_clean, &vpd.layout.inputs)?))?, None, None)?;
+        for e in experiments {
+            let m_plan = site_plan(&d, &vpd.m_layout, heads, e, length, typical, directions)?;
+            let e_plan = site_plan(&d, &vpd.layout, heads, e, length, typical, directions)?;
+            let m_edited = vpd.m.program.forward_edited(&family, BTreeMap::new(), &none, |_, _| Ok(()), |node, trace| m_plan.get(&node).map(|steps| apply_steps(&d, node, steps, trace, &m_clean)).transpose())?;
+            let m_hidden = m_edited.value(vpd.m.hidden)?;
+            let effect = kl_bits(m_hidden, m_clean.value(vpd.m.hidden)?, e.base)?[e.position];
+            let family_name: &'static str = match &e.patch {
+                None => "clean",
+                Some(interchange::Patch::Ops { family, .. }) => match family {
+                    interchange::Family::Swap => "swap",
+                    interchange::Family::Zero => "zero",
+                    interchange::Family::Scale => "scale",
+                    interchange::Family::Push => "push",
+                    _ => "other",
+                },
+                Some(_) => "read",
+            };
+            let published = e_run(&masks_of(&vpd.importance, &vpd.outputs, Some(inputs_from(&m_edited, &vpd.m_layout.inputs)?))?, Some(&e_plan), Some(&published_clean))?;
+            let causal_run = e_run(&masks_of(&causal, &causal_outputs, Some(inputs_from(&m_edited, &vpd.m_layout.inputs)?))?, Some(&e_plan), Some(&causal_clean))?;
+            let all_on = e_run(&ones, Some(&e_plan), Some(&all_on_clean))?;
+            let autonomous = e_run(&masks_of(&causal, &causal_outputs, Some(inputs_from(&all_on, &vpd.layout.inputs)?))?, Some(&e_plan), Some(&autonomous_clean))?;
+            let mut gaps = Vec::new();
+            for (f, run) in [published, causal_run, autonomous].iter().enumerate() {
+                let bits = kl_bits(m_hidden, run.value(vpd.e.hidden)?, e.base)?;
+                let scored = &bits[e.position..];
+                let bin = BINS.iter().filter(|b| effect >= **b).count();
+                let entry = scores[f].entry(family_name).or_insert_with(|| (Vec::new(), Vec::new(), vec![(0.0, 0, 0.0, 0); BINS.len() + 1]));
+                entry.0.extend_from_slice(scored);
+                entry.1.push(scored[0]);
+                let b = &mut entry.2[bin];
+                b.0 += scored.iter().sum::<f64>();
+                b.1 += scored.len();
+                b.2 += scored[0];
+                b.3 += 1;
+                gaps.push(scored[0]);
+            }
+            records.push(json!({"sequence": e.base, "source": e.source, "position": e.position, "family": family_name, "effect_bits_at_edited_token": effect, "gap_bits_at_edited_token": gaps}));
+        }
+        log::info!("vpd site edits: a batch of {} experiments scored", experiments.len());
+    }
+    let mut out = serde_json::Map::new();
+    for (f, name) in FORMS.iter().enumerate() {
+        let mut families = serde_json::Map::new();
+        for (family, (all, edited, bins)) in &scores[f] {
+            let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len().max(1) as f64;
+            let by_effect: Vec<Value> = bins
+                .iter()
+                .enumerate()
+                .filter(|(_, b)| b.3 > 0)
+                .map(|(i, b)| {
+                    let low = if i == 0 { 0.0 } else { BINS[i - 1] };
+                    let high = BINS.get(i).map_or(json!("inf"), |h| json!(h));
+                    json!({"effect_bits_at_edited_token": [low, high], "experiments": b.3, "mean_bits_per_token": b.0 / b.1 as f64, "edited_token_mean_bits": b.2 / b.3 as f64})
+                })
+                .collect();
+            families.insert((*family).to_string(), json!({"experiments": edited.len(), "tokens": all.len(), "mean_bits_per_token": mean(all), "edited_token_mean_bits": mean(edited), "by_effect": by_effect}));
+        }
+        out.insert((*name).to_string(), json!({"families": families}));
+    }
+    out.insert("experiments".into(), Value::Array(records));
+    Ok(Value::Object(out))
 }
 
 /// Whether VPD's masks read the future (the look-ahead test), at VPD's own weights (the remainder

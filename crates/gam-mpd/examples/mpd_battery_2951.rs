@@ -7,6 +7,7 @@
 //! EXPORT SETTINGS.json OUT.json host|gpu price_charged DECOMPOSITION [START]
 //! EXPORT SETTINGS.json OUT.json host|gpu masks DECOMPOSITION
 //! EXPORT SETTINGS.json OUT.json host|gpu lookahead DECOMPOSITION
+//! EXPORT SETTINGS.json OUT.json host|gpu site_edits DECOMPOSITION PER_BASE
 //! EXPORT SETTINGS.json OUT.json host|gpu start DECOMPOSITION
 //! EXPORT SETTINGS.json OUT.json host|gpu fit DECOMPOSITION START
 //!
@@ -18,6 +19,13 @@
 //!
 //! `lookahead` tests whether VPD's masks read the future (`explanation_battery::vpd_lookahead`):
 //! 16 cuts per held-out row, 3 counterfactual futures each, VPD's network and a causal control.
+//!
+//! `site_edits` scores VPD on the edits driver's shared manifest (`explanation_battery::vpd_site_edits`):
+//! the experiments `mpd_library_mdl_2951`'s edits mode draws (`interchange::Interchange::sample_ops`:
+//! swaps, zeroings, scalings and pushes, PER_BASE per held-out sequence, the settings' seed and
+//! batches, each base's donor the next sequence of its batch, pushes at the typical norms of `M`'s
+//! runs of the first batch), drawn here from `M`'s interchange, applied to `M` and to VPD published,
+//! with causal masks, and autonomous and causal.
 //!
 //! `masks` measures where VPD's masks come from (`explanation_battery::vpd_mask_sources`): held-out
 //! KL with masks from `M`'s activations, from them through a causal network, with every mask 1,
@@ -213,7 +221,7 @@ fn circuits(device: &Device, export: &Path, layers: &[gam_mpd::run_check::LayerN
 fn main() -> Result<(), String> {
     log_to_stderr();
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let usage = "EXPORT SETTINGS.json OUT.json host|gpu library [ARTIFACT] | vpd DECOMPOSITION | circuits PAIRS.json [DECOMPOSITION] | price|price_charged DECOMPOSITION [START] | masks DECOMPOSITION | lookahead DECOMPOSITION | start DECOMPOSITION | fit DECOMPOSITION START";
+    let usage = "EXPORT SETTINGS.json OUT.json host|gpu library [ARTIFACT] | vpd DECOMPOSITION | circuits PAIRS.json [DECOMPOSITION] | price|price_charged DECOMPOSITION [START] | masks DECOMPOSITION | lookahead DECOMPOSITION | site_edits DECOMPOSITION PER_BASE | start DECOMPOSITION | fit DECOMPOSITION START";
     let (export, settings_path, out, mode, kind, extra, more) = match &args[..] {
         [e, s, o, m, k] => (e, s, o, m, k.as_str(), None, None),
         [e, s, o, m, k, a] => (e, s, o, m, k.as_str(), Some(Path::new(a)), None),
@@ -324,6 +332,33 @@ fn main() -> Result<(), String> {
         let decomposition = extra.ok_or(usage)?;
         let vpd = Vpd::new(&device, export, Decomposition::load(decomposition)?, settings.numeric_bytes)?;
         report["lookahead"] = battery::vpd_lookahead(&vpd, export, decomposition, bases, (settings.batch_sequences, 16, 3, settings.seed), settings.numeric_bytes)?;
+        report["seconds"] = json!(started.elapsed().as_secs_f64());
+        save(&report)?;
+        log::info!("battery done in {:.0} s: {out}", started.elapsed().as_secs_f64());
+        return Ok(());
+    }
+    if kind == "site_edits" {
+        let decomposition = extra.ok_or(usage)?;
+        let per_base: usize = more.and_then(|p| p.to_str()).and_then(|p| p.parse().ok()).ok_or("site_edits: PER_BASE, the experiments per held-out sequence")?;
+        let vpd = Vpd::new(&device, export, Decomposition::load(decomposition)?, settings.numeric_bytes)?;
+        // The experiments as the edits driver draws them, from M's own interchange: none of an
+        // explanation's parts enter the draw.
+        let families = [interchange::Family::Swap, interchange::Family::Zero, interchange::Family::Scale, interchange::Family::Push];
+        let mut drawing = Interchange::new(&device, &native, &layers, &Artifact::native(&native)?, &[], interchange::reads(&native, &layers)?, settings.numeric_bytes, 256)?;
+        let first_batch: Vec<Vec<u32>> = bases.iter().take(settings.batch_sequences).cloned().collect();
+        drawing.set_directions(interchange::DIRECTIONS, settings.seed);
+        drawing.measure_typical(&Batch::new(first_batch.clone(), first_batch)?)?;
+        let mut rng = StdRng::seed_from_u64(settings.seed);
+        let mut batches = Vec::new();
+        for chunk in bases.chunks(settings.batch_sequences) {
+            let batch = Batch::new(chunk.to_vec(), chunk.to_vec())?;
+            let donors: Vec<usize> = (0..chunk.len()).map(|n| (n + 1) % chunk.len()).collect();
+            batches.push((chunk.to_vec(), drawing.sample_ops(&mut rng, &batch, &families, per_base, &donors, false)?));
+        }
+        let (typical, directions) = (drawing.typical_norms(), drawing.push_directions());
+        drop(drawing);
+        report["manifest"] = json!({"sequences": [0, bases.len()], "seed": settings.seed, "families": ["swap", "zero", "scale", "push"], "edits_per_sequence": per_base, "batch_sequences": settings.batch_sequences});
+        report["site_edits"] = battery::vpd_site_edits(&vpd, export, decomposition, &batches, (&typical, &directions), settings.numeric_bytes)?;
         report["seconds"] = json!(started.elapsed().as_secs_f64());
         save(&report)?;
         log::info!("battery done in {:.0} s: {out}", started.elapsed().as_secs_f64());
