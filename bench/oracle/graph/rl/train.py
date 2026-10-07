@@ -304,16 +304,29 @@ class VllmSampler:
     def __init__(self, args, rank: int, end: int):
         from vllm import LLM
 
+        self.share = args.share_gpu
         self.llm = LLM(model=args.base, dtype="bfloat16", enable_lora=True, max_lora_rank=rank, max_loras=1, enable_prefix_caching=True,
-                       gpu_memory_utilization=args.gpu_memory, max_model_len=args.max_model_len, seed=args.seed)
+                       gpu_memory_utilization=args.gpu_memory, max_model_len=args.max_model_len, seed=args.seed, enable_sleep_mode=self.share)
         self.max_tokens, self.end = args.max_tokens, end
+        self.policy = None  # with --share-gpu: the trainer, moved to the host while vLLM samples
+        if self.share:
+            self.llm.sleep(level=1)  # weights to host memory, KV cache freed: the trainer loads next
 
     def __call__(self, prompts: list[list[int]], n: int, adapter: Path, version: int) -> list[list[list[int]]]:
         from vllm import SamplingParams
         from vllm.lora.request import LoRARequest
 
+        if self.share:  # one GPU: the trainer's weights leave while vLLM wakes with its whole share
+            self.policy.model.to("cpu")
+            torch.cuda.empty_cache()
+            self.llm.wake_up()
         params = SamplingParams(n=n, temperature=1.0, top_p=1.0, top_k=-1, max_tokens=self.max_tokens, stop_token_ids=[self.end], logprobs=0)
-        outs = self.llm.generate([{"prompt_token_ids": p} for p in prompts], params, lora_request=LoRARequest(f"policy{version}", version + 1, str(adapter)), use_tqdm=False)
+        try:
+            outs = self.llm.generate([{"prompt_token_ids": p} for p in prompts], params, lora_request=LoRARequest(f"policy{version}", version + 1, str(adapter)), use_tqdm=False)
+        finally:
+            if self.share:
+                self.llm.sleep(level=1)
+                self.policy.model.to(self.policy.dev)
         try:  # the sampled tokens' log-probabilities, for the on-policy check only
             self.logprob_sums = [sum(d[t].logprob for d, t in zip(c.logprobs, c.token_ids)) for o in outs for c in o.outputs]
         except (TypeError, KeyError, AttributeError):  # a vLLM whose logprobs container differs
@@ -696,6 +709,8 @@ def main():
     ap.add_argument("--pack", action="store_true", help="GRPO / DPO: one sequence per group (the shared prompt once; see Policy.token_logprobs); sets GRPO's micro-batch to the group")
     ap.add_argument("--sampler", choices=["auto", "vllm", "hf"], default="auto")
     ap.add_argument("--resample", type=int, default=0, help="redraw each invalid program (mech.trace) up to R times at sampling time")
+    ap.add_argument("--share-gpu", action="store_true", help="one GPU for vLLM and the trainer: vLLM sleeps (weights to host) while training and the trainer moves to the host while sampling, so --gpu-memory can be 0.8")
+    ap.add_argument("--execution-only", action="store_true", help="score without the reader term (required when GRAPH_READER is unset and the checker scores)")
     ap.add_argument("--hf-batch", type=int, default=16, help="sequences per transformers generate call (the Mac / CPU sampler)")
     ap.add_argument("--gpu-memory", type=float, default=0.85, help="vLLM's share of its GPU (lower it when the trainer shares the GPU)")
     ap.add_argument("--prompt-holdout", type=int, default=4, help="every K-th prompt of each training behavior is held out for evaluation (0: none)")
@@ -719,6 +734,8 @@ def main():
     ap.add_argument("--run-name", help="the run's name in runs/oracle/<behavior>.<run>.json (default: the --out directory's name)")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
+    if args.scorer == "checker" and not os.environ.get("GRAPH_READER") and not args.execution_only:
+        raise SystemExit("the score includes the reader term: set GRAPH_READER (reader_score.py serve) or pass --execution-only")
     lr = args.lr if args.lr is not None else {"bestofn": 1e-4, "sft": 1e-4}.get(args.mode, 1e-5)
     beta = args.beta if args.beta is not None else {"dpo": 0.1}.get(args.mode, 0.04)
     random.seed(args.seed)
@@ -743,6 +760,8 @@ def main():
         sampler = VllmSampler(args, rank, AutoTokenizer.from_pretrained(args.base).convert_tokens_to_ids("<|im_end|>"))
     dev = torch.device(f"cuda:{torch.cuda.device_count() - 1}" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
     pol = Policy(args, dev)
+    if isinstance(sampler, VllmSampler):
+        sampler.policy = pol
     if sampler is None:
         sampler = HfSampler(pol, args.max_tokens, args.hf_batch)
     if args.resample:
