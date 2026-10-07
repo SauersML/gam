@@ -1882,7 +1882,8 @@ impl<'t> Plan<'t> {
                     before(self.lane(source, c), c);
                 }
                 for (_, edit) in path.edits.iter().filter(|(b, _)| *b == c) {
-                    if let Edit::Op { source, .. } = edit {
+                    // Only a swap reads a donor; another operation's source is `usize::MAX`.
+                    if let Edit::Op { operation: Operation::Swap, source, .. } = edit {
                         before(self.lane(*source, c), c);
                     }
                 }
