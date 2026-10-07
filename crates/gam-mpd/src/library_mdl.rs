@@ -2201,9 +2201,12 @@ fn part_targets(scorer: &Scorer, batch: &Batch, experiments: Vec<Experiment>) ->
 fn complexity_terms(scorer: &mut Scorer, device_posterior: &DevicePosterior, explanation: &Explanation, active: &[bool], batch: &Batch, key: u64) -> Result<(f64, Vec<(usize, Array2<f64>, Array2<f64>)>), String> {
     device_posterior.iterate_into(scorer.experiments.explanation_mut(), key)?;
     let family = sequence_family(&batch.base.iter().map(Vec::as_slice).collect::<Vec<_>>())?;
+    // The count's derivatives are a step's, so its forward and products run in the reverse passes'
+    // arithmetic, as every evaluation of P with a gradient does (`Scorer::reversed`, b290535ec5).
+    let trace = scorer.reversed(|experiments| experiments.models().1.program.forward(&family))?;
     let (_, p) = scorer.experiments.models();
     let (program, d) = (p.program, p.program.device());
-    let trace = program.forward(&family)?;
+    let arithmetic = interchange::factor_arithmetic(d, program.arithmetic());
     let positions = &family.layout.as_ref().ok_or("a sequence layout")?.position;
     let rows = family.rows;
     let alive = |g: &usize| active[*g];
@@ -2227,7 +2230,7 @@ fn complexity_terms(scorer: &mut Scorer, device_posterior: &DevicePosterior, exp
                 };
                 let per = 1.0 / rows as f64;
                 let gate = direction.as_ref().map(|(_, mean, variance)| (mean, variance));
-                let (expected, gate_terms) = gated_expected(d, program.arithmetic(), trace.value(stage.input)?, gate, (&bias.0, &bias.1), &rank)?;
+                let (expected, gate_terms) = gated_expected(d, arithmetic, trace.value(stage.input)?, gate, (&bias.0, &bias.1), &rank)?;
                 if let (Some((i, _, _)), Some((mean, variance))) = (&direction, gate_terms) {
                     terms.push((*i, mean * per, variance * per));
                 }
