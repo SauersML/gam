@@ -62,10 +62,16 @@ impl Whole {
         Self { keys, own, rows, earlier }
     }
 
+    /// Each segment's own rows: where they are in the whole sequences, where in the call, and how
+    /// many (`Device::move_rows`'s moves from the whole sequences to the call).
+    fn own_moves(&self) -> Vec<(usize, usize, usize)> {
+        self.own.iter().zip(&self.rows).map(|(own, rows)| (own.start, rows.start, rows.len())).collect()
+    }
+
     /// The whole sequences' outputs `all` at the call's rows (`rows` of them): each segment's own.
     pub(crate) fn outputs(&self, d: &Device, all: &Tensor, rows: usize) -> Result<Tensor, GpuError> {
         let mut out = d.zeros(rows, all.cols())?;
-        d.scatter_ranges(&mut out, &self.rows, &d.gather_ranges(all, &self.own)?)?;
+        d.move_rows(all, &mut out, &self.own_moves())?;
         Ok(out)
     }
 
@@ -73,7 +79,8 @@ impl Whole {
     /// where its own rows are there, zero at its earlier positions (their queries are its twin's).
     pub(crate) fn spread(&self, d: &Device, cot: &Tensor) -> Result<Tensor, GpuError> {
         let mut all = d.zeros(self.keys.iter().map(ExactSizeIterator::len).sum(), cot.cols())?;
-        d.scatter_ranges(&mut all, &self.own, &d.gather_ranges(cot, &self.rows)?)?;
+        let moves: Vec<(usize, usize, usize)> = self.own_moves().into_iter().map(|(own, rows, n)| (rows, own, n)).collect();
+        d.move_rows(cot, &mut all, &moves)?;
         Ok(all)
     }
 
@@ -82,7 +89,7 @@ impl Whole {
     /// them (another segment's own rows, segment by segment).
     pub(crate) fn gather_back(&self, d: &Device, all: &Tensor, rows: usize) -> Result<Tensor, GpuError> {
         let mut out = d.zeros(rows, all.cols())?;
-        d.scatter_ranges(&mut out, &self.rows, &d.gather_ranges(all, &self.own)?)?;
+        d.move_rows(all, &mut out, &self.own_moves())?;
         for (at, before) in &self.earlier {
             add_rows(d, &mut out, before, (all, at.start))?;
         }

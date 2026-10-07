@@ -3417,6 +3417,16 @@ impl Device {
         self.copy_ranges(values, t, &moves)
     }
 
+    /// Rows `from..from + length` of `x` copied to rows `to..to + length` of `y`, per move
+    /// `(from, to, length)` (equal columns): a gather and a scatter in one pass, no rows made
+    /// between them.
+    pub fn move_rows(&self, x: &Tensor, y: &mut Tensor, moves: &[(usize, usize, usize)]) -> Result<(), GpuError> {
+        if moves.iter().any(|&(from, to, length)| from + length > x.rows || to + length > y.rows) {
+            return Err(shape(format!("row moves {moves:?} from {:?} into {:?}", x.dim(), y.dim())));
+        }
+        self.copy_ranges(x, y, moves)
+    }
+
     /// Rows `from..from + length` of `x` copied to rows `to..` of `y`, per move (equal columns).
     fn copy_ranges(&self, x: &Tensor, y: &mut Tensor, moves: &[(usize, usize, usize)]) -> Result<(), GpuError> {
         if x.cols != y.cols {
