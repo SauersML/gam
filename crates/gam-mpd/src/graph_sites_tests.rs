@@ -385,3 +385,35 @@ fn shared_keys_are_edited_together() {
     restore.restore(&mut weights).expect("restore");
     assert_eq!((weights.layers[0].heads[0].key.clone(), weights.layers[0].heads[1].key.clone()), (key.clone(), key));
 }
+
+/// A VPD attention subcomponent edit adds `(factor − 1) U_i ⊗ V_i` to the stacked query map (and to
+/// the side-by-side output columns), split over the heads, and restores exactly.
+#[test]
+fn attention_subcomponent_edits_split_over_heads() {
+    let (mut weights, _) = model("graph_sites_vpd_attention");
+    let heads = weights.layers[0].heads.len();
+    let (dh, width) = weights.layers[0].heads[0].query.dim();
+    let wave = |rows: usize, cols: usize, phase: f64| Array2::from_shape_fn((rows, cols), |(i, j)| 0.1 * ((i * 5 + j * 3) as f64 + phase).cos());
+    let (q, o) = ((wave(3, heads * dh, 0.2), wave(width, 3, 0.9)), (wave(3, width, 1.3), wave(heads * dh, 3, 0.4)));
+    weights.vpd_attention.insert(0, crate::graph::VpdAttention { q: q.clone(), k: q.clone(), v: q.clone(), o: o.clone() });
+    let before = weights.clone();
+    for (map, (u, v)) in [(0usize, &q), (3, &o)] {
+        let restore = WeightEdit::AttnSubcomponents { layer: 0, map, indices: vec![1], factor: 3.0 }.apply(&mut weights).expect("edit");
+        let delta = |r: usize, c: usize| 2.0 * u[[1, r]] * v[[c, 1]];
+        for h in 0..heads {
+            let (now, was) = if map == 0 { (&weights.layers[0].heads[h].query, &before.layers[0].heads[h].query) } else { (&weights.layers[0].heads[h].output, &before.layers[0].heads[h].output) };
+            let gap = now.indexed_iter().map(|((r, c), x)| {
+                let (row, col) = if map == 0 { (h * dh + r, c) } else { (r, h * dh + c) };
+                (x - was[[r, c]] - delta(row, col)).abs()
+            }).fold(0.0f64, f64::max);
+            assert!(gap < 1e-12, "map {map} head {h}: off by {gap:e}");
+        }
+        restore.restore(&mut weights).expect("restore");
+        for h in 0..heads {
+            assert_eq!(weights.layers[0].heads[h].query, before.layers[0].heads[h].query);
+            assert_eq!(weights.layers[0].heads[h].output, before.layers[0].heads[h].output);
+        }
+        assert_eq!(weights.vpd_attention[&0].q.0, q.0);
+        assert_eq!(weights.vpd_attention[&0].o.0, o.0);
+    }
+}

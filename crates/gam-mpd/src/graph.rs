@@ -1712,6 +1712,10 @@ pub enum WeightEdit {
     /// the matrix changes by `(factor − 1) Σ_i U_i ⊗ V_i` and each subcomponent's `U_i` by the
     /// factor, so the remainder piece stays as it was (the layer's VPD view, `Weights::vpd`).
     Subcomponents { layer: usize, down: bool, indices: Vec<usize>, factor: f64 },
+    /// VPD subcomponents `indices` of the attention's `q_proj`, `k_proj`, `v_proj` or `o_proj`
+    /// (`map` 0, 1, 2, 3) times `factor`, as [`WeightEdit::Subcomponents`]: each head's rows (its
+    /// columns of `o_proj`) of `(factor − 1) Σ_i U_i ⊗ V_i` added to its map, `U_i` scaled.
+    AttnSubcomponents { layer: usize, map: usize, indices: Vec<usize>, factor: f64 },
 }
 
 impl WeightEdit {
@@ -1736,11 +1740,15 @@ impl WeightEdit {
 
     /// Applies the edit; returns what restores the weights.
     pub fn apply(&self, weights: &mut Weights) -> Result<Restore, String> {
+        if let Self::AttnSubcomponents { layer, map, indices, factor } = self {
+            return Self::attention_subcomponents(weights, *layer, *map, indices, *factor);
+        }
         let (layer, head, matrix) = match self {
             Self::Head { layer, head, .. } => (*layer, Some(*head), Matrix::Output),
             Self::Neurons { layer, .. } => (*layer, None, Matrix::Down),
             Self::RankOne { layer, head, matrix, .. } => (*layer, *head, *matrix),
             Self::Subcomponents { layer, down, .. } => (*layer, None, if *down { Matrix::Down } else { Matrix::Gate }),
+            Self::AttnSubcomponents { .. } => return Err("handled above".into()),
         };
         // A subcomponent edit's change of the matrix, and its factors' saved values.
         let mut factors = None;
@@ -1803,7 +1811,43 @@ impl WeightEdit {
                 }
             }
         }
-        Ok(Restore { layer, head, matrix, saved, factors, shared })
+        Ok(Restore { layer, head, matrix, saved, factors, shared, heads: Vec::new(), attention: None })
+    }
+
+    /// [`WeightEdit::AttnSubcomponents`]: the change split over the heads (rows `h·d..(h+1)·d` of
+    /// the stacked query, key or value map, columns of the output map), every head's map saved.
+    fn attention_subcomponents(weights: &mut Weights, layer: usize, map: usize, indices: &[usize], factor: f64) -> Result<Restore, String> {
+        let matrix = [Matrix::Query, Matrix::Key, Matrix::Value, Matrix::Output].get(map).copied().ok_or("an attention map is 0..4")?;
+        let vpd = weights.vpd_attention.get_mut(&layer).ok_or_else(|| format!("layer {layer} has no VPD view of attention"))?;
+        let factors = match map {
+            0 => &mut vpd.q,
+            1 => &mut vpd.k,
+            2 => &mut vpd.v,
+            _ => &mut vpd.o,
+        };
+        if let Some(i) = indices.iter().find(|&&i| i >= factors.0.nrows()) {
+            return Err(format!("subcomponent {i} out of range"));
+        }
+        // (out × in) change: U rows are outputs, V columns inputs.
+        let delta = factors.0.select(Axis(0), indices).t().dot(&factors.1.select(Axis(1), indices).t()) * (factor - 1.0);
+        let saved_u = factors.0.clone();
+        for &i in indices {
+            factors.0.row_mut(i).mapv_inplace(|x| x * factor);
+        }
+        let mut heads = Vec::new();
+        let mut at = 0;
+        for h in 0..weights.layers[layer].heads.len() {
+            let m = Self::matrix(weights, layer, Some(h), matrix)?;
+            heads.push((h, m.clone()));
+            let part = if matrix == Matrix::Output { delta.slice(s![.., at..at + m.ncols()]) } else { delta.slice(s![at..at + m.nrows(), ..]) };
+            if part.dim() != m.dim() {
+                return Err("VPD attention factors of another shape than the heads' maps".into());
+            }
+            at += if matrix == Matrix::Output { m.ncols() } else { m.nrows() };
+            *m += &part;
+        }
+        let (first, saved) = heads.first().cloned().ok_or("a layer without heads")?;
+        Ok(Restore { layer, head: Some(first), matrix, saved, factors: None, shared: Vec::new(), heads: heads.into_iter().skip(1).collect(), attention: Some((map, saved_u)) })
     }
 }
 
@@ -1817,12 +1861,22 @@ pub struct Restore {
     factors: Option<(bool, Array2<f64>)>,
     /// The heads sharing the edited key or value matrix, edited alike.
     shared: Vec<usize>,
+    /// Further heads' maps before an attention subcomponent edit, and its factors' `U`.
+    heads: Vec<(usize, Array2<f64>)>,
+    attention: Option<(usize, Array2<f64>)>,
 }
 
 impl Restore {
     pub fn restore(self, weights: &mut Weights) -> Result<(), String> {
         for g in &self.shared {
             *WeightEdit::matrix(weights, self.layer, Some(*g), self.matrix)? = self.saved.clone();
+        }
+        for (h, m) in self.heads {
+            *WeightEdit::matrix(weights, self.layer, Some(h), self.matrix)? = m;
+        }
+        if let Some((map, u)) = self.attention {
+            let vpd = weights.vpd_attention.get_mut(&self.layer).ok_or("the VPD view of attention went missing")?;
+            [&mut vpd.q, &mut vpd.k, &mut vpd.v, &mut vpd.o][map.min(3)].0 = u;
         }
         *WeightEdit::matrix(weights, self.layer, self.head, self.matrix)? = self.saved;
         if let Some((down, u)) = self.factors {
@@ -1890,6 +1944,7 @@ impl Experiment {
                 WeightEdit::Neurons { layer, neurons, factor } => format!("L[{layer}].mlp{neurons:?}'s down weights times {factor}"),
                 WeightEdit::RankOne { layer, head, matrix, .. } => format!("a random rank-one change of L[{layer}]{}'s {matrix:?} weights", head.map_or(".mlp".to_string(), |h| format!(".head[{h}]"))),
                 WeightEdit::Subcomponents { layer, down, indices, factor } => format!("PD.vpd[{layer}].{}{indices:?} times {factor}", if *down { "down_proj" } else { "c_fc" }),
+                WeightEdit::AttnSubcomponents { layer, map, indices, factor } => format!("PD.vpd[{layer}].{}{indices:?} times {factor}", ["q_proj", "k_proj", "v_proj", "o_proj"][(*map).min(3)]),
             },
             Self::Swap { node: n } => format!("{}'s output replaced by its output on another prompt", node(*n)),
             Self::Cut { from, to, route, .. } => format!("the connection {} >> {}.{route:?} cut (the reader gets its average)", writer(from), to.map_or("logits".to_string(), node)),
@@ -1923,7 +1978,11 @@ pub fn sample(weights: &Weights, graph: &Graph, counterfactual: bool, count: usi
                 let l = rng.random_range(0..layers);
                 if weights.vpd.contains_key(&l) && rng.random_bool(1.0 / 3.0) {
                     // A layer with a VPD view: its subcomponents a third of the time.
-                    Block::Slices { layer: l, fc: Vec::new(), down: Vec::new(), rest: true }
+                    if weights.vpd_attention.contains_key(&l) && rng.random_bool(0.5) {
+                        Block::AttnSlices { layer: l, q: Vec::new(), k: Vec::new(), v: Vec::new(), o: Vec::new(), rest: true }
+                    } else {
+                        Block::Slices { layer: l, fc: Vec::new(), down: Vec::new(), rest: true }
+                    }
                 } else if rng.random_bool(0.5) || weights.neurons(l) == 0 {
                     Block::Heads { layer: l, heads: (0..weights.layers[l].heads.len()).collect() }
                 } else {
@@ -1933,8 +1992,25 @@ pub fn sample(weights: &Weights, graph: &Graph, counterfactual: bool, count: usi
         };
         match block {
             Block::Heads { layer, heads } => WeightEdit::Head { layer, head: heads[rng.random_range(0..heads.len())], factor },
-            // VPD attention subcomponents are not native weights: an aimed edit takes one of the layer's heads.
-            Block::AttnSlices { layer, .. } => WeightEdit::Head { layer, head: rng.random_range(0..weights.layers[layer].heads.len()), factor },
+            // VPD attention subcomponents: one, 8 or all of one of the node's maps (a remainder node:
+            // any of the layer's).
+            Block::AttnSlices { layer, q, k, v, o, rest } => {
+                let lists = [q, k, v, o];
+                let total = |m: usize| weights.vpd_attention.get(&layer).map_or(0, |a| [&a.q, &a.k, &a.v, &a.o][m].0.nrows());
+                let maps: Vec<usize> = (0..4).filter(|&m| if rest { total(m) > 0 } else { !lists[m].is_empty() }).collect();
+                if maps.is_empty() {
+                    WeightEdit::Head { layer, head: rng.random_range(0..weights.layers[layer].heads.len()), factor }
+                } else {
+                    let map = maps[rng.random_range(0..maps.len())];
+                    let pool: Vec<usize> = if rest { (0..total(map)).collect() } else { lists[map].clone() };
+                    let indices = match rng.random_range(0..3) {
+                        0 => vec![pool[rng.random_range(0..pool.len())]],
+                        1 => (0..8.min(pool.len())).map(|_| pool[rng.random_range(0..pool.len())]).collect::<BTreeSet<_>>().into_iter().collect(),
+                        _ => pool,
+                    };
+                    WeightEdit::AttnSubcomponents { layer, map, indices, factor }
+                }
+            }
             // Transcoder features are not M's weights: an aimed edit takes their layer's MLP.
             Block::Features { layer, .. } => WeightEdit::Neurons { layer, neurons: (0..weights.neurons(layer)).collect(), factor },
             // VPD subcomponents: one, a group of 8, or all of the node's c_fc or down_proj ones
