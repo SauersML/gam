@@ -41,7 +41,7 @@ use crate::{
     operator_program::{FamilyInputs, Interface, LabelKind, Node, Operator, OperatorProgram, Provenance, Rule, Trace, exact_precision},
     run_check::LayerNodes,
 };
-use ndarray::{Array2, Axis, s};
+use ndarray::{Array1, Array2, Axis, s};
 use serde::Deserialize;
 use std::{collections::BTreeMap, path::Path};
 
@@ -812,6 +812,88 @@ struct Dumped {
 /// A stage's gate of one component: on per row, `τ_b`, and a direction gate's `g`.
 type StageGate = (Vec<bool>, f64, Option<Vec<f64>>);
 
+/// One gate of a stage in [`dump_parts`]'s report: its member components (positions in the
+/// stage), the share of rows it is on, and the distinct contexts it fires in ([`contexts`]).
+type GateReport = (Vec<usize>, f64, usize);
+
+/// The distinct contexts a part fires in: k-means of its firing rows' reads (`points`, rows × the
+/// part's read width; at most 4,096 rows, every ⌈n / 4096⌉-th), `k` from 1 to 8 chosen by the
+/// Bayesian information criterion of a spherical Gaussian mixture with one shared variance,
+/// `n r ln(SSE / (n r)) + k (r + 1) ln n` (descent's report, d6ad2537cb); 0 for a part never on.
+fn contexts(points: &Array2<f64>) -> usize {
+    let total = points.nrows();
+    if total == 0 {
+        return 0;
+    }
+    let rows: Vec<usize> = (0..total).step_by(total.div_ceil(4096)).collect();
+    let p = points.select(Axis(0), &rows);
+    let (n, r) = p.dim();
+    if n < 2 || r == 0 {
+        return 1;
+    }
+    let mut best = (f64::INFINITY, 1);
+    for k in 1..=n.min(8) {
+        let sse = kmeans_sse(&p, k);
+        let bic = if sse > 0.0 { (n * r) as f64 * (sse / (n * r) as f64).ln() + (k * (r + 1)) as f64 * (n as f64).ln() } else { f64::NEG_INFINITY };
+        if bic < best.0 {
+            best = (bic, k);
+        }
+        if sse <= 0.0 {
+            break;
+        }
+    }
+    best.1
+}
+
+/// Lloyd's k-means of the rows of `p` from a farthest-point start (the row nearest the mean, then
+/// each next center the row farthest from the centers so far), at most 50 iterations: the sum of
+/// squared distances to the final centers.
+fn kmeans_sse(p: &Array2<f64>, k: usize) -> f64 {
+    let n = p.nrows();
+    let distance = |i: usize, c: &Array1<f64>| -> f64 {
+        let d = &p.row(i) - c;
+        d.dot(&d)
+    };
+    let Some(mean) = p.mean_axis(Axis(0)) else { return 0.0 };
+    let first = (0..n).min_by(|a, b| distance(*a, &mean).total_cmp(&distance(*b, &mean))).unwrap_or(0);
+    let mut centers = vec![p.row(first).to_owned()];
+    let mut nearest: Vec<f64> = (0..n).map(|i| distance(i, &centers[0])).collect();
+    while centers.len() < k {
+        let far = (0..n).max_by(|a, b| nearest[*a].total_cmp(&nearest[*b])).unwrap_or(0);
+        centers.push(p.row(far).to_owned());
+        for (i, d) in nearest.iter_mut().enumerate() {
+            *d = d.min(distance(i, &centers[centers.len() - 1]));
+        }
+    }
+    let closest = |i: usize, centers: &[Array1<f64>]| -> (usize, f64) { centers.iter().enumerate().map(|(j, c)| (j, distance(i, c))).min_by(|a, b| a.1.total_cmp(&b.1)).unwrap_or((0, 0.0)) };
+    let mut member = vec![usize::MAX; n];
+    for _ in 0..50 {
+        let mut changed = false;
+        for (i, m) in member.iter_mut().enumerate() {
+            let (j, _) = closest(i, &centers);
+            if *m != j {
+                *m = j;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+        let mut sums = vec![Array1::<f64>::zeros(p.ncols()); centers.len()];
+        let mut counts = vec![0usize; centers.len()];
+        for (i, m) in member.iter().enumerate() {
+            sums[*m] += &p.row(i);
+            counts[*m] += 1;
+        }
+        for ((c, sum), count) in centers.iter_mut().zip(sums).zip(counts) {
+            if count > 0 {
+                *c = sum / count as f64;
+            }
+        }
+    }
+    (0..n).map(|i| closest(i, &centers).1).sum()
+}
+
 /// Native node `node`'s value in `P`'s run `trace`.
 fn node_value<'a>(artifact: &Artifact, trace: &'a Trace, node: usize) -> Result<&'a Array2<f64>, String> {
     let at = artifact.place(node).ok_or_else(|| error(format!("P holds no node {node}")))?;
@@ -861,27 +943,57 @@ pub fn dump_parts(native: &OperatorProgram, layers: &[LayerNodes], artifact: &Ar
     let matrix = |name: &str| -> Result<Array2<f64>, String> { Ok(artifact.program.operators[index_of(&artifact.program, name)?].matrix()) };
     let interfaces = native.interfaces().map_err(error)?;
     // A stage's gates, per component of the stage (its rows of the stacked `read`, `widths` of
-    // them in order), from the stage's input `x`.
-    let gates = |x: &Array2<f64>, read: &Array2<f64>, widths: &[usize], prefix: &str| -> Result<Vec<StageGate>, String> {
+    // them in order), from the stage's input `x`: in a shared stage each component takes the gate
+    // its assignment puts it on (the largest entry of its column; `explanation` builds the gates'
+    // pre-activations on the squared norm of their members' reads, `τ|τ|` the threshold), whose
+    // `τ` in the norm's units it reports. And per gate with members its report ([`GateReport`]).
+    let gates = |x: &Array2<f64>, read: &Array2<f64>, widths: &[usize], prefix: &str| -> Result<(Vec<StageGate>, Vec<GateReport>), String> {
         let threshold = matrix(&format!("{prefix}.threshold"))?;
-        let mut out = Vec::with_capacity(widths.len());
-        if direction {
-            let g = matrix(&format!("{prefix}.direction"))?;
-            for k in 0..widths.len() {
-                let z = x.dot(&g.row(k)) + threshold[[k, 0]];
-                out.push((z.iter().map(|v| *v > 0.0).collect(), -threshold[[k, 0]], Some(g.row(k).to_vec())));
-            }
-        } else {
-            let a = x.dot(&read.t());
-            let mut first = 0;
-            for (k, &w) in widths.iter().enumerate() {
-                let norms = a.slice(s![.., first..first + w]).map_axis(Axis(1), |r| r.dot(&r).sqrt());
-                out.push((norms.iter().map(|n| n + threshold[[k, 0]] > 0.0).collect(), -threshold[[k, 0]], None));
-                first += w;
-            }
+        let assign = index_of(&artifact.program, &format!("{prefix}.assign")).ok().map(|op| artifact.program.operators[op].matrix());
+        let directions = if direction { Some(matrix(&format!("{prefix}.direction"))?) } else { None };
+        let count = widths.len();
+        let gate_of: Vec<usize> = (0..count).map(|b| assign.as_ref().and_then(|a| a.column(b).iter().enumerate().max_by(|x, y| x.1.total_cmp(y.1)).map(|(m, _)| m)).unwrap_or(b)).collect();
+        let a = x.dot(&read.t());
+        let mut spans = Vec::with_capacity(count);
+        let mut first = 0;
+        for &w in widths {
+            spans.push(first..first + w);
+            first += w;
         }
-        Ok(out)
+        let z: Vec<Array1<f64>> = match (&directions, &assign) {
+            (Some(g), _) => (0..threshold.nrows()).map(|m| x.dot(&g.row(m)) + threshold[[m, 0]]).collect(),
+            (None, Some(assign)) => {
+                let squares: Vec<Array1<f64>> = spans.iter().map(|r| a.slice(s![.., r.clone()]).map_axis(Axis(1), |row| row.dot(&row))).collect();
+                (0..threshold.nrows())
+                    .map(|m| {
+                        let mut q = Array1::from_elem(x.nrows(), threshold[[m, 0]]);
+                        for (b, square) in squares.iter().enumerate() {
+                            q.scaled_add(assign[[m, b]], square);
+                        }
+                        q
+                    })
+                    .collect()
+            }
+            (None, None) => spans.iter().zip(threshold.column(0)).map(|(r, t)| a.slice(s![.., r.clone()]).map_axis(Axis(1), |row| row.dot(&row).sqrt()) + *t).collect(),
+        };
+        let tau = |m: usize| if assign.is_some() && directions.is_none() { -threshold[[m, 0]].signum() * threshold[[m, 0]].abs().sqrt() } else { -threshold[[m, 0]] };
+        let out = gate_of.iter().map(|&m| (z[m].iter().map(|v| *v > 0.0).collect(), tau(m), directions.as_ref().map(|g| g.row(m).to_vec()))).collect();
+        let mut reports = Vec::new();
+        for (m, zm) in z.iter().enumerate() {
+            let members: Vec<usize> = (0..count).filter(|b| gate_of[*b] == m).collect();
+            if members.is_empty() {
+                continue;
+            }
+            let on: Vec<usize> = (0..x.nrows()).filter(|r| zm[*r] > 0.0).collect();
+            let columns: Vec<usize> = members.iter().flat_map(|b| spans[*b].clone()).collect();
+            let points = a.select(Axis(0), &on).select(Axis(1), &columns);
+            reports.push((members, on.len() as f64 / x.nrows().max(1) as f64, contexts(&points)));
+        }
+        Ok((out, reports))
     };
+    // Per gate with members: its stage, its members (indices into the arm's components), the
+    // share of rows it is on and its contexts.
+    let mut reported: Vec<(String, Vec<usize>, f64, usize)> = Vec::new();
     let mut parts: Vec<Dumped> = components.iter().map(|_| Dumped { slices: BTreeMap::new(), gate: serde_json::Value::Null, g: None, on: vec![false; rows] }).collect();
     for (l, layer) in layers.iter().enumerate() {
         let name = format!("library.l{l}");
@@ -917,7 +1029,9 @@ pub fn dump_parts(native: &OperatorProgram, layers: &[LayerNodes], artifact: &Ar
                 let u: Vec<f64> = (0..heads).flat_map(|h| writes[h][j].column(c).to_vec()).collect();
                 push_slice(&mut parts[b], export(s), u, read.row(r).to_vec());
             }
-            for (i, g) in gates(value(layer.normed_stream)?, &read, &widths, &format!("{name}.attn"))?.into_iter().enumerate() {
+            let (stage_gates, reports) = gates(value(layer.normed_stream)?, &read, &widths, &format!("{name}.attn"))?;
+            reported.extend(reports.into_iter().map(|(members, on, k)| (format!("{name}.attn"), members.iter().map(|i| a_comps[*i]).collect(), on, k)));
+            for (i, g) in stage_gates.into_iter().enumerate() {
                 let b = a_comps[i];
                 let first = read_rows.iter().find(|(c, _)| *c == b).map_or(q, |(_, s)| *s);
                 set_gate(&mut parts[b], export(first), g);
@@ -948,7 +1062,9 @@ pub fn dump_parts(native: &OperatorProgram, layers: &[LayerNodes], artifact: &Ar
                 let heads: Vec<&Array2<f64>> = layer.reads.iter().map(|&n| value(n)).collect::<Result<_, _>>()?;
                 let views: Vec<_> = heads.iter().map(|h| h.view()).collect();
                 let concat = ndarray::concatenate(Axis(1), &views).map_err(error)?;
-                for (i, g) in gates(&concat, &read.select(Axis(0), &own_rows), &own_widths, &format!("{name}.o"))?.into_iter().enumerate() {
+                let (stage_gates, reports) = gates(&concat, &read.select(Axis(0), &own_rows), &own_widths, &format!("{name}.o"))?;
+                reported.extend(reports.into_iter().map(|(members, on, k)| (format!("{name}.o"), members.iter().map(|i| o_own[*i]).collect(), on, k)));
+                for (i, g) in stage_gates.into_iter().enumerate() {
                     set_gate(&mut parts[o_own[i]], export(o), g);
                 }
             }
@@ -972,7 +1088,8 @@ pub fn dump_parts(native: &OperatorProgram, layers: &[LayerNodes], artifact: &Ar
             f_widths.push(n);
         }
         let h2 = value(layer.normed)?;
-        let f_gates = gates(h2, &fc_read, &f_widths, &format!("{name}.mlp.fc"))?;
+        let (f_gates, reports) = gates(h2, &fc_read, &f_widths, &format!("{name}.mlp.fc"))?;
+        reported.extend(reports.into_iter().map(|(members, on, k)| (format!("{name}.mlp.fc"), members.iter().map(|i| f_comps[*i]).collect(), on, k)));
         let dn_carriers: Vec<usize> = f_comps.iter().copied().filter(|&b| slices_on(b, dn) > 0).chain(d_own.iter().copied()).collect();
         let (mut r, mut own_rows, mut own_widths) = (0, Vec::new(), Vec::new());
         for &b in &dn_carriers {
@@ -1009,7 +1126,9 @@ pub fn dump_parts(native: &OperatorProgram, layers: &[LayerNodes], artifact: &Ar
                 let law = *law;
                 act.slice_mut(s![.., interfaces[*pre].range(group)]).mapv_inplace(|t| law.apply(t));
             }
-            for (i, g) in gates(&act, &dn_read.select(Axis(0), &own_rows), &own_widths, &format!("{name}.mlp.dn"))?.into_iter().enumerate() {
+            let (stage_gates, reports) = gates(&act, &dn_read.select(Axis(0), &own_rows), &own_widths, &format!("{name}.mlp.dn"))?;
+            reported.extend(reports.into_iter().map(|(members, on, k)| (format!("{name}.mlp.dn"), members.iter().map(|i| d_own[*i]).collect(), on, k)));
+            for (i, g) in stage_gates.into_iter().enumerate() {
                 set_gate(&mut parts[d_own[i]], export(dn), g);
             }
         }
@@ -1045,5 +1164,19 @@ pub fn dump_parts(native: &OperatorProgram, layers: &[LayerNodes], artifact: &Ar
     write("active.f64", &active)?;
     let record = serde_json::json!({"parts": records, "active": "active.f64", "kept": ["wte", "lm_head"], "fitter": format!("library_vpd, arm {arm}")});
     std::fs::write(dir.join("parts.json"), serde_json::to_vec_pretty(&record).map_err(error)?).map_err(error)?;
+    // Per part (a gate with its member components, of any rank where a stage shares gates): its
+    // rank (the slices its members run, in rank-one equivalents), the share of rows it is on and
+    // the distinct contexts it fires in; per stage the parts' rank histogram.
+    let rank_of = |b: usize| parts[b].slices.values().map(|(us, _)| us.len()).sum::<usize>();
+    let report: Vec<serde_json::Value> = reported
+        .iter()
+        .map(|(stage, members, on, k)| serde_json::json!({"stage": stage, "members": members, "rank": members.iter().map(|b| rank_of(*b)).sum::<usize>(), "share_on": on, "contexts": k}))
+        .collect();
+    let mut stages: BTreeMap<&str, BTreeMap<usize, usize>> = BTreeMap::new();
+    for (stage, members, _, _) in &reported {
+        *stages.entry(stage.as_str()).or_default().entry(members.iter().map(|b| rank_of(*b)).sum()).or_insert(0) += 1;
+    }
+    let summary = serde_json::json!({"parts": report, "rank_histogram": stages, "rows": rows});
+    std::fs::write(dir.join("parts_report.json"), serde_json::to_vec_pretty(&summary).map_err(error)?).map_err(error)?;
     Ok(parts.len())
 }
