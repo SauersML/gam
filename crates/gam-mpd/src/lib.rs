@@ -63,6 +63,8 @@ pub mod library_removal;
 pub mod library_transcoder;
 // Native weight edits compiled into M and an explanation through its owners: D(E_e(P)) = e(D(P)).
 pub mod weight_edit;
+// Adversarial verbatim edits: ascent of the gap over an edit's own parameters.
+pub mod adversary;
 /// VPD's slices with intrinsic gates as a library explanation.
 pub mod library_vpd;
 // Its posterior resident on the device: sample, Adam step and group divergences without transfers.

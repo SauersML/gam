@@ -255,8 +255,9 @@ struct EditSettings {
     adversarial: Option<AdversarialSettings>,
 }
 
-/// Adversarial pushes (`EditSettings::adversarial`): `searches` of them, each of `steps` steps
-/// estimating the gradient from `probes` directions.
+/// Adversarial pushes (`EditSettings::adversarial`): `searches` of them, each of at most `steps`
+/// steps (it stops earlier once the gap saturates, `adversary::ascend`) estimating the gradient from
+/// `probes` directions.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AdversarialSettings {
@@ -278,9 +279,13 @@ struct WeightFamily {
 /// compared on the same experiments by the manifest file's SHA-256 alone. It names the export, the
 /// held-out rows (their range and their token ids' digest), the seed, families, experiments per
 /// sequence and batch size it was drawn with, the binary that drew it (its source revision), the
-/// pushed directions' digest and the sites' typical norms (the units of a push), and every
-/// experiment, batch by batch. A driver given it scores exactly those experiments, whatever its own
-/// sampler would draw, and refuses it when the export, the rows or the directions differ.
+/// pushed directions themselves with their digest and the sites' typical norms (the units of a
+/// push), and every experiment, batch by batch. A driver given it scores exactly those experiments
+/// with those directions, whatever its own sampler or its machine's mathematical library would draw
+/// (macOS's and Linux's `ln` and `cos` differ in the last bits, so seeded directions do), and refuses
+/// it when the export or the rows differ or the stored directions do not match their digest. A
+/// manifest written before the directions were stored takes the reader's seeded directions, with a
+/// warning where their digest differs.
 #[derive(serde::Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct Manifest {
@@ -293,6 +298,9 @@ struct Manifest {
     batch_sequences: usize,
     binary: Option<String>,
     directions: String,
+    /// The pushed directions (`Interchange::push_directions`), whose digest `directions` is.
+    #[serde(default)]
+    push: Vec<Vec<f64>>,
     typical: Vec<(interchange::SharedSite, f64)>,
     experiments: Vec<Vec<interchange::Experiment>>,
     /// The native weight edits (`EditSettings::weights`), as drawn.
@@ -484,7 +492,7 @@ fn edit_faithfulness(
     experiments.set_directions(interchange::DIRECTIONS, settings.seed);
     let manifest_path = out.join(settings.manifest.clone().unwrap_or_else(|| format!("MANIFEST_{}.json", settings.name)));
     let rows = digest(held_out[first..end].iter().flat_map(|s| s.iter().map(|t| u64::from(*t)).chain([u64::MAX])));
-    let directions = digest(experiments.push_directions().iter().flatten().map(|v| v.to_bits()));
+    let digest_of = |directions: &[Vec<f64>]| digest(directions.iter().flatten().map(|v| v.to_bits()));
     let loaded: Option<Manifest> = if manifest_path.exists() {
         if settings.manifest.is_none() {
             return Err(format!("edits: {} exists and is immutable: name it in `manifest` to score on it", manifest_path.display()));
@@ -497,10 +505,18 @@ fn edit_faithfulness(
             ("families", m.families != settings.families),
             ("experiments per sequence", m.edits_per_sequence != settings.edits_per_sequence),
             ("batch size", m.batch_sequences != settings.batch_sequences),
-            ("pushed directions", m.directions != directions),
         ];
         if let Some((what, _)) = differs.iter().find(|d| d.1) {
             return Err(format!("edits: the manifest {} differs in its {what}", manifest_path.display()));
+        }
+        if m.push.is_empty() {
+            if m.directions != digest_of(&experiments.push_directions()) {
+                log::warn!("edits: the manifest {} stores no pushed directions and this machine's seeded ones differ from its digest", manifest_path.display());
+            }
+        } else if m.directions != digest_of(&m.push) {
+            return Err(format!("edits: the manifest {}'s pushed directions do not match their digest", manifest_path.display()));
+        } else {
+            experiments.set_push_directions(m.push.clone());
         }
         if m.weights.len() != settings.weights.as_ref().map_or(0, |w| w.edits) {
             return Err(format!("edits: the manifest {} lists {} weight edits", manifest_path.display(), m.weights.len()));
@@ -511,6 +527,9 @@ fn edit_faithfulness(
         experiments.measure_typical(&typical_batch)?;
         None
     };
+    // The pushed directions every model takes from here on: the manifest's, else this draw's.
+    let pushed = experiments.push_directions();
+    let directions = digest_of(&pushed);
     let family = |e: &interchange::Experiment| match &e.patch {
         None => "clean",
         Some(interchange::Patch::Ops { family: interchange::Family::Swap, .. }) => "swap",
@@ -563,6 +582,7 @@ fn edit_faithfulness(
                 batch_sequences: settings.batch_sequences,
                 binary: option_env!("GAM_BUILD_GIT_SHA").map(String::from),
                 directions: directions.clone(),
+                push: pushed.clone(),
                 typical: experiments.typical_norms().into_iter().collect(),
                 experiments: batches.iter().map(|(_, _, drawn, _)| drawn.clone()).collect(),
                 weights: match &settings.weights {
@@ -587,7 +607,7 @@ fn edit_faithfulness(
     let adversarial = match &settings.adversarial {
         Some(family) => {
             let found = adversarial_search(&mut experiments, &held_out[first..end], family, settings.seed, 2 * layers.len())?;
-            experiments.set_directions(interchange::DIRECTIONS, settings.seed);
+            experiments.set_push_directions(pushed.clone());
             Some(found)
         }
         None => None,
@@ -608,7 +628,7 @@ fn edit_faithfulness(
     let typical = experiments.typical_norms();
     drop(experiments);
     let mut reference = interchange::Interchange::new(device, native, layers, &gam_mpd::artifact::Artifact::native(native)?, &[], explanation.reads.clone(), settings.numeric_bytes, 256)?;
-    reference.set_directions(interchange::DIRECTIONS, settings.seed);
+    reference.set_push_directions(pushed.clone());
     reference.set_typical(typical);
     reference.unedited_explanation();
     // An edit's evidence grows with how much it moves M: per family, the gaps of the edits whose
@@ -660,6 +680,7 @@ fn edit_faithfulness(
             let mean = |key: &str| searches.iter().filter_map(|r| r[key].as_f64()).sum::<f64>() / searches.len().max(1) as f64;
             Some(json!({
                 "clean_bits_per_token": mean("clean_bits_per_token"), "random_bits_per_token": mean("random_bits_per_token"), "adversarial_bits_per_token": mean("adversarial_bits_per_token"),
+                "random_excess_bits_per_token": mean("random_excess_bits_per_token"), "adversarial_excess_bits_per_token": mean("adversarial_excess_bits_per_token"),
                 "effect_bits_per_token": mean("effect_bits_per_token"), "searches": searches,
             }))
         }
@@ -799,93 +820,41 @@ fn weight_faithfulness(
 /// row and direction).
 type Found = (Vec<Value>, Vec<(usize, interchange::SharedSite, usize, Vec<f64>)>);
 
-/// Adversarial pushes against the explanation (`EditSettings::adversarial`), applied verbatim to `M`
-/// and `P` like every push: per search a held-out sequence of `rows`, a stream site and a row
-/// (after the first) drawn from `seed`, and a push of one typical norm at that row along a unit
-/// direction `θ`, started at a random one. Each step ascends the gap `KL(M_e ‖ P_e)` (bits per
-/// scored token) on the sphere of directions: its gradient there is estimated by central
-/// differences along `probes` random tangent directions `u` (`θ` turned by ±0.05 rad toward `u`),
-/// then `θ` turns toward the estimated gradient by the best of π/16, π/8, π/4 and π/2, kept only
-/// where it raises the gap. Every candidate is one experiment of a batch, scored by
-/// `Interchange::evaluate`, so each step's gradient comes through both models' own runs. Each
-/// record also gives `P`'s clean error over the same rows, which every gap includes.
+/// Adversarial pushes against the explanation (`EditSettings::adversarial`, `gam_mpd::adversary`),
+/// applied verbatim to `M` and `P` like every push: per search a held-out sequence of `rows`, a
+/// stream site, a row and a starting direction drawn from `seed` alone (`adversary::draw`, the same
+/// for every explanation), then the ascent of the gap `KL(M_e ‖ P_e)` (bits per scored token) over
+/// the direction of a push of one typical norm (`adversary::ascend`), every candidate one
+/// experiment of a batch scored by `Interchange::evaluate`. Each record gives `P`'s clean error over
+/// the same rows, which every gap includes, and the excess of the random start's and the found
+/// push's gaps over it.
 fn adversarial_search(experiments: &mut interchange::Interchange, rows: &[Vec<u32>], family: &AdversarialSettings, seed: u64, blocks: usize) -> Result<Found, String> {
-    use rand::RngExt;
-    let mut rng = rand::rngs::StdRng::seed_from_u64(seed ^ 0x4144_5645_5253);
     let width = experiments.push_directions().first().map(Vec::len).ok_or("edits: no pushed directions")?;
-    let streams: Vec<interchange::SharedSite> = experiments.shared_sites().into_iter().filter(|s| matches!(s, interchange::SharedSite::Stream(_))).collect();
     let length = rows.first().map(Vec::len).ok_or("edits: no rows to search on")?;
-    if streams.is_empty() || length < 2 {
-        return Err("edits: no stream site or row to push".into());
-    }
-    let unit = |v: Vec<f64>| -> Vec<f64> {
-        let norm = v.iter().map(|x| x * x).sum::<f64>().sqrt();
-        v.into_iter().map(|x| x / norm).collect()
-    };
-    let normal = |rng: &mut rand::rngs::StdRng| -> Vec<f64> {
-        (0..width)
-            .map(|_| {
-                let (a, b): (f64, f64) = (rng.random::<f64>().max(f64::MIN_POSITIVE), rng.random());
-                (-2.0 * a.ln()).sqrt() * (std::f64::consts::TAU * b).cos()
-            })
-            .collect()
-    };
-    let turn = |t: &[f64], u: &[f64], angle: f64| -> Vec<f64> { t.iter().zip(u).map(|(x, y)| angle.cos() * x + angle.sin() * y).collect() };
+    let draws = gam_mpd::adversary::draw(seed, family.searches, rows.len(), length, blocks, width)?;
     let (mut records, mut finals) = (Vec::new(), Vec::new());
-    for search in 0..family.searches {
-        let sequence = rng.random_range(0..rows.len());
-        let site = streams[rng.random_range(0..streams.len())];
-        let position = rng.random_range(1..length);
-        let batch = interchange::Batch::new(vec![rows[sequence].clone()], vec![rows[sequence].clone()])?;
-        let score = |experiments: &mut interchange::Interchange, candidates: Vec<Vec<f64>>| -> Result<Vec<f64>, String> {
+    for (search, d) in draws.into_iter().enumerate() {
+        let batch = interchange::Batch::new(vec![rows[d.sequence].clone()], vec![rows[d.sequence].clone()])?;
+        let unpatched = interchange::Experiment { base: 0, source: 0, explained: vec![true; blocks], patch: None, position: 0 };
+        let clean = experiments.evaluate(&batch, &[unpatched], false)?.bits[0][d.position..].to_vec();
+        let clean = clean.iter().sum::<f64>() / clean.len().max(1) as f64;
+        let found = gam_mpd::adversary::ascend(seed, search, &d.start, family.steps, family.probes, |candidates| {
             let count = candidates.len();
             experiments.set_push_directions(candidates);
             let drawn: Vec<interchange::Experiment> = (0..count)
-                .map(|c| interchange::Experiment { base: 0, source: 0, explained: vec![true; blocks], patch: Some(interchange::Patch::Ops { family: interchange::Family::Push, ops: vec![interchange::SiteOp { site, operation: interchange::Operation::Push { direction: c, size: 1 }, onward: false }] }), position })
+                .map(|c| interchange::Experiment { base: 0, source: 0, explained: vec![true; blocks], patch: Some(interchange::Patch::Ops { family: interchange::Family::Push, ops: vec![interchange::SiteOp { site: d.site, operation: interchange::Operation::Push { direction: c, size: 1 }, onward: false }] }), position: d.position })
                 .collect();
             Ok(experiments.evaluate(&batch, &drawn, false)?.bits.iter().map(|b| b.iter().sum::<f64>() / b.len().max(1) as f64).collect())
-        };
-        // P's clean error over the same rows, which every push's gap includes.
-        let unpatched = interchange::Experiment { base: 0, source: 0, explained: vec![true; blocks], patch: None, position: 0 };
-        let clean = experiments.evaluate(&batch, &[unpatched], false)?.bits[0][position..].to_vec();
-        let clean = clean.iter().sum::<f64>() / clean.len().max(1) as f64;
-        let mut theta = unit(normal(&mut rng));
-        let mut current = score(experiments, vec![theta.clone()])?[0];
-        let start = current;
-        let mut path = vec![current];
-        for _ in 0..family.steps {
-            let delta = 0.05;
-            let probes: Vec<Vec<f64>> = (0..family.probes)
-                .map(|_| {
-                    let u = normal(&mut rng);
-                    let along = u.iter().zip(&theta).map(|(a, b)| a * b).sum::<f64>();
-                    unit(u.iter().zip(&theta).map(|(a, b)| a - along * b).collect())
-                })
-                .collect();
-            let candidates: Vec<Vec<f64>> = probes.iter().flat_map(|u| [turn(&theta, u, delta), turn(&theta, u, -delta)]).collect();
-            let f = score(experiments, candidates)?;
-            let mut g = vec![0.0; width];
-            for (j, u) in probes.iter().enumerate() {
-                let slope = (f[2 * j] - f[2 * j + 1]) / (2.0 * delta);
-                g.iter_mut().zip(u).for_each(|(gk, uk)| *gk += slope * uk);
-            }
-            if g.iter().all(|v| *v == 0.0) {
-                break;
-            }
-            let ascent = unit(g);
-            let turns: Vec<Vec<f64>> = [16.0, 8.0, 4.0, 2.0].iter().map(|k| turn(&theta, &ascent, std::f64::consts::PI / k)).collect();
-            let f = score(experiments, turns.clone())?;
-            if let Some((best, value)) = f.iter().copied().enumerate().max_by(|a, b| a.1.total_cmp(&b.1))
-                && value > current
-            {
-                theta = turns[best].clone();
-                current = value;
-            }
-            path.push(current);
-        }
-        log::info!("edits: adversarial search {search}: {start:.4} → {current:.4} bits per token at {site:?}, row {position}");
-        records.push(json!({"sequence": sequence, "site": site, "position": position, "clean_bits_per_token": clean, "random_bits_per_token": start, "adversarial_bits_per_token": current, "path": path}));
-        finals.push((sequence, site, position, theta));
+        })?;
+        let (start, end) = (found.path[0], *found.path.last().unwrap_or(&found.path[0]));
+        log::info!("edits: adversarial search {search}: {start:.4} → {end:.4} bits per token (clean {clean:.4}) at {:?}, row {}, {} steps", d.site, d.position, found.path.len() - 1);
+        records.push(json!({
+            "sequence": d.sequence, "site": d.site, "position": d.position, "clean_bits_per_token": clean,
+            "random_bits_per_token": start, "adversarial_bits_per_token": end,
+            "random_excess_bits_per_token": start - clean, "adversarial_excess_bits_per_token": end - clean,
+            "steps": found.path.len() - 1, "saturated": found.saturated, "path": found.path,
+        }));
+        finals.push((d.sequence, d.site, d.position, found.direction));
     }
     Ok((records, finals))
 }
