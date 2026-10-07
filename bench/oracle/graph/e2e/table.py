@@ -60,11 +60,12 @@ def oracle_eval_rows(path: Path) -> list[list[str]]:
     return rows
 
 
-def collect(sweep: Path | None, searches: list[Path], oracle: Path | None, oracle_evals: list[Path] = ()) -> list[list[str]]:
+def collect(sweep, searches: list[Path], oracle: Path | None, oracle_evals: list[Path] = ()) -> list[list[str]]:
+    """`sweep`: one sweep directory or several (each program row from every one of them)."""
     rows = []
     behaviors = set()
-    if sweep is not None:
-        for path in sorted(sweep.glob("*.json")):
+    for directory in ([] if sweep is None else [sweep] if isinstance(sweep, Path) else sweep):
+        for path in sorted(directory.glob("*.json")):
             r = json.loads(path.read_text())
             behaviors.add(r["behavior"])
             for name in ("empty", "hand", "random", "full"):
@@ -92,13 +93,13 @@ def collect(sweep: Path | None, searches: list[Path], oracle: Path | None, oracl
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--sweep", type=Path, default=RUNS / "sweep")
+    ap.add_argument("--sweep", type=Path, nargs="*", default=[RUNS / "sweep"])
     ap.add_argument("--search", type=Path, nargs="*", default=[RUNS / "search"])
     ap.add_argument("--oracle", type=Path, default=RUNS / "oracle")
     ap.add_argument("--oracle-eval", type=Path, nargs="*", default=[], help="g-rl's eval.jsonl files")
     ap.add_argument("--out", type=Path, default=RUNS / "oracle_vs_search.tsv")
     a = ap.parse_args()
-    rows = collect(a.sweep if a.sweep.exists() else None, [d for d in a.search if d.exists()], a.oracle if a.oracle.exists() else None,
+    rows = collect([d for d in a.sweep if d.exists()], [d for d in a.search if d.exists()], a.oracle if a.oracle.exists() else None,
                    [p for p in a.oracle_eval if p.exists()])
     text = "\t".join(COLUMNS) + "\n" + "".join("\t".join(r) + "\n" for r in rows)
     a.out.parent.mkdir(parents=True, exist_ok=True)
