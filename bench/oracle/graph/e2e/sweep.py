@@ -1,6 +1,6 @@
 """End to end on every behavior of a model (#2951): per behavior file, the reference programs (empty,
 random heads, full, and the hand-written example when examples/index.json has one for the behavior's
-family) scored through the checker, one checker per worker process.
+family) scored through the checker in one score_batch request per behavior, one checker per worker.
 
   sweep.py --model vpd4l [--behaviors DIR] [--task K --tasks T] [--workers 4] [--experiments 16]
            [--stand-in MODE] [--out DIR] [--export DIR]
@@ -49,14 +49,13 @@ def score_behavior(path: Path, experiments: int, seed: int, stand_in: str | None
     results = {}
     with score.Checker(behavior["model"], export) as checker:
         e2e.load_behavior(checker, path)
-        for name, source in references_for(behavior, seed).items():
-            t = time.time()
-            try:
-                r = checker.score(e2e.ir_of(source, behavior["model"], stand_in), experiments=experiments, seed=seed, reader=False)
-            except RuntimeError as e:  # the checker's refusal is this behavior's result
-                r = {"error": str(e), "valid": False}
-            r.pop("items", None)
-            r["seconds"] = time.time() - t
+        names, sources = zip(*references_for(behavior, seed).items())
+        t = time.time()
+        # one score_batch request: the checker shares M's run per experiment across the programs
+        answer = checker.request({"op": "score_batch", "programs": [e2e.ir_of(s, behavior["model"], stand_in) for s in sources],
+                                  "experiments": experiments, "seed": seed, "routing": "edges", "N": None, "reader_top": 0})
+        for name, r in zip(names, answer["scores"]):
+            r["seconds"] = (time.time() - t) / len(names)
             results[name] = r
     return {"behavior": behavior["id"], "family": behavior.get("family"), "model": behavior["model"],
             "prompts": len(behavior["prompts"]), "stand_in": stand_in, "experiments": experiments, "seed": seed,
