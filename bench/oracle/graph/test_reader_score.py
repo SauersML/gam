@@ -99,7 +99,7 @@ def test_prompt_prefix_is_shared():
     tok = qwen_tokenizer()
     pr = S.Prompter(tok, shared_vocab=True)
     it = item()
-    full = tok.encode(pr.head + S.INSTRUCTIONS.replace("{source}", PROGRAM), add_special_tokens=False)
+    full = tok.encode(pr.head + S.INSTRUCTIONS.replace("{task}", S.TASK["continue"]).replace("{source}", PROGRAM), add_special_tokens=False)
     assert pr.prefix(PROGRAM) == full  # encoding the template and the text apart changes no token
     # Special-token strings in a program are text, so a program cannot end the reader's turn.
     end = tok.convert_tokens_to_ids("<|im_end|>")
@@ -196,3 +196,18 @@ def test_server_score_and_score_many():
     assert many[1]["N"] == 20 and many[1]["items"] == 2
     assert "error" in ask({"op": "nope"})
     server.shutdown()
+
+
+def test_choice_answer():
+    tok = qwen_tokenizer()
+    pr = S.Prompter(tok, shared_vocab=True, answer="choice")
+    it = item()
+    assert pr.candidates(it) == [tok.encode(x, add_special_tokens=False) for x in "ABC"]  # 2 candidates + every other token
+    assert "C. every other token" in tok.decode(pr.item(it)) and "The capital of" in tok.decode(pr.item(it))
+    stub = StubReader(tok)
+    sc = S.Scorer(stub, "qwen3-0.6b", answer="choice")
+    V = len(tok)
+    q_lab = np.array([math.log(0.3 / (V - 2))] * 3)  # the stub's letters all get the same log-probability
+    q = np.exp(q_lab) / np.exp(q_lab).sum()
+    want = S.kl_bits(np.array([0.6, 0.1]), 0.3, q[:2])
+    assert sc.score([{"id": "e", "source": ""}], [it], N=1, baselines=False)[0]["per_item"][0] == pytest.approx(want, abs=1e-6)
