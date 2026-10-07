@@ -1135,11 +1135,10 @@ for step in range(steps):
     # Each kept edge's index bits, at the expected gates.
     edge_bits = sum(E['bits'] * (0.5 * (1 + torch.erf(E['eta'] / SQ2))).sum() for E in EDGE.values()) if EDGES else torch.zeros((), device=dev)
     objective = kl + (desc + edge_bits) / N
-    # The per-token count over the sequences that run as the explanation runs (not the all-on ones).
-    counted = torch.ones(batch, seq, device=dev)
-    if state['force_on']:
-        counted[state['force_on']] = 0.0
-    counted = counted.reshape(-1)
+    # The per-token budget is the explanation's execution on clean text: counted over the clean
+    # sequences only (an edited, all-on or leftover-removal sequence runs extra machinery, e.g. its
+    # leftover where the parts cannot express the edit, which the clean budget does not cap).
+    counted = torch.tensor([1.0 if k_ is None else 0.0 for k_ in kinds], device=dev)[:, None].expand(batch, seq).reshape(-1)
     ek = (torch.stack(state['soft']).sum(0) * counted).sum() / counted.sum()
     hk = ((torch.stack(state['hard']).sum(0) * counted).sum() / counted.sum()).item()
     if EDGES:
