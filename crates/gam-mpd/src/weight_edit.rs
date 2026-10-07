@@ -6,7 +6,8 @@
 //! reads it transposed, a key map a group's query heads share). The explanation `P` computes with its
 //! decoded `W` plus `ΔW`:
 //!
-//! * where `P` applies `W` itself (an operator of `M`'s it keeps by name), with `W + ΔW`, as `M` does;
+//! * where `P` applies `W` itself (an operator of `M`'s it keeps by name), with `W + ΔW`, as `M` does
+//!   (and, where it also owns blocks of `W` elsewhere, at those too);
 //! * where one of `P`'s operators owns a block of `W` (`Artifact::owners`: `P`'s block `B` stands for
 //!   `M`'s block, up to scalar factors and a transpose), with the matching block of `ΔW` as a term of
 //!   its own at every node applying that operator, on that node's input. The term is an operator
@@ -130,12 +131,12 @@ pub fn compile(native: &OperatorProgram, explanation: &Artifact, edits: &[Weight
         model.operators[w] = Arc::clone(&edited);
         let size = delta.iter().map(|v| v * v).sum::<f64>();
         total += size;
-        // P's own use of W, by name: the same edited operator (one resident copy for both).
+        // P's own use of W, by name: the same edited operator (one resident copy for both). An
+        // explanation may also own blocks of W elsewhere (M's own block at the attention sink's
+        // position, the library's functions at the others): both take the edit.
         let kept = named(&out.program, name)?.filter(|op| applied(&out.program, *op));
         if let Some(op) = kept {
             out.program.operators[op] = edited;
-            taken += size;
-            continue;
         }
         // P's owners of W's blocks: each distinct record once (a key map several heads read has one
         // record per head, all alike), every entry of W owned at most once.
@@ -147,8 +148,13 @@ pub fn compile(native: &OperatorProgram, explanation: &Artifact, edits: &[Weight
             }
         }
         if records.is_empty() {
-            return Ok(None);
+            if kept.is_none() {
+                return Ok(None);
+            }
+            taken += size;
+            continue;
         }
+        let mut owned = 0.0;
         let mut covered = Array2::<bool>::from_elem(delta.dim(), false);
         for o in &records {
             if o.native_rows.end > delta.nrows() || o.native_cols.end > delta.ncols() {
@@ -175,8 +181,9 @@ pub fn compile(native: &OperatorProgram, explanation: &Artifact, edits: &[Weight
             let term = terms.entry(op).or_insert_with(|| Array2::zeros((target.rows.width(), target.cols.width())));
             let mut at = term.slice_mut(s![o.rows.clone(), o.cols.clone()]);
             at += &block;
-            taken += delta.slice(s![o.native_rows.clone(), o.native_cols.clone()]).iter().map(|v| v * v).sum::<f64>();
+            owned += delta.slice(s![o.native_rows.clone(), o.native_cols.clone()]).iter().map(|v| v * v).sum::<f64>();
         }
+        taken += if kept.is_some() { size } else { owned };
     }
     // Each owning operator's term joins every node applying it, on that node's input.
     for (op, values) in terms {
