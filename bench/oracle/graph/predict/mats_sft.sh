@@ -23,5 +23,5 @@ sets=()
 for spec in "$@"; do sets+=(--heldout "$spec"); done
 mkdir -p "$OUT"
 $PY "$here/sft.py" --model "$ORACLE" --train "$TRAIN" "${sets[@]}" --out "$OUT" --steps "$STEPS" --hours "$HOURS"
-$PY "$here/eval_kl.py" --model "$ORACLE" "${sets[@]}" --out "$OUT/eval_kl_base.json"
-$PY "$here/eval_kl.py" --model "$ORACLE" --adapters "$OUT/adapters.safetensors" "${sets[@]}" --out "$OUT/eval_kl_trained.json"
+$PY "$here/eval_kl.py" --model "$ORACLE" "${sets[@]}" --per-type 64 --out "$OUT/eval_kl_base.json"
+$PY "$here/eval_kl.py" --model "$ORACLE" --adapters "$OUT/adapters.safetensors" "${sets[@]}" --per-type 64 --out "$OUT/eval_kl_trained.json"

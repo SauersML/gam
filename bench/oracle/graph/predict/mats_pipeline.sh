@@ -33,6 +33,6 @@ sub() { MATS_REF=$REF MATS_MEM_EXACT=1 "$@" | tail -1; }
 train=$(MATS_QOS=debug MATS_GPUS=1 MATS_ARRAY=$ARR sub mats-run "$N-train" 6 "$MEM" 2 -- bash "$G/mats_gen.sh" "$MODEL" "$D/train_{task}.jsonl" "$TRAINW" train train "$TEXTS" "{task}" "${EXTRA[@]}")
 held=$(MATS_QOS=debug MATS_GPUS=1 sub mats-run "$N-heldout" 6 "$MEM" 2 -- bash "$G/mats_heldout.sh" "$MODEL" "$D" "$HELDW" "$HTEXTS" "$BEH" "${EXTRA[@]}")
 if [ -n "${NOSFT:-}" ]; then echo "$N: train $train, heldout $held (commit ${REF:0:12})"; exit 0; fi
-sft=$(MATS_GPUS=1 MATS_AFTEROK="$train:$held" sub mats-run "$N-sft" 6 32 6 -- bash "$G/mats_sft.sh" Qwen/Qwen3-8B "$D/sft" \
+sft=$(MATS_GPUS=1 MATS_AFTEROK="$train:$held" sub mats-run "$N-sft" 6 32 8 -- bash "$G/mats_sft.sh" Qwen/Qwen3-8B "$D/sft" \
     "$D/train_*.jsonl,$D/behaviors_train.jsonl" 4000 5.2 "prompts=$D/heldout_prompts.jsonl" "pieces=$D/heldout_pieces.jsonl" "behaviors=$D/behaviors_heldout.jsonl")
 echo "$N: train $train, heldout $held, sft $sft (commit ${REF:0:12})"
