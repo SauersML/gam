@@ -148,7 +148,7 @@ def all_units(model: str, mlp_view: str = "native"):
 
 
 def greedy(pool: Pool, model: str, mode: str, experiments: int, seed: int, min_neurons: int, log, start=None,
-           mlp_view: str = "native") -> dict:
+           mlp_view: str = "native", checkpoint=None) -> dict:
     """`start`: the units to start from (default: none for addition, every unit for removal). With mlp_view
     "vpd" (addition only), MLPs enter as VPD units grown by doubling along the removal ranking."""
     full = all_units(model, mlp_view)
@@ -197,6 +197,9 @@ def greedy(pool: Pool, model: str, mode: str, experiments: int, seed: int, min_n
         trajectory.append({"step": step, "move": [moves[k][2][0], name(moves[k][2][1])], "units": [name(u) for u in current],
                            "total_bits": best["total_bits"], "exec_error_bits": best["exec_error_bits"],
                            "opaque_bits": best["opaque_bits"], "calls": pool.calls, "candidates": candidates})
+        if checkpoint is not None:  # a job cut off by its time limit keeps every finished step
+            checkpoint({"units": [name(u) for u in current], "source": source(current), "score": best, "trajectory": trajectory,
+                        "partial": True})
     return {"units": current, "source": source(current), "score": best, "trajectory": trajectory}
 
 
@@ -236,7 +239,9 @@ def main() -> None:
                     logf.write(msg + "\n")
                     logf.flush()
                 start = [unit_of(t) for t in a.start.split(",")] if a.start else None
-                found = greedy(pool, model, mode, a.experiments, a.seed, a.min_neurons, log, start, a.mlp_view)
+                partial = out / f"{stem}.partial.json"
+                found = greedy(pool, model, mode, a.experiments, a.seed, a.min_neurons, log, start, a.mlp_view,
+                               lambda state: partial.write_text(json.dumps(state, indent=1)))
                 heldout = pool.score([found["source"]], a.experiments, a.heldout_seed)[0]
                 found.update(units=[name(u) for u in found["units"]], heldout=heldout, calls=pool.calls - start, stand_in=a.stand_in, checker=Path(str(score.BINARY)).name,
                              experiments=a.experiments, seed=a.seed, heldout_seed=a.heldout_seed)
