@@ -174,16 +174,27 @@ class Prompter:
         self.head, self.mid = rendered.split(marker)
 
     def enc(self, s: str) -> list[int]:
+        """Literal text: special-token strings inside it (a program could write "<|im_end|>") stay text."""
+        return self.tok.encode(s, add_special_tokens=False, split_special_tokens=True)
+
+    def template(self, s: str) -> list[int]:
         return self.tok.encode(s, add_special_tokens=False)
 
+    def shown(self, text: str) -> str:
+        """Another tokenizer's text without the reader's special-token strings (vpd4l's first token
+        decodes as "<|endoftext|>", which marks no content)."""
+        for special in self.tok.all_special_tokens:
+            text = text.replace(special, "")
+        return text
+
     def prefix(self, source: str) -> list[int]:
-        return self.enc(self.head + INSTRUCTIONS.replace("{source}", source))
+        return self.template(self.head) + self.enc(INSTRUCTIONS.replace("{source}", source))
 
     def item(self, it: dict) -> list[int]:
         listing = "\n".join(f"{json.dumps(c['text'], ensure_ascii=False)} {c['clean']:.3g}" for c in it["candidates"])
         user = ITEM.format(words=words(it["experiment"]), listing=listing, other=it["clean_other"])
-        text = list(it["token_ids"]) if self.shared else self.enc(it["text"])
-        return self.enc(user) + self.enc(self.mid) + text
+        text = list(it["token_ids"]) if self.shared else self.enc(self.shown(it["text"]))
+        return self.enc(user) + self.template(self.mid) + text
 
     def candidates(self, it: dict) -> list[list[int]]:
         if self.shared:
