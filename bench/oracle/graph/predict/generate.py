@@ -106,6 +106,7 @@ class Qwen3:
         c = self.model.config
         self.L, self.H, self.KV, self.hd, self.Fn, self.d = c.num_hidden_layers, c.num_attention_heads, c.num_key_value_heads, c.head_dim, c.intermediate_size, c.hidden_size
         self.Wo = [layer.self_attn.o_proj.weight.view(self.d, self.H, self.hd) for layer in self.layers]
+        self.name = {1024: "qwen3-0.6b", 2048: "qwen3-1.7b", 2560: "qwen3-4b", 4096: "qwen3-8b"}.get(self.d, f"qwen3-d{self.d}")
         self.tc = {}  # layer -> transcoder tensors (bfloat16 as stored)
 
     def load_transcoders(self, root: str, layers: list[int]):
@@ -339,34 +340,77 @@ def kl_bits(lp_clean: torch.Tensor, lp_edit: torch.Tensor) -> torch.Tensor:
 # ---------------------------------------------------------------- drawing pieces
 
 
+KIND_CODE = {"head": 1, "neuron": 2, "tc": 3, "q_proj": 4, "k_proj": 5, "v_proj": 6, "o_proj": 7, "c_fc": 8, "down_proj": 9}
+
+
+def held_out_units(kind: str, layer: int, count: int) -> np.ndarray:
+    """Which units (heads, neurons, features or subcomponents) of a site are held-out pieces: a fixed
+    integer hash of (kind, layer, index), one unit in ten. Training shards ask only about the others;
+    held-out-piece shards only about these, so the oracle is scored on pieces it never saw."""
+    i = np.arange(count, dtype=np.uint64)
+    h = (np.uint64(layer + 1) * np.uint64(0x9E3779B1) + (i + np.uint64(1)) * np.uint64(0x85EBCA77) + np.uint64(KIND_CODE[kind]) * np.uint64(0xC2B2AE3D)) & np.uint64(0xFFFFFFFF)
+    h ^= h >> np.uint64(15)
+    h = (h * np.uint64(0x2C1B3C6D)) & np.uint64(0xFFFFFFFF)
+    h ^= h >> np.uint64(12)
+    return (h % np.uint64(10)) == 0
+
+
 class Draw:
-    def __init__(self, m: Qwen3, rng: np.random.Generator):
-        self.m, self.rng = m, rng
+    """Draws pieces for questions, restricted to one piece split: "train" (units not held out; whole blocks
+    allowed) or "heldout" (held-out units only; no whole blocks)."""
+
+    def __init__(self, m: Qwen3, rng: np.random.Generator, split: str = "train"):
+        self.m, self.rng, self.split = m, rng, split
+        want = split == "heldout"
+        self.heads = [np.flatnonzero(held_out_units("head", l, m.H) == want) for l in range(m.L)]
+        self.neurons = [np.flatnonzero(held_out_units("neuron", l, m.Fn) == want) for l in range(m.L)]
+        self._masks = {}
+
+    def mask(self, kind, layer, count):
+        """Torch mask of the units of this split (cached), for aimed draws among the most active."""
+        key = (kind, layer)
+        if key not in self._masks:
+            self._masks[key] = torch.from_numpy(held_out_units(kind, layer, count) == (self.split == "heldout")).to(self.m.dev)
+        return self._masks[key]
+
+    def layer_with_heads(self):
+        while True:
+            L = int(self.rng.integers(self.m.L))
+            if len(self.heads[L]):
+                return L
 
     def uniform(self):
         r = self.rng.random()
+        whole = self.split == "train"
+        if r < 0.3 or (not whole and r >= 0.6):
+            L = self.layer_with_heads()
+            return ("head", L, int(self.rng.choice(self.heads[L])))
         L = int(self.rng.integers(self.m.L))
-        if r < 0.3:
-            return ("head", L, int(self.rng.integers(self.m.H)))
         if r < 0.6:
             k = int(self.rng.choice([1, 4, 16, 64]))
-            return ("neurons", L, tuple(sorted(int(i) for i in self.rng.choice(self.m.Fn, size=k, replace=False))))
+            return ("neurons", L, tuple(sorted(int(i) for i in self.rng.choice(self.neurons[L], size=k, replace=False))))
         if r < 0.8:
             return ("mlp", L)
         return ("attn", L)
 
     def aimed_head(self, rec, row, L):
+        """A head of this split among the 4 of largest write norm at the row's last position (L must have one)."""
         z = rec["z_last"][row, L]  # [H, hd]
         norms = torch.linalg.vector_norm(torch.einsum("dhk,hk->hd", self.m.Wo[L], z), dim=-1)
-        return int(self.rng.choice(norms.topk(4).indices.tolist()))
+        norms = torch.where(self.mask("head", L, self.m.H), norms, torch.full_like(norms, -1.0))
+        top = norms.topk(min(4, len(self.heads[L]))).indices.tolist()
+        return int(self.rng.choice(top))
 
     def aimed(self, rec, row):
         """A piece among the most active at the row's last position: a head among the 4 of largest write
         norm in its layer, or neurons among the 256 of largest |activation|."""
-        L = int(self.rng.integers(self.m.L))
         if self.rng.random() < 0.5:
+            L = self.layer_with_heads()
             return ("head", L, self.aimed_head(rec, row, L))
-        top = rec["act_last"][row, L].abs().topk(256).indices.cpu().numpy()
+        L = int(self.rng.integers(self.m.L))
+        a = rec["act_last"][row, L].abs()
+        a = torch.where(self.mask("neuron", L, self.m.Fn), a, torch.full_like(a, -1.0))
+        top = a.topk(min(256, len(self.neurons[L]))).indices.cpu().numpy()
         k = int(self.rng.choice([1, 4, 16, 64]))
         return ("neurons", L, tuple(sorted(int(i) for i in self.rng.choice(top[: max(k, 16 * k if k < 16 else 256)], size=k, replace=False))))
 
@@ -376,11 +420,14 @@ class Draw:
         if self.m.parts:
             l, site = list(self.m.parts)[int(self.rng.integers(len(self.m.parts)))]
             act = (rec["site_in_last"][(l, site)][row] @ self.m.parts[(l, site)][1]).abs()
+            act = torch.where(self.mask(site, l, act.shape[0]), act, torch.full_like(act, -1.0))
             top = act.topk(64).indices.cpu().numpy()
             k = int(self.rng.choice([1, 1, 4] if small else [1, 4, 16]))
             return ("vpd", l, site, tuple(sorted(int(i) for i in self.rng.choice(top, size=k, replace=False))))
         L = int(self.rng.choice(sorted(self.m.tc)))
-        top = rec["tc_last"][L][row].float().topk(64)
+        a = rec["tc_last"][L][row].float()
+        a = torch.where(self.mask("tc", L, a.shape[0]), a, torch.zeros_like(a))
+        top = a.topk(64)
         live = top.indices[top.values > 0].cpu().numpy()
         if len(live) == 0:
             return None
@@ -413,14 +460,18 @@ def batch_questions(m: Qwen3, w: Writer, draw: Draw, tokens: torch.Tensor, sourc
     rows = list(range(B))
 
     def emit(row, kind, inp, ans, numbers):
-        out.append({"model": m.name, "type": kind, "source": source, "split": split, "text_id": ids[row],
+        out.append({"model": m.name, "type": kind, "source": source, "split": split, "piece_split": draw.split, "text_id": ids[row],
                     "input": f"<model> {m.name}\n" + inp, "answer": ans, "numbers": numbers})
 
     # Probes for the where questions: a neuron or a head per text.
     probes = {}
     for r in rows:
-        l = int(rng.integers(m.L))
-        probes[r] = (l, int(rng.integers(m.H)), -1) if rng.random() < 0.4 else (l, -1, int(rng.integers(m.Fn)))
+        if rng.random() < 0.4:
+            l = draw.layer_with_heads()
+            probes[r] = (l, int(rng.choice(draw.heads[l])), -1)
+        else:
+            l = int(rng.integers(m.L))
+            probes[r] = (l, -1, int(rng.choice(draw.neurons[l])))
     rec = {"probes": probes}
     if m.tc or m.parts:
         # Feature probes need the clean pass's activations to pick live features: a first pass picks them.
@@ -435,8 +486,8 @@ def batch_questions(m: Qwen3, w: Writer, draw: Draw, tokens: torch.Tensor, sourc
     clean_txt = [w.dist(lp_clean[r]) for r in rows]
     texts = [w.text(tokens[r].tolist()) for r in rows]
 
-    # plain
-    for r in rows:
+    # plain (no piece: not asked in held-out-piece shards, nor prompt edits)
+    for r in rows if draw.split == "train" else []:
         emit(r, "plain", f"<text> {texts[r]}\n<question> next-token distribution\n", clean_txt[r][0], {"edited": clean_txt[r][1]})
 
     def edited_questions(kind, iv, describe, extra=None, toks=None):
@@ -501,11 +552,12 @@ def batch_questions(m: Qwen3, w: Writer, draw: Draw, tokens: torch.Tensor, sourc
     # cut
     iv, desc, extra = m.new(B), [], []
     for r in rows:
-        al = int(rng.integers(m.L))
         u = rng.random()
-        if u < 0.5:
-            ak, ah = "head", (draw.aimed_head(rec, r, al) if rng.random() < 0.5 else int(rng.integers(m.H)))
+        if u < 0.5 or draw.split == "heldout":
+            al = draw.layer_with_heads()
+            ak, ah = "head", (draw.aimed_head(rec, r, al) if rng.random() < 0.5 else int(rng.choice(draw.heads[al])))
         else:
+            al = int(rng.integers(m.L))
             ak, ah = ("mlp" if u < 0.75 else "attn"), -1
         first = al + (1 if ak == "mlp" else 0)  # the earliest layer whose readers see A's write
         v = rng.random()
@@ -515,7 +567,9 @@ def batch_questions(m: Qwen3, w: Writer, draw: Draw, tokens: torch.Tensor, sourc
             bk, bl, bh, route = "mlp", int(rng.integers(first, min(m.L, first + 4))), -1, "input"
         else:
             lo = first if ak == "mlp" else first + 1
-            bk, bl, bh, route = "head", int(rng.integers(lo, min(m.L, lo + 4))), int(rng.integers(m.H)), ROUTES[int(rng.integers(3))]
+            bl = int(rng.integers(lo, min(m.L, lo + 4)))
+            bh = int(rng.choice(draw.heads[bl])) if len(draw.heads[bl]) else -1
+            bk, route = ("head", ROUTES[int(rng.integers(3))]) if bh >= 0 else ("mlp", "input")
         iv.cuts[r] = (ak, al, ah, bk, bl, bh, route)
         a_txt = "node(" + piece_text(("head", al, ah) if ak == "head" else (ak, al)) + ")"
         b_txt = {"logits": "logits", "mlp": f"node(L[{bl}].mlp[:]).input", "head": f"node(L[{bl}].head[{bh}]).{route}"}[bk]
@@ -524,24 +578,25 @@ def batch_questions(m: Qwen3, w: Writer, draw: Draw, tokens: torch.Tensor, sourc
     edited_questions("cut", iv, desc, extra)
 
     # prompt edit: one token replaced by a token of another text in the batch
-    toks2 = tokens.clone()
-    desc, extra = [], []
-    for r in rows:
-        cf = counterfactuals[r] if counterfactuals else None
-        if cf is not None:
-            toks2[r] = torch.tensor(cf, device=tokens.device)
-            changed = [i for i in range(T) if int(tokens[r, i]) != cf[i]]
-            edits = ", ".join(f"position {i}: {w.token(int(tokens[r, i]))} -> {w.token(cf[i])}" for i in changed)
-            desc.append(f"<text> {texts[r]}\n<edit> {edits}\n<edited_text> {w.text(cf)}\n")
-            extra.append({"positions": changed, "counterfactual": cf})
-            continue
-        p = int(rng.integers(1, T))
-        new = int(tokens[(r + 1 + int(rng.integers(B - 1))) % B, int(rng.integers(T))].item()) if B > 1 else int(rng.integers(1000))
-        old = int(tokens[r, p].item())
-        toks2[r, p] = new
-        desc.append(f"<text> {texts[r]}\n<edit> position {p}: {w.token(old)} -> {w.token(new)}\n<edited_text> {w.text(toks2[r].tolist())}\n")
-        extra.append({"position": p, "old": old, "new": new})
-    edited_questions("prompt", None, desc, extra, toks=toks2)
+    if draw.split == "train":
+        toks2 = tokens.clone()
+        desc, extra = [], []
+        for r in rows:
+            cf = counterfactuals[r] if counterfactuals else None
+            if cf is not None:
+                toks2[r] = torch.tensor(cf, device=tokens.device)
+                changed = [i for i in range(T) if int(tokens[r, i]) != cf[i]]
+                edits = ", ".join(f"position {i}: {w.token(int(tokens[r, i]))} -> {w.token(cf[i])}" for i in changed)
+                desc.append(f"<text> {texts[r]}\n<edit> {edits}\n<edited_text> {w.text(cf)}\n")
+                extra.append({"positions": changed, "counterfactual": cf})
+                continue
+            p = int(rng.integers(1, T))
+            new = int(tokens[(r + 1 + int(rng.integers(B - 1))) % B, int(rng.integers(T))].item()) if B > 1 else int(rng.integers(1000))
+            old = int(tokens[r, p].item())
+            toks2[r, p] = new
+            desc.append(f"<text> {texts[r]}\n<edit> position {p}: {w.token(old)} -> {w.token(new)}\n<edited_text> {w.text(toks2[r].tolist())}\n")
+            extra.append({"position": p, "old": old, "new": new})
+        edited_questions("prompt", None, desc, extra, toks=toks2)
 
     # swap: the piece's last-position value from the next text of the batch
     if B > 1:
@@ -609,6 +664,8 @@ def main():
     ap.add_argument("--steps", type=int, default=8)
     ap.add_argument("--split", default="train")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--piece-split", default="train", choices=("train", "heldout"),
+                    help="ask about training pieces (and whole blocks) or only held-out pieces (held_out_units)")
     ap.add_argument("--row-range", default="", help="A:B, draw texts from rows A..B-1 only (e.g. vpd4l Pile rows 0:3584 train, 3584:4096 held out)")
     ap.add_argument("--per-behavior", type=int, default=64, help="prefixes per behavior (--behaviors)")
     ap.add_argument("--transcoders", default="", help="circuit-tracer transcoder directory (layer_{l}.safetensors)")
@@ -626,7 +683,7 @@ def main():
         m.load_transcoders(args.transcoders, [int(x) for x in args.tc_layers.split(",")])
     w = Writer(m)
     rng = np.random.default_rng(args.seed)
-    draw = Draw(m, rng)
+    draw = Draw(m, rng, args.piece_split)
     lengths = [int(x) for x in args.lengths.split(",")]
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
