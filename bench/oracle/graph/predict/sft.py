@@ -16,7 +16,8 @@ code length in bits (sum of -log2 p over the answer tokens, end-of-text included
 answer token, for the base model (adapters off) before training and the trained model after; written to
 OUT/eval.json with the per-type means and standard errors, OUT/adapters.safetensors holds the adapters.
 
-  sft.py --model Qwen/Qwen3-8B --train 'DIR/train_*.jsonl' --heldout 'DIR/heldout_*.jsonl' --out DIR
+  sft.py --model Qwen/Qwen3-8B --train 'DIR/train_*.jsonl' --heldout 'prompts=DIR/heldout_*.jsonl'
+         [--heldout 'pieces=DIR/pieces_*.jsonl' --heldout 'behaviors=DIR/behaviors_heldout*.jsonl'] --out DIR
          [--steps 1000] [--batch 8] [--max-tokens 768] [--lr 2e-4] [--rank 16] [--alpha 32]
          [--eval-per-type 128] [--hours 1.8] [--seed 0]
 """
@@ -176,7 +177,10 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model", default="Qwen/Qwen3-8B")
     ap.add_argument("--train", required=True)
-    ap.add_argument("--heldout", required=True)
+    ap.add_argument("--heldout", action="append", required=True,
+                    help="NAME=GLOB (repeatable): held-out sets scored separately, e.g. prompts=... pieces=... behaviors=...")
+    ap.add_argument("--eval-every", type=int, default=500, help="score every held-out set every N steps (the learning curve)")
+    ap.add_argument("--curve-per-type", type=int, default=32)
     ap.add_argument("--out", required=True)
     ap.add_argument("--steps", type=int, default=1000)
     ap.add_argument("--batch", type=int, default=8)
@@ -211,11 +215,16 @@ def main():
         p.requires_grad_(False)
     adapters = wrap(model, args.rank, args.alpha)
     params = [p for a in adapters.values() for p in (a.A, a.B)]
-    train, heldout = load(args.train), load(args.heldout)
+    train = load(args.train)
+    sets = {}
+    for spec in args.heldout:
+        name, _, pattern = spec.rpartition("=")
+        sets[name or "heldout"] = load(pattern)
     types = sorted(train)
     moved = {k: [q for q in v if changed(q)] for k, v in train.items()}
     log = open(out / "train.jsonl", "a")
-    meta = {"args": vars(args), "train_questions": {k: len(v) for k, v in train.items()}, "changed_questions": {k: len(v) for k, v in moved.items()}, "heldout_questions": {k: len(v) for k, v in heldout.items()},
+    meta = {"args": vars(args), "train_questions": {k: len(v) for k, v in train.items()}, "changed_questions": {k: len(v) for k, v in moved.items()}, "heldout_questions": {n: {k: len(v) for k, v in h.items()} for n, h in sets.items()},
+            "distinct_train_texts": len({q["text_id"] for v in train.values() for q in v}),
             "adapter_parameters": sum(p.numel() for p in params)}
     (out / "meta.json").write_text(json.dumps(meta, indent=1))
     print(json.dumps(meta), flush=True)
@@ -225,7 +234,10 @@ def main():
             a.on = on
 
     set_adapters(False)
-    base = evaluate(model, tok, heldout, args.eval_per_type, args.batch, args.max_tokens, dev)
+    def evaluate_sets(per_type):
+        return {n: evaluate(model, tok, h, per_type, args.batch, args.max_tokens, dev) for n, h in sets.items()}
+
+    base = evaluate_sets(args.eval_per_type)
     (out / "eval_base.json").write_text(json.dumps(base, indent=1))
     print(json.dumps({"base": base}), flush=True)
     set_adapters(True)
@@ -255,6 +267,10 @@ def main():
         opt.step()
         opt.zero_grad(set_to_none=True)
         step += 1
+        if args.eval_every and step % args.eval_every == 0:
+            curve = {"step": step, "heldout": evaluate_sets(args.curve_per_type)}
+            log.write(json.dumps(curve) + "\n")
+            print(json.dumps(curve), flush=True)
         if step % 10 == 0:
             rec = {"step": step, "bits_per_answer_token": loss.item() / math.log(2), "seconds_per_step": (time.time() - t0) / step,
                    "types": [q["type"] for q in items]}
@@ -265,9 +281,9 @@ def main():
 
     save_file({f"{k}.{n}": getattr(a, n).detach().cpu().contiguous() for k, a in adapters.items() for n in ("A", "B")}, str(out / "adapters.safetensors"))
     save_peft(out / "adapters.safetensors", out / "peft", args.model, args.rank, args.alpha)
-    trained = evaluate(model, tok, heldout, args.eval_per_type, args.batch, args.max_tokens, dev)
+    trained = evaluate_sets(args.eval_per_type)
     result = {"steps": step, "base": base, "trained": trained,
-              "gain_bits_per_question": {k: base[k]["bits_per_question"] - trained[k]["bits_per_question"] for k in trained},
+              "gain_bits_per_question": {n: {k: base[n][k]["bits_per_question"] - t[k]["bits_per_question"] for k in t} for n, t in trained.items()},
               "hours": (time.time() - started) / 3600}
     (out / "eval.json").write_text(json.dumps(result, indent=1))
     print(json.dumps(result), flush=True)

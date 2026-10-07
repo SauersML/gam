@@ -13,7 +13,7 @@ The reference answer for intervention questions is "no change": the clean distri
 question) read the same way; plain questions have none. Written to OUT: per type the mean KL in bits,
 its standard error, the no-change reference's mean on the same questions, and the paired difference.
 
-  eval_kl.py --model Qwen/Qwen3-8B [--adapters OUT/adapters.safetensors] --heldout 'DIR/heldout_*.jsonl'
+  eval_kl.py --model Qwen/Qwen3-8B [--adapters OUT/adapters.safetensors] --heldout 'prompts=DIR/heldout_*.jsonl' [--heldout NAME=GLOB ...]
              --out EVAL.json [--per-type 128] [--batch 16] [--rank 16] [--alpha 32] [--format chat|raw]
 """
 
@@ -75,35 +75,8 @@ def kl_bits(measured_strs, measured_p, answer) -> float:
     return out + rest * math.log2(rest / q_rest)
 
 
-def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--model", default="Qwen/Qwen3-8B")
-    ap.add_argument("--adapters", default="")
-    ap.add_argument("--heldout", required=True)
-    ap.add_argument("--out", required=True)
-    ap.add_argument("--per-type", type=int, default=128)
-    ap.add_argument("--batch", type=int, default=16)
-    ap.add_argument("--rank", type=int, default=16)
-    ap.add_argument("--alpha", type=float, default=32.0)
-    ap.add_argument("--max-new", type=int, default=72)
-    ap.add_argument("--format", default="chat", choices=("chat", "raw"), help="the format the adapters were trained with (sft.py)")
-    args = ap.parse_args()
-    sft.FORMAT["name"] = args.format
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-
-    dev = torch.device("cuda" if torch.cuda.is_available() else "mps")
-    tok = AutoTokenizer.from_pretrained(args.model)
-    tok.padding_side = "left"
-    model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.bfloat16).to(dev).eval()
-    if args.adapters:
-        from safetensors.torch import load_file
-
-        adapters = wrap(model, args.rank, args.alpha)
-        state = load_file(args.adapters)
-        for name, a in adapters.items():
-            a.A.data.copy_(state[f"{name}.A"])
-            a.B.data.copy_(state[f"{name}.B"])
-    heldout = load(args.heldout)
+def score_set(model, tok, heldout, args, dev, name):
+    """Per question type: the oracle's KL and the no-change answer's on the same questions."""
     result = {}
     for kind in TYPES:
         qs = heldout.get(kind, [])[: args.per_type]
@@ -133,8 +106,44 @@ def main():
             row.update({"no_change_kl_bits": sum(ref) / len(ref), "difference_bits": dm,
                         "difference_se": (sum((x - dm) ** 2 for x in d) / max(1, len(d) - 1) / len(d)) ** 0.5})
         result[kind] = row
-        print(json.dumps({kind: row}), flush=True)
-    Path(args.out).write_text(json.dumps({"model": args.model, "adapters": args.adapters, "per_type": result}, indent=1))
+        print(json.dumps({name: {kind: row}}), flush=True)
+    return result
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--model", default="Qwen/Qwen3-8B")
+    ap.add_argument("--adapters", default="")
+    ap.add_argument("--heldout", action="append", required=True, help="NAME=GLOB (repeatable), each set scored separately")
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--per-type", type=int, default=128)
+    ap.add_argument("--batch", type=int, default=16)
+    ap.add_argument("--rank", type=int, default=16)
+    ap.add_argument("--alpha", type=float, default=32.0)
+    ap.add_argument("--max-new", type=int, default=72)
+    ap.add_argument("--format", default="chat", choices=("chat", "raw"), help="the format the adapters were trained with (sft.py)")
+    args = ap.parse_args()
+    sft.FORMAT["name"] = args.format
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    dev = torch.device("cuda" if torch.cuda.is_available() else "mps")
+    tok = AutoTokenizer.from_pretrained(args.model)
+    tok.padding_side = "left"
+    model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.bfloat16).to(dev).eval()
+    if args.adapters:
+        from safetensors.torch import load_file
+
+        adapters = wrap(model, args.rank, args.alpha)
+        state = load_file(args.adapters)
+        for name, a in adapters.items():
+            a.A.data.copy_(state[f"{name}.A"])
+            a.B.data.copy_(state[f"{name}.B"])
+    out = {}
+    for spec in args.heldout:
+        name, _, pattern = spec.rpartition("=")
+        name = name or "heldout"
+        out[name] = score_set(model, tok, load(pattern), args, dev, name)
+    Path(args.out).write_text(json.dumps({"model": args.model, "adapters": args.adapters, "sets": out}, indent=1))
 
 
 if __name__ == "__main__":
