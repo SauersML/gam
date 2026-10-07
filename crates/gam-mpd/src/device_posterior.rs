@@ -589,17 +589,20 @@ impl DevicePosterior {
                     .collect();
                 log::info!("library line step draw by block: {}", text.join(", "));
             }
-            // `ρ̄` is the plain running mean of the draws' ratios. The logarithm's mean (kept beside
-            // it for the record, `log_rho`) read back through `E[ln χ²₁]` is the ratios' geometric
-            // mean, below their mean wherever the directions' ratios differ: from it η reached
-            // 3.7e-2 in the third epoch of vpd4l grouped direction gates with learned widths and the
-            // epoch diverged (decomp-vpd4l-h, 591bb575c2), where the plain mean held the same arm
-            // stable through seven epochs (decomp-vpd4l-f, 42e03873f6).
+            // `ρ̄` is the draws' ratio averaged in logarithm and read back through `E[ln χ²₁]`: one
+            // draw is a single χ²₁-like sample of the current direction's ratio, and the directions'
+            // ratios jump by orders of magnitude (vpd4l tiny fit: draws of 7e2, 1e4, then 1.7e10 and
+            // 2e10 at steps 2 and 3, then 3e6 and 13). With the plain mean of the ratios (339d446dbe)
+            // the tiny gated library missed its budget (a_tiny_gated_library_meets_its_budget: the
+            // count's last epochs 14.5 and 12.3 parts per token against K 11.0); with the logarithm
+            // it meets it. This average is the geometric mean, below the plain one where the
+            // directions' ratios differ, so it can make the step long: the trust factor
+            // (`trust_update`) answers a measured rise.
             if diagonal > 0.0 && draw_curvature > 0.0 {
                 self.rho_steps += 1;
                 let w = (1.0 / self.rho_steps as f64).max(1.0 - ivon.beta2);
-                self.rho += w * (draw_curvature / diagonal - self.rho);
                 self.log_rho += w * ((draw_curvature / diagonal).ln() - self.log_rho);
+                self.rho = (self.log_rho - LOG_CHI2_1).exp();
             }
             if own > 0.0 && own.is_finite() && fresh.is_finite() {
                 self.slope_steps += 1;
