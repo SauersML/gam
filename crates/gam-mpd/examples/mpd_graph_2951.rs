@@ -1,7 +1,8 @@
 //! The graph oracle's checker as a JSON-lines server (#2951): one request per stdin line, one JSON
 //! answer per stdout line.
 //!
-//! * `{"op": "load", "export": DIR}`: the native model of an export (`import::import_language_model`),
+//! * `{"op": "load", "export": DIR, "vpd": DIR?, "transcoders": DIR?}`: the native model of an export
+//!   (`import::import_language_model`), with VPD's or the transcoders' view attached when named;
 //!   its weights taken from the start library (`library_mdl::explanation`, equal to `M`).
 //! * `{"op": "behavior", "path": FILE}` or `{"op": "behavior", "behavior": {...}}`: a behavior file
 //!   (design.txt section 5); measures its stand-in averages on `M`. With `"manifest": FILE` (an
@@ -210,7 +211,18 @@ fn handle(request: &Value, weights: &mut Option<Weights>, checker: &mut Option<C
             let path = request["export"].as_str().ok_or("export")?;
             *checker = None;
             *export = Some(path.into());
-            let w = load(Path::new(path))?;
+            let mut w = load(Path::new(path))?;
+            // Decomposition views, attached when named: "vpd": VPD's decomposition export (its MLP and
+            // attention subcomponents, `Weights::attach_vpd`), "transcoders": a directory of
+            // layer_{l}.safetensors (`Weights::attach_transcoders`). Pieces of a view that is not
+            // attached do not resolve.
+            let mut views = serde_json::Map::new();
+            if let Some(dir) = request["vpd"].as_str() {
+                views.insert("vpd".into(), json!(w.attach_vpd(Path::new(dir))?));
+            }
+            if let Some(dir) = request["transcoders"].as_str() {
+                views.insert("transcoders".into(), json!(w.attach_transcoders(Path::new(dir))?));
+            }
             // "device": "gpu" runs the executor's large products on the single-precision device
             // (Metal on the Mac, CUDA elsewhere) for the rest of the process.
             let device = match request["device"].as_str() {
@@ -220,7 +232,7 @@ fn handle(request: &Value, weights: &mut Option<Weights>, checker: &mut Option<C
                 }
                 _ => false,
             };
-            let answer = json!({"ok": true, "device": device, "layers": w.layers.len(), "heads": w.layers.first().map_or(0, |l| l.heads.len()), "neurons": w.layers.first().and_then(|l| l.mlp.as_ref()).map_or(0, |m| m.gate.nrows()), "vocabulary": w.embedding.nrows(), "width": w.embedding.ncols()});
+            let answer = json!({"ok": true, "device": device, "views": views, "layers": w.layers.len(), "heads": w.layers.first().map_or(0, |l| l.heads.len()), "neurons": w.layers.first().and_then(|l| l.mlp.as_ref()).map_or(0, |m| m.gate.nrows()), "vocabulary": w.embedding.nrows(), "width": w.embedding.ncols()});
             *weights = Some(w);
             Ok(answer)
         }
