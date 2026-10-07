@@ -2,8 +2,9 @@
 
 usage: ~/mpd-data/venv/bin/python bench/toys_2951/gate_settings.py TOY_DIR START_DIR ARM BUDGET EPOCHS OUT.json
 
-ARM is one of toy_start.py's arms (per_slice_own, grouped_own, grouped_direction) or of a frame
-start's (frame_own, frame_direction; START_DIR one of frame-start's tight/ or dictionary/). BUDGET is
+START_DIR is one of the driver's frame-start directories (tight/, dictionary/, heads_neurons/:
+the decomposition and start.json side by side), ARM one of its arms (frame_own, frame_direction;
+per_slice_own, grouped_own, grouped_direction for heads_neurons/). BUDGET is
 `true` (the per-token budget K at the toy's true count) or `none` (no budget, K = infinity). The
 true count is, per held-out token, the rank-one slices the known mechanisms active there span
 (each mechanism's numerical rank on every operator it spans), averaged, plus the start's zero
@@ -23,9 +24,7 @@ import numpy as np
 def main():
     toy, start, arm, budget, epochs, out = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3], sys.argv[4], int(sys.argv[5]), Path(sys.argv[6])
     record = json.loads((toy / "export.json").read_text())
-    # a start directory holds its decomposition in decomposition/ (toy_start.py) or is one
-    # (library_frame's frame-start: export.json and start.json side by side)
-    decomposition_dir = start / "decomposition" if (start / "decomposition").exists() else start
+    decomposition_dir = start
     truth = json.loads((toy / "truth.json").read_text())
     rows, context = record["files"]["tokens"]["shape"]
     held = truth["active"]["shape"][0] // context
