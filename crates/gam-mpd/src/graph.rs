@@ -1134,13 +1134,16 @@ pub struct Execution {
     pub writes: Vec<Option<Array2<f64>>>,
     /// Per (unit, route slot) its normed input, at the sites `Interventions::record` lists.
     pub normed: BTreeMap<(usize, usize), Array2<f64>>,
+    /// Per VPD-view attention unit its heads' reads `z` (rows × heads' value widths), at the sites
+    /// `Interventions::record_reads` lists.
+    pub reads: BTreeMap<usize, Array2<f64>>,
     captured: Option<Reference>,
 }
 
 impl Execution {
     /// A run's outcome from the device path (`graph_device`).
     pub(crate) fn of(log_probabilities: Array2<f64>, writes: Vec<Option<Array2<f64>>>, captured: Option<Reference>, normed: BTreeMap<(usize, usize), Array2<f64>>) -> Self {
-        Self { log_probabilities, writes, normed, captured }
+        Self { log_probabilities, writes, normed, reads: BTreeMap::new(), captured }
     }
 
     /// The run's capture ([`Reference`]), when it made one.
@@ -1321,6 +1324,7 @@ fn run(weights: &Weights, circuit: &Circuit, batch: &Batch, scored: &[usize], sw
         factors: vec![None; units + 1],
     };
     let mut normed_kept = BTreeMap::new();
+    let mut reads_kept = BTreeMap::new();
     let input = |incoming: &Incoming, st: &Streams| -> Array2<f64> {
         match incoming {
             Incoming::AllBut(cut) => {
@@ -1479,6 +1483,7 @@ fn run(weights: &Weights, circuit: &Circuit, batch: &Batch, scored: &[usize], sw
                     }
                     (qc, kc, vc) = (qc + qw, kc + kw, vc + vw);
                 }
+                ops.head_reads_of(site, u, lw, &mut z, &mut reads_kept);
                 slice_writes.insert(u, sliced(&vpd.o, &maps[3], o, *rest, &z));
             }
         }
@@ -1548,7 +1553,7 @@ fn run(weights: &Weights, circuit: &Circuit, batch: &Batch, scored: &[usize], sw
     }
     let last = input(&circuit.logits, &st).select(Axis(0), scored);
     let log_probabilities = log_probabilities(weights, &last)?;
-    Ok(Execution { log_probabilities, writes: st.writes, normed: normed_kept, captured })
+    Ok(Execution { log_probabilities, writes: st.writes, normed: normed_kept, reads: reads_kept, captured })
 }
 
 /// `a · b`, row blocks of `a` on parallel threads when called outside rayon's pool (a run the
@@ -2191,15 +2196,13 @@ impl Weights {
 }
 
 /// What a score's runs need ([`Checker::measure_runs`]): the runs (program, experiment, `M`'s cache
-/// key), the runs grouped by weight edit, each program parsed with its circuit and `M`'s circuit on
-/// its units, the behavior's size, the reader's candidate count and `M`'s clean outcome.
+/// key), the runs grouped by weight edit, each program parsed with its circuit, the behavior's size, the reader's candidate count and `M`'s clean outcome.
 #[derive(Clone, Copy)]
 struct Plan<'a> {
     runs: &'a [(usize, Experiment, String)],
     groups: &'a BTreeMap<Option<String>, Vec<usize>>,
     parsed: &'a [(Graph, bool, Option<String>)],
     circuits: &'a [Circuit],
-    models: &'a [Circuit],
     n: f64,
     top: usize,
     clean: Option<&'a Array2<f64>>,
@@ -2307,6 +2310,7 @@ pub struct Donor {
     pub(crate) embed: Array2<f64>,
     pub(crate) writes: Vec<Option<Array2<f64>>>,
     pub(crate) normed: BTreeMap<(usize, usize), Array2<f64>>,
+    pub(crate) reads: BTreeMap<usize, Array2<f64>>,
 }
 
 /// Row interventions of one run: site operations (`interchange::SiteOp`) resolved against a
@@ -2326,6 +2330,20 @@ pub struct Interventions {
     pub(crate) donor: Option<Donor>,
     /// Sites whose units' normed inputs a run keeps (`Execution::normed`).
     pub(crate) record: BTreeSet<usize>,
+    /// Operations on a head of a VPD-view attention, where no unit is the head alone: they act on
+    /// the head's read `z_h` before `o_proj` (site, head in its layer, operation, rows), which for a
+    /// native head is the same as acting on its write.
+    pub(crate) head_reads: Vec<(usize, usize, HeadRead, Vec<usize>)>,
+    /// Sites whose VPD-view attention units' reads a run keeps (`Execution::reads`).
+    pub(crate) record_reads: BTreeSet<usize>,
+}
+
+/// What a site operation does to a head's read in a VPD-view attention ([`Interventions`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum HeadRead {
+    Scale(f64),
+    /// The read at the rows replaced by the same unit's on the donor.
+    Swap,
 }
 
 impl Interventions {
@@ -2429,6 +2447,44 @@ impl Interventions {
         }
     }
 
+    /// Unit `u`'s heads' reads `z` at `site` under the head operations there (a head's columns
+    /// scaled, or taken from the same unit's reads on the donor), kept in `kept` when the site is
+    /// recorded.
+    fn head_reads_of(&self, site: usize, u: usize, layer: &LayerWeights, z: &mut Array2<f64>, kept: &mut BTreeMap<usize, Array2<f64>>) {
+        for (_, h, read, rows) in self.head_reads.iter().filter(|(s, ..)| *s == site) {
+            let from: usize = layer.heads.iter().take(*h).map(|w| w.value.nrows()).sum();
+            let cols = from..from + layer.heads.get(*h).map_or(0, |w| w.value.nrows());
+            match read {
+                HeadRead::Scale(f) => rows.iter().for_each(|&r| z.slice_mut(s![r, cols.clone()]).mapv_inplace(|v| v * f)),
+                HeadRead::Swap => {
+                    if let Some(donor) = self.donor.as_ref().and_then(|d| d.reads.get(&u)) {
+                        rows.iter().for_each(|&r| z.slice_mut(s![r, cols.clone()]).assign(&donor.slice(s![r, cols.clone()])));
+                    }
+                }
+            }
+        }
+        if self.record_reads.contains(&site) {
+            kept.insert(u, z.clone());
+        }
+    }
+
+    /// The counterfactual run with a VPD-view attention's head scalings applied to its recorded
+    /// reads, so undeclared units' stand-ins scale with the head as `M`'s run does.
+    pub(crate) fn scaled_reference(&self, reference: &Reference) -> Option<Reference> {
+        let scalings: Vec<&(usize, usize, HeadRead, Vec<usize>)> = self.head_reads.iter().filter(|(_, _, r, _)| matches!(r, HeadRead::Scale(_))).collect();
+        if scalings.is_empty() {
+            return None;
+        }
+        let mut out = reference.clone();
+        for (site, h, read, rows) in scalings {
+            if let (HeadRead::Scale(f), Some(z)) = (read, out.reads.get_mut(site / 2).and_then(|l| l.get_mut(*h))) {
+                let n = z.nrows();
+                rows.iter().filter(|&&r| r < n).for_each(|&r| z.row_mut(r).mapv_inplace(|v| v * f));
+            }
+        }
+        Some(out)
+    }
+
     /// Whether the operations read a donor run (swaps and cuts).
     pub fn needs_donor(draw: &SiteDraw) -> bool {
         draw.ops.iter().any(|o| matches!(o.operation, Operation::Swap | Operation::Cut { .. }))
@@ -2454,7 +2510,7 @@ impl Interventions {
         let mut out = Self::default();
         if let (Some(run), Some(b)) = (donor, donor_batch) {
             let tokens: Vec<usize> = b.tokens.iter().map(|t| *t as usize).collect();
-            out.donor = Some(Donor { embed: weights.embedding.select(Axis(0), &tokens), writes: run.writes.clone(), normed: run.normed.clone() });
+            out.donor = Some(Donor { embed: weights.embedding.select(Axis(0), &tokens), writes: run.writes.clone(), normed: run.normed.clone(), reads: run.reads.clone() });
         }
         let heads_at = |pred: &dyn Fn(&Block) -> bool| -> Vec<Writer> { circuit.units.iter().enumerate().filter(|(_, u)| pred(&u.block)).map(|(i, _)| Writer::Unit(i)).collect() };
         for op in &draw.ops {
@@ -2464,8 +2520,9 @@ impl Interventions {
                     let (l, hh) = head_of(weights, h)?;
                     (Some(2 * l), heads_at(&|b| matches!(b, Block::Heads { layer, heads } if *layer == l && heads.as_slice() == [hh])))
                 }
-                SharedSite::Attention(l) => (Some(2 * l), heads_at(&|b| matches!(b, Block::Heads { layer, .. } if *layer == l))),
-                SharedSite::Mlp(l) => (Some(2 * l + 1), heads_at(&|b| matches!(b, Block::Neurons { layer, .. } if *layer == l))),
+                // Every unit writing at the site, whatever its view.
+                SharedSite::Attention(l) => (Some(2 * l), heads_at(&|b| b.site() == 2 * l && b.writes_residual())),
+                SharedSite::Mlp(l) => (Some(2 * l + 1), heads_at(&|b| b.site() == 2 * l + 1 && b.writes_residual())),
                 SharedSite::Embedding => (None, vec![Writer::Embed]),
                 SharedSite::Stream(b) => (Some(b), [Writer::Embed].into_iter().chain(heads_at(&|x| x.site() <= b)).collect()),
                 SharedSite::Input(_) => (None, Vec::new()),
@@ -2473,7 +2530,21 @@ impl Interventions {
             if let SharedSite::Head(h) = op.site
                 && writers.len() != 1
             {
-                return Err(format!("head {h} is not its own unit (split the circuit first)"));
+                let (l, hh) = head_of(weights, h)?;
+                let vpd_view = circuit.units.iter().any(|u| matches!(u.block, Block::AttnSlices { layer, .. } if layer == l));
+                if !vpd_view {
+                    return Err(format!("head {h} is not its own unit (split the circuit first)"));
+                }
+                let read = match op.operation {
+                    Operation::Scale(i) => HeadRead::Scale(interchange::SCALES.get(i).copied().ok_or_else(|| format!("no scale {i}"))?),
+                    Operation::Swap => HeadRead::Swap,
+                    other => return Err(format!("{other:?} on head {h} of a VPD-view attention")),
+                };
+                if matches!(read, HeadRead::Swap) && out.donor.is_none() {
+                    return Err("swaps and cuts need a donor run".into());
+                }
+                out.head_reads.push((2 * l, hh, read, rows));
+                continue;
             }
             if point.is_some_and(|p| p >= blocks) {
                 return Err(format!("{:?} past the last block", op.site));
@@ -2528,11 +2599,20 @@ pub fn run_sites(weights: &Weights, circuit: &Circuit, base: (&Batch, &[usize]),
     let heads: BTreeSet<(usize, usize)> = draw.ops.iter().filter_map(|o| if let SharedSite::Head(h) = o.site { head_of(weights, h).ok() } else { None }).collect();
     let circuit = circuit.split_heads(&heads);
     let donor_run = match donor {
-        Some(b) if Interventions::needs_donor(draw) => Some(execute_with(weights, &circuit, b, &[], &BTreeMap::new(), &Interventions::recording(Interventions::donor_record(draw, weights)))?),
+        Some(b) if Interventions::needs_donor(draw) => {
+            let record_reads = draw.ops.iter().filter(|o| o.operation == Operation::Swap).filter_map(|o| if let SharedSite::Head(h) = o.site { head_of(weights, h).ok().map(|(l, _)| 2 * l) } else { None }).collect();
+            let recording = Interventions { record_reads, ..Interventions::recording(Interventions::donor_record(draw, weights)) };
+            Some(execute_with(weights, &circuit, b, &[], &BTreeMap::new(), &recording)?)
+        }
         _ => None,
     };
     let ops = Interventions::resolve(draw, &circuit, weights, base.0, units, donor_run.as_ref(), donor)?;
-    Ok(execute_with(weights, &circuit, base.0, base.1, &BTreeMap::new(), &ops)?.log_probabilities)
+    let scaled = base.0.reference.as_deref().and_then(|r| ops.scaled_reference(r));
+    let mut batch = base.0.clone();
+    if let Some(r) = scaled {
+        batch.reference = Some(std::sync::Arc::new(r));
+    }
+    Ok(execute_with(weights, &circuit, &batch, base.1, &BTreeMap::new(), &ops)?.log_probabilities)
 }
 
 /// Head `h` numbered layer by layer (`SharedSite::Head`) as (layer, head).
@@ -3263,7 +3343,6 @@ impl Checker {
             self.weights.load_features(g)?;
         }
         let circuits: Vec<Circuit> = parsed.iter().map(|(g, _, _)| g.program(&self.weights, edges)).collect();
-        let models: Vec<Circuit> = parsed.iter().map(|(g, _, _)| g.model(&self.weights)).collect();
         // One experiment set for every program (design.txt section 2), drawn from the seed alone;
         // site operations that read a donor are left out when the behavior has none.
         let donors = self.counterfactual_donors() || !self.donors.is_empty();
@@ -3294,7 +3373,7 @@ impl Checker {
         // Counterfactual runs made for this score stay until it ends (a later run under quantized
         // weights must find them, never remake them).
         let budget = std::mem::replace(&mut self.reference_bytes, usize::MAX);
-        let plan = Plan { runs: &runs, groups: &groups, parsed: &parsed, circuits: &circuits, models: &models, n, top, clean: clean.as_ref() };
+        let plan = Plan { runs: &runs, groups: &groups, parsed: &parsed, circuits: &circuits, n, top, clean: clean.as_ref() };
         let result = self.measure_runs(plan, &mut measured);
         self.reference_bytes = budget;
         let widths = result?;
@@ -3348,7 +3427,9 @@ impl Checker {
     /// blocks quantized to their widths ([`Checker::width`]), experiments grouped by weight edit
     /// (the edit applied once on top), runs in parallel threads. Returns each program's widths.
     fn measure_runs(&mut self, plan: Plan, measured: &mut [Option<(Vec<f64>, Option<Candidates>)>]) -> Result<Vec<Vec<Width>>, String> {
-        let Plan { runs, groups, parsed, circuits, models, n, top, clean } = plan;
+        let Plan { runs, groups, parsed, circuits, n, top, clean } = plan;
+        // M's outcomes come from its native circuit, the same for every program whatever its views.
+        let native = Graph::empty().model(&self.weights);
         // M's outcomes of this score, held until it ends: the cache's byte budget may drop some
         // while later groups add theirs.
         let mut outcomes: BTreeMap<String, Arc<Array2<f64>>> = BTreeMap::new();
@@ -3368,7 +3449,7 @@ impl Checker {
                 let this = &*self;
                 // Each outcome with whether it is new to the cache.
                 let compute = |&r: &usize| -> Result<(String, Arc<Array2<f64>>, bool), String> {
-                    let (i, e, key) = &runs[r];
+                    let (_, e, key) = &runs[r];
                     this.prewarm(e)?;
                     if let Some(m) = this.cache.get(key) {
                         return Ok((key.clone(), m.clone(), false));
@@ -3376,7 +3457,7 @@ impl Checker {
                     if let Some(m) = this.disk_get(key) {
                         return Ok((key.clone(), Arc::new(m), true));
                     }
-                    let m = this.run(&models[*i], e)?;
+                    let m = this.run(&native, e)?;
                     this.disk_put(key, &m);
                     Ok((key.clone(), Arc::new(m), true))
                 };

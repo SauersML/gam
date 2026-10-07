@@ -10,7 +10,7 @@ use crate::{
     test_support::tiny_export,
 };
 use gam_gpu::tensor::Device;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 const LAYERS: usize = 2;
 
@@ -560,7 +560,7 @@ fn device_site_operations_on_the_host_backend_are_the_host_run() {
         let recording = Interventions { record: (0..4).collect(), ..Interventions::default() };
         let donor_run = execute_with(&weights, &circuit, &donor_batch, &[], &BTreeMap::new(), &recording).expect("donor run");
         let embed = weights.embedding.select(ndarray::Axis(0), &cf_batch.tokens.iter().map(|t| *t as usize).collect::<Vec<_>>());
-        let donor = Donor { embed, writes: donor_run.writes.clone(), normed: donor_run.normed.clone() };
+        let donor = Donor { embed, writes: donor_run.writes.clone(), normed: donor_run.normed.clone(), reads: BTreeMap::new() };
         let push = ndarray::Array1::from_shape_fn(weights.width(), |c| 0.3 * (c as f64 + 1.0).sin());
         let ops = Interventions {
             after: vec![
@@ -573,6 +573,8 @@ fn device_site_operations_on_the_host_backend_are_the_host_run() {
             cuts: vec![(3, vec![Writer::Embed, Writer::Unit(0)], vec![7, 50])],
             donor: Some(donor),
             record: [2].into_iter().collect(),
+            head_reads: Vec::new(),
+            record_reads: BTreeSet::new(),
         };
         let host = execute_with(&weights, &circuit, &batch, &rows, &BTreeMap::new(), &ops).expect("host");
         let reference = if circuit.is_model() { None } else { batch.reference.as_deref() };

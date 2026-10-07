@@ -493,3 +493,33 @@ fn a_tiny_cache_still_scores() {
     let (b, _) = large.score(&empty, 12, 2, true, None).expect("large cache");
     assert_eq!(a.exec_error_bits, b.exec_error_bits);
 }
+
+/// A head's site operation on a program whose attention is in VPD's view acts on the head's read
+/// before o_proj: it runs (there is no unit of that head alone), and zeroing the head changes the
+/// program's outcome.
+#[test]
+fn head_operations_reach_a_vpd_view_attention() {
+    let mut s = setup("graph_sites_vpd_heads");
+    let heads = s.weights.layers[0].heads.len();
+    let (dh, width) = s.weights.layers[0].heads[0].query.dim();
+    let wave = |rows: usize, cols: usize, phase: f64| Array2::from_shape_fn((rows, cols), |(i, j)| 0.1 * ((i * 5 + j * 3) as f64 + phase).cos());
+    let qkv = (wave(3, heads * dh, 0.2), wave(width, 3, 0.9));
+    s.weights.vpd_attention.insert(0, crate::graph::VpdAttention { q: qkv.clone(), k: qkv.clone(), v: qkv, o: (wave(3, width, 1.3), wave(heads * dh, 3, 0.4)) });
+    let mut program = Program { model: "tiny".into(), valid: true, ..Program::default() };
+    program.nodes = vec![NodeIr { id: "o".into(), pieces: vec![PieceIr { view: "vpd".into(), layer: 0, kind: "o_proj".into(), index: Some(crate::graph::Index::One(0)) }], rule: None }];
+    program.edges = vec![EdgeIr { from: "o".into(), to: "logits".into(), route: "input".into() }];
+    let graph = Graph::parse(&program, &s.weights).expect("parse");
+    let circuit = graph.program(&s.weights, true);
+    // The donor (the counterfactual) takes its stand-ins from the prompts.
+    let mut donor = s.donor.clone();
+    donor.reference = Some(std::sync::Arc::new(reference(&s.weights, &s.base).expect("reference")));
+    let run = |d: &SiteDraw| {
+        let mut base = Batch::new(&s.base.sequences()).expect("batch");
+        base.reference = Some(std::sync::Arc::new(reference_under(&s.weights, &s.donor, d, &s.units).expect("reference")));
+        run_sites(&s.weights, &circuit, (&base, &s.rows), Some(&donor), d, &s.units).expect("site run")
+    };
+    let zero = run(&draw(Family::Zero, &[(SharedSite::Head(1), Operation::Scale(0))], 0, true));
+    let push = run(&draw(Family::Push, &[(SharedSite::Stream(0), Operation::Push { direction: 0, size: 0 })], 0, true));
+    let swap = run(&draw(Family::Swap, &[(SharedSite::Head(0), Operation::Swap)], 3, true));
+    assert!(max(&kl_bits(&zero, &push)) > 1e-9 && zero.iter().chain(swap.iter()).all(|v| v.is_finite() || *v == f64::NEG_INFINITY));
+}
