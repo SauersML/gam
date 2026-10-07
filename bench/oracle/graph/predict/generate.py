@@ -17,11 +17,11 @@ logits) inside three question verbs, scale / cut / swap. Pieces of Qwen3-0.6B (n
   a = 0 removes the piece. A weight edit acts at every position (and every generated step).
   cut(node(A) >> node(B).route)
                         path patching: B's read (route query, key or value of a head, input of an MLP,
-                        or logits = the final residual) receives A's STAND-IN write in place of its
-                        actual write, as an undeclared edge in graph.rs: A applied to its average input
-                        over the batch's texts, every token (a head: W_O of its average attention read;
-                        an MLP: the MLP on its average normed input); every other reader keeps A's
-                        actual write.
+                        or logits = the final residual) receives A's write on the text's counterfactual
+                        x' (given in the question) in place of its write on x, as an undeclared edge in
+                        graph.rs (counterfactual stand-ins); every other reader keeps A's actual write.
+                        x' is the behavior's own minimal edit, or for plain text one token replaced
+                        (the same x' the prompt question asks about).
   swap(P, source)       P's value at the last position (a head's z_h, or the neurons' activations) is the
                         value P computes at the last position of the source text.
 
@@ -167,10 +167,11 @@ class Qwen3:
         return F.scaled_dot_product_attention(q, k, v, is_causal=True).transpose(1, 2)  # [B, T, H, hd]
 
     @torch.no_grad()
-    def forward(self, tokens: torch.Tensor, iv: Interventions | None = None, record: dict | None = None, means: dict | None = None):
+    def forward(self, tokens: torch.Tensor, iv: Interventions | None = None, record: dict | None = None, cf: dict | None = None):
         """The final normed stream at the last position [B, d]. `record` (optional dict) receives the clean
-        statistics: z and activations at the last position, the mean z per head and mean MLP output per
-        layer over positions 1.., head write norms and activations of probes ("probes": row -> (l, h or -1, i))."""
+        statistics: z and activations at the last position, probes' activities ("probes": row -> (l, h or -1, i)),
+        attention weights ("attend"), and the writes of the cut writers asked for ("write_requests": row ->
+        (kind, layer, head)) for a run on the counterfactual x'. `cf` holds those writes for a cut run on x."""
         B, T = tokens.shape
         h = self.inner.embed_tokens(tokens)
         pos = torch.arange(T, device=self.dev)[None]
@@ -179,9 +180,7 @@ class Qwen3:
         if record is not None:
             record.update(z_last=torch.empty(B, self.L, self.H, self.hd, device=self.dev, dtype=self.dtype),
                           act_last=torch.empty(B, self.L, self.Fn, device=self.dev, dtype=self.dtype),
-                          mean_z=torch.empty(self.L, self.H, self.hd, device=self.dev, dtype=self.dtype),
-                          mean_mlp=torch.empty(self.L, self.d, device=self.dev, dtype=self.dtype),
-                          mean_attn=torch.empty(self.L, self.d, device=self.dev, dtype=self.dtype), probe_values={})
+                          probe_values={}, writes={})
         for l, layer in enumerate(self.layers):
             x = layer.input_layernorm(h)
             q, k, v = self.qkv(layer, x, cos, sin)
@@ -217,26 +216,26 @@ class Qwen3:
                 z = z * iv.head[:, l][:, None, :, None]
             if record is not None:
                 record["z_last"][:, l] = z[:, -1]
-                record["mean_z"][l] = z.mean(dim=(0, 1))  # a head's stand-in read (graph.rs: every token)
                 for r, (pl, ph, pi) in record.get("probes", {}).items():
                     if pl == l and ph >= 0:
                         record["probe_values"][r] = torch.linalg.vector_norm(z[r, :, ph] @ self.Wo[l][:, ph].T, dim=-1)
             attn_out = layer.self_attn.o_proj(z.reshape(B, T, self.H * self.hd))
-            if iv is not None:
-                Ra = [r for r, c in iv.cuts.items() if c[1] == l and c[0] == "head"]
-                if Ra:
-                    rt = torch.tensor(Ra, device=self.dev)
-                    ah = torch.tensor([iv.cuts[r][2] for r in Ra], device=self.dev)
-                    Wsel = self.Wo[l][:, ah]  # [d, n, hd]
-                    write = torch.einsum("ntk,dnk->ntd", z[rt, :, ah], Wsel)
-                    mean = torch.einsum("nk,dnk->nd", means["mean_z"][l, ah], Wsel)
-                    for i, r in enumerate(Ra):
-                        cut_delta[r] = mean[i][None] - write[i]
-                for r, c in iv.cuts.items():
-                    if c[1] == l and c[0] == "attn":
-                        cut_delta[r] = means["mean_attn"][l][None] - attn_out[r]
+            # Cut writers among this layer's heads and attention: the write on x' (the counterfactual run's,
+            # cf["writes"]) minus the actual write, added to the cut reader's input only. A run on x' records
+            # the writes asked for in record["write_requests"].
+            wanted = dict(iv.cuts) if iv is not None else {}
             if record is not None:
-                record["mean_attn"][l] = attn_out.mean(dim=(0, 1))
+                wanted.update({r: (ak, al, ah, None, None, None, None) for r, (ak, al, ah) in record.get("write_requests", {}).items()})
+            Ra = [r for r, c in wanted.items() if c[1] == l and c[0] == "head"]
+            if Ra:
+                rt = torch.tensor(Ra, device=self.dev)
+                ah = torch.tensor([wanted[r][2] for r in Ra], device=self.dev)
+                write = torch.einsum("ntk,dnk->ntd", z[rt, :, ah], self.Wo[l][:, ah])
+                for i, r in enumerate(Ra):
+                    self._writer(r, write[i], iv, record, cf, cut_delta)
+            for r, c in wanted.items():
+                if c[1] == l and c[0] == "attn":
+                    self._writer(r, attn_out[r], iv, record, cf, cut_delta)
             mid = h + attn_out
             y = layer.post_attention_layernorm(mid)
             if iv is not None:
@@ -278,14 +277,9 @@ class Qwen3:
                     if tl == l:
                         a = self.tc_acts(l, y[r, -1], idx)
                         mlp_out[r, -1] += (values - a) @ self.tc[l]["W_dec"][idx].to(self.dtype)
-            if record is not None:
-                # The MLP's stand-in write (graph.rs): the MLP applied to its average normed input.
-                yb = y.mean(dim=(0, 1))
-                record["mean_mlp"][l] = mlp.down_proj(mlp.act_fn(mlp.gate_proj(yb)) * mlp.up_proj(yb))
-            if iv is not None:
-                for r, (ak, al, ah, bk, bl, bh, route) in iv.cuts.items():
-                    if al == l and ak == "mlp":
-                        cut_delta[r] = means["mean_mlp"][l][None] - mlp_out[r]
+            for r, c in wanted.items():
+                if c[1] == l and c[0] == "mlp":
+                    self._writer(r, mlp_out[r], iv, record, cf, cut_delta)
             h = mid + mlp_out
         if iv is not None:
             for r, (ak, al, ah, bk, bl, bh, route) in iv.cuts.items():
@@ -293,6 +287,15 @@ class Qwen3:
                     h = h.clone()
                     h[r] = h[r] + cut_delta[r]
         return self.inner.norm(h[:, -1])
+
+    @staticmethod
+    def _writer(r, write, iv, record, cf, cut_delta):
+        """A cut writer's write on this run: recorded (a run on x'), or turned into the cut reader's input
+        change, write(x') - write(x) (a cut run on x)."""
+        if record is not None and r in record.get("write_requests", {}):
+            record["writes"][r] = write
+        if iv is not None and r in iv.cuts:
+            cut_delta[r] = cf["writes"][r] - write
 
     def log_probs(self, final: torch.Tensor) -> torch.Tensor:
         return torch.log_softmax(self.model.lm_head(final).to(self.wide), dim=-1)
@@ -530,12 +533,33 @@ def batch_questions(m: Qwen3, w: Writer, draw: Draw, tokens: torch.Tensor, sourc
     clean_txt = [w.dist(lp_clean[r]) for r in rows]
     texts = [w.text(tokens[r].tolist()) for r in rows]
 
+    # The counterfactual of each text, x': the behavior's own minimal edit, or one token replaced by a token
+    # of another text in the batch. Prompt questions ask about it; cut questions take the writer's value on it.
+    toks2 = tokens.clone()
+    cf_desc, cf_extra = [], []
+    for r in rows:
+        cf = counterfactuals[r] if counterfactuals else None
+        if cf is not None:
+            toks2[r] = torch.tensor(cf, device=tokens.device)
+            changed = [i for i in range(T) if int(tokens[r, i]) != cf[i]]
+            edits = ", ".join(f"position {i}: {w.token(int(tokens[r, i]))} -> {w.token(cf[i])}" for i in changed)
+            cf_desc.append(f"<text> {texts[r]}\n<edit> {edits}\n<edited_text> {w.text(cf)}\n")
+            cf_extra.append({"positions": changed, "counterfactual": cf})
+            continue
+        # Half the edits among the last 4 tokens, where they usually move the next-token distribution.
+        p = int(rng.integers(max(1, T - 4), T)) if rng.random() < 0.5 else int(rng.integers(1, T))
+        new = int(tokens[(r + 1 + int(rng.integers(B - 1))) % B, int(rng.integers(T))].item()) if B > 1 else int(rng.integers(1000))
+        old = int(tokens[r, p].item())
+        toks2[r, p] = new
+        cf_desc.append(f"<text> {texts[r]}\n<edit> position {p}: {w.token(old)} -> {w.token(new)}\n<edited_text> {w.text(toks2[r].tolist())}\n")
+        cf_extra.append({"position": p, "old": old, "new": new})
+
     # plain (no piece: not asked in held-out-piece shards, nor prompt edits)
     for r in rows if draw.split == "train" else []:
         emit(r, "plain", f"<text> {texts[r]}\n<question> next-token distribution\n", clean_txt[r][0], {"edited": clean_txt[r][1]})
 
-    def edited_questions(kind, iv, describe, extra=None, toks=None):
-        lp = m.log_probs(m.forward(tokens if toks is None else toks, iv, None, rec))
+    def edited_questions(kind, iv, describe, extra=None, toks=None, cf=None):
+        lp = m.log_probs(m.forward(tokens if toks is None else toks, iv, None, cf))
         kl = kl_bits(lp_clean, lp)
         for r in rows:
             d, nums = w.dist(lp[r])
@@ -629,31 +653,16 @@ def batch_questions(m: Qwen3, w: Writer, draw: Draw, tokens: torch.Tensor, sourc
         iv.cuts[r] = (ak, al, ah, bk, bl, bh, route)
         a_txt = "node(" + piece_text(("head", al, ah) if ak == "head" else (ak, al)) + ")"
         b_txt = {"logits": "logits", "mlp": f"node(L[{bl}].mlp[:]).input", "head": f"node(L[{bl}].head[{bh}]).{route}"}[bk]
-        desc.append(f"<intervention> cut({a_txt} >> {b_txt})\n")
-        extra.append({"edge": f"{a_txt} >> {b_txt}"})
-    edited_questions("cut", iv, desc, extra)
+        desc.append(f"<counterfactual> {w.text(toks2[r].tolist())}\n<intervention> cut({a_txt} >> {b_txt})\n")
+        extra.append({"edge": f"{a_txt} >> {b_txt}", "cut": "counterfactual"})
+    # The writers' values on x' (graph.rs's counterfactual stand-in: an undeclared edge delivers the writer's value on x').
+    rec_cf = {"write_requests": {r: c[:3] for r, c in iv.cuts.items()}}
+    m.forward(toks2, None, rec_cf)
+    edited_questions("cut", iv, desc, extra, cf=rec_cf)
 
-    # prompt edit: one token replaced by a token of another text in the batch
-    toks2 = tokens.clone()
-    desc, extra = [], []
-    for r in rows:
-        cf = counterfactuals[r] if counterfactuals else None
-        if cf is not None:
-            toks2[r] = torch.tensor(cf, device=tokens.device)
-            changed = [i for i in range(T) if int(tokens[r, i]) != cf[i]]
-            edits = ", ".join(f"position {i}: {w.token(int(tokens[r, i]))} -> {w.token(cf[i])}" for i in changed)
-            desc.append(f"<text> {texts[r]}\n<edit> {edits}\n<edited_text> {w.text(cf)}\n")
-            extra.append({"positions": changed, "counterfactual": cf})
-            continue
-        p = int(rng.integers(1, T))
-        new = int(tokens[(r + 1 + int(rng.integers(B - 1))) % B, int(rng.integers(T))].item()) if B > 1 else int(rng.integers(1000))
-        old = int(tokens[r, p].item())
-        toks2[r, p] = new
-        desc.append(f"<text> {texts[r]}\n<edit> position {p}: {w.token(old)} -> {w.token(new)}\n<edited_text> {w.text(toks2[r].tolist())}\n")
-        extra.append({"position": p, "old": old, "new": new})
-    prompt_desc = desc
+    prompt_desc = cf_desc
     if draw.split == "train":  # no piece: not asked in held-out-piece shards
-        edited_questions("prompt", None, desc, extra, toks=toks2)
+        edited_questions("prompt", None, cf_desc, cf_extra, toks=toks2)
 
     # carry: which of 4 pieces' removal shrinks the prompt edit's effect most (a crossed intervention: the
     # edit's KL with every piece in place, against its KL with the piece removed, both texts edited alike)

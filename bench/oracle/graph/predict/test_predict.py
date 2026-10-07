@@ -232,3 +232,18 @@ def test_vpd_subcomponents_are_the_engines():
             if name.endswith(".U"):
                 layer, site = int(name.split(".")[1]), name.split(".")[3]
                 assert shapes[layer][site] == a.shape[0], name
+
+
+def test_cut_with_the_text_as_its_own_counterfactual_changes_nothing(qwen):
+    """A cut delivers the writer's value on x'; with x' = x the run is the clean run."""
+    t = torch.cat([tokens(), tokens().flip(1)])
+    clean = qwen.log_probs(qwen.forward(t))
+    iv = qwen.new(2)
+    iv.cuts = {0: ("head", 3, 5, "head", 6, 2, "key"), 1: ("mlp", 4, -1, "logits", 28, -1, "")}
+    rec_cf = {"write_requests": {r: c[:3] for r, c in iv.cuts.items()}}
+    qwen.forward(t, None, rec_cf)
+    assert (qwen.log_probs(qwen.forward(t, iv, None, rec_cf)) - clean).abs().max().item() < 1e-5
+    other = t.flip(0)  # a different x' moves the prediction
+    rec_cf = {"write_requests": {r: c[:3] for r, c in iv.cuts.items()}}
+    qwen.forward(other, None, rec_cf)
+    assert (qwen.log_probs(qwen.forward(t, iv, None, rec_cf)) - clean).abs().max().item() > 1e-4

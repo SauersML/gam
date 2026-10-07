@@ -95,17 +95,20 @@ class Vpd4l:
         return self.t._rope(q, T), self.t._rope(k, T), v
 
     @torch.no_grad()
-    def forward(self, tokens, iv=None, record=None, means=None):
-        """generate.Qwen3.forward's contract on vpd4l (the same interventions, records and means)."""
+    def forward(self, tokens, iv=None, record=None, cf=None):
+        """generate.Qwen3.forward's contract on vpd4l (the same interventions, records and counterfactual writes)."""
         t = self.t
         B, T = tokens.shape
         x = t.wte[tokens]
         cut_delta = {}
         if record is not None:
             record.update(z_last=torch.empty(B, self.L, self.H, self.hd, device=self.dev), act_last=torch.empty(B, self.L, self.Fn, device=self.dev),
-                          mean_z=torch.empty(self.L, self.H, self.hd, device=self.dev), mean_mlp=torch.empty(self.L, self.d, device=self.dev),
-                          mean_attn=torch.empty(self.L, self.d, device=self.dev), probe_values={}, site_in_last={})
+                          probe_values={}, site_in_last={}, writes={})
         cuts = iv.cuts if iv is not None else {}
+        wanted = dict(cuts)  # cut writers, and on a run on x' the writes asked for (generate.Qwen3.forward)
+        if record is not None:
+            wanted.update({r: (ak, al, ah, None, None, None, None) for r, (ak, al, ah) in record.get("write_requests", {}).items()})
+        writer = lambda r, write: self._writer(r, write, iv, record, cf, cut_delta)  # noqa: E731
         for l in range(self.L):
             h = VM.rms(x, t.norms[2 * l], t.eps)
             q, k, v = self.qkv(l, h, iv)
@@ -129,7 +132,6 @@ class Vpd4l:
                 z = z * iv.head[:, l][:, None, :, None]
             if record is not None:
                 record["z_last"][:, l] = z[:, -1]
-                record["mean_z"][l] = z.mean(dim=(0, 1))
                 for kind in ("q_proj", "k_proj", "v_proj"):
                     record["site_in_last"][(l, kind)] = h[:, -1]
                 record["site_in_last"][(l, "o_proj")] = z[:, -1].reshape(B, -1)
@@ -141,13 +143,11 @@ class Vpd4l:
                     elif pl == l and ph == -3 and pi[0] == "o_proj":
                         record["probe_values"][r] = z[r].reshape(T, -1) @ self.parts[(l, "o_proj")][1][:, pi[1]]
             attn_out = self.site(l, "o_proj", z.reshape(B, T, -1), iv)
-            for r, (ak, al, ah, bk, bl, bh, route) in cuts.items():
+            for r, (ak, al, ah, bk, bl, bh, route) in wanted.items():
                 if al == l and ak == "head":
-                    cut_delta[r] = (means["mean_z"][l, ah] @ self.Wo[l][:, ah].T)[None] - z[r, :, ah] @ self.Wo[l][:, ah].T
+                    writer(r, z[r, :, ah] @ self.Wo[l][:, ah].T)
                 elif al == l and ak == "attn":
-                    cut_delta[r] = means["mean_attn"][l][None] - attn_out[r]
-            if record is not None:
-                record["mean_attn"][l] = attn_out.mean(dim=(0, 1))
+                    writer(r, attn_out[r])
             mid = x + attn_out
             y = VM.rms(mid, t.norms[2 * l + 1], t.eps)
             for r, (ak, al, ah, bk, bl, bh, route) in cuts.items():
@@ -172,18 +172,21 @@ class Vpd4l:
                         inp = y[r] if pi[0] == "c_fc" else act[r]
                         record["probe_values"][r] = inp @ self.parts[(l, pi[0])][1][:, pi[1]]
             mlp_out = self.site(l, "down_proj", act, iv)
-            if record is not None:
-                yb = y.mean(dim=(0, 1))  # the MLP's stand-in write: the MLP on its average normed input
-                record["mean_mlp"][l] = self.site(l, "down_proj", VM.gelu_tanh(self.site(l, "c_fc", yb[None, None], None)), None)[0, 0]
-            for r, (ak, al, ah, bk, bl, bh, route) in cuts.items():
+            for r, (ak, al, ah, bk, bl, bh, route) in wanted.items():
                 if al == l and ak == "mlp":
-                    cut_delta[r] = means["mean_mlp"][l][None] - mlp_out[r]
+                    writer(r, mlp_out[r])
             x = mid + mlp_out
         for r, (ak, al, ah, bk, bl, bh, route) in cuts.items():
             if bk == "logits":
                 x = x.clone()
                 x[r] = x[r] + cut_delta[r]
         return VM.rms(x[:, -1], t.ln_f, t.eps)
+
+    @staticmethod
+    def _writer(r, write, iv, record, cf, cut_delta):
+        from generate import Qwen3
+
+        Qwen3._writer(r, write, iv, record, cf, cut_delta)
 
     def log_probs(self, final):
         return torch.log_softmax((final @ self.t.wte.T).to(self.wide), dim=-1)
