@@ -71,7 +71,13 @@ class Runs:
         return ids, (P, P + len(think)), P + len(think) + len(self.reply)  # ids, thinking span, turn-2 start
 
     def answer(self, animal: str) -> int:
-        return self.tok.encode(" " + animal.title(), add_special_tokens=False)[0]
+        """First token of the lowercase answer: the list and the thinking write the names in lowercase, and the models
+        answer in lowercase (Qwen3-0.6B with the thinking visible: ' o' for ocelot at p 0.995)."""
+        return self.tok.encode(" " + animal, add_special_tokens=False)[0]
+
+    def accepted(self, animal: str) -> list[int]:
+        """First tokens of both forms the readout sums over (" name" and " Name")."""
+        return sorted({self.tok.encode(" " + f, add_special_tokens=False)[0] for f in (animal, animal.title())})
 
 
 def mask_for(n_ctx: int, cand: list[list[int]], think: tuple[int, int], s2: int, block: bool, dtype) -> tuple[torch.Tensor, list[int]]:
@@ -141,7 +147,7 @@ def main():
     for animal, thinking in zip(study["chosen"], study["thinking"]):
         ids, think, s2 = runs.context(thinking)
         ans = runs.answer(animal)
-        others = [b for b in ANIMALS if b != animal and runs.answer(b) != ans]
+        others = [b for b in ANIMALS if b != animal and not set(runs.accepted(b)) & set(runs.accepted(animal))]
         rng.shuffle(others)
         cf = None
         for b in others:
@@ -157,8 +163,10 @@ def main():
             _, cfirst = score(model, runs, cf[1], think, s2, block, a.device)
             L[fam].append(best)
             toks, cans = ids + [ans], cf[1] + [runs.answer(cf[0])]
-            p = {"text": tok.decode(toks), "token_ids": toks, "target_positions": [len(ids) - 1], "answer": " " + animal.title(),
-                 "hidden": animal, "counterfactual": {"text": tok.decode(cans), "token_ids": cans, "answer": " " + cf[0].title(), "hidden": cf[0]}}
+            p = {"text": tok.decode(toks), "token_ids": toks, "target_positions": [len(ids) - 1], "answer": " " + animal,
+                 "accepted_token_ids": [runs.accepted(animal)], "hidden": animal,
+                 "counterfactual": {"text": tok.decode(cans), "token_ids": cans, "answer": " " + cf[0],
+                                    "accepted_token_ids": [runs.accepted(cf[0])], "hidden": cf[0]}}
             if block:
                 blk = [[s2, len(toks), think[0], think[1]]]
                 p["attention_block"] = blk
@@ -166,9 +174,10 @@ def main():
             for d, f in ((p, first), (p["counterfactual"], cfirst)):
                 v, ix = f.exp().topk(TOP)
                 d["model_top"] = [[[tok.decode([int(j)]), round(float(q), 4)] for q, j in zip(v, ix)]]
-                d["correct"] = [int(f.argmax()) == d["token_ids"][-1]]
-            pa = float(first[toks[-1]] > first[cans[-1]])
-            pb = float(cfirst[cans[-1]] > cfirst[toks[-1]])
+                d["correct"] = [int(f.argmax()) in d["accepted_token_ids"][0]]
+            mass = lambda f, ids_: float(torch.logsumexp(f[ids_], 0))  # first-token mass of a name's two forms
+            pa = float(mass(first, runs.accepted(animal)) > mass(first, runs.accepted(cf[0])))
+            pb = float(mass(cfirst, runs.accepted(cf[0])) > mass(cfirst, runs.accepted(animal)))
             p["pair"] = [pa, pb]
             prompts[fam].append(p)
         if len(chosen) % 100 == 0:
