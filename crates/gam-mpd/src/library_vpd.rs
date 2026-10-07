@@ -19,6 +19,12 @@
 //! the heads' rows of those slices' writes. A write-side slice (o, down_proj) of a component gated
 //! at the block's input takes that gate's column (a fixed selection of the gate's columns).
 //!
+//! Training uses the expected gate: each stage holds a fixed operator `{stage}.softness` (one
+//! entry per component, zero in the program as built, so evaluation is the hard gate `H(z)`) that
+//! `library_mdl` sets to the threshold's posterior deviation `σ_b` for a pass with a gradient, with
+//! the threshold at its mean there, so the gate is `Φ(z_b / σ_b)`, the step `H` integrated exactly
+//! over the threshold's posterior, and the gate's threshold and direction take gradients.
+//!
 //! Prior groups: per slice its read row and its write column (over every head for q, k and v),
 //! per direction gate its row, and per stage of a layer its thresholds (one group, as a transcoder
 //! block's gate biases are). Each head recomputes the attention input stage's gated activations;
@@ -200,11 +206,13 @@ pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes], decompositio
                     ops.push(dense(&format!("{prefix}.threshold"), units(count)?, Interface::constant(), c)?);
                 }
             }
+            ops.push(dense(&format!("{prefix}.softness"), units(count)?, Interface::constant(), Array2::zeros((count, 1)))?);
             Ok(ops)
         };
         // The attention input stage's nodes from `input` (node 0 of a rule's nodes so far): the
-        // stacked read, the gate, the gated activations; returns (gated node, gate node).
-        let stage_nodes = |nodes: &mut Vec<Node>, input: usize, (read, gate_a, gate_b): (usize, usize, usize)| -> (usize, usize) {
+        // stacked read, the gate, the gate's softness, the gated activations; returns (gated node,
+        // gate node, softness node).
+        let stage_nodes = |nodes: &mut Vec<Node>, input: usize, (read, gate_a, gate_b, soft): (usize, usize, usize, usize)| -> (usize, usize, usize) {
             nodes.push(Node::Affine { terms: vec![(input, read)], bias: None });
             let a = nodes.len() - 1;
             let z = if direction {
@@ -215,8 +223,10 @@ pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes], decompositio
                 nodes.push(Node::Affine { terms: vec![(nodes.len() - 1, gate_a)], bias: Some(gate_b) });
                 nodes.len() - 1
             };
-            nodes.push(Node::Gated { value: a, gate: z, scale: None });
-            (nodes.len() - 1, z)
+            nodes.push(Node::Constant { operator: soft });
+            let s = nodes.len() - 1;
+            nodes.push(Node::Gated { value: a, gate: z, scale: Some(s) });
+            (nodes.len() - 1, z, s)
         };
         let selections: Vec<(usize, Vec<usize>)> = [q, k, v].iter().map(|&s| (s, (0..r_a).filter(|&r| read_rows[r].0 == s).collect())).collect();
         for (h, &read) in layer.reads.iter().enumerate() {
@@ -228,7 +238,7 @@ pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes], decompositio
             let base = artifact.program.operators.len();
             let mut operators = Vec::new();
             let shared = |artifact: &Artifact, part: &str| index_of(&artifact.program, &format!("{name}.attn.{part}"));
-            let (read_op, gate_a, gate_b) = if h == 0 {
+            let (read_op, gate_a, gate_b, soft) = if h == 0 {
                 operators.push(dense(&format!("{name}.attn.read"), stacked.clone(), x_interface.clone(), v_a.clone())?);
                 let mut gates = gate_ops(&format!("{name}.attn"), &a_comps, &x_interface)?;
                 operators.append(&mut gates);
@@ -237,13 +247,13 @@ pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes], decompositio
                         operators.push(dense(&format!("{name}.attn.select{}", s % KINDS.len()), units(picked.len())?, stacked.clone(), selection(picked, r_a))?);
                     }
                 }
-                (base, base + 1, base + 2)
+                (base, base + 1, base + 2, base + 3)
             } else {
                 let gate_names = if direction { ("direction", "threshold") } else { ("gate_identity", "threshold") };
-                (shared(&artifact, "read")?, shared(&artifact, gate_names.0)?, shared(&artifact, gate_names.1)?)
+                (shared(&artifact, "read")?, shared(&artifact, gate_names.0)?, shared(&artifact, gate_names.1)?, shared(&artifact, "softness")?)
             };
             let mut nodes = vec![Node::Param { index: 0 }];
-            let (gated, _) = stage_nodes(&mut nodes, 0, (read_op, gate_a, gate_b));
+            let (gated, _, _) = stage_nodes(&mut nodes, 0, (read_op, gate_a, gate_b, soft));
             let mut projections = Vec::new();
             for (j, (s, picked)) in selections.iter().enumerate() {
                 let rows = head_rows([query, key, value][j])?;
@@ -295,15 +305,22 @@ pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes], decompositio
             let a_o = nodes.len() - 1;
             // The gate columns of the o carriers: from the attention input stage's gate (recomputed
             // here from x), then the own o gates.
-            let mut gate_parts = Vec::new();
+            let (mut gate_parts, mut soft_parts) = (Vec::new(), Vec::new());
             let carried: Vec<usize> = o_carriers.iter().filter(|b| a_comps.contains(b)).map(|b| a_comps.iter().position(|a| a == b).unwrap_or(0)).collect();
             if !carried.is_empty() {
                 let gate_names = if direction { ("direction", "threshold") } else { ("gate_identity", "threshold") };
-                let (read_op, ga, gb) = (index_of(&artifact.program, &format!("{name}.attn.read"))?, index_of(&artifact.program, &format!("{name}.attn.{}", gate_names.0))?, index_of(&artifact.program, &format!("{name}.attn.{}", gate_names.1))?);
-                let (_, z) = stage_nodes(&mut nodes, heads, (read_op, ga, gb));
+                let stage_ops = (
+                    index_of(&artifact.program, &format!("{name}.attn.read"))?,
+                    index_of(&artifact.program, &format!("{name}.attn.{}", gate_names.0))?,
+                    index_of(&artifact.program, &format!("{name}.attn.{}", gate_names.1))?,
+                    index_of(&artifact.program, &format!("{name}.attn.softness"))?,
+                );
+                let (_, z, s) = stage_nodes(&mut nodes, heads, stage_ops);
                 operators.push(dense(&format!("{name}.o.select_gate"), units(carried.len())?, units(a_comps.len())?, selection(&carried, a_comps.len()))?);
                 nodes.push(Node::Affine { terms: vec![(z, base + operators.len() - 1)], bias: None });
                 gate_parts.push(nodes.len() - 1);
+                nodes.push(Node::Affine { terms: vec![(s, base + operators.len() - 1)], bias: None });
+                soft_parts.push(nodes.len() - 1);
             }
             if !o_own.is_empty() {
                 // Own o gates read the o carriers' own rows: the group norms of the read's own groups.
@@ -321,14 +338,11 @@ pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes], decompositio
                     nodes.push(Node::Affine { terms: vec![(nodes.len() - 1, first)], bias: Some(first + 1) });
                 }
                 gate_parts.push(nodes.len() - 1);
+                nodes.push(Node::Constant { operator: first + 2 });
+                soft_parts.push(nodes.len() - 1);
             }
-            let z = if gate_parts.len() == 1 {
-                gate_parts[0]
-            } else {
-                nodes.push(Node::Concat { parts: gate_parts });
-                nodes.len() - 1
-            };
-            nodes.push(Node::Gated { value: a_o, gate: z, scale: None });
+            let (z, s) = joined(&mut nodes, gate_parts, soft_parts);
+            nodes.push(Node::Gated { value: a_o, gate: z, scale: Some(s) });
             nodes.push(Node::Affine { terms: vec![(nodes.len() - 1, base + 1)], bias: None });
             let mut inputs = reads_cols.clone();
             inputs.push(x_interface.clone());
@@ -368,18 +382,20 @@ pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes], decompositio
         let mut gates = gate_ops(&format!("{name}.mlp.fc"), &f_comps, &h2_interface)?;
         operators.append(&mut gates);
         let mut nodes = vec![Node::Param { index: 0 }];
-        let (gated, z_f) = stage_nodes(&mut nodes, 0, (base, base + 4, base + 5));
+        let (gated, z_f, s_f) = stage_nodes(&mut nodes, 0, (base, base + 4, base + 5, base + 6));
         nodes.push(Node::Affine { terms: vec![(gated, base + 1)], bias: None });
         nodes.push(Node::Pointwise { input: nodes.len() - 1, laws: laws.clone() });
         let act = nodes.len() - 1;
         nodes.push(Node::Affine { terms: vec![(act, base + 2)], bias: None });
         let a_dn = nodes.len() - 1;
-        let mut gate_parts = Vec::new();
+        let (mut gate_parts, mut soft_parts) = (Vec::new(), Vec::new());
         let carried: Vec<usize> = dn_carriers.iter().filter(|b| f_comps.contains(b)).map(|b| f_comps.iter().position(|a| a == b).unwrap_or(0)).collect();
         if !carried.is_empty() {
             operators.push(dense(&format!("{name}.mlp.dn_select_gate"), units(carried.len())?, units(f_comps.len())?, selection(&carried, f_comps.len()))?);
             nodes.push(Node::Affine { terms: vec![(z_f, base + operators.len() - 1)], bias: None });
             gate_parts.push(nodes.len() - 1);
+            nodes.push(Node::Affine { terms: vec![(s_f, base + operators.len() - 1)], bias: None });
+            soft_parts.push(nodes.len() - 1);
         }
         if !d_own.is_empty() {
             let own_first = carried.len();
@@ -396,14 +412,11 @@ pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes], decompositio
                 nodes.push(Node::Affine { terms: vec![(nodes.len() - 1, first)], bias: Some(first + 1) });
             }
             gate_parts.push(nodes.len() - 1);
+            nodes.push(Node::Constant { operator: first + 2 });
+            soft_parts.push(nodes.len() - 1);
         }
-        let z = if gate_parts.len() == 1 {
-            gate_parts[0]
-        } else {
-            nodes.push(Node::Concat { parts: gate_parts });
-            nodes.len() - 1
-        };
-        nodes.push(Node::Gated { value: a_dn, gate: z, scale: None });
+        let (z, s) = joined(&mut nodes, gate_parts, soft_parts);
+        nodes.push(Node::Gated { value: a_dn, gate: z, scale: Some(s) });
         nodes.push(Node::Affine { terms: vec![(nodes.len() - 1, base + 3)], bias: None });
         let rule = Rule { name: format!("{name}.mlp"), inputs: vec![h2_interface.clone()], output: nodes.len() - 1, nodes };
         artifact = artifact.replace_block(&format!("{name}.mlp"), Callee::New(rule), vec![Argument::Native(h2)], layer.mlp, operators)?;
@@ -546,6 +559,17 @@ fn groups_of(artifact: Artifact, layers: &[LayerNodes], direction: bool) -> Resu
     trainable.dedup();
     let reference = mean_squares(&artifact.program, &groups);
     Ok(Explanation { artifact, trainable, groups, layers: out, removed: Vec::new(), fixed_nats: 0.0, reference, reads: Vec::new() })
+}
+
+/// The gate and softness nodes of a write-side stage from their parts (carried, then own): the part
+/// itself when one, else their concatenation.
+fn joined(nodes: &mut Vec<Node>, gates: Vec<usize>, softs: Vec<usize>) -> (usize, usize) {
+    if gates.len() == 1 {
+        return (gates[0], softs[0]);
+    }
+    nodes.push(Node::Concat { parts: gates });
+    nodes.push(Node::Concat { parts: softs });
+    (nodes.len() - 2, nodes.len() - 1)
 }
 
 /// The interface of the concatenation of `parts`.

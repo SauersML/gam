@@ -60,9 +60,15 @@ pub fn normal_pdf(z: f64) -> f64 {
 /// The expected count of `gate`'s surviving parts on its rows, `Σ_t Σ_i Φ(m_ti / s_ti)`, and its
 /// exact derivatives (module note).
 pub fn expected(gate: &Gate<'_>) -> Result<Expected, String> {
+    weighted(gate, &vec![1.0; gate.mean.nrows()])
+}
+
+/// [`expected`] with part `i` counting `weight[i]` when on: a gated component of rank `r` runs `r`
+/// rank-one slices (`library_vpd`).
+pub fn weighted(gate: &Gate<'_>, weight: &[f64]) -> Result<Expected, String> {
     let (rows, d) = gate.x.dim();
     let parts = gate.mean.nrows();
-    if gate.mean.ncols() != d || gate.variance.dim() != (parts, d) || gate.alive.len() != parts {
+    if gate.mean.ncols() != d || gate.variance.dim() != (parts, d) || gate.alive.len() != parts || weight.len() != parts {
         return Err("library complexity: a gate of other shapes than its input".into());
     }
     if let Some((m, v)) = gate.bias
@@ -86,16 +92,16 @@ pub fn expected(gate: &Gate<'_>) -> Result<Expected, String> {
             if !gate.alive[i] {
                 continue;
             }
-            let (mean, var) = (m[[t, i]], s2[[t, i]]);
+            let (mean, var, w) = (m[[t, i]], s2[[t, i]], weight[i]);
             if var > 0.0 {
                 let s = var.sqrt();
                 let z = mean / s;
                 let density = normal_pdf(z);
-                count += normal_cdf(z);
-                slope[[t, i]] = density / s;
-                spread[[t, i]] = -density * mean / (2.0 * var * s);
+                count += w * normal_cdf(z);
+                slope[[t, i]] = w * density / s;
+                spread[[t, i]] = -w * density * mean / (2.0 * var * s);
             } else if mean > 0.0 {
-                count += 1.0;
+                count += w;
             }
         }
     }
@@ -107,6 +113,40 @@ pub fn expected(gate: &Gate<'_>) -> Result<Expected, String> {
         bias_mean: slope.sum_axis(Axis(0)),
         bias_variance: spread.sum_axis(Axis(0)),
     })
+}
+
+/// The expected rank executed by own-gated components on rows of their read norms `norms` (rows ×
+/// components, `‖V_bᵀx‖`), each on iff `‖V_bᵀx‖ + c_b > 0` with `c_b ~ N(μ_b, σ²_b)` (`bias`, the
+/// negated thresholds' means and variances), component `b` counting `rank[b]`: the count
+/// `Σ_t Σ_b r_b Φ(m_tb / σ_b)`, `m_tb = ‖V_bᵀx_t‖ + μ_b`, and its derivatives in `μ` and `σ²`
+/// (`bias_mean`, `bias_variance`; `mean` and `variance` are empty: the identity reading the norms is
+/// fixed). The reads `V_b` are held at the step's sample, as an upstream part's are.
+pub fn own(norms: ArrayView2<'_, f64>, bias: (ArrayView1<'_, f64>, ArrayView1<'_, f64>), rank: &[f64]) -> Result<Expected, String> {
+    let (rows, parts) = norms.dim();
+    let (mu, var) = bias;
+    if mu.len() != parts || var.len() != parts || rank.len() != parts {
+        return Err("library complexity: own gates of other counts than their norms".into());
+    }
+    let mut count = 0.0;
+    let (mut bias_mean, mut bias_variance) = (Array1::zeros(parts), Array1::zeros(parts));
+    for t in 0..rows {
+        for i in 0..parts {
+            let (m, v, w) = (norms[[t, i]] + mu[i], var[i], rank[i]);
+            if w == 0.0 {
+                continue;
+            }
+            if v > 0.0 {
+                let s = v.sqrt();
+                let density = normal_pdf(m / s);
+                count += w * normal_cdf(m / s);
+                bias_mean[i] += w * density / s;
+                bias_variance[i] -= w * density * m / (2.0 * v * s);
+            } else if m > 0.0 {
+                count += w;
+            }
+        }
+    }
+    Ok(Expected { count, rows, mean: Array2::zeros((parts, 0)), variance: Array2::zeros((parts, 0)), bias_mean, bias_variance })
 }
 
 #[cfg(test)]

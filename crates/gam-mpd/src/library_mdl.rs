@@ -1829,8 +1829,12 @@ struct Mlp {
 }
 
 impl Mlp {
-    fn of(flat: &OperatorProgram, l: usize) -> Result<Self, String> {
+    /// None for a layer whose MLP is gated components with no one gate map (`library_vpd`).
+    fn of(flat: &OperatorProgram, l: usize) -> Result<Option<Self>, String> {
         let name = format!("library.l{l}.mlp");
+        if operator_named(flat, &format!("{name}.gate")).is_none() && operator_named(flat, &format!("{name}.fc_read")).is_some() {
+            return Ok(None);
+        }
         let (gate, input) = Map::of(flat, &format!("{name}.gate"))?;
         let found = flat.nodes.iter().enumerate().find_map(|(n, node)| match node {
             Node::Pointwise { input, laws } if *input == gate.node => laws.first().map(|law| (n, *law)),
@@ -1841,14 +1845,113 @@ impl Mlp {
             Some(_) => Some(Map::of(flat, &format!("{name}.up"))?.0),
             None => None,
         };
-        Ok(Self { input, gate, activation, law, up })
+        Ok(Some(Self { input, gate, activation, law, up }))
+    }
+}
+
+/// A stage of gated components (`library_vpd`): the gate node `z = input·Aᵀ + c` in the flat
+/// program (`A` the identity over the components' read norms for an own gate, the gate rows `g`
+/// for a direction gate), its input node, the threshold operator `c` and the direction operator
+/// `g` (none for an own gate), and per component the read groups of the slices it runs when on
+/// (its rank in rank-one equivalents is the number of those still active).
+struct GatedStage {
+    gate: usize,
+    input: usize,
+    threshold: usize,
+    direction: Option<usize>,
+    slices: Vec<Vec<usize>>,
+}
+
+impl GatedStage {
+    /// Layer `l`'s stages of the explanation `explanation` compiled into `flat`: the attention's
+    /// input (its components' q, k, v slices and the o slices they carry), the own-gated o slices,
+    /// the MLP's input (c_fc slices and the down slices they carry) and the own-gated down slices.
+    fn of(flat: &OperatorProgram, explanation: &Explanation, l: usize) -> Result<Vec<Self>, String> {
+        let program = &explanation.artifact.program;
+        let name = format!("library.l{l}");
+        // Each single-row read group by its operator and row.
+        let mut read_group: BTreeMap<(usize, usize), usize> = BTreeMap::new();
+        for (g, group) in explanation.groups.iter().enumerate() {
+            if group.name.starts_with(&format!("{name}.")) && group.name.ends_with(".read") && group.cells.len() == 1 && group.cells[0].rows.len() == 1 {
+                read_group.insert((group.cells[0].operator, group.cells[0].rows[0]), g);
+            }
+        }
+        // Per row group of operator `op` its read groups.
+        let blocks = |op: usize| -> Result<Vec<Vec<usize>>, String> {
+            let mut row = 0;
+            let mut out = Vec::new();
+            for group in program.operators[op].rows.groups() {
+                out.push((row..row + group.width).map(|r| read_group.get(&(op, r)).copied().ok_or_else(|| format!("{name}: no read group of row {r}"))).collect::<Result<Vec<_>, _>>()?);
+                row += group.width;
+            }
+            Ok(out)
+        };
+        // The carried write-side slices: row `r` of the selection picks the component, carrier `r`.
+        let carry = |slices: &mut [Vec<usize>], select: &str, carriers: &[Vec<usize>]| -> Result<usize, String> {
+            let Some(op) = operator_named(program, select) else { return Ok(0) };
+            let m = program.operators[op].matrix();
+            for (r, row) in m.rows().into_iter().enumerate() {
+                let c = row.iter().position(|v| *v != 0.0).ok_or("an empty gate selection")?;
+                slices[c].extend(&carriers[r]);
+            }
+            Ok(m.nrows())
+        };
+        let gate_node = |threshold: usize| -> Result<(usize, usize), String> {
+            flat.nodes
+                .iter()
+                .enumerate()
+                .find_map(|(n, node)| match node {
+                    Node::Affine { terms, bias: Some(b) } if *b == threshold && terms.len() == 1 => Some((n, terms[0].0)),
+                    _ => None,
+                })
+                .ok_or_else(|| format!("{name}: no gate node of threshold {threshold}"))
+        };
+        let mut stages = Vec::new();
+        let mut stage = |prefix: &str, slices: Vec<Vec<usize>>| -> Result<(), String> {
+            let threshold = index_of(flat, &format!("{prefix}.threshold"))?;
+            let (gate, input) = gate_node(threshold)?;
+            let direction = operator_named(flat, &format!("{prefix}.direction"));
+            if program.operators[threshold].rows.width() != slices.len() {
+                return Err(format!("{prefix}: {} thresholds for {} components", program.operators[threshold].rows.width(), slices.len()));
+            }
+            stages.push(Self { gate, input, threshold, direction, slices });
+            Ok(())
+        };
+        let mut attention = blocks(index_of(program, &format!("{name}.attn.read"))?)?;
+        let o = match operator_named(program, &format!("{name}.o.read")) {
+            Some(op) => blocks(op)?,
+            None => Vec::new(),
+        };
+        let carried = carry(&mut attention, &format!("{name}.o.select_gate"), &o)?;
+        stage(&format!("{name}.attn"), attention)?;
+        if o.len() > carried {
+            stage(&format!("{name}.o"), o[carried..].to_vec())?;
+        }
+        let mut up = blocks(index_of(program, &format!("{name}.mlp.fc_read"))?)?;
+        let down = blocks(index_of(program, &format!("{name}.mlp.dn_read"))?)?;
+        let carried = carry(&mut up, &format!("{name}.mlp.dn_select_gate"), &down)?;
+        stage(&format!("{name}.mlp.fc"), up)?;
+        if down.len() > carried {
+            stage(&format!("{name}.mlp.dn"), down[carried..].to_vec())?;
+        }
+        Ok(stages)
+    }
+
+    /// Per component its active slices, its rank in rank-one equivalents.
+    fn ranks(&self, active: &[bool]) -> Vec<f64> {
+        self.slices.iter().map(|groups| groups.iter().filter(|g| active[**g]).count() as f64).collect()
     }
 }
 
 /// `M` and the explanation compiled for the experiments, with the explanation's MLP nodes.
 struct Scorer {
     experiments: Interchange,
-    mlps: Vec<Mlp>,
+    mlps: Vec<Option<Mlp>>,
+    /// Per layer its stages of gated components (`library_vpd`), none for a layer of functions.
+    stages: Vec<Vec<GatedStage>>,
+    /// Each gated stage's softness and threshold operators and its components (`library_vpd`;
+    /// [`Scorer::soften`]).
+    soft: Vec<(usize, usize, usize)>,
     /// Each trainable operator's position in `Explanation::trainable`.
     position: BTreeMap<usize, usize>,
     /// The blocks the explanation explains ([`scope`]), when not all of them ([`scoped`]): every
@@ -1897,10 +2000,19 @@ impl Scorer {
         // process's memory budget admits them.
         experiments.keep_targets(gam_runtime::resource::MemoryGovernor::global());
         let (flat, _, _) = interchange::sites(&explanation.artifact, &sites)?;
-        let mlps = (0..sites.len()).map(|l| Mlp::of(&flat, l)).collect::<Result<_, _>>()?;
+        let mlps: Vec<Option<Mlp>> = (0..sites.len()).map(|l| Mlp::of(&flat, l)).collect::<Result<_, _>>()?;
+        let stages = mlps.iter().enumerate().map(|(l, mlp)| if mlp.is_some() { Ok(Vec::new()) } else { GatedStage::of(&flat, explanation, l) }).collect::<Result<_, String>>()?;
         let position = explanation.trainable.iter().enumerate().map(|(i, op)| (*op, i)).collect();
         let scope = Some(scope(explanation)).filter(|blocks| !blocks.iter().all(|b| *b));
-        Ok(Self { experiments, mlps, position, scope, families: settings.families.clone(), edits: std::cell::RefCell::new(BTreeMap::new()) })
+        let program = &explanation.artifact.program;
+        let soft = program
+            .operators
+            .iter()
+            .enumerate()
+            .filter_map(|(i, op)| op.name.strip_suffix(".softness").map(|prefix| (i, prefix.to_string(), op.rows.width())))
+            .map(|(i, prefix, count)| Ok((i, index_of(program, &format!("{prefix}.threshold"))?, count)))
+            .collect::<Result<_, String>>()?;
+        Ok(Self { experiments, mlps, stages, soft, position, scope, families: settings.families.clone(), edits: std::cell::RefCell::new(BTreeMap::new()) })
     }
 
     /// With push among the families, the scorer with the pushed directions set from the seed and
@@ -1918,6 +2030,33 @@ impl Scorer {
 
     fn layers(&self) -> usize {
         self.mlps.len()
+    }
+
+    /// With `posterior`, each gated stage's softness set to its threshold's posterior deviation
+    /// `σ_b` and the threshold to its iterate's mean, so the stage's gates are `Φ(z_b / σ_b)`, the
+    /// hard gate integrated exactly over the threshold's posterior (`library_vpd`), for a pass
+    /// with a gradient; with none, the softness back to zero, the hard gate `H(z_b)` every other
+    /// evaluation scores.
+    fn soften(&mut self, posterior: Option<&DevicePosterior>) -> Result<(), String> {
+        if self.soft.is_empty() {
+            return Ok(());
+        }
+        for (soft, threshold, count) in self.soft.clone() {
+            let (sd, mean) = match posterior {
+                Some(posterior) => {
+                    let j = self.at(threshold)?;
+                    (posterior.values(j)?.1.mapv(f64::exp), Some(posterior.iterate(j)?))
+                }
+                None => (Array2::zeros((count, 1)), None),
+            };
+            let program = self.experiments.explanation_mut();
+            let device = program.device().clone();
+            program.replace_dense_parameter(soft, device.upload(sd.view()).map_err(error)?)?;
+            if let Some(mean) = mean {
+                program.replace_dense_parameter(threshold, device.upload(mean.view()).map_err(error)?)?;
+            }
+        }
+        self.experiments.explanation_mut().refresh_fused()
     }
 
     fn at(&self, operator: usize) -> Result<usize, String> {
@@ -1994,7 +2133,10 @@ impl Scorer {
             _ => None,
         };
         let evaluation = if gradient {
-            self.reversed(|e| e.evaluate_probed(batch, experiments, Some(targets), gradient, probe))?
+            self.soften(Some(posterior))?;
+            let evaluation = self.reversed(|e| e.evaluate_probed(batch, experiments, Some(targets), gradient, probe));
+            self.soften(None)?;
+            evaluation?
         } else {
             self.experiments.evaluate_probed(batch, experiments, Some(targets), gradient, probe)?
         };
@@ -2101,6 +2243,32 @@ fn complexity_terms(scorer: &mut Scorer, device_posterior: &DevicePosterior, exp
     let mut terms = Vec::new();
     for (l, (layer, mlp)) in explanation.layers.iter().zip(&scorer.mlps).enumerate() {
         count += (layer.heads.iter().filter(|(_, values)| values.iter().any(alive)).count() * rows) as f64;
+        let Some(mlp) = mlp else {
+            // Gated components (`library_vpd`): each counts its rank where its gate is on.
+            for stage in &scorer.stages[l] {
+                let input = d.download(trace.value(stage.input)?).map_err(|e| e.to_string())?;
+                let rank = stage.ranks(active);
+                let j = scorer.at(stage.threshold)?;
+                let bias = (device_posterior.iterate(j)?.column(0).to_owned(), device_posterior.values(j)?.1.column(0).mapv(|s| (2.0 * s).exp()));
+                let per = 1.0 / rows as f64;
+                let expected = match stage.direction {
+                    None => crate::library_complexity::own(input.view(), (bias.0.view(), bias.1.view()), &rank)?,
+                    Some(g) => {
+                        let i = scorer.at(g)?;
+                        let mean = device_posterior.iterate(i)?;
+                        let variance = device_posterior.values(i)?.1.mapv(|s| (2.0 * s).exp());
+                        let alive: Vec<bool> = rank.iter().map(|r| *r > 0.0).collect();
+                        let gate = crate::library_complexity::Gate { x: input.view(), mean: mean.view(), variance: variance.view(), bias: Some((bias.0.view(), bias.1.view())), alive: &alive };
+                        let expected = crate::library_complexity::weighted(&gate, &rank)?;
+                        terms.push((i, expected.mean.clone() * per, expected.variance.clone() * per));
+                        expected
+                    }
+                };
+                count += expected.count;
+                terms.push((j, expected.bias_mean.insert_axis(ndarray::Axis(1)) * per, expected.bias_variance.insert_axis(ndarray::Axis(1)) * per));
+            }
+            continue;
+        };
         if layer.functions.is_empty() {
             continue;
         }
@@ -2360,6 +2528,12 @@ fn activity(scorer: &mut Scorer, explanation: &Explanation, (posterior, device_p
     // Per layer its surviving functions' flags, its law per function, and its maps' variances.
     let mut gates = Vec::with_capacity(scorer.layers());
     for (layer, mlp) in explanation.layers.iter().zip(&scorer.mlps) {
+        let Some(mlp) = mlp else {
+            // Gated components (`library_vpd`), counted below from their gates.
+            out.push(LayerCount { heads: 0, planes: 0, values: 0, functions: 0, nonzero_per_token: 0.0, resolved_per_token: 0.0 });
+            gates.push(None);
+            continue;
+        };
         let surviving: Vec<u32> = layer.functions.iter().map(|groups| u32::from(groups.iter().all(active))).collect();
         out.push(LayerCount {
             heads: layer.heads.iter().filter(|(_, values)| values.iter().any(active)).count(),
@@ -2399,6 +2573,23 @@ fn activity(scorer: &mut Scorer, explanation: &Explanation, (posterior, device_p
         for (l, ((count, mlp), gates)) in out.iter_mut().zip(&scorer.mlps).zip(&gates).enumerate() {
             let skipped: Vec<usize> = positions.iter().enumerate().filter(|(_, p)| fixed[l].binary_search(p).is_ok()).map(|(r, _)| r).collect();
             rows[l] += family.rows - skipped.len();
+            if mlp.is_none() {
+                // Gated components at the posterior mean: the rank of each component whose gate is
+                // on, per token (the slices executed, in rank-one equivalents).
+                let mut executed = 0.0;
+                let mut surviving = 0;
+                for stage in &scorer.stages[l] {
+                    let rank = stage.ranks(&posterior.active);
+                    surviving += rank.iter().filter(|r| **r > 0.0).count();
+                    let z = d.download(trace.value(stage.gate)?).map_err(error)?;
+                    executed += z.rows().into_iter().map(|row| row.iter().zip(&rank).filter(|(z, _)| **z > 0.0).map(|(_, r)| r).sum::<f64>()).sum::<f64>();
+                }
+                count.functions = surviving;
+                count.nonzero_per_token += executed;
+                count.resolved_per_token += executed;
+                continue;
+            }
+            let Some(mlp) = mlp else { continue };
             let Some((alive, codes, gate, up)) = gates else { continue };
             let x = trace.value(mlp.input)?;
             let mut squares = d.empty(x.rows(), x.cols()).map_err(error)?;
@@ -3684,7 +3875,10 @@ fn laplace_sums(scorer: &mut Scorer, device_posterior: &DevicePosterior, draws: 
         // gradient.
         let key = noise_seed(settings.seed, 0, b);
         device_posterior.sample_into(scorer.experiments.explanation_mut(), key)?;
-        let factor = scorer.reversed(|e| e.fisher_probe_resident(&batch, &experiments, probe_key(key)))?;
+        scorer.soften(Some(device_posterior))?;
+        let factor = scorer.reversed(|e| e.fisher_probe_resident(&batch, &experiments, probe_key(key)));
+        scorer.soften(None)?;
+        let factor = factor?;
         for (op, u) in &factor {
             let u = wide.convert(u).map_err(error)?;
             match sums.get_mut(op) {
@@ -3768,7 +3962,10 @@ fn removal_curvature(scorer: &mut Scorer, posterior: &DevicePosterior, draws: &[
         lap(2, &mut timed);
         // One forward pass at the batch's sample, reversed twice: the divergence's gradient (in
         // bits) and a draw of the Gauss–Newton factor.
-        let evaluation = scorer.reversed(|e| e.evaluate_probed(&batch, &experiments, Some(&targets), true, Some(probe_key(key))))?;
+        scorer.soften(Some(posterior))?;
+        let evaluation = scorer.reversed(|e| e.evaluate_probed(&batch, &experiments, Some(&targets), true, Some(probe_key(key))));
+        scorer.soften(None)?;
+        let evaluation = evaluation?;
         let factor = evaluation.factor.ok_or("no Gauss–Newton factor")?;
         lap(3, &mut timed);
         posterior.add_removal((&evaluation.gradient, LN_2), &factor.gradient, key, &mut curvature, &mut pending)?;
