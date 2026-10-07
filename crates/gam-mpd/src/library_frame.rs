@@ -77,7 +77,10 @@ impl Frame {
             (-2.0 * u.ln()).sqrt() * angle.cos()
         });
         let gram = fast_ata(&draws);
-        let root = eigh(gram.view(), SymmetricAssembly::Mirrored, None).map_err(|e| error(format!("{e:?}")))?.psd_map(0.0, |v| v.powf(-0.5)).map_err(|e| error(format!("{e:?}")))?;
+        let root = eigh(gram.view(), SymmetricAssembly::Mirrored, None)
+            .map_err(|e| error(format!("{e:?}")))?
+            .psd_map(0.0, |v| v.powf(-0.5))
+            .map_err(|e| error(format!("{e:?}")))?;
         Ok(Self { atoms: draws.dot(&root) })
     }
 
@@ -100,7 +103,11 @@ impl Frame {
         // so the loop ends; the pass bound guards a tie cycle.
         for _ in 0..1000 {
             let scores = x.dot(&atoms.t());
-            let next: Vec<usize> = scores.rows().into_iter().map(|r| (0..r.len()).max_by(|&a, &b| r[a].abs().total_cmp(&r[b].abs())).unwrap_or(0)).collect();
+            let next: Vec<usize> = scores
+                .rows()
+                .into_iter()
+                .map(|r| (0..r.len()).max_by(|&a, &b| r[a].abs().total_cmp(&r[b].abs())).unwrap_or(0))
+                .collect();
             if next == assigned {
                 break;
             }
@@ -211,12 +218,18 @@ struct Site {
 impl Site {
     /// `W` cut through the frame with dual `dual`: slice `i` writes `W f_i` and reads `g_i`.
     fn framed(w: &Array2<f64>, frame: &Frame, dual: &Array2<f64>) -> Self {
-        Self { u: frame.atoms.dot(&w.t()), v: dual.t().to_owned() }
+        Self {
+            u: frame.atoms.dot(&w.t()),
+            v: dual.t().to_owned(),
+        }
     }
 
     /// A zero map: one zero slice.
     fn zero(rows: usize, cols: usize) -> Self {
-        Self { u: Array2::zeros((1, rows)), v: Array2::zeros((cols, 1)) }
+        Self {
+            u: Array2::zeros((1, rows)),
+            v: Array2::zeros((cols, 1)),
+        }
     }
 }
 
@@ -258,7 +271,11 @@ pub fn frame_start(native: &OperatorProgram, layers: &[LayerNodes], fitting: &Fa
                     layer_sites.push(Site::zero(w.nrows(), w.ncols()));
                 }
                 own.push(component(json!({"own": [site(0), 0]}), 1.0, &[[site(0), 0], [site(1), 0], [site(2), 0]]));
-                direction.push(component(json!({"direction": {"site": site(0), "coefficients": vec![0.0; x.ncols() + 1]}}), 1.0, &[[site(0), 0], [site(1), 0], [site(2), 0]]));
+                direction.push(component(
+                    json!({"direction": {"site": site(0), "coefficients": vec![0.0; x.ncols() + 1]}}),
+                    1.0,
+                    &[[site(0), 0], [site(1), 0], [site(2), 0]],
+                ));
                 (None, None)
             } else {
                 let frame = Frame::of(kind, &x, seed ^ (l as u64 * 6 + 1))?;
@@ -303,8 +320,14 @@ pub fn frame_start(native: &OperatorProgram, layers: &[LayerNodes], fitting: &Fa
             } else {
                 // Per neuron its c_fc row and down_proj column.
                 let m = up.nrows();
-                layer_sites.push(Site { u: Array2::eye(m), v: up.t().to_owned() });
-                layer_sites.push(Site { u: down.t().to_owned(), v: Array2::eye(m) });
+                layer_sites.push(Site {
+                    u: Array2::eye(m),
+                    v: up.t().to_owned(),
+                });
+                layer_sites.push(Site {
+                    u: down.t().to_owned(),
+                    v: Array2::eye(m),
+                });
                 Some((m, m, None))
             };
             // The components, per site group, own and direction; each gate's width is its read's
@@ -322,26 +345,23 @@ pub fn frame_start(native: &OperatorProgram, layers: &[LayerNodes], fitting: &Fa
                     direction.push(component(direction_read(&heads_out, dual.row(i), site(3)), 1.0, &[[site(3), i]]));
                 }
             }
-            match &mlp {
-                Some((ups, downs, Some((up_dual, down_dual)))) => {
-                    let hidden = value(layer.active)?;
-                    for i in 0..*ups {
-                        own.push(component(json!({"own": [site(4), i]}), own_width(&h2, up_dual.row(i), 1.0), &[[site(4), i]]));
-                        direction.push(component(direction_read(&h2, up_dual.row(i), site(4)), 1.0, &[[site(4), i]]));
-                    }
-                    for i in 0..*downs {
-                        own.push(component(json!({"own": [site(5), i]}), own_width(&hidden, down_dual.row(i), 1.0), &[[site(5), i]]));
-                        direction.push(component(direction_read(&hidden, down_dual.row(i), site(5)), 1.0, &[[site(5), i]]));
-                    }
+            // A zero MLP has no component (library_vpd adds zero for it).
+            if let Some((ups, downs, Some((up_dual, down_dual)))) = &mlp {
+                let hidden = value(layer.active)?;
+                for i in 0..*ups {
+                    own.push(component(json!({"own": [site(4), i]}), own_width(&h2, up_dual.row(i), 1.0), &[[site(4), i]]));
+                    direction.push(component(direction_read(&h2, up_dual.row(i), site(4)), 1.0, &[[site(4), i]]));
                 }
-                Some((m, _, None)) => {
-                    for n in 0..*m {
-                        let slices = [[site(4), n], [site(5), n]];
-                        own.push(component(json!({"own": [site(4), n]}), own_width(&h2, up.row(n), 1.0), &slices));
-                        direction.push(component(direction_read(&h2, up.row(n), site(4)), 1.0, &slices));
-                    }
+                for i in 0..*downs {
+                    own.push(component(json!({"own": [site(5), i]}), own_width(&hidden, down_dual.row(i), 1.0), &[[site(5), i]]));
+                    direction.push(component(direction_read(&hidden, down_dual.row(i), site(5)), 1.0, &[[site(5), i]]));
                 }
-                _ => {}
+            } else if let Some((m, _, None)) = &mlp {
+                for n in 0..*m {
+                    let slices = [[site(4), n], [site(5), n]];
+                    own.push(component(json!({"own": [site(4), n]}), own_width(&h2, up.row(n), 1.0), &slices));
+                    direction.push(component(direction_read(&h2, up.row(n), site(4)), 1.0, &slices));
+                }
             }
             for (k, s) in layer_sites.iter().enumerate() {
                 let name = format!("h.{l}.{}", crate::library_vpd::EXPORT_NAMES[k]);
@@ -359,5 +379,180 @@ pub fn frame_start(native: &OperatorProgram, layers: &[LayerNodes], fitting: &Fa
         std::fs::write(out.join("start.json"), arms.to_string()).map_err(error)?;
         summary.push(json!({"frame": name, "components": own.len(), "sites": sites.len(), "fitting_rows": fitting.rows}));
     }
+    summary.push(unit_start(native, layers, &value, &dir.join("heads_neurons"))?);
     Ok(json!(summary))
+}
+
+/// A head's or neuron's slices of one map: `U` rows (writes) and `V` columns (reads), as for a
+/// [`Site`], with the unit owning each.
+struct Units {
+    writes: Vec<Vec<f64>>,
+    reads: Vec<Vec<f64>>,
+    owner: Vec<usize>,
+}
+
+impl Units {
+    fn new() -> Self {
+        Self {
+            writes: Vec::new(),
+            reads: Vec::new(),
+            owner: Vec::new(),
+        }
+    }
+
+    /// The block `rows × cols` of `W` that unit `unit` owns (zero elsewhere), cut by its exact SVD
+    /// (the resolved singular values).
+    fn cut(&mut self, w: &Array2<f64>, rows: std::ops::Range<usize>, cols: std::ops::Range<usize>, unit: usize) -> Result<(), String> {
+        let block = w.slice(ndarray::s![rows.clone(), cols.clone()]);
+        if block.iter().all(|v| *v == 0.0) {
+            return Ok(());
+        }
+        let svd = gam_linalg::decompose::svd(block, false).map_err(|e| error(format!("{e:?}")))?;
+        for (j, sigma) in svd.singular_values.iter().enumerate().filter(|(_, s)| **s > svd.band) {
+            let mut write = vec![0.0; w.nrows()];
+            let mut read = vec![0.0; w.ncols()];
+            for (r, row) in rows.clone().enumerate() {
+                write[row] = svd.u[[r, j]] * sigma;
+            }
+            for (c, col) in cols.clone().enumerate() {
+                read[col] = svd.vt[[j, c]];
+            }
+            self.writes.push(write);
+            self.reads.push(read);
+            self.owner.push(unit);
+        }
+        Ok(())
+    }
+
+    /// The site: a zero map's one zero slice when no unit holds a slice.
+    fn site(&self, rows: usize, cols: usize) -> Site {
+        if self.writes.is_empty() {
+            return Site::zero(rows, cols);
+        }
+        let u = Array2::from_shape_fn((self.writes.len(), rows), |(i, r)| self.writes[i][r]);
+        let v = Array2::from_shape_fn((cols, self.reads.len()), |(c, i)| self.reads[i][c]);
+        Site { u, v }
+    }
+
+    fn of(&self, unit: usize) -> Vec<usize> {
+        (0..self.owner.len()).filter(|&i| self.owner[i] == unit).collect()
+    }
+}
+
+/// The per-unit start, the baseline the frame starts are compared to, in `dir`: per head one
+/// component (its q, k and v rows and its o columns, each head's block cut by its exact SVD), per
+/// MLP neuron one (its c_fc row and down_proj column), arms `per_slice_own` (every slice its own
+/// component, an o or down_proj slice gated on its own read), `grouped_own` and
+/// `grouped_direction` (the grouped components gated by their first read slice, in units of its
+/// spread). Gates start at `τ = 0`, widths the reads' spreads on the fitting rows, as for the
+/// frames. Heads must own their keys and values (no grouped-query sharing).
+fn unit_start(native: &OperatorProgram, layers: &[LayerNodes], value: &dyn Fn(usize) -> Result<Array2<f64>, String>, dir: &Path) -> Result<Value, String> {
+    std::fs::create_dir_all(dir).map_err(error)?;
+    let (mut sites, mut files) = (Vec::new(), serde_json::Map::new());
+    let (mut per_slice, mut grouped, mut direction) = (Vec::new(), Vec::new(), Vec::new());
+    for (l, layer) in layers.iter().enumerate() {
+        let site = |k: usize| KINDS.len() * l + k;
+        let heads = layer.reads.len();
+        if layer.keys.len() != heads {
+            return Err(error(format!(
+                "layer {l}: {} key heads for {heads} heads (the per-unit start needs a key and value per head)",
+                layer.keys.len()
+            )));
+        }
+        let weight = |part: &str| operator(native, &format!("blocks.{l}.{part}"));
+        let stack = |parts: Vec<Array2<f64>>, axis: usize| -> Result<Array2<f64>, String> {
+            let views: Vec<_> = parts.iter().map(|p| p.view()).collect();
+            concatenate(Axis(axis), &views).map_err(error)
+        };
+        let wq = stack((0..heads).map(|h| weight(&format!("q{h}"))).collect::<Result<_, _>>()?, 0)?;
+        let wk = stack((0..heads).map(|h| weight(&format!("k{h}"))).collect::<Result<_, _>>()?, 0)?;
+        let wv = stack((0..heads).map(|h| weight(&format!("v{h}"))).collect::<Result<_, _>>()?, 0)?;
+        let wo = stack((0..heads).map(|h| weight(&format!("o{h}"))).collect::<Result<_, _>>()?, 1)?;
+        let (up, down) = (weight("c_fc")?, weight("down_proj")?);
+        let hd = wq.nrows() / heads;
+        let mut units: Vec<Units> = (0..KINDS.len()).map(|_| Units::new()).collect();
+        for h in 0..heads {
+            for (k, w) in [&wq, &wk, &wv].into_iter().enumerate() {
+                units[k].cut(w, h * hd..(h + 1) * hd, 0..w.ncols(), h)?;
+            }
+            units[3].cut(&wo, 0..wo.nrows(), h * hd..(h + 1) * hd, h)?;
+        }
+        for n in 0..up.nrows() {
+            units[4].cut(&up, n..n + 1, 0..up.ncols(), n)?;
+            units[5].cut(&down, 0..down.nrows(), n..n + 1, n)?;
+        }
+        let shapes = [
+            (wq.nrows(), wq.ncols()),
+            (wk.nrows(), wk.ncols()),
+            (wv.nrows(), wv.ncols()),
+            (wo.nrows(), wo.ncols()),
+            (up.nrows(), up.ncols()),
+            (down.nrows(), down.ncols()),
+        ];
+        let layer_sites: Vec<Site> = units.iter().zip(shapes).map(|(u, (r, c))| u.site(r, c)).collect();
+        let (x, heads_out, h2, hidden) = (
+            value(layer.normed_stream)?,
+            stack(layer.reads.iter().map(|&r| value(r)).collect::<Result<_, _>>()?, 1)?,
+            value(layer.normed)?,
+            value(layer.active)?,
+        );
+        let read_of = |k: usize, i: usize| layer_sites[k].v.column(i).to_owned();
+        // The attention: per head its slices; a zero attention one component of its zero slices.
+        let attention_units: Vec<usize> = if units[..3].iter().all(|u| u.writes.is_empty()) { Vec::new() } else { (0..heads).collect() };
+        if attention_units.is_empty() {
+            let slices = [[site(0), 0], [site(1), 0], [site(2), 0]];
+            for arm in [&mut per_slice, &mut grouped] {
+                arm.push(component(json!({"own": [site(0), 0]}), 1.0, &slices));
+            }
+            direction.push(component(json!({"direction": {"site": site(0), "coefficients": vec![0.0; x.ncols() + 1]}}), 1.0, &slices));
+        }
+        for &h in &attention_units {
+            let mut slices = Vec::new();
+            let mut reads = Vec::new();
+            for k in 0..3 {
+                for i in units[k].of(h) {
+                    slices.push([site(k), i]);
+                    reads.push(read_of(k, i));
+                    per_slice.push(component(json!({"own": [site(k), i]}), own_width(&x, read_of(k, i).view(), 1.0), &[[site(k), i]]));
+                }
+            }
+            for i in units[3].of(h) {
+                slices.push([site(3), i]);
+                per_slice.push(component(json!({"own": [site(3), i]}), own_width(&heads_out, read_of(3, i).view(), 1.0), &[[site(3), i]]));
+            }
+            let Some(first) = slices.first().copied() else { continue };
+            let stacked = concatenate(Axis(1), &reads.iter().map(|r| r.view().insert_axis(Axis(1))).collect::<Vec<_>>()).map_err(error)?;
+            let norms = x.dot(&stacked).map_axis(Axis(1), |r| r.dot(&r).sqrt());
+            grouped.push(component(json!({"own": first}), spread(norms.iter().copied()), &slices));
+            direction.push(component(direction_read(&x, read_of(0, first[1]).view(), first[0]), 1.0, &slices));
+        }
+        // The MLP: per neuron its c_fc row and down_proj column.
+        for n in 0..up.nrows() {
+            let (ins, outs) = (units[4].of(n), units[5].of(n));
+            for &i in &ins {
+                per_slice.push(component(json!({"own": [site(4), i]}), own_width(&h2, read_of(4, i).view(), 1.0), &[[site(4), i]]));
+            }
+            for &i in &outs {
+                per_slice.push(component(json!({"own": [site(5), i]}), own_width(&hidden, read_of(5, i).view(), 1.0), &[[site(5), i]]));
+            }
+            let slices: Vec<[usize; 2]> = ins.iter().map(|&i| [site(4), i]).chain(outs.iter().map(|&i| [site(5), i])).collect();
+            if let Some(&i) = ins.first() {
+                grouped.push(component(json!({"own": [site(4), i]}), own_width(&h2, read_of(4, i).view(), 1.0), &slices));
+                direction.push(component(direction_read(&h2, read_of(4, i).view(), site(4)), 1.0, &slices));
+            }
+        }
+        for (k, s) in layer_sites.iter().enumerate() {
+            let name = format!("h.{l}.{}", crate::library_vpd::EXPORT_NAMES[k]);
+            for (suffix, t) in [("U", &s.u), ("V", &s.v)] {
+                let bytes: Vec<u8> = t.iter().flat_map(|v| v.to_le_bytes()).collect();
+                std::fs::write(dir.join(format!("{name}.{suffix}.f64")), bytes).map_err(error)?;
+                files.insert(format!("{name}.{suffix}"), json!({"shape": [t.nrows(), t.ncols()]}));
+            }
+            sites.push(name);
+        }
+    }
+    std::fs::write(dir.join("export.json"), json!({"config": {"sites": sites, "frame": "heads_neurons"}, "files": files}).to_string()).map_err(error)?;
+    let arms = json!([{"arm": "per_slice_own", "components": per_slice}, {"arm": "grouped_own", "components": grouped}, {"arm": "grouped_direction", "components": direction}]);
+    std::fs::write(dir.join("start.json"), arms.to_string()).map_err(error)?;
+    Ok(json!({"frame": "heads_neurons", "components": grouped.len(), "slices": per_slice.len(), "sites": sites.len()}))
 }
