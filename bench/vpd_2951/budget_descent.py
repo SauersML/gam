@@ -23,6 +23,9 @@ Gate arms (DESCENT_ARM): own (above); dir, a separate signed gate direction per 
 small causal router per layer added to the own read; router_pure, the router alone; share, learned
 gate sharing across the slices of a layer (below).
 Objective (DESCENT_F=1): F, the bits-back code length per training token (below); otherwise KL alone.
+Exactness (DESCENT_EXACT=1): each map's slices are parametrized by a read frame F and its canonical
+dual, so they sum to M's weight at every step whatever F becomes (frame(), below); training moves
+only the frames and the gates, and kl_all_on stays at rounding.
 Wiring (DESCENT_EDGES=1, own arm): the MLP parts' reads of the residual stream are an explicit, fitted
 graph (below), each kept edge charged its index bits.
 Dual step (DESCENT_DUAL): measured (default, library_mdl's rule, below); anneal, the measured rule
@@ -58,7 +61,10 @@ import os
 # with g_i started at the slice's read v_i ||u_i||, signed so its firing on M's fit tokens is kept.
 ARM = os.environ.get('DESCENT_ARM', 'own')
 dev = os.environ.get('DESCENT_DEV') or ('cuda' if torch.cuda.is_available() else 'mps')
-torch.backends.cuda.matmul.allow_tf32 = True
+# DESCENT_EXACT=1: every map's slices sum to M's weight at every step by construction (below), so
+# matmuls run in full float32 (TF32's 10-bit mantissa would break the sum).
+EXACT = os.environ.get('DESCENT_EXACT') == '1'
+torch.backends.cuda.matmul.allow_tf32 = not EXACT
 torch.manual_seed(0)
 T = load_target(dev)
 mlp = [n for n in site_names() if '.mlp.' in n]
@@ -90,6 +96,14 @@ if vpdlike and str(VPD_DIR).endswith('.pth'):
 elif vpdlike:
     shapes = {k: v['shape'] for k, v in json.load(open(VPD_DIR / 'export.json'))['files'].items()}
     load = lambda k: torch.tensor(np.fromfile(VPD_DIR / f'{k}.f64', dtype='<f8').reshape(shapes[k]), dtype=torch.float32, device=dev)
+def frame(F, W):
+    """Exact slices of W from a read frame F (C x d_in rows f_i, C >= d_in, full rank): reads the
+    canonical dual g_i = (F^T F)^-1 f_i and writes W f_i, so sum_i (W f_i) g_i^T = W F^T F (F^T F)^-1 = W
+    for every F. Through the thin QR F = Q R: G^T = R^-1 Q^T, whose rounding error grows with cond(F),
+    not cond(F)^2. Returns V (d_in x C, the reads as columns) and U (C x d_out, the writes)."""
+    Q, R = torch.linalg.qr(F)
+    return torch.linalg.solve_triangular(R, Q.T, upper=True), F @ W.T
+
 P = {}
 for n in mlp:
     W = T.site(n).W
@@ -102,6 +116,17 @@ for n in mlp:
         U = torch.tensor((Us * S).T, dtype=torch.float32, device=dev)
     else:
         V, U = load(n + '.V'), load(n + '.U')
+    if EXACT:
+        # The start's reads kept (the canonical dual is an involution: the frame R (R^T R)^-1 has dual
+        # R), its writes replaced by the exact ones. The SVD start's down_proj has fewer slices than
+        # inputs, so its frame is the hidden (neuron) axis: f_i = e_i, slice i = neuron i.
+        if start == 'svd' and n.endswith('down_proj'):
+            F0 = torch.eye(W.shape[1], device=dev)
+        else:
+            Rd = V.T.cpu().double().numpy()
+            F0 = torch.tensor(Rd @ np.linalg.inv(Rd.T @ Rd), dtype=torch.float32, device=dev)
+        with torch.no_grad():
+            V, U = frame(F0, W)
     with torch.no_grad():
         r = (X[n] @ V).abs() * U.norm(dim=1)
         s = 0.1 * r.pow(2).mean(0).sqrt().clamp_min(1e-12)
@@ -113,6 +138,8 @@ for n in mlp:
             idx = torch.randperm(flat.numel(), device=dev)[:2_000_000]
             tau = torch.full_like(s, torch.quantile(flat[idx], q).item())
     P[n] = {'V': V.clone().requires_grad_(), 'U': U.clone().requires_grad_(), 'tau': tau.clone().requires_grad_(), 's': s}
+    if EXACT:
+        P[n]['F'] = F0.clone().requires_grad_()
     if ARM == 'dir':
         with torch.no_grad():
             c = X[n] @ V
@@ -346,6 +373,9 @@ def example_graph(position):
 
 @torch.no_grad()
 def evaluate(final=False):
+    if EXACT:
+        for n in mlp:
+            P[n]['V'], P[n]['U'] = frame(P[n]['F'], T.site(n).W)
     r = {'kl': [], 'kl_soft': [], 'kl_all_on': [], 'active': [], 'active_soft': [], 'per_map': [], 'edges_active': []}
     graph = None
     for i in range(0, ev.shape[0], 4):
@@ -390,7 +420,7 @@ def evaluate(final=False):
 # threshold's its map's noise scale x 33. DESCENT_LR multiplies every step size (default 1).
 LR = float(os.environ.get('DESCENT_LR', '1'))
 rms = lambda q: q.detach().pow(2).mean().sqrt().item()
-slots = [(P[n], w, rms(P[n][w])) for n in mlp for w in (('V', 'U', 'G') if ARM == 'dir' else ('V', 'U'))]
+slots = [(P[n], w, rms(P[n][w])) for n in mlp for w in (('F',) if EXACT else ('V', 'U')) + (('G',) if ARM == 'dir' else ())]
 slots += [(P[n], 'tau', 100 / 3 * P[n]['s'].mean().item()) for n in mlp]
 # The ramp's log width, started at log s (a ramp as wide as the threshold noise), by 1% per step.
 if gate == 'ramp':
@@ -429,9 +459,13 @@ opt = torch.optim.Adam(groups)
 trainable = [q for g in groups for q in g['params']]
 
 def draw(mean):
-    """Install the posterior mean (mean) or one sample of every tensor (F only)."""
+    """Install the posterior mean (mean) or one sample of every tensor (F only), then (exact) every
+    map's reads and writes from its frame."""
     for cont, key, mu, ls in leaves:
         cont[key] = mu if mean else mu + ls.exp() * torch.randn_like(mu)
+    if EXACT:
+        for n in mlp:
+            P[n]['V'], P[n]['U'] = frame(P[n]['F'], T.site(n).W)
 
 def description_bits():
     """KL(q || p) in bits (F only)."""
