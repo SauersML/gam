@@ -125,7 +125,7 @@ class Vpd4l:
                 z = z * iv.head[:, l][:, None, :, None]
             if record is not None:
                 record["z_last"][:, l] = z[:, -1]
-                record["mean_z"][l] = z[:, 1:].mean(dim=(0, 1))
+                record["mean_z"][l] = z.mean(dim=(0, 1))
                 for kind in ("q_proj", "k_proj", "v_proj"):
                     record["site_in_last"][(l, kind)] = h[:, -1]
                 record["site_in_last"][(l, "o_proj")] = z[:, -1].reshape(B, -1)
@@ -143,7 +143,7 @@ class Vpd4l:
                 elif al == l and ak == "attn":
                     cut_delta[r] = means["mean_attn"][l][None] - attn_out[r]
             if record is not None:
-                record["mean_attn"][l] = attn_out[:, 1:].mean(dim=(0, 1))
+                record["mean_attn"][l] = attn_out.mean(dim=(0, 1))
             mid = x + attn_out
             y = VM.rms(mid, t.norms[2 * l + 1], t.eps)
             for r, (ak, al, ah, bk, bl, bh, route) in cuts.items():
@@ -169,7 +169,8 @@ class Vpd4l:
                         record["probe_values"][r] = inp @ self.parts[(l, pi[0])][1][:, pi[1]]
             mlp_out = self.site(l, "down_proj", act, iv)
             if record is not None:
-                record["mean_mlp"][l] = mlp_out[:, 1:].mean(dim=(0, 1))
+                yb = y.mean(dim=(0, 1))  # the MLP's stand-in write: the MLP on its average normed input
+                record["mean_mlp"][l] = self.site(l, "down_proj", VM.gelu_tanh(self.site(l, "c_fc", yb[None, None], None)), None)[0, 0]
             for r, (ak, al, ah, bk, bl, bh, route) in cuts.items():
                 if al == l and ak == "mlp":
                     cut_delta[r] = means["mean_mlp"][l][None] - mlp_out[r]

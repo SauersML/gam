@@ -17,9 +17,11 @@ logits) inside three question verbs, scale / cut / swap. Pieces of Qwen3-0.6B (n
   a = 0 removes the piece. A weight edit acts at every position (and every generated step).
   cut(node(A) >> node(B).route)
                         path patching: B's read (route query, key or value of a head, input of an MLP,
-                        or logits = the final residual) receives A's AVERAGE write (over this shard's
-                        texts, every position after the first) in place of A's actual write; every
-                        other reader keeps A's actual write.
+                        or logits = the final residual) receives A's STAND-IN write in place of its
+                        actual write, as an undeclared edge in graph.rs: A applied to its average input
+                        over the batch's texts, every token (a head: W_O of its average attention read;
+                        an MLP: the MLP on its average normed input); every other reader keeps A's
+                        actual write.
   swap(P, source)       P's value at the last position (a head's z_h, or the neurons' activations) is the
                         value P computes at the last position of the source text.
 
@@ -207,7 +209,7 @@ class Qwen3:
                 z = z * iv.head[:, l][:, None, :, None]
             if record is not None:
                 record["z_last"][:, l] = z[:, -1]
-                record["mean_z"][l] = z[:, 1:].mean(dim=(0, 1))
+                record["mean_z"][l] = z.mean(dim=(0, 1))  # a head's stand-in read (graph.rs: every token)
                 for r, (pl, ph, pi) in record.get("probes", {}).items():
                     if pl == l and ph >= 0:
                         record["probe_values"][r] = torch.linalg.vector_norm(z[r, :, ph] @ self.Wo[l][:, ph].T, dim=-1)
@@ -226,7 +228,7 @@ class Qwen3:
                     if c[1] == l and c[0] == "attn":
                         cut_delta[r] = means["mean_attn"][l][None] - attn_out[r]
             if record is not None:
-                record["mean_attn"][l] = attn_out[:, 1:].mean(dim=(0, 1))
+                record["mean_attn"][l] = attn_out.mean(dim=(0, 1))
             mid = h + attn_out
             y = layer.post_attention_layernorm(mid)
             if iv is not None:
@@ -269,7 +271,9 @@ class Qwen3:
                         a = self.tc_acts(l, y[r, -1], idx)
                         mlp_out[r, -1] += (values - a) @ self.tc[l]["W_dec"][idx].to(self.dtype)
             if record is not None:
-                record["mean_mlp"][l] = mlp_out[:, 1:].mean(dim=(0, 1))
+                # The MLP's stand-in write (graph.rs): the MLP applied to its average normed input.
+                yb = y.mean(dim=(0, 1))
+                record["mean_mlp"][l] = mlp.down_proj(mlp.act_fn(mlp.gate_proj(yb)) * mlp.up_proj(yb))
             if iv is not None:
                 for r, (ak, al, ah, bk, bl, bh, route) in iv.cuts.items():
                     if al == l and ak == "mlp":
