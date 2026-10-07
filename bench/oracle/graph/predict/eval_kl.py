@@ -147,8 +147,15 @@ def score_set(model, tok, heldout, args, dev, name):
             chunk = qs[s : s + args.batch]
             enc = tok([prompt_text(tok, q) for q in chunk], return_tensors="pt", padding=True, add_special_tokens=False).to(dev)
             with torch.no_grad():
-                gen = model.generate(**enc, max_new_tokens=args.max_new, do_sample=False, pad_token_id=tok.pad_token_id or 0)
-            texts = tok.batch_decode(gen[:, enc["input_ids"].shape[1] :], skip_special_tokens=True)
+                if sft.CHANNEL["module"] is not None:  # the parts' soft tokens enter through the embeddings
+                    parts = torch.tensor([sft.part_index(q) for q in chunk], device=dev)
+                    emb = sft.embed(model, enc["input_ids"], parts)
+                    gen = model.generate(inputs_embeds=emb, attention_mask=enc["attention_mask"], max_new_tokens=args.max_new,
+                                         do_sample=False, pad_token_id=tok.pad_token_id or 0)
+                    texts = tok.batch_decode(gen, skip_special_tokens=True)  # only the new tokens come back
+                else:
+                    gen = model.generate(**enc, max_new_tokens=args.max_new, do_sample=False, pad_token_id=tok.pad_token_id or 0)
+                    texts = tok.batch_decode(gen[:, enc["input_ids"].shape[1] :], skip_special_tokens=True)
             for q, text in zip(chunk, texts):
                 n = q["numbers"]["edited"]
                 strs, V = target_tokens(q, "edited", tok), q.get("vocab", QWEN3_VOCAB)
@@ -186,6 +193,8 @@ def main():
     ap.add_argument("--rank", type=int, default=16)
     ap.add_argument("--alpha", type=float, default=32.0)
     ap.add_argument("--max-new", type=int, default=72)
+    ap.add_argument("--vectors", default="", help="vectors.py table, with --channel: the adapters were trained with the vector channel")
+    ap.add_argument("--channel", default="", help="the channel weights saved beside the adapters")
     ap.add_argument("--stratify", action="store_true", help="per type, up to per_type/4 questions from each size of the measured change")
     ap.add_argument("--format", default="chat", choices=("chat", "raw"), help="the format the adapters were trained with (sft.py)")
     args = ap.parse_args()
@@ -204,6 +213,8 @@ def main():
         for name, a in adapters.items():
             a.A.data.copy_(state[f"{name}.A"])
             a.B.data.copy_(state[f"{name}.B"])
+        if args.vectors:  # the trained vector channel (sft.py --vectors) beside the adapters
+            sft.setup_channel(args.vectors, model, tok, dev, weights=args.channel)
     out = {}
     for spec in args.heldout:
         name, _, pattern = spec.rpartition("=")

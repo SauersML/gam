@@ -29,6 +29,7 @@ import glob
 import json
 import math
 import random
+import re
 import time
 from pathlib import Path
 
@@ -95,7 +96,8 @@ def load_slim(pattern):
         for line in open(path):
             q = json.loads(line)
             by_type.setdefault(q["type"], []).append({"type": q["type"], "input": q["input"], "answer": q["answer"],
-                                                      "text_id": q["text_id"], "changed": changed(q)})
+                                                      "text_id": q["text_id"], "changed": changed(q),
+                                                      "numbers": {k: q["numbers"][k] for k in ("piece", "edge") if k in q["numbers"]}})
     return by_type
 
 
@@ -129,12 +131,85 @@ def changed(q) -> bool:
 FORMAT = {"name": "chat"}  # "chat": Qwen3's chat template (user turn = question, thinking off); "raw": question + SEP
 
 
+# The vector channel (--vectors): parts of a fixed set (vectors.py) enter the oracle as soft tokens after
+# their question, each token = a trainable projection of one of the part's directions and its scale.
+PLACEHOLDER = "<|fim_pad|>"  # one token in Qwen3's vocabulary, never in the questions' text
+CHANNEL = {"table": None, "index": {}, "module": None, "ph": None}
+
+
+def part_of(q):
+    """The fixed-set part a question asks about: the edited or swapped piece, or a cut's writer."""
+    n = q["numbers"]
+    if "piece" in n:
+        return n["piece"]
+    if "edge" in n and (m := re.match(r"node\((.*?)\) >> ", n["edge"])):
+        return m[1]
+    return None
+
+
+def part_index(q) -> int:
+    return CHANNEL["index"].get(part_of(q), -1) if CHANNEL["table"] is not None else -1
+
+
+class Channel(nn.Module):
+    """[n, K, d + 1] part vectors -> [n, K, hidden] embeddings: a linear map plus one learned embedding per
+    slot (which direction it is), rescaled to the RMS of the oracle's token embeddings."""
+
+    def __init__(self, din: int, hidden: int, k: int, emb_rms: float, dev):
+        super().__init__()
+        self.proj = nn.Linear(din, hidden).to(dev)
+        self.slot = nn.Parameter(torch.randn(k, hidden, device=dev) * 0.02)
+        self.emb_rms = emb_rms
+
+    def forward(self, x):
+        y = self.proj(x) + self.slot
+        return self.emb_rms * y / y.pow(2).mean(-1, keepdim=True).add(1e-6).sqrt()
+
+
+def setup_channel(path, model, tok, dev, weights=None):
+    """Loads the part table and builds (or loads) the projection."""
+    from safetensors import safe_open
+    from safetensors.torch import load_file
+
+    with safe_open(path, "pt") as f:
+        CHANNEL["table"] = f.get_tensor("vectors").to(dev)
+        pieces = json.loads(f.metadata()["pieces"])
+    CHANNEL["index"] = {p: i for i, p in enumerate(pieces)}
+    CHANNEL["ph"] = tok.convert_tokens_to_ids(PLACEHOLDER)
+    emb = model.get_input_embeddings().weight
+    rms = float(emb.detach().float().pow(2).mean(-1).sqrt().mean())
+    _, k, din = CHANNEL["table"].shape
+    CHANNEL["module"] = Channel(din, emb.shape[1], k, rms, dev)
+    if weights:
+        CHANNEL["module"].load_state_dict(load_file(weights))
+    return list(CHANNEL["module"].parameters())
+
+
 def prompt_text(tok, q) -> str:
     """The oracle's context for a question: Qwen3's chat template with the question as the user turn and
-    thinking off (the format g-rl's program training uses), or the first run's raw format."""
+    thinking off (the format g-rl's program training uses), or the first run's raw format. With the vector
+    channel, a question about a part of the set carries "<part>" and K placeholders before its question line."""
+    text = q["input"]
+    if part_index(q) >= 0:
+        k = CHANNEL["table"].shape[1]
+        text = text.replace("<question>", "<part> " + PLACEHOLDER * k + "\n<question>", 1)
     if FORMAT["name"] == "raw":
-        return q["input"] + SEP
-    return tok.apply_chat_template([{"role": "user", "content": q["input"]}], tokenize=False, add_generation_prompt=True, enable_thinking=False)
+        return text + SEP
+    return tok.apply_chat_template([{"role": "user", "content": text}], tokenize=False, add_generation_prompt=True, enable_thinking=False)
+
+
+def embed(model, ids, parts):
+    """Token embeddings with each row's placeholders replaced by its part's channel embeddings."""
+    emb = model.get_input_embeddings()(ids)
+    if CHANNEL["module"] is None or parts is None or not bool((parts >= 0).any()):
+        return emb
+    emb = emb.clone()
+    rows = (parts >= 0).nonzero()[:, 0]
+    soft = CHANNEL["module"](CHANNEL["table"][parts[rows]]).to(emb.dtype)  # [n, K, hidden]
+    for j, b in enumerate(rows.tolist()):
+        pos = (ids[b] == CHANNEL["ph"]).nonzero()[:, 0]
+        emb[b, pos] = soft[j, : len(pos)]
+    return emb
 
 
 def end_id(tok) -> int:
@@ -159,12 +234,13 @@ def collate(tok, items, max_tokens, dev):
         ids[r, : len(s)] = torch.tensor(s)
         labels[r, len(p) : len(s)] = torch.tensor(a)
         mask[r, : len(s)] = 1
-    return ids.to(dev), labels.to(dev), mask.to(dev)
+    parts = torch.tensor([part_index(q) for q in items], device=dev)
+    return ids.to(dev), labels.to(dev), mask.to(dev), parts
 
 
-def answer_bits(model, ids, labels, mask):
+def answer_bits(model, ids, labels, mask, parts=None):
     """Per sequence: the answer's bits and its token count (the head runs at the answer positions only)."""
-    h = model.model(input_ids=ids, attention_mask=mask).last_hidden_state[:, :-1]
+    h = model.model(inputs_embeds=embed(model, ids, parts), attention_mask=mask).last_hidden_state[:, :-1]
     target = labels[:, 1:]
     valid = target != -100
     lp = torch.log_softmax(model.lm_head(h[valid]).float(), dim=-1)
@@ -181,8 +257,8 @@ def evaluate(model, tok, heldout, per_type, batch, max_tokens, dev):
         qs = qs[:per_type]
         bits, count = [], []
         for s in range(0, len(qs), batch):
-            ids, labels, mask = collate(tok, qs[s : s + batch], max_tokens, dev)
-            b, n = answer_bits(model, ids, labels, mask)
+            ids, labels, mask, parts = collate(tok, qs[s : s + batch], max_tokens, dev)
+            b, n = answer_bits(model, ids, labels, mask, parts)
             bits += b.tolist()
             count += n.tolist()
         mean = sum(bits) / len(bits)
@@ -197,8 +273,8 @@ def evaluate(model, tok, heldout, per_type, batch, max_tokens, dev):
             alt = [dict(q, answer=nc) for _, q, nc in pairs]
             alt_bits = []
             for s in range(0, len(alt), batch):
-                ids, labels, mask = collate(tok, alt[s : s + batch], max_tokens, dev)
-                alt_bits += answer_bits(model, ids, labels, mask)[0].tolist()
+                ids, labels, mask, parts = collate(tok, alt[s : s + batch], max_tokens, dev)
+                alt_bits += answer_bits(model, ids, labels, mask, parts)[0].tolist()
             true_bits = [bits[i] for i, _, _ in pairs]
             d = [t - a for t, a in zip(true_bits, alt_bits)]
             moved = [x for x, (_, q, _) in zip(d, pairs) if changed(q)]
@@ -245,6 +321,8 @@ def main():
     ap.add_argument("--alpha", type=float, default=32.0)
     ap.add_argument("--eval-per-type", type=int, default=128)
     ap.add_argument("--hours", type=float, default=1.8)
+    ap.add_argument("--channel", default="", help="with --eval-only: the trained channel (channel.safetensors)")
+    ap.add_argument("--vectors", default="", help="vectors.py table: questions about its parts carry the parts' vectors as soft tokens")
     ap.add_argument("--changed-min", type=float, default=0.1, help="threshold of changed() in bits: --changed-share draws from questions above it")
     ap.add_argument("--types", default="", help="train only on these question types (comma-separated), e.g. the types two compared runs share")
     ap.add_argument("--changed-share", type=float, default=0.5,
@@ -307,6 +385,8 @@ def main():
         for name, a in adapters.items():
             a.A.data.copy_(state[f"{name}.A"])
             a.B.data.copy_(state[f"{name}.B"])
+        if args.vectors:  # the trained channel beside the adapters (channel*.safetensors)
+            setup_channel(args.vectors, model, tok, dev, weights=args.channel)
         set_adapters(True)
         trained = evaluate_sets(args.eval_per_type)
         result = {"adapters": args.eval_only, "base": base, "trained": trained,
@@ -318,6 +398,8 @@ def main():
     print(json.dumps({"base": base}), flush=True)
     set_adapters(True)
     eval_seconds = time.time() - started
+    if args.vectors:  # after the base model's evaluation (it has no channel); trains with the adapters
+        params += setup_channel(args.vectors, model, tok, dev)
 
     opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=0.0)
     big = dev.type == "cuda" and torch.cuda.get_device_properties(0).total_memory > 40 * 2**30
@@ -335,8 +417,8 @@ def main():
             kind = random.choice(types)
             pool = moved[kind] if moved[kind] and random.random() < args.changed_share else train[kind]
             items.append(random.choice(pool))
-        ids, labels, mask = collate(tok, items, args.max_tokens, dev)
-        bits, n = answer_bits(model, ids, labels, mask)
+        ids, labels, mask, parts = collate(tok, items, args.max_tokens, dev)
+        bits, n = answer_bits(model, ids, labels, mask, parts)
         loss = bits.sum() / n.sum() * math.log(2)  # nats per answer token
         loss.backward()
         torch.nn.utils.clip_grad_norm_(params, 1.0)
@@ -350,6 +432,8 @@ def main():
 
             save_file({f"{k}.{n}": getattr(a, n).detach().cpu().contiguous() for k, a in adapters.items() for n in ("A", "B")},
                       str(out / f"adapters_step{step}.safetensors"))
+            if CHANNEL["module"] is not None:
+                save_file({k: v.detach().cpu().contiguous() for k, v in CHANNEL["module"].state_dict().items()}, str(out / f"channel_step{step}.safetensors"))
         if args.eval_every and step % args.eval_every == 0:
             curve = {"step": step, "heldout": evaluate_sets(args.curve_per_type)}
             log.write(json.dumps(curve) + "\n")
@@ -364,6 +448,8 @@ def main():
 
     save_file({f"{k}.{n}": getattr(a, n).detach().cpu().contiguous() for k, a in adapters.items() for n in ("A", "B")}, str(out / "adapters.safetensors"))
     save_peft(out / "adapters.safetensors", out / "peft", args.model, args.rank, args.alpha)
+    if CHANNEL["module"] is not None:
+        save_file({k: v.detach().cpu().contiguous() for k, v in CHANNEL["module"].state_dict().items()}, str(out / "channel.safetensors"))
     trained = evaluate_sets(args.eval_per_type)
     result = {"steps": step, "base": base, "trained": trained,
               "gain_bits_per_question": {n: {k: base[n][k]["bits_per_question"] - t[k]["bits_per_question"] for k in t} for n, t in trained.items()},
