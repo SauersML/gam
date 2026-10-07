@@ -87,8 +87,9 @@ def pieces_of(unit, min_neurons: int):
 class Pool:
     """`workers` checker processes with the behavior loaded; scores programs in parallel."""
 
-    def __init__(self, model: str, behavior: Path, workers: int, export: Path | None = None):
+    def __init__(self, model: str, behavior: Path, workers: int, export: Path | None = None, stand_in: str | None = None):
         self.checkers = [score.Checker(model, export) for _ in range(workers)]
+        self.extra = {} if stand_in is None else {"stand_in": stand_in}
         for c in self.checkers:
             c.behavior(behavior)
         self.calls = 0
@@ -98,7 +99,7 @@ class Pool:
             c = self.checkers[k % len(self.checkers)]
             out = []
             for i in range(k, len(programs), len(self.checkers)):
-                out.append((i, c.score(programs[i], experiments=experiments, seed=seed, reader=False)))
+                out.append((i, c.score(programs[i], experiments=experiments, seed=seed, reader=False, **self.extra)))
             return out
 
         with ThreadPoolExecutor(len(self.checkers)) as ex:
@@ -169,13 +170,14 @@ def main() -> None:
     ap.add_argument("--out", type=Path, default=OUT)
     ap.add_argument("--start", help="comma-separated units to start from (h<l>_<h>, m<l>_<start>_<stop>)")
     ap.add_argument("--tag", default="", help="suffix of the output names")
+    ap.add_argument("--stand-in", help="the checker's stand-in option (counterfactual, global, position, ...)")
     a = ap.parse_args()
     path = a.behavior.expanduser()
     behavior = json.loads(path.read_text())
     model = behavior["model"]
     out = a.out.expanduser()
     out.mkdir(parents=True, exist_ok=True)
-    pool = Pool(model, path, a.workers, a.export)
+    pool = Pool(model, path, a.workers, a.export, a.stand_in)
     try:
         for mode in (["addition", "removal"] if a.mode == "both" else [a.mode]):
             start = pool.calls
@@ -189,12 +191,12 @@ def main() -> None:
                 start = [unit_of(t) for t in a.start.split(",")] if a.start else None
                 found = greedy(pool, model, mode, a.experiments, a.seed, a.min_neurons, log, start)
                 heldout = pool.score([found["source"]], a.experiments, a.heldout_seed)[0]
-                found.update(units=[name(u) for u in found["units"]], heldout=heldout, calls=pool.calls - start,
+                found.update(units=[name(u) for u in found["units"]], heldout=heldout, calls=pool.calls - start, stand_in=a.stand_in,
                              experiments=a.experiments, seed=a.seed, heldout_seed=a.heldout_seed)
                 log(f"{mode}: {len(found['units'])} units, {found['score']['total_bits']:.6g} bits (held-out seed "
                     f"{heldout['total_bits']:.6g}), {found['calls']} checker calls")
             (out / f"{stem}.json").write_text(json.dumps(found, indent=1))
-            e2e.record([e2e.status_line(model, behavior["id"], f"search_{mode}{a.tag}", found["heldout"])])
+            e2e.record([e2e.status_line(model, behavior["id"], f"search_{mode}{a.tag}", found["heldout"], a.stand_in)])
     finally:
         pool.close()
 

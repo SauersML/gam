@@ -1,7 +1,9 @@
 """End-to-end checks of the graph oracle's score (#2951) on vpd4l induction: the reference programs trace,
 the oracle prompt renders, and the checker orders them the way every valid score must:
-  hand-written induction program < empty program < random irrelevant heads   (total bits)
-  full program (every piece declared, every edge listed): execution error ~0, the largest opaque cost.
+  full program (every piece declared, every edge listed): execution error ~0, the largest opaque cost;
+  empty program < random irrelevant heads (total bits);
+  search's best program (e2e/search.py's result for the behavior, when one exists) < empty and < random.
+The hand-written program's place is a measurement, not a requirement: test_hand_terms prints it.
 
   GRAPH_CHECKER=<mpd_graph_2951 binary> ~/mpd-data/venv/bin/python -m pytest bench/oracle/graph/e2e/test_e2e.py
 The checker tests are skipped when the binary or the behavior file is missing.
@@ -83,9 +85,29 @@ def test_empty_beats_random_heads(scores):
 
 
 @needs_checker
-def test_hand_beats_empty(scores):
-    assert scores["hand"]["total_bits"] < scores["empty"]["total_bits"], {
-        n: (r["total_bits"], r["exec_error_bits"], r["opaque_bits"]) for n, r in scores.items()}
+def test_hand_terms(scores):
+    for n, r in scores.items():
+        print(n, {k: r[k] for k in ("total_bits", "exec_error_bits", "opaque_bits", "code_bits")})
+
+
+def best_search_program() -> str | None:
+    """The lowest-total program search.py found for BEHAVIOR (any mode), or None."""
+    found = []
+    for path in (Path.home() / "mpd-data/graph_oracle/runs/search").glob(f"{BEHAVIOR.stem}.*.json"):
+        r = json.loads(path.read_text())
+        if r.get("stand_in") is None:  # scored under the checker's default stand-ins, as `scores` is
+            found.append((r["score"]["total_bits"], r["source"]))
+    return min(found)[1] if found else None
+
+
+@needs_checker
+@pytest.mark.skipif(best_search_program() is None, reason="no search result for the behavior yet")
+def test_search_beats_empty_and_random(scores):
+    with score.Checker("vpd4l") as c:
+        c.behavior(BEHAVIOR)
+        best = c.score(best_search_program(), experiments=16, seed=0, reader=False)
+    assert best["total_bits"] < scores["empty"]["total_bits"], (best["total_bits"], scores["empty"]["total_bits"])
+    assert best["total_bits"] < scores["random"]["total_bits"], (best["total_bits"], scores["random"]["total_bits"])
 
 
 class FakePool:

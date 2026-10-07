@@ -31,7 +31,8 @@ import score  # noqa: E402
 
 STATUS = Path.home() / "mpd-data/graph_oracle/runs/status.tsv"
 COLUMNS = ["time", "model", "behavior", "program", "total_bits", "exec_error_bits", "reader_error_bits", "code_bits",
-           "python_tokens", "opaque_numbers", "opaque_bits", "N", "experiments", "valid", "clean_kl_bits", "checker"]
+           "python_tokens", "opaque_numbers", "opaque_bits", "N", "experiments", "valid", "clean_kl_bits", "checker",
+           "stand_in"]
 
 
 def sources(names: list[str], model: str, seed: int) -> dict[str, str]:
@@ -39,15 +40,18 @@ def sources(names: list[str], model: str, seed: int) -> dict[str, str]:
     return {Path(n).stem if n not in refs else n: refs[n] if n in refs else Path(n).read_text() for n in names}
 
 
-def status_line(model: str, behavior: str, name: str, result: dict) -> list[str]:
+def status_line(model: str, behavior: str, name: str, result: dict, stand_in: str | None = None) -> list[str]:
     clean = result.get("per_family", {}).get("clean", {}).get("mean_kl_bits")
     row = {"time": time.strftime("%Y-%m-%d %H:%M"), "model": model, "behavior": behavior, "program": name,
-           "clean_kl_bits": clean, "checker": Path(str(score.BINARY)).name, **result}
+           "clean_kl_bits": clean, "checker": Path(str(score.BINARY)).name, "stand_in": stand_in or "default", **result}
     return [("" if row.get(c) is None else f"{row[c]:.6g}" if isinstance(row[c], float) else str(row[c])) for c in COLUMNS]
 
 
 def record(lines: list[list[str]], path: Path = STATUS) -> None:
+    """Appends to the status table; a table with other columns is moved aside first."""
     path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists() and path.read_text().split("\n", 1)[0] != "\t".join(COLUMNS):
+        path.rename(path.with_name(f"{path.stem}.{time.strftime('%Y%m%d-%H%M%S')}{path.suffix}"))
     new = not path.exists()
     with path.open("a") as f:
         if new:
@@ -57,19 +61,22 @@ def record(lines: list[list[str]], path: Path = STATUS) -> None:
 
 
 def run(behavior_path: Path, names: list[str], experiments: int = 32, seed: int = 0, reader: bool = True,
-        write_status: bool = True, items_dir: Path | None = None) -> dict[str, dict]:
+        write_status: bool = True, items_dir: Path | None = None, stand_in: str | None = None,
+        export: Path | None = None) -> dict[str, dict]:
     """Scores each program; without a reader server (GRAPH_READER) and with `items_dir`, writes each
     program's reader items to items_dir/<behavior>.<program>.items.jsonl and the program to
-    items_dir/<behavior>.<program>.program.jsonl, the inputs of `reader_score.py score`."""
+    items_dir/<behavior>.<program>.program.jsonl, the inputs of `reader_score.py score`. `stand_in`
+    is the checker's stand-in option (score.py's default when None)."""
     behavior = json.loads(behavior_path.read_text())
     model = behavior["model"]
     text = prompt.render(behavior)  # the oracle's input; the reference programs do not read it
     results = {}
-    with score.Checker(model) as checker:
+    extra = {} if stand_in is None else {"stand_in": stand_in}
+    with score.Checker(model, export) as checker:
         checker.behavior(behavior_path)
         for name, source in sources(names, model, seed).items():
             t = time.time()
-            result = checker.score(source, experiments=experiments, seed=seed, reader=reader or items_dir is not None)
+            result = checker.score(source, experiments=experiments, seed=seed, reader=reader or items_dir is not None, **extra)
             items = result.pop("items", None)
             if items and items_dir is not None:
                 items_dir.mkdir(parents=True, exist_ok=True)
@@ -79,7 +86,7 @@ def run(behavior_path: Path, names: list[str], experiments: int = 32, seed: int 
             result["seconds"] = time.time() - t
             results[name] = result
     if write_status:
-        record([status_line(model, behavior["id"], n, r) for n, r in results.items()])
+        record([status_line(model, behavior["id"], n, r, stand_in) for n, r in results.items()])
     results["_prompt_characters"] = len(text)
     return results
 
@@ -105,8 +112,11 @@ def main() -> None:
     ap.add_argument("--no-reader", action="store_true")
     ap.add_argument("--json", type=Path, help="also write the full results here")
     ap.add_argument("--items", type=Path, help="without GRAPH_READER: write the reader items of each program here")
+    ap.add_argument("--stand-in", help="the checker's stand-in option (counterfactual, global, position, ...)")
+    ap.add_argument("--export", type=Path, help="the model's export directory (score.py's default otherwise)")
     a = ap.parse_args()
-    results = run(a.behavior.expanduser(), a.programs, a.experiments, a.seed, reader=not a.no_reader, items_dir=a.items)
+    results = run(a.behavior.expanduser(), a.programs, a.experiments, a.seed, reader=not a.no_reader, items_dir=a.items,
+                  stand_in=a.stand_in, export=a.export)
     print(table(results))
     if a.json:
         a.json.write_text(json.dumps(results, indent=1))
