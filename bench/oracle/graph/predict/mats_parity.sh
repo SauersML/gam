@@ -1,19 +1,20 @@
 #!/usr/bin/env bash
 # Parity of generate.py against oracle.rs on MATS (#2951), one CPU job with the commit's binaries:
 #   MATS_QOS=debug MATS_BUILD=1 mats-run predict-parity 16 24 1 -- bash /Users/user/gam/bench/oracle/graph/predict/mats_parity.sh \
-#       /Users/user/mpd-data/cluster/predict-parity /Users/user/mpd-data/qwen3_fineweb/heldout/windows_T128.u32
+#       /Users/user/mpd-data/cluster/predict-parity /Users/user/mpd-data/qwen3_fineweb/heldout/windows_T128.u32 \
+#       /Users/user/gam/target/release/examples/mpd_oracle_2951
 # A small held-out shard is generated on the CPU (float32), then each sampled question is measured again by
 # mpd_oracle_2951 (float64 host execution); the report is OUT/parity.json.
 set -Eeuo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
-OUT=$1 WIN=$2
+OUT=$1 WIN=$2 SERVER=${3:-$MPD_BIN/mpd_oracle_2951}
 PY=$HOME/oracle-venv/bin/python
 export HF_HUB_OFFLINE=1
 SNAP=$($PY -c "from huggingface_hub import snapshot_download; print(snapshot_download('Qwen/Qwen3-0.6B'))")
 mkdir -p "$OUT"
 $PY "$here/generate.py" --model "$SNAP" --windows "$WIN" --out "$OUT/parity_shard.jsonl" --texts 32 --batch 16 --lengths 24,32 --split heldout --seed 7
 PORT=$((40000 + ${SLURM_JOB_ID:-1} % 20000))
-"$MPD_BIN/mpd_oracle_2951" "127.0.0.1:$PORT" 8 "qwen=$SNAP" > "$OUT/server.log" 2>&1 &
+"$SERVER" "127.0.0.1:$PORT" 8 "qwen=$SNAP" > "$OUT/server.log" 2>&1 &
 server=$!
 $PY -c "
 import socket, sys, time
