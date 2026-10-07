@@ -222,6 +222,26 @@ api() {
 status_of() { printf '%s' "${1##*$'\n'}"; }
 body_of() { printf '%s' "${1%$'\n'*}"; }
 gql() { api POST "$GRAPHQL" "$(jq -nc --arg q "$1" '{query: $q}')"; }
+# The RunPod API server's clock in epoch seconds (its Date header); empty when it does not answer.
+# A pod's age is that less the pod's lastStartedAt, never a reading of the Mac's clock: after the
+# 10-06 20:05 reboot the Mac's ran 1 h 45 min slow, so every pod read as not yet started and the
+# orphan sweep never fired, and a clock set right jumps forward and reaches every cap early.
+server_now() {
+    local d
+    d=$(curl -sS -o /dev/null --max-time 20 -w '%header{date}' "$REST/pods" 2> /dev/null) || return 0
+    LC_ALL=C date -j -u -f '%a, %d %b %Y %H:%M:%S GMT' "$d" +%s 2> /dev/null || true
+}
+# A RunPod time ("2026-10-07 04:21:30.493 +0000 UTC") in epoch seconds.
+epoch_of() { date -j -u -f '%Y-%m-%d %H:%M:%S' "${1:0:19}" +%s 2> /dev/null; }
+# Seconds RunPod pod POD has run by the API's clock (from its lastStartedAt); empty when unknown.
+pod_age() {  # POD
+    local r s n
+    r=$(api GET "$REST/pods/$1")
+    [ "$(status_of "$r")" = 200 ] || return 0
+    s=$(epoch_of "$(jq -r '.lastStartedAt // .createdAt // ""' <<< "$(body_of "$r")" 2> /dev/null)") || return 0
+    n=$(server_now)
+    [ -z "$n" ] || echo $(( n - s ))
+}
 
 # Providers besides RunPod, each used only while the macOS Keychain holds its credentials (service
 # PROVIDER-api-key): with thunder listed, `security add-generic-password -s thunder-api-key -a "$USER" -w`
@@ -524,6 +544,14 @@ owned() {  # POD; 0 ours, 1 not ours, 2 unknown (RunPod gave no answer: the Mac 
     esac
 }
 
+# The SSH key directory POD's record names (a run's, under RP/.ssh), deleted with the record.
+drop_keys() {  # POD
+    local keys
+    read -r _ _ keys _ < "$ACTIVE/.$1.ssh" 2> /dev/null || return 0
+    [[ $keys == "$RP/.ssh/"?* ]] && rm -rf "$keys"
+    return 0
+}
+
 # The live runs on POD other than this process, one pid per line: the run that made it (its
 # record's owner) and the runs packed onto it (active/.POD.guests/NAME, each holding its pid).
 holders() {  # POD
@@ -555,12 +583,19 @@ reap() {  # POD [cap]
     done
     if (( o == 1 )); then
         echo "rp-run: pod $pod is not ours (not named mpd2951- or not created by rp-run); not deleting it, dropping its record" >&2
+        drop_keys "$pod"
         rm -f "$rec" "$ACTIVE/.$pod".*
         return 0
     fi
-    local name gpu cloud price created ended upload_s data_s wait_s end
+    local name gpu cloud price created ended upload_s data_s wait_s end started_api=""
     read -r name gpu cloud price created _ _ _ upload_s data_s wait_s < "$rec"
     end=$(cat "$ACTIVE/.$pod.end" 2> /dev/null || echo deleted)
+    # The ledger's hours run from the pod's lastStartedAt to its deletion by the API's clock; the
+    # record's creation and the Mac's clock only where the API gives no time.
+    if [ "$(provider_of "$pod")" = runpod ]; then
+        r=$(api GET "$REST/pods/$pod")
+        [ "$(status_of "$r")" != 200 ] || started_api=$(epoch_of "$(jq -r '.lastStartedAt // .createdAt // ""' <<< "$(body_of "$r")" 2> /dev/null)") || started_api=""
+    fi
     gpu=${gpu//_/ }
     while (( tries < 20 )); do
         if [ "$(provider_of "$pod")" != runpod ]; then
@@ -593,6 +628,10 @@ reap() {  # POD [cap]
         sleep 6
     done
     ended=$(date +%s)
+    if [ -n "$started_api" ]; then
+        r=$(server_now)
+        [ -z "$r" ] || { created=$started_api; ended=$r; }
+    fi
     if (( ! gone )); then
         echo "rp-run: POD $pod MAY STILL BE RUNNING: deletion not confirmed after $tries attempts; delete it at https://console.runpod.io/pods" >&2
         return 1
@@ -623,6 +662,7 @@ reap() {  # POD [cap]
         line="pod $pod deleted (confirmed). $gpu ($cloud) at \$$price/h x $hours h = \$$dollars; ledger total \$$total"
         echo "rp-run: $line" >&2
         [ -d "$RP/$name" ] && echo "$(date '+%F %T') $line" >> "$RP/$name/cost.txt"
+        drop_keys "$pod"
         rm -f "$rec" "$ACTIVE/.$pod.deadline" "$ACTIVE/.$pod.owner" "$ACTIVE/.$pod.approval" "$ACTIVE/.$pod.ssh" "$ACTIVE/.$pod.end"
         rm -rf "$ACTIVE/.$pod.guests"
     fi
@@ -637,7 +677,18 @@ if [ "${1:-}" = --watch ]; then
     pod=$2 parent=$3 deadline=$4 guest=${5:-}
     trap '' INT HUP
     due() { if [ -n "$guest" ]; then echo "$deadline"; else cat "$ACTIVE/.$pod.deadline" 2> /dev/null || echo "$deadline"; fi; }
-    while kill -0 "$parent" 2> /dev/null && [ -f "$ACTIVE/$pod" ] && (( $(date +%s) < $(due) )); do sleep 10; done
+    while :; do
+        while kill -0 "$parent" 2> /dev/null && [ -f "$ACTIVE/$pod" ] && (( $(date +%s) < $(due) )); do sleep 10; done
+        # A Mac clock set forward reaches the cap early: the pod's own age by the API's clock
+        # decides, against the time its record allows (deadline less creation, both the runner's
+        # readings), and the deadline moves by the difference.
+        [ -z "$guest" ] && kill -0 "$parent" 2> /dev/null && [ -f "$ACTIVE/$pod" ] || break
+        read -r _ _ _ _ c _ < "$ACTIVE/$pod" 2> /dev/null || break
+        age=$(pod_age "$pod")
+        [ -n "$age" ] && (( $(due) - c - age > 60 )) || break
+        echo "rp-run: the Mac's clock reached $pod's cap $(( $(due) - c - age )) s before the pod's own age did; the cap moves" >&2
+        echo $(( $(date +%s) + $(due) - c - age )) > "$ACTIVE/.$pod.deadline"
+    done
     if [ -n "$guest" ]; then
         if kill -0 "$parent" 2> /dev/null; then
             echo "rp-run: $guest reached its HOURS cap on pod $pod; stopping it" >&2
@@ -753,10 +804,12 @@ sweep_orphans() {
     local r id name created price gpu start now rec hours dollars
     r=$(api GET "$REST/pods?includeMachine=true" 2> /dev/null) || return 0
     [ "$(status_of "$r")" = 200 ] || return 0
-    now=$(date +%s)
+    # Ages by the API's clock: without it no pod's age is known and none is swept.
+    now=$(server_now)
+    [ -n "$now" ] || return 0
     while IFS=$'\t' read -r id name created price gpu; do
         [ -n "$id" ] && [[ $name == mpd2951-* ]] && registered "$id" || continue
-        start=$(date -j -u -f '%Y-%m-%d %H:%M:%S' "${created:0:19}" +%s 2> /dev/null) || continue
+        start=$(epoch_of "$created") || continue
         (( now - start > 600 )) || continue
         rec=$ACTIVE/$id
         if [ -f "$rec" ]; then
@@ -767,13 +820,13 @@ sweep_orphans() {
         else
             echo "rp-run: ORPHAN pod $id (${name#mpd2951-}) is ours with no record and no run, up $(( (now - start) / 60 )) minutes; deleting it" >&2
             api DELETE "$REST/pods/$id" > /dev/null 2>&1 || continue
-            hours=$(awk -v a="$start" -v b="$(date +%s)" 'BEGIN { printf "%.4f", (b - a) / 3600 }')
+            hours=$(awk -v a="$start" -v b="$now" 'BEGIN { printf "%.4f", (b - a) / 3600 }')
             dollars=$(awk -v h="$hours" -v p="$price" 'BEGIN { printf "%.4f", h * p }')
             until mkdir "$RP/.ledger.lock" 2> /dev/null; do sleep 1; done
             printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t-\t-\t-\torphaned\t-\t-\n' "$(date '+%F %T')" "${name#mpd2951-}" "$gpu" - "$hours" "$dollars" "$id" >> "$LEDGER"
             rmdir "$RP/.ledger.lock"
         fi
-    done < <(jq -r '.[] | select(.desiredStatus == "RUNNING") | [.id, (.name // ""), (.createdAt // ""), (.costPerHr // 0), (.machine.gpuTypeId // .gpu.id // "?")] | @tsv' <<< "$(body_of "$r")" 2> /dev/null)
+    done < <(jq -r '.[] | select(.desiredStatus == "RUNNING") | [.id, (.name // ""), (.lastStartedAt // .createdAt // ""), (.costPerHr // 0), (.machine.gpuTypeId // .gpu.id // "?")] | @tsv' <<< "$(body_of "$r")" 2> /dev/null)
     return 0
 }
 
@@ -784,7 +837,7 @@ case ${1:-} in
         [ $# -eq 1 ] || usage
         r=$(api GET "$REST/pods?includeMachine=true")
         [ "$(status_of "$r")" = 200 ] || { echo "rp-run: pod list failed: $(body_of "$r" | head -c 200)" >&2; exit 1; }
-        pods=$(jq -r '.[] | select(.desiredStatus == "RUNNING") | [.id, .name, (.costPerHr // 0), (.machine.gpuTypeId // .gpu.id // .cpuFlavorId // "?"), (.createdAt // ""), (.publicIp // "-"), (.portMappings["22"] // "-")] | @tsv' <<< "$(body_of "$r")")
+        pods=$(jq -r '.[] | select(.desiredStatus == "RUNNING") | [.id, .name, (.costPerHr // 0), (.machine.gpuTypeId // .gpu.id // .cpuFlavorId // "?"), (.lastStartedAt // .createdAt // ""), (.publicIp // "-"), (.portMappings["22"] // "-")] | @tsv' <<< "$(body_of "$r")")
         # Thunder's instances, as rows of the same form: ours named from the registry, priced and
         # timed from their records (creation time in UTC, as RunPod gives it).
         if thunder_enabled; then
@@ -824,6 +877,9 @@ case ${1:-} in
             fi
         fi
         now=$(date +%s)
+        # Pods' hours by the API's clock (server_now), the Mac's only when the API gives none.
+        snow=$(server_now)
+        snow=${snow:-$now}
         # Each held GPU pod's mean GPU utilization over the last 10 minutes, read from its own samples
         # through its runner's SSH key, all pods at once. A pod held by a runner from before the
         # samples (no .ssh record) is read now, over 5 s, with whichever run key reaches it ("*").
@@ -838,7 +894,7 @@ case ${1:-} in
                     > "$utils/$id" 2> /dev/null < /dev/null &
             elif [ "$pip" != - ] && [ "$pport" != - ]; then
                 (
-                    for key in /tmp/rp-run.*/key; do
+                    for key in "$RP"/.ssh/*/key; do
                         u=$(ssh -F none -i "$key" -o IdentitiesOnly=yes -o BatchMode=yes -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no \
                             -o ConnectTimeout=5 -o LogLevel=ERROR -p "$pport" "root@$pip" \
                             'nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits -l 1 & p=$!; sleep 5; kill $p' 2> /dev/null < /dev/null |
@@ -879,8 +935,8 @@ case ${1:-} in
                 idle_rate=$(awk -v a="$idle_rate" -v p="$price" 'BEGIN { print a + p }')
             fi
             # The pod's own creation time, which the account bills from.
-            start=$(date -j -u -f '%Y-%m-%d %H:%M:%S' "${created:0:19}" +%s 2> /dev/null || echo "$now")
-            up=$(awk -v a="$start" -v n="$now" 'BEGIN { printf "%.2f", (n - a) / 3600 }')
+            start=$(epoch_of "$created" || echo "$snow")
+            up=$(awk -v a="$start" -v n="$snow" 'BEGIN { printf "%.2f", (n - a) / 3600 }')
             printf '%-15s %-22s %-9s %-22s %6s %5s %5s %7s %6s %6s %-9s %s\n' "$id" "${name:0:22}" "${owner:0:9}" "$(cut -c1-22 <<< "${gpu#NVIDIA } ${kind%%:*}")" "$price" "${util:--}" "$up" \
                 "$(awk -v p="$price" -v u="$up" 'BEGIN { printf "%.2f", p * u }')" "$left" "$setup" "${flag:--}" "$last"
             # Runs packed onto this pod.
@@ -1666,13 +1722,21 @@ LOG=$OUT/run.log
 rm -f "$OUT/data.log"
 say() { echo "rp-run: $*" >&2; echo "$(date '+%F %T') $*" >> "$OUT/rp-run.log"; }
 TMP=$(mktemp -d /tmp/rp-run.XXXXXX)
-ssh-keygen -q -t ed25519 -N '' -C "rp-run $NAME" -f "$TMP/key"
-chmod 600 "$TMP/key"
-KEYS="$( [ -f "$TMP/key.pub" ] && cat "$TMP/key.pub")"$'\n'"$(cat ~/.ssh/runpod_ed25519.pub)"
+# The run's SSH key and known hosts are kept beside the runs (RP/.ssh/NAME.PID, mode 700 and 600),
+# not in /tmp: the 10-06 20:05 reboot wiped /tmp and left every live pod unreachable. Outside OUT,
+# so no output restore, scan or publish of the run's directory carries the key. Deleted when the
+# run ends, or with the pod's record (drop_keys) when the pod outlives it.
+KEYDIR=$RP/.ssh/$NAME.$$
+mkdir -p -m 700 "$RP/.ssh"
+rm -rf "$KEYDIR"
+mkdir -m 700 "$KEYDIR"
+ssh-keygen -q -t ed25519 -N '' -C "rp-run $NAME" -f "$KEYDIR/key"
+chmod 600 "$KEYDIR/key"
+KEYS="$( [ -f "$KEYDIR/key.pub" ] && cat "$KEYDIR/key.pub")"$'\n'"$(cat ~/.ssh/runpod_ed25519.pub)"
 POD="" IP="" PORT="" VCPU="" ATTEMPTED=0 DEADLINE="" SYNC="" PRICE="" CREATED="" THUNDER_UNSURE=0 NEBIUS_UNSURE=0 GUEST=0 EARLY_FETCH="" EARLY_PYENV="" EARLY_RSYNC="" EARLY_BINS="" PROBE_A="" MED_RATE="" POD_HOST=""
 POD_DC="" ATTEMPT_GPU="" ATTEMPT_KIND="" ATTEMPT_DONE=1 RUN_STARTED=0 REACH_WHY="" REACH_DC=""
-SSH=(ssh -F none -i "$TMP/key" -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no -o ForwardX11=no
-     -o UserKnownHostsFile="$TMP/known_hosts" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20
+SSH=(ssh -F none -i "$KEYDIR/key" -o IdentitiesOnly=yes -o BatchMode=yes -o ForwardAgent=no -o ForwardX11=no
+     -o UserKnownHostsFile="$KEYDIR/known_hosts" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20
      -o ServerAliveInterval=30 -o ServerAliveCountMax=4 -o LogLevel=ERROR)
 # One shared connection for the control steps; the uploads open their own, in parallel.
 # RunPod pods log in as root; Thunder instances as ubuntu (with sudo).
@@ -1756,6 +1820,9 @@ finish() {
         done < <(nebius_instances)
     fi
     rm -rf "$TMP"
+    # The key stays while the pod's record names it (the pod kept for a packed run); drop_keys
+    # deletes it with the record.
+    grep -qF " $KEYDIR " "$ACTIVE/.$POD.ssh" 2> /dev/null || rm -rf "$KEYDIR"
     rm -f "$OUT/ssh" "$OUT/rsh" "$OUT/host" "$OUT/STOP" "$OUT/EXTEND"
     say "$NAME ended with status $rc; log $LOG"
     exit $rc
@@ -1975,7 +2042,7 @@ nebius_create() {  # PLATFORM
     r=$(napi GET "/compute/v1/platforms/get-by-name?parentId=$project&name=$1")
     read -r preset vcpu < <(jq -r --argjson ram "${RP_MIN_RAM_GB:-32}" "$NEBIUS_PRESET"'preset(.; $ram) | "\(.name) \(.resources.vcpuCount)"' <<< "$(body_of "$r")" 2> /dev/null) || true
     [ -n "$preset" ] || { r="no one-GPU preset of $1 with ${RP_MIN_RAM_GB:-32} GiB"$'\n'"000"; return 0; }
-    r=$(napi POST /compute/v1/instances "$(nebius_request "$1" "$preset" "$project" "$subnet" "$policy" "$(cat "$TMP/key.pub")" "mpd2951-$(nebius_name)-$(date +%s)")")
+    r=$(napi POST /compute/v1/instances "$(nebius_request "$1" "$preset" "$project" "$subnet" "$policy" "$(cat "$KEYDIR/key.pub")" "mpd2951-$(nebius_name)-$(date +%s)")")
     NEBIUS_CODE=$(status_of "$r")
     if [[ $NEBIUS_CODE == 2* ]] && [ -n "$(jq -r '.resourceId // empty' <<< "$(body_of "$r")")" ]; then
         CREATED=$(date +%s)
@@ -2072,7 +2139,7 @@ attach() {  # POD
     read -r ip port tmp user < "$ACTIVE/.$1.ssh"
     read -r holder _ < "$ACTIVE/$1"
     ssh -F none -i "$tmp/key" -o IdentitiesOnly=yes -o BatchMode=yes -o UserKnownHostsFile="$tmp/known_hosts" -o StrictHostKeyChecking=accept-new \
-        -o ConnectTimeout=10 -o LogLevel=ERROR -p "$port" "${user:-root}@$ip" 'cat >> ~/.ssh/authorized_keys' < "$TMP/key.pub" 2> /dev/null || return 1
+        -o ConnectTimeout=10 -o LogLevel=ERROR -p "$port" "${user:-root}@$ip" 'cat >> ~/.ssh/authorized_keys' < "$KEYDIR/key.pub" 2> /dev/null || return 1
     POD=$1 IP=$ip PORT=$port SSH_USER=${user:-root} GUEST=1
     on_pod true < /dev/null 2> /dev/null || { POD="" IP="" GUEST=0; return 1; }
     CREATED=$(date +%s)
@@ -2139,7 +2206,7 @@ launch() {
                 NEBIUS_UNSURE=1
             fi
         elif [[ $gpu == thunder:* ]]; then
-            r=$(tapi POST /instances/create "$(thunder_body "$gpu" "$(cat "$TMP/key.pub")")")
+            r=$(tapi POST /instances/create "$(thunder_body "$gpu" "$(cat "$KEYDIR/key.pub")")")
             code=$(status_of "$r")
             if [[ $code == 2* ]] && [ -n "$(jq -r '.identifier // empty' <<< "$(body_of "$r")")" ]; then
                 CREATED=$(date +%s)
@@ -2261,7 +2328,7 @@ launch() {
     fi
     done
     # How status and the idle check reach the pod.
-    echo "$IP $PORT $TMP $SSH_USER" > "$ACTIVE/.$POD.ssh"
+    echo "$IP $PORT $KEYDIR $SSH_USER" > "$ACTIVE/.$POD.ssh"
     on_pod 'nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader; nvidia-smi | grep -o "CUDA Version: [0-9.]*"' < /dev/null | paste -sd ' ' - | sed "s/^/$POD /; s/\$/, $VCPU vCPUs/" | tee -a "$OUT/pod.txt" >&2
     # The GPU's utilization every 10 s ("seconds percent"), for status and the idle check.
     on_pod 'setsid nohup bash -c "while :; do echo \"\$(date +%s) \$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits | head -n 1)\"; sleep 10; done" >> /workspace/gpu-util.log 2>&1 < /dev/null &' < /dev/null || true
@@ -3116,8 +3183,8 @@ run_command() {
 # Login and copy commands for a held pod, in OUT/.
 access() {
     local opts
-    opts=$(printf '%q ' -F none -i "$TMP/key" -o IdentitiesOnly=yes -o ForwardAgent=no -o ForwardX11=no \
-        -o UserKnownHostsFile="$TMP/known_hosts" -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=30 -p "$PORT")
+    opts=$(printf '%q ' -F none -i "$KEYDIR/key" -o IdentitiesOnly=yes -o ForwardAgent=no -o ForwardX11=no \
+        -o UserKnownHostsFile="$KEYDIR/known_hosts" -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=30 -p "$PORT")
     printf '#!/bin/sh\n# Logs in to pod %s (%s); gone with the pod.\nexec ssh %s %s@%s "$@"\n' "$POD" "$NAME" "$opts" "$SSH_USER" "$IP" > "$OUT/ssh"
     printf '#!/bin/sh\n# ssh for rsync -e: the host comes from the rsync destination (see host).\nexec ssh %s "$@"\n' "$opts" > "$OUT/rsh"
     echo "$SSH_USER@$IP" > "$OUT/host"
@@ -3132,7 +3199,20 @@ hold() {
     say "held until $(date -r "$DEADLINE" '+%F %T'): $OUT/ssh logs in; rp-run stop $NAME deletes it; rp-run extend $NAME HOURS extends it"
     while :; do
         now=$(date +%s)
-        (( now < DEADLINE )) || { say "the HOURS cap is reached"; return 0; }
+        if (( now >= DEADLINE )); then
+            # The pod's own age by the API's clock decides (a Mac clock set forward reaches the cap
+            # early); a packed run's cap is its own, read on the Mac.
+            h=""
+            (( GUEST )) || h=$(pod_age "$POD")
+            if [ -n "$h" ] && (( DEADLINE - CREATED - h > 60 )); then
+                DEADLINE=$(( now + DEADLINE - CREATED - h ))
+                echo "$DEADLINE" > "$ACTIVE/.$POD.deadline"
+                say "the Mac's clock ran ahead of the pod's own age; the cap moves to $(date -r "$DEADLINE" '+%F %T')"
+            else
+                say "the HOURS cap is reached"
+                return 0
+            fi
+        fi
         if [ -f "$OUT/STOP" ]; then
             say "stop requested"
             return 0
