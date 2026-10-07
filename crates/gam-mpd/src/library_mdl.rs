@@ -2749,9 +2749,10 @@ fn gated_expected(
 /// batch: the change of the Lagrangian per token the move made, measured on the batch at the
 /// step's own weight samples on both sides (`new`: the batch's data bits and expected parts per
 /// token at the moved iterate, from the step itself; the same draws around the iterate before
-/// the move, `DevicePosterior::previous_into`), `ΔL = (B ln 2 Δbits + ΔKL) / N + λ ΔÊ` with `B`
+/// the move, `DevicePosterior::previous_into`), `ΔL = (B ln 2 Δbits + ΔKL + λ ΔÊ) / N` with `B`
 /// the batches, `N` the training tokens, `ΔKL` the move's change of the prior's divergence and
-/// `λ` the budget's multiplier. A batch the move was not made on, so the test is not the move's
+/// `λ` the budget's multiplier (nats of the whole `F` per part per token, as the step's pull
+/// takes it). A batch the move was not made on, so the test is not the move's
 /// own fit. Accepted when `ΔL ≤ 0`; returns the decision and `ΔL`. A line step's quadratic model
 /// can be wrong (toys: TMS-id grouped own gates, η −9.5e-3 with ρ̄ NaN, the mean's KL from 4e-4 to
 /// 2e182 over epochs 2–6; resid_mlp_2l per-slice gates, η changing sign, 1.9 → 3.8e19); a move
@@ -2784,7 +2785,7 @@ fn step_accepted(
         Some(moved) if lambda > 0.0 => lambda * (moved - complexity_terms(scorer, device_posterior, explanation, active, batch, (key, true))?.0),
         _ => 0.0,
     };
-    let change = (scale * LN_2 * (bits - previous) + divergence) / tokens as f64 + budget;
+    let change = (scale * LN_2 * (bits - previous) + divergence + budget) / tokens as f64;
     if !change.is_finite() {
         return Err(format!("a nonfinite change of the objective at the move's test ({change})"));
     }
