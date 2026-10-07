@@ -177,7 +177,8 @@ def programs(args):
 def report(args):
     """The calibration table from reader_score.py's output: per program its mean bits per item and per
     family, the empty program and the code alone, and paired differences over the same items (mean and
-    standard error): every program against true_measured, and each X_paraphrase against X."""
+    standard error): every pair of programs, each program against the empty program and its code alone,
+    and each X_paraphrase against X."""
     d = json.loads(Path(args.out).read_text())
     rows = {r["id"]: r for r in d["results"]}
     bits = {k: np.array(r["per_item"]) for k, r in rows.items()}
@@ -197,10 +198,11 @@ def report(args):
             bits[f"{k}:empty"], bits[f"{k}:code_alone"] = np.array(r["per_item_empty"]), np.array(r["per_item_code_only"])
             lines.append(paired(f"{k}:empty", k))
             lines.append(paired(f"{k}:code_alone", k))
-    ref = "true_measured"
+    names = [k for k in rows if not k.endswith("_paraphrase")]
+    for i, a in enumerate(names):  # every pair of programs
+        for b in names[i + 1:]:
+            lines.append(paired(a, b))
     for k in rows:
-        if k != ref and ref in rows and not k.endswith("_paraphrase"):
-            lines.append(paired(k, ref))
         if k.endswith("_paraphrase") and k[: -len("_paraphrase")] in rows:
             lines.append(paired(k, k[: -len("_paraphrase")]))
     for k, r in rows.items():
