@@ -112,6 +112,8 @@ def piece_name(p: dict) -> str:
 def _pieces(ps) -> str:
     if isinstance(ps, str):  # "embed" or "logits"
         return ps
+    if not ps:
+        return "a node of the program"
     return " + ".join(piece_name(p) for p in ps)
 
 
@@ -250,7 +252,11 @@ class Scorer:
 
     @staticmethod
     def _key(text: str, it: dict) -> tuple[str, str]:
-        return hashlib.sha1(text.encode()).hexdigest(), hashlib.sha1(json.dumps(it, sort_keys=True).encode()).hexdigest()
+        """The memo key: the text and the item fields the reader reads or is scored on (the checker's
+        items also carry the program's own outputs, which differ between programs)."""
+        read = {"words": words(it["experiment"]), "text": it.get("text"), "token_ids": it.get("token_ids"), "clean_other": it["clean_other"], "other": it["other"],
+                "candidates": [(c.get("token_id"), c.get("text"), c["clean"], c["p"]) for c in it["candidates"]]}
+        return hashlib.sha1(text.encode()).hexdigest(), hashlib.sha1(json.dumps(read, sort_keys=True).encode()).hexdigest()
 
     def bits(self, texts: list[str], items: list[dict]) -> np.ndarray:
         """[len(texts), len(items)] bits."""
