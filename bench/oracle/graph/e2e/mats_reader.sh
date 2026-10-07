@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The reader term of e2e/run.py's programs on MATS (#2951): one reader_score.py server (Qwen3-8B on vLLM,
-# g-rl's ~/rl-venv built by rl/mats_rl.sh) scores every DIR/<stem>.program.jsonl written by
+# g-rl's ~/rl-venv, built here as rl/mats_rl.sh builds it when missing) scores every DIR/<stem>.program.jsonl written by
 # `run.py --items DIR` on its own DIR/<stem>.items.jsonl and writes OUT/<stem>.reader.json (the reader
 # term with the empty-program and code-alone baselines).
 #   MATS_GPUS=1 MATS_QOS=debug mats-run g-int-reader 8 48 1 -- bash /Users/user/gam/bench/oracle/graph/e2e/mats_reader.sh \
@@ -9,7 +9,15 @@ set -Eeuo pipefail
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 DIR=$1 OUT=$2 TARGET=${3:-vpd4l}
 py=$HOME/rl-venv/bin/python
-"$py" -c "import vllm" 2> /dev/null || { echo "no vLLM in ~/rl-venv: run rl/mats_rl.sh once to build it"; exit 1; }
+(   # the venv recipe and lock of rl/mats_rl.sh
+    flock 9
+    if ! "$py" -c "import vllm, peft" 2> /dev/null; then
+        export UV_CACHE_DIR=$HOME/.cache/uv
+        rm -rf "$HOME/rl-venv"
+        ~/.local/bin/uv venv -q --python 3.12 "$HOME/rl-venv"
+        ~/.local/bin/uv pip install -q --python "$py" "vllm==0.10.2" "transformers>=4.56,<5" "peft==0.21.2" "accelerate==1.15.0" numpy
+    fi
+) 9> "$HOME/.rl-venv.lock"
 export TOKENIZERS_PARALLELISM=false
 mkdir -p "$OUT"
 PORT=$((40000 + ${SLURM_JOB_ID:-1} % 20000))
