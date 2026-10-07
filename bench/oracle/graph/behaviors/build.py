@@ -134,18 +134,18 @@ def build_prompts(tok: Tok, items: list[Item], rng: random.Random) -> list[dict]
 
 
 class Model:
-    def __init__(self, model: str):
-        self.model = model
+    def __init__(self, model: str, device: str = "mps"):
+        self.model, self.device = model, device
         if model == "qwen3-0.6b":
             from transformers import AutoModelForCausalLM
-            self.m = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-0.6B", torch_dtype=torch.float32).to("mps").eval()
+            self.m = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-0.6B", dtype=torch.float32).to(device).eval()
         else:
             sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "vpd_2951"))
             from vpd_model import load_target
-            self.m = load_target("mps")
+            self.m = load_target(device)
 
     @torch.no_grad()
-    def logprobs(self, seqs: list[list[int]], positions: list[list[int]], batch: int = 16) -> list[torch.Tensor]:
+    def logprobs(self, seqs: list[list[int]], positions: list[list[int]], batch: int = 32) -> list[torch.Tensor]:
         """Log-probabilities [len(positions_i), vocab] at the given positions of each sequence (right padding:
         causal attention leaves the real positions unchanged)."""
         out = []
@@ -157,13 +157,16 @@ class Model:
             for i, s in enumerate(ss):
                 ids[i, :len(s)] = torch.tensor(s)
                 mask[i, :len(s)] = 1
-            ids, mask = ids.to("mps"), mask.to("mps")
+            ids, mask = ids.to(self.device), mask.to(self.device)
             if self.model == "qwen3-0.6b":  # the head only at the scored positions
                 h, head = self.m.model(input_ids=ids, attention_mask=mask).last_hidden_state, self.m.lm_head
             else:
                 h, head = self.m.hidden(ids), lambda x: x @ self.m.wte.T
-            for i, pos in enumerate(positions[b:b + batch]):
-                out.append(torch.log_softmax(head(h[i, pos]).float().cpu().double(), -1))
+            pos = positions[b:b + batch]
+            bi = torch.tensor([i for i, ps in enumerate(pos) for _ in ps], device=h.device)
+            ti = torch.tensor([t for ps in pos for t in ps], device=h.device)
+            lp = torch.log_softmax(head(h[bi, ti]).float(), -1).cpu()  # one transfer per batch
+            out += list(lp.split([len(ps) for ps in pos]))
         return out
 
 
@@ -204,9 +207,10 @@ def main():
     ap.add_argument("--model", required=True, choices=["qwen3-0.6b", "vpd4l"])
     ap.add_argument("--families", default="", help="comma-separated subset (default all)")
     ap.add_argument("--seed", type=int, default=2951)
+    ap.add_argument("--device", default="mps")
     a = ap.parse_args()
     tok = Tok(a.model)
-    model = Model(a.model)
+    model = Model(a.model, a.device)
     root = OUT / a.model
     (root / "dropped").mkdir(parents=True, exist_ok=True)
     rows = []
