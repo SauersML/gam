@@ -75,8 +75,9 @@ def main():
         xs = [i + k * width for i in range(len(behaviors))]
         ys = [recovered[m].get(b) if recovered[m].get(b) is not None else 0.0 for b in behaviors]
         ax.bar(xs, ys, width=width, color=colors[k % len(colors)])
-        if ys:
-            ax.text(xs[-1] + width / 2, ys[-1], f" {m}", color=colors[k % len(colors)], va="bottom", rotation=90, fontsize=12)
+        if ys:  # the method's name on its tallest bar
+            j = max(range(len(ys)), key=lambda i: ys[i])
+            ax.text(xs[j], ys[j], f" {m}", color=colors[k % len(colors)], va="bottom", ha="center", rotation=90, fontsize=12)
     ax.axhline(0, color="black", lw=0.8)
     ax.set_xticks([i + 0.4 - width / 2 for i in range(len(behaviors))], behaviors, rotation=35, ha="right", fontsize=11)
     ax.set_ylabel("signal recovered by the best program")
