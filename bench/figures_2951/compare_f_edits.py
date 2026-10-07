@@ -61,22 +61,37 @@ def description(held_out):
     return sum(held_out.get(k) or 0.0 for k in ('divergence_bits', 'variance_bits', 'choice_bits', 'prior_bits'))
 
 
-def strong_weights(path):
-    """An arm's scores under the strong native weight edits (MANIFEST_vpd4l_s3.json, an EDITS file's
-    "weights"): over the applicable edits the gap KL(M_e || P_e), the edit-ignoring baseline
-    KL(M_e || P) and the effect KL(M_e || M) in bits per token, in all and per family and per effect bin
-    (the effect on the scored tokens: below 0.01, 0.01 to 0.1, 0.1 to 1, above 1 bit); none without the
-    file."""
+def supported_edits(path):
+    """The indices of the strong weight edits an arm's EDITS file scores (an edit it does not take is
+    unsupported: absent, never zero), with the number of edits; none without the file."""
     r = L(path)
     if not r or not r.get('weights'):
         return None
-    records = [x for x in r['weights']['records'] if x.get('applicable')]
+    records = r['weights']['records']
+    return {i for i, x in enumerate(records) if x.get('supported', x.get('applicable'))}, len(records)
+
+
+def strong_weights(path, common=None):
+    """An arm's scores under the strong native weight edits (MANIFEST_vpd4l_s3.json, an EDITS file's
+    "weights"), over the edits every compared arm supports (`common`, the indices; else its own):
+    the gap KL(M_e || P_e), the edit-ignoring baseline KL(M_e || P) and the effect KL(M_e || M) in
+    bits per token, in all and per family and per effect bin (the effect on the scored tokens: below
+    0.01, 0.01 to 0.1, 0.1 to 1, above 1 bit), with how many edits it supports and how many are
+    compared; none without the file."""
+    r = L(path)
+    if not r or not r.get('weights'):
+        return None
+    own, total = supported_edits(path)
+    keep = own if common is None else common
+    if not keep <= own:
+        raise ValueError(f'{path}: compared on edits it does not support')
+    records = [x for i, x in enumerate(r['weights']['records']) if i in keep]
     def summary(rs):
         n = len(rs)
         mean = lambda k: sum(x[k] for x in rs) / n if n else None
         return {'edits': n, 'gap': mean('mean_bits_per_token'), 'ignoring': mean('ignoring_mean_bits_per_token'), 'effect': mean('effect_mean_bits_per_token')}
     bins = [(0.0, 0.01), (0.01, 0.1), (0.1, 1.0), (1.0, float('inf'))]
-    return {'file': path, 'not_applicable': len(r['weights']['records']) - len(records), 'all': summary(records),
+    return {'file': path, 'supported': len(own), 'of': total, 'compared': len(records), 'all': summary(records),
             'families': {f: summary([x for x in records if x.get('family') == f]) for f in sorted({x.get('family') for x in records})},
             'bins': {f'[{a}, {b})': summary([x for x in records if a <= x['effect_mean_bits_per_token'] < b]) for a, b in bins}}
 
@@ -145,7 +160,7 @@ for model, label, d, f, rec, out in arms:
         if r.get('weights'):
             # The manifest's native weight edits (EDITS "weights"): the gap, the edit-ignoring
             # baseline and the effect on M over the applicable edits, and how many were not.
-            row['weights'] = {k: r['weights'].get(k) for k in ('edits', 'not_applicable', 'mean_bits_per_token', 'ignoring_mean_bits_per_token', 'effect_mean_bits_per_token')}
+            row['weights'] = {**{k: r['weights'].get(k) for k in ('edits', 'mean_bits_per_token', 'ignoring_mean_bits_per_token', 'effect_mean_bits_per_token')}, 'unsupported': r['weights'].get('unsupported', r['weights'].get('not_applicable'))}
     if rec:
         row['description_bits'] = description(rec) + fixed_bits(out)
         row['active_per_token'] = [l['nonzero_per_token'] for l in rec['layers'] if l['functions']]
@@ -170,7 +185,7 @@ for form, label in (('published', 'VPD as published (CI reads the edited M, both
         if r.get('weights'):
             # The manifest's native weight edits (EDITS "weights"): the gap, the edit-ignoring
             # baseline and the effect on M over the applicable edits, and how many were not.
-            row['weights'] = {k: r['weights'].get(k) for k in ('edits', 'not_applicable', 'mean_bits_per_token', 'ignoring_mean_bits_per_token', 'effect_mean_bits_per_token')}
+            row['weights'] = {**{k: r['weights'].get(k) for k in ('edits', 'mean_bits_per_token', 'ignoring_mean_bits_per_token', 'effect_mean_bits_per_token')}, 'unsupported': r['weights'].get('unsupported', r['weights'].get('not_applicable'))}
     rows.append(row)
 # Other workstreams' arms (decomp's decompositions), from the frontier's points file.
 for p in L('/Users/user/mpd-data/compare/frontier_points.json') or []:
@@ -186,7 +201,7 @@ for p in L('/Users/user/mpd-data/compare/frontier_points.json') or []:
         if r.get('weights'):
             # The manifest's native weight edits (EDITS "weights"): the gap, the edit-ignoring
             # baseline and the effect on M over the applicable edits, and how many were not.
-            row['weights'] = {k: r['weights'].get(k) for k in ('edits', 'not_applicable', 'mean_bits_per_token', 'ignoring_mean_bits_per_token', 'effect_mean_bits_per_token')}
+            row['weights'] = {**{k: r['weights'].get(k) for k in ('edits', 'mean_bits_per_token', 'ignoring_mean_bits_per_token', 'effect_mean_bits_per_token')}, 'unsupported': r['weights'].get('unsupported', r['weights'].get('not_applicable'))}
     rows.append(row)
 for r in rows:
     if r['model'] == 'vpd4l' and r.get('gap') is not None and r.get('manifest') != reference:
@@ -197,15 +212,23 @@ for r in rows:
         r['description_bits_total'] = r['description_bits'] + (r.get('attention_bits') or 0)
         if r.get('gap') is not None:
             r['F_edits'] = r['description_bits_total'] / N + r['gap']
+# The strong weight edits compared only on the edits every arm scored on them supports.
+weighed = [r for r in rows if r.get('strong_weights')]
+common = set.intersection(*[supported_edits(r['strong_weights']['file'])[0] for r in weighed]) if weighed else set()
+for r in weighed:
+    r['strong_weights'] = strong_weights(r['strong_weights']['file'], common)
+if weighed:
+    print(f"strong weight edits: compared on the {len(common)} edits all {len(weighed)} arms support; supported per arm:",
+          {r['method'][:40]: (r['strong_weights']['supported'], r['strong_weights']['of']) for r in weighed})
 json.dump(rows, open('/Users/user/mpd-data/compare/f_edits_table.json', 'w'), indent=1)
 for r in rows:
     print(r['model'], '|', r['method'], '| gap', r.get('gap') and round(r['gap'], 3), '| description', r.get('description_bits_total') and f"{r['description_bits_total']:.4g}",
           '| F on edits (N = 2^24)', r.get('F_edits') and round(r['F_edits'], 3),
           '| weight edits: gap', (r.get('weights') or {}).get('mean_bits_per_token') and round(r['weights']['mean_bits_per_token'], 4),
           'ignoring', (r.get('weights') or {}).get('ignoring_mean_bits_per_token') and round(r['weights']['ignoring_mean_bits_per_token'], 4),
-          'not applicable', (r.get('weights') or {}).get('not_applicable'),
+          'unsupported', (r.get('weights') or {}).get('unsupported'),
           '| adversarial push: excess', (r.get('adversarial') or {}).get('excess') and round(r['adversarial']['excess'], 4),
-          '| strong weight edits', (lambda w: w and {'all': {k: (round(v, 4) if isinstance(v, float) else v) for k, v in w['all'].items()}, 'not applicable': w['not_applicable'],
+          '| strong weight edits', (lambda w: w and {'all': {k: (round(v, 4) if isinstance(v, float) else v) for k, v in w['all'].items()}, 'supported': (w['supported'], w['of']), 'compared': w['compared'],
                                                      'families': {f: (v['edits'], v['gap'] and round(v['gap'], 3), v['ignoring'] and round(v['ignoring'], 3), v['effect'] and round(v['effect'], 3)) for f, v in w['families'].items()},
                                                      'bins': {b: (v['edits'], v['gap'] and round(v['gap'], 3), v['ignoring'] and round(v['ignoring'], 3)) for b, v in w['bins'].items()}})(r.get('strong_weights')), '| bins', {k: (n, round(g, 3)) for k, (n, g) in (r.get('gap_by_effect') or {}).items()}, r.get('refused', ''))
 if len(sys.argv) > 1:
