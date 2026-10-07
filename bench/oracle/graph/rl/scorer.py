@@ -70,10 +70,12 @@ def checker(items: list[dict]) -> list[dict]:
         if c.loaded != path:
             load_behavior(c, path)
             c.loaded = path
-        keys = sorted({(items[k].get("seed", 0), items[k].get("uniform_seeds") or 0) for k in ks})
-        for seed, uniform in keys:  # one batch request per seed: the server runs M once per experiment and the programs in parallel
-            batch = [k for k in ks if (items[k].get("seed", 0), items[k].get("uniform_seeds") or 0) == (seed, uniform)]
-            for k, r in zip(batch, c.score_batch([items[k]["source"] for k in batch], seed=seed, uniform_seeds=uniform or None)):
+        def key(k):
+            return items[k].get("seed", 0), items[k].get("uniform_seeds") or 0, items[k].get("experiments") or 32
+
+        for seed, uniform, experiments in sorted({key(k) for k in ks}):  # one batch request per seed: M once per experiment, the programs in parallel
+            batch = [k for k in ks if key(k) == (seed, uniform, experiments)]
+            for k, r in zip(batch, c.score_batch([items[k]["source"] for k in batch], experiments=experiments, seed=seed, uniform_seeds=uniform or None)):
                 out[k] = r
 
     per_worker = [[] for _ in range(WORKERS)]

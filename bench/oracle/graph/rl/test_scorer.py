@@ -22,7 +22,7 @@ class Checker:
     def request(self, message):
         self.path = message["path"]
 
-    def score_batch(self, sources, seed=0, uniform_seeds=None):
+    def score_batch(self, sources, experiments=32, seed=0, uniform_seeds=None):
         calls.append((self.path, seed, len(sources)))
         return [{"total_bits": len(x) + seed, "valid": True, "behavior": self.path} for x in sources]
 
@@ -53,7 +53,7 @@ def check_repair():
     score = lambda items: [{"valid": True, "total_bits": float(it["source"].split("=")[1])} for it in items]  # noqa: E731
     best = [{"completion": [0], "text": "```python\nbad(\n```", "score": {"valid": False, "total_bits": 1e4, "error": "line 1: syntax error"}},
             {"completion": [0], "text": "```python\nX = 10\n```", "score": {"valid": True, "total_bits": 10.0}}]
-    args = types.SimpleNamespace(repair=1, samples=2)
+    args = types.SimpleNamespace(repair=1, samples=2, uniform_seeds=0, experiments=16)
     replaced = train.repair([{"id": "a"}, {"id": "b"}], best, pol, sampler, score, args, Path("."), 0)
     assert replaced == {0} and best[0]["score"]["total_bits"] == 30.0 and best[0]["completion"] == [30] and best[1]["score"]["total_bits"] == 10.0, (replaced, best)
     assert "line 1: syntax error" in shown[0] and "bad(" in shown[0] and shown[0].startswith("input a")
