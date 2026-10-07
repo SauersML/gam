@@ -4251,8 +4251,10 @@ pub fn fit_from(
                 parts.1 += 1;
                 // The multiplier: from the first step whose count exceeds the budget, λ starts at
                 // the robust balance of F's push on the gates against the count's, the median over
-                // the gates of |∂F/∂z_b| / |∂Ê/∂z_b| (both read off each gate's threshold or bias,
-                // whose derivative is its pre-activation's), and then integrates the violation in
+                // the gates of |∂F/∂z_b| / |∂Ê/∂z_b| (read off each gate's row of its parameters: a
+                // threshold's or bias's entry, whose derivative is its pre-activation's, or the norms
+                // of a gate's weight row, whose derivative is its pre-activation's times its input),
+                // and then integrates the violation in
                 // log space, log λ ← log λ + (Ê − K) / (K B) per step (`B` the steps of one pass):
                 // symmetric, unable to wind up, and still only where Ê = K. The global ratio
                 // −⟨g_F, g_k⟩ / |g_k|² (560f12d2d3's λ̄ Ê / K) explodes where most gates are
@@ -4261,9 +4263,17 @@ pub fn fit_from(
                 if !progress.engaged && limit > 0.0 && expected > limit {
                     let mut ratios = Vec::new();
                     for (i, mean, _) in &terms {
-                        let Some(g) = gradients.get(&explanation.trainable[*i]).filter(|_| mean.cols() == 1) else { continue };
+                        let Some(g) = gradients.get(&explanation.trainable[*i]) else { continue };
                         let (data, count) = (device.download(g).map_err(error)?, device.download(mean).map_err(error)?);
-                        ratios.extend(data.iter().zip(count.iter()).filter(|(f, k)| **k != 0.0 && f.is_finite()).map(|(f, k)| (f * scale * LN_2).abs() / k.abs()));
+                        if data.dim() != count.dim() {
+                            continue;
+                        }
+                        for (f, k) in data.rows().into_iter().zip(count.rows()) {
+                            let (f, k) = (f.dot(&f).sqrt() * scale * LN_2, k.dot(&k).sqrt());
+                            if k > 0.0 && f.is_finite() {
+                                ratios.push(f / k);
+                            }
+                        }
                     }
                     ratios.sort_by(f64::total_cmp);
                     if let Some(balance) = ratios.get(ratios.len() / 2).copied().filter(|v| *v > 0.0) {
