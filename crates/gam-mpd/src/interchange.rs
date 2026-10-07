@@ -3615,9 +3615,11 @@ mod tests {
 
 
     /// The response diagnostic ([`Interchange::response`]) on the tiny Qwen3 export's scoped
-    /// starting library with its MLPs perturbed (so `P` differs from `M`): with `P` applying no edit,
-    /// `q_e = q_0`, so `p̃_e = p_0` and the diagnostic is the edit's effect `KL(p_e ‖ p_0)`, which a
-    /// reference with `P` = `M` unedited scores as its gap (1e-9); applying the edit, it differs.
+    /// starting library with its MLPs perturbed (so `P` differs from `M`), `P` autonomous: with `P`
+    /// applying no edit, `q_e = q_0`, so `p̃_e = p_0` and the diagnostic is the edit's effect
+    /// `KL(p_e ‖ p_0)`, which a reference with `P` = `M` unedited scores as its gap (1e-9); applying
+    /// the edit, it differs. (In a hybrid, `M`'s blocks still apply the edit on `P_e`'s path, so
+    /// `q_e ≠ q_0` there even with `P` unedited.)
     #[test]
     fn the_response_diagnostic_of_an_unedited_explanation_is_the_edits_effect() {
         use rand::RngExt;
@@ -3641,7 +3643,7 @@ mod tests {
         let op = |site: SharedSite, operation: Operation, onward: bool| SiteOp { site, operation, onward };
         let experiments = vec![
             Experiment { base: 0, source: 1, explained: vec![true; 4], patch: Some(Patch::Ops { family: Family::Scale, ops: vec![op(SharedSite::Mlp(0), Operation::Scale(3), true)] }), position: 2 },
-            Experiment { base: 1, source: 2, explained: vec![false, true, false, true], patch: Some(Patch::Ops { family: Family::Swap, ops: vec![op(SharedSite::Stream(0), Operation::Swap, false)] }), position: 4 },
+            Experiment { base: 1, source: 2, explained: vec![true; 4], patch: Some(Patch::Ops { family: Family::Swap, ops: vec![op(SharedSite::Stream(0), Operation::Swap, false)] }), position: 4 },
         ];
         let edited = ic.response(&batch, &experiments).expect("the response");
         ic.unedited_explanation();
