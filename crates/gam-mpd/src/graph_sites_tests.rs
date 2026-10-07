@@ -2,7 +2,7 @@
 //! export (#2951): identical for `M` and a program that declares every piece, and equal to `M`'s
 //! own weight edits and donor runs where those define the same experiment.
 use crate::{
-    graph::{Batch, Circuit, EdgeIr, Graph, NodeIr, PieceIr, Program, SiteDraw, SiteUnits, Stats, WeightEdit, Weights, execute, kl_bits, op_rows, run_sites, sample},
+    graph::{Batch, Circuit, EdgeIr, Graph, NodeIr, PieceIr, Program, SiteDraw, SiteUnits, Stats, WeightEdit, Weights, execute, kl_bits, op_rows, reference, reference_under, run_sites, sample},
     import::import_language_model,
     interchange::{self, Family, Operation, SharedSite, SiteOp},
     library_mdl,
@@ -194,10 +194,85 @@ fn the_behaviors_half_is_the_same_for_every_program() {
     let (weights, _) = model("graph_sites_uniform");
     let pool = vec![draw(Family::Zero, &[(SharedSite::Head(0), Operation::Scale(0))], 0, true), draw(Family::Push, &[(SharedSite::Stream(1), Operation::Push { direction: 0, size: 0 })], 3, false)];
     let full = Graph::parse(&full_program(), &weights).expect("parse");
-    let a = sample(&weights, &Graph::empty(), false, 40, 11, &[], &pool);
-    let b = sample(&weights, &full, false, 40, 11, &[], &pool);
+    let units = SiteUnits { pool, ..SiteUnits::default() };
+    let a = sample(&weights, &Graph::empty(), false, 40, 11, &[], &units);
+    let b = sample(&weights, &full, false, 40, 11, &[], &units);
     // Clean first, then the behavior's draws at even k.
     let fixed = |v: &[crate::graph::Experiment]| v.iter().skip(1).step_by(2).cloned().collect::<Vec<_>>();
     assert_eq!(fixed(&a), fixed(&b));
     assert!(fixed(&a).iter().any(|e| e.family().starts_with("site_")));
+}
+
+/// The empty program under counterfactual stand-ins and a site operation is `M` on the
+/// counterfactual under the same operation: its stand-ins come from that run (`reference_under`).
+#[test]
+fn counterfactual_stand_ins_take_the_same_site_operations() {
+    let s = setup("graph_sites_reference");
+    let model = Graph::empty().model(&s.weights);
+    let empty = Graph::empty().program(&s.weights, true);
+    let heads = s.weights.layers[0].heads.len();
+    let push = Operation::Push { direction: 1, size: 2 };
+    for d in [
+        draw(Family::Zero, &[(SharedSite::Head(heads + 1), Operation::Scale(0)), (SharedSite::Input(1), Operation::Scale(0))], 0, true),
+        draw(Family::Push, &[(SharedSite::Stream(0), push), (SharedSite::Mlp(0), push), (SharedSite::Embedding, push)], 4, true),
+        draw(Family::Scale, &[(SharedSite::Attention(1), Operation::Scale(3)), (SharedSite::Stream(2), Operation::Scale(1))], 6, false),
+    ] {
+        let on_partner = run_sites(&s.weights, &s.stats, &model, (&s.donor, &s.rows), None, &d, &s.units).expect("M on x'");
+        let mut base = Batch::new(&s.base.sequences()).expect("batch");
+        base.reference = Some(std::sync::Arc::new(reference_under(&s.weights, &s.stats, &s.donor, &d, &s.units).expect("reference")));
+        let program = run_sites(&s.weights, &s.stats, &empty, (&base, &s.rows), None, &d, &s.units).expect("empty program");
+        let kl = max(&kl_bits(&on_partner, &program));
+        assert!(kl < 1e-9, "{:?}: KL(M_e(x') ‖ empty P_e(x)) = {kl:e} bits", d.family);
+    }
+}
+
+/// A head zeroed at every token in the counterfactual run records what the run with the head
+/// removed from the weights records (its read, every later read and MLP).
+#[test]
+fn a_zeroed_head_in_the_reference_is_the_removed_head() {
+    let mut s = setup("graph_sites_reference_edit");
+    let heads = s.weights.layers[0].heads.len();
+    let zeroed = reference_under(&s.weights, &s.stats, &s.donor, &draw(Family::Zero, &[(SharedSite::Head(heads), Operation::Scale(0))], 0, true), &s.units).expect("reference");
+    let restore = WeightEdit::Head { layer: 1, head: 0, factor: 0.0 }.apply(&mut s.weights).expect("edit");
+    let removed = reference(&s.weights, &s.stats, &s.donor).expect("reference");
+    restore.restore(&mut s.weights).expect("restore");
+    let gap = |a: &Array2<f64>, b: &Array2<f64>| (a - b).iter().fold(0.0f64, |m, v| m.max(v.abs()));
+    for l in 0..LAYERS {
+        for h in 0..s.weights.layers[l].heads.len() {
+            assert!(gap(&zeroed.reads[l][h], &removed.reads[l][h]) < 1e-9, "head {l}.{h}'s read");
+        }
+        assert!(gap(&zeroed.active[l], &removed.active[l]) < 1e-9 && gap(&zeroed.mlp[l], &removed.mlp[l]) < 1e-9, "layer {l}'s MLP");
+    }
+}
+
+#[test]
+fn typical_norms_cover_every_site_and_manifests_round_trip() {
+    let s = setup("graph_sites_typical");
+    let typical = SiteUnits::measure_typical(&s.weights, &s.stats, &s.base.sequences()).expect("typical");
+    let (sites, _) = SiteUnits::shared(&s.weights);
+    assert_eq!(typical.keys().copied().collect::<Vec<_>>(), sites);
+    assert!(typical.values().all(|v| v.is_finite() && *v > 0.0), "{typical:?}");
+    let dir = std::env::temp_dir().join(format!("graph_sites_write_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("dir");
+    let path = dir.join("MANIFEST_tiny.json");
+    let families = [Family::Swap, Family::Zero, Family::Scale, Family::Push, Family::Cut];
+    let written = SiteUnits::write_manifest(&path, "tiny", &s.weights, &s.stats, &s.base.sequences(), &families, 40, 5, 64).expect("write");
+    assert!(SiteUnits::write_manifest(&path, "tiny", &s.weights, &s.stats, &s.base.sequences(), &families, 40, 5, 64).is_err(), "a manifest is immutable");
+    let read = SiteUnits::manifest(&path, 512, s.weights.embedding.ncols()).expect("read");
+    assert_eq!(read.pool, written.pool);
+    assert_eq!(read.typical, written.typical);
+    assert_eq!(read.directions, written.directions);
+    assert!(read.pool.iter().all(|d| d.length == 64 && !d.ops.is_empty()));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn aimed_sites_are_the_programs() {
+    let (weights, _) = model("graph_sites_aimed");
+    let heads = weights.layers[0].heads.len();
+    let mut program = Program { model: "tiny".into(), valid: true, ..Program::default() };
+    program.nodes = vec![NodeIr { id: "h".into(), pieces: vec![PieceIr { view: "native".into(), layer: 1, kind: "head".into(), index: Some(crate::graph::Index::One(0)) }], rule: None }];
+    let graph = Graph::parse(&program, &weights).expect("parse");
+    let aimed = SiteUnits::default().aimed_sites(&weights, &graph);
+    assert_eq!(aimed, vec![SharedSite::Stream(2), SharedSite::Head(heads), SharedSite::Attention(1), SharedSite::Input(2)]);
 }

@@ -691,6 +691,20 @@ pub fn reference(weights: &Weights, stats: &Stats, batch: &Batch) -> Result<Refe
     run(weights, stats, &circuit, &plain, &[], &BTreeMap::new(), false, &Interventions::default(), true)?.captured.ok_or_else(|| "no captured run".to_string())
 }
 
+/// `M`'s run on `batch` recorded per piece ([`Reference`]) under the site operations `draw`
+/// that act on a run without a donor (a swap or a cut reads the run's own donor, the
+/// counterfactual, which on the counterfactual's own run changes nothing): the counterfactual run
+/// of a site experiment, the same experiment applied to it.
+pub fn reference_under(weights: &Weights, stats: &Stats, batch: &Batch, draw: &SiteDraw, units: &SiteUnits) -> Result<Reference, String> {
+    let own = SiteDraw { ops: draw.ops.iter().filter(|o| !matches!(o.operation, Operation::Swap | Operation::Cut { .. })).copied().collect(), ..draw.clone() };
+    let heads: BTreeSet<(usize, usize)> = own.ops.iter().filter_map(|o| if let SharedSite::Head(h) = o.site { head_of(weights, h).ok() } else { None }).collect();
+    let circuit = Graph::empty().model(weights).split_heads(&heads);
+    let mut plain = batch.clone();
+    plain.reference = None;
+    let ops = Interventions::resolve(&own, &circuit, weights, &plain, units, None, None)?;
+    run(weights, stats, &circuit, &plain, &[], &BTreeMap::new(), false, &ops, true)?.captured.ok_or_else(|| "no captured run".to_string())
+}
+
 /// One run: the logits' log-probabilities at the scored rows (rows × vocabulary) and every
 /// computing unit's actual write (rows × width).
 pub struct Execution {
@@ -1147,7 +1161,9 @@ impl Experiment {
 /// program's pieces and pieces it omits, half of those among the four omitted heads first in
 /// `strongest`, heads by measured removal effect), rank-one perturbations, node swaps, edge cuts
 /// (declared edges and undeclared pairs).
-pub fn sample(weights: &Weights, graph: &Graph, counterfactual: bool, count: usize, seed: u64, strongest: &[(usize, usize)], sites: &[SiteDraw]) -> Vec<Experiment> {
+pub fn sample(weights: &Weights, graph: &Graph, counterfactual: bool, count: usize, seed: u64, strongest: &[(usize, usize)], units: &SiteUnits) -> Vec<Experiment> {
+    let sites = &units.pool;
+    let aimed_sites = units.aimed_sites(weights, graph);
     let mut out = vec![Experiment::Clean];
     if counterfactual {
         out.push(Experiment::Counterfactual);
@@ -1195,6 +1211,9 @@ pub fn sample(weights: &Weights, graph: &Graph, counterfactual: bool, count: usi
     if !declared_edges.is_empty() {
         kinds.push("cut_declared");
     }
+    if !aimed_sites.is_empty() && !units.directions.is_empty() {
+        kinds.push("site_aimed");
+    }
     for k in 0..count {
         let rng = if k % 2 == 0 { &mut fixed } else { &mut aimed };
         // The behavior's half: uniform weight edits, rank-one perturbations and (when a pool of drawn
@@ -1203,6 +1222,10 @@ pub fn sample(weights: &Weights, graph: &Graph, counterfactual: bool, count: usi
         let kind = if k % 2 == 0 { fixed_kinds[rng.random_range(0..fixed_kinds.len())] } else { kinds[rng.random_range(0..kinds.len())] };
         out.push(match kind {
             "sites" => Experiment::Sites { draw: sites[rng.random_range(0..sites.len())].clone() },
+            "site_aimed" => match units.draw_at(rng, &aimed_sites, weights) {
+                Some(draw) => Experiment::Sites { draw },
+                None => Experiment::Edit { edit: random_edit(rng, graph.blocks.first()), aimed: true },
+            },
             "edit_uniform" => Experiment::Edit { edit: random_edit(rng, None), aimed: false },
             "edit_aimed" => {
                 let own = !graph.blocks.is_empty() && (omitted.is_empty() || rng.random_bool(0.5));
@@ -1678,6 +1701,139 @@ pub struct SiteUnits {
 }
 
 impl SiteUnits {
+    /// Every shared site of `weights`' model in ascending order (`SharedSite`'s order), and each
+    /// head's block (`interchange::draw_site_ops`'s arguments).
+    pub fn shared(weights: &Weights) -> (Vec<SharedSite>, Vec<usize>) {
+        let layers = weights.layers.len();
+        let head_blocks: Vec<usize> = weights.layers.iter().enumerate().flat_map(|(l, layer)| std::iter::repeat_n(2 * l, layer.heads.len())).collect();
+        let mut sites: Vec<SharedSite> = (0..2 * layers).map(SharedSite::Stream).chain((0..head_blocks.len()).map(SharedSite::Head)).collect();
+        sites.extend((0..layers).map(SharedSite::Attention).chain((0..layers).map(SharedSite::Mlp)).chain((0..2 * layers).map(SharedSite::Input)));
+        sites.push(SharedSite::Embedding);
+        (sites, head_blocks)
+    }
+
+    /// The sites of a program's nodes: each declared head's output, the attention or MLP output of
+    /// each layer holding a node, a node's block input and the stream after it.
+    pub fn aimed_sites(&self, weights: &Weights, graph: &Graph) -> Vec<SharedSite> {
+        let mut out = BTreeSet::new();
+        let mut first = vec![0usize; weights.layers.len() + 1];
+        for (l, layer) in weights.layers.iter().enumerate() {
+            first[l + 1] = first[l] + layer.heads.len();
+        }
+        for block in &graph.blocks {
+            match block {
+                Block::Heads { layer, heads } => {
+                    out.extend(heads.iter().map(|h| SharedSite::Head(first[*layer] + h)));
+                    out.insert(SharedSite::Attention(*layer));
+                }
+                Block::Neurons { layer, .. } => {
+                    out.insert(SharedSite::Mlp(*layer));
+                }
+            }
+            out.insert(SharedSite::Input(block.site()));
+            out.insert(SharedSite::Stream(block.site()));
+        }
+        out.into_iter().collect()
+    }
+
+    /// One experiment of operations drawn as interchange draws them (`draw_site_ops`, a family
+    /// uniform among swap, zero, scale, push, cut) on the sites `sites`, its position on sequences of
+    /// the pool's length (512 without a pool); `None` when no operation of the family fits them.
+    pub fn draw_at(&self, rng: &mut impl RngExt, sites: &[SharedSite], weights: &Weights) -> Option<SiteDraw> {
+        let (_, head_blocks) = Self::shared(weights);
+        let families = [interchange::Family::Swap, interchange::Family::Zero, interchange::Family::Scale, interchange::Family::Push, interchange::Family::Cut];
+        let family = families[rng.random_range(0..families.len())];
+        let length = self.pool.first().map_or(512, |d| d.length);
+        match interchange::draw_site_ops(rng, family, length, sites, &head_blocks, &self.typical, self.directions.len(), 2 * weights.layers.len()) {
+            Ok((interchange::Patch::Ops { family, ops }, position)) if !ops.is_empty() => Some(SiteDraw { family, ops, position, length }),
+            _ => None,
+        }
+    }
+
+    /// Each shared site's typical norm on `M` (unedited `weights`) over `sequences`: the root mean
+    /// square of its rows' norms after each sequence's first token, as
+    /// `Interchange::measure_typical` measures it (heads' and attentions' outputs and MLPs' outputs
+    /// as their writes into the stream, a block's input as its normed input, the stream after a block,
+    /// the embeddings).
+    pub fn measure_typical(weights: &Weights, stats: &Stats, sequences: &[Vec<u32>]) -> Result<BTreeMap<SharedSite, f64>, String> {
+        let batch = Batch::new(sequences)?;
+        let all: BTreeSet<(usize, usize)> = weights.layers.iter().enumerate().flat_map(|(l, layer)| (0..layer.heads.len()).map(move |h| (l, h))).collect();
+        let circuit = Graph::empty().model(weights).split_heads(&all);
+        let blocks = 2 * weights.layers.len();
+        let run = execute_with(weights, stats, &circuit, &batch, &[], &BTreeMap::new(), false, &Interventions::recording((0..blocks).collect()))?;
+        let later: Vec<usize> = batch.spans.iter().flat_map(|&(start, n)| start + 1..start + n).collect();
+        let typical = |x: &Array2<f64>| -> f64 { (later.iter().map(|&r| x.row(r).dot(&x.row(r))).sum::<f64>() / later.len().max(1) as f64).sqrt() };
+        let mut out = BTreeMap::new();
+        let mut stream = weights.embedding.select(Axis(0), &batch.tokens.iter().map(|t| *t as usize).collect::<Vec<_>>());
+        out.insert(SharedSite::Embedding, typical(&stream));
+        let (_, head_blocks) = Self::shared(weights);
+        for b in 0..blocks {
+            let at: Vec<usize> = (0..circuit.units.len()).filter(|&u| circuit.units[u].block.site() == b).collect();
+            let first = at.first().ok_or("a block without units")?;
+            out.insert(SharedSite::Input(b), typical(run.normed.get(&(*first, 0)).ok_or("an unrecorded input")?));
+            let mut total = Array2::<f64>::zeros(stream.dim());
+            for &u in &at {
+                let w = run.writes[u].as_ref().ok_or("a unit that did not compute")?;
+                total += w;
+                if let Block::Heads { layer, heads } = &circuit.units[u].block
+                    && let [h] = heads.as_slice()
+                {
+                    let index = head_blocks.iter().take_while(|&&hb| hb < 2 * layer).count() + h;
+                    out.insert(SharedSite::Head(index), typical(w));
+                }
+            }
+            out.insert(if b % 2 == 0 { SharedSite::Attention(b / 2) } else { SharedSite::Mlp(b / 2) }, typical(&total));
+            stream += &total;
+            out.insert(SharedSite::Stream(b), typical(&stream));
+        }
+        Ok(out)
+    }
+
+    /// An immutable manifest for a model without one, drawn by interchange's code: typical norms
+    /// measured on `sequences` ([`SiteUnits::measure_typical`]), `interchange::DIRECTIONS` seeded
+    /// directions, and `count` experiments, each of a family uniform in `families`
+    /// (`interchange::draw_site_ops` over every shared site on sequences of `length` tokens). The
+    /// file has the keys of `mpd_library_mdl_2951`'s `Manifest` (one batch of experiments) plus
+    /// `context` (`length`), and is refused if it exists.
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_manifest(path: &std::path::Path, export: &str, weights: &Weights, stats: &Stats, sequences: &[Vec<u32>], families: &[interchange::Family], count: usize, seed: u64, length: usize) -> Result<Self, String> {
+        if path.exists() {
+            return Err(format!("{} exists and is immutable", path.display()));
+        }
+        let typical = Self::measure_typical(weights, stats, sequences)?;
+        let directions = interchange::seeded_directions(interchange::DIRECTIONS, weights.width(), seed);
+        let (sites, head_blocks) = Self::shared(weights);
+        let mut rng = StdRng::seed_from_u64(seed);
+        let mut experiments = Vec::with_capacity(count);
+        let mut pool = Vec::with_capacity(count);
+        let blocks = 2 * weights.layers.len();
+        for _ in 0..count {
+            let family = families[rng.random_range(0..families.len())];
+            let (patch, position) = interchange::draw_site_ops(&mut rng, family, length, &sites, &head_blocks, &typical, directions.len(), blocks)?;
+            if let interchange::Patch::Ops { family, ops } = &patch {
+                pool.push(SiteDraw { family: *family, ops: ops.clone(), position, length });
+            }
+            experiments.push(interchange::Experiment { base: 0, source: 1, explained: vec![true; blocks], patch: Some(patch), position });
+        }
+        let manifest = serde_json::json!({
+            "export": export,
+            "sequences": [0, sequences.len()],
+            "rows": format!("{} sequences of {} tokens", sequences.len(), sequences.first().map_or(0, Vec::len)),
+            "seed": seed,
+            "families": families,
+            "edits_per_sequence": count,
+            "batch_sequences": sequences.len(),
+            "binary": option_env!("GIT_HASH"),
+            "directions": "seeded",
+            "push": directions,
+            "typical": typical.iter().collect::<Vec<_>>(),
+            "experiments": [experiments],
+            "context": length,
+        });
+        std::fs::write(path, serde_json::to_vec(&manifest).map_err(|e| e.to_string())?).map_err(|e| format!("{}: {e}", path.display()))?;
+        Ok(Self { typical, directions, pool })
+    }
+
     /// The experiments of an immutable experiment manifest (`mpd_library_mdl_2951`'s `Manifest`,
     /// e.g. `~/mpd-data/compare/manifest/MANIFEST_vpd4l_s1.json`) drawn on sequences of `length`
     /// tokens of a model of width `width`: its typical norms, its pushed directions (stored, or
@@ -1690,6 +1846,7 @@ impl SiteUnits {
         let seed = value["seed"].as_u64().ok_or("manifest seed")?;
         let directions = if stored.is_empty() { interchange::seeded_directions(interchange::DIRECTIONS, width, seed) } else { stored };
         let batches: Vec<Vec<interchange::Experiment>> = serde_json::from_value(value["experiments"].clone()).map_err(|e| format!("manifest experiments: {e}"))?;
+        let length = value.get("context").and_then(serde_json::Value::as_u64).map_or(length, |c| c as usize);
         let pool = batches
             .into_iter()
             .flatten()
@@ -1873,6 +2030,9 @@ pub struct Checker {
     /// Counterfactual runs by (edit, sequences), each computed once by whichever run asks first.
     #[allow(clippy::type_complexity)]
     references: std::sync::Mutex<Vec<(String, Arc<std::sync::OnceLock<Result<Arc<Reference>, String>>>)>>,
+    /// Counterfactual runs under site operations (`reference_under`) by experiment, for one
+    /// [`Checker::score_batch`] (cleared at its start).
+    site_references: std::sync::Mutex<BTreeMap<String, Arc<std::sync::OnceLock<Result<Arc<Reference>, String>>>>>,
 }
 
 /// Every score term (bits) and the counts behind them.
@@ -1966,6 +2126,7 @@ impl Checker {
             partners,
             edit: None,
             references: std::sync::Mutex::new(Vec::new()),
+            site_references: std::sync::Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -2136,6 +2297,7 @@ impl Checker {
     pub fn score_batch(&mut self, programs: &[Program], count: usize, seed: u64, edges: bool, n: Option<f64>, top: usize) -> Result<Vec<(Score, Vec<Measured>)>, String> {
         let n = n.unwrap_or_else(|| self.behavior.size());
         let strongest = self.strongest()?;
+        self.site_references.lock().map_err(|e| e.to_string())?.clear();
         let parsed: Vec<(Graph, bool, Option<String>)> = programs
             .iter()
             .map(|program| match Graph::parse(program, &self.weights) {
@@ -2149,7 +2311,7 @@ impl Checker {
         let mut runs: Vec<(usize, Experiment, String)> = Vec::new();
         let mut drawn = vec![0usize; programs.len()];
         for (i, (graph, _, _)) in parsed.iter().enumerate() {
-            for e in sample(&self.weights, graph, self.counterfactual.is_some(), count, seed, &strongest, &self.sites.pool) {
+            for e in sample(&self.weights, graph, self.counterfactual.is_some(), count, seed, &strongest, &self.sites) {
                 if matches!(e, Experiment::Swap { .. }) && self.donors.is_empty() {
                     continue;
                 }
@@ -2318,7 +2480,18 @@ impl Checker {
     /// scored rows.
     fn sites_outcome(&self, circuit: &Circuit, draw: &SiteDraw) -> Result<Array2<f64>, String> {
         let (base, rows, donor) = self.site_batches(Interventions::needs_donor(draw))?;
-        let (base, donor) = (self.referenced(circuit, &base)?, donor.map(|d| self.referenced(circuit, &d)).transpose()?);
+        let (mut base, donor) = (self.referenced(circuit, &base)?, donor.map(|d| self.referenced(circuit, &d)).transpose()?);
+        // The stand-ins' run on the counterfactuals takes the same operations (reference_under).
+        if base.reference.is_some() {
+            let partner: Vec<Vec<u32>> = base.sequences().iter().map(|s| self.partners.get(s).cloned().ok_or("a prompt without a counterfactual")).collect::<Result<_, _>>()?;
+            let key = format!("{} {}", serde_json::to_string(draw).map_err(|e| e.to_string())?, partner.len());
+            let cell = {
+                let mut cache = self.site_references.lock().map_err(|e| e.to_string())?;
+                cache.entry(key).or_insert_with(|| Arc::new(std::sync::OnceLock::new())).clone()
+            };
+            let r = cell.get_or_init(|| Batch::new(&partner).and_then(|b| reference_under(&self.weights, &self.stats, &b, draw, &self.sites)).map(Arc::new)).clone()?;
+            base.reference = Some(r);
+        }
         run_sites(&self.weights, &self.stats, circuit, (&base, &rows), donor.as_ref(), draw, &self.sites)
     }
 

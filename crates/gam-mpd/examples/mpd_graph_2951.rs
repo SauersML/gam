@@ -122,11 +122,25 @@ fn items(checker: &Checker, outcomes: &[Measured], program: &Program) -> Value {
     Value::Array(list)
 }
 
-/// The export's context in tokens (`export.json`'s `context`), what a manifest's positions were
-/// drawn on.
+/// The export's context in tokens (`export.json`'s `source.context`), what a manifest's positions
+/// were drawn on (a manifest stating its own `context` overrides it).
 fn context(export: &Path) -> Result<usize, String> {
     let record: Value = serde_json::from_slice(&std::fs::read(export.join("export.json")).map_err(error)?).map_err(error)?;
-    record["context"].as_u64().map(|c| c as usize).ok_or_else(|| "export.json has no context".into())
+    record["source"]["context"].as_u64().or_else(|| record["context"].as_u64()).map(|c| c as usize).ok_or_else(|| "export.json states no context".into())
+}
+
+/// The first `count` sequences of the export's token table (`tokens.f64`, rows × columns of
+/// float64 token ids).
+fn export_sequences(export: &Path, count: usize) -> Result<Vec<Vec<u32>>, String> {
+    let record: Value = serde_json::from_slice(&std::fs::read(export.join("export.json")).map_err(error)?).map_err(error)?;
+    let shape = &record["files"]["tokens"]["shape"];
+    let (rows, cols) = (shape[0].as_u64().ok_or("tokens shape")? as usize, shape[1].as_u64().ok_or("tokens shape")? as usize);
+    let bytes = std::fs::read(export.join("tokens.f64")).map_err(error)?;
+    if bytes.len() != rows * cols * 8 {
+        return Err("tokens.f64 disagrees with its shape".into());
+    }
+    let id = |i: usize| f64::from_le_bytes(bytes[8 * i..8 * i + 8].try_into().unwrap_or_default()) as u32;
+    Ok((0..count.min(rows)).map(|r| (0..cols).map(|c| id(r * cols + c)).collect()).collect())
 }
 
 /// The manifest a behavior request names, or by default VPD-4L's shared one for its export.
@@ -207,6 +221,26 @@ fn handle(request: &Value, weights: &mut Option<Weights>, checker: &mut Option<C
                 answer["seconds"] = json!(seconds);
                 Ok(answer)
             }
+        }
+        // An immutable manifest of site operations for a model without one, drawn by interchange's
+        // code (graph::SiteUnits::write_manifest) on the export's first `sequences` token rows, and
+        // made the behavior's pool: {"out": FILE, "seed": 1, "count": 1024, "length": 512,
+        // "sequences": 8, "families": ["swap", "zero", "scale", "push", "cut"]}.
+        "draw_manifest" => {
+            let c = checker.as_mut().ok_or("load a behavior first (its stand-in averages run the model)")?;
+            let dir = export.as_deref().ok_or("load a model first")?;
+            let out = Path::new(request["out"].as_str().ok_or("out")?);
+            let seed = request["seed"].as_u64().unwrap_or(1);
+            let count = request["count"].as_u64().unwrap_or(1024) as usize;
+            let length = request["length"].as_u64().unwrap_or(512) as usize;
+            let sequences = export_sequences(dir, request["sequences"].as_u64().unwrap_or(8) as usize)?;
+            let families: Vec<gam_mpd::interchange::Family> = match request.get("families") {
+                Some(f) if !f.is_null() => serde_json::from_value(f.clone()).map_err(error)?,
+                _ => serde_json::from_value(json!(["swap", "zero", "scale", "push", "cut"])).map_err(error)?,
+            };
+            let identity = gam_mpd::engine::sha256(&dir.join("export.json"))?;
+            c.sites = SiteUnits::write_manifest(out, &identity, &c.weights, &c.stats, &sequences, &families, count, seed, length)?;
+            Ok(json!({"ok": true, "manifest": out.display().to_string(), "site_experiments": c.sites.pool.len(), "typical_sites": c.sites.typical.len()}))
         }
         other => Err(format!("unknown op {other}")),
     }
