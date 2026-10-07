@@ -1,0 +1,64 @@
+name: Graph Oracle E2E
+
+# The graph oracle's whole path (#2951) on a tiny random model: mech traces programs, the Rust checker
+# (crates/gam-mpd/examples/mpd_graph_2951.rs) scores them on bench/oracle/graph/e2e/tiny.py's export and
+# behavior, and bench/oracle/graph/e2e/test_tiny.py checks the terms (full program error ~0, the
+# counterfactual empty program's error is the behavior's signal at no opaque cost, terms follow the
+# declared pieces, batch == single requests). The tracer and e2e unit tests run alongside.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "bench/oracle/graph/**"
+      - "crates/gam-mpd/src/graph*.rs"
+      - "crates/gam-mpd/examples/mpd_graph_2951.rs"
+      - ".github/workflows/graph-oracle-e2e.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: graph-oracle-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+  SCCACHE_GHA_ENABLED: "true"
+
+jobs:
+  e2e:
+    name: graph oracle whole path (tiny model)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up warm Rust toolchain
+        uses: ./.github/actions/setup-rust-ci
+        with:
+          free-disk-space: "false"
+          cache-targets: "false"
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install pytest
+        run: python -m pip install 'pytest>=8'
+
+      - name: Build the checker server
+        run: cargo build -p gam-mpd --example mpd_graph_2951
+
+      - name: Run the whole path and the tracer tests
+        env:
+          GRAPH_CHECKER: ${{ github.workspace }}/target/debug/examples/mpd_graph_2951
+          MEM_LEASE_GIB: "1"
+          MPD_MEM_GIB: "1"
+        run: |
+          python -m pytest bench/oracle/graph/e2e/test_tiny.py bench/oracle/graph/e2e/test_e2e.py \
+            bench/oracle/graph/test_mech.py -p no:cacheprovider -v --tb=short
