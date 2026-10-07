@@ -1,0 +1,53 @@
+"""Print every example that beats the empty program (rescore_examples.py outputs) with the printer, and
+attach its score: ~/mpd-data/graph_oracle/printed/<example>.{py,wrong.py,graph.json} (for the gallery
+and for training data). Examples already printed with a score are skipped.
+
+  MPD_MEM_GIB=3 mem-lease 3 ~/mpd-data/venv/bin/python print_winners.py RESCORE.jsonl [...]
+"""
+
+import json
+import sys
+from pathlib import Path
+
+G = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(G))
+import mech  # noqa: E402
+import printer  # noqa: E402
+
+OUT = Path.home() / "mpd-data/graph_oracle/printed"
+KEYS = ("total_bits", "exec_error_bits", "opaque_bits", "code_bits", "N", "experiments", "per_family", "valid")
+
+
+def main():
+    records = {}
+    for path in sys.argv[1:]:
+        for line in Path(path).read_text().splitlines():
+            r = json.loads(line)
+            if "error" not in r:
+                records[r["example"]] = r
+    OUT.mkdir(parents=True, exist_ok=True)
+    for name, r in sorted(records.items()):
+        if r["program"]["total_bits"] >= r["empty"]["total_bits"]:
+            continue
+        graph_path = OUT / f"{name}.graph.json"
+        if graph_path.exists() and "score" in json.loads(graph_path.read_text()):
+            continue
+        behavior = json.loads((Path.home() / f"mpd-data/graph_oracle/behaviors/vpd4l/{r['behavior']}.json").read_text())
+        ir = mech.trace_inline((G / "examples" / f"{name}.py").read_text(), "vpd4l")
+        printer.SHAPE[0] = mech.shapes("vpd4l")
+        measured = printer.facts(printer.engine_for("vpd4l"), ir, behavior)
+        score = {k: r["program"].get(k) for k in KEYS} | {"checker": r["checker"]}
+        src, graph = printer.printed(ir, behavior, score, measured)
+        (OUT / f"{name}.py").write_text(src)
+        (OUT / f"{name}.wrong.py").write_text(printer.printed(ir, behavior, score, printer.wrong(measured))[0])
+        N = r["empty"].get("N") or 2**24
+        graph["empty_score"] = {k: r["empty"].get(k) for k in KEYS}
+        graph["summary"] = (f"total {r['program']['total_bits'] / N:.3f} bits per scored token vs the empty program's "
+                            f"{r['empty']['total_bits'] / N:.3f}; signal recovered "
+                            f"{1 - r['program']['exec_error_bits'] / r['empty']['exec_error_bits']:.0%}")
+        graph_path.write_text(json.dumps(graph, indent=1))
+        print(name, graph["summary"], flush=True)
+
+
+if __name__ == "__main__":
+    main()
