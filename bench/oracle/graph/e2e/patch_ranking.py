@@ -4,6 +4,10 @@ head's or neuron's clean output recovers when patched alone into the counterfact
 table rank their neurons last (0).
 
   patch_ranking.py [--tables ~/mpd-data/graph_oracle/experiments/examples] [--out ~/mpd-data/graph_oracle/experiments/patch_rankings]
+
+With --vpd, the VPD vocabulary instead (--out default .../vpd_rankings): native heads (patch_vpd4l) and VPD MLP
+subcomponents (vpdpatch_vpd4l: a subcomponent's clean contribution patched alone into the counterfactual run),
+as {"mixed": [[unit name, recovery per opaque number], ...]} in decreasing order, for search.py --ranking.
 """
 
 from __future__ import annotations
@@ -21,13 +25,41 @@ import mech  # noqa: E402
 DATA = Path.home() / "mpd-data/graph_oracle/experiments"
 
 
+def vpd_rankings(a, s) -> int:
+    """Native heads and VPD MLP subcomponents ranked together by recovered bits per opaque number."""
+    head_cost = 4 * s["d_model"] * s["head_dim"]
+    sub_cost = s["d_model"] + s["d_mlp"]  # a c_fc or down_proj subcomponent's two vectors
+    written = 0
+    for path in sorted((a.tables / f"vpdpatch_{a.model}").glob("vpdpatch_*.json")):
+        behavior = path.stem[len("vpdpatch_"):]
+        heads_table = a.tables / f"patch_{a.model}" / f"patch_{behavior}.json"
+        if not heads_table.exists():
+            continue
+        units = [(h["recovery_bits"] / head_cost, f"h{h['layer']}_{h['head']}") for h in json.loads(heads_table.read_text())["heads"]]
+        for key, rec in json.loads(path.read_text())["recovery"].items():
+            layer, site = key.split(".")
+            if site in ("c_fc", "down_proj"):
+                units += [(r / sub_cost, f"s{layer}_{site}_{i}") for i, r in enumerate(rec) if r > 0]
+        units = [u for u in sorted(units, key=lambda x: -x[0]) if u[0] > 0]
+        (a.out / f"{behavior}.json").write_text(json.dumps({"behavior": behavior, "source": f"{heads_table} and {path} (g-mech's patching)",
+                                                            "mixed": [[n, v] for v, n in units]}))
+        written += 1
+    return written
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--tables", type=Path, default=DATA / "examples")
     ap.add_argument("--out", type=Path, default=DATA / "patch_rankings")
     ap.add_argument("--model", default="vpd4l")
+    ap.add_argument("--vpd", action="store_true", help="the VPD vocabulary: native heads and VPD MLP subcomponents")
     a = ap.parse_args()
     s = mech.shapes(a.model)
+    if a.vpd:
+        a.out = a.out if a.out != DATA / "patch_rankings" else DATA / "vpd_rankings"
+        a.out.mkdir(parents=True, exist_ok=True)
+        print(f"{vpd_rankings(a, s)} rankings in {a.out}")
+        return
     a.out.mkdir(parents=True, exist_ok=True)
     written = 0
     for path in sorted((a.tables / f"patch_{a.model}").glob("patch_*.json")):

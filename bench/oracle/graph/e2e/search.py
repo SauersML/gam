@@ -398,7 +398,8 @@ def main() -> None:
         GROW = a.grow
         if a.mode != "prefix":
             load_ranking(a.ranking)
-    views = {"vpd": a.vpd} if a.mlp_view == "vpd" else None
+    mixed = a.ranking is not None and "mixed" in json.loads(a.ranking.read_text())
+    views = {"vpd": a.vpd} if a.mlp_view == "vpd" or mixed else None
     pool = Pool(model, path, a.workers, a.export, a.stand_in, views, out / f"{behavior['id']}{a.tag}.candidates.jsonl", a.device)
     try:
         for mode in (["addition", "removal"] if a.mode == "both" else [a.mode]):
@@ -414,8 +415,10 @@ def main() -> None:
                 partial = out / f"{stem}.partial.json"
                 save = lambda state: partial.write_text(json.dumps(state, indent=1))
                 if mode == "prefix":
-                    ranked = None if a.ranking is None else (ranked_subcomponents(a.ranking) if a.mlp_view == "vpd"
-                                                             else ranked_native(a.ranking, model))[: a.max_units]
+                    data = None if a.ranking is None else json.loads(a.ranking.read_text())
+                    ranked = None if data is None else ([unit_of(n) for n, _ in data["mixed"]] if "mixed" in data
+                                                        else ranked_subcomponents(a.ranking) if a.mlp_view == "vpd"
+                                                        else ranked_native(a.ranking, model))[: a.max_units]
                     found = prefix_search(pool, model, a.experiments, a.seed, a.block, log, a.rank_experiments, save,
                                           objective_of(a.objective), ranked=ranked, max_prune=a.max_prune)
                 else:
