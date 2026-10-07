@@ -17,13 +17,22 @@ an own read beside a direction gate anywhere read the constant 0, Φ(0) = 1/2 at
 which halved every attention map of the neuron start's exports): a neuron start's always-on attention
 components read the zero direction (z = 0 - tau > 0), which either way scores them on, and its head
 slices keep their own reads at the attention's stages beside the direction-gated MLP.
+The rot arm (a save with 'rot': per layer the neuron order 'perm', per group of 32 neurons the
+rotation's 'A', the block logits 'L', thresholds 'tau' and widths 's') gives each MLP map M's own
+weights (from MODEL, an export of M) in the groups' rotated bases Q = exp(A*U - (A*U)^T), U the strict
+upper triangle: c_fc slice i of a group reads W_fc,G^T Q_i and writes Q_i, its down slice reads Q_i
+and writes W_dn,G Q_i (rescaled to Q_i ||W_dn,G Q_i||, W_dn,G Q_i / ||W_dn,G Q_i||); each block
+(the slices whose argmax over L is it) is one component of its c_fc and down slices, gated on the
+norm of its down reads on the layer's all-on activations (library_vpd's Read::Active, c5ebe92bc2),
+which is the arm's own read sqrt(sum_i (|abar_G . Q_i| ||W_dn,G Q_i||)^2).
 
-usage: export_to_rust.py STATE.pt ATTN_DIR OUT_DIR ARM [--all-on]"""
+usage: export_to_rust.py STATE.pt ATTN_DIR OUT_DIR ARM [--all-on] [--model MODEL]"""
 import sys, json, os, shutil
-import numpy as np, torch
+import numpy as np, scipy.linalg as sl, torch
 
 state_path, attn_dir, out, arm = sys.argv[1:5]
 all_on = '--all-on' in sys.argv
+model = sys.argv[sys.argv.index('--model') + 1] if '--model' in sys.argv else '/Users/user/mpd-data/engine/vpd4l_pile2p27'
 S = torch.load(state_path, map_location='cpu', weights_only=False)
 KINDS = ('q_proj', 'k_proj', 'v_proj', 'o_proj', 'c_fc', 'down_proj')
 sites = [f"h.{l}.{'mlp' if k in ('c_fc', 'down_proj') else 'attn'}.{k}" for l in range(4) for k in KINDS]
@@ -31,6 +40,34 @@ index = {n: i for i, n in enumerate(sites)}
 os.makedirs(out, exist_ok=False)
 attn_record = json.load(open(os.path.join(attn_dir, 'export.json')))
 heads = S.get('attn') or {}
+rot = S.get('rot') or {}
+rot_maps, rot_blocks = {}, {}
+if rot:
+    record = json.load(open(os.path.join(model, 'export.json')))
+    weight = lambda name: np.fromfile(os.path.join(model, f'{name}.f64'), dtype='<f8').reshape(record['files'][name]['shape'])
+    for l, R in rot.items():
+        l = int(l)
+        Wf, Wd = weight(f'blocks.{l}.mlp.c_fc'), weight(f'blocks.{l}.mlp.down_proj')       # [3072, 768], [768, 3072]
+        perm, A = R['perm'].long().numpy(), R['A'].double().numpy()
+        ng, g = A.shape[0], A.shape[1]
+        upper = np.triu(np.ones((g, g)), 1)
+        Vf, Uf = np.zeros((Wf.shape[1], ng * g)), np.zeros((ng * g, Wf.shape[0]))
+        Vd, Ud = np.zeros((Wd.shape[1], ng * g)), np.zeros((ng * g, Wd.shape[0]))
+        for n in range(ng):
+            G = perm[n * g:(n + 1) * g]
+            S_ = A[n] * upper
+            Q = sl.expm(S_ - S_.T)                                                        # [g, g], columns Q_i
+            k = slice(n * g, (n + 1) * g)
+            Vf[:, k] = Wf[G].T @ Q
+            Uf[k][:, G] = Q.T
+            Vd[G, k] = Q
+            Ud[k] = (Wd[:, G] @ Q).T
+        norm = np.maximum(np.linalg.norm(Ud, axis=1), 1e-30)
+        Vd, Ud = Vd * norm[None, :], Ud / norm[:, None]                                  # |v'.a| = |Q_i . a_G| ||W_dn,G Q_i||
+        rot_maps[f'h.{l}.mlp.c_fc'], rot_maps[f'h.{l}.mlp.down_proj'] = (Vf, Uf), (Vd, Ud)
+        block = R['L'].double().argmax(-1).numpy()                                        # [ng, g]: each slice's block
+        tau, s_ = R['tau'].double().numpy(), R['s'].double().numpy()
+        rot_blocks[l] = [(n, j, [n * g + i for i in range(g) if block[n, i] == j], float(tau[n, j]), float(s_[n, j])) for n in range(ng) for j in range(g) if (block[n] == j).any()]
 files = {}
 
 
@@ -65,6 +102,11 @@ for n in sites:
             shutil.copyfile(os.path.join(attn_dir, f'{n}.{w}.f64'), os.path.join(out, f'{n}.{w}.f64'))
             files[f'{n}.{w}'] = {'shape': attn_record['files'][f'{n}.{w}']['shape']}
         continue
+    if n in rot_maps:
+        for w, t in (('U', rot_maps[n][1]), ('V', rot_maps[n][0])):
+            t.astype('<f8').tofile(os.path.join(out, f'{n}.{w}.f64'))
+            files[f'{n}.{w}'] = {'shape': list(t.shape)}
+        continue
     m = S['maps'][n]
     V, U = m['V'].double(), m['U'].double()                                   # [d_in, C], [C, d_out]
     norm = U.norm(dim=1).clamp_min(1e-30)
@@ -89,9 +131,13 @@ for n in sites:
         C, d = files[f'{n}.U']['shape'][0], files[f'{n}.V']['shape'][0]
         read = {'direction': {'site': index[n], 'coefficients': [0.0] * (d + 1)}} if S['start'] == 'neuron' else {'own': [index[n], 0]}
         components.append({'read': read, 'tau': -1e9, 'width': 1.0, 'slices': [[index[n], i] for i in range(C)]})
+for l, blocks in rot_blocks.items():
+    fc, dn = index[f'h.{l}.mlp.c_fc'], index[f'h.{l}.mlp.down_proj']
+    for _, _, members, tau, s_ in blocks:
+        components.append({'read': {'active': {'site': fc}}, 'tau': -1e9 if all_on else tau, 'width': s_, 'slices': [[fc, i] for i in members] + [[dn, i] for i in members]})
 tied = {fc: (dn, own) for dn, (fc, own) in S['tied'].items()}
 for n in sites:
-    if '.attn.' in n or n in S['tied']:
+    if '.attn.' in n or n in S['tied'] or n in rot_maps:
         continue
     m = S['maps'][n]
     tau, s = m['tau'].double(), m['s'].double()
