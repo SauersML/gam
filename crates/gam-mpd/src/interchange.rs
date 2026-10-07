@@ -94,6 +94,11 @@ fn error(e: impl std::fmt::Display) -> String {
 #[derive(Clone)]
 struct Sites {
     entries: Vec<usize>,
+    /// Per block its input, the normed stream its projections read.
+    reads: Vec<usize>,
+    /// Per block the earlier blocks whose input it reads: a gate carried from its home block
+    /// (`library_vpd`'s blocks across blocks), recomputed from the home's input.
+    carried: Vec<Vec<usize>>,
     trainable: Vec<Vec<usize>>,
     values: Vec<Value>,
     parts: PartSites,
@@ -113,6 +118,7 @@ impl Sites {
         }
         let wanted: BTreeSet<usize> = trainable.iter().copied().collect();
         let mut per_block = Vec::with_capacity(blocks);
+        let mut carried = Vec::with_capacity(blocks);
         for b in 0..blocks {
             let end = if b + 1 < blocks { entries[b + 1] } else { hidden };
             let first = if b == 0 { 0 } else { entries[b] + 1 };
@@ -120,20 +126,30 @@ impl Sites {
                 return Err(error(format!("block {b}: its entering stream, read and end are not in order")));
             }
             let floor = if b == 0 { 0 } else { entries[b] };
-            let mut used = BTreeSet::new();
+            let (mut used, mut homes) = (BTreeSet::new(), BTreeSet::new());
             for n in first..=end {
                 let node = &flat.nodes[n];
-                if node.arguments().iter().any(|a| *a < floor && !matches!(flat.nodes[*a], Node::Feature { .. })) {
-                    return Err(error(format!("block {b}: node {n} reads a node before the stream entering the block")));
+                for a in node.arguments().into_iter().filter(|a| *a < floor && !matches!(flat.nodes[*a], Node::Feature { .. })) {
+                    // Before the stream entering the block a node reads only an earlier block's
+                    // input, to recompute a gate carried from there: the gate is a variable of the
+                    // explanation, decided at its home block and carried forward (a patch of a later
+                    // block's stream leaves it as it was, and the experiments test that claim).
+                    match reads[..b].iter().position(|r| *r == a) {
+                        Some(home) => {
+                            homes.insert(home);
+                        }
+                        None => return Err(error(format!("block {b}: node {n} reads a node before the stream entering the block other than an earlier block's input"))),
+                    }
                 }
                 used.extend(node.operators().into_iter().filter(|op| wanted.contains(op)));
             }
             per_block.push(used.into_iter().collect());
+            carried.push(homes.into_iter().collect());
         }
         if values.iter().any(|v| v.block >= blocks) || values.iter().flat_map(|v| &v.sites).any(|s| s.node >= hidden || widths[s.node] != s.width || s.columns.is_empty() || s.columns.end > s.width) {
             return Err(error("a read variable's value outside the program or its node"));
         }
-        Ok(Self { entries, trainable: per_block, values, parts: PartSites::default() })
+        Ok(Self { entries, reads, carried, trainable: per_block, values, parts: PartSites::default() })
     }
 }
 
@@ -152,8 +168,9 @@ impl<'a> Model<'a> {
     /// stream, `Head::prefix`). Per block (each layer's attention, then its MLP) `entries` holds
     /// the stream entering it and `reads` the node its projections read. `trainable` lists the
     /// dense operators that receive gradients (none for `M`). Each block's nodes must read nothing
-    /// before the stream entering it except token features, so that one block runs from that
-    /// stream alone. `values` says where the model holds each read variable's value ([`values`]).
+    /// before the stream entering it except token features and earlier blocks' inputs (a gate
+    /// carried from its home block, given to the block's calls: [`BlockEngine::forward_carrying`]).
+    /// `values` says where the model holds each read variable's value ([`values`]).
     pub fn new(program: &'a DeviceProgram, flat: &OperatorProgram, entries: Vec<usize>, reads: Vec<usize>, trainable: &[usize], values: Vec<Value>) -> Result<Self, String> {
         Ok(Self { program, sites: Arc::new(Sites::new(program, flat, entries, reads, trainable, values)?), prefixes: None })
     }
@@ -1773,6 +1790,53 @@ pub trait BlockEngine {
         keep: bool,
     ) -> Result<Option<Self::Tape>, String>;
 
+    /// The earlier blocks whose input block `block` reads (a gate carried from its home block,
+    /// `library_vpd`'s blocks across blocks); none by default.
+    fn carried(&self, _block: usize) -> &[usize] {
+        &[]
+    }
+
+    /// [`BlockEngine::forward_before`] given `carried`, the values of the earlier blocks' inputs
+    /// block `block` reads (by block, each on the call's rows), returning with `own` this block's
+    /// input on the call's rows too (a later block reads it).
+    #[allow(clippy::too_many_arguments)]
+    fn forward_carrying(
+        &self,
+        block: usize,
+        stream: &mut Tensor,
+        call: (&[Range<usize>], &[Vec<Range<usize>>]),
+        tokens: &[&[u32]],
+        edits: Option<&Edits>,
+        keep: bool,
+        (carried, own): (BTreeMap<usize, Tensor>, bool),
+    ) -> Result<(Option<Self::Tape>, Option<Tensor>), String> {
+        if !carried.is_empty() || own {
+            return Err(error("an engine without carried block inputs"));
+        }
+        Ok((self.forward_before(block, stream, call, tokens, edits, keep)?, None))
+    }
+
+    /// [`BlockEngine::reverse`] with `own`, the cotangent of this block's input on the call's rows
+    /// from later blocks' reads of it, seeded there; returns the cotangents of the earlier blocks'
+    /// inputs it reads (by block, on the call's rows).
+    #[allow(clippy::too_many_arguments)]
+    fn reverse_carrying(
+        &self,
+        block: usize,
+        tape: &Self::Tape,
+        cotangent: &mut Tensor,
+        ranges: &[Range<usize>],
+        edits: Option<&Edits>,
+        sums: (&mut BTreeMap<usize, Tensor>, Arithmetic),
+        own: Option<Tensor>,
+    ) -> Result<BTreeMap<usize, Tensor>, String> {
+        if own.is_some() || !self.carried(block).is_empty() {
+            return Err(error("an engine without carried block inputs"));
+        }
+        self.reverse(block, tape, cotangent, ranges, edits, sums)?;
+        Ok(BTreeMap::new())
+    }
+
     /// The reverse of block `block` from its tape, its products in `arithmetic` (a pass may run in
     /// another precision than the forward pass that made the tape), adding `P`'s parameter
     /// gradient into `gradient`.
@@ -1900,13 +1964,34 @@ impl BlockEngine for Model<'_> {
         &self,
         block: usize,
         stream: &mut Tensor,
-        (ranges, before): (&[Range<usize>], &[Vec<Range<usize>>]),
+        call: (&[Range<usize>], &[Vec<Range<usize>>]),
         tokens: &[&[u32]],
         edits: Option<&Edits>,
         keep: bool,
     ) -> Result<Option<DeviceTrace>, String> {
+        Ok(self.forward_carrying(block, stream, call, tokens, edits, keep, (BTreeMap::new(), false))?.0)
+    }
+
+    fn carried(&self, block: usize) -> &[usize] {
+        self.sites.carried.get(block).map_or(&[], Vec::as_slice)
+    }
+
+    fn forward_carrying(
+        &self,
+        block: usize,
+        stream: &mut Tensor,
+        (ranges, before): (&[Range<usize>], &[Vec<Range<usize>>]),
+        tokens: &[&[u32]],
+        edits: Option<&Edits>,
+        keep: bool,
+        (carried, own): (BTreeMap<usize, Tensor>, bool),
+    ) -> Result<(Option<DeviceTrace>, Option<Tensor>), String> {
         let d = self.program.device();
         let entry = if block == 0 { None } else { Some((self.entry(block), gather(d, stream, ranges)?)) };
+        if carried.keys().copied().ne(self.carried(block).iter().copied()) {
+            return Err(error(format!("block {block}: carried inputs of other blocks than it reads")));
+        }
+        let carried: Vec<(usize, Tensor)> = carried.into_iter().map(|(home, value)| (self.sites.reads[home], value)).collect();
         let edit = |n: usize, trace: &DeviceTrace| -> Result<Option<Tensor>, String> {
             match edits {
                 Some(edits) if edits.changes(n) => {
@@ -1920,11 +2005,12 @@ impl BlockEngine for Model<'_> {
         };
         let end = self.end(block);
         let trace = match segments(ranges, before, tokens)? {
-            None => self.program.forward_span(&family(tokens), entry, end, edit)?,
-            Some((family, segments)) => self.program.forward_span_segments(&family, entry, end, edit, Arc::new(segments))?,
+            None => self.program.forward_span_carried(&family(tokens), (entry, carried), end, edit, None)?,
+            Some((family, segments)) => self.program.forward_span_carried(&family, (entry, carried), end, edit, Some(Arc::new(segments)))?,
         };
+        let input = if own { Some(d.copy(trace.value(self.sites.reads[block])?).map_err(error)?) } else { None };
         scatter(d, stream, ranges, trace.value(end)?)?;
-        Ok(keep.then_some(trace))
+        Ok((keep.then_some(trace), input))
     }
 
     fn reverse(
@@ -1934,15 +2020,33 @@ impl BlockEngine for Model<'_> {
         cotangent: &mut Tensor,
         ranges: &[Range<usize>],
         edits: Option<&Edits>,
-        (gradient, arithmetic): (&mut BTreeMap<usize, Tensor>, Arithmetic),
+        sums: (&mut BTreeMap<usize, Tensor>, Arithmetic),
     ) -> Result<(), String> {
+        self.reverse_carrying(block, tape, cotangent, ranges, edits, sums, None).map(|_| ())
+    }
+
+    fn reverse_carrying(
+        &self,
+        block: usize,
+        tape: &DeviceTrace,
+        cotangent: &mut Tensor,
+        ranges: &[Range<usize>],
+        edits: Option<&Edits>,
+        (gradient, arithmetic): (&mut BTreeMap<usize, Tensor>, Arithmetic),
+        own: Option<Tensor>,
+    ) -> Result<BTreeMap<usize, Tensor>, String> {
         let d = self.program.device();
-        let seeds = BTreeMap::from([(self.end(block), gather(d, cotangent, ranges)?)]);
+        let mut seeds = BTreeMap::from([(self.end(block), gather(d, cotangent, ranges)?)]);
+        if let Some(own) = own {
+            seeds.insert(self.sites.reads[block], own);
+        }
         let edited = edits.map(Edits::nodes).unwrap_or_default();
         let mut keep: Vec<usize> = edited.iter().copied().collect();
         if block > 0 {
             keep.push(self.entry(block));
         }
+        let homes = self.carried(block).to_vec();
+        keep.extend(homes.iter().map(|&h| self.sites.reads[h]));
         let mut hook = |n: usize, g: &mut Tensor| -> Result<(), String> {
             match edits {
                 Some(edits) => edits.transpose(d, n, g),
@@ -1950,15 +2054,25 @@ impl BlockEngine for Model<'_> {
             }
         };
         let mut nodes = self.program.vjp_values_dense_edited(tape, seeds, &keep, &self.sites.trainable[block], arithmetic, (&edited, &mut hook), gradient)?;
+        let rows: usize = ranges.iter().map(ExactSizeIterator::len).sum();
+        let mut carried = BTreeMap::new();
+        for h in homes {
+            let g = match nodes.remove(&self.sites.reads[h]) {
+                Some(g) => g,
+                None => d.zeros(rows, cotangent.cols()).map_err(error)?,
+            };
+            carried.insert(h, g);
+        }
         let mut entering = if block > 0 {
             nodes.remove(&self.entry(block)).ok_or_else(|| error("no cotangent of a block's entering stream"))?
         } else {
-            d.zeros(ranges.iter().map(ExactSizeIterator::len).sum(), cotangent.cols()).map_err(error)?
+            d.zeros(rows, cotangent.cols()).map_err(error)?
         };
         if let Some(edits) = edits {
             edits.add_entering(d, &mut entering)?;
         }
-        scatter(d, cotangent, ranges, &entering)
+        scatter(d, cotangent, ranges, &entering)?;
+        Ok(carried)
     }
 
     fn tape_bytes(tape: &DeviceTrace) -> usize {
@@ -2355,16 +2469,24 @@ fn edits<E: BlockEngine>(engine: &E, plan: &Plan, block: usize, lanes: &[usize])
 /// the calls. With `keep`, each call keeps its tape while the kept bytes, this call's tape and one
 /// block run again with its reverse (each estimated by the largest tape so far) stay below `P`'s
 /// [`BlockEngine::tape_budget`], and the rows entering it otherwise.
-fn run<E: BlockEngine>(engines: [&E; 2], plan: &Plan, keep: bool) -> Result<(Tensor, Vec<Call<E::Tape>>), String> {
+fn run<E: BlockEngine>(engines: [&E; 2], plan: &Plan, keep: bool) -> Result<(Tensor, Vec<Call<E::Tape>>, Inputs), String> {
     let (d, width, blocks) = (engines[0].device(), engines[0].width(), engines[0].blocks());
     let mut stream = d.zeros(plan.lanes.len() * plan.length, width).map_err(error)?;
+    // The blocks whose input a later block of `P` reads ([`BlockEngine::carried`]), each with its
+    // input on every lane's rows, written by the call that runs it, forked and copied as the stream.
+    let mut inputs: Inputs = BTreeMap::new();
+    for b in (0..blocks).flat_map(|b| engines[0].carried(b).to_vec()) {
+        if let std::collections::btree_map::Entry::Vacant(v) = inputs.entry(b) {
+            v.insert(d.zeros(stream.rows(), width).map_err(error)?);
+        }
+    }
     let mut calls = Vec::new();
     let budget = if keep { Some(engines[0].tape_budget(stream.rows())?) } else { None };
     let (mut kept, mut largest) = (0usize, 0usize);
     // `M`'s prefixes kept across scorings (`PrefixStore`), where `P` and `M` are two engines (not a
     // run of `M` alone, its targets') and the stream holds f32: a lane whose prefix is kept skips
     // its calls through the prefix's last block and takes the kept rows after it.
-    let store = if std::ptr::eq(engines[0], engines[1]) { None } else { engines[1].prefixes() };
+    let store = if std::ptr::eq(engines[0], engines[1]) || !inputs.is_empty() { None } else { engines[1].prefixes() };
     let ends = if store.is_some() { plan.prefix_ends() } else { vec![None; plan.lanes.len()] };
     let key = |l: usize, k: usize| (plan.paths[plan.lanes[l].path].tokens.to_vec(), k);
     let restored: Vec<bool> = match store {
@@ -2380,6 +2502,9 @@ fn run<E: BlockEngine>(engines: [&E; 2], plan: &Plan, keep: bool) -> Result<(Ten
             if let Some(parent) = lane.parent {
                 let rows = plan.lanes[parent].rows.clone();
                 d.copy_rows_within(&mut stream, lane.rows.start, rows.start, rows.len()).map_err(error)?;
+                for buffer in inputs.values_mut() {
+                    d.copy_rows_within(buffer, lane.rows.start, rows.start, rows.len()).map_err(error)?;
+                }
             }
         }
         for side in 0..2 {
@@ -2394,32 +2519,33 @@ fn run<E: BlockEngine>(engines: [&E; 2], plan: &Plan, keep: bool) -> Result<(Ten
             let before = plan.before(b, &lanes)?;
             let tokens: Vec<&[u32]> = lanes.iter().map(|l| plan.paths[plan.lanes[*l].path].tokens).collect();
             let edits = edits(engines[side], plan, b, &lanes)?;
+            let own = inputs.contains_key(&b);
+            let carried = || -> Result<BTreeMap<usize, Tensor>, String> { engines[side].carried(b).iter().map(|h| Ok((*h, gather(d, &inputs[h], &ranges)?))).collect() };
+            let forward = |stream: &mut Tensor, keep: bool| -> Result<(Option<E::Tape>, Option<Tensor>), String> { engines[side].forward_carrying(b, stream, (&ranges, &before), &tokens, edits.as_ref(), keep, (carried()?, own)) };
             // An `M` call none of whose lanes' cotangents reach anything trainable is not reversed
             // (`Plan::reaches_trainable`): its forward keeps nothing.
             let reversed = side == 0 || edits.is_some() || lanes.iter().any(|&l| plan.reaches_trainable(l, b));
-            let kept_here = match budget {
-                None => {
-                    engines[side].forward_before(b, &mut stream, (&ranges, &before), &tokens, edits.as_ref(), false)?;
-                    None
-                }
-                Some(_) if !reversed => {
-                    engines[side].forward_before(b, &mut stream, (&ranges, &before), &tokens, edits.as_ref(), false)?;
-                    None
-                }
+            let (kept_here, input) = match budget {
+                None => (None, forward(&mut stream, false)?.1),
+                Some(_) if !reversed => (None, forward(&mut stream, false)?.1),
                 Some(budget) if kept.saturating_add(largest.saturating_mul(3)) < budget => {
-                    let tape = engines[side].forward_before(b, &mut stream, (&ranges, &before), &tokens, edits.as_ref(), true)?.ok_or_else(|| error("a call kept no tape"))?;
+                    let (tape, input) = forward(&mut stream, true)?;
+                    let tape = tape.ok_or_else(|| error("a call kept no tape"))?;
                     let bytes = E::tape_bytes(&tape);
                     kept = kept.saturating_add(bytes);
                     largest = largest.max(bytes);
-                    Some(Kept::Tape(tape))
+                    (Some(Kept::Tape(tape)), input)
                 }
                 Some(_) => {
                     let entering = if b == 0 { None } else { Some(gather(d, &stream, &ranges)?) };
                     kept = kept.saturating_add(entering.as_ref().map_or(0, Tensor::bytes));
-                    engines[side].forward_before(b, &mut stream, (&ranges, &before), &tokens, edits.as_ref(), false)?;
-                    Some(Kept::Entering(entering))
+                    let input = forward(&mut stream, false)?.1;
+                    (Some(Kept::Entering(entering)), input)
                 }
             };
+            if let (Some(input), Some(buffer)) = (input, inputs.get_mut(&b)) {
+                scatter(d, buffer, &ranges, &input)?;
+            }
             calls.push(Call { block: b, side, lanes, edits, kept: kept_here });
         }
         if let Some(store) = store {
@@ -2440,9 +2566,15 @@ fn run<E: BlockEngine>(engines: [&E; 2], plan: &Plan, keep: bool) -> Result<(Ten
             }
         }
         plan.copy_prefixes(d, &mut stream, b)?;
+        if let Some(buffer) = inputs.get_mut(&b) {
+            plan.copy_prefixes(d, buffer, b)?;
+        }
     }
-    Ok((stream, calls))
+    Ok((stream, calls, inputs))
 }
+
+/// Per block whose input a later block of `P` reads, its input on every lane's rows ([`run`]).
+type Inputs = BTreeMap<usize, Tensor>;
 
 /// The products' precision of the reverse passes (the data term's gradient and the Gauss–Newton
 /// factor): bfloat16 on CUDA in f32 storage (whose bfloat16 tensor cores run at least twice its
@@ -2473,9 +2605,12 @@ struct Pass<'a> {
 /// Each pass adds `P`'s parameter gradient into its own map, by the same operations in the same
 /// order as a reverse of its own, so each result is that pass's alone bit for bit, with one
 /// recomputation of a call's tape for all of them; the calls' tapes stay.
-fn run_reverse<E: BlockEngine>(engines: [&E; 2], plan: &Plan, calls: &[Call<E::Tape>], passes: &mut [Pass<'_>]) -> Result<(), String> {
+fn run_reverse<E: BlockEngine>(engines: [&E; 2], plan: &Plan, (calls, inputs): (&[Call<E::Tape>], &Inputs), passes: &mut [Pass<'_>]) -> Result<(), String> {
     let d = engines[0].device();
     let width = passes.first().map(|p| p.cotangent.cols()).ok_or_else(|| error("a reverse pass of no cotangent"))?;
+    // Per pass, per block whose input a later block reads, that input's cotangent on every lane's
+    // rows, from the later blocks' reverses, seeded into the block's own.
+    let mut input_cotangents: Vec<Inputs> = passes.iter().map(|p| inputs.keys().map(|&b| Ok((b, d.zeros(p.cotangent.rows(), width).map_err(error)?))).collect::<Result<_, String>>()).collect::<Result<_, String>>()?;
     for (index, call) in calls.iter().enumerate().rev() {
         let b = call.block;
         let ranges: Vec<Range<usize>> = call.lanes.iter().map(|l| plan.range(*l)).collect();
@@ -2500,14 +2635,25 @@ fn run_reverse<E: BlockEngine>(engines: [&E; 2], plan: &Plan, calls: &[Call<E::T
                     None => return Err(error("a call past the first block without its entering rows")),
                 };
                 let tokens: Vec<&[u32]> = call.lanes.iter().map(|l| plan.paths[plan.lanes[*l].path].tokens).collect();
-                recomputed = engines[call.side].forward_before(b, &mut rows, (&local, &plan.before(b, &call.lanes)?), &tokens, call.edits.as_ref(), true)?.ok_or_else(|| error("a call kept no tape"))?;
+                let carried = engines[call.side].carried(b).iter().map(|h| Ok((*h, gather(d, &inputs[h], &ranges)?))).collect::<Result<BTreeMap<_, _>, String>>()?;
+                recomputed = engines[call.side].forward_carrying(b, &mut rows, (&local, &plan.before(b, &call.lanes)?), &tokens, call.edits.as_ref(), true, (carried, false))?.0.ok_or_else(|| error("a call kept no tape"))?;
                 Some(&recomputed)
             }
         };
-        for pass in passes.iter_mut() {
+        for (pass, input_cotangent) in passes.iter_mut().zip(input_cotangents.iter_mut()) {
             plan.return_prefixes(d, &mut pass.cotangent, b, &call.lanes)?;
+            if let Some(g) = input_cotangent.get_mut(&b) {
+                plan.return_prefixes(d, g, b, &call.lanes)?;
+            }
             if let Some(tape) = tape {
-                engines[call.side].reverse(b, tape, &mut pass.cotangent, &ranges, call.edits.as_ref(), (&mut *pass.gradient, pass.arithmetic))?;
+                let own = input_cotangent.get(&b).map(|g| gather(d, g, &ranges)).transpose()?;
+                let carried = engines[call.side].reverse_carrying(b, tape, &mut pass.cotangent, &ranges, call.edits.as_ref(), (&mut *pass.gradient, pass.arithmetic), own)?;
+                for (home, g) in carried {
+                    let sum = input_cotangent.get_mut(&home).ok_or_else(|| error("a carried input's cotangent of a block no one reads"))?;
+                    let mut total = gather(d, sum, &ranges)?;
+                    d.axpy(&mut total, 1.0, &g).map_err(error)?;
+                    scatter(d, sum, &ranges, &total)?;
+                }
             }
         }
         if let Some(tape) = tape {
@@ -2516,7 +2662,7 @@ fn run_reverse<E: BlockEngine>(engines: [&E; 2], plan: &Plan, calls: &[Call<E::T
         // Once both sides of the block are reversed, the forks made there return their rows, the
         // later lanes first (a lane forked from a lane forked at the same block returns through it).
         if index == 0 || calls[index - 1].block != b {
-            for pass in passes.iter_mut() {
+            for (pass, input_cotangent) in passes.iter_mut().zip(input_cotangents.iter_mut()) {
                 for lane in plan.lanes.iter().rev().filter(|l| l.start == b) {
                     if let Some(parent) = lane.parent {
                         let rows = plan.lanes[parent].rows.clone();
@@ -2524,6 +2670,10 @@ fn run_reverse<E: BlockEngine>(engines: [&E; 2], plan: &Plan, calls: &[Call<E::T
                             return Err(error("a lane returns rows to a parent of another length"));
                         }
                         d.axpy_rows_within(&mut pass.cotangent, rows.start, 1.0, lane.rows.start, rows.len()).map_err(error)?;
+                        // The inputs of the blocks below the fork it holds as copies of its parent's.
+                        for (_, g) in input_cotangent.range_mut(..b) {
+                            d.axpy_rows_within(g, rows.start, 1.0, lane.rows.start, rows.len()).map_err(error)?;
+                        }
                     }
                 }
             }
@@ -2620,7 +2770,7 @@ pub fn targets<E: BlockEngine>(m: &E, head: &FixedHead, batch: &Batch, experimen
     let native = vec![false; blocks];
     let (paths, bases) = paths(batch, experiments, m.values(), engine_heads(m), Some(&native), blocks)?;
     let plan = Plan::new(paths, batch.length);
-    let (stream, _) = run([m, m], &plan, false)?;
+    let (stream, _, _) = run([m, m], &plan, false)?;
     let rows = outputs(&plan, &bases, experiments);
     let hidden = gather(d, &stream, &rows)?;
     let all = head.target(d, &hidden, m.arithmetic())?;
@@ -3118,7 +3268,7 @@ pub fn evaluate_probed<E: BlockEngine>(
     let (paths, bases) = paths(batch, experiments, p.values(), engine_heads(p), None, blocks)?;
     let plan = Plan::new(paths, length);
     let arithmetic = p.arithmetic();
-    let (stream, calls) = run([p, m], &plan, gradient || probe.is_some())?;
+    let (stream, calls, inputs) = run([p, m], &plan, gradient || probe.is_some())?;
     let work = Work {
         paths: plan.paths.len(),
         lanes: plan.lanes.len(),
@@ -3184,7 +3334,7 @@ pub fn evaluate_probed<E: BlockEngine>(
         passes.push(Pass { cotangent, gradient: &mut u, arithmetic: factor });
     }
     if !passes.is_empty() {
-        run_reverse([p, m], &plan, &calls, &mut passes)?;
+        run_reverse([p, m], &plan, (&calls, &inputs), &mut passes)?;
     }
     drop(passes);
     let factor = factored.then(|| Factor { gradient: u, tokens: hidden.rows() });
@@ -3741,7 +3891,7 @@ fn final_rows<E: BlockEngine>(m: &E, p: &E, batch: &Batch, experiments: &[Experi
     let engine = if alone { m } else { p };
     let (paths, bases) = paths(batch, experiments, engine.values(), engine_heads(engine), alone.then_some(native.as_slice()), blocks)?;
     let plan = Plan::new(paths, batch.length);
-    let (stream, _) = run([engine, m], &plan, false)?;
+    let (stream, _, _) = run([engine, m], &plan, false)?;
     outputs(&plan, &bases, experiments).iter().map(|r| d.download(&d.rows_of(&stream, r.start, r.len()).map_err(error)?).map_err(error)).collect()
 }
 
@@ -3779,7 +3929,7 @@ mod tests {
             let (m, p) = ic.models();
             let (paths, bases) = paths(&batch, &experiments, p.values(), &[], None, 4).expect("the paths");
             let plan = Plan::new(paths, 12);
-            let (stream, calls) = run([&p, &m], &plan, true).expect("the forward pass");
+            let (stream, calls, inputs) = run([&p, &m], &plan, true).expect("the forward pass");
             let rows = outputs(&plan, &bases, &experiments);
             let scored: usize = rows.iter().map(ExactSizeIterator::len).sum();
             let seed = |k: u64| {
@@ -3792,13 +3942,13 @@ mod tests {
             };
             let arithmetic = factor_arithmetic(&device, p.arithmetic());
             let (mut first, mut second) = (BTreeMap::new(), BTreeMap::new());
-            run_reverse([&p, &m], &plan, &calls, &mut [Pass { cotangent: seed(1), gradient: &mut first, arithmetic }]).expect("the first pass");
-            run_reverse([&p, &m], &plan, &calls, &mut [Pass { cotangent: seed(2), gradient: &mut second, arithmetic }]).expect("the second pass");
+            run_reverse([&p, &m], &plan, (&calls, &inputs), &mut [Pass { cotangent: seed(1), gradient: &mut first, arithmetic }]).expect("the first pass");
+            run_reverse([&p, &m], &plan, (&calls, &inputs), &mut [Pass { cotangent: seed(2), gradient: &mut second, arithmetic }]).expect("the second pass");
             let (mut first_together, mut second_together) = (BTreeMap::new(), BTreeMap::new());
             run_reverse(
                 [&p, &m],
                 &plan,
-                &calls,
+                (&calls, &inputs),
                 &mut [Pass { cotangent: seed(1), gradient: &mut first_together, arithmetic }, Pass { cotangent: seed(2), gradient: &mut second_together, arithmetic }],
             )
             .expect("the passes together");
@@ -3929,7 +4079,7 @@ mod tests {
         let (m, p) = ic.models();
         let (paths, bases) = paths(&batch, &experiments, p.values(), &[], None, 4).expect("the paths");
         let plan = Plan::new(paths, 12);
-        let (stream, calls) = run([&p, &m], &plan, true).expect("the forward pass");
+        let (stream, calls, inputs) = run([&p, &m], &plan, true).expect("the forward pass");
         let rows = outputs(&plan, &bases, &experiments);
         let hidden = device.download(&gather(&device, &stream, &rows).expect("the scored rows")).expect("download");
         let embedding = device.download(&ic.head().resident.embedding).expect("download");
@@ -3946,7 +4096,7 @@ mod tests {
                 seed.row_mut(r).assign(&residual.dot(&embedding));
                 let cotangent = spread(&device, stream.rows(), &rows, &device.upload(seed.view()).expect("upload"), 1.0).expect("the seed");
                 let mut gradient = BTreeMap::new();
-                run_reverse([&p, &m], &plan, &calls, &mut [Pass { cotangent, gradient: &mut gradient, arithmetic: p.arithmetic() }]).expect("the reverse pass");
+                run_reverse([&p, &m], &plan, (&calls, &inputs), &mut [Pass { cotangent, gradient: &mut gradient, arithmetic: p.arithmetic() }]).expect("the reverse pass");
                 for (op, g) in gradient {
                     let g = device.download(&g).expect("download");
                     let term = g.mapv(|v| prediction[c] * v * v);
@@ -4051,13 +4201,13 @@ mod tests {
         let (m, p) = ic.models();
         let (paths, bases) = paths(&batch, &experiments, p.values(), engine_heads(&p), None, 4).expect("the paths");
         let plan = Plan::new(paths, 12);
-        let (stream, calls) = run([&p, &m], &plan, true).expect("the forward pass");
+        let (stream, calls, inputs) = run([&p, &m], &plan, true).expect("the forward pass");
         let rows = outputs(&plan, &bases, &experiments);
         let scored: usize = rows.iter().map(ExactSizeIterator::len).sum();
         let seed_values = ndarray::Array2::from_shape_fn((scored, stream.cols()), |_| rng.random::<f64>() - 0.5);
         let seed = spread(&device, stream.rows(), &rows, &device.upload(seed_values.view()).expect("upload"), 1.0).expect("the seed");
         let mut gradient = BTreeMap::new();
-        run_reverse([&p, &m], &plan, &calls, &mut [Pass { cotangent: device.copy(&seed).expect("copy"), gradient: &mut gradient, arithmetic: Arithmetic::F64 }]).expect("the reverse pass");
+        run_reverse([&p, &m], &plan, (&calls, &inputs), &mut [Pass { cotangent: device.copy(&seed).expect("copy"), gradient: &mut gradient, arithmetic: Arithmetic::F64 }]).expect("the reverse pass");
         let tangents: BTreeMap<usize, ndarray::Array2<f64>> = explanation
             .trainable
             .iter()

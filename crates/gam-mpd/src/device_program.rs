@@ -449,6 +449,10 @@ enum Slot {
 /// family's blocks and rotation tables.
 pub struct DeviceTrace {
     slots: Vec<Slot>,
+    /// The nodes a span took as given values: its entry and the earlier nodes it reads
+    /// ([`DeviceProgram::forward_span_carried`]). The reverse keeps their cotangents and passes them
+    /// no further: their own inputs are another span's.
+    given: BTreeSet<usize>,
     /// The fused groups' buffers, and per group which are its own when it ran fused.
     buffers: Vec<Tensor>,
     fused: Vec<Option<Buffers>>,
@@ -693,6 +697,8 @@ enum Reuse<'a> {
 /// before it runs), up to `end`.
 struct Span {
     entry: Option<(usize, Tensor)>,
+    /// Values of nodes before the entry the span reads, given ([`DeviceProgram::forward_span_carried`]).
+    carried: Vec<(usize, Tensor)>,
     end: usize,
     /// The rows as runs of sequences' positions whose earlier keys are other rows
     /// ([`DeviceProgram::forward_span_segments`]).
@@ -702,7 +708,7 @@ struct Span {
 impl Span {
     /// Every node.
     fn all() -> Self {
-        Self { entry: None, end: usize::MAX, segments: None }
+        Self { entry: None, carried: Vec::new(), end: usize::MAX, segments: None }
     }
 }
 
@@ -1953,7 +1959,23 @@ impl DeviceProgram {
         edit: impl FnMut(usize, &DeviceTrace) -> Result<Option<Tensor>, String>,
     ) -> Result<DeviceTrace, String> {
         let hooks = Hooks { before: None, edit: true };
-        self.forward_hooks(Some(family), given, &[], |_, _| Err("no gate".into()), false, hooks, |_, _| Ok(()), edit, Reuse::Nothing, Span { entry, end, segments: None })
+        self.forward_hooks(Some(family), given, &[], |_, _| Err("no gate".into()), false, hooks, |_, _| Ok(()), edit, Reuse::Nothing, Span { entry, carried: Vec::new(), end, segments: None })
+    }
+
+    /// [`Self::forward_span`] (with `segments`, [`Self::forward_span_segments`]) given the values of
+    /// nodes before the entry that the span reads (`carried`, each rows × its width): an earlier
+    /// block's input a later block's gate reads (`interchange`'s carried inputs). Their cotangents
+    /// come back from the reverse like the entry's when kept.
+    pub fn forward_span_carried(
+        &self,
+        family: &FamilyInputs,
+        (entry, carried): (Option<(usize, Tensor)>, Vec<(usize, Tensor)>),
+        end: usize,
+        edit: impl FnMut(usize, &DeviceTrace) -> Result<Option<Tensor>, String>,
+        segments: Option<Arc<Vec<Segment>>>,
+    ) -> Result<DeviceTrace, String> {
+        let hooks = Hooks { before: None, edit: true };
+        self.forward_hooks(Some(family), BTreeMap::new(), &[], |_, _| Err("no gate".into()), false, hooks, |_, _| Ok(()), edit, Reuse::Nothing, Span { entry, carried, end, segments })
     }
 
     /// [`Self::forward_span`] on rows that are runs of sequences' positions (`segments`, in row
@@ -1970,7 +1992,7 @@ impl DeviceProgram {
         segments: Arc<Vec<Segment>>,
     ) -> Result<DeviceTrace, String> {
         let hooks = Hooks { before: None, edit: true };
-        self.forward_hooks(Some(family), BTreeMap::new(), &[], |_, _| Err("no gate".into()), false, hooks, |_, _| Ok(()), edit, Reuse::Nothing, Span { entry, end, segments: Some(segments) })
+        self.forward_hooks(Some(family), BTreeMap::new(), &[], |_, _| Err("no gate".into()), false, hooks, |_, _| Ok(()), edit, Reuse::Nothing, Span { entry, carried: Vec::new(), end, segments: Some(segments) })
     }
 
     pub fn is_streamed_head(&self, node: usize) -> bool {
@@ -2087,6 +2109,7 @@ impl DeviceProgram {
             .collect();
         let mut trace = DeviceTrace {
             slots: (0..self.steps.len()).map(|_| Slot::Empty).collect(),
+            given: BTreeSet::new(),
             buffers: Vec::new(),
             fused: vec![None; self.fused.len()],
             frozen: match reuse {
@@ -2110,6 +2133,14 @@ impl DeviceProgram {
         };
         // The nodes an edit replaced: a later node of the same value computes its own.
         let mut replaced = BTreeSet::new();
+        for (index, value) in span.carried {
+            if entry.is_none_or(|e| index >= e) || value.dim() != (rows, self.widths[index]) {
+                return Err(format!("device: a carried value for node {index} not before the span's entry, or of {:?}", value.dim()));
+            }
+            trace.slots[index] = Slot::Value(value);
+            replaced.insert(index);
+            trace.given.insert(index);
+        }
         for (index, step) in self.steps.iter().enumerate() {
             if Some(index) == entry {
                 let value = entered.take().ok_or("device: a span's entry value")?;
@@ -2120,6 +2151,7 @@ impl DeviceProgram {
                 // The entering stream may be another pass's (a patched lane's): a later node of the
                 // same computation computes its own.
                 replaced.insert(index);
+                trace.given.insert(index);
                 continue;
             }
             if index > span.end {
@@ -2765,6 +2797,12 @@ impl DeviceProgram {
         };
         for index in (first..self.steps.len()).rev() {
             if let Some((ids, part)) = packed.remove(&index) {
+                if index != first && trace.given.contains(&index) {
+                    if keep.contains(&index) {
+                        packed_kept.insert(index, (ids, part));
+                    }
+                    continue;
+                }
                 if index != first {
                     self.reverse_packed(trace, index, (&ids, &part), (&mut g, &needed, &mut packed), (edited, &seeded), arithmetic)?;
                 }
@@ -2783,6 +2821,13 @@ impl DeviceProgram {
             if index == first {
                 kept.insert(index, cot);
                 break;
+            }
+            // A node the span took as given passes its cotangent no further ([`DeviceTrace::given`]).
+            if trace.given.contains(&index) {
+                if keep.contains(&index) {
+                    kept.insert(index, cot);
+                }
+                continue;
             }
             // A node that took an earlier node's value passes its cotangent to it, as a readout does.
             if let Some(&earlier) = trace.aliased.get(&index) {

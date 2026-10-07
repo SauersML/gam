@@ -19,7 +19,7 @@ use super::device_program_tests::{devices, fixture_sized, noise};
 use super::interchange::{Batch, Experiment, FixedHead, Interchange, Model, Patch, ReadVariable, Site, Value, census, evaluate, reads, sample, sites, targets, values};
 use super::interchange::{BlockEngine, Edits};
 use super::device_program::DeviceTrace;
-use super::operator_program::{FamilyInputs, Operator, OperatorProgram, SequenceLayout, SlotValues, exact_precision};
+use super::operator_program::{FamilyInputs, Node, Operator, OperatorProgram, SequenceLayout, SlotValues, exact_precision};
 use super::resident_causal_fit::fixed_head_target::Head;
 use super::run_check::{layer_nodes, split_sites};
 use gam_gpu::tensor::Device;
@@ -102,6 +102,26 @@ fn fixture_at(width: usize) -> Fixture {
     Fixture { m, p, variables, values: held, trainable, head, batch: Batch::new(base, source).expect("batch") }
 }
 
+/// [`fixture`] with `P`'s second MLP also reading the first attention's input (`x₀ B`, `B` a new
+/// trainable operator, added to its pre-activations): a later block reading an earlier block's
+/// input, as a gate carried from its home block does.
+fn fixture_carried() -> Fixture {
+    let mut f = fixture();
+    let (read, input) = (f.p.reads[3], f.p.reads[0]);
+    let node = f.p.flat.nodes.iter().position(|n| matches!(n, Node::Affine { terms, .. } if terms.len() == 1 && terms[0].0 == read)).expect("the second MLP's input map");
+    let Node::Affine { terms, bias } = f.p.flat.nodes[node].clone() else { unreachable!() };
+    let rows = f.p.flat.operators[terms[0].1].rows.clone();
+    let cols = f.p.flat.interfaces().expect("interfaces")[input].clone();
+    let values = Array2::from_shape_fn((rows.width(), cols.width()), |(i, j)| 0.3 * noise(104_729 + 17 * i + j));
+    let precision = exact_precision(values.iter().copied()).expect("finite");
+    f.p.flat.operators.push(Arc::new(Operator::dense("carried.b", rows, cols, values, precision, f.p.flat.operators[terms[0].1].provenance.clone()).expect("dense")));
+    let b = f.p.flat.operators.len() - 1;
+    f.p.flat.nodes[node] = Node::Affine { terms: vec![terms[0], (input, b)], bias };
+    f.p.prefix = f.head.prefix(&f.p.flat);
+    f.trainable.push(b);
+    f
+}
+
 fn one(tokens: &[u32]) -> FamilyInputs {
     FamilyInputs {
         rows: tokens.len(),
@@ -123,6 +143,9 @@ fn hybrid(f: &Fixture, tokens: &[u32], explained: &[bool], patch: Option<HostPat
     let family = one(tokens);
     let blocks = 2 * LAYERS;
     let (mut state, mut runs) = (None::<Array2<f64>>, Vec::with_capacity(blocks));
+    // Each block's input as the block's own run computed it: a later block reading an earlier
+    // block's input (a carried gate) reads the hybrid's.
+    let mut inputs: Vec<Array2<f64>> = Vec::with_capacity(blocks);
     for b in 0..blocks {
         let host = if explained[b] { &f.p } else { &f.m };
         let end = if b + 1 < blocks { host.entries[b + 1] } else { host.prefix.output };
@@ -133,6 +156,9 @@ fn hybrid(f: &Fixture, tokens: &[u32], explained: &[bool], patch: Option<HostPat
                     && node == host.entries[b]
                 {
                     *value = entering.clone();
+                }
+                if let Some(earlier) = host.reads[..b].iter().position(|r| *r == node) {
+                    *value = inputs[earlier].clone();
                 }
                 if let Some((block, sites, source, at)) = patch
                     && block == b
@@ -147,6 +173,7 @@ fn hybrid(f: &Fixture, tokens: &[u32], explained: &[bool], patch: Option<HostPat
             })
             .expect("block");
         state = Some(run.values[end].clone());
+        inputs.push(run.values[host.reads[b]].clone());
         runs.push(run.values);
     }
     (state.expect("a block ran"), runs)
@@ -296,6 +323,54 @@ fn the_gradient_matches_central_differences() {
         let start = f.p.flat.operators[op].matrix();
         let (rows, cols) = start.dim();
         let (i, j) = ((7 * k + 1) % rows, (3 * k + 2) % cols);
+        let analytic = device.download(&gradient[&op]).expect("gradient")[[i, j]];
+        let mut up = start.clone();
+        up[[i, j]] += delta;
+        let mut down = start.clone();
+        down[[i, j]] -= delta;
+        let numeric = (total_at(&device, &f, &mut programs, op, &up, &experiments) - total_at(&device, &f, &mut programs, op, &down, &experiments)) / (2.0 * delta);
+        total_at(&device, &f, &mut programs, op, &start, &experiments);
+        let scale = analytic.abs().max(numeric.abs()).max(1.0);
+        assert!((analytic - numeric).abs() <= 1e-6 * scale, "operator {} entry ({i}, {j}): analytic {analytic}, numeric {numeric}", f.p.flat.operators[op].name);
+    }
+}
+
+/// A later block reading an earlier block's input (a gate carried from its home block,
+/// `library_vpd`'s blocks across blocks) scores every hybrid and patch as the host's run of the
+/// same programs, where the read takes the hybrid's own value of that input (the block's run that
+/// computed it, `P`'s or `M`'s): a patch of a later block's stream leaves it as the base run had it.
+/// The read moves the scores, and the gradient in its operator and in another matches central
+/// differences.
+#[test]
+fn a_carried_block_input_scores_as_the_host_reference() {
+    let (f, plain) = (fixture_carried(), fixture());
+    let experiments = experiments(&f);
+    for device in devices() {
+        let programs = programs(&device, &f);
+        let (m, p) = models(&f, &programs);
+        let targets = targets(&m, &programs.head, &f.batch, &experiments).expect("targets");
+        let evaluation = evaluate(&m, &p, &programs.head, &f.batch, &targets, &experiments, false).expect("evaluate");
+        let mut moved = 0.0f64;
+        for (e, bits) in experiments.iter().zip(&evaluation.bits) {
+            let expected = reference(&f, e);
+            for (a, b) in bits.iter().zip(&expected) {
+                assert!((a - b).abs() <= 1e-9, "{e:?}: device {a} bits, host {b} bits");
+            }
+            moved = moved.max(expected.iter().zip(reference(&plain, e)).fold(0.0f64, |m, (a, b)| m.max((a - b).abs())));
+        }
+        assert!(moved > 1e-6, "the carried read moves the scores");
+    }
+    let device = Device::host();
+    let mut programs = programs(&device, &f);
+    let gradient = {
+        let (m, p) = models(&f, &programs);
+        let targets = targets(&m, &programs.head, &f.batch, &experiments).expect("targets");
+        evaluate(&m, &p, &programs.head, &f.batch, &targets, &experiments, true).expect("evaluate").gradient
+    };
+    let delta = 1e-5;
+    for &op in [f.trainable[0], *f.trainable.last().expect("the carried operator")].iter() {
+        let start = f.p.flat.operators[op].matrix();
+        let (i, j) = (1 % start.nrows(), 2 % start.ncols());
         let analytic = device.download(&gradient[&op]).expect("gradient")[[i, j]];
         let mut up = start.clone();
         up[[i, j]] += delta;
