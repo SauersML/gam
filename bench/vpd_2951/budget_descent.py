@@ -223,7 +223,10 @@ if ARM == 'share':
 # A -> B is kept where eta_AB > 0: in training the expected gate Phi(eta_AB) under unit Gaussian noise,
 # at evaluation the hard gate 1[eta_AB > 0]. Every kept edge costs its index bits, log2 of the number
 # of candidate sources of B (every down_proj slice of the earlier layers), added to the objective per
-# training token (/ N); the start keeps every edge (eta = 3), which is exact, and F prunes.
+# training token (/ N); the start keeps every edge (eta = 3), which is exact, and F prunes. An edge is
+# executed machinery on a token where it is kept and both its parts are on, so the budget counts it:
+# k = parts on + edges on per token (in training the expectation, Phi(eta) times both parts' expected
+# gates; at evaluation the hard count).
 EDGES = os.environ.get('DESCENT_EDGES') == '1'
 EDGE = {}
 if EDGES:
@@ -243,7 +246,7 @@ if EDGES:
     vpd_model.rms = recording_rms
 del X
 
-state = {'mode': 'M', 'soft': [], 'hard': [], 'gates': {}, 'route': {}, 'share': {}, 'r': {}, 'writers': {}, 'on': {}}
+state = {'mode': 'M', 'soft': [], 'hard': [], 'gates': {}, 'route': {}, 'share': {}, 'r': {}, 'writers': {}, 'on': {}, 'gate': {}, 'edges_soft': [], 'edges_hard': []}
 SQ2 = math.sqrt(2)
 def make(n):
     st = T.site(n); p = P[n]; grp = GROUP.get(n); mult = MULT.get(n)
@@ -261,6 +264,7 @@ def make(n):
         c = x @ p['V']
         if state['mode'] == 'all':
             return emit(c)
+        keep = None
         if layer in EDGE and n.endswith('c_fc'):
             # The read of the listed inputs only: the full read less the edges that are off.
             E = EDGE[layer]
@@ -316,6 +320,17 @@ def make(n):
         if mult is not None:
             state['gates'][n] = (hard, phi); w = mult
         state['hard'].append((hard * w).sum(-1).reshape(-1))
+        if EDGES:
+            # The slice's gate (hard, expected) for the edges into later layers, and the edges on per
+            # token into this layer's readers: kept, with both parts on.
+            state['gate'][n] = (hard, phi)
+            if keep is not None:
+                with torch.no_grad():
+                    hw = torch.cat([state['gate'][f'h.{k}.mlp.down_proj'][0] for k in range(layer)], -1)
+                    state['edges_hard'].append(((hw @ (E['eta'] > 0).float()) * hard).sum(-1).reshape(-1))
+                if state['mode'] != 'hard':
+                    pw = torch.cat([state['gate'][f'h.{k}.mlp.down_proj'][1] for k in range(layer)], -1)
+                    state['edges_soft'].append(((pw @ keep) * phi).sum(-1).reshape(-1))
         if gate == 'ramp':
             a, width = read - p['tau'], p['lw'].exp()
             if state['mode'] == 'hard':
@@ -342,18 +357,8 @@ def kl_bits(lm, lp):
     return (pm.exp() * (pm - pp)).sum(-1) / math.log(2)
 
 def run(ids, mode):
-    state['mode'], state['soft'], state['hard'] = mode, [], []
+    state['mode'], state['soft'], state['hard'], state['edges_soft'], state['edges_hard'] = mode, [], [], [], []
     return T(ids)
-
-def kept_edges():
-    """Per layer with edges, the kept edges (hard) between the parts active on each token: the mean
-    over the tokens of the last hard run."""
-    out = {}
-    for l, E in EDGE.items():
-        writers = torch.cat([state['on'][f'h.{k}.mlp.down_proj'] for k in range(l)], -1).reshape(-1, E['eta'].shape[0])
-        readers = state['on'][f'h.{l}.mlp.c_fc'].reshape(-1, E['eta'].shape[1])
-        out[l] = ((writers @ (E['eta'] > 0).float()) * readers).sum(-1).mean().item()
-    return out
 
 def example_graph(position):
     """The explanation's graph on one token (held-out row 1024 at `position`) from the last hard run:
@@ -425,7 +430,7 @@ def evaluate(final=False):
         for n in mlp:
             P[n]['V'], P[n]['U'] = frame(P[n]['F'], T.site(n).W)
     state['collect'] = {} if SHARE else None
-    r = {'kl': [], 'kl_soft': [], 'kl_all_on': [], 'active': [], 'active_soft': [], 'per_map': [], 'edges_active': []}
+    r = {'kl': [], 'kl_soft': [], 'kl_all_on': [], 'active': [], 'active_soft': [], 'per_map': [], 'edges_on': [], 'edges_on_soft': []}
     graph = None
     for i in range(0, ev.shape[0], 4):
         ids = ev[i:i + 4]
@@ -434,11 +439,13 @@ def evaluate(final=False):
         r['active'].append(torch.stack(state['hard']).sum(0).mean().item())
         r['per_map'].append([h.mean().item() for h in state['hard']])
         if EDGES:
-            r['edges_active'].append(sum(kept_edges().values()))
+            r['edges_on'].append(torch.stack(state['edges_hard']).sum(0).mean().item())
             if final and i == 0:
                 graph = example_graph(255)
         lp = run(ids, 'soft'); r['kl_soft'].append(kl_bits(lm, lp).mean().item())
         r['active_soft'].append(torch.stack(state['soft']).sum(0).mean().item())
+        if EDGES:
+            r['edges_on_soft'].append(torch.stack(state['edges_soft']).sum(0).mean().item())
         lp = run(ids, 'all'); r['kl_all_on'].append(kl_bits(lm, lp).mean().item())
     out = {k: float(np.mean(v)) for k, v in r.items() if k != 'per_map' and v}
     out['per_map'] = [round(float(x), 2) for x in np.mean(r['per_map'], 0)]
@@ -544,6 +551,10 @@ for step in range(steps):
     objective = kl + (desc + edge_bits) / N
     ek = torch.stack(state['soft']).sum(0).mean()
     hk = torch.stack(state['hard']).sum(0).mean().item()
+    if EDGES:
+        # The per-token budget counts the edges on beside the parts on.
+        ek = ek + torch.stack(state['edges_soft']).sum(0).mean()
+        hk += torch.stack(state['edges_hard']).sum(0).mean().item()
     if DUAL == 'anneal':
         if step == 0:
             K0 = max(ek.item(), K)

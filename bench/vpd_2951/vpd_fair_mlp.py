@@ -101,7 +101,7 @@ def inputs_of(ids, mlp_masks):
 
 
 def kl_bits(lm, lp):
-    pm = F.log_softmax(lm.double(), -1); pp = F.log_softmax(lp.double(), -1)
+    pm = F.log_softmax(lm.cpu().double(), -1); pp = F.log_softmax(lp.cpu().double(), -1)  # MPS holds no float64
     return ((pm.exp() * (pm - pp)).sum(-1) / math.log(2)).mean().item()
 
 
