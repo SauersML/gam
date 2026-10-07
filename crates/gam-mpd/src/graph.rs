@@ -3926,6 +3926,10 @@ impl Checker {
     /// (the edit applied once on top), runs in parallel threads. Returns each program's widths.
     fn measure_runs(&mut self, plan: Plan, measured: &mut [Option<(Vec<f64>, Option<Candidates>)>]) -> Result<Vec<Vec<Width>>, String> {
         let Plan { runs, groups, parsed, circuits, n, top, clean } = plan;
+        // Where the score's time goes, logged at its end: M's outcomes, the width searches, the
+        // counterfactual runs and the programs' runs.
+        let started = std::time::Instant::now();
+        let mut seconds = [0.0f64; 4];
         // M's outcomes come from its native circuit, the same for every program whatever its views.
         let native = Graph::empty().model(&self.weights);
         // M's outcomes of this score, held until it ends: the cache's byte budget may drop some
@@ -3976,6 +3980,8 @@ impl Checker {
             }
             result?;
         }
+        seconds[0] = started.elapsed().as_secs_f64();
+        let searched = self.widths.len();
         let mut widths = Vec::with_capacity(parsed.len());
         for (graph, _, _) in parsed {
             let mut chosen = Vec::with_capacity(graph.blocks.len());
@@ -3987,6 +3993,9 @@ impl Checker {
             }
             widths.push(chosen);
         }
+        seconds[1] = started.elapsed().as_secs_f64() - seconds[0];
+        let searched = self.widths.len() - searched;
+        let mut made_bytes = 0usize;
         let quantized: Vec<Vec<(Block, Option<u32>)>> = parsed.iter().zip(&widths).map(|((g, _, _), w)| g.blocks.iter().cloned().zip(w.iter().map(|x| x.bits)).collect()).collect();
         // The programs' runs, per edit group in chunks of experiments: a chunk's counterfactual runs
         // are made first with M's exact weights (on this thread: made inside parallel runs, a run
@@ -4016,12 +4025,15 @@ impl Checker {
                     let chunk: Vec<usize> = experiments[at..(at + size).min(experiments.len())].to_vec();
                     self.reference_bytes = usize::MAX;
                     let before = self.held_references();
+                    let prewarm = std::time::Instant::now();
                     let restore = edit.as_ref().map(|e| e.apply(&mut self.weights)).transpose()?;
                     let made: Result<(), String> = chunk.iter().try_for_each(|&r| self.prewarm(&runs[r].1));
                     if let Some(r) = restore {
                         r.restore(&mut self.weights)?;
                     }
                     made?;
+                    seconds[2] += prewarm.elapsed().as_secs_f64();
+                    made_bytes += self.held_references().saturating_sub(before);
                     // Chunks as large as the budget holds.
                     per = per.max(self.held_references().saturating_sub(before) / chunk.len());
                     let keys: BTreeSet<&str> = chunk.iter().map(|&r| runs[r].2.as_str()).collect();
@@ -4065,6 +4077,16 @@ impl Checker {
             self.set_edit(&Experiment::Clean);
             result?;
         }
+        seconds[3] = started.elapsed().as_secs_f64() - seconds[0] - seconds[1] - seconds[2];
+        log::info!(
+            "graph score of {} programs: M's outcomes {:.1} s, {searched} width searches {:.1} s, counterfactual runs {:.1} s ({:.1} GB made), program runs {:.1} s",
+            parsed.len(),
+            seconds[0],
+            seconds[1],
+            seconds[2],
+            made_bytes as f64 / 1e9,
+            seconds[3]
+        );
         Ok(widths)
     }
 

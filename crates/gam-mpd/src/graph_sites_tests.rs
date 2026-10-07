@@ -641,3 +641,49 @@ fn memos_serve_a_later_checker() {
     assert_eq!(a.exec_error_bits, b.exec_error_bits);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// On a device, a run after VPD subcomponents are quantized or edited (their factors change in
+/// place) reads the new factors, and a run after restoring reads the old ones: each device run is
+/// the host's.
+#[test]
+fn device_runs_read_quantized_and_edited_vpd_factors() {
+    let (mut weights, sequences) = model("graph_sites_device_vpd");
+    let (hidden, width) = weights.layers[0].mlp.as_ref().expect("an MLP").gate.dim();
+    let wave = |rows: usize, cols: usize, phase: f64| Array2::from_shape_fn((rows, cols), |(i, j)| 0.1 * ((i * 7 + j * 3) as f64 + phase).sin());
+    weights.vpd.insert(0, crate::graph::VpdMlp { fc_u: wave(5, hidden, 0.3), fc_v: wave(width, 5, 1.1), down_u: wave(4, width, 2.0), down_v: wave(hidden, 4, 0.7) });
+    let vpd = |kind: &str, index: crate::graph::Index| PieceIr { view: "vpd".into(), layer: 0, kind: kind.into(), index: Some(index) };
+    let mut program = full_program();
+    program.nodes.iter_mut().find(|n| n.id == "m0").expect("m0").pieces = vec![vpd("c_fc", crate::graph::Index::Many((0..5).collect())), vpd("down_proj", crate::graph::Index::Many((0..4).collect()))];
+    let mut batch = Batch::new(&sequences).expect("batch");
+    let rows: Vec<usize> = (0..batch.tokens.len()).collect();
+    batch.reference = Some(std::sync::Arc::new(reference(&weights, &Batch::new(&sequences.iter().rev().cloned().collect::<Vec<_>>()).expect("cf")).expect("reference")));
+    let run = |w: &Weights| {
+        let graph = Graph::parse(&program, w).expect("parse");
+        execute(w, &graph.program(w, true), &batch, &rows, &BTreeMap::new()).expect("program").log_probabilities
+    };
+    let block = crate::graph::Block::Slices { layer: 0, fc: vec![0, 2], down: vec![1], rest: false };
+    let edit = WeightEdit::Subcomponents { layer: 0, down: false, indices: vec![1, 3], factor: 0.25 };
+    // Host runs (no device yet), then the same steps on the device (the host backend).
+    let mut outcomes = Vec::new();
+    for on_device in [false, true] {
+        if on_device {
+            assert!(crate::graph::use_device(Device::host()), "a device was already set");
+        }
+        let exact = run(&weights);
+        let restore = weights.quantize(&[(block.clone(), Some(2))]).expect("quantize");
+        let quantized = run(&weights);
+        restore.restore(&mut weights);
+        let restored = run(&weights);
+        let undo = edit.apply(&mut weights).expect("edit");
+        let edited = run(&weights);
+        undo.restore(&mut weights).expect("restore");
+        let after = run(&weights);
+        outcomes.push([exact, quantized, restored, edited, after]);
+    }
+    let [host, device] = &outcomes[..] else { panic!("two passes") };
+    for (k, name) in ["exact", "quantized", "restored", "edited", "after the edit"].iter().enumerate() {
+        let kl = max(&kl_bits(&host[k], &device[k]));
+        assert!(kl < 1e-9, "{name}: KL(host ‖ device) = {kl:e} bits");
+    }
+    assert!(max(&kl_bits(&host[0], &host[1])) > 1e-9 && max(&kl_bits(&host[0], &host[3])) > 1e-9, "the quantization and the edit change the program");
+}

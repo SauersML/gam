@@ -2,9 +2,11 @@
 //! answer per stdout line.
 //!
 //! * `{"op": "load", "export": DIR, "vpd": DIR?, "transcoders": DIR?, "library": START_JSON?,
-//!   "library_arm": ARM?}`: the native model of an export (`import::import_language_model`), with
-//!   VPD's, the transcoders' or the library's view attached when named;
-//!   its weights read from the native program (`graph::Weights::from_native`).
+//!   "library_arm": ARM?}`: the native model of an export (`import::import_language_model`), read
+//!   from the checkpoint the export names when that file is still there
+//!   (`import::hugging_face_language_model`; the answer's `"weights"` says which), with VPD's, the
+//!   transcoders' or the library's view attached when named; its weights read from the native
+//!   program (`graph::Weights::from_native`).
 //! * `{"op": "behavior", "path": FILE}` or `{"op": "behavior", "behavior": {...}}`: a behavior file
 //!   (design.txt section 5); measures its stand-in averages on `M`. With `"manifest": FILE` (an
 //!   immutable experiment manifest, `mpd_library_mdl_2951`'s or `draw_manifest`'s; by default
@@ -35,7 +37,7 @@ use gam_gpu::tensor::Device;
 use gam_mpd::{
     engine::log_to_stderr,
     graph::{Behavior, Checker, Experiment, Measured, Program, SiteUnits, WeightEdit, Weights},
-    import::import_language_model,
+    import::{hugging_face_language_model, import_language_model},
     run_check::{layer_nodes, split_sites},
 };
 use serde_json::{Value, json};
@@ -70,16 +72,80 @@ impl Caches {
     }
 }
 
-fn load(export: &Path) -> Result<Weights, String> {
-    let imported = import_language_model(export, 1, 1)?;
-    let layer_count = imported.record["config"]["n_layers"].as_u64().ok_or("config.n_layers")? as usize;
-    let native = split_sites(&imported.program)?;
-    drop(imported);
+fn load(export: &Path) -> Result<(Weights, String), String> {
+    let record: Value = serde_json::from_str(&std::fs::read_to_string(export.join("export.json")).map_err(error)?).map_err(error)?;
+    let layer_count = record["config"]["n_layers"].as_u64().ok_or("config.n_layers")? as usize;
+    // An export holds its checkpoint's reals widened to float64, read onto the host whole and then
+    // copied into the weights (Qwen3-0.6B: 4.6 GB read, a 12.2 GB peak). When the export names its
+    // checkpoint and that file is still there, the program reads the checkpoint where it is stored
+    // (memory-mapped, each matrix widened once, into the weights).
+    let checkpoint = checkpoint_of(&record, layer_count)?;
+    let program = match &checkpoint {
+        Some(dir) => hugging_face_language_model(dir, 0..layer_count)?.0,
+        None => import_language_model(export, 1, 1)?.program,
+    };
+    let native = split_sites(&program)?;
+    drop(program);
     let layers = layer_nodes(&native, layer_count)?;
     // Read straight from the native program: a start library on the host held several more copies
     // of the model (Qwen3-0.6B's load went past 24 GiB).
-    Weights::from_native(&native, &layers)
+    let weights = Weights::from_native(&native, &layers)?;
+    drop(native);
+    release_freed_memory();
+    let Some(dir) = checkpoint else { return Ok((weights, "export".into())) };
+    // The checkpoint's reals are the export's: its embedding's first row and layer 0's query map.
+    let width = weights.embedding.ncols();
+    let mut row = vec![0u8; 8 * width];
+    std::io::Read::read_exact(&mut std::fs::File::open(export.join("wte.f64")).map_err(error)?, &mut row).map_err(error)?;
+    let same_row = row.chunks_exact(8).zip(weights.embedding.row(0)).all(|(b, &x)| b.try_into().is_ok_and(|b| f64::from_le_bytes(b) == f64::from(x)));
+    let query = gam_mpd::import::read_f64(&export.join("blocks.0.attn.q_proj.f64"), width)?;
+    let heads = &weights.layers.first().ok_or("no layers")?.heads;
+    let stacked: Vec<f64> = heads.iter().flat_map(|h| h.query.iter().map(|&x| f64::from(x))).collect();
+    if !same_row || stacked != query.iter().copied().collect::<Vec<f64>>() {
+        return Err(format!("{}: its reals differ from the export's", dir.display()));
+    }
+    Ok((weights, format!("checkpoint {}", dir.display())))
 }
+
+/// The checkpoint directory an export names as its source (`source.weights`) when it holds all of
+/// the export's blocks and is still the file the export read: Hugging Face's cache links a
+/// snapshot's file to a blob named by its content's SHA-256, which the export recorded
+/// (`source.weights_sha256`).
+fn checkpoint_of(record: &Value, layers: usize) -> Result<Option<std::path::PathBuf>, String> {
+    let (Some(weights), Some(sha)) = (record["source"]["weights"].as_str(), record["source"]["weights_sha256"].as_str()) else { return Ok(None) };
+    let weights = Path::new(weights);
+    let Some(dir) = weights.parent() else { return Ok(None) };
+    if !weights.exists() || !dir.join("config.json").exists() {
+        return Ok(None);
+    }
+    // The snapshot's file links to its blob (another store may link that blob on again).
+    if !std::fs::symlink_metadata(weights).map_err(error)?.is_symlink() {
+        return Ok(None);
+    }
+    let blob = std::fs::read_link(weights).map_err(error)?;
+    if blob.file_name().and_then(|n| n.to_str()) != Some(sha) {
+        return Ok(None);
+    }
+    let config: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).map_err(error)?).map_err(error)?;
+    Ok((config["num_hidden_layers"].as_u64() == Some(layers as u64)).then(|| dir.to_path_buf()))
+}
+
+/// Returns the pages of freed allocations to the system: the load's program (freed above) leaves
+/// them dirty in the allocator's regions, where they count against the process's memory.
+#[cfg(target_os = "macos")]
+fn release_freed_memory() {
+    // SAFETY: the declaration is libmalloc's (malloc/malloc.h), which every macOS process links.
+    unsafe extern "C" {
+        fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
+    }
+    // SAFETY: a null zone asks every malloc zone to release its free pages; goal 0 releases all.
+    unsafe {
+        malloc_zone_pressure_relief(std::ptr::null_mut(), 0);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn release_freed_memory() {}
 
 /// The experiment in reader_score.py's form (its `words` renders it) for one prompt.
 fn reader_experiment(e: &Experiment, behavior: &Behavior, prompt: usize, donor: Option<usize>) -> Value {
@@ -192,7 +258,7 @@ fn handle(request: &Value, weights: &mut Option<Weights>, checker: &mut Option<C
             let path = request["export"].as_str().ok_or("export")?;
             *checker = None;
             *export = Some(path.into());
-            let mut w = load(Path::new(path))?;
+            let (mut w, source) = load(Path::new(path))?;
             // Decomposition views, attached when named: "vpd": VPD's decomposition export (its MLP and
             // attention subcomponents, `Weights::attach_vpd`), "transcoders": a directory of
             // layer_{l}.safetensors (`Weights::attach_transcoders`). Pieces of a view that is not
@@ -219,7 +285,7 @@ fn handle(request: &Value, weights: &mut Option<Weights>, checker: &mut Option<C
                 }
                 _ => false,
             };
-            let answer = json!({"ok": true, "device": device, "views": views, "layers": w.layers.len(), "heads": w.layers.first().map_or(0, |l| l.heads.len()), "neurons": w.layers.first().and_then(|l| l.mlp.as_ref()).map_or(0, |m| m.gate.nrows()), "vocabulary": w.embedding.nrows(), "width": w.embedding.ncols()});
+            let answer = json!({"ok": true, "weights": source, "device": device, "views": views, "layers": w.layers.len(), "heads": w.layers.first().map_or(0, |l| l.heads.len()), "neurons": w.layers.first().and_then(|l| l.mlp.as_ref()).map_or(0, |m| m.gate.nrows()), "vocabulary": w.embedding.nrows(), "width": w.embedding.ncols()});
             *weights = Some(w);
             Ok(answer)
         }
