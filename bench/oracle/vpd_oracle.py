@@ -82,7 +82,7 @@ from reporter import Injection, Magnitude  # noqa: E402
 
 KINDS = ("q_proj", "k_proj", "v_proj", "o_proj", "c_fc", "down_proj", "head", "function")  # VPD's sites, then the library's
 LABELS = "ABCDEFGHIJ"
-CONDITIONS = ("graph", "weights", "activity", "nothing", "graph_lens", "weights_lens", "weights_examples", "examples", "weights_activity")
+CONDITIONS = ("graph", "weights", "activity", "nothing", "graph_lens", "weights_lens", "weights_examples", "examples", "weights_activity", "weights_activity_lens")
 QUESTIONS = ("activity", "direction", "top", "continuation", "edge", "attribution", "effect")
 # The edit's effect on M at the edited token, KL(M_e || M) in bits: the edits driver's bins (also the
 # effect question's answers; "barely" includes no change at all).
@@ -204,12 +204,14 @@ class Table:
         name = max((n for n, o in self.offsets.items() if o <= gid), key=lambda n: self.offsets[n])
         return int(name.split(".")[1]), name.split(".")[-1], gid - self.offsets[name]
 
-    def vectors(self, layer: int, kind: str, c: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """Subcomponent c of the table's site: a strided table (vpd_labels.py --edit row) holds every
-        stride-th subcomponent, its numbers in `subcomponents`."""
-        name = site_name(layer, kind)
+    def number(self, layer: int, kind: str, c: int) -> int:
+        """Subcomponent c of the table's site as a number of its site: a strided table (vpd_labels.py
+        --edit row) holds every stride-th subcomponent, its numbers in `subcomponents`."""
         d = self.sites[(layer, kind)][1] if (layer, kind) in self.sites else {}
-        n = int(d["subcomponents"][c]) if "subcomponents" in d else c
+        return int(d["subcomponents"][c]) if "subcomponents" in d else c
+
+    def vectors(self, layer: int, kind: str, c: int) -> tuple[torch.Tensor, torch.Tensor]:
+        name, n = site_name(layer, kind), self.number(layer, kind, c)
         return self.uv[f"{name}.V"][:, n], self.uv[f"{name}.U"][n]
 
     def neighbours(self, layer: int, kind: str, c: int) -> list[tuple[int, str, int, float, str]]:
@@ -254,6 +256,7 @@ class Table:
         n = site_name(layer, kind)
         if self.lens is None or f"{n}.write" not in self.lens:
             return None
+        c = self.number(layer, kind, c)
         w = float(self.lens[f"{n}.write"][c].float() @ self.lens["unembed"][int(token)].float())
         return (w - float(self.lens[f"{n}.write_centre"][c])) / float(self.lens[f"{n}.write_scale"][c])
 
@@ -268,6 +271,12 @@ def effect_index(table: Table, keys: list) -> list[np.ndarray]:
             c, j = np.nonzero(which == s_)
             per[s_].append(np.stack([np.full(len(c), k), c, j], 1))
     return [np.concatenate(p) for p in per]
+
+
+# Row-edit variants (vpd_labels.py --edit row): where the edit acts and on what, in the question's words.
+VARIANT_WORDS = {"": " at the marked token only", "_from": " at every token of the text", "_group": " at the marked token only", "_groupfrom": " at every token of the text"}
+WHO = {"": "the component is", "_from": "the component is", "_group": "the component and the 7 other components of its site most active at the marked token are",
+       "_groupfrom": "the component and the 7 other components of its site most active at the marked token are"}
 
 
 def effect_bin(bits: float) -> int:
@@ -325,6 +334,22 @@ def examples(table: Table, layers: set[int], count: int, seed: int, stratified: 
     index = effect_index(table, keys) if stratified else None
     if index is not None and held:
         index = [x[[ok(int(c)) for c in x[:, 1]]] if len(x) else x for x in index]
+    variants = [v for v in VARIANT_WORDS if row and all(f"effect_ablate{v}" in d for _, d in table.sites.values())]
+    by_bin = None
+    if row and stratified:  # effect questions drawn evenly across the effect bins, over edits and variants
+        by_bin = [[] for _ in range(len(EFFECT_BINS) + 1)]
+        for k, key in enumerate(keys):
+            d_ = table.sites[key][1]
+            for e, edit_ in enumerate(("ablate", "amplify")):
+                for v, sfx in enumerate(variants):
+                    b_ = np.searchsorted(np.array(EFFECT_BINS), d_[f"effect_{edit_}{sfx}"].numpy(), side="right")
+                    cs_, js_ = np.nonzero(np.ones_like(b_, dtype=bool))
+                    rows_ = np.stack([np.full(len(cs_), k), cs_, js_, np.full(len(cs_), e), np.full(len(cs_), v), b_[cs_, js_]], 1)
+                    rows_ = rows_[[respects(key[0], int(c_)) for c_ in rows_[:, 1]]]
+                    for b in range(len(by_bin)):
+                        by_bin[b].append(rows_[rows_[:, 5] == b])
+        by_bin = [np.concatenate(x) if x else np.zeros((0, 6), dtype=np.int64) for x in by_bin]
+    drawn_of: dict[str, int] = {}
     out = []
     while len(out) < count:
         q = kinds[len(out) % len(kinds)]
@@ -332,7 +357,19 @@ def examples(table: Table, layers: set[int], count: int, seed: int, stratified: 
         meta, d = table.sites[(layer, kind)]
         c = rng.randrange(meta["subcomponents"])
         j = rng.randrange(meta["top"] + meta["random"])
-        if q in ("direction", "top", "effect") and index is not None:
+        variant = None
+        if row and q in ("direction", "top", "effect"):
+            if by_bin is not None:
+                n_ = drawn_of.get(q, 0)
+                drawn_of[q] = n_ + 1
+                pool = [x for x in by_bin if len(x)][n_ % sum(1 for x in by_bin if len(x))]
+                k, c, j, e, v, _ = (int(x) for x in pool[rng.randrange(len(pool))])
+                layer, kind = keys[k]
+                meta, d = table.sites[(layer, kind)]
+            else:
+                e, v = rng.randrange(2), rng.randrange(len(variants))
+            variant = (("ablate", "amplify")[e], variants[v])
+        elif q in ("direction", "top", "effect") and index is not None:
             pool = index[(len(out) // len(kinds)) % len(index)]
             if pending[q]:
                 k, c, j = pending[q].pop()
@@ -354,6 +391,9 @@ def examples(table: Table, layers: set[int], count: int, seed: int, stratified: 
         peak = float(act.abs().max())
         here = ""
         where = " at the marked token only" if row else ""
+        if variant is not None:
+            sfx = variant[1]
+            where = VARIANT_WORDS[sfx]
         if q in ("direction", "top", "effect"):  # an effect question states the activity there (an input-side measurement, not its answer)
             a_here = float(act[j, int(d["position"][c, j])])
             signed = int(math.copysign(level(a_here, peak), a_here))
@@ -367,8 +407,11 @@ def examples(table: Table, layers: set[int], count: int, seed: int, stratified: 
             edit, side, r = rng.choice(["ablate", "amplify"]), rng.choice(["up", "down"]), rng.randrange(10)
             if rule == 1:
                 edit = "amplify"
+            sfx = ""
+            if variant is not None:
+                edit, sfx = variant
             verb = ("removed" if edit == "ablate" else f"made {meta.get('amplify', 1.5):g} times stronger") + where
-            token, answer = int(d[f"{side}_ids_{edit}"][c, j, r]), 0 if float(d[f"{side}_dp_{edit}"][c, j, r]) > 0 else 1
+            token, answer = int(d[f"{side}_ids_{edit}{sfx}"][c, j, r]), 0 if float(d[f"{side}_dp_{edit}{sfx}"][c, j, r]) > 0 else 1
             if rule:
                 a_sign = int(math.copysign(1, a_here)) if level(a_here, peak) > 0 else 0
                 if a_sign == 0 or (rule == 1 and a_sign < 0):
@@ -377,28 +420,33 @@ def examples(table: Table, layers: set[int], count: int, seed: int, stratified: 
                 token = int(listed[rng.randrange(int((listed >= 0).sum()))])
                 answer = 0 if (-1 if edit == "ablate" else 1) * a_sign * (1 if side == "up" else -1) > 0 else 1
             ex.update(context=int(contexts[j]), position=p, stratum=stratum(float(d["kl_ablate"][c, j])), options=["up", "down"],
-                      answer=answer, edit=edit, option_ids=[token], change=(-1.0 if edit == "ablate" else meta.get("amplify", 1.5) - 1.0) * signed / (BINS - 1),
-                      question=here + f"If the component is {verb}, does the probability that the next token after the marked token is {table.piece(token)} go up or go down?")
+                      answer=answer, edit=edit, variant=sfx, option_ids=[token],
+                      change=None if "group" in sfx else (-1.0 if edit == "ablate" else meta.get("amplify", 1.5) - 1.0) * signed / (BINS - 1),
+                      question=here + f"If {WHO[sfx]} {verb}, does the probability that the next token after the marked token is {table.piece(token)} go up or go down?")
         elif q == "top":
             p = int(d["position"][c, j])
-            truth = int(d["up_ids_ablate"][c, j, 0])
-            # Distractors: tokens its removal lowers here (likely in this context, so the text alone does not
+            edit, sfx = variant if variant is not None else ("ablate", "")
+            truth = int(d[f"up_ids_{edit}{sfx}"][c, j, 0])
+            # Distractors: tokens the edit lowers here (likely in this context, so the text alone does not
             # tell them apart; the direction of its effect does).
-            pool = [int(x) for x in d["down_ids_ablate"][c, j].tolist() if int(x) != truth]
+            pool = [int(x) for x in d[f"down_ids_{edit}{sfx}"][c, j].tolist() if int(x) != truth]
             if len(pool) < 3:
                 continue
             options = [truth] + rng.sample(pool, 3)
             order = list(range(4))
             rng.shuffle(order)
+            verb = ("removed" if edit == "ablate" else f"made {meta.get('amplify', 1.5):g} times stronger") + where
             ex.update(context=int(contexts[j]), position=p, stratum=stratum(float(d["kl_ablate"][c, j])), options=[table.piece(options[i]) for i in order],
-                      answer=order.index(0), edit="ablate", option_ids=[int(options[i]) for i in order], change=-signed / (BINS - 1), question=here + f"If the component is removed{where}, which of these next tokens after the marked token gains the most probability?")
+                      answer=order.index(0), edit=edit, variant=sfx, option_ids=[int(options[i]) for i in order],
+                      change=None if "group" in sfx else (-1.0 if edit == "ablate" else meta.get("amplify", 1.5) - 1.0) * signed / (BINS - 1),
+                      question=here + f"If {WHO[sfx]} {verb}, which of these next tokens after the marked token gains the most probability?")
         elif q == "effect":
             p = int(d["position"][c, j])
-            edit = rng.choice(["ablate", "amplify"])
+            edit, sfx = variant if variant is not None else (rng.choice(["ablate", "amplify"]), "")
             verb = ("removed" if edit == "ablate" else f"made {meta.get('amplify', 1.5):g} times stronger") + where
-            ex.update(context=int(contexts[j]), position=p, stratum=stratum(float(d["kl_ablate"][c, j])), options=list(EFFECT_LEVELS), edit=edit,
-                      answer=effect_bin(float(d[f"effect_{edit}"][c, j])),
-                      question=here + f"If the component is {verb}, how much does the model's distribution of the next token after the marked token change?")
+            ex.update(context=int(contexts[j]), position=p, stratum=stratum(float(d["kl_ablate"][c, j])), options=list(EFFECT_LEVELS), edit=edit, variant=sfx,
+                      answer=effect_bin(float(d[f"effect_{edit}{sfx}"][c, j])),
+                      question=here + f"If {WHO[sfx]} {verb}, how much does the model's distribution of the next token after the marked token change?")
         elif q == "continuation" and row:
             J = meta.get("continue", 1)
             j = rng.randrange(J)
@@ -456,8 +504,10 @@ def examples(table: Table, layers: set[int], count: int, seed: int, stratified: 
             ex.update(layer=-1, kind="", c=-1, j=-1, context=ctx, position=p, options=[f"C{i + 1} (layer {l}, {k})" for i, (l, k, _) in enumerate(cands)],
                       candidates=[(l, k, cc, 1.0, "up") for l, k, cc in cands], answer=order.index(0),
                       question=f"At the marked token the model predicts {table.piece(att['token'][r])} next. Which of the listed components raises that prediction most?")
-        if row and ex.get("edit") and ex["c"] >= 0:
-            ex["effect"] = float(d[f"effect_{ex['edit']}"][ex["c"], ex["j"]])  # KL(M_e || M) at the edited token, bits
+        if row and ex.get("edit") and ex["c"] >= 0 and q != "continuation":
+            ex["effect"] = float(d[f"effect_{ex['edit']}{ex.get('variant', '')}"][ex["c"], ex["j"]])  # KL(M_e || M) at the edited token, bits
+        elif row and ex.get("edit") and ex["c"] >= 0:
+            ex["effect"] = float(d[f"effect_{ex['edit']}"][ex["c"], ex["j"]])
         named = ([(ex["layer"], ex["c"])] if ex["c"] >= 0 else []) + [(l_, c_) for l_, _, c_, _, _ in ex["candidates"]]
         assert all(respects(l_, c_) for l_, c_ in named), ("a question names a component outside its split", q, named)
         out.append(ex)
@@ -483,7 +533,7 @@ def exemplars(table: Table, ex: dict, n: int = 3) -> str:
 def base(condition: str) -> str:
     """The condition's vector input (a *_lens, *_examples or *_activity condition adds text to graph's or
     weights')."""
-    return condition.removesuffix("_lens").removesuffix("_examples").removesuffix("_activity")
+    return condition.removesuffix("_lens").removesuffix("_examples").removesuffix("_activity")  # weights_activity_lens -> weights
 
 
 def slots(table: Table, ex: dict, condition: str) -> list[tuple]:
@@ -510,6 +560,7 @@ def lens_text(table: Table, layer: int, kind: str, c: int, name: str = "It", rea
     write alone with reads=False)."""
     L = table.lens
     n = site_name(layer, kind)
+    c = table.number(layer, kind, c)
     words = lambda key: ", ".join(table.piece(int(t)) for t in L[f"{n}.{key}"][c].tolist() if t >= 0)  # noqa: E731
     if kind == "head":
         attends = f"{name} attends from tokens like {words('attn_from')} to tokens like {words('attn_to')}. " if reads else f"{name}: "
@@ -524,7 +575,7 @@ def prompt(table: Table, ex: dict, condition: str) -> tuple[str, str]:
     """The user turn around the placeholders: (before, after)."""
     lens = condition.endswith("_lens")
     public = condition.endswith("examples")
-    shown = condition == "activity" or condition.endswith("_activity")  # its top-activating texts from the label table
+    shown = condition == "activity" or "_activity" in condition  # its top-activating texts from the label table
     condition = base(condition)
     n = table.depth
     if ex["c"] >= 0:
@@ -545,7 +596,7 @@ def prompt(table: Table, ex: dict, condition: str) -> tuple[str, str]:
         if ex["c"] >= 0:
             info += lens_text(table, ex["layer"], ex["kind"], ex["c"])
             values = [table.lens_value(ex["layer"], ex["kind"], ex["c"], t) for t in ex.get("option_ids", [])] if ex["kind_q"] in ("direction", "top") else []
-            if values and values[0] is not None:
+            if values and values[0] is not None and ex.get("change") is not None:
                 info += "\nIts write's lens value (standard deviations over tokens; positive activity raises tokens with positive values) for " + ", ".join(
                     f"{table.piece(t)}: {v:+.1f}" for t, v in zip(ex["option_ids"], values)) + "."
                 # The edit's direct effect through the unembedding: the change of its activity (the stated level
