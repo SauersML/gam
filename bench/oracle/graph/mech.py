@@ -16,14 +16,15 @@ A program declares nodes bound to pieces of the target model M's weights and the
 Addresses (layer l, indices i, j, ... from 0):
   L[l].head[h, ...]          native attention heads (Qwen3: query heads; a head's k/v rows are those of
                              its key-value group, shared with the other heads of the group)
-  L[l].mlp[i, ...]           native MLP neurons
+  L[l].mlp[i, ...]           native MLP neurons (L[l].attn: all heads of layer l)
   PD.vpd[l].<site>[i, ...]   VPD subcomponents U_i V_i^T, site in q_proj k_proj v_proj o_proj c_fc down_proj
   PD.lib[l].<site>[i, ...]   our library's parts (not available yet)
   PD.tc[l][i, ...]           transcoder features of layer l's MLP (Qwen3-0.6B)
 Indices may be ints, slices or ranges; a site without indices (L[3].mlp) is all of its units.
 `node(*pieces)` makes one node (its pieces in one layer's attention or one layer's MLP); `writer >> reader` declares an
 edge (writer: a node or embed; reader: a route handle, a node = all of its reads, or logits) and
-`edges(...)` lists them. Comments and docstrings are free text: the English of the explanation.
+`edges(...)` lists them. `standin(mode)` says what undeclared pieces carry: "counterfactual" (default:
+the model's values on the prompt's counterfactual), "global" or "position" (averages). Comments and docstrings are free text: the English of the explanation.
 
 trace(source, model) checks a program and runs it in a sandboxed child process, returning the IR the
 checker reads (design.txt section 5); code_length counts its Python tokens; english extracts its
@@ -39,9 +40,11 @@ import builtins
 import inspect
 import io
 import json
+import os
 import signal
 import subprocess
 import sys
+import threading
 import tokenize
 import traceback
 from pathlib import Path
@@ -52,8 +55,10 @@ MODELS = ("qwen3-0.6b", "vpd4l")
 VIEWS = ("native", "vpd", "library", "transcoder")
 SITES = ("q_proj", "k_proj", "v_proj", "o_proj", "c_fc", "down_proj")
 ROUTES = ("query", "key", "value", "input")
-EXPORTS = ("node", "edges", "L", "PD", "embed", "logits")
-ATTRIBUTES = ("head", "mlp", "vpd", "lib", "tc", "query", "key", "value", "input") + SITES
+EXPORTS = ("node", "edges", "L", "PD", "embed", "logits", "standin")
+ATTRIBUTES = ("head", "attn", "mlp", "vpd", "lib", "tc", "query", "key", "value", "input") + SITES
+STANDINS = ("counterfactual", "global", "position")
+DEFAULT_STANDIN = "counterfactual"
 
 
 class MechError(Exception):
@@ -123,6 +128,7 @@ class _Program:
         self.shape = shapes(model)
         self.nodes: list[Node] = []
         self.edges: dict[tuple, Edge] = {}
+        self.standin: str | None = None
 
 
 def _shape() -> dict | None:
@@ -233,6 +239,11 @@ class _NativeLayer:
     def head(self) -> _Site:
         shape = _shape()
         return _Site("native", self._l, "head", shape and shape["heads"])
+
+    @property
+    def attn(self) -> _Site:
+        """The layer's attention: all of its heads, e.g. node(L[2].attn)."""
+        return self.head
 
     @property
     def mlp(self) -> _Site:
@@ -398,6 +409,18 @@ def node(*pieces, rule=None) -> Node:
     return Node(tuple(Piece(v, l, k, tuple(sorted(i)), n) for (v, l, k, n), i in merged.items()))
 
 
+def standin(mode: str) -> None:
+    """What every undeclared piece and edge carries (once per program): "counterfactual" (the default:
+    the model's own values on the prompt's counterfactual), "global" (its average over the behavior's
+    prompts) or "position" (its average per token position)."""
+    if mode not in STANDINS:
+        raise MechError(f"standin({mode!r}): choose one of {', '.join(STANDINS)}")
+    if _PROGRAM is not None:
+        if _PROGRAM.standin not in (None, mode):
+            raise MechError("standin() may be set once per program")
+        _PROGRAM.standin = mode
+
+
 def edges(*declared) -> None:
     """Lists the program's edges (each `writer >> reader` is declared where it is written)."""
     for e in declared:
@@ -481,8 +504,8 @@ def _line_of(exc: BaseException) -> int | None:
 def trace_inline(source: str, model: str) -> dict:
     """Checks and runs `source` in this process (trusted sources only; `trace` sandboxes) -> IR."""
     global _PROGRAM
-    ir = {"model": model, "nodes": [], "edges": [], "python_tokens": 0, "token_types": 0,
-          "source": source, "valid": False, "error": None}
+    ir = {"model": model, "standin": DEFAULT_STANDIN, "nodes": [], "edges": [], "python_tokens": 0,
+          "token_types": 0, "source": source, "valid": False, "error": None}
     try:
         ir["python_tokens"], ir["token_types"] = code_length(source)
     except (SyntaxError, tokenize.TokenError, IndentationError):
@@ -546,6 +569,7 @@ def _validate(program: _Program, namespace: dict, ir: dict) -> None:
                 if o != n.id:
                     raise MechError(f"{Piece(p.view, p.layer, p.kind, (i,)).name()} is in nodes {o} and {n.id}; "
                                     f"a piece belongs to one node")
+    ir["standin"] = program.standin or DEFAULT_STANDIN
     ir["nodes"] = [{"id": n.id, "pieces": [p.ir() for p in n.pieces], "rule": None} for n in program.nodes]
     ir["edges"] = [{"from": "embed" if e.src is embed else e.src.id,
                     "to": "logits" if e.dst is logits else e.dst.id, "route": e.route}
@@ -565,61 +589,118 @@ def _limit(seconds: float) -> None:
         pass  # macOS does not enforce address-space limits; trace() watches the footprint instead
 
 
+_LIBC = None
+
+
 def _footprint(pid: int) -> int:
     """macOS: the process's physical footprint (rusage_info_v2 ri_phys_footprint), 0 if unknown."""
+    global _LIBC
     import ctypes
     import ctypes.util
     import struct
 
+    if _LIBC is None:
+        _LIBC = ctypes.CDLL(ctypes.util.find_library("c"))
     buf = ctypes.create_string_buffer(256)
-    if ctypes.CDLL(ctypes.util.find_library("c")).proc_pid_rusage(pid, 2, buf) != 0:
+    if _LIBC.proc_pid_rusage(pid, 2, buf) != 0:
         return 0
     return struct.unpack_from("Q", buf.raw, 72)[0]
 
 
-def trace(source: str, model: str, timeout: float = 10.0) -> dict:
-    """Checks and runs `source` in a sandboxed child process (restricted names and builtins, CPU and
-    memory limits, a wall-clock timeout) -> IR dict (design.txt section 5)."""
-    import threading
-    import time
-
-    # -S: no site hooks (the research venv's reserves ledger memory per script); mech needs only the stdlib
-    child = subprocess.Popen([sys.executable, "-I", "-S", str(Path(__file__).resolve()), "trace", "--model", model,
-                              "--timeout", str(timeout)],
-                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    over = threading.Event()
-
-    def watch():  # RLIMIT_AS is not enforced on macOS: kill the child when its footprint passes MEMORY
-        while child.poll() is None:
-            if _footprint(child.pid) > MEMORY:
-                over.set()
-                child.kill()
-                return
-            time.sleep(0.005)
-
-    if sys.platform == "darwin":
-        threading.Thread(target=watch, daemon=True).start()
-    try:
-        stdout, stderr = child.communicate(source, timeout=timeout + 5)
-        if child.returncode == 0:
-            return json.loads(stdout)
-        if over.is_set() or child.returncode == -signal.SIGKILL:
-            error = f"memory limit of {MEMORY >> 20} MiB exceeded"
-        elif child.returncode == -signal.SIGXCPU:
-            error = f"time limit of {timeout} s CPU exceeded"
-        else:
-            error = f"the program crashed the tracer (exit {child.returncode}): {stderr.strip()[-300:]}"
-    except subprocess.TimeoutExpired:
-        child.kill()
-        child.communicate()
-        error = f"time limit of {timeout} s exceeded"
-    ir = {"model": model}
+def _invalid(source: str, model: str, error: str) -> dict:
     try:
         tokens, types = code_length(source)
-    except (SyntaxError, tokenize.TokenError, IndentationError):
+    except (SyntaxError, tokenize.TokenError, IndentationError, ValueError):
         tokens, types = 0, 0
-    ir.update(nodes=[], edges=[], python_tokens=tokens, token_types=types, source=source, valid=False, error=error)
-    return ir
+    return {"model": model, "standin": DEFAULT_STANDIN, "nodes": [], "edges": [], "python_tokens": tokens,
+            "token_types": types, "source": source, "valid": False, "error": error}
+
+
+def _traced_child(source: str, model: str, timeout: float) -> dict:
+    """Forks a child that traces `source` under CPU/memory limits; waits for it with a wall-clock
+    deadline, watching its footprint on macOS (RLIMIT_AS is not enforced there)."""
+    import select
+    import time
+
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:  # child
+        try:
+            os.close(r)
+            _limit(timeout)
+            sys.setrecursionlimit(500)
+            data = json.dumps(trace_inline(source, model)).encode()
+            view = memoryview(data)
+            while view:
+                view = view[os.write(w, view):]
+        finally:
+            os._exit(0)
+    os.close(w)
+    chunks, deadline, over, late = [], time.monotonic() + timeout + 2, False, False
+    try:
+        while True:
+            ready, _, _ = select.select([r], [], [], 0.005)
+            if ready:
+                chunk = os.read(r, 1 << 16)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            elif sys.platform == "darwin" and _footprint(pid) > MEMORY:
+                over = True
+                os.kill(pid, signal.SIGKILL)
+                break
+            elif time.monotonic() > deadline:
+                late = True
+                os.kill(pid, signal.SIGKILL)
+                break
+    finally:
+        os.close(r)
+        _, status = os.waitpid(pid, 0)
+    if over or (os.WIFSIGNALED(status) and os.WTERMSIG(status) == signal.SIGKILL and not late):
+        return _invalid(source, model, f"memory limit of {MEMORY >> 20} MiB exceeded")
+    if late or (os.WIFSIGNALED(status) and os.WTERMSIG(status) == signal.SIGXCPU):
+        return _invalid(source, model, f"time limit of {timeout} s exceeded")
+    try:
+        return json.loads(b"".join(chunks))
+    except ValueError:
+        return _invalid(source, model, f"the program crashed the tracer (status {status})")
+
+
+def serve() -> None:
+    """JSON lines on stdin {"source", "model", "timeout"} -> IR lines on stdout, one forked child each."""
+    for model in MODELS:
+        shapes(model)
+    for line in sys.stdin:
+        req = json.loads(line)
+        print(json.dumps(_traced_child(req["source"], req["model"], req.get("timeout", 10.0))), flush=True)
+
+
+_SERVERS = threading.local()
+
+
+def trace(source: str, model: str, timeout: float = 10.0) -> dict:
+    """Checks and runs `source` sandboxed (restricted names and builtins; a forked child with CPU and
+    memory limits and a wall-clock deadline) -> IR dict (design.txt section 5). Each thread keeps one
+    tracer server (`mech.py serve`, started with -I -S: no site hooks, the standard library only, no
+    memory-ledger reservation), so a trace costs a fork, a few milliseconds."""
+    for attempt in range(2):
+        server = getattr(_SERVERS, "proc", None)
+        if server is None or server.poll() is not None:
+            server = _SERVERS.proc = subprocess.Popen(
+                [sys.executable, "-I", "-S", str(Path(__file__).resolve()), "serve"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1,
+                env={**os.environ, "MPD_MEM_GIB": "1"})
+        try:
+            server.stdin.write(json.dumps({"source": source, "model": model, "timeout": timeout}) + "\n")
+            server.stdin.flush()
+            line = server.stdout.readline()
+            if line:
+                return json.loads(line)
+        except (BrokenPipeError, OSError, ValueError):
+            pass
+        server.kill()
+        _SERVERS.proc = None
+    return _invalid(source, model, "the tracer server failed")
 
 
 def trace_many(sources: list[str], model: str, timeout: float = 10.0, workers: int = 8) -> list[dict]:
@@ -695,6 +776,7 @@ def main() -> None:
     s.add_argument("--data", type=Path, default=Path.home() / "mpd-data")
     s.add_argument("--write", action="store_true")
     sub.add_parser("english", help="stdin program -> its comments and docstrings")
+    sub.add_parser("serve", help="the tracer server (JSON lines; trace() starts it)")
     a = ap.parse_args()
     if a.command == "trace":
         source = sys.stdin.read()
@@ -702,6 +784,8 @@ def main() -> None:
             _limit(a.timeout)
         sys.setrecursionlimit(500)
         print(json.dumps(trace_inline(source, a.model)))
+    elif a.command == "serve":
+        serve()
     elif a.command == "shapes":
         built = build_shapes(a.data)
         if a.write:

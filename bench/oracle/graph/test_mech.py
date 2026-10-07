@@ -39,7 +39,9 @@ def test_ir_fields():
     ir = mech.trace_inline(HEAD + "a = node(L[1].head[1], L[1].head[3])\nb = node(PD.vpd[3].c_fc[2], PD.vpd[3].down_proj[5:8])\n"
                            "edges(a >> b, embed >> a.query, b >> logits)\nnode(L[0].mlp[9]) >> a.key\n", "vpd4l")
     assert ir["valid"], ir["error"]
-    assert set(ir) == {"model", "nodes", "edges", "python_tokens", "token_types", "source", "valid", "error"}
+    assert set(ir) == {"model", "standin", "nodes", "edges", "python_tokens", "token_types", "source", "valid",
+                       "error"}
+    assert ir["standin"] == "counterfactual"
     assert ir["nodes"] == [
         {"id": "a", "pieces": [{"view": "native", "layer": 1, "kind": "head", "index": [1, 3]}], "rule": None},
         {"id": "b", "pieces": [{"view": "vpd", "layer": 3, "kind": "c_fc", "index": 2},
@@ -55,6 +57,25 @@ def test_whole_site():
                            "edges(h >> m, m >> logits)\n", "vpd4l")
     assert ir["valid"], ir["error"]
     assert [p["index"] for n in ir["nodes"] for p in n["pieces"]] == [None, None, None]
+
+
+def test_standin_and_attn():
+    ir = mech.trace_inline(HEAD.replace("logits", "logits, standin") + "standin('position')\nh = node(L[2].attn)\n",
+                           "vpd4l")
+    assert ir["valid"] and ir["standin"] == "position", ir["error"]
+    assert ir["nodes"][0]["pieces"] == [{"view": "native", "layer": 2, "kind": "head", "index": None}]
+    assert "choose one of" in invalid("from mech import standin\nstandin('mean')\n")
+    assert "once per program" in invalid("from mech import standin\nstandin('global')\nstandin('position')\n")
+
+
+def test_tracer_speed():
+    import time
+
+    mech.trace("from mech import L\n", "vpd4l")
+    start = time.time()
+    for _ in range(20):
+        assert mech.trace("from mech import node, L\na = node(L[1].head[0])\n", "vpd4l")["valid"]
+    assert (time.time() - start) / 20 < 0.5
 
 
 def test_qwen_views():
@@ -120,8 +141,9 @@ def test_sandbox():
     assert "not allowed" in invalid("while True:\n    pass\n")
     assert "time limit" in invalid("for i in range(10 ** 12):\n    pass\n", sandboxed=True)
     assert "time limit" in invalid("x = 10\ny = x ** x ** x ** x\n", sandboxed=True)
-    assert "memory limit" in invalid("n = 10 ** 10\nx = [0] * n\n", sandboxed=True)
-    assert "memory limit" in invalid("n = 10 ** 9\nx = list(range(n))\n", sandboxed=True)
+    for big in ("n = 10 ** 10\nx = [0] * n\n", "n = 10 ** 10\nx = 'ab' * n\n"):
+        error = invalid(big, sandboxed=True)  # killed at the footprint limit, or malloc refuses first
+        assert "memory limit" in error or "MemoryError" in error, error
 
 
 def test_code_length():
