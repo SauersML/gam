@@ -2203,8 +2203,13 @@ pub struct Targets {
 /// How many of the strongest pieces and of the strongest connections targeted draws take.
 const TARGETED: usize = 8;
 
+/// The version of `M`'s execution semantics in disk-cache names: raised whenever a change alters what
+/// a cached outcome of `M` would be, so an old cache is never read as a new one.
+const DISK_SEMANTICS: u64 = 2;
+
 /// The experiments every program of a behavior is scored on (design.txt section 2), drawn from
-/// `seed` alone and never from a program: clean, the counterfactual prompts (`counterfactual`),
+/// `seed` and `M`'s own pieces alone, never from a program or an attached view (VPD, library,
+/// transcoder), so every checker configuration scores the same set: clean, the counterfactual prompts (`counterfactual`),
 /// then `count` draws, half uniform (weight edits of random pieces at random granularity,
 /// rank-one perturbations and, with a manifest, its site operations, a third each) and half
 /// targeted at `targets`' strongest pieces and connections (a piece removed or scaled, a head's or
@@ -2222,15 +2227,10 @@ pub fn sample(weights: &Weights, counterfactual: bool, count: usize, seed: u64, 
         let block = match block {
             Some(b) => b.clone(),
             None => {
+                // M's own pieces only: an attached view must not change the draw (the same seed gives
+                // the same experiments whatever views a checker carries).
                 let l = rng.random_range(0..layers);
-                if weights.vpd.contains_key(&l) && rng.random_bool(1.0 / 3.0) {
-                    // A layer with a VPD view: its subcomponents a third of the time.
-                    if weights.vpd_attention.contains_key(&l) && rng.random_bool(0.5) {
-                        Block::AttnSlices { layer: l, q: Vec::new(), k: Vec::new(), v: Vec::new(), o: Vec::new(), rest: true }
-                    } else {
-                        Block::Slices { layer: l, fc: Vec::new(), down: Vec::new(), rest: true }
-                    }
-                } else if rng.random_bool(0.5) || weights.neurons(l) == 0 {
+                if rng.random_bool(0.5) || weights.neurons(l) == 0 {
                     Block::Heads { layer: l, heads: (0..weights.layers[l].heads.len()).collect() }
                 } else {
                     Block::Neurons { layer: l, neurons: (0..weights.neurons(l)).collect() }
@@ -3401,9 +3401,10 @@ pub struct Behavior {
 }
 
 impl Behavior {
-    /// The declared size in scored tokens: `2^24`, times the behavior's frequency when it states one.
+    /// The declared size in scored tokens: `2^24`, times the behavior's frequency when it states one,
+    /// and at least one token, so an exact number's price `½ log2 N` is never negative.
     pub fn size(&self) -> f64 {
-        16_777_216.0 * self.frequency.unwrap_or(1.0)
+        (16_777_216.0 * self.frequency.unwrap_or(1.0)).max(1.0)
     }
 }
 
@@ -3598,6 +3599,13 @@ impl Checker {
         })
     }
 
+    /// Attaches the behavior's attention blocks to every sequence of `b`. Every native batch goes
+    /// through it (the program's runs and every stand-in run), so a run never drops the
+    /// behavior's execution constraints.
+    fn mask(&self, b: &mut Batch) {
+        b.blocks = b.sequences().iter().map(|s| self.blocks.get(s).cloned().unwrap_or_default()).collect();
+    }
+
     /// `batch` with its stand-in source attached: under counterfactual stand-ins, `M`'s run (with
     /// the current weights) on each sequence's partner (a prompt's counterfactual, a
     /// counterfactual's prompt). `M` itself (every unit computing, every edge kept) reads no
@@ -3605,8 +3613,7 @@ impl Checker {
     pub fn referenced(&self, circuit: &Circuit, batch: &Batch) -> Result<Batch, String> {
         let mut out = batch.clone();
         out.reference = None;
-        let masked = |b: &mut Batch| b.blocks = b.sequences().iter().map(|s| self.blocks.get(s).cloned().unwrap_or_default()).collect();
-        masked(&mut out);
+        self.mask(&mut out);
         if circuit.is_model() {
             return Ok(out);
         }
@@ -3618,7 +3625,7 @@ impl Checker {
         let r = cell
             .get_or_init(|| {
                 let mut b = Batch::new(&partner)?;
-                masked(&mut b);
+                self.mask(&mut b);
                 reference(&self.weights, &b).map(Arc::new)
             })
             .clone()?;
@@ -3708,8 +3715,9 @@ impl Checker {
     }
 
     /// The file of `M`'s outcome under `key` in the disk cache (`Checker::disk_cache`, shared by
-    /// every checker process given it): named by the behavior, a fingerprint of its prompts and of `M`'s weights,
-    /// and the key; `None` when the cache is off.
+    /// every checker process given it): named by the behavior, a fingerprint of its prompts, attention
+    /// blocks and of `M`'s weights, the semantics version ([`DISK_SEMANTICS`]) and the key; `None` when
+    /// the cache is off.
     fn disk_path(&self, key: &str) -> Option<std::path::PathBuf> {
         let dir = self.disk_cache.as_ref()?;
         // FNV-1a over little-endian words.
@@ -3735,10 +3743,19 @@ impl Checker {
         let mut sample: Vec<f64> = w.embedding.row(0).iter().map(|&v| f64::from(v)).collect();
         sample.extend(w.unembedding.row(w.unembedding.nrows() - 1).iter().map(|&v| f64::from(v)));
         sample.extend(w.final_norm.gain.iter());
+        // A row of every matrix (attention's maps as well as the MLPs'), so two checkpoints that differ in
+        // any block do not share outcomes; the behavior's attention blocks and the execution semantics'
+        // version are part of the name too.
         for l in &w.layers {
             sample.extend(l.mlp.iter().flat_map(|m| m.out.row(0).to_vec()).map(f64::from));
+            for h in &l.heads {
+                for m in [&h.query, &*h.key, &*h.value, &h.output] {
+                    sample.extend(m.row(0).iter().map(|&v| f64::from(v)));
+                }
+            }
         }
-        let h = fnv(prompts, &mut sample.iter().map(|v| v.to_bits()).chain(key.bytes().map(u64::from)));
+        let blocks = self.behavior.prompts.iter().flat_map(|p| p.attention_block.iter().flatten().map(|&b| b as u64).chain([u64::MAX - 1]));
+        let h = fnv(prompts, &mut sample.iter().map(|v| v.to_bits()).chain(blocks).chain(std::iter::once(DISK_SEMANTICS)).chain(key.bytes().map(u64::from)));
         Some(std::path::Path::new(&dir).join(format!("{}_{prompts:016x}", self.behavior.id)).join(format!("{h:016x}.f64")))
     }
 
@@ -4128,18 +4145,9 @@ impl Checker {
         mlps.sort_by(|a, b| b.1.total_cmp(&a.1));
         for &(layer, _) in mlps.iter().take(2) {
             let n = self.weights.neurons(layer);
-            let mut groups: Vec<(Block, WeightEdit)> = (0..8).map(|g| (g * n / 8..(g + 1) * n / 8).collect::<Vec<usize>>()).filter(|g| !g.is_empty()).map(|g| (Block::Neurons { layer, neurons: g.clone() }, WeightEdit::Neurons { layer, neurons: g, factor: 0.0 })).collect();
-            if let Some(v) = self.weights.vpd.get(&layer) {
-                for (down, count) in [(false, v.fc_u.nrows()), (true, v.down_u.nrows())] {
-                    for g in 0..8 {
-                        let indices: Vec<usize> = (g * count / 8..(g + 1) * count / 8).collect();
-                        if !indices.is_empty() {
-                            let block = if down { Block::Slices { layer, fc: Vec::new(), down: indices.clone(), rest: false } } else { Block::Slices { layer, fc: indices.clone(), down: Vec::new(), rest: false } };
-                            groups.push((block, WeightEdit::Subcomponents { layer, down, indices, factor: 0.0 }));
-                        }
-                    }
-                }
-            }
+            // M's own neurons only, so the targets (and the experiments drawn from them) do not depend on
+            // the views a checker carries.
+            let groups: Vec<(Block, WeightEdit)> = (0..8).map(|g| (g * n / 8..(g + 1) * n / 8).collect::<Vec<usize>>()).filter(|g| !g.is_empty()).map(|g| (Block::Neurons { layer, neurons: g.clone() }, WeightEdit::Neurons { layer, neurons: g, factor: 0.0 })).collect();
             for (block, edit) in groups {
                 let m = self.model_outcome(&graph, &Experiment::Edit { edit, targeted: true })?;
                 targets.pieces.push((block, effect(&m)));
@@ -4195,7 +4203,13 @@ impl Checker {
             let partner: Vec<Vec<u32>> = base.sequences().iter().map(|s| self.partners.get(s).cloned().ok_or("a prompt without a counterfactual")).collect::<Result<_, _>>()?;
             let key = format!("{} {}", serde_json::to_string(draw).map_err(|e| e.to_string())?, partner.len());
             let cell = cached_run(&self.site_references, key, self.reference_bytes)?;
-            let r = cell.get_or_init(|| Batch::new(&partner).and_then(|b| reference_under(&self.weights, &b, draw, &self.sites)).map(Arc::new)).clone()?;
+            let r = cell
+                .get_or_init(|| {
+                    let mut b = Batch::new(&partner)?;
+                    self.mask(&mut b);
+                    reference_under(&self.weights, &b, draw, &self.sites).map(Arc::new)
+                })
+                .clone()?;
             base.reference = Some(r);
         }
         Ok((base, rows, donor))
@@ -4219,7 +4233,8 @@ impl Checker {
     /// features are not `M`'s weights: their error is measured on the program of that block alone
     /// (node-level, counterfactual stand-ins), exact against quantized.
     pub fn width(&mut self, block: &Block, n: f64) -> Result<Option<u32>, String> {
-        let key = serde_json::to_string(block).map_err(|e| e.to_string())?;
+        // The search minimizes bits plus N times the error, so its choice depends on N as well.
+        let key = format!("{} {n}", serde_json::to_string(block).map_err(|e| e.to_string())?);
         if let Some(b) = self.widths.get(&key) {
             return Ok(*b);
         }

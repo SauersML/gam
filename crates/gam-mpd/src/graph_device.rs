@@ -721,27 +721,29 @@ pub(crate) fn run_on(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, 
                     s.device.scale_columns(&mut x_hat, &unit_x, s.get(gain).map_err(e)?, false).map_err(e)?;
                     normed(&s.device, ops, (site, u, 0), &mut x_hat, &mut kept).map_err(e)?;
                     let n = mlp.gate.nrows();
-                    // The whole MLP, less the few neurons outside a large block.
-                    let whole = 2 * neurons.len() > n;
-                    let (all, active) = neuron_writes(s, mlp, &x_hat, None).map_err(e)?;
-                    let write = if whole && neurons.len() == n {
-                        all
-                    } else if whole {
-                        let inside: std::collections::BTreeSet<usize> = neurons.iter().copied().collect();
-                        let rest: Vec<usize> = (0..n).filter(|i| !inside.contains(i)).collect();
-                        let (outside, _) = neuron_writes(s, mlp, &x_hat, Some(&rest)).map_err(e)?;
-                        let mut w = all;
-                        s.device.axpy(&mut w, -1.0, &outside).map_err(e)?;
-                        w
+                    // A large block: the whole MLP (resident), less the few neurons outside it; a small
+                    // block: its own rows alone (the whole MLP would cost n / |block| times as much).
+                    let (write, active) = if 2 * neurons.len() > n {
+                        let (all, active) = neuron_writes(s, mlp, &x_hat, None).map_err(e)?;
+                        if neurons.len() == n {
+                            (all, Some(active))
+                        } else {
+                            let inside: std::collections::BTreeSet<usize> = neurons.iter().copied().collect();
+                            let rest: Vec<usize> = (0..n).filter(|i| !inside.contains(i)).collect();
+                            let (outside, _) = neuron_writes(s, mlp, &x_hat, Some(&rest)).map_err(e)?;
+                            let mut w = all;
+                            s.device.axpy(&mut w, -1.0, &outside).map_err(e)?;
+                            (w, None)
+                        }
                     } else {
-                        neuron_writes(s, mlp, &x_hat, Some(neurons)).map_err(e)?.0
+                        (neuron_writes(s, mlp, &x_hat, Some(neurons)).map_err(e)?.0, None)
                     };
                     if let Some(c) = captured.as_mut() {
-                        if neurons.len() != n {
+                        let Some(active) = active.as_ref() else {
                             return Err("a capture needs each MLP whole in one unit".into());
-                        }
+                        };
                         c.mlp[*layer] = s.device.download(&write).map_err(e)?;
-                        c.active[*layer] = s.device.download(&active).map_err(e)?;
+                        c.active[*layer] = s.device.download(active).map_err(e)?;
                         // Only transcoder features and VPD MLP subcomponents read it.
                         if !weights.transcoders.is_empty() || !weights.vpd.is_empty() {
                             c.inputs[*layer] = s.device.download(&x_hat).map_err(e)?;
