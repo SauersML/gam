@@ -120,6 +120,19 @@ def score(toy: Toy, parts: Parts) -> dict:
                          "rank_right": all(part_rank.get(op) == r for op, r in truth_rank.items())})
         matched.add(b)
     best_for_part = [max((cosine(d, f) for d in deltas), default=0.0) for f in fitted]
+    # Pieces: each part goes to the mechanism its weights are most aligned with (none where it is
+    # orthogonal to all); per mechanism its pieces, their slices, the cosine of their sum with the
+    # mechanism (the span the pieces recover together) and whether any piece's gate is on against
+    # the mechanism's activity (precision, recall).
+    owner = [int(np.argmax([cosine(d, f) for d in deltas])) if best_for_part[b] > 0 else -1 for b, f in enumerate(fitted)]
+    rows = min(len(parts.active), len(toy.active))
+    for i, (r, delta) in enumerate(zip(recovery, deltas)):
+        mine = [b for b, o in enumerate(owner) if o == i]
+        total = {op: sum((fitted[b][op] for b in mine if op in fitted[b]), np.zeros_like(d)) for op, d in delta.items()}
+        on, t = parts.active[:rows][:, mine].any(1), toy.active[:rows, i]
+        r["pieces"] = {"parts": len(mine), "slices": int(sum(U.shape[1] for b in mine for U, _ in parts.parts[b]["slices"].values())),
+                       "sum_cosine": cosine(delta, total) if mine else 0.0,
+                       "gate_precision": float((on & t).sum() / max(on.sum(), 1)), "gate_recall": float((on & t).sum() / max(t.sum(), 1))}
     cosines = np.array([r["cosine"] for r in recovery])
     recovered = [r for r in recovery if r["cosine"] >= 0.9]
     out = {
