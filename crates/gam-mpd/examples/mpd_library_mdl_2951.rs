@@ -34,7 +34,10 @@
 //! next to it, over the same tokens, the edit's effect on the model `KL(M_e ‖ M)` (`effect_*`), the
 //! size of the change the explanation is asked to predict, the edit-ignoring baseline
 //! `KL(M_e ‖ P)` (`ignoring_*`: P's clean prediction against M's edited outcome, which a gap must
-//! beat for the explanation to predict the edit at all), and the gaps again in bins of the
+//! beat for the explanation to predict the edit at all), the response diagnostic
+//! `KL(p_e ‖ p̃_e)`, `p̃_e ∝ p_0 q_e / q_0` (`response_*`: `M`'s clean prediction moved by `P`'s
+//! response to the edit, zero where `P` responds as `M` does whatever its clean error; `p` = `M`,
+//! `q` = `P`, `0` clean, `e` edited), and the gaps again in bins of the
 //! effect at the edited token (`by_effect`: below 0.01, 0.01–0.1, 0.1–1 and above 1 bits), so a
 //! comparison can rest on the edits that change `M`.
 //!
@@ -336,6 +339,13 @@ fn edit_faithfulness(
             w.whole_rows
         );
     }
+    // The response diagnostic KL(p_e ‖ p̃_e), p̃_e ∝ p_0 q_e / q_0 (p = M, q = P, 0 clean, e edited;
+    // Interchange::response): whether P predicts M's change under the edit, apart from P's clean
+    // error, over the same tokens.
+    let mut responses = Vec::with_capacity(batches.len());
+    for (_, batch, drawn, _) in &batches {
+        responses.push(experiments.response(batch, drawn)?);
+    }
     // The edits' effect on M, KL(M_e ‖ M), over the same tokens: the same experiments with P = M
     // applying no edit.
     // The edit-ignoring baseline: P's clean prediction against M's edited outcome, KL(M_e ‖ P),
@@ -358,19 +368,20 @@ fn edit_faithfulness(
     // effect at the edited token KL(M_e ‖ M) falls in each bin (bits).
     const BINS: [f64; 3] = [0.01, 0.1, 1.0];
     let mut effects: BTreeMap<&str, (Vec<f64>, Vec<f64>)> = BTreeMap::new();
-    let mut binned: BTreeMap<(&str, usize), (Vec<f64>, Vec<f64>, Vec<f64>)> = BTreeMap::new();
+    let mut binned: BTreeMap<(&str, usize), (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>)> = BTreeMap::new();
+    let mut response: BTreeMap<&str, (Vec<f64>, Vec<f64>)> = BTreeMap::new();
     // Per experiment (one JSON line each): its held-out sequence, edited position, family,
     // operations, effect at the edited token and gap there.
     let mut records = String::new();
-    for (b, batch, drawn, gaps) in &batches {
-        for ((e, bits), gap) in drawn.iter().zip(&reference.evaluate(batch, drawn, false)?.bits).zip(gaps) {
+    for ((b, batch, drawn, gaps), moved) in batches.iter().zip(&responses) {
+        for (((e, bits), gap), moved) in drawn.iter().zip(&reference.evaluate(batch, drawn, false)?.bits).zip(gaps).zip(moved) {
             let ops: Vec<Value> = match &e.patch {
                 Some(interchange::Patch::Ops { ops, .. }) => ops.iter().map(|o| json!({"site": o.site, "operation": format!("{:?}", o.operation), "onward": o.onward})).collect(),
                 _ => Vec::new(),
             };
             records.push_str(&json!({
                 "sequence": first + b * settings.batch_sequences + e.base, "position": e.position, "family": family(e), "ops": ops,
-                "effect_bits_at_edited_token": bits.first(), "gap_bits_at_edited_token": gap.first(),
+                "effect_bits_at_edited_token": bits.first(), "gap_bits_at_edited_token": gap.first(), "response_bits_at_edited_token": moved.first(),
             }).to_string());
             records.push('\n');
             let entry = effects.entry(family(e)).or_default();
@@ -382,6 +393,10 @@ fn edit_faithfulness(
             entry.0.extend_from_slice(gap);
             entry.1.extend(gap.first());
             entry.2.push(at);
+            entry.3.extend_from_slice(moved);
+            let entry = response.entry(family(e)).or_default();
+            entry.0.extend_from_slice(moved);
+            entry.1.extend(moved.first());
         }
     }
     std::fs::write(out.join(format!("EDITS_{}.experiments.jsonl", settings.name)), records).map_err(|e| e.to_string())?;
@@ -398,13 +413,15 @@ fn edit_faithfulness(
         let (mut ignored_all, mut ignored_edited) = ignoring.remove(family).unwrap_or_default();
         let ((ignored_mean, ignored_p99), (ignored_edited_mean, _)) = (summary(&mut ignored_all), summary(&mut ignored_edited));
         let ((effect_mean, effect_p99), (effect_edited_mean, effect_edited_p99)) = (summary(&mut effect_all), summary(&mut effect_edited));
+        let (mut moved_all, mut moved_edited) = response.remove(family).unwrap_or_default();
+        let ((moved_mean, moved_p99), (moved_edited_mean, _)) = (summary(&mut moved_all), summary(&mut moved_edited));
         let bins: Vec<Value> = (0..=BINS.len())
             .filter_map(|bin| {
-                let (all, at, effect) = binned.get(&(family, bin))?;
+                let (all, at, effect, moved) = binned.get(&(family, bin))?;
                 let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len().max(1) as f64;
                 let low = if bin == 0 { 0.0 } else { BINS[bin - 1] };
                 let high = BINS.get(bin).copied().unwrap_or(f64::INFINITY);
-                Some(json!({"effect_bits_at_edited_token": [low, if high.is_finite() { json!(high) } else { json!("inf") }], "experiments": effect.len(), "mean_bits_per_token": mean(all), "edited_token_mean_bits": mean(at), "effect_edited_token_mean_bits": mean(effect)}))
+                Some(json!({"effect_bits_at_edited_token": [low, if high.is_finite() { json!(high) } else { json!("inf") }], "experiments": effect.len(), "mean_bits_per_token": mean(all), "edited_token_mean_bits": mean(at), "effect_edited_token_mean_bits": mean(effect), "response_mean_bits_per_token": mean(moved)}))
             })
             .collect();
         families.insert(
@@ -415,6 +432,7 @@ fn edit_faithfulness(
                 "mean_bits_per_token": mean, "p99_bits_per_token": p99, "edited_token_mean_bits": edited_mean, "edited_token_p99_bits": edited_p99,
                 "effect_mean_bits_per_token": effect_mean, "effect_p99_bits_per_token": effect_p99, "effect_edited_token_mean_bits": effect_edited_mean, "effect_edited_token_p99_bits": effect_edited_p99,
                 "ignoring_mean_bits_per_token": ignored_mean, "ignoring_p99_bits_per_token": ignored_p99, "ignoring_edited_token_mean_bits": ignored_edited_mean,
+                "response_mean_bits_per_token": moved_mean, "response_p99_bits_per_token": moved_p99, "response_edited_token_mean_bits": moved_edited_mean,
             }),
         );
     }

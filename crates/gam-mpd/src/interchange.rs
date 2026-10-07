@@ -3188,6 +3188,61 @@ impl Interchange {
         }
         Ok(Scored { bits: evaluation.bits, gradient, work: evaluation.work })
     }
+
+    /// The response diagnostic of `experiments` on `batch`: per experiment, per scored token (from
+    /// its position on), `KL(p_e ‖ p̃_e)` in bits, with `p` = `M`, `q` = `P` (the experiment's
+    /// hybrid), `0` the clean run of the same base (and hybrid), `e` the edited run, and
+    /// `p̃_e ∝ p_0 q_e / q_0`: `M`'s clean prediction moved by `P`'s response to the edit. The head is
+    /// linear in the final hidden row `h` (`p ∝ exp(E h)`), so `p̃_e` is the head at
+    /// `h_{M,0} + h_{P,e} − h_{P,0}`. It is zero where `P` responds to the edit as `M` does
+    /// (`h_{P,e} − h_{P,0} = h_{M,e} − h_{M,0}`) whatever `P`'s clean error, which the gap
+    /// `KL(p_e ‖ q_e)` also counts.
+    pub fn response(&self, batch: &Batch, experiments: &[Experiment]) -> Result<Vec<Vec<f64>>, String> {
+        let (m, p) = self.models();
+        let d = p.device();
+        let clean: Vec<Experiment> = experiments.iter().map(|e| Experiment { base: e.base, source: e.base, explained: e.explained.clone(), patch: None, position: 0 }).collect();
+        let targets = self.targets(batch, experiments)?;
+        let (m0, p0, pe) = (final_rows(&m, &p, batch, &clean, true)?, final_rows(&m, &p, batch, &clean, false)?, final_rows(&m, &p, batch, experiments, false)?);
+        let mut moved = ndarray::Array2::zeros((pe.iter().map(ndarray::Array2::nrows).sum(), BlockEngine::width(&p)));
+        let mut at = 0;
+        for (i, e) in experiments.iter().enumerate() {
+            let rows = pe[i].nrows();
+            let tail = ndarray::s![e.position.., ..];
+            let h = &m0[i].slice(tail) + &pe[i] - &p0[i].slice(tail);
+            moved.slice_mut(ndarray::s![at..at + rows, ..]).assign(&h);
+            at += rows;
+        }
+        let hidden = d.upload(moved.view()).map_err(error)?;
+        let mut mu = d.zeros(hidden.rows(), hidden.cols()).map_err(error)?;
+        let (mut entropy, mut at) = (Vec::with_capacity(hidden.rows()), 0);
+        for (r, t) in pe.iter().zip(&targets.rows) {
+            d.set_rows(&mut mu, at, &t.mu).map_err(error)?;
+            entropy.extend_from_slice(&t.entropy);
+            at += r.nrows();
+        }
+        let target = Target { mu: Arc::new(mu), entropy, head: Arc::clone(&self.head.head), scored: None };
+        let (nats, _, _) = self.head.resident.score(d, &hidden, &target, false, None, p.arithmetic())?;
+        let mut out = Vec::with_capacity(experiments.len());
+        let mut at = 0;
+        for r in &pe {
+            out.push(nats[at..at + r.nrows()].iter().map(|v| v / std::f64::consts::LN_2).collect());
+            at += r.nrows();
+        }
+        Ok(out)
+    }
+}
+
+/// Per experiment, the final hidden rows of its base's path from its position on (on the host):
+/// `M` alone when `alone`, else the experiment's hybrid of `P` and `M` with its edits.
+fn final_rows<E: BlockEngine>(m: &E, p: &E, batch: &Batch, experiments: &[Experiment], alone: bool) -> Result<Vec<ndarray::Array2<f64>>, String> {
+    let d = p.device();
+    let blocks = p.blocks();
+    let native = vec![false; blocks];
+    let engine = if alone { m } else { p };
+    let (paths, bases) = paths(batch, experiments, engine.values(), engine_heads(engine), alone.then_some(native.as_slice()), blocks)?;
+    let plan = Plan::new(paths, batch.length);
+    let (stream, _) = run([engine, m], &plan, false)?;
+    outputs(&plan, &bases, experiments).iter().map(|r| d.download(&d.rows_of(&stream, r.start, r.len()).map_err(error)?).map_err(error)).collect()
 }
 
 #[cfg(test)]
@@ -3536,6 +3591,48 @@ mod tests {
         assert!((projected - along).abs() <= 1e-10 * projected.abs().max(along.abs()), "tangent pass {projected}, reverse pass {along}");
     }
 
+
+    /// The response diagnostic ([`Interchange::response`]) on the tiny Qwen3 export's scoped
+    /// starting library with its MLPs perturbed (so `P` differs from `M`): with `P` applying no edit,
+    /// `q_e = q_0`, so `p̃_e = p_0` and the diagnostic is the edit's effect `KL(p_e ‖ p_0)`, which a
+    /// reference with `P` = `M` unedited scores as its gap (1e-9); applying the edit, it differs.
+    #[test]
+    fn the_response_diagnostic_of_an_unedited_explanation_is_the_edits_effect() {
+        use rand::RngExt;
+        let dir = crate::test_support::tiny_qwen3_export("interchange_response", 2);
+        let imported = import_language_model(&dir, 6, 12).expect("the tiny export imports");
+        std::fs::remove_dir_all(dir).expect("the tiny export is removed");
+        let native = split_sites(&imported.program).expect("the native sites");
+        let layers = layer_nodes(&native, 2).expect("the layers");
+        let explanation = library_mdl::scoped(&library_mdl::explanation(&native, &layers).expect("the library"), &[1, 3]).expect("scoped");
+        let SlotValues::Tokens(tokens) = &imported.family.slots[0] else { panic!("a token slot") };
+        let sequences: Vec<Vec<u32>> = tokens.chunks(12).map(<[u32]>::to_vec).collect();
+        let device = Device::host();
+        let blocks: Vec<LayerNodes> = explanation.layers.iter().map(|l| l.sites.clone()).collect();
+        let variables = reads(&native, &blocks).expect("the reads");
+        let mut ic = Interchange::new(&device, &native, &blocks, &explanation.artifact, &explanation.trainable, variables.clone(), 1 << 30, 64).expect("the experiments");
+        let mut rng = StdRng::seed_from_u64(43);
+        let program = &explanation.artifact.program;
+        let perturbed: Vec<ndarray::Array2<f64>> = explanation.trainable.iter().map(|op| program.operators[*op].matrix().mapv(|v| v * (1.0 + 0.3 * (rng.random::<f64>() - 0.5)))).collect();
+        ic.load(&perturbed).expect("a P that differs from M");
+        let batch = Batch::new(sequences[..3].to_vec(), sequences[3..6].to_vec()).expect("the batch");
+        let op = |site: SharedSite, operation: Operation, onward: bool| SiteOp { site, operation, onward };
+        let experiments = vec![
+            Experiment { base: 0, source: 1, explained: vec![true; 4], patch: Some(Patch::Ops { family: Family::Scale, ops: vec![op(SharedSite::Mlp(0), Operation::Scale(3), true)] }), position: 2 },
+            Experiment { base: 1, source: 2, explained: vec![false, true, false, true], patch: Some(Patch::Ops { family: Family::Swap, ops: vec![op(SharedSite::Stream(0), Operation::Swap, false)] }), position: 4 },
+        ];
+        let edited = ic.response(&batch, &experiments).expect("the response");
+        ic.unedited_explanation();
+        let unedited = ic.response(&batch, &experiments).expect("the response");
+        let mut reference = Interchange::new(&device, &native, &blocks, &Artifact::native(&native).expect("M"), &[], variables, 1 << 30, 64).expect("the reference");
+        reference.unedited_explanation();
+        let effect = reference.evaluate(&batch, &experiments, false).expect("the effect").bits;
+        for (a, b) in unedited.iter().flatten().zip(effect.iter().flatten()) {
+            assert!((a - b).abs() <= 1e-9 * b.abs().max(1.0), "unedited P: the diagnostic {a}, the effect {b}");
+        }
+        let (sum_edited, sum_unedited): (f64, f64) = (edited.iter().flatten().sum(), unedited.iter().flatten().sum());
+        assert!(sum_unedited > 1e-6 && (sum_edited - sum_unedited).abs() > 1e-6, "the edit moves M ({sum_unedited}) and P's response changes the diagnostic ({sum_edited})");
+    }
 
     /// Swaps and cuts take the donor's values from each model's own run of the donor, never `M`'s:
     /// with `P` the scoped starting library of the tiny Qwen3 export with its MLPs perturbed (so `P`
