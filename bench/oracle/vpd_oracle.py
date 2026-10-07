@@ -589,7 +589,7 @@ class Oracle(torch.nn.Module):
 
         inner = self.model.get_base_model()
         self.model = PeftModel.from_pretrained(inner, str(run / "adapter"), is_trainable=True)
-        state = torch.load(run / "maps.pt")
+        state = torch.load(run / "maps.pt", map_location=self.dev)  # a run trained on CUDA, read anywhere
         # A VPD run read on a library: maps of kinds it lacks, or of another width (another model), start fresh.
         own = self.maps.state_dict()
         maps = {k: v for k, v in state["maps"].items() if k in own and own[k].shape == v.shape}
