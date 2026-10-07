@@ -2747,7 +2747,7 @@ pub fn vpd_site_edits(
 /// VPD's three forms against adversarial pushes ([`crate::adversary`]), searched as the edits
 /// driver searches them against an explanation: per search a sequence of `rows`, a stream site, a
 /// row and a starting direction from `seed` alone (`adversary::draw`, the same for every
-/// explanation), then per form the ascent (`adversary::ascend`, at most `steps` steps of `probes`
+/// explanation), then per form the ascent (`adversary::ascend`, exactly `steps` steps of `probes`
 /// probes) of the form's gap `KL(M_e ‖ VPD_e)` (bits per token from the row on) over the direction
 /// of a push of one typical norm (`typical`, the manifest's) at that site and row alone, applied
 /// verbatim to `M` and to the form, whose masks are recomputed under each push; every step's
@@ -2813,7 +2813,7 @@ pub fn vpd_adversarial(
                 "sequence": draw.sequence, "site": draw.site, "position": draw.position, "clean_bits_per_token": clean,
                 "random_bits_per_token": start, "adversarial_bits_per_token": end,
                 "random_excess_bits_per_token": start - clean, "adversarial_excess_bits_per_token": end - clean,
-                "effect_bits_per_token": effect, "steps": found.path.len() - 1, "saturated": found.saturated, "path": found.path,
+                "effect_bits_per_token": effect, "steps": found.path.len() - 1, "saturated": found.saturated, "path": found.path, "excess_path": found.excess,
             }));
         }
     }

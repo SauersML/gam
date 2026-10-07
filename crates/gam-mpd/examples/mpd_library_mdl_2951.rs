@@ -255,9 +255,9 @@ struct EditSettings {
     adversarial: Option<AdversarialSettings>,
 }
 
-/// Adversarial pushes (`EditSettings::adversarial`): `searches` of them, each of at most `steps`
-/// steps (it stops earlier once the gap saturates, `adversary::ascend`) estimating the gradient from
-/// `probes` directions.
+/// Adversarial pushes (`EditSettings::adversarial`): `searches` of them, each of `steps` steps
+/// (the same for every explanation, `adversary::ascend`) estimating the gradient from `probes`
+/// directions.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AdversarialSettings {
@@ -852,7 +852,7 @@ fn adversarial_search(experiments: &mut interchange::Interchange, rows: &[Vec<u3
             "sequence": d.sequence, "site": d.site, "position": d.position, "clean_bits_per_token": clean,
             "random_bits_per_token": start, "adversarial_bits_per_token": end,
             "random_excess_bits_per_token": start - clean, "adversarial_excess_bits_per_token": end - clean,
-            "steps": found.path.len() - 1, "saturated": found.saturated, "path": found.path,
+            "steps": found.path.len() - 1, "saturated": found.saturated, "path": found.path, "excess_path": found.excess,
         }));
         finals.push((d.sequence, d.site, d.position, found.direction));
     }

@@ -10,9 +10,10 @@
 //! π/4 and π/2 (the finer turns let it close in where the estimate's direction is noisy),
 //! kept only where the gap rises. The caller scores candidates (each one experiment, run through
 //! both models' own forward passes), so the search serves any explanation the caller can score.
-//! It stops when the gain over the last three steps is below 1% of the gap's excess over the
-//! explanation's clean error on the same rows (what the edit adds; the clean error itself can be
-//! many times larger and would stop the search before it starts), or after its steps.
+//! Every search takes the same number of steps whatever the explanation, so explanations compare at
+//! an equal search effort (a stopping rule measured against the gap stopped searches sooner on
+//! explanations with larger clean error), and the gap's excess over the explanation's clean error
+//! on the same rows is reported at every step.
 
 use crate::interchange::SharedSite;
 use rand::{RngExt, SeedableRng, rngs::StdRng};
@@ -30,11 +31,14 @@ pub struct Draw {
     pub start: Vec<f64>,
 }
 
-/// One search's outcome: the gap along the ascent (the start's first), the found direction, and
-/// whether it stopped by saturation rather than by its step count.
+/// One search's outcome: the gap after each step (the start's first, one entry per step after it),
+/// its excess over the clean error at each step, the found direction, and whether the gradient
+/// vanished (the gap flat along every probe, as for an explanation equal to `M`), from which step on
+/// the search stays where it is.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Found {
     pub path: Vec<f64>,
+    pub excess: Vec<f64>,
     pub direction: Vec<f64>,
     pub saturated: bool,
 }
@@ -74,9 +78,9 @@ pub fn draw(seed: u64, searches: usize, sequences: usize, length: usize, blocks:
         .collect())
 }
 
-/// The ascent of search `index` (its probes drawn from `seed` and `index` alone) from `start`, at
-/// most `steps` steps of `probes` probes, `score` giving the gap of each candidate direction and
-/// `clean` the explanation's clean error on the same rows (the gap with no edit).
+/// The ascent of search `index` (its probes drawn from `seed` and `index` alone) from `start`,
+/// `steps` steps of `probes` probes, `score` giving the gap of each candidate direction and `clean`
+/// the explanation's clean error on the same rows (the gap with no edit).
 pub fn ascend(seed: u64, index: usize, start: &[f64], (steps, probes): (usize, usize), clean: f64, mut score: impl FnMut(Vec<Vec<f64>>) -> Result<Vec<f64>, String>) -> Result<Found, String> {
     let mut rng = StdRng::seed_from_u64(seed ^ 0x5052_4f42_4553 ^ (index as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15));
     let width = start.len();
@@ -98,8 +102,9 @@ pub fn ascend(seed: u64, index: usize, start: &[f64], (steps, probes): (usize, u
             g.iter_mut().zip(u).for_each(|(gk, uk)| *gk += slope * uk);
         }
         if g.iter().all(|v| *v == 0.0) {
-            path.push(current);
-            return Ok(Found { path, direction: theta, saturated: true });
+            path.resize(steps + 1, current);
+            let excess = path.iter().map(|g| g - clean).collect();
+            return Ok(Found { path, excess, direction: theta, saturated: true });
         }
         let ascent = unit(g);
         let turns: Vec<Vec<f64>> = [64.0, 32.0, 16.0, 8.0, 4.0, 2.0].iter().map(|k| turn(&theta, &ascent, std::f64::consts::PI / k)).collect();
@@ -111,11 +116,9 @@ pub fn ascend(seed: u64, index: usize, start: &[f64], (steps, probes): (usize, u
             current = value;
         }
         path.push(current);
-        if path.len() > 3 && current - path[path.len() - 4] < 0.01 * (current - clean).abs() {
-            return Ok(Found { path, direction: theta, saturated: true });
-        }
     }
-    Ok(Found { path, direction: theta, saturated: false })
+    let excess = path.iter().map(|g| g - clean).collect();
+    Ok(Found { path, excess, direction: theta, saturated: false })
 }
 
 #[cfg(test)]
@@ -123,16 +126,23 @@ mod tests {
     use super::*;
 
     /// On a gap with one maximum on the sphere, `f(θ) = 1 + θ·a` (`a` a unit vector), the ascent
-    /// climbs from a random start to within 2% of the maximum 2 (at 29eb5a0706, with turns no finer
-    /// than π/16, it stopped at 1.963), never falls, and its draws are the same for the same seed.
+    /// takes exactly its steps, climbs from a random start to within 2% of the maximum 2 (at
+    /// 29eb5a0706, with turns no finer than π/16, it stopped at 1.963), never falls, reports the
+    /// excess over the clean error at every step, and its draws are the same for the same seed. On a
+    /// flat gap (an explanation equal to `M`) it reports the vanished gradient and the same number of
+    /// steps.
     #[test]
     fn the_ascent_climbs_a_smooth_gap_to_its_maximum() {
         let width = 32;
         let a = unit((0..width).map(|i| (i as f64 * 0.7).sin()).collect());
         let draws = draw(5, 2, 3, 10, 4, width).expect("draws");
         assert_eq!(draws, draw(5, 2, 3, 10, 4, width).expect("draws"));
-        let found = ascend(5, 0, &draws[0].start, (60, 8), 0.0, |candidates| Ok(candidates.iter().map(|t| 1.0 + t.iter().zip(&a).map(|(x, y)| x * y).sum::<f64>()).collect())).expect("the ascent");
+        let found = ascend(5, 0, &draws[0].start, (60, 8), 0.5, |candidates| Ok(candidates.iter().map(|t| 1.0 + t.iter().zip(&a).map(|(x, y)| x * y).sum::<f64>()).collect())).expect("the ascent");
+        assert_eq!(found.path.len(), 61, "every search takes its steps");
         assert!(found.path.windows(2).all(|w| w[1] >= w[0]), "the gap never falls: {:?}", found.path);
         assert!(*found.path.last().expect("a path") > 0.98 * 2.0, "the ascent reaches {:?}", found.path.last());
+        assert!(found.path.iter().zip(&found.excess).all(|(g, e)| (g - 0.5 - e).abs() < 1e-15), "the excess is the gap less the clean error");
+        let flat = ascend(5, 1, &draws[1].start, (12, 4), 0.0, |candidates| Ok(vec![0.0; candidates.len()])).expect("the ascent");
+        assert!(flat.saturated && flat.path.len() == 13 && flat.excess.iter().all(|e| *e == 0.0), "a flat gap: {flat:?}");
     }
 }
