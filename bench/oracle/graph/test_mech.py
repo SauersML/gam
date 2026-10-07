@@ -105,6 +105,8 @@ def test_sandbox():
     assert "not allowed" in invalid("while True:\n    pass\n")
     assert "time limit" in invalid("for i in range(10 ** 12):\n    pass\n", sandboxed=True)
     assert "time limit" in invalid("x = 10\ny = x ** x ** x ** x\n", sandboxed=True)
+    assert "memory limit" in invalid("n = 10 ** 10\nx = [0] * n\n", sandboxed=True)
+    assert "memory limit" in invalid("n = 10 ** 9\nx = list(range(n))\n", sandboxed=True)
 
 
 def test_code_length():

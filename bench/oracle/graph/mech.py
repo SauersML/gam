@@ -536,36 +536,73 @@ def _validate(program: _Program, namespace: dict, ir: dict) -> None:
                    for e in program.edges.values()]
 
 
+MEMORY = 1 << 30  # bytes a traced program may use
+
+
 def _limit(seconds: float) -> None:
     import resource
 
     resource.setrlimit(resource.RLIMIT_CPU, (int(seconds) + 1, int(seconds) + 2))
     try:
-        resource.setrlimit(resource.RLIMIT_AS, (4 << 30, 4 << 30))
+        resource.setrlimit(resource.RLIMIT_AS, (MEMORY + (1 << 30), MEMORY + (1 << 30)))
     except (ValueError, OSError):
-        pass  # macOS does not enforce address-space limits
+        pass  # macOS does not enforce address-space limits; trace() watches the footprint instead
+
+
+def _footprint(pid: int) -> int:
+    """macOS: the process's physical footprint (rusage_info_v2 ri_phys_footprint), 0 if unknown."""
+    import ctypes
+    import ctypes.util
+    import struct
+
+    buf = ctypes.create_string_buffer(256)
+    if ctypes.CDLL(ctypes.util.find_library("c")).proc_pid_rusage(pid, 2, buf) != 0:
+        return 0
+    return struct.unpack_from("Q", buf.raw, 72)[0]
 
 
 def trace(source: str, model: str, timeout: float = 10.0) -> dict:
     """Checks and runs `source` in a sandboxed child process (restricted names and builtins, CPU and
     memory limits, a wall-clock timeout) -> IR dict (design.txt section 5)."""
+    import threading
+    import time
+
+    # -S: no site hooks (the research venv's reserves ledger memory per script); mech needs only the stdlib
+    child = subprocess.Popen([sys.executable, "-I", "-S", str(Path(__file__).resolve()), "trace", "--model", model,
+                              "--timeout", str(timeout)],
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    over = threading.Event()
+
+    def watch():  # RLIMIT_AS is not enforced on macOS: kill the child when its footprint passes MEMORY
+        while child.poll() is None:
+            if _footprint(child.pid) > MEMORY:
+                over.set()
+                child.kill()
+                return
+            time.sleep(0.005)
+
+    if sys.platform == "darwin":
+        threading.Thread(target=watch, daemon=True).start()
     try:
-        done = subprocess.run([sys.executable, "-I", str(Path(__file__).resolve()), "trace", "--model", model,
-                               "--timeout", str(timeout)],
-                              input=source, capture_output=True, text=True, timeout=timeout + 5)
-        if done.returncode == 0:
-            return json.loads(done.stdout)
-        if done.returncode in (-signal.SIGXCPU, -signal.SIGKILL):
-            raise subprocess.TimeoutExpired(done.args, timeout)
-        error = f"the program crashed the tracer (exit {done.returncode}): {done.stderr.strip()[-300:]}"
+        stdout, stderr = child.communicate(source, timeout=timeout + 5)
+        if child.returncode == 0:
+            return json.loads(stdout)
+        if over.is_set() or child.returncode == -signal.SIGKILL:
+            error = f"memory limit of {MEMORY >> 20} MiB exceeded"
+        elif child.returncode == -signal.SIGXCPU:
+            error = f"time limit of {timeout} s CPU exceeded"
+        else:
+            error = f"the program crashed the tracer (exit {child.returncode}): {stderr.strip()[-300:]}"
     except subprocess.TimeoutExpired:
-        error = f"time limit of {timeout} s CPU exceeded"
-    ir = trace_inline("", model) if model in MODELS else {"model": model, "nodes": [], "edges": []}
+        child.kill()
+        child.communicate()
+        error = f"time limit of {timeout} s exceeded"
+    ir = {"model": model}
     try:
         tokens, types = code_length(source)
     except (SyntaxError, tokenize.TokenError, IndentationError):
         tokens, types = 0, 0
-    ir.update(source=source, valid=False, error=error, python_tokens=tokens, token_types=types, nodes=[], edges=[])
+    ir.update(nodes=[], edges=[], python_tokens=tokens, token_types=types, source=source, valid=False, error=error)
     return ir
 
 
