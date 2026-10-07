@@ -12,7 +12,6 @@ dicts in design.txt section 5's format ({"total_bits", "exec_error_bits", "reade
 
 from __future__ import annotations
 
-import ast
 import math
 import sys
 from pathlib import Path
@@ -24,34 +23,19 @@ MOCK_EMPTY_BITS = 1.0e4
 
 
 def mock(items: list[dict]) -> list[dict]:
-    try:
-        import mech
+    from concurrent.futures import ThreadPoolExecutor
 
-        trace = mech.trace
-    except ImportError:
-        trace = None
-    if trace is not None:  # each trace is a sandboxed child process
-        from concurrent.futures import ThreadPoolExecutor
+    import mech
 
-        with ThreadPoolExecutor(8) as ex:
-            irs = list(ex.map(lambda it: trace(it["source"], it["behavior"]["model"]), items))
+    with ThreadPoolExecutor(8) as ex:  # each trace is a sandboxed child process
+        irs = list(ex.map(lambda it: mech.trace(it["source"], it["behavior"]["model"]), items))
     out = []
-    for k, it in enumerate(items):
-        source = it["source"]
-        if trace is not None:
-            ir = irs[k]
-            valid, error, tokens, types = ir["valid"], ir.get("error"), ir.get("python_tokens", 0), ir.get("token_types", 1)
-        else:  # mech.py has not landed: parseability only
-            try:
-                ast.parse(source)
-                valid, error = True, None
-            except SyntaxError as e:
-                valid, error = False, f"SyntaxError: {e}"
-            tokens, types = len(source.split()), 256
+    for ir in irs:
+        valid, error, tokens, types = ir["valid"], ir.get("error"), ir.get("python_tokens", 0), ir.get("token_types", 1)
         code = tokens * math.log2(max(types, 2)) if valid else 0.0
         out.append({"total_bits": code if valid else MOCK_EMPTY_BITS, "exec_error_bits": 0.0 if valid else MOCK_EMPTY_BITS, "reader_error_bits": 0.0,
                     "code_bits": code, "python_tokens": tokens if valid else 0, "opaque_numbers": 0, "opaque_bits": 0.0, "valid": valid, "error": error,
-                    "scorer": "mock" if trace is not None else "mock-ast"})
+                    "scorer": "mock"})
     return out
 
 

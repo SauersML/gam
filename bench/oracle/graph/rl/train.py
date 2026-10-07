@@ -3,7 +3,7 @@
 Each step takes K behaviors from the train split. For each, the oracle's input (prompt.py's render, as a
 Qwen3 chat user turn, thinking off) gets N programs sampled at temperature 1: by vLLM serving the
 current LoRA adapter when it is installed (a GPU), by transformers' generate otherwise. A program is
-the first fenced code block of the reply (the whole reply when there is none). scorer.py scores every
+prompt.program_of(reply): the last fenced python block that parses, else the reply. scorer.py scores every
 program: S = total bits (lower is better). One update follows, by --mode:
 
   bestofn  SFT on each behavior's best valid program (lowest S):
@@ -41,7 +41,6 @@ from __future__ import annotations
 import argparse
 import json
 import random
-import re
 import sys
 import time
 from pathlib import Path
@@ -52,28 +51,11 @@ import torch
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent))
+import prompt  # noqa: E402
+from prompt import program_of, render  # noqa: E402
 from scorer import SCORERS  # noqa: E402
 
 BEHAVIORS = Path.home() / "mpd-data/graph_oracle/behaviors"
-
-
-def render(behavior: dict) -> str:
-    try:
-        import prompt
-    except ImportError:  # prompt.py has not landed: mech's own reference, the description and examples
-        import mech
-
-        lines = [mech.__doc__.split("trace(source")[0], f"Target model: {behavior['model']}. Behavior: {behavior['description']}", "Example prompts:"]
-        lines += [f"- {p['text']!r}" for p in behavior["prompts"][:4]]
-        lines.append("Write one Python program using only `from mech import ...` that explains how the model produces this behavior.")
-        return "\n".join(lines)
-    return prompt.render(behavior)
-
-
-def program_of(text: str) -> str:
-    text = re.sub(r"<think>.*?</think>", "", text, flags=re.S)
-    m = re.search(r"```(?:python)?\n(.*?)(?:```|$)", text, flags=re.S)
-    return (m.group(1) if m else text).strip() + "\n"
 
 
 def behaviors(root: Path, model: str, split: str) -> list[dict]:
