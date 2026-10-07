@@ -21,5 +21,5 @@ py=$HOME/rl-venv/bin/python
         ~/.local/bin/uv pip install -q --python "$py" "vllm==0.10.2" "transformers>=4.56,<5" "peft==0.21.2" "accelerate==1.15.0" numpy
     fi
 ) 9> "$HOME/.rl-venv.lock"
-export VLLM_WORKER_MULTIPROC_METHOD=spawn TOKENIZERS_PARALLELISM=false
+export TOKENIZERS_PARALLELISM=false
 exec "$py" "$here/train.py" "$@"
