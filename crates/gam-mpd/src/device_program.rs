@@ -58,6 +58,10 @@ enum Held {
     Dense(Tensor),
     /// `left` (rows × r) and `right` (r × cols).
     LowRank(Tensor, Tensor),
+    /// A selection: each row `i` of the operator one 1 at column `ids[i]` (distinct) and zeros
+    /// elsewhere, so a product `x Aᵀ` is `x`'s columns `ids` and a cotangent's pull `g A` adds
+    /// `g`'s columns into columns `ids` (library_vpd's per-head and per-gate selections).
+    Selection(Indices),
     Table(Tensor),
     Column(Tensor),
 }
@@ -81,18 +85,43 @@ fn hold(device: &Device, op: &Operator, role: Role) -> Result<Held, String> {
             OperatorBody::LowRank { left, right, .. } => Held::LowRank(device.upload(left.view()).map_err(error)?, device.upload(right.view()).map_err(error)?),
             OperatorBody::Dense { values, .. } => match op.diagonal() {
                 Some(d) => Held::Diagonal(device.upload_vec(1, d.len(), d.to_vec()).map_err(error)?),
-                // Stored reals go to an f32 device as the f32 values they are, never widened on
-                // the host; others as their float64 values.
-                None => Held::Dense(
-                    match values.stored().filter(|_| device.storage() == Storage::F32).and_then(crate::safetensors::Stored::f32_values) {
-                        Some(f32s) => device.upload_f32(values.shape().0, values.shape().1, &f32s),
-                        None => device.upload(values.matrix().view()),
-                    }
-                    .map_err(error)?,
-                ),
+                None => match values.stored().is_none().then(|| selection(&values.matrix())).flatten() {
+                    Some(ids) => Held::Selection(device.upload_indices(&ids).map_err(error)?),
+                    // Stored reals go to an f32 device as the f32 values they are, never widened on
+                    // the host; others as their float64 values.
+                    None => Held::Dense(
+                        match values.stored().filter(|_| device.storage() == Storage::F32).and_then(crate::safetensors::Stored::f32_values) {
+                            Some(f32s) => device.upload_f32(values.shape().0, values.shape().1, &f32s),
+                            None => device.upload(values.matrix().view()),
+                        }
+                        .map_err(error)?,
+                    ),
+                },
             },
         },
     })
+}
+
+/// The column of each row's single 1 when every row of `a` has exactly one entry 1 and zeros
+/// elsewhere and no two rows pick the same column (`Held::Selection`); `None` otherwise. Most
+/// operators fail on their first entry.
+fn selection(a: &Array2<f64>) -> Option<Vec<u32>> {
+    let mut picked = vec![false; a.ncols()];
+    let mut ids = Vec::with_capacity(a.nrows());
+    for row in a.rows() {
+        let mut one = None;
+        for (c, &v) in row.iter().enumerate() {
+            if v == 1.0 && one.is_none() && !picked[c] {
+                one = Some(c);
+            } else if v != 0.0 {
+                return None;
+            }
+        }
+        let c = one?;
+        picked[c] = true;
+        ids.push(u32::try_from(c).ok()?);
+    }
+    (!ids.is_empty()).then_some(ids)
 }
 
 /// How one node executes.
@@ -712,7 +741,7 @@ impl DeviceProgram {
         for held in self.operators.values() {
             if !seen.insert(Arc::as_ptr(&held.held) as usize) { continue; }
             let count = match &*held.held {
-                Held::Identity => 0,
+                Held::Identity | Held::Selection(_) => 0,
                 Held::Diagonal(t) | Held::Dense(t) | Held::Table(t) | Held::Column(t) => t.len(),
                 Held::LowRank(a, b) => a.len().checked_add(b.len()).ok_or("operator size overflow")?,
             };
@@ -1131,7 +1160,7 @@ impl DeviceProgram {
                     Held::Dense(value) => self.device.copy(value).map_err(error)?,
                     // Only a Dense literal's immutable diagonal fast path reaches
                     // here. Later replacements always materialize Held::Dense.
-                    Held::Diagonal(_) => self.device.upload(source.matrix_cow().view()).map_err(error)?,
+                    Held::Diagonal(_) | Held::Selection(_) => self.device.upload(source.matrix_cow().view()).map_err(error)?,
                     _ => return Err("device: unsupported trainable dense storage".into()),
                 }
             } else {
@@ -1425,6 +1454,8 @@ impl DeviceProgram {
         match self.held(op, Role::Product)? {
             Held::Identity => d.axpy(out, 1.0, x).map_err(error),
             Held::Diagonal(diag) => d.scale_columns(out, x, diag, true).map_err(error),
+            Held::Selection(ids) if transposed => d.scatter_columns(out, ids, x, true).map_err(error),
+            Held::Selection(ids) => d.axpy(out, 1.0, &d.gather_columns(x, ids).map_err(error)?).map_err(error),
             Held::Dense(a) => {
                 let rounded = self.rounded_operator(a, arithmetic)?;
                 d.gemm(out, 1.0, x, Op::N, rounded.as_deref().unwrap_or(a), if transposed { Op::N } else { Op::T }, 1.0, arithmetic).map_err(error)
@@ -1460,6 +1491,7 @@ impl DeviceProgram {
                 out
             }
             Held::Identity => d.scaled(1.0, x).map_err(error)?,
+            Held::Selection(ids) if !transposed => d.gather_columns(x, ids).map_err(error)?,
             _ => {
                 let mut out = d.zeros(rows, width).map_err(error)?;
                 self.add_product(&mut out, x, op, transposed, arithmetic)?;
@@ -2992,13 +3024,15 @@ impl DeviceProgram {
                 g[argument] = Some(d.scaled(1.0, cot).map_err(error)?);
                 return Ok(());
             }
-            g[argument] = Some(d.empty(rows, self.widths[argument]).map_err(error)?);
+            // A selection's pull writes only its columns: the others start at zero.
+            g[argument] = Some(if matches!(held, Held::Selection(_)) { d.zeros(rows, self.widths[argument]) } else { d.empty(rows, self.widths[argument]) }.map_err(error)?);
         }
         let beta = if fresh { 0.0 } else { 1.0 };
         let target = g[argument].as_mut().ok_or("device: cotangent slot")?;
         match held {
             Held::Identity => d.axpy(target, 1.0, cot).map_err(error),
             Held::Diagonal(diag) => d.scale_columns(target, cot, diag, !fresh).map_err(error),
+            Held::Selection(ids) => d.scatter_columns(target, ids, cot, true).map_err(error),
             Held::Dense(a) => {
                 let rounded = self.rounded_operator(a, arithmetic)?;
                 d.gemm(target, 1.0, self.operand(cot, half, arithmetic)?, Op::N, rounded.as_deref().unwrap_or(a), Op::N, beta, arithmetic).map_err(error)
@@ -4290,6 +4324,47 @@ mod gated_tests {
             for op in &trainable {
                 close(&program.operators[*op].name, &device.download(&gradients[op]).unwrap(), &device.download(&dense_gradients[op]).unwrap());
             }
+        }
+    }
+
+    /// A selection operator (each row one 1, at distinct columns) is held as one and runs as a gather
+    /// of its input's columns, its pull as a scatter: every device's output, input cotangent and the
+    /// next operator's gradient equal the host's.
+    #[test]
+    fn a_selection_is_a_gather_on_every_device() {
+        let mut rng = StdRng::seed_from_u64(4);
+        let rows = 5;
+        let picked = [4usize, 0, 2];
+        let dense = |name: &str, rows: Interface, cols: Interface, v: Array2<f64>| Arc::new(Operator::dense(name, rows, cols, v.clone(), exact_precision(v.iter().copied()).unwrap(), Default::default()).unwrap());
+        let operators = vec![
+            dense("S", Interface::native(3).unwrap(), Interface::native(D).unwrap(), Array2::from_shape_fn((3, D), |(i, c)| f64::from(u8::from(picked[i] == c)))),
+            dense("W", Interface::native(OUT).unwrap(), Interface::native(3).unwrap(), Array2::from_shape_fn((OUT, 3), |_| rng.random::<f64>() - 0.5)),
+        ];
+        let nodes = vec![Node::Raw { slot: 0 }, Node::Affine { terms: vec![(0, 0)], bias: None }, Node::Affine { terms: vec![(1, 1)], bias: None }];
+        let program = OperatorProgram { declarations: Declarations { domains: vec![], slots: vec![Slot::Raw { width: D }], parameters: 0 }, operators, bases: vec![], rules: vec![], nodes, output: 2 };
+        let family = FamilyInputs { rows, slots: vec![SlotValues::Raw(Array2::from_shape_fn((rows, D), |_| rng.random::<f64>() - 0.5))], layout: Some(SequenceLayout { sequence: vec![0; rows], position: (0..rows as u32).collect() }) };
+        let host = program.execute(&family, false).unwrap();
+        let seed = Array2::from_shape_fn((rows, OUT), |(i, j)| ((i * 3 + j) % 5) as f64 - 2.0);
+        let host_cot = crate::derivatives::vjp_seeded(&program, &family, &host, BTreeMap::from([(2, seed.clone())]), None).unwrap();
+        let host_gradient = seed.t().dot(&host.values[1]);
+        let mut devices = crate::device_program_tests::devices();
+        devices.extend(Device::single_precision(gam_gpu::GpuPolicy::Auto).unwrap());
+        for device in &devices {
+            let (tolerance, arithmetic) = if device.float64() { (1e-12, Arithmetic::F64) } else { (1e-5, Arithmetic::F32) };
+            let close = |what: &str, got: &Array2<f64>, want: &Array2<f64>| {
+                let scale = want.iter().fold(1.0_f64, |m, v| m.max(v.abs()));
+                let err = (got - want).iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+                assert!(err <= tolerance * scale, "{}: {what} differs by {err}", device.name());
+            };
+            let mut lowered = DeviceProgram::compile_values(device, &program).unwrap();
+            lowered.set_arithmetic(arithmetic);
+            assert!(matches!(lowered.held(0, Role::Product), Ok(Held::Selection(_))), "{}: the selection is held as one", device.name());
+            let trace = lowered.forward(&family).unwrap();
+            close("the selected columns", &device.download(trace.value(1).unwrap()).unwrap(), &host.values[1]);
+            close("the output", &device.download(trace.value(2).unwrap()).unwrap(), &host.values[2]);
+            let (nodes, gradients) = lowered.vjp_values_dense(&trace, BTreeMap::from([(2, device.upload(seed.view()).unwrap())]), &[0], &[1], arithmetic).unwrap();
+            close("the input's cotangent", &device.download(&nodes[&0]).unwrap(), host_cot[0].as_ref().unwrap());
+            close("W's gradient", &device.download(&gradients[&1]).unwrap(), &host_gradient);
         }
     }
 
