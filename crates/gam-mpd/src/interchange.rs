@@ -3212,11 +3212,19 @@ impl Interchange {
     /// (`h_{P,e} − h_{P,0} = h_{M,e} − h_{M,0}`) whatever `P`'s clean error, which the gap
     /// `KL(p_e ‖ q_e)` also counts.
     pub fn response(&self, batch: &Batch, experiments: &[Experiment]) -> Result<Vec<Vec<f64>>, String> {
+        self.response_from(self, batch, experiments)
+    }
+
+    /// [`Interchange::response`] where the edit is compiled into this interchange's models (a native
+    /// weight edit, `weight_edit::compile`) and `clean` holds the models before it: the clean runs
+    /// `p_0` and `q_0` are `clean`'s, the edited ones this interchange's.
+    pub fn response_from(&self, clean: &Interchange, batch: &Batch, experiments: &[Experiment]) -> Result<Vec<Vec<f64>>, String> {
         let (m, p) = self.models();
+        let (m_clean, p_clean) = clean.models();
         let d = p.device();
-        let clean: Vec<Experiment> = experiments.iter().map(|e| Experiment { base: e.base, source: e.base, explained: e.explained.clone(), patch: None, position: 0 }).collect();
+        let unedited: Vec<Experiment> = experiments.iter().map(|e| Experiment { base: e.base, source: e.base, explained: e.explained.clone(), patch: None, position: 0 }).collect();
         let targets = self.targets(batch, experiments)?;
-        let (m0, p0, pe) = (final_rows(&m, &p, batch, &clean, true)?, final_rows(&m, &p, batch, &clean, false)?, final_rows(&m, &p, batch, experiments, false)?);
+        let (m0, p0, pe) = (final_rows(&m_clean, &p_clean, batch, &unedited, true)?, final_rows(&m_clean, &p_clean, batch, &unedited, false)?, final_rows(&m, &p, batch, experiments, false)?);
         let mut moved = ndarray::Array2::zeros((pe.iter().map(ndarray::Array2::nrows).sum(), BlockEngine::width(&p)));
         let mut at = 0;
         for (i, e) in experiments.iter().enumerate() {

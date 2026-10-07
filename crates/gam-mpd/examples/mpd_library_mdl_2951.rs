@@ -39,7 +39,9 @@
 //! response to the edit, zero where `P` responds as `M` does whatever its clean error; `p` = `M`,
 //! `q` = `P`, `0` clean, `e` edited), and the gaps again in bins of the
 //! effect at the edited token (`by_effect`: below 0.01, 0.01–0.1, 0.1–1 and above 1 bits), so a
-//! comparison can rest on the edits that change `M`. The experiments are an immutable manifest
+//! comparison can rest on the edits that change `M`. With `weights`, native weight edits of `M`'s
+//! maps follow (`weight_faithfulness`), compiled into `M` and into `P` through `P`'s owners
+//! (`gam_mpd::weight_edit`), reported under `weights`. The experiments are an immutable manifest
 //! (`Manifest`, `EditSettings::manifest`): drawn and written once, then scored as written by any
 //! binary, so explanations compare on the manifest file's SHA-256 (`manifest.sha256` in the
 //! report).
@@ -239,6 +241,18 @@ struct EditSettings {
     /// `OUT/MANIFEST_{name}.json`, which must not exist yet.
     #[serde(default)]
     manifest: Option<String>,
+    /// Native weight edits of `M`'s maps, scored after the operations (`weight_faithfulness`).
+    #[serde(default)]
+    weights: Option<WeightFamily>,
+}
+
+/// Native weight edits (`EditSettings::weights`): `edits` of them, each drawn from the settings'
+/// seed and scored on the first `sequences` held-out sequences of the range.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WeightFamily {
+    edits: usize,
+    sequences: usize,
 }
 
 /// An immutable experiment manifest: what an edits score is a score of, so two explanations are
@@ -488,6 +502,14 @@ fn edit_faithfulness(
         }
     }
     std::fs::write(out.join(format!("EDITS_{}.experiments.jsonl", settings.name)), records).map_err(|e| e.to_string())?;
+    drop(reference);
+    let weights = match &settings.weights {
+        Some(family) => {
+            let rows = &held_out[first..end.min(first + family.sequences)];
+            Some(weight_faithfulness(device, (native, layers), (&artifact, &explanation.reads), rows, family, settings)?)
+        }
+        None => None,
+    };
     let summary = |values: &mut Vec<f64>| {
         values.sort_by(f64::total_cmp);
         let mean = values.iter().sum::<f64>() / values.len().max(1) as f64;
@@ -531,6 +553,7 @@ fn edit_faithfulness(
         "edits_per_sequence": settings.edits_per_sequence,
         "seed": settings.seed,
         "manifest": manifest,
+        "weights": weights,
         "device": device.name(),
         "source_revision": option_env!("GAM_BUILD_GIT_SHA"),
         "families": families,
@@ -538,6 +561,107 @@ fn edit_faithfulness(
     });
     log::info!("edits: {report}");
     save(&out.join(format!("EDITS_{}.json", settings.name)), &report)
+}
+
+/// Native weight edits of `M`'s maps (`EditSettings::weights`), compiled into `M` and into `P`
+/// (`weight_edit::compile`: `M` computes with `W + ΔW`, `P` with its decoded `W` plus `ΔW` through
+/// its owners), the same for every explanation: per edit one map of a layer (an operator of `M`
+/// whose name starts with `blocks.`, neither a vector nor a norm's diagonal), uniformly, and either
+/// `k = 2^u` of its rows or of its columns (`u` uniform in `0..=4`) scaled by a factor of `SCALES`,
+/// or a rank-one push `s ‖W‖_F / √min(r, c) · u vᵀ` with `u`, `v` seeded unit directions and `s`
+/// of `SIZES`. Each is scored on `rows` with `P` autonomous: the gap `KL(M_e ‖ P_e)`, the effect
+/// `KL(M_e ‖ M)`, the edit-ignoring baseline `KL(M_e ‖ P)` and the response diagnostic, in bits per
+/// token, with the share of the edit `P` took (`Compiled::owned`); an explanation holding no copy
+/// of the edited map counts it as not applicable.
+fn weight_faithfulness(
+    device: &Device,
+    (native, layers): (&OperatorProgram, &[LayerNodes]),
+    (artifact, reads): (&gam_mpd::artifact::Artifact, &[interchange::ReadVariable]),
+    rows: &[Vec<u32>],
+    family: &WeightFamily,
+    settings: &EditSettings,
+) -> Result<Value, String> {
+    let (seed, numeric_bytes) = (settings.seed, settings.numeric_bytes);
+    use rand::RngExt;
+    let started = Instant::now();
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed ^ 0x5745_4947_4854);
+    let pool: Vec<usize> = native.operators.iter().enumerate().filter(|(_, op)| op.name.starts_with("blocks.") && op.rows.width() > 1 && op.cols.width() > 1 && op.diagonal().is_none()).map(|(i, _)| i).collect();
+    if pool.is_empty() || rows.is_empty() {
+        return Err("edits: no map of M to edit or no rows to score".into());
+    }
+    let batch = interchange::Batch::new(rows.to_vec(), rows.to_vec())?;
+    let clean: Vec<interchange::Experiment> = (0..rows.len()).map(|base| interchange::Experiment { base, source: base, explained: vec![true; 2 * layers.len()], patch: None, position: 0 }).collect();
+    let interchange = |model: &OperatorProgram, explanation: &gam_mpd::artifact::Artifact| interchange::Interchange::new(device, model, layers, explanation, &[], reads.to_vec(), numeric_bytes, 256);
+    let unedited = interchange(native, artifact)?;
+    let mean = |bits: &[Vec<f64>]| bits.iter().flatten().sum::<f64>() / bits.iter().map(Vec::len).sum::<usize>().max(1) as f64;
+    let normal = |rng: &mut rand::rngs::StdRng, n: usize| -> Vec<f64> {
+        let v: Vec<f64> = (0..n)
+            .map(|_| {
+                let (a, b): (f64, f64) = (rng.random::<f64>().max(f64::MIN_POSITIVE), rng.random());
+                (-2.0 * a.ln()).sqrt() * (std::f64::consts::TAU * b).cos()
+            })
+            .collect();
+        let norm = v.iter().map(|x| x * x).sum::<f64>().sqrt();
+        v.into_iter().map(|x| x / norm).collect()
+    };
+    let mut records = Vec::new();
+    for i in 0..family.edits {
+        let op = &native.operators[pool[rng.random_range(0..pool.len())]];
+        let w = op.matrix();
+        let (r, c) = w.dim();
+        let (kind, delta) = if rng.random_range(0..2) == 0 {
+            let along_rows = rng.random_range(0..2) == 0;
+            let n = if along_rows { r } else { c };
+            let k = (1usize << rng.random_range(0..=4usize)).min(n);
+            let mut units: Vec<usize> = (0..n).collect();
+            for j in 0..k {
+                let t = rng.random_range(j..n);
+                units.swap(j, t);
+            }
+            units.truncate(k);
+            let alpha = interchange::SCALES[rng.random_range(0..interchange::SCALES.len())];
+            let mut delta = ndarray::Array2::zeros((r, c));
+            for u in units {
+                if along_rows {
+                    delta.row_mut(u).assign(&w.row(u).mapv(|v| v * (alpha - 1.0)));
+                } else {
+                    delta.column_mut(u).assign(&w.column(u).mapv(|v| v * (alpha - 1.0)));
+                }
+            }
+            (format!("{k} {} scaled by {alpha}", if along_rows { "rows" } else { "columns" }), delta)
+        } else {
+            let size = interchange::SIZES[rng.random_range(0..interchange::SIZES.len())];
+            let (u, v) = (normal(&mut rng, r), normal(&mut rng, c));
+            let scale = size * w.iter().map(|x| x * x).sum::<f64>().sqrt() / (r.min(c) as f64).sqrt();
+            (format!("rank one of size {size}"), ndarray::Array2::from_shape_fn((r, c), |(a, b)| scale * u[a] * v[b]))
+        };
+        let edit = gam_mpd::weight_edit::WeightEdit { native: op.name.clone(), delta };
+        let Some(compiled) = gam_mpd::weight_edit::compile(native, artifact, &[edit])? else {
+            records.push(json!({"operator": op.name, "kind": kind, "applicable": false}));
+            continue;
+        };
+        let edited = interchange(&compiled.model, &compiled.explanation)?;
+        let gap = edited.evaluate(&batch, &clean, false)?.bits;
+        let response = edited.response_from(&unedited, &batch, &clean)?;
+        drop(edited);
+        let ignoring = interchange(&compiled.model, artifact)?.evaluate(&batch, &clean, false)?.bits;
+        let effect = interchange(&compiled.model, &gam_mpd::artifact::Artifact::native(native)?)?.evaluate(&batch, &clean, false)?.bits;
+        let record = json!({
+            "operator": op.name, "kind": kind, "applicable": true, "owned": compiled.owned,
+            "mean_bits_per_token": mean(&gap), "effect_mean_bits_per_token": mean(&effect),
+            "ignoring_mean_bits_per_token": mean(&ignoring), "response_mean_bits_per_token": mean(&response),
+        });
+        log::info!("edits: weight edit {i} ({:.0} s): {record}", started.elapsed().as_secs_f64());
+        records.push(record);
+    }
+    let applicable: Vec<&Value> = records.iter().filter(|r| r["applicable"] == json!(true)).collect();
+    let average = |key: &str| applicable.iter().filter_map(|r| r[key].as_f64()).sum::<f64>() / applicable.len().max(1) as f64;
+    Ok(json!({
+        "edits": records.len(), "not_applicable": records.len() - applicable.len(), "sequences": rows.len(),
+        "mean_bits_per_token": average("mean_bits_per_token"), "effect_mean_bits_per_token": average("effect_mean_bits_per_token"),
+        "ignoring_mean_bits_per_token": average("ignoring_mean_bits_per_token"), "response_mean_bits_per_token": average("response_mean_bits_per_token"),
+        "records": records,
+    }))
 }
 
 fn save(path: &Path, value: &Value) -> Result<(), String> {
