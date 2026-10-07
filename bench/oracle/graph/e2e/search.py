@@ -292,7 +292,7 @@ def greedy(pool: Pool, model: str, mode: str, experiments: int, seed: int, min_n
 
 
 def prefix_search(pool: Pool, model: str, experiments: int, seed: int, block: int, log, rank_experiments: int = 0,
-                  checkpoint=None, objective=None, units=None, ranked=None, max_prune: int = 64) -> dict:
+                  checkpoint=None, objective=None, units=None, ranked=None, max_prune: int = 64, growth: float = 1.5) -> dict:
     """Measured ranking, then prefixes, then pruning, all exact through the checker:
     1. every unit alone (heads, MLP neuron blocks of `block`) as a one-node program: under counterfactual
        stand-ins this is the unit's activation patch from x into x', and the drop in KL on the clean and
@@ -320,7 +320,7 @@ def prefix_search(pool: Pool, model: str, experiments: int, seed: int, block: in
     ks, k = [], 1
     while k < len(ranked):
         ks.append(k)
-        k = max(k + 1, int(k * 1.5))
+        k = max(k + 1, int(k * growth))
     ks.append(len(ranked))
     # k = 0, the empty program, competes too: no prefix may be worse than declaring nothing
     ks = [0] + ks
@@ -375,6 +375,7 @@ def main() -> None:
     ap.add_argument("behavior", type=Path)
     ap.add_argument("--mode", default="both", choices=["addition", "removal", "both", "prefix"])
     ap.add_argument("--block", type=int, default=96, help="prefix mode: MLP neurons per unit")
+    ap.add_argument("--prefix-growth", type=float, default=1.5, help="prefix mode: ratio between successive prefix sizes")
     ap.add_argument("--max-prune", type=int, default=64, help="prefix mode: prune one unit at a time only up to this many units (else refine k)")
     ap.add_argument("--device", help="the checker's device (gpu: the single-precision device path)")
     ap.add_argument("--max-units", type=int, default=8192, help="prefix mode with --mlp-view vpd: the top ranked subcomponents considered")
@@ -436,7 +437,7 @@ def main() -> None:
                                                         else ranked_subcomponents(a.ranking) if a.mlp_view == "vpd"
                                                         else ranked_native(a.ranking, model))[: a.max_units]
                     found = prefix_search(pool, model, a.experiments, a.seed, a.block, log, a.rank_experiments, save,
-                                          objective_of(a.objective), ranked=ranked, max_prune=a.max_prune)
+                                          objective_of(a.objective), ranked=ranked, max_prune=a.max_prune, growth=a.prefix_growth)
                 else:
                     found = greedy(pool, model, mode, a.experiments, a.seed, a.min_neurons, log, start_units, a.mlp_view,
                                    save, objective_of(a.objective))

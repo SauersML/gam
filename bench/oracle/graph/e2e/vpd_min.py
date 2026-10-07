@@ -47,7 +47,8 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("behaviors", nargs="+")
     ap.add_argument("--model", default="vpd4l")
-    ap.add_argument("--budget", type=int, default=2048, help="the most parts a program may declare")
+    ap.add_argument("--budget", type=int, default=1024, help="the most parts a program may declare")
+    ap.add_argument("--growth", type=float, default=2.0, help="ratio between successive prefix sizes")
     ap.add_argument("--device")
     ap.add_argument("--experiments", type=int, default=16)
     ap.add_argument("--rankings", type=Path, default=DATA / "experiments/vpd_rankings")
@@ -64,7 +65,7 @@ def main() -> None:
         cmd = [sys.executable, str(HERE / "search.py"), str(DATA / f"behaviors/{a.model}/{b}.json"), "--mode", "prefix",
                "--ranking", str(a.rankings / f"{b}.json"), "--max-units", str(a.budget), "--objective", "fit",
                "--experiments", str(a.experiments), "--max-prune", "24", "--prompt-holdout", "4", "--vpd", str(a.vpd),
-               "--tag", "_vpd_min", "--out", str(work)]
+               "--prefix-growth", str(a.growth), "--tag", "_vpd_min", "--out", str(work)]
         cmd += ["--device", a.device] if a.device else []
         cmd += ["--export", str(a.export)] if a.export else []
         with open(work / f"{b}.stdout", "w") as log:

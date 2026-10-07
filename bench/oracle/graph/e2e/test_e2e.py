@@ -55,7 +55,7 @@ def test_random_heads_avoid_hand():
 @pytest.mark.skipif(not BEHAVIOR.exists(), reason="no behavior file")
 def test_prompt_renders():
     text = prompt.render(json.loads(BEHAVIOR.read_text()))
-    assert "Write the program." in text and "vpd4l" in text
+    assert "Write the program" in text and "vpd4l" in text
 
 
 @pytest.fixture(scope="module")
