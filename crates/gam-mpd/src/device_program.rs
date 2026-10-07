@@ -2548,7 +2548,10 @@ impl DeviceProgram {
                 Step::Gain { input, factor } => add(&mut g, *input, d.scaled(*factor, &cot).map_err(error)?)?,
                 Step::Head | Step::Feature { .. } | Step::Raw { .. } | Step::Constant { .. } => {}
                 Step::Affine { terms, .. } => {
-                    for (argument, operator) in terms {
+                    // The last term, when it is an identity's into a cotangent not yet made, takes
+                    // `cot` itself where nothing reads it after (this node unkept) in place of a copy.
+                    let mut moved = None;
+                    for (i, (argument, operator)) in terms.iter().enumerate() {
                         // A cotangent of the argument kept or edited is the dense one.
                         let observed = keep.contains(argument) || edited.contains(argument);
                         if needed[*argument] && !matches!(self.steps[*argument], Step::Feature { .. }) && let Some(term) = self.listed_pull(trace, (index, *argument, *operator), &cot, (observed, edited, &seeded))? {
@@ -2567,8 +2570,21 @@ impl DeviceProgram {
                                     d.scatter_columns(target, &ids, &part, true).map_err(error)?;
                                 }
                             }
+                            _ if i + 1 == terms.len()
+                                && !keep.contains(&index)
+                                && needed[*argument]
+                                && g[*argument].is_none()
+                                && !matches!(self.steps[*argument], Step::Feature { .. })
+                                && matches!(self.held(*operator, Role::Product), Ok(Held::Identity)) =>
+                            {
+                                moved = Some(*argument);
+                            }
                             _ => self.pull_term((&mut g, &needed), trace.rows, (&cot, &mut half), *argument, *operator, arithmetic)?,
                         }
+                    }
+                    if let Some(argument) = moved {
+                        g[argument] = Some(cot);
+                        continue;
                     }
                 }
                 Step::Transposed { input, operator } => {
@@ -2712,22 +2728,29 @@ impl DeviceProgram {
             }
             Step::Affine { terms, .. } => {
                 let round = |t: Tensor| if arithmetic == Arithmetic::Bf16 && t.storage() == Storage::F32 { d.bf16_copy(&t) } else { Ok(t) };
-                let c = round(d.copy(part).map_err(error)?).map_err(error)?;
+                // `part` as the products read it: rounded once in bfloat16, else itself.
+                let rounded = (arithmetic == Arithmetic::Bf16 && part.storage() == Storage::F32).then(|| d.bf16_copy(part)).transpose().map_err(error)?;
+                let c = rounded.as_ref().unwrap_or(part);
                 for (argument, operator) in terms {
                     if !needed[*argument] || matches!(self.steps[*argument], Step::Feature { .. }) {
                         continue;
                     }
-                    if g[*argument].is_none() {
-                        g[*argument] = Some(d.zeros(rows, self.widths[*argument]).map_err(error)?);
-                    }
                     match self.held(*operator, Role::Product)? {
                         Held::Dense(a) if a.storage() != Storage::Bf16 => {
+                            // A cotangent not yet made is written whole by the product (β = 0).
+                            let fresh = g[*argument].is_none();
                             if ids.is_empty() {
+                                if fresh {
+                                    g[*argument] = Some(d.zeros(rows, self.widths[*argument]).map_err(error)?);
+                                }
                                 continue;
+                            }
+                            if fresh {
+                                g[*argument] = Some(d.empty(rows, self.widths[*argument]).map_err(error)?);
                             }
                             let a = round(d.gather_rows(a, ids).map_err(error)?).map_err(error)?;
                             let target = g[*argument].as_mut().ok_or("device: cotangent slot")?;
-                            d.gemm(target, 1.0, &c, Op::N, &a, Op::N, 1.0, arithmetic).map_err(error)?;
+                            d.gemm(target, 1.0, c, Op::N, &a, Op::N, if fresh { 0.0 } else { 1.0 }, arithmetic).map_err(error)?;
                         }
                         _ => {
                             let dense = self.unpack(rows, index, ids, part)?;
@@ -3075,7 +3098,8 @@ impl DeviceProgram {
                 // A packed cotangent ([`Packed`]): only its columns' rows of the operators and of the
                 // bias have a gradient.
                 let d = &self.device;
-                let c = if arithmetic == Arithmetic::Bf16 && part.storage() == Storage::F32 { d.bf16_copy(part).map_err(error)? } else { d.copy(part).map_err(error)? };
+                let rounded = (arithmetic == Arithmetic::Bf16 && part.storage() == Storage::F32).then(|| d.bf16_copy(part)).transpose().map_err(error)?;
+                let c = rounded.as_ref().unwrap_or(part);
                 for (input, op) in terms {
                     let Some(storage) = gradients.values.get(op).map(Tensor::storage) else { continue };
                     if storage == Storage::Bf16 || matches!(self.steps[*input], Step::Feature { .. }) {
@@ -3087,14 +3111,14 @@ impl DeviceProgram {
                         let (gradient, _) = gradients.ready(d, *op, false)?.ok_or("device: a gradient slot")?;
                         let mut rows = d.empty(ids.len(), gradient.cols()).map_err(error)?;
                         let x = trace.rounded_value(*input, arithmetic)?;
-                        d.gemm(&mut rows, 1.0, &c, Op::T, x.as_deref().map_or(trace.value(*input), Ok)?, Op::N, 0.0, arithmetic).map_err(error)?;
+                        d.gemm(&mut rows, 1.0, c, Op::T, x.as_deref().map_or(trace.value(*input), Ok)?, Op::N, 0.0, arithmetic).map_err(error)?;
                         d.scatter_rows(gradient, ids, &rows, true).map_err(error)?;
                     }
                 }
                 if let Some(op) = bias.filter(|_| !ids.is_empty()) {
                     if let Some((gradient, _)) = gradients.ready(d, op, false)? {
                         let mut rows = d.empty(ids.len(), 1).map_err(error)?;
-                        d.gemm(&mut rows, 1.0, &c, Op::T, ones.as_ref().ok_or("device: missing column reduction workspace")?, Op::N, 0.0, arithmetic).map_err(error)?;
+                        d.gemm(&mut rows, 1.0, c, Op::T, ones.as_ref().ok_or("device: missing column reduction workspace")?, Op::N, 0.0, arithmetic).map_err(error)?;
                         d.scatter_rows(gradient, ids, &rows, true).map_err(error)?;
                     }
                 }
