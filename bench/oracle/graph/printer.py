@@ -405,10 +405,22 @@ def engine_for(model: str):
     return ENGINES[model]
 
 
-def printed(ir: dict, behavior: dict, score: dict | None = None) -> tuple[str, dict]:
-    """(source, graph description) of a traced program on a behavior."""
+def wrong(measured: dict[str, dict]) -> dict[str, dict]:
+    """The same facts on the wrong nodes, for the reader's control (R3): rotated by one node, or with
+    their signs flipped when the program has one node."""
+    ids = list(measured)
+    if len(ids) > 1:
+        return {nid: measured[ids[(k + 1) % len(ids)]] for k, nid in enumerate(ids)}
+    flip = lambda v: -v if isinstance(v, float) else v  # noqa: E731
+    return {nid: {k: flip(v) if k in ("removal_answer_bits", "direct_answer_logit") else v for k, v in f.items()}
+            for nid, f in measured.items()}
+
+
+def printed(ir: dict, behavior: dict, score: dict | None = None, measured: dict | None = None) -> tuple[str, dict]:
+    """(source, graph description) of a traced program on a behavior (`measured`: facts already taken,
+    e.g. wrong(facts) for the reader's control)."""
     SHAPE[0] = mech.shapes(ir["model"])
-    measured = facts(engine_for(ir["model"]), ir, behavior)
+    measured = measured if measured is not None else facts(engine_for(ir["model"]), ir, behavior)
     src = source_of(ir, behavior, measured, score)
     check = mech.trace_inline(src, ir["model"])
     if not check["valid"] or (check["nodes"], check["edges"]) != (ir["nodes"], ir["edges"]):
@@ -423,6 +435,7 @@ def main():
     ap.add_argument("--name")
     ap.add_argument("--out-dir", type=Path, default=Path.home() / "mpd-data/graph_oracle/printed")
     ap.add_argument("--score", type=Path, help="the program's score JSON (score.py), stated in the docstring")
+    ap.add_argument("--wrong", action="store_true", help="also write NAME.wrong.py: the facts on the wrong nodes (R3)")
     a = ap.parse_args()
     behavior = json.loads(a.behavior.read_text())
     text = a.program.read_text()
@@ -434,10 +447,14 @@ def main():
     if not ir["valid"]:
         sys.exit(f"invalid program: {ir['error']}")
     score = json.loads(a.score.read_text()) if a.score else None
-    src, graph = printed(ir, behavior, score)
+    SHAPE[0] = mech.shapes(ir["model"])
+    measured = facts(engine_for(ir["model"]), ir, behavior)
+    src, graph = printed(ir, behavior, score, measured)
     a.out_dir.mkdir(parents=True, exist_ok=True)
     name = a.name or f"{behavior['id']}.{a.program.stem}"
     (a.out_dir / f"{name}.py").write_text(src)
+    if a.wrong:
+        (a.out_dir / f"{name}.wrong.py").write_text(printed(ir, behavior, score, wrong(measured))[0])
     (a.out_dir / f"{name}.graph.json").write_text(json.dumps(graph, indent=1))
     print(src)
 
