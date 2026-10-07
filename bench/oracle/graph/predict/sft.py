@@ -211,6 +211,7 @@ def main():
                     help="share of each type's draws taken from its questions whose measured answer differs from no change")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--format", default="chat", choices=("chat", "raw"))
+    ap.add_argument("--eval-only", default="", help="ADAPTERS: score base and these adapters on the held-out sets, no training")
     ap.add_argument("--export-peft", default="", help="only convert OUT/adapters.safetensors to OUT/peft (no training)")
     args = ap.parse_args()
     FORMAT["name"] = args.format
@@ -256,6 +257,20 @@ def main():
         return {n: evaluate(model, tok, h, per_type, args.batch, args.max_tokens, dev) for n, h in sets.items()}
 
     base = evaluate_sets(args.eval_per_type)
+    if args.eval_only:  # held-out bits of existing adapters against the base model on the same questions
+        from safetensors.torch import load_file
+
+        state = load_file(args.eval_only)
+        for name, a in adapters.items():
+            a.A.data.copy_(state[f"{name}.A"])
+            a.B.data.copy_(state[f"{name}.B"])
+        set_adapters(True)
+        trained = evaluate_sets(args.eval_per_type)
+        result = {"adapters": args.eval_only, "base": base, "trained": trained,
+                  "gain_bits_per_question": {n: {k: base[n][k]["bits_per_question"] - t[k]["bits_per_question"] for k in t} for n, t in trained.items()}}
+        (out / "eval_only.json").write_text(json.dumps(result, indent=1))
+        print(json.dumps(result), flush=True)
+        return
     (out / "eval_base.json").write_text(json.dumps(base, indent=1))
     print(json.dumps({"base": base}), flush=True)
     set_adapters(True)
