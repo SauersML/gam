@@ -150,7 +150,7 @@ if len(sys.argv) > 1 and points:
         ax.scatter([p['active']], [p['gap']], s=90, facecolors='none', edgecolors=c)
         ax.plot([p['active'], p['executed']], [p['gap'], p['gap']], color=c, lw=1)
         ax.annotate('\n'.join(texts[i]), (p['executed'], p['gap']), xytext=(6e5, placed[i]), textcoords='data', va='center', fontsize=10, color=c,
-                    arrowprops=dict(arrowstyle='-', lw=0.6, color=c))
+                    arrowprops=dict(arrowstyle='-', lw=0.6, color=c, relpos=(0, 0.5)))
     ax.set_xscale('log')
     ax.set_xlim(30, 5e5)
     ax.set_ylim(0, max(top, max(placed[i] + line * len(texts[i]) / 2 for i in placed)))
