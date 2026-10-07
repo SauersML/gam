@@ -5,10 +5,11 @@
 //! projection/reduction ordering and cancellation in logZ-mu.h+c can change rounding.
 use crate::{
     device_program::DeviceProgram,
-    operator_program::{FamilyInputs, Node, Operator, OperatorBody, OperatorProgram},
+    operator_program::{FamilyInputs, Law, Node, Operator, OperatorBody, OperatorProgram},
 };
 use gam_gpu::tensor::{Arithmetic, ColumnBlocks, Device, Op, Storage, Tensor};
-use ndarray::{Array2, ArrayView2};
+use ndarray::{Array2, ArrayView2, s};
+use rand::{RngExt, SeedableRng, rngs::StdRng};
 use std::sync::{Arc, Mutex};
 fn error(e: impl std::fmt::Display) -> String {
     e.to_string()
@@ -17,6 +18,23 @@ fn error(e: impl std::fmt::Display) -> String {
 pub(crate) struct Head {
     pub hidden: usize,
     table: Table,
+    /// A Gaussian head's bias and law ([`GAUSSIAN_HEAD`]); none for a softmax head.
+    pub(crate) gaussian: Option<Gaussian>,
+}
+
+/// The name of a Gaussian head's table `E` (outputs × hidden): the model's outputs are
+/// `y = law(E h + b)`, `law` the identity or ReLU (a pointwise node after the head), and each
+/// output's predictive distribution is `N(y, 1)`. An exporter divides the table and the bias by
+/// the model's task residual `σ` (its root mean squared error against its training target), so
+/// the unit is `σ` and `KL(M ‖ P) = ‖y_M − y_P‖² / 2` nats per row. A real-valued toy is a
+/// language model whose tokens index its inputs (`bench/toys_2951`).
+pub const GAUSSIAN_HEAD: &str = "gaussian_head";
+
+/// A Gaussian head's bias `b` (one per output) and whether a ReLU follows it.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Gaussian {
+    pub bias: Vec<f64>,
+    pub relu: bool,
 }
 
 /// A head's table, classes × hidden: the operator it was read from (read transposed where the
@@ -28,22 +46,24 @@ struct Table {
 impl Head {
     pub fn of(source: &OperatorProgram) -> Result<Self, String> {
         source.interfaces().map_err(error)?;
-        let logits = match &source.nodes[source.output] {
+        // A Gaussian head's law follows it as a pointwise node.
+        let (logits, law) = match &source.nodes[source.output] {
             Node::Readout { input, basis }
                 if matches!(
                     source.bases[*basis],
                     crate::operator_program::Basis::Indicator { .. }
                 ) =>
             {
-                *input
+                (*input, None)
             }
             Node::Readout { .. } => return Err("fixed head requires indicator readout".into()),
-            _ => source.output,
+            Node::Pointwise { input, laws } => (*input, Some(laws.clone())),
+            _ => (source.output, None),
         };
-        let (hidden, operator, transposed) = match &source.nodes[logits] {
-            Node::Transposed { input, operator } => (*input, *operator, true),
-            Node::Affine { terms, bias: None } if terms.len() == 1 => {
-                (terms[0].0, terms[0].1, false)
+        let (hidden, operator, transposed, bias) = match &source.nodes[logits] {
+            Node::Transposed { input, operator } => (*input, *operator, true, None),
+            Node::Affine { terms, bias } if terms.len() == 1 => {
+                (terms[0].0, terms[0].1, false, *bias)
             }
             _ => {
                 return Err(
@@ -52,6 +72,27 @@ impl Head {
             }
         };
         let op = &source.operators[operator];
+        let gaussian = if op.name == GAUSSIAN_HEAD {
+            let relu = match &law {
+                None => false,
+                Some(laws) if laws.iter().all(|l| *l == Law::Relu) => true,
+                Some(laws) if laws.iter().all(|l| *l == Law::Identity) => false,
+                Some(_) => return Err("a Gaussian head's law is the identity or ReLU".into()),
+            };
+            let outputs = op.rows.width();
+            let bias = match bias {
+                Some(b) => source.operators[b].matrix().column(0).to_vec(),
+                None => vec![0.0; outputs],
+            };
+            if bias.len() != outputs || bias.iter().any(|v| !v.is_finite()) {
+                return Err("a Gaussian head's bias is not one finite value per output".into());
+            }
+            Some(Gaussian { bias, relu })
+        } else if bias.is_some() || law.is_some() {
+            return Err("compact targets require an unedited bias-free single dense head".into());
+        } else {
+            None
+        };
         let OperatorBody::Dense {
             values, present, ..
         } = &op.body
@@ -67,7 +108,7 @@ impl Head {
                 "fixed head requires a final contiguous hidden/head/readout boundary".into(),
             );
         }
-        Ok(Self { hidden, table: Table { operator: Arc::clone(op), transposed } })
+        Ok(Self { hidden, table: Table { operator: Arc::clone(op), transposed }, gaussian })
     }
     /// The head's table, classes × hidden.
     pub fn embedding(&self) -> ArrayView2<'_, f64> {
@@ -79,12 +120,38 @@ impl Head {
         }
     }
     pub fn same(&self, other: &Self) -> bool {
-        self.embedding().dim() == other.embedding().dim()
+        self.gaussian == other.gaussian
+            && self.embedding().dim() == other.embedding().dim()
             && self
                 .embedding()
                 .iter()
                 .zip(other.embedding().iter())
                 .all(|(a, b)| a.to_bits() == b.to_bits())
+    }
+    /// A Gaussian head's outputs `y = law(E h + b)` of the hidden rows `h`, with each output's
+    /// slope there (1, or ReLU's 0 or 1); none for a softmax head.
+    pub(crate) fn gaussian_outputs(&self, h: &Array2<f64>) -> Option<(Array2<f64>, Array2<f64>)> {
+        let g = self.gaussian.as_ref()?;
+        let mut z = h.dot(&self.embedding().t());
+        for mut row in z.rows_mut() {
+            row.iter_mut().zip(&g.bias).for_each(|(v, b)| *v += b);
+        }
+        let slope = z.mapv(|v| if !g.relu || v > 0.0 { 1.0 } else { 0.0 });
+        if g.relu {
+            z.mapv_inplace(|v| v.max(0.0));
+        }
+        Some((z, slope))
+    }
+    /// A Gaussian head's target of the hidden rows `h` in the compact target's shape: `M`'s
+    /// outputs in the first columns of a row of the hidden width (the rest zero).
+    pub(crate) fn gaussian_target(&self, h: &Array2<f64>) -> Result<Array2<f64>, String> {
+        let (y, _) = self.gaussian_outputs(h).ok_or("not a Gaussian head")?;
+        if y.ncols() > h.ncols() {
+            return Err("a Gaussian head has more outputs than its hidden width".into());
+        }
+        let mut out = Array2::zeros(h.dim());
+        out.slice_mut(s![.., ..y.ncols()]).assign(&y);
+        Ok(out)
     }
     pub fn prefix(&self, source: &OperatorProgram) -> OperatorProgram {
         let mut prefix = source.clone();
@@ -294,6 +361,16 @@ impl Teacher {
         let mut mu = self.device.zeros(rows, width).map_err(error)?;
         let mut entropy = Vec::with_capacity(rows);
         let teacher_hidden = trace.value(self.prefix.hidden())?;
+        if self.head.gaussian.is_some() {
+            let hidden = self.device.download(teacher_hidden).map_err(error)?;
+            let target = self.head.gaussian_target(&hidden)?;
+            return Ok(Target {
+                mu: Arc::new(self.device.upload(target.view()).map_err(error)?),
+                entropy: vec![0.0; rows],
+                head: self.head.clone(),
+                scored: scored.map(<[bool]>::to_vec),
+            });
+        }
         // f32 storage (the Apple GPU) has no float64 product: the classes are swept as in
         // ResidentHead::score, mu is the log partition's gradient, and the negative entropy is
         // h.mu - logZ.
@@ -399,6 +476,8 @@ impl Teacher {
 
 pub(crate) struct ResidentHead {
     pub embedding: Tensor,
+    /// A Gaussian head, scored on the host ([`gaussian_score`]).
+    gaussian: Option<Arc<Head>>,
     /// The embedding in bfloat16 (CUDA in f32), which a sweep in bfloat16 (a training step's,
     /// `library_mdl::Scorer::evaluate_device`) reads as it is in place of rounding the embedding at
     /// every call: made at the first such sweep ([`ResidentHead::embedding_in`]), so a head that no
@@ -412,8 +491,12 @@ pub(crate) struct ResidentHead {
 impl ResidentHead {
     pub fn new(d: &Device, head: &Head, tile_rows: usize) -> Result<Self, String> {
         let embedding = d.upload(head.embedding()).map_err(error)?;
+        let gaussian = head.gaussian.is_some().then(|| {
+            Arc::new(Head { hidden: head.hidden, table: Table { operator: Arc::clone(&head.table.operator), transposed: head.table.transposed }, gaussian: head.gaussian.clone() })
+        });
         Ok(Self {
             embedding,
+            gaussian,
             half: std::sync::OnceLock::new(),
             ones: d
                 .upload(Array2::ones((head.embedding().ncols(), 1)).view())
@@ -452,6 +535,9 @@ impl ResidentHead {
     ) -> Result<(Vec<f64>, Option<Tensor>, Option<Tensor>), String> {
         if probe.is_some() && !gradient {
             return Err("a probe needs the gradient".into());
+        }
+        if let Some(head) = &self.gaussian {
+            return gaussian_score(d, head, hidden, target, gradient, probe);
         }
         if hidden.storage() == Storage::F32 {
             return self.swept(d, hidden, target, gradient, probe, arithmetic);
@@ -643,6 +729,59 @@ impl ResidentHead {
     }
 }
 
+/// A Gaussian head's ([`GAUSSIAN_HEAD`]) per-row `KL(M ‖ P) = ‖y_P − y_M‖² / 2` against `target`
+/// (`M`'s outputs, [`Head::gaussian_target`]); with `gradient`, the hidden seed
+/// `Eᵀ ((y_P − y_M) ⊙ law′)`; with the probe key `probe` as well, the Fisher probe pulled back to
+/// the hidden rows ([`gaussian_probe`]). Computed on the host in float64: the toys it serves are
+/// small, and the hidden rows and targets are downloaded once.
+fn gaussian_score(d: &Device, head: &Head, hidden: &Tensor, target: &Target, gradient: bool, probe: Option<u64>) -> Result<(Vec<f64>, Option<Tensor>, Option<Tensor>), String> {
+    let h = d.download(hidden).map_err(error)?;
+    let t = d.download(&target.mu).map_err(error)?;
+    let (y, slope) = head.gaussian_outputs(&h).ok_or("not a Gaussian head")?;
+    let mut diff = &y - &t.slice(s![.., ..y.ncols()]);
+    let scored = |r: usize| target.scored.as_ref().is_none_or(|s| s[r]);
+    let mut losses = Vec::with_capacity(h.nrows());
+    for (r, mut row) in diff.rows_mut().into_iter().enumerate() {
+        if !scored(r) {
+            row.fill(0.0);
+        }
+        let loss = 0.5 * row.dot(&row);
+        if !loss.is_finite() {
+            return Err("nonfinite Gaussian head KL".into());
+        }
+        losses.push(loss);
+    }
+    let seed = match gradient {
+        true => Some(d.upload((&diff * &slope).dot(&head.embedding()).view()).map_err(error)?),
+        false => None,
+    };
+    let probed = match probe {
+        Some(key) => {
+            let mask = Array2::from_shape_fn(slope.dim(), |(r, j)| if scored(r) { slope[[r, j]] } else { 0.0 });
+            Some(gaussian_probe(d, head, &mask, key)?)
+        }
+        None => None,
+    };
+    Ok((losses, seed, probed))
+}
+
+/// The Fisher probe of a Gaussian head under `key`, pulled back to the hidden rows: per row `r`
+/// (numbered from zero) `Eᵀ (ξ_r ⊙ law′_r)`, `ξ_r` standard normal drawn from `key` and `r` (a
+/// label `y ~ N(y_P, 1)` less its mean), so its expected outer product is the Gauss–Newton matrix
+/// `Eᵀ diag(law′) E`. `slope` is each output's law slope, zero on rows left out.
+pub(crate) fn gaussian_probe(d: &Device, head: &Head, slope: &Array2<f64>, key: u64) -> Result<Tensor, String> {
+    let mut xi = Array2::zeros(slope.dim());
+    for (r, mut row) in xi.rows_mut().into_iter().enumerate() {
+        let mut rng = StdRng::seed_from_u64(key ^ (r as u64).wrapping_add(1).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        for v in row.iter_mut() {
+            // Box–Muller: the uniform in (0, 1] keeps the logarithm finite.
+            let (u, angle) = (1.0 - rng.random::<f64>(), std::f64::consts::TAU * rng.random::<f64>());
+            *v = (-2.0 * u.ln()).sqrt() * angle.cos();
+        }
+    }
+    d.upload((&xi * slope).dot(&head.embedding()).view()).map_err(error)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -653,7 +792,7 @@ mod tests {
         let precision = crate::operator_program::exact_precision(values.iter().copied()).expect("a finite table");
         let (rows, cols) = (crate::operator_program::Interface::native(classes).expect("rows"), crate::operator_program::Interface::native(width).expect("columns"));
         let operator = Operator::dense("head", rows, cols, values, precision, crate::operator_program::Provenance::native("head")).expect("a dense head");
-        Head { hidden, table: Table { operator: Arc::new(operator), transposed: false } }
+        Head { hidden, table: Table { operator: Arc::new(operator), transposed: false }, gaussian: None }
     }
 
     #[test]

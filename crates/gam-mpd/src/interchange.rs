@@ -777,6 +777,12 @@ impl FixedHead {
     /// `arithmetic`. `Device::head_log_partition` gives `log Z` and `μ` without forming the rows ×
     /// vocabulary logits in f32 storage.
     fn target(&self, d: &Device, hidden: &Tensor, arithmetic: Arithmetic) -> Result<Target, String> {
+        // A Gaussian head's target is `M`'s outputs (`Head::gaussian_target`), made on the host.
+        if self.head.gaussian.is_some() {
+            let target = self.head.gaussian_target(&d.download(hidden).map_err(error)?)?;
+            let mu = d.upload(target.view()).map_err(error)?;
+            return Ok(Target { mu: Arc::new(mu), entropy: vec![0.0; hidden.rows()], head: Arc::clone(&self.head), scored: None });
+        }
         let mut mu = d.zeros(hidden.rows(), hidden.cols()).map_err(error)?;
         let partitions = d.head_log_partition(hidden, &self.resident.embedding, false, None, Some(&mut mu), arithmetic).map_err(error)?;
         let dots = d.download(&d.block_products(hidden, &mu, &self.width).map_err(error)?).map_err(error)?;
@@ -2782,6 +2788,10 @@ pub fn evaluate_probed<E: BlockEngine>(
         Some(key) => Some(spread(
             &match probed {
                 Some(seed) => seed,
+                None if head.head.gaussian.is_some() => {
+                    let (_, slope) = head.head.gaussian_outputs(&d.download(&hidden).map_err(error)?).ok_or_else(|| error("not a Gaussian head"))?;
+                    crate::resident_causal_fit::fixed_head_target::gaussian_probe(d, &head.head, &slope, key)?
+                }
                 None => fisher_probe_seed(d, &hidden, head.resident.embedding_in(d, factor)?, head.resident.tile_rows.max(1), key, factor)?,
             },
             1.0,

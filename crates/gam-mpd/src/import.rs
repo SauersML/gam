@@ -371,10 +371,20 @@ fn language_model(tensors: &Tensors<'_>, record: &Value, blocks: std::ops::Range
     refuse_unsupported(&record["config"])?;
     let flag = |key: &str| record["config"][key].as_bool().unwrap_or(false);
     let (parallel, qk_norm, gated) = (flag("parallel_residual"), flag("qk_norm"), flag("mlp_gated"));
-    let layer_norm = match record["config"]["norm"].as_str() {
-        None | Some("rms") => false,
-        Some("layer") => true,
+    // `none`: no norm anywhere (a real-valued toy's residual MLP, `bench/toys_2951`).
+    let (layer_norm, no_norm) = match record["config"]["norm"].as_str() {
+        None | Some("rms") => (false, false),
+        Some("layer") => (true, false),
+        Some("none") => (false, true),
         Some(other) => return Err(format!("unsupported norm {other}")),
+    };
+    // A Gaussian head (`fixed_head_target::GAUSSIAN_HEAD`): the outputs `law(E h + b)` of the
+    // last stream, `E` and `b` the tensors `gaussian_head` and `gaussian_head.bias` (already in
+    // units of the model's task residual), `law` ReLU when `head.relu`, else the identity.
+    let gaussian = match record["config"]["head"]["law"].as_str() {
+        None | Some("softmax") => None,
+        Some("gaussian") => Some(record["config"]["head"]["relu"].as_bool().unwrap_or(false)),
+        Some(other) => return Err(format!("unsupported head law {other}")),
     };
     let tied = record["config"]["tied_embeddings"].as_bool().unwrap_or(true);
     let rotary_dims = record["config"]["rotary_dims"].as_u64().map_or(hd, |v| v as usize);
@@ -386,6 +396,7 @@ fn language_model(tensors: &Tensors<'_>, record: &Value, blocks: std::ops::Range
         Some("gelu") => Law::Gelu,
         Some("silu") => Law::Silu,
         Some("relu") => Law::Relu,
+        Some("identity") => Law::Identity,
         other => return Err(format!("unsupported mlp activation {other:?}")),
     };
     if theta.fract() != 0.0 || theta <= 0.0 || theta > f64::from(u32::MAX) {
@@ -450,6 +461,9 @@ fn language_model(tensors: &Tensors<'_>, record: &Value, blocks: std::ops::Range
         None
     };
     let norm = |b: &mut Builder, x: usize, name: &str| -> Result<usize, String> {
+        if no_norm {
+            return Ok(x);
+        }
         let input = match centring {
             Some(centre) => b.node(Node::Affine { terms: vec![(x, identity), (x, centre)], bias: None }),
             None => x,
@@ -557,14 +571,29 @@ fn language_model(tensors: &Tensors<'_>, record: &Value, blocks: std::ops::Range
         x
     } else {
         let h = norm(&mut b, x, "final_norm")?;
-        let logits = match embedding {
-            Some(embedding) if tied => b.node(Node::Transposed { input: h, operator: embedding }),
-            _ => {
-                let head_op = tensors.operator(&mut b, "lm_head", &tokens_interface, &model, "lm_head")?;
-                b.node(Node::Affine { terms: vec![(h, head_op)], bias: None })
+        match gaussian {
+            Some(relu) => {
+                let name = crate::resident_causal_fit::fixed_head_target::GAUSSIAN_HEAD;
+                let outputs = interface(tensors.rows_of(name)?, 1, LabelKind::Unit)?;
+                let head_op = tensors.operator(&mut b, name, &outputs, &model, name)?;
+                let head_bias = bias(&mut b, &format!("{name}.bias"), &outputs, None)?;
+                let y = b.node(Node::Affine { terms: vec![(h, head_op)], bias: head_bias });
+                match relu {
+                    true => b.node(Node::Pointwise { input: y, laws: vec![Law::Relu; outputs.groups().len()] }),
+                    false => y,
+                }
             }
-        };
-        b.node(Node::Readout { input: logits, basis: 0 })
+            None => {
+                let logits = match embedding {
+                    Some(embedding) if tied => b.node(Node::Transposed { input: h, operator: embedding }),
+                    _ => {
+                        let head_op = tensors.operator(&mut b, "lm_head", &tokens_interface, &model, "lm_head")?;
+                        b.node(Node::Affine { terms: vec![(h, head_op)], bias: None })
+                    }
+                };
+                b.node(Node::Readout { input: logits, basis: 0 })
+            }
+        }
     };
     let declarations = Declarations { parameters: 0, domains: vec![Domain { size: vocab }], slots: vec![input_slot] };
     Ok(OperatorProgram {
