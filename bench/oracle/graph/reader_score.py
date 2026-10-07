@@ -266,7 +266,9 @@ class CachedReader:
         self.tokenizer = AutoTokenizer.from_pretrained(model)
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         dtype = torch.float32 if self.device.type == "cpu" else torch.bfloat16
-        self.model = AutoModelForCausalLM.from_pretrained(model, dtype=dtype).to(self.device).eval()
+        # Loaded straight onto a GPU (device_map), so the host needs little memory beyond the tokenizer.
+        place = {"device_map": self.device.type} if self.device.type == "cuda" else {}
+        self.model = AutoModelForCausalLM.from_pretrained(model, dtype=dtype, **place).to(self.device).eval()
         self.pad = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id
 
     def describe(self) -> dict:
