@@ -32,7 +32,7 @@
 use gam_gpu::tensor::Device;
 use gam_mpd::{
     engine::log_to_stderr,
-    graph::{Behavior, Checker, Experiment, Graph, Measured, Program, SiteUnits, WeightEdit, Weights, Writer},
+    graph::{Behavior, Checker, Experiment, Measured, Program, SiteUnits, WeightEdit, Weights},
     import::import_language_model,
     library_mdl,
     library_readout::Library,
@@ -83,16 +83,8 @@ fn load(export: &Path) -> Result<Weights, String> {
     Ok(Weights::of(&library))
 }
 
-/// A node's or writer's pieces in IR form (reader_score.py renders them), or "embed" / "logits".
-fn pieces(program: &Program, graph: &Graph, unit: Option<usize>, end: &str) -> Value {
-    match unit {
-        None => json!(end),
-        Some(u) => program.nodes.iter().find(|n| graph.ids.get(u) == Some(&n.id)).map_or(Value::Null, |n| json!(n.pieces)),
-    }
-}
-
 /// The experiment in reader_score.py's form (its `words` renders it) for one prompt.
-fn reader_experiment(e: &Experiment, program: &Program, graph: &Graph, behavior: &Behavior, prompt: usize, donor: Option<usize>) -> Value {
+fn reader_experiment(e: &Experiment, behavior: &Behavior, prompt: usize, donor: Option<usize>) -> Value {
     let native = |layer: usize, kind: &str, index: Value| json!([{"view": "native", "layer": layer, "kind": kind, "index": index}]);
     match e {
         Experiment::Clean => json!({"kind": "clean"}),
@@ -113,17 +105,9 @@ fn reader_experiment(e: &Experiment, program: &Program, graph: &Graph, behavior:
                 json!({"kind": "low_rank", "rank": 1, "matrix": name, "layer": layer, "relative_norm": 0.5})
             }
         },
-        Experiment::Swap { node } => json!({"kind": "swap", "pieces": pieces(program, graph, Some(*node), ""), "source_text": donor.map_or(String::new(), |d| behavior.prompts[d].text.clone())}),
         Experiment::Sites { .. } => {
             let source = behavior.prompts[prompt].counterfactual.as_ref().map_or_else(|| donor.map_or(String::new(), |d| behavior.prompts[d].text.clone()), |c| c.text.clone());
-            json!({"words": format!("{} (the counterfactual text: <<<{source}>>>)", e.describe(graph))})
-        }
-        Experiment::Cut { from, to, route, .. } => {
-            let from = match from {
-                Writer::Embed => json!("embed"),
-                Writer::Unit(u) => pieces(program, graph, Some(*u), ""),
-            };
-            json!({"kind": "cut", "from": from, "to": pieces(program, graph, *to, "logits"), "route": route})
+            json!({"words": format!("{} (the counterfactual text: <<<{source}>>>)", e.describe())})
         }
     }
 }
@@ -131,8 +115,7 @@ fn reader_experiment(e: &Experiment, program: &Program, graph: &Graph, behavior:
 /// The reader's items (reader_score.py's format, without the texts, which score.py decodes): per
 /// experiment and target token, `M`'s clean top `k` tokens with their clean probabilities, `M_e`'s
 /// probabilities of them and of everything else, and the program's.
-fn items(checker: &Checker, outcomes: &[Measured], program: &Program) -> Value {
-    let graph = checker.graph(program);
+fn items(checker: &Checker, outcomes: &[Measured]) -> Value {
     let behavior = &checker.behavior;
     let donors = checker.donors();
     let mut list = Vec::new();
@@ -152,8 +135,8 @@ fn items(checker: &Checker, outcomes: &[Measured], program: &Program) -> Value {
             list.push(json!({
                 "id": format!("{x}:{prompt}:{position}"),
                 "family": e.family(),
-                "experiment": reader_experiment(e, program, &graph, behavior, prompt, donor),
-                "words_checker": e.describe(&graph),
+                "experiment": reader_experiment(e, behavior, prompt, donor),
+                "words_checker": e.describe(),
                 "prompt": prompt,
                 "position": cut,
                 "token_ids": ids[..=cut.min(ids.len() - 1)],
@@ -288,10 +271,10 @@ fn handle(request: &Value, weights: &mut Option<Weights>, checker: &mut Option<C
             let scored = c.score_batch(&programs, count, seed, edges, n, k)?;
             let seconds = started.elapsed().as_secs_f64();
             let mut answers = Vec::with_capacity(scored.len());
-            for (program, (score, outcomes)) in programs.iter().zip(&scored) {
+            for (score, outcomes) in &scored {
                 let mut answer = serde_json::to_value(score).map_err(error)?;
                 if k > 0 {
-                    answer["items"] = items(c, outcomes, program);
+                    answer["items"] = items(c, outcomes);
                 }
                 answers.push(answer);
             }

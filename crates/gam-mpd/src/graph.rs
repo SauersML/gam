@@ -529,17 +529,6 @@ impl Incoming {
         Self::AllBut(BTreeSet::new())
     }
 
-    /// The route without writer `w`'s actual write (it reads `w`'s stand-in).
-    fn cut(&mut self, w: Writer) {
-        match self {
-            Self::Only(set) => {
-                set.remove(&w);
-            }
-            Self::AllBut(set) => {
-                set.insert(w);
-            }
-        }
-    }
 }
 
 /// One unit of a circuit: its pieces and whether it computes (else it writes its stand-in).
@@ -2018,13 +2007,9 @@ pub enum Experiment {
     Clean,
     /// Every prompt's counterfactual in its place.
     Counterfactual,
-    Edit { edit: WeightEdit, aimed: bool },
-    /// Node `node`'s write replaced by its write on the donor prompt (the next prompt of the same
-    /// length).
-    Swap { node: usize },
-    /// The edge from `from` to `to` (a node, `None` the logits) on `route` cut: the reader gets the
-    /// writer's stand-in write.
-    Cut { from: Writer, to: Option<usize>, route: Route, declared: bool },
+    /// A weight edit, of a random piece (uniform) or of one of `M`'s strongest pieces for the
+    /// behavior (targeted).
+    Edit { edit: WeightEdit, targeted: bool },
     /// Operations on sites `M` and every program share (`interchange::SiteOp`: heads', attentions'
     /// and MLPs' outputs, the embeddings, the stream after a block, a block's normed input; swaps
     /// and cuts read the donor, the prompt's counterfactual), [`Interventions`].
@@ -2037,11 +2022,8 @@ impl Experiment {
             Self::Clean => "clean",
             Self::Counterfactual => "counterfactual",
             Self::Edit { edit: WeightEdit::RankOne { .. }, .. } => "rank_one",
-            Self::Edit { aimed: true, .. } => "edit_aimed",
-            Self::Edit { aimed: false, .. } => "edit_uniform",
-            Self::Swap { .. } => "swap",
-            Self::Cut { declared: true, .. } => "cut_declared",
-            Self::Cut { declared: false, .. } => "cut_undeclared",
+            Self::Edit { targeted: true, .. } => "edit_targeted",
+            Self::Edit { targeted: false, .. } => "edit_uniform",
             Self::Sites { draw } => match draw.family {
                 interchange::Family::Swap => "site_swap",
                 interchange::Family::Zero => "site_zero",
@@ -2055,12 +2037,7 @@ impl Experiment {
     }
 
     /// The experiment in words, for the reader.
-    pub fn describe(&self, graph: &Graph) -> String {
-        let node = |u: usize| graph.ids.get(u).cloned().unwrap_or_else(|| format!("unit {u}"));
-        let writer = |w: &Writer| match w {
-            Writer::Embed => "embed".to_string(),
-            Writer::Unit(u) => node(*u),
-        };
+    pub fn describe(&self) -> String {
         match self {
             Self::Clean => "the prompt as given".into(),
             Self::Counterfactual => "the counterfactual prompt in place of the prompt".into(),
@@ -2071,30 +2048,39 @@ impl Experiment {
                 WeightEdit::Subcomponents { layer, down, indices, factor } => format!("PD.vpd[{layer}].{}{indices:?} times {factor}", if *down { "down_proj" } else { "c_fc" }),
                 WeightEdit::AttnSubcomponents { layer, map, indices, factor } => format!("PD.vpd[{layer}].{}{indices:?} times {factor}", ["q_proj", "k_proj", "v_proj", "o_proj"][(*map).min(3)]),
             },
-            Self::Swap { node: n } => format!("{}'s output replaced by its output on another prompt", node(*n)),
-            Self::Cut { from, to, route, .. } => format!("the connection {} >> {}.{route:?} cut (the reader gets its average)", writer(from), to.map_or("logits".to_string(), node)),
             Self::Sites { draw } => describe_sites(draw),
         }
     }
 }
 
-/// The checker's draw of `count` experiments beyond clean (and counterfactual when the prompts
-/// have them): weight edits (half uniform over pieces at random granularity, half aimed at the
-/// program's pieces and pieces it omits, half of those among the four omitted heads first in
-/// `strongest`, heads by measured removal effect), rank-one perturbations, node swaps, edge cuts
-/// (declared edges and undeclared pairs).
-pub fn sample(weights: &Weights, graph: &Graph, counterfactual: bool, count: usize, seed: u64, strongest: &[(usize, usize)], units: &SiteUnits) -> Vec<Experiment> {
+/// Pieces and connections of `M` by measured effect on the behavior (`Checker::targets`, measured
+/// once): each piece (a head, a whole MLP, a group of an MLP's neurons, a group of VPD
+/// subcomponents) with the mean `KL(M ‖ M_e)` at the targets when it is removed, and each
+/// connection (an attention's or an MLP's output into a later block's read, a site cut from the
+/// counterfactual) with that of its cut, strongest first.
+#[derive(Clone, Debug, Default)]
+pub struct Targets {
+    pub pieces: Vec<(Block, f64)>,
+    pub cuts: Vec<(SiteOp, f64)>,
+}
+
+/// How many of the strongest pieces and of the strongest connections targeted draws take.
+const TARGETED: usize = 8;
+
+/// The experiments every program of a behavior is scored on (design.txt section 2), drawn from
+/// `seed` alone and never from a program: clean, the counterfactual prompts (`counterfactual`),
+/// then `count` draws, half uniform (weight edits of random pieces at random granularity,
+/// rank-one perturbations and, with a manifest, its site operations, a third each) and half
+/// targeted at `targets`' strongest pieces and connections (a piece removed or scaled, a head's or
+/// an MLP's output swapped from the counterfactual at every token, a connection cut).
+pub fn sample(weights: &Weights, counterfactual: bool, count: usize, seed: u64, targets: &Targets, units: &SiteUnits) -> Vec<Experiment> {
     let sites = &units.pool;
-    let aimed_sites = units.aimed_sites(weights, graph);
     let mut out = vec![Experiment::Clean];
     if counterfactual {
         out.push(Experiment::Counterfactual);
     }
     let layers = weights.layers.len();
     let factors = [0.0, 0.5, 2.0];
-    let omitted = graph.complement(weights);
-    let declared = |l: usize, h: usize| graph.blocks.iter().any(|b| matches!(b, Block::Heads { layer, heads } if *layer == l && heads.contains(&h)));
-    let strong: Vec<Block> = strongest.iter().filter(|(l, h)| !declared(*l, *h)).take(4).map(|&(layer, h)| Block::Heads { layer, heads: vec![h] }).collect();
     let random_edit = |rng: &mut StdRng, block: Option<&Block>| -> WeightEdit {
         let factor = factors[rng.random_range(0..factors.len())];
         let block = match block {
@@ -2136,7 +2122,7 @@ pub fn sample(weights: &Weights, graph: &Graph, counterfactual: bool, count: usi
                     WeightEdit::AttnSubcomponents { layer, map, indices, factor }
                 }
             }
-            // Transcoder features are not M's weights: an aimed edit takes their layer's MLP.
+            // Transcoder features are not M's weights: an edit takes their layer's MLP.
             Block::Features { layer, .. } => WeightEdit::Neurons { layer, neurons: (0..weights.neurons(layer)).collect(), factor },
             // VPD subcomponents: one, a group of 8, or all of the node's c_fc or down_proj ones
             // (a remainder node: any of the layer's).
@@ -2166,47 +2152,59 @@ pub fn sample(weights: &Weights, graph: &Graph, counterfactual: bool, count: usi
             }
         }
     };
-    let declared_edges: Vec<(Writer, Option<usize>, Route)> = graph.edges.clone();
-    // Half the draws are the behavior's (uniform edits and rank-one perturbations drawn from `seed`
-    // alone, the same for every program, so `M`'s outcomes are shared across programs), half are
-    // aimed at the program (its pieces and the strongest it omits, its nodes, its edges).
-    let (mut fixed, mut aimed) = (StdRng::seed_from_u64(seed), StdRng::seed_from_u64(seed ^ 0x9E37_79B9_7F4A_7C15));
-    let mut kinds = vec!["edit_aimed", "cut_undeclared"];
-    if !graph.blocks.is_empty() {
-        kinds.push("swap");
+    let pieces: Vec<&Block> = targets.pieces.iter().take(TARGETED).map(|(b, _)| b).collect();
+    let mut first_head = vec![0usize; layers + 1];
+    for (l, layer) in weights.layers.iter().enumerate() {
+        first_head[l + 1] = first_head[l] + layer.heads.len();
     }
-    if !declared_edges.is_empty() {
-        kinds.push("cut_declared");
+    // The strongest pieces with a shared site of their own: one head, a whole MLP.
+    let swappable: Vec<SharedSite> = pieces
+        .iter()
+        .filter_map(|b| match b {
+            Block::Heads { layer, heads } if heads.len() == 1 => Some(SharedSite::Head(first_head[*layer] + heads[0])),
+            Block::Neurons { layer, neurons } if neurons.len() == weights.neurons(*layer) => Some(SharedSite::Mlp(*layer)),
+            _ => None,
+        })
+        .collect();
+    let cuts: Vec<SiteOp> = targets.cuts.iter().take(TARGETED).map(|(c, _)| *c).collect();
+    let mut targeted_kinds = Vec::new();
+    if !pieces.is_empty() {
+        targeted_kinds.push("edit");
     }
-    if !aimed_sites.is_empty() && !units.directions.is_empty() {
-        kinds.push("site_aimed");
+    if !swappable.is_empty() {
+        targeted_kinds.push("swap");
     }
+    if !cuts.is_empty() {
+        targeted_kinds.push("cut");
+    }
+    let uniform_kinds: &[&str] = if sites.is_empty() { &["edit_uniform", "rank_one"] } else { &["edit_uniform", "rank_one", "sites"] };
+    let (mut uniform, mut targeted) = (StdRng::seed_from_u64(seed), StdRng::seed_from_u64(seed ^ 0x9E37_79B9_7F4A_7C15));
+    let every = |site: SharedSite, operation: Operation, family: interchange::Family| SiteDraw { family, ops: vec![SiteOp { site, operation, onward: true }], position: 0, length: 1 };
     for k in 0..count {
-        let rng = if k % 2 == 0 { &mut fixed } else { &mut aimed };
-        // The behavior's half: uniform weight edits, rank-one perturbations and (when a pool of drawn
-        // site operations is given, a manifest's) site operations, a third each.
-        let fixed_kinds: &[&str] = if sites.is_empty() { &["edit_uniform", "rank_one"] } else { &["edit_uniform", "rank_one", "sites"] };
-        let kind = if k % 2 == 0 { fixed_kinds[rng.random_range(0..fixed_kinds.len())] } else { kinds[rng.random_range(0..kinds.len())] };
+        let take_targeted = k % 2 == 1 && !targeted_kinds.is_empty();
+        let rng = if take_targeted { &mut targeted } else { &mut uniform };
+        let kind = if take_targeted { targeted_kinds[rng.random_range(0..targeted_kinds.len())] } else { uniform_kinds[rng.random_range(0..uniform_kinds.len())] };
         out.push(match kind {
             "sites" => Experiment::Sites { draw: sites[rng.random_range(0..sites.len())].clone() },
-            "site_aimed" => match units.draw_at(rng, &aimed_sites, weights) {
-                Some(draw) => Experiment::Sites { draw },
-                None => Experiment::Edit { edit: random_edit(rng, graph.blocks.first()), aimed: true },
-            },
-            "edit_uniform" => Experiment::Edit { edit: random_edit(rng, None), aimed: false },
-            "edit_aimed" => {
-                let own = !graph.blocks.is_empty() && (omitted.is_empty() || rng.random_bool(0.5));
-                let pool = if own {
-                    &graph.blocks
-                } else if !strong.is_empty() && rng.random_bool(0.5) {
-                    &strong
-                } else {
-                    &omitted
+            "edit_uniform" => Experiment::Edit { edit: random_edit(rng, None), targeted: false },
+            "edit" => {
+                let factor = factors[rng.random_range(0..factors.len())];
+                let edit = match pieces[rng.random_range(0..pieces.len())].clone() {
+                    Block::Heads { layer, heads } => WeightEdit::Head { layer, head: heads[0], factor },
+                    Block::Slices { layer, fc, down, .. } if fc.is_empty() => WeightEdit::Subcomponents { layer, down: true, indices: down, factor },
+                    Block::Slices { layer, fc, .. } => WeightEdit::Subcomponents { layer, down: false, indices: fc, factor },
+                    Block::Neurons { layer, neurons } => WeightEdit::Neurons { layer, neurons, factor },
+                    other => random_edit(rng, Some(&other)),
                 };
-                let block = pool[rng.random_range(0..pool.len())].clone();
-                Experiment::Edit { edit: random_edit(rng, Some(&block)), aimed: true }
+                Experiment::Edit { edit, targeted: true }
             }
-            "rank_one" => {
+            "swap" => Experiment::Sites { draw: every(swappable[rng.random_range(0..swappable.len())], Operation::Swap, interchange::Family::Swap) },
+            "cut" => {
+                let c = cuts[rng.random_range(0..cuts.len())];
+                Experiment::Sites { draw: every(c.site, c.operation, interchange::Family::Cut) }
+            }
+            // "rank_one"
+            _ => {
                 let layer = rng.random_range(0..layers);
                 let heads = weights.layers[layer].heads.len();
                 let (head, matrix) = if rng.random_bool(0.5) || weights.neurons(layer) == 0 {
@@ -2225,32 +2223,11 @@ pub fn sample(weights: &Weights, graph: &Graph, counterfactual: bool, count: usi
                 let (rows, cols) = probe.dim();
                 let u: Vec<f64> = unit(rows).into_iter().map(|x| x * size).collect();
                 let v = unit(cols);
-                Experiment::Edit { edit: WeightEdit::RankOne { layer, head, matrix, u, v }, aimed: false }
+                Experiment::Edit { edit: WeightEdit::RankOne { layer, head, matrix, u, v }, targeted: false }
             }
-            "swap" => Experiment::Swap { node: rng.random_range(0..graph.blocks.len()) },
-            "cut_declared" => {
-                let (from, to, route) = declared_edges[rng.random_range(0..declared_edges.len())];
-                Experiment::Cut { from, to, route, declared: true }
-            }
-            _ => cut_draw(graph, layers, rng),
         });
     }
     out
-}
-
-/// A cut of a pair among `embed`, the program's nodes and the logits, in causal order, uniform
-/// over readers, then writers before them, then routes (an undeclared pair, or a declared edge
-/// when the draw lands on one).
-fn cut_draw(graph: &Graph, layers: usize, rng: &mut StdRng) -> Experiment {
-    let readers: Vec<Option<usize>> = (0..graph.blocks.len()).map(Some).chain([None]).collect();
-    let to = readers[rng.random_range(0..readers.len())];
-    let site = to.map_or(2 * layers, |r| graph.blocks[r].site());
-    let writers: Vec<Writer> = [Writer::Embed].into_iter().chain((0..graph.blocks.len()).filter(|&w| graph.blocks[w].site() < site).map(Writer::Unit)).collect();
-    let from = writers[rng.random_range(0..writers.len())];
-    let routes = to.map_or(&[Route::Input][..], |r| graph.blocks[r].routes());
-    let route = routes[rng.random_range(0..routes.len())];
-    let declared = graph.edges.contains(&(from, to, route));
-    Experiment::Cut { from, to, route, declared }
 }
 
 impl Weights {
@@ -2683,47 +2660,6 @@ impl SiteUnits {
         (sites, head_blocks)
     }
 
-    /// The sites of a program's nodes: each declared head's output, the attention or MLP output of
-    /// each layer holding a node, a node's block input and the stream after it.
-    pub fn aimed_sites(&self, weights: &Weights, graph: &Graph) -> Vec<SharedSite> {
-        let mut out = BTreeSet::new();
-        let mut first = vec![0usize; weights.layers.len() + 1];
-        for (l, layer) in weights.layers.iter().enumerate() {
-            first[l + 1] = first[l] + layer.heads.len();
-        }
-        for block in &graph.blocks {
-            match block {
-                Block::Heads { layer, heads } => {
-                    out.extend(heads.iter().map(|h| SharedSite::Head(first[*layer] + h)));
-                    out.insert(SharedSite::Attention(*layer));
-                }
-                Block::AttnSlices { layer, .. } => {
-                    out.insert(SharedSite::Attention(*layer));
-                }
-                Block::Neurons { layer, .. } | Block::Features { layer, .. } | Block::Slices { layer, .. } => {
-                    out.insert(SharedSite::Mlp(*layer));
-                }
-            }
-            out.insert(SharedSite::Input(block.site()));
-            out.insert(SharedSite::Stream(block.site()));
-        }
-        out.into_iter().collect()
-    }
-
-    /// One experiment of operations drawn as interchange draws them (`draw_site_ops`, a family
-    /// uniform among swap, zero, scale, push, cut) on the sites `sites`, its position on sequences of
-    /// the pool's length (512 without a pool); `None` when no operation of the family fits them.
-    pub fn draw_at(&self, rng: &mut impl RngExt, sites: &[SharedSite], weights: &Weights) -> Option<SiteDraw> {
-        let (_, head_blocks) = Self::shared(weights);
-        let families = [interchange::Family::Swap, interchange::Family::Zero, interchange::Family::Scale, interchange::Family::Push, interchange::Family::Cut];
-        let family = families[rng.random_range(0..families.len())];
-        let length = self.pool.first().map_or(512, |d| d.length);
-        match interchange::draw_site_ops(rng, family, length, sites, &head_blocks, &self.typical, self.directions.len(), 2 * weights.layers.len()) {
-            Ok((interchange::Patch::Ops { family, ops }, position)) if !ops.is_empty() => Some(SiteDraw { family, ops, position, length }),
-            _ => None,
-        }
-    }
-
     /// Each shared site's typical norm on `M` (unedited `weights`) over `sequences`: the root mean
     /// square of its rows' norms after each sequence's first token, as
     /// `Interchange::measure_typical` measures it (heads' and attentions' outputs and MLPs' outputs
@@ -2985,7 +2921,7 @@ pub struct Checker {
     pub disk_cache: Option<std::path::PathBuf>,
     /// Heads by their measured removal effect on `M` (mean `KL(M ‖ M without the head)` at the
     /// targets), strongest first; measured on first use.
-    strongest: Option<Vec<(usize, usize)>>,
+    targets: Option<Targets>,
     /// The units and pool of site operations (`SiteUnits::manifest`); empty draws none.
     pub sites: SiteUnits,
     /// When set to `m`, a score draws its experiments from seed `seed mod m`: `m` collections of
@@ -3099,7 +3035,7 @@ impl Checker {
             cached: Default::default(),
             cache_bytes: CACHE_BYTES,
             disk_cache: None,
-            strongest: None,
+            targets: None,
             sites: SiteUnits::default(),
             uniform_seeds: None,
             partners,
@@ -3193,24 +3129,15 @@ impl Checker {
     }
 
     /// The experiment's key for `M`'s cache: what it does to which pieces.
-    fn key(graph: &Graph, e: &Experiment) -> String {
-        let block = |u: usize| serde_json::to_string(&graph.blocks[u]).unwrap_or_default();
+    fn key(e: &Experiment) -> String {
         match e {
-            Experiment::Swap { node } => format!("swap {}", block(*node)),
-            Experiment::Cut { from, to, route, .. } => {
-                let from = match from {
-                    Writer::Embed => "embed".to_string(),
-                    Writer::Unit(u) => block(*u),
-                };
-                format!("cut {from} {} {route:?}", to.map_or("logits".to_string(), block))
-            }
             Experiment::Edit { edit, .. } => format!("edit {}", serde_json::to_string(edit).unwrap_or_default()),
             other => serde_json::to_string(other).unwrap_or_default(),
         }
     }
 
-    /// One circuit under one experiment: its log-probabilities at the scored rows (the swap's
-    /// prompts only, for a swap).
+    /// One circuit under one experiment: its log-probabilities at the scored rows (a site
+    /// operation's base prompts only, when they read a same-length donor).
     fn outcome(&mut self, circuit: &Circuit, e: &Experiment) -> Result<Array2<f64>, String> {
         let restore = match e {
             Experiment::Edit { edit, .. } => Some(edit.apply(&mut self.weights)?),
@@ -3227,33 +3154,13 @@ impl Checker {
 
     /// [`Checker::outcome`] on the current weights (an edit's already applied).
     fn run(&self, circuit: &Circuit, e: &Experiment) -> Result<Array2<f64>, String> {
-        let mut circuit = circuit.clone();
+        let circuit = circuit.clone();
         let (batch, rows) = match e {
             Experiment::Counterfactual => self.counterfactual.as_ref().ok_or("the behavior has no counterfactuals")?,
             _ => &self.clean,
         };
         {
             match e {
-                Experiment::Cut { from, to, route, .. } => {
-                    match to {
-                        Some(r) => circuit.units[*r].routes[route.slot()].cut(*from),
-                        None => circuit.logits.cut(*from),
-                    }
-                    Ok(execute(&self.weights, &self.stats, &circuit, &self.referenced(&circuit, batch)?, rows, &BTreeMap::new(), false)?.log_probabilities)
-                }
-                Experiment::Swap { node } => {
-                    if self.donors.is_empty() {
-                        return Err("no two prompts of one length to swap between".into());
-                    }
-                    let prompts: Vec<Vec<u32>> = self.donors.iter().map(|(i, _)| self.behavior.prompts[*i].token_ids.clone()).collect();
-                    let donors: Vec<Vec<u32>> = self.donors.iter().map(|(_, j)| self.behavior.prompts[*j].token_ids.clone()).collect();
-                    let (base, donor) = (Batch::new(&prompts)?, Batch::new(&donors)?);
-                    let donor_run = execute(&self.weights, &self.stats, &circuit, &self.referenced(&circuit, &donor)?, &[], &BTreeMap::new(), false)?;
-                    let value = donor_run.writes[*node].clone().ok_or("the swapped node does not compute")?;
-                    let targets: Vec<(usize, &[usize])> = self.donors.iter().enumerate().map(|(k, (i, _))| (k, self.behavior.prompts[*i].target_positions.as_slice())).collect();
-                    let rows = scored_rows(&base, &targets)?;
-                    Ok(execute(&self.weights, &self.stats, &circuit, &self.referenced(&circuit, &base)?, &rows, &[(*node, value)].into(), false)?.log_probabilities)
-                }
                 Experiment::Sites { draw } => self.sites_outcome(&circuit, draw),
                 _ => Ok(execute(&self.weights, &self.stats, &circuit, &self.referenced(&circuit, batch)?, rows, &BTreeMap::new(), false)?.log_probabilities),
             }
@@ -3269,7 +3176,7 @@ impl Checker {
             (StandIn::Global, true) => "mean output; ",
             (StandIn::Global, false) => "",
         };
-        format!("{form}{}", Self::key(graph, e))
+        format!("{form}{}", Self::key(e))
     }
 
     /// Stores `M`'s outcome under `key`, dropping the oldest past the byte budget.
@@ -3379,7 +3286,7 @@ impl Checker {
     pub fn score_batch(&mut self, programs: &[Program], count: usize, seed: u64, edges: bool, n: Option<f64>, top: usize) -> Result<Vec<(Score, Vec<Measured>)>, String> {
         let n = n.unwrap_or_else(|| self.behavior.size());
         let seed = self.uniform_seeds.map_or(seed, |m| seed % m.max(1));
-        let strongest = self.strongest()?;
+        let targets = self.targets()?;
         self.site_references.lock().map_err(|e| e.to_string())?.clear();
         let parsed: Vec<(Graph, bool, Option<String>)> = programs
             .iter()
@@ -3393,78 +3300,20 @@ impl Checker {
         }
         let circuits: Vec<Circuit> = parsed.iter().map(|(g, _, _)| g.program(&self.weights, edges)).collect();
         let models: Vec<Circuit> = parsed.iter().map(|(g, _, _)| g.model(&self.weights)).collect();
-        // Per program its experiments; per run (program, experiment) the cache key of M's outcome.
+        // One experiment set for every program (design.txt section 2), drawn from the seed alone;
+        // site operations that read a donor are left out when the behavior has none.
+        let donors = self.counterfactual_donors() || !self.donors.is_empty();
+        let experiments: Vec<Experiment> = sample(&self.weights, self.counterfactual.is_some(), count, seed, &targets, &self.sites)
+            .into_iter()
+            .filter(|e| donors || !matches!(e, Experiment::Sites { draw } if Interventions::needs_donor(draw)))
+            .collect();
+        // Per run (program, experiment) the cache key of M's outcome.
         let mut runs: Vec<(usize, Experiment, String)> = Vec::new();
         let mut drawn = vec![0usize; programs.len()];
         for (i, (graph, _, _)) in parsed.iter().enumerate() {
-            for e in sample(&self.weights, graph, self.counterfactual.is_some(), count, seed, &strongest, &self.sites) {
-                if matches!(e, Experiment::Swap { .. }) && self.donors.is_empty() {
-                    continue;
-                }
-                let key = self.model_key(graph, &e);
-                runs.push((i, e, key));
+            for e in &experiments {
+                runs.push((i, e.clone(), self.model_key(graph, e)));
                 drawn[i] += 1;
-            }
-        }
-        // An undeclared cut takes the strongest of three drawn undeclared cuts (the drawn one and two
-        // more): strength is M's mean KL(M ‖ M_cut) at the targets, measured (cached, in parallel),
-        // so the aimed half tests the omitted connections that carry the most.
-        let mut contest: Vec<(usize, Vec<(Experiment, String)>)> = Vec::new();
-        let first: Vec<usize> = drawn.iter().scan(0, |at, d| { let f = *at; *at += d; Some(f) }).collect();
-        for (r, (i, e, key)) in runs.iter().enumerate() {
-            if let Experiment::Cut { declared: false, .. } = e {
-                let graph = &parsed[*i].0;
-                // Seeded by the run's place among its program's draws, so a program draws the same
-                // entrants alone or in a batch.
-                let k = (r - first[*i]) as u64;
-                let mut rng = StdRng::seed_from_u64(seed ^ 0xC0_7C07 ^ k.wrapping_mul(0x9E37_79B9));
-                let mut entrants = vec![(e.clone(), key.clone())];
-                for _ in 0..2 {
-                    let c = cut_draw(graph, self.weights.layers.len(), &mut rng);
-                    if matches!(c, Experiment::Cut { declared: false, .. }) && !entrants.iter().any(|(x, _)| *x == c) {
-                        let k = self.model_key(graph, &c);
-                        entrants.push((c, k));
-                    }
-                }
-                if entrants.len() > 1 {
-                    contest.push((r, entrants));
-                }
-            }
-        }
-        if !contest.is_empty() {
-            let clean_m = self.model_outcome(&Graph::empty(), &Experiment::Clean)?;
-            let mut wanted: Vec<(usize, Experiment, String)> = Vec::new();
-            for (r, entrants) in &contest {
-                for (e, k) in entrants {
-                    if !self.cache.contains_key(k) && !wanted.iter().any(|w| w.2 == *k) {
-                        wanted.push((runs[*r].0, e.clone(), k.clone()));
-                    }
-                }
-            }
-            let this = &*self;
-            let made: Vec<(String, Arc<Array2<f64>>)> = wanted
-                .par_iter()
-                .map(|(i, e, k)| -> Result<(String, Arc<Array2<f64>>), String> {
-                    if let Some(m) = this.disk_get(k) {
-                        return Ok((k.clone(), Arc::new(m)));
-                    }
-                    let m = this.run(&models[*i], e)?;
-                    this.disk_put(k, &m);
-                    Ok((k.clone(), Arc::new(m)))
-                })
-                .collect::<Result<_, String>>()?;
-            for (k, m) in made {
-                self.keep(k, m);
-            }
-            for (r, entrants) in contest {
-                let strength = |k: &String| self.cache.get(k).map_or(f64::NEG_INFINITY, |m| {
-                    let kl = kl_bits(&clean_m, m);
-                    kl.iter().sum::<f64>() / kl.len().max(1) as f64
-                });
-                if let Some((e, k)) = entrants.into_iter().max_by(|a, b| strength(&a.1).total_cmp(&strength(&b.1))) {
-                    runs[r].1 = e;
-                    runs[r].2 = k;
-                }
             }
         }
         // Runs grouped by the weight edit they apply (none first).
@@ -3592,32 +3441,98 @@ impl Checker {
         Ok(out)
     }
 
-    /// Heads by measured removal effect, strongest first (cached).
-    pub fn strongest(&mut self) -> Result<Vec<(usize, usize)>, String> {
-        if let Some(s) = &self.strongest {
-            return Ok(s.clone());
+    /// `M`'s strongest pieces and connections for the behavior ([`Targets`]), measured once and
+    /// kept: every head's and every MLP's output zeroed at every token (equal to its removal,
+    /// graph_sites_tests), the two strongest MLPs' neurons removed in 8 contiguous groups (and, with
+    /// a VPD view, each of their two matrices' subcomponents in 8 groups), and every attention's and
+    /// MLP's output cut into each of the next 8 blocks from the counterfactual; a piece's or
+    /// connection's effect is the mean `KL(M ‖ M_e)` at the targets.
+    pub fn targets(&mut self) -> Result<Targets, String> {
+        if let Some(t) = &self.targets {
+            return Ok(t.clone());
         }
         let graph = Graph::empty();
         let clean = self.model_outcome(&graph, &Experiment::Clean)?;
-        // A head's output zeroed at every token is the head removed (graph_sites_tests), and site
-        // operations leave the weights alone, so every head runs in parallel.
-        let heads: Vec<(usize, usize)> = self.weights.layers.iter().enumerate().flat_map(|(l, layer)| (0..layer.heads.len()).map(move |h| (l, h))).collect();
+        let effect = |m: &Array2<f64>| {
+            let kl = kl_bits(&clean, m);
+            kl.iter().sum::<f64>() / kl.len().max(1) as f64
+        };
+        let layers = self.weights.layers.len();
+        let blocks = 2 * layers;
+        let every = |site: SharedSite, operation: Operation, family: interchange::Family| Experiment::Sites { draw: SiteDraw { family, ops: vec![SiteOp { site, operation, onward: true }], position: 0, length: 1 } };
+        // Site operations leave the weights alone, so they run in parallel.
+        let mut site_runs: Vec<(Option<Block>, Option<SiteOp>, Experiment)> = Vec::new();
+        let mut h = 0;
+        for (l, layer) in self.weights.layers.iter().enumerate() {
+            for head in 0..layer.heads.len() {
+                site_runs.push((Some(Block::Heads { layer: l, heads: vec![head] }), None, every(SharedSite::Head(h), Operation::Scale(0), interchange::Family::Zero)));
+                h += 1;
+            }
+            if self.weights.neurons(l) > 0 {
+                site_runs.push((Some(Block::Neurons { layer: l, neurons: (0..self.weights.neurons(l)).collect() }), None, every(SharedSite::Mlp(l), Operation::Scale(0), interchange::Family::Zero)));
+            }
+        }
+        if self.counterfactual_donors() || !self.donors.is_empty() {
+            for from in 0..blocks.saturating_sub(1) {
+                let site = if from % 2 == 0 { SharedSite::Attention(from / 2) } else { SharedSite::Mlp(from / 2) };
+                for to in from + 1..blocks.min(from + 9) {
+                    let op = SiteOp { site, operation: Operation::Cut { to }, onward: true };
+                    site_runs.push((None, Some(op), every(site, op.operation, interchange::Family::Cut)));
+                }
+            }
+        }
         let model = graph.model(&self.weights);
         let this = &*self;
-        let mut effects: Vec<((usize, usize), f64)> = heads
+        let measured: Vec<f64> = site_runs
             .par_iter()
-            .enumerate()
-            .map(|(k, &lh)| {
-                let draw = SiteDraw { family: interchange::Family::Zero, ops: vec![SiteOp { site: SharedSite::Head(k), operation: Operation::Scale(0), onward: true }], position: 0, length: 1 };
-                let removed = this.run(&model, &Experiment::Sites { draw })?;
-                let kl = kl_bits(&clean, &removed);
-                Ok((lh, kl.iter().sum::<f64>() / kl.len().max(1) as f64))
+            .map(|(_, _, e)| -> Result<f64, String> {
+                let key = this.model_key(&graph, e);
+                let m = match this.disk_get(&key) {
+                    Some(m) => m,
+                    None => {
+                        let m = this.run(&model, e)?;
+                        this.disk_put(&key, &m);
+                        m
+                    }
+                };
+                Ok(effect(&m))
             })
             .collect::<Result<_, String>>()?;
-        effects.sort_by(|a, b| b.1.total_cmp(&a.1));
-        let order: Vec<(usize, usize)> = effects.into_iter().map(|(k, _)| k).collect();
-        self.strongest = Some(order.clone());
-        Ok(order)
+        let mut targets = Targets::default();
+        for ((piece, cut, _), e) in site_runs.into_iter().zip(measured) {
+            if let Some(b) = piece {
+                targets.pieces.push((b, e));
+            }
+            if let Some(c) = cut {
+                targets.cuts.push((c, e));
+            }
+        }
+        // Sub-blocks of the two strongest MLPs: weight edits, one at a time.
+        let mut mlps: Vec<(usize, f64)> = targets.pieces.iter().filter_map(|(b, e)| if let Block::Neurons { layer, .. } = b { Some((*layer, *e)) } else { None }).collect();
+        mlps.sort_by(|a, b| b.1.total_cmp(&a.1));
+        for &(layer, _) in mlps.iter().take(2) {
+            let n = self.weights.neurons(layer);
+            let mut groups: Vec<(Block, WeightEdit)> = (0..8).map(|g| (g * n / 8..(g + 1) * n / 8).collect::<Vec<usize>>()).filter(|g| !g.is_empty()).map(|g| (Block::Neurons { layer, neurons: g.clone() }, WeightEdit::Neurons { layer, neurons: g, factor: 0.0 })).collect();
+            if let Some(v) = self.weights.vpd.get(&layer) {
+                for (down, count) in [(false, v.fc_u.nrows()), (true, v.down_u.nrows())] {
+                    for g in 0..8 {
+                        let indices: Vec<usize> = (g * count / 8..(g + 1) * count / 8).collect();
+                        if !indices.is_empty() {
+                            let block = if down { Block::Slices { layer, fc: Vec::new(), down: indices.clone(), rest: false } } else { Block::Slices { layer, fc: indices.clone(), down: Vec::new(), rest: false } };
+                            groups.push((block, WeightEdit::Subcomponents { layer, down, indices, factor: 0.0 }));
+                        }
+                    }
+                }
+            }
+            for (block, edit) in groups {
+                let m = self.model_outcome(&graph, &Experiment::Edit { edit, targeted: true })?;
+                targets.pieces.push((block, effect(&m)));
+            }
+        }
+        targets.pieces.sort_by(|a, b| b.1.total_cmp(&a.1));
+        targets.cuts.sort_by(|a, b| b.1.total_cmp(&a.1));
+        self.targets = Some(targets.clone());
+        Ok(targets)
     }
 
     /// Whether every prompt has a counterfactual of its own length: the donor of site operations.
@@ -3671,7 +3586,6 @@ impl Checker {
     /// same-length donor; a counterfactual's positions are the prompt's.
     pub fn rows_of(&self, e: &Experiment) -> Vec<(usize, usize)> {
         let subset = match e {
-            Experiment::Swap { .. } => true,
             Experiment::Sites { draw } => Interventions::needs_donor(draw) && !self.counterfactual_donors(),
             _ => false,
         };

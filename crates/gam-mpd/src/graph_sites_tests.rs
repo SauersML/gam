@@ -188,20 +188,29 @@ fn manifest_experiments_load() {
     std::fs::remove_dir_all(&dir).expect("the test directory is removed");
 }
 
-/// The behavior's half of the draws depends on the seed alone: two programs face the same
-/// experiments there, so `M`'s cached outcomes serve both.
+/// The draws depend on the seed and the measured targets alone (no program), and targeted edits
+/// take the strongest pieces whole.
 #[test]
-fn the_behaviors_half_is_the_same_for_every_program() {
+fn the_experiments_come_from_the_seed_and_the_targets() {
     let (weights, _) = model("graph_sites_uniform");
     let pool = vec![draw(Family::Zero, &[(SharedSite::Head(0), Operation::Scale(0))], 0, true), draw(Family::Push, &[(SharedSite::Stream(1), Operation::Push { direction: 0, size: 0 })], 3, false)];
-    let full = Graph::parse(&full_program(), &weights).expect("parse");
     let units = SiteUnits { pool, ..SiteUnits::default() };
-    let a = sample(&weights, &Graph::empty(), false, 40, 11, &[], &units);
-    let b = sample(&weights, &full, false, 40, 11, &[], &units);
-    // Clean first, then the behavior's draws at even k.
-    let fixed = |v: &[crate::graph::Experiment]| v.iter().skip(1).step_by(2).cloned().collect::<Vec<_>>();
-    assert_eq!(fixed(&a), fixed(&b));
-    assert!(fixed(&a).iter().any(|e| e.family().starts_with("site_")));
+    let neurons = weights.layers[1].mlp.as_ref().expect("an MLP").gate.nrows();
+    let targets = crate::graph::Targets {
+        pieces: vec![(crate::graph::Block::Heads { layer: 1, heads: vec![0] }, 0.5), (crate::graph::Block::Neurons { layer: 1, neurons: (0..neurons).collect() }, 0.2)],
+        cuts: vec![(SiteOp { site: SharedSite::Attention(0), operation: Operation::Cut { to: 3 }, onward: true }, 0.3)],
+    };
+    let a = sample(&weights, true, 40, 11, &targets, &units);
+    assert_eq!(a, sample(&weights, true, 40, 11, &targets, &units));
+    assert_eq!(&a[..2], &[crate::graph::Experiment::Clean, crate::graph::Experiment::Counterfactual]);
+    assert!(a.iter().any(|e| e.family().starts_with("site_")));
+    let targeted: Vec<&crate::graph::Experiment> = a.iter().skip(3).step_by(2).collect();
+    assert!(targeted.iter().all(|e| match e {
+        crate::graph::Experiment::Edit { edit: WeightEdit::Head { layer: 1, head: 0, .. }, targeted: true } => true,
+        crate::graph::Experiment::Edit { edit: WeightEdit::Neurons { layer: 1, neurons: n, .. }, targeted: true } => n.len() == neurons,
+        crate::graph::Experiment::Sites { draw } => draw.ops.len() == 1 && (draw.ops[0].site == SharedSite::Head(weights.layers[0].heads.len()) || draw.ops[0].site == SharedSite::Mlp(1) || draw.ops[0].operation == Operation::Cut { to: 3 }),
+        _ => false,
+    }), "{targeted:?}");
 }
 
 /// The empty program under counterfactual stand-ins and a site operation is `M` on the
@@ -267,16 +276,6 @@ fn typical_norms_cover_every_site_and_manifests_round_trip() {
     std::fs::remove_dir_all(&dir).expect("the test directory is removed");
 }
 
-#[test]
-fn aimed_sites_are_the_programs() {
-    let (weights, _) = model("graph_sites_aimed");
-    let heads = weights.layers[0].heads.len();
-    let mut program = Program { model: "tiny".into(), valid: true, ..Program::default() };
-    program.nodes = vec![NodeIr { id: "h".into(), pieces: vec![PieceIr { view: "native".into(), layer: 1, kind: "head".into(), index: Some(crate::graph::Index::One(0)) }], rule: None }];
-    let graph = Graph::parse(&program, &weights).expect("parse");
-    let aimed = SiteUnits::default().aimed_sites(&weights, &graph);
-    assert_eq!(aimed, vec![SharedSite::Stream(2), SharedSite::Head(heads), SharedSite::Attention(1), SharedSite::Input(2)]);
-}
 
 /// A behavior of the tiny export's sequences, each with the next one as its counterfactual.
 fn behavior(sequences: &[Vec<u32>]) -> Behavior {
@@ -418,18 +417,12 @@ fn attention_subcomponent_edits_split_over_heads() {
     }
 }
 
-/// The aimed half draws site operations on the program's own sites, and with `uniform_seeds` m a
-/// seed and the seed plus m score alike.
+/// Every program of a behavior faces the same experiments, its strongest pieces measured once, and
+/// with `uniform_seeds` m a seed and the seed plus m score alike.
 #[test]
-fn aimed_site_operations_and_recurring_seeds() {
-    let (weights, sequences) = model("graph_sites_aimed_draws");
+fn every_program_faces_the_same_experiments() {
+    let (weights, sequences) = model("graph_sites_fixed_set");
     let units = units(&weights);
-    let full = Graph::parse(&full_program(), &weights).expect("parse");
-    let aimed = units.aimed_sites(&weights, &full);
-    let drawn = sample(&weights, &full, false, 60, 2, &[], &units);
-    let sites: Vec<&SiteDraw> = drawn.iter().skip(2).step_by(2).filter_map(|e| if let crate::graph::Experiment::Sites { draw } = e { Some(draw) } else { None }).collect();
-    assert!(!sites.is_empty(), "no aimed site operation in 30 aimed draws");
-    assert!(sites.iter().all(|d| d.ops.iter().all(|o| aimed.contains(&o.site))), "an aimed operation off the program's sites");
     let mut checker = Checker::new(weights, behavior(&sequences)).expect("checker");
     checker.sites = units;
     checker.uniform_seeds = Some(4);
@@ -438,4 +431,11 @@ fn aimed_site_operations_and_recurring_seeds() {
     let (b, _) = checker.score(&program, 10, 7, true, None).expect("score");
     assert_eq!(a.exec_error_bits, b.exec_error_bits);
     assert_eq!(a.per_family.keys().collect::<Vec<_>>(), b.per_family.keys().collect::<Vec<_>>());
+    let empty = Program { model: "tiny".into(), valid: true, ..Program::default() };
+    let both = checker.score_batch(&[program, empty], 10, 3, true, None, 0).expect("batch");
+    let experiments = |m: &[crate::graph::Measured]| m.iter().map(|x| x.0.clone()).collect::<Vec<_>>();
+    assert_eq!(experiments(&both[0].1), experiments(&both[1].1));
+    let targets = checker.targets().expect("targets");
+    assert!(targets.pieces.windows(2).all(|w| w[0].1 >= w[1].1) && targets.cuts.windows(2).all(|w| w[0].1 >= w[1].1));
+    assert!(targets.pieces.iter().any(|(b, _)| matches!(b, crate::graph::Block::Heads { .. })) && !targets.cuts.is_empty());
 }
