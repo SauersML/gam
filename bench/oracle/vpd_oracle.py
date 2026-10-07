@@ -55,7 +55,11 @@ u for o_proj and down_proj, W_O u for v_proj, W_down u for c_fc) and, for a dire
 each option token's unembedding row g_f * e_X in the next slots (option order), both through one map
 `resid_write`; in the other conditions the write arrives in its site's basis (c_fc's 3072 hidden units,
 v_proj's value space) and the option tokens only as the reader's own text, so the map would have to learn
-vpd4l's vocabulary to compare them. Needs --lens.
+vpd4l's vocabulary to compare them. Needs --lens. weights_tokens_signed puts the edit's sign and size on
+the vector side too: for a question about an edit, the write slot carries the edit's direct write change
+at the marked token, D = (alpha - 1) sum_i a_i r_i over the edited subcomponents (the subcomponent, or its
+group of 8; a_i their activities there), log ||D|| on the magnitude term, so the sign of D . g_f e_X (the
+direct-effect rule) is one contraction between slots.
 
 Held out: subcomponents of --heldout-layers (never trained on) on held-out texts (the held-out runs), and
 trained layers on held-out texts.
@@ -90,7 +94,7 @@ from reporter import Injection, Magnitude  # noqa: E402
 KINDS = ("q_proj", "k_proj", "v_proj", "o_proj", "c_fc", "down_proj", "head", "function")  # VPD's sites, then the library's
 LABELS = "ABCDEFGHIJ"
 CONDITIONS = ("graph", "weights", "activity", "nothing", "graph_lens", "weights_lens", "weights_examples", "examples", "weights_activity", "weights_activity_lens",
-              "weights_tokens", "weights_tokens_lens")
+              "weights_tokens", "weights_tokens_lens", "weights_tokens_signed")
 QUESTIONS = ("activity", "direction", "top", "continuation", "edge", "attribution", "effect")
 # The edit's effect on M at the edited token, KL(M_e || M) in bits: the edits driver's bins (also the
 # effect question's answers; "barely" includes no change at all).
@@ -257,6 +261,23 @@ class Table:
 
     def piece(self, token: int) -> str:
         return json.dumps(self.tok.decode([int(token)]))
+
+    def edit_write(self, ex: dict) -> torch.Tensor | None:
+        """The question's edit's direct write change at the marked token, in the residual stream:
+        (alpha - 1) sum_i a_i r_i over the edited subcomponents (the subcomponent, or for a _group variant
+        its group, with their activities at p), r_i the write lens's direction; None without a write (q, k)."""
+        layer, kind, c, j = ex["layer"], ex["kind"], ex["c"], ex["j"]
+        n = site_name(layer, kind)
+        if self.lens is None or f"{n}.write" not in self.lens:
+            return None
+        meta, d = self.sites[(layer, kind)]
+        factor = -1.0 if ex["edit"] == "ablate" else meta.get("amplify", 1.5) - 1.0
+        if "group" in (ex.get("variant") or ""):
+            members, acts = d["group"][c, j].long(), d["group_act"][c, j].float()
+        else:
+            members = torch.tensor([self.number(layer, kind, c)])
+            acts = d["activity"][c, j, int(d["position"][c, j])].float().reshape(1)
+        return factor * (acts[:, None] * self.lens[f"{n}.write"][members].float()).sum(0)
 
     def residual_write(self, layer: int, kind: str, c: int) -> torch.Tensor | None:
         """Subcomponent c's write as its residual direction r (vpd_lens.py's write lens), or None (q, k)."""
@@ -593,19 +614,23 @@ def exemplars(table: Table, ex: dict, n: int = 3) -> str:
 def base(condition: str) -> str:
     """The condition's vector input (a *_lens, *_examples or *_activity condition adds text to graph's or
     weights')."""
-    return condition.removesuffix("_lens").removesuffix("_examples").removesuffix("_activity").removesuffix("_tokens")  # weights_activity_lens -> weights
+    return condition.removesuffix("_lens").removesuffix("_examples").removesuffix("_activity").removesuffix("_signed").removesuffix("_tokens")  # weights_activity_lens -> weights
 
 
 def slots(table: Table, ex: dict, condition: str) -> list[tuple]:
     """The example's subcomponents in slot order: (layer, kind, index, log magnitude, role prefix, shown);
     a *_tokens condition marks the subcomponent's kind "<kind>@resid" (its write as r) and adds, for a
     direction or top question, one slot per option token (kind "token", index its id; read side only)."""
-    tokens = "_tokens" in condition
+    tokens, signed = "_tokens" in condition, "_signed" in condition
     condition = base(condition)
     out = []
     if ex["c"] >= 0:
         v, u = table.vectors(ex["layer"], ex["kind"], ex["c"])
-        out.append((ex["layer"], ex["kind"] + ("@resid" if tokens else ""), ex["c"], math.log(float(u.norm() * v.norm())), "", condition in ("graph", "weights")))
+        D = table.edit_write(ex) if signed and ex.get("edit") and ex["kind_q"] in ("direction", "top", "effect") else None
+        if D is not None:  # the edit's direct write change replaces the write (a 7th entry: the write side's vector)
+            out.append((ex["layer"], ex["kind"], ex["c"], math.log(max(float(D.norm()), 1e-30)), "", condition == "weights", D))
+        else:
+            out.append((ex["layer"], ex["kind"] + ("@resid" if tokens else ""), ex["c"], math.log(float(u.norm() * v.norm())), "", condition in ("graph", "weights")))
     if tokens and ex["kind_q"] in ("direction", "top") and ex["c"] >= 0:
         # The option tokens' unembedding rows; the down_read role and the layer past the last mark them (the
         # weights conditions show no neighbours, whose role it is otherwise).
@@ -743,8 +768,10 @@ class Oracle(torch.nn.Module):
                     cols.append(where[2 * s + h])
                     x = None
                     if s < len(items):
-                        layer, kind, c, mag, prefix, shown = items[s]
-                        if kind == "token":  # an option token's unembedding row g_f * e_X, read side only
+                        layer, kind, c, mag, prefix, shown, *given = items[s]
+                        if given and side == "write":  # a residual vector given by slots (the edit's direct write change)
+                            x = (given[0], "resid_write")
+                        elif kind == "token":  # an option token's unembedding row g_f * e_X, read side only
                             x = (table.lens["unembed"][c].float(), "resid_write") if side == "read" else None
                         elif kind.endswith("@resid") and side == "write" and table.residual_write(layer, kind.removesuffix("@resid"), c) is not None:
                             x = (table.residual_write(layer, kind.removesuffix("@resid"), c), "resid_write")  # r, in the residual stream
