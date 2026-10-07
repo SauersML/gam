@@ -1199,16 +1199,15 @@ YES_NO = [("Is the sun hot?", "Yes"), ("Is ice cold?", "Yes"), ("Can fish swim?"
 @family
 def yes_no_facts(tok, rng):
     """Answer a yes/no commonsense question."""
-    v = Variant("qa", "Yes/no questions about everyday facts after two answered examples; the counterfactual asks a question with the other answer.")
+    v = Variant("qa", "Yes/no questions about everyday facts after two answered examples; the counterfactual asks a question with the other answer after the same examples.")
     yes = [q for q, a in YES_NO if a == "Yes"]
     no = [q for q, a in YES_NO if a == "No"]
-    for _ in range(300):
-        q1, q2 = rng.choice(yes), rng.choice(no)
-        shots = "Q: Is milk white?\nA: Yes\nQ: Do fish walk?\nA: No\n"
-        if rng.random() < 0.5:
-            v.items.append(Item(shots + f"Q: {q1}\nA:", " Yes", shots + f"Q: {q2}\nA:", " No"))
-        else:
-            v.items.append(Item(shots + f"Q: {q2}\nA:", " No", shots + f"Q: {q1}\nA:", " Yes"))
+    for k in range(12):  # each pair of worked examples is one template; build.py pairs questions within it
+        sy, sn = rng.choice(yes), rng.choice(no)
+        shots = f"Q: {sy}\nA: Yes\nQ: {sn}\nA: No\n" if rng.random() < 0.5 else f"Q: {sn}\nA: No\nQ: {sy}\nA: Yes\n"
+        for q, ans in YES_NO:
+            if q not in (sy, sn):
+                v.items.append(Item(shots + f"Q: {q}\nA:", " " + ans, tmpl=k))
     return [v]
 
 
