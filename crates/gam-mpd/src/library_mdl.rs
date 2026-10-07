@@ -4345,11 +4345,14 @@ pub fn fit_from(
         log::info!("library fit epoch {epoch}: {record:?}");
         let (log_sd, magnitude, variances) = posterior.spread();
         log::info!("library posterior after epoch {epoch}: mean ln σ {log_sd:.5}, mean |μ| {magnitude:.6e}, Σ v_G {variances:.6e}");
-        // Nothing nonfinite is checkpointed: the epoch fails at its record instead.
+        // Nothing nonfinite is checkpointed: the epoch fails at its record instead. With every
+        // group removed (a removal round may remove them all, and the descent goes on) the spread's
+        // means average no entry (0 / 0) and are left out.
         let held = &record.held_out;
-        let values = [record.data_bits, record.snapshot_bits, held.objective_bits_per_token, held.data_bits_per_token, held.mean_bits_per_token, held.rounded_bits_per_token, held.divergence_bits, log_sd, magnitude, variances];
-        if values.iter().any(|v| !v.is_finite()) {
-            return Err(format!("epoch {epoch}: nonfinite record (data, snapshot, held-out F, data, mean, rounded, divergence, mean ln σ, mean |μ|, Σ v_G: {values:?})"));
+        let values = [record.data_bits, record.snapshot_bits, held.objective_bits_per_token, held.data_bits_per_token, held.mean_bits_per_token, held.rounded_bits_per_token, held.divergence_bits, variances];
+        let means = if posterior.active.iter().any(|a| *a) { vec![log_sd, magnitude] } else { Vec::new() };
+        if values.iter().chain(&means).any(|v| !v.is_finite()) {
+            return Err(format!("epoch {epoch}: nonfinite record (data, snapshot, held-out F, data, mean, rounded, divergence, Σ v_G: {values:?}; mean ln σ, mean |μ|: {means:?})"));
         }
         progress.epochs.push(record);
         progress.previous = Some(snapshot);
