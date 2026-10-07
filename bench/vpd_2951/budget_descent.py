@@ -578,6 +578,13 @@ def swaps_of(n, T_):
     """Head swaps on map n (o_proj) in the installed edits: (h1, h2, the edited sequence's token rows)."""
     return [(h[0], h[1], torch.arange(b * T_, (b + 1) * T_, device=dev)) for b, kind, h, _ in state['entry'].get(n, ()) if kind == 'swap']
 
+def force_rows(hard, soft, T_):
+    """The all-on sequences' gates [H, B*T, C] forced on (their token rows b*T .. (b+1)*T - 1)."""
+    if not state['force_on']:
+        return hard, soft
+    rows = torch.cat([torch.arange(b * T_, (b + 1) * T_, device=hard.device) for b in state['force_on']])
+    return hard.index_fill(1, rows, 1.0), soft.index_fill(1, rows, 1.0)
+
 def make_attn(n):
     st = T.site(n); p = A[n]
     def fwd(x):
@@ -596,7 +603,7 @@ def make_attn(n):
         if state.get('capture') is not None and p['o']:
             state['capture'].setdefault(n, []).append(c.abs() * p['U'].norm(dim=-1)[:, None, :])
         if SHARE_A and p['o'] and state['mode'] != 'all':
-            hard, soft = share_o(int(n.split('.')[1]), c, p)
+            hard, soft = force_rows(*share_o(int(n.split('.')[1]), c, p), x.shape[1])
             state['hard'].append(hard.sum((0, 2)))
             if state['mode'] == 'hard':
                 g = hard
@@ -609,12 +616,11 @@ def make_attn(n):
             g = 1.0
         else:
             z = (c.abs() * p['U'].norm(dim=-1)[:, None, :] - p['tau'][:, None, :]) / p['s'][:, None, :]
-            hard = (z > 0).float()
+            hard, phi = force_rows((z > 0).float(), 0.5 * (1 + torch.erf(z / SQ2)), x.shape[1])
             state['hard'].append(hard.sum((0, 2)))
             if state['mode'] == 'hard':
                 g = hard
             else:
-                phi = 0.5 * (1 + torch.erf(z / SQ2))
                 state['soft'].append(phi.sum((0, 2)))
                 g = phi if gate == 'mf' else hard + phi - phi.detach()
         y = head_output(c * g, p['U'], p['o'], swaps_of(n, x.shape[1])).view(x.shape[0], x.shape[1], -1)
@@ -781,6 +787,10 @@ def attn_v(l, h, pattern):
         else:
             z = (r - p['tau'][None, :, None, :]) / p['s'][None, :, None, :]
             hard = (z > 0).float(); soft = 0.5 * (1 + torch.erf(z / SQ2))
+        if state['force_on']:
+            # The all-on sequences' gates on.
+            on = torch.tensor(state['force_on'], device=hard.device)
+            hard, soft = hard.index_fill(0, on, 1.0), soft.index_fill(0, on, 1.0)
         state['hard'].append(hard.sum((1, 3)).reshape(-1))
         if state['mode'] == 'hard':
             g = hard
