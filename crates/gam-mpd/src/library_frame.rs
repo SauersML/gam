@@ -14,7 +14,7 @@
 //! through a frame, while an MLP whose law is elementwise nonlinear keeps its neuron groups (the
 //! law privileges the neuron axis): per neuron its c_fc row and down_proj column.
 //!
-//! Two frames ([`FrameKind`]):
+//! Three frames ([`FrameKind`]):
 //! * `Tight`: `C` standard normal atoms made a Parseval frame, `F ← F (FᵀF)^{-1/2}`, so its dual
 //!   is itself; no data.
 //! * `Dictionary`: a one-sparse dictionary of `M`'s activations at the read on fitting rows
@@ -23,6 +23,11 @@
 //!   repeated until no assignment changes). The atoms are directions the activations take one at a
 //!   time; no ground truth is used. Directions the activations never take are completed by the
 //!   unresolved eigenvectors of the atoms' Gram, so the frame spans its space.
+//!
+//! * `Sparse`: a k-sparse dictionary (orthogonal matching pursuit, each row's atom count the one of
+//!   shortest two-part code, so `k` is the data's own sparsity; atoms by the method of optimal
+//!   directions) with the dual of least ℓ1 norm of its coefficients on the fitting rows among all
+//!   duals, so the reads are sparse on the data and every map is still cut exactly.
 //!
 //! Each component is one atom's slices on the maps reading its space, with one own gate at that
 //! read, started at `τ = 0`: on wherever it reads anything, which is everywhere its output is
@@ -54,6 +59,9 @@ fn error(e: impl std::fmt::Display) -> String {
 pub enum FrameKind {
     Tight,
     Dictionary,
+    /// A k-sparse dictionary with its sparse dual ([`Frame::sparse_dictionary`],
+    /// [`Frame::sparse_dual`]).
+    Sparse,
 }
 
 /// A frame of a read space: its atoms as rows, `C × d`.
@@ -126,18 +134,7 @@ impl Frame {
         // no atom; they are completed by the unresolved eigenvectors of the atoms' Gram, so the
         // frame spans the space and every map is still cut exactly (their components read nothing
         // on the fitting rows).
-        let gram = fast_ata(&atoms);
-        let decomposition = eigh(gram.view(), SymmetricAssembly::Mirrored, None).map_err(|e| error(format!("{e:?}")))?;
-        let largest = decomposition.values.iter().fold(0.0_f64, |m, v| m.max(*v));
-        let floor = decomposition.band.max(largest * f64::EPSILON * dim as f64);
-        let missing: Vec<usize> = (0..dim).filter(|&k| decomposition.values[k] <= floor).collect();
-        if !missing.is_empty() {
-            let complement = decomposition.vectors.select(Axis(1), &missing).t().to_owned();
-            atoms = concatenate(Axis(0), &[atoms.view(), complement.view()]).map_err(error)?;
-        }
-        let frame = Self { atoms };
-        frame.dual()?;
-        Ok(frame)
+        Self::dictionary_completed(atoms)
     }
 
     /// The canonical dual, `C × d`: rows `g_i = (FᵀF)⁻¹ f_i`. Refused for atoms that do not span.
@@ -159,8 +156,158 @@ impl Frame {
         match kind {
             FrameKind::Tight => Ok(tight),
             FrameKind::Dictionary => Self::dictionary(rows, tight),
+            FrameKind::Sparse => Ok(Self::sparse_dictionary(rows, tight)?.0),
         }
     }
+
+    /// A k-sparse dictionary of `rows` (one per row), started at `start`, and the rows' mean atom
+    /// count. Each row is coded by orthogonal matching pursuit over the unit atoms, its atom count
+    /// the one of shortest two-part code: per atom its index and coefficient,
+    /// `log₂ C + ½ log₂ N` bits (`N` the rows), and the residual at its own mean square per
+    /// dimension, `(d/2) log₂(‖r‖²/d)`, down to the rounding of the row (`‖r‖² ≥ d (ε‖x‖)²`), so
+    /// the count is the data's own sparsity, measured, not set. The atoms are then the least squares
+    /// fit to the codes (the method of optimal directions), unit again; repeated until no row's
+    /// support changes. Directions the rows never take are completed as in [`Frame::dictionary`].
+    pub fn sparse_dictionary(rows: &Array2<f64>, start: Frame) -> Result<(Self, f64), String> {
+        let (count, dim) = start.atoms.dim();
+        let live: Vec<usize> = (0..rows.nrows()).filter(|&r| rows.row(r).iter().any(|v| *v != 0.0)).collect();
+        let x = rows.select(Axis(0), &live);
+        let mut atoms = start.atoms;
+        let unit = |atoms: &mut Array2<f64>| {
+            for mut atom in atoms.rows_mut() {
+                let norm = atom.dot(&atom).sqrt();
+                if norm > 0.0 {
+                    atom.mapv_inplace(|v| v / norm);
+                }
+            }
+        };
+        unit(&mut atoms);
+        let bits_per_atom = (count as f64).log2() + 0.5 * (x.nrows().max(1) as f64).log2();
+        let mut supports: Vec<Vec<usize>> = Vec::new();
+        let mut mean_k = 0.0;
+        for _ in 0..100 {
+            let codes: Vec<(Vec<usize>, Vec<f64>)> = (0..x.nrows()).map(|r| pursuit(x.row(r), &atoms, bits_per_atom)).collect::<Result<_, _>>()?;
+            let next: Vec<Vec<usize>> = codes.iter().map(|(support, _)| support.clone()).collect();
+            mean_k = next.iter().map(Vec::len).sum::<usize>() as f64 / next.len().max(1) as f64;
+            if next == supports {
+                break;
+            }
+            supports = next;
+            // The method of optimal directions: atoms = (AᵀA)⁺ Aᵀ X over the codes A.
+            let mut ata = Array2::<f64>::zeros((count, count));
+            let mut atx = Array2::<f64>::zeros((count, dim));
+            for (r, (support, coefficients)) in codes.iter().enumerate() {
+                for (a, &i) in support.iter().enumerate() {
+                    for (b, &j) in support.iter().enumerate() {
+                        ata[[i, j]] += coefficients[a] * coefficients[b];
+                    }
+                    atx.row_mut(i).scaled_add(coefficients[a], &x.row(r));
+                }
+            }
+            let used: Vec<usize> = (0..count).filter(|&i| ata[[i, i]] > 0.0).collect();
+            if used.is_empty() {
+                break;
+            }
+            let sub = ata.select(Axis(0), &used).select(Axis(1), &used);
+            let inverse = eigh(sub.view(), SymmetricAssembly::Mirrored, None).map_err(|e| error(format!("{e:?}")))?.psd_map(0.0, |v| 1.0 / v).map_err(|e| error(format!("{e:?}")))?;
+            let fitted = inverse.dot(&atx.select(Axis(0), &used));
+            for (k, &i) in used.iter().enumerate() {
+                atoms.row_mut(i).assign(&fitted.row(k));
+            }
+            unit(&mut atoms);
+        }
+        let frame = Self::dictionary_completed(atoms)?;
+        Ok((frame, mean_k))
+    }
+
+    /// `atoms` completed by the unresolved eigenvectors of their Gram, so they span their space.
+    fn dictionary_completed(mut atoms: Array2<f64>) -> Result<Self, String> {
+        let dim = atoms.ncols();
+        let gram = fast_ata(&atoms);
+        let decomposition = eigh(gram.view(), SymmetricAssembly::Mirrored, None).map_err(|e| error(format!("{e:?}")))?;
+        let largest = decomposition.values.iter().fold(0.0_f64, |m, v| m.max(*v));
+        let floor = decomposition.band.max(largest * f64::EPSILON * dim as f64);
+        let missing: Vec<usize> = (0..dim).filter(|&k| decomposition.values[k] <= floor).collect();
+        if !missing.is_empty() {
+            let complement = decomposition.vectors.select(Axis(1), &missing).t().to_owned();
+            atoms = concatenate(Axis(0), &[atoms.view(), complement.view()]).map_err(error)?;
+        }
+        let frame = Self { atoms };
+        frame.dual()?;
+        Ok(frame)
+    }
+
+    /// The dual of least ℓ1 norm of its coefficients on `rows`: among the duals `G` (`C × d`,
+    /// `FᵀG = I`, so `Σ_i f_i g_iᵀ = I` and every map is still cut exactly), `G = G₀ + P W` with
+    /// `G₀` the canonical dual and `P = I − G₀Fᵀ` the projector onto the coefficient vectors no
+    /// atom combination synthesizes, the one minimizing `Σ_rows ‖G x‖₁`, by the alternating
+    /// direction method of multipliers (its penalty sets the speed, not the solution), to a
+    /// relative residual of 1e-9 or 2,000 passes. Returns the dual and its coefficients' mean
+    /// count of nonzeros per row (the ADMM's sparse iterate).
+    pub fn sparse_dual(&self, rows: &Array2<f64>) -> Result<(Array2<f64>, f64), String> {
+        let g0 = self.dual()?;
+        let count = self.atoms.nrows();
+        let p = Array2::<f64>::eye(count) - g0.dot(&self.atoms.t());
+        let x = rows;
+        let m0 = x.dot(&g0.t());
+        let xtx_inverse = eigh(fast_ata(x).view(), SymmetricAssembly::Mirrored, None).map_err(|e| error(format!("{e:?}")))?.psd_map(0.0, |v| 1.0 / v).map_err(|e| error(format!("{e:?}")))?;
+        let scale = m0.iter().map(|v| v.abs()).sum::<f64>() / m0.len().max(1) as f64;
+        let threshold = if scale > 0.0 { scale } else { 1.0 };
+        let (mut a, mut u) = (m0.clone(), Array2::<f64>::zeros(m0.dim()));
+        let mut y = Array2::<f64>::zeros((x.ncols(), count));
+        let norm = m0.iter().map(|v| v * v).sum::<f64>().sqrt().max(f64::MIN_POSITIVE);
+        for _ in 0..2000 {
+            let b = &a - &m0 - &u;
+            y = xtx_inverse.dot(&x.t().dot(&b)).dot(&p);
+            let t = &m0 + &x.dot(&y);
+            let previous = a.clone();
+            a = (&t + &u).mapv(|v| v.signum() * (v.abs() - threshold * 1e-3).max(0.0));
+            u = &u + &t - &a;
+            let primal = (&t - &a).iter().map(|v| v * v).sum::<f64>().sqrt();
+            let change = (&a - &previous).iter().map(|v| v * v).sum::<f64>().sqrt();
+            if primal <= 1e-9 * norm && change <= 1e-9 * norm {
+                break;
+            }
+        }
+        let dual = &g0 + &y.t();
+        let nonzeros = a.iter().filter(|v| **v != 0.0).count() as f64 / a.nrows().max(1) as f64;
+        Ok((dual, nonzeros))
+    }
+}
+
+/// Orthogonal matching pursuit of `x` over the unit `atoms` (rows), its atom count the one of
+/// shortest two-part code ([`Frame::sparse_dictionary`]): the support and its coefficients.
+fn pursuit(x: ndarray::ArrayView1<f64>, atoms: &Array2<f64>, bits_per_atom: f64) -> Result<(Vec<usize>, Vec<f64>), String> {
+    let dim = x.len();
+    let energy = x.dot(&x);
+    if energy == 0.0 {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let floor = dim as f64 * (f64::EPSILON * energy.sqrt()).powi(2);
+    let code_bits = |k: usize, residual: f64| k as f64 * bits_per_atom + 0.5 * dim as f64 * (residual.max(floor) / dim as f64).log2();
+    let (mut support, mut residual) = (Vec::new(), x.to_owned());
+    let mut best = (code_bits(0, energy), Vec::new(), Vec::new());
+    while support.len() < dim.min(atoms.nrows()) {
+        let scores = atoms.dot(&residual);
+        let next = (0..scores.len()).filter(|i| !support.contains(i)).max_by(|&a, &b| scores[a].abs().total_cmp(&scores[b].abs()));
+        let Some(next) = next else { break };
+        support.push(next);
+        let chosen = atoms.select(Axis(0), &support);
+        let gram = chosen.dot(&chosen.t());
+        let rhs = chosen.dot(&x).insert_axis(Axis(1));
+        let Ok(solved) = gam_linalg::decompose::solve(gram.view(), rhs.view()) else { break };
+        let coefficients = solved.column(0).to_vec();
+        residual = &x - &chosen.t().dot(&solved.column(0));
+        let left = residual.dot(&residual);
+        let bits = code_bits(support.len(), left);
+        if bits < best.0 {
+            best = (bits, support.clone(), coefficients);
+        }
+        if left <= floor {
+            break;
+        }
+    }
+    Ok((best.1, best.2))
 }
 
 /// The gates a component of the shared arm may move to, its own first (library_vpd's gate sharing;
@@ -189,6 +336,17 @@ fn candidates(magnitudes: &Array2<f64>, first: usize) -> Vec<Vec<usize>> {
             others.into_iter().map(|j| first + j).collect()
         })
         .collect()
+}
+
+/// The frame of `kind` for a space of `rows` and its dual: the sparse dual for a sparse frame, the
+/// canonical dual otherwise.
+fn framed(kind: FrameKind, rows: &Array2<f64>, seed: u64) -> Result<(Frame, Array2<f64>), String> {
+    let frame = Frame::of(kind, rows, seed)?;
+    let dual = match kind {
+        FrameKind::Sparse => frame.sparse_dual(rows)?.0,
+        _ => frame.dual()?,
+    };
+    Ok((frame, dual))
 }
 
 /// One component of a start file, as library_vpd reads it: its read, `τ = 0`, its gate's width
@@ -271,7 +429,7 @@ pub fn frame_start(native: &OperatorProgram, layers: &[LayerNodes], fitting: &Fa
     let trace = artifact.execute(fitting)?;
     let value = |node: usize| -> Result<Array2<f64>, String> { Ok(trace.values[artifact.place(node).ok_or_else(|| error(format!("no node {node}")))?].clone()) };
     let mut summary = Vec::new();
-    for (kind, name) in [(FrameKind::Tight, "tight"), (FrameKind::Dictionary, "dictionary")] {
+    for (kind, name) in [(FrameKind::Tight, "tight"), (FrameKind::Dictionary, "dictionary"), (FrameKind::Sparse, "sparse")] {
         let out = dir.join(name);
         std::fs::create_dir_all(&out).map_err(error)?;
         let (mut sites, mut files) = (Vec::new(), serde_json::Map::new());
@@ -309,8 +467,7 @@ pub fn frame_start(native: &OperatorProgram, layers: &[LayerNodes], fitting: &Fa
                 ));
                 (None, None)
             } else {
-                let frame = Frame::of(kind, &x, seed ^ (l as u64 * 6 + 1))?;
-                let dual = frame.dual()?;
+                let (frame, dual) = framed(kind, &x, seed ^ (l as u64 * 6 + 1))?;
                 for w in [&wq, &wk, &wv] {
                     layer_sites.push(Site::framed(w, &frame, &dual));
                 }
@@ -323,8 +480,7 @@ pub fn frame_start(native: &OperatorProgram, layers: &[LayerNodes], fitting: &Fa
                 layer_sites.push(Site::zero(wo.nrows(), wo.ncols()));
                 None
             } else {
-                let frame = Frame::of(kind, &heads_out, seed ^ (l as u64 * 6 + 2))?;
-                let dual = frame.dual()?;
+                let (frame, dual) = framed(kind, &heads_out, seed ^ (l as u64 * 6 + 2))?;
                 layer_sites.push(Site::framed(&wo, &frame, &dual));
                 Some((frame, dual))
             };
@@ -340,12 +496,10 @@ pub fn frame_start(native: &OperatorProgram, layers: &[LayerNodes], fitting: &Fa
                 layer_sites.push(Site::zero(down.nrows(), down.ncols()));
                 None
             } else if linear {
-                let up_frame = Frame::of(kind, &h2, seed ^ (l as u64 * 6 + 3))?;
-                let up_dual = up_frame.dual()?;
+                let (up_frame, up_dual) = framed(kind, &h2, seed ^ (l as u64 * 6 + 3))?;
                 layer_sites.push(Site::framed(&up, &up_frame, &up_dual));
                 let hidden = value(layer.active)?;
-                let down_frame = Frame::of(kind, &hidden, seed ^ (l as u64 * 6 + 4))?;
-                let down_dual = down_frame.dual()?;
+                let (down_frame, down_dual) = framed(kind, &hidden, seed ^ (l as u64 * 6 + 4))?;
                 layer_sites.push(Site::framed(&down, &down_frame, &down_dual));
                 Some((up_frame.atoms.nrows(), down_frame.atoms.nrows(), Some((up_dual, down_dual))))
             } else {
