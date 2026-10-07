@@ -142,6 +142,17 @@ pub struct DevicePosterior {
     /// whose arrays are not these ([`Shared::same`]; a removal trial shares the operators it does
     /// not change, and a write to a shared array copies it).
     uploaded: Vec<Option<(Shared, Shared)>>,
+    /// The last step's move, until the next batch's measured objective accepts or rejects it
+    /// ([`DevicePosterior::step`], [`DevicePosterior::revert`]): the iterate and its average
+    /// before the move, and the move's change of the prior's divergence at the iterate in nats.
+    pending: Option<Pending>,
+}
+
+/// A step's move awaiting its test ([`DevicePosterior::pending`]).
+struct Pending {
+    means: Vec<Tensor>,
+    averages: Vec<Tensor>,
+    divergence_nats: f64,
 }
 
 /// Each trainable operator's entries' groups, row-major.
@@ -301,6 +312,7 @@ impl DevicePosterior {
             tokens,
             steps,
             uploaded: Vec::new(),
+            pending: None,
         };
         out.average = out.mean.iter().map(|m| out.fitting.copy(m).map_err(error)).collect::<Result<_, _>>()?;
         out.refresh()?;
@@ -536,6 +548,16 @@ impl DevicePosterior {
             let held = self.hold || self.rho_steps < RATIO_DRAWS || self.slope_steps < RATIO_DRAWS;
             let eta = if held || !(curvature > 0.0 && slope.is_finite()) { 0.0 } else { slope / curvature };
             self.last_eta = eta;
+            // The move is kept until the next batch tests it (`pending`): the iterate and average
+            // before it, and the prior's divergence at the iterate before and after it (per group
+            // `Σ μ²` over `2 v_G`; the deviations are the move's own on both sides).
+            self.pending = None;
+            if eta != 0.0 {
+                let means = self.mean.iter().map(|m| self.fitting.copy(m)).collect::<Result<Vec<_>, _>>().map_err(error)?;
+                let averages = self.average.iter().map(|m| self.fitting.copy(m)).collect::<Result<Vec<_>, _>>().map_err(error)?;
+                let before = self.iterate_divergence()?;
+                self.pending = Some(Pending { means, averages, divergence_nats: -before });
+            }
             // The mean moved by `η d`, its Polyak average (uniform over the steps since the posterior
             // was set, then over about one epoch; module note) moved toward it, and the groups'
             // variances and divergences at the average, one pass per operator.
@@ -547,6 +569,57 @@ impl DevicePosterior {
                     .posterior_finish((&mut self.mean[i], d, eta), (&mut self.average[i], weight), &self.log_sd[i], &self.groups[i], &mut self.sums)
                     .map_err(error)?;
             }
+            if self.pending.is_some() {
+                let after = self.iterate_divergence()?;
+                if let Some(pending) = self.pending.as_mut() {
+                    pending.divergence_nats += after;
+                }
+            }
+        }
+        self.wide.group_divergence(&mut self.sums, self.reference.as_ref(), &mut self.variance, &mut self.divergence).map_err(error)
+    }
+
+    /// The prior's `μ`-dependent divergence at the iterate in nats, `Σ_G Σ_{j∈G} μ_j² / (2 v_G)` at the
+    /// groups' current variances: the part of `F`'s description a move of the iterate changes.
+    fn iterate_divergence(&self) -> Result<f64, String> {
+        let mut sums = self.wide.zeros(self.sums.rows(), 3).map_err(error)?;
+        for i in 0..self.mean.len() {
+            self.fitting.group_moments((&self.mean[i], &self.log_sd[i]), &self.groups[i], &mut sums).map_err(error)?;
+        }
+        let (sums, variances) = (self.wide.download(&sums).map_err(error)?, self.variances()?);
+        // Column 1 is `Σ μ² + σ²`; the deviations are the same on both sides of a move.
+        Ok(sums.column(1).iter().zip(&variances).map(|(s, v)| if *v > 0.0 { s / (2.0 * v) } else { 0.0 }).sum())
+    }
+
+    /// Whether the last step's move awaits its test, and that move's change of the prior's
+    /// divergence at the iterate in nats.
+    #[must_use]
+    pub fn pending_divergence(&self) -> Option<f64> {
+        self.pending.as_ref().map(|p| p.divergence_nats)
+    }
+
+    /// The weight sample of `key` around the iterate before the pending move, into `program`
+    /// (the old side of the move's test).
+    pub fn previous_into(&self, program: &mut DeviceProgram, key: u64) -> Result<(), String> {
+        let pending = self.pending.as_ref().ok_or_else(|| error("no pending move"))?;
+        self.sample_of(program, key, &pending.means)
+    }
+
+    /// Accepts the pending move: it stays.
+    pub fn accept(&mut self) {
+        self.pending = None;
+    }
+
+    /// Rejects the pending move: the iterate and its average are back where they were before it,
+    /// with the groups' variances and divergences at that average.
+    pub fn revert(&mut self) -> Result<(), String> {
+        let pending = self.pending.take().ok_or_else(|| error("no pending move"))?;
+        self.mean = pending.means;
+        self.average = pending.averages;
+        self.uploaded.clear();
+        self.sums = self.wide.zeros(self.sums.rows(), 3).map_err(error)?;
+        for i in 0..self.average.len() {
+            self.fitting.group_moments((&self.average[i], &self.log_sd[i]), &self.groups[i], &mut self.sums).map_err(error)?;
         }
         self.wide.group_divergence(&mut self.sums, self.reference.as_ref(), &mut self.variance, &mut self.divergence).map_err(error)
     }
@@ -635,6 +708,7 @@ impl DevicePosterior {
     /// sent keeps its curvature, and its momentum and the momentum's bias correction are zeroed:
     /// the momentum's gradients were taken at another point.
     pub fn set_values(&mut self, posterior: &Posterior) -> Result<(), String> {
+        self.pending = None;
         if posterior.mean.len() != self.mean.len() {
             return Err(error("one posterior array per trainable operator required"));
         }
@@ -785,6 +859,7 @@ impl DevicePosterior {
     /// averages over, restored exactly from a checkpoint ([`DevicePosterior::operator`],
     /// [`DevicePosterior::iterate`]): the fit goes on as if it had not stopped.
     pub fn restore(&mut self, held: &[Array2<f64>], iterate: &[Array2<f64>], averaged: u64) -> Result<(), String> {
+        self.pending = None;
         let fits = |arrays: &[Array2<f64>]| arrays.len() == self.mean.len() && arrays.iter().zip(&self.mean).all(|(a, m)| a.dim() == (m.rows(), m.cols()));
         if !fits(held) || !fits(iterate) {
             return Err(error("one mean and one iterate per trainable operator, of its shape, required"));

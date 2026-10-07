@@ -2198,8 +2198,14 @@ fn part_targets(scorer: &Scorer, batch: &Batch, experiments: Vec<Experiment>) ->
 /// of another law and every attention head with a surviving value executes on every token and
 /// counts one; a gated layer's fixed positions (where its block's output is not its functions',
 /// `library_transcoder`'s first token) count nothing of it.
-fn complexity_terms(scorer: &mut Scorer, device_posterior: &DevicePosterior, explanation: &Explanation, active: &[bool], batch: &Batch, key: u64) -> Result<(f64, Vec<(usize, Array2<f64>, Array2<f64>)>), String> {
-    device_posterior.iterate_into(scorer.experiments.explanation_mut(), key)?;
+fn complexity_terms(scorer: &mut Scorer, device_posterior: &DevicePosterior, explanation: &Explanation, active: &[bool], batch: &Batch, (key, previous): (u64, bool)) -> Result<(f64, Vec<(usize, Array2<f64>, Array2<f64>)>), String> {
+    // At the iterate's sample, or with `previous` around the iterate before the pending move (its
+    // test, `step_accepted`).
+    if previous {
+        device_posterior.previous_into(scorer.experiments.explanation_mut(), key)?;
+    } else {
+        device_posterior.iterate_into(scorer.experiments.explanation_mut(), key)?;
+    }
     let family = sequence_family(&batch.base.iter().map(Vec::as_slice).collect::<Vec<_>>())?;
     // The count's derivatives are a step's, so its forward and products run in the reverse passes'
     // arithmetic, as every evaluation of P with a gradient does (`Scorer::reversed`, b290535ec5).
@@ -2361,6 +2367,51 @@ fn gated_expected(
     };
     let expected = crate::library_complexity::Expected { count, rows, mean: Array2::zeros((parts, 0)), variance: Array2::zeros((parts, 0)), bias_mean, bias_variance };
     Ok((expected, gate_terms))
+}
+
+/// The test of the posterior's pending move (`DevicePosterior::pending_divergence`) on this step's
+/// batch: the change of the Lagrangian per token the move made, measured on the batch at the
+/// step's own weight samples on both sides (`new`: the batch's data bits and expected parts per
+/// token at the moved iterate, from the step itself; the same draws around the iterate before
+/// the move, `DevicePosterior::previous_into`), `ΔL = (B ln 2 Δbits + ΔKL) / N + λ ΔÊ` with `B`
+/// the batches, `N` the training tokens, `ΔKL` the move's change of the prior's divergence and
+/// `λ` the budget's multiplier. A batch the move was not made on, so the test is not the move's
+/// own fit. Accepted when `ΔL ≤ 0`; returns the decision and `ΔL`. A line step's quadratic model
+/// can be wrong (toys: TMS-id grouped own gates, η −9.5e-3 with ρ̄ NaN, the mean's KL from 4e-4 to
+/// 2e182 over epochs 2–6; resid_mlp_2l per-slice gates, η changing sign, 1.9 → 3.8e19); a move
+/// that raises the measured objective is not taken.
+fn step_accepted(
+    scorer: &mut Scorer,
+    device_posterior: &DevicePosterior,
+    explanation: &Explanation,
+    active: &[bool],
+    (batch, experiments, key): (&Batch, &[Experiment], u64),
+    (bits, expected): (f64, Option<f64>),
+    (scale, tokens, lambda): (f64, usize, f64),
+) -> Result<(bool, f64), String> {
+    let divergence = device_posterior.pending_divergence().ok_or("no pending move")?;
+    // The same parts and draws as the step's (`antithetic_step`).
+    let parts = step_parts(batch, experiments.to_vec());
+    let keys = [key, key ^ gam_gpu::tensor::ANTITHETIC];
+    let mut previous = 0.0;
+    for (part, k) in parts.iter().zip(keys) {
+        let targets = scorer.experiments.targets(batch, part)?;
+        device_posterior.previous_into(scorer.experiments.explanation_mut(), k)?;
+        let evaluation = scorer.reversed(|e| e.evaluate_probed(batch, part, Some(&targets), false, None))?;
+        if evaluation.bits.iter().flatten().any(|b| !b.is_finite()) {
+            return Err("nonfinite explanation divergence before the move".into());
+        }
+        previous += evaluation.bits.iter().flatten().sum::<f64>();
+    }
+    let budget = match expected {
+        Some(moved) if lambda > 0.0 => lambda * (moved - complexity_terms(scorer, device_posterior, explanation, active, batch, (key, true))?.0),
+        _ => 0.0,
+    };
+    let change = (scale * LN_2 * (bits - previous) + divergence) / tokens as f64 + budget;
+    if !change.is_finite() {
+        return Err(format!("a nonfinite change of the objective at the move's test ({change})"));
+    }
+    Ok((change <= 0.0, change))
 }
 
 /// Returns the experiments in the order of their bits.
@@ -3718,8 +3769,26 @@ pub fn fit_from(
             // mean's KL went from 1e-24 to 1.4e5 bits per token; re-measuring `λ̂` in its rate
             // (3a279507d3) moved it from 69 to 2,813 within three steps of a tiny vpd4l fit.
             let mut parts_note = String::new();
-            if let Some(limit) = settings.budget.filter(|k| k.is_finite()) {
-                let (expected, terms) = complexity_terms(&mut scorer, &device_posterior, explanation, &posterior.active, &batch, key)?;
+            let budget = match settings.budget.filter(|k| k.is_finite()) {
+                Some(limit) => Some((limit, complexity_terms(&mut scorer, &device_posterior, explanation, &posterior.active, &batch, (key, false))?)),
+                None => None,
+            };
+            // The previous step's move stands only if this batch's measured objective is lower at
+            // it (`step_accepted`); a rejected move is undone and this batch takes no step.
+            if device_posterior.pending_divergence().is_some() {
+                let new = (bits.iter().flatten().sum::<f64>(), budget.as_ref().map(|(_, (expected, _))| *expected));
+                let lambda = progress.multiplier;
+                let (accepted, change) = step_accepted(&mut scorer, &device_posterior, explanation, &posterior.active, (&batch, &experiments, key), new, (scale, tokens, lambda))?;
+                if accepted {
+                    device_posterior.accept();
+                } else {
+                    device_posterior.revert()?;
+                    progress.step += 1;
+                    log::info!("library step {epoch}.{b}: the last move rejected (its change of the objective on this batch {change:.4e} nats per token), undone; no step on this batch");
+                    continue;
+                }
+            }
+            if let Some((limit, (expected, terms))) = budget {
                 parts.0 += expected;
                 parts.1 += 1;
                 let (mut along, mut square) = (0.0, 0.0);
@@ -4923,7 +4992,7 @@ mod tests {
         let key = training_key(settings.seed, 0, 0);
         let mut terms_at = |posterior: &Posterior| {
             let device_posterior = DevicePosterior::new(&device, &explanation, posterior, 72.0, None, 0).unwrap();
-            complexity_terms(&mut scorer, &device_posterior, &explanation, &posterior.active, &batch, key).unwrap()
+            complexity_terms(&mut scorer, &device_posterior, &explanation, &posterior.active, &batch, (key, false)).unwrap()
         };
         let (count, terms) = terms_at(&posterior);
         assert!(count > 0.0);
