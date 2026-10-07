@@ -84,9 +84,11 @@ def checker(items: list[dict]) -> list[dict]:
             extra = {"options": json.loads(options)} if json.loads(options) else {}
             for s in range(0, len(batch), BATCH):  # a server's memory grows with the programs of one request
                 chunk = batch[s : s + BATCH]
-                reader = bool(os.environ.get("GRAPH_READER"))  # without a reader server, no reader items (13 MB per vpd4l score)
-                for k, r in zip(chunk, c.score_batch([items[k]["source"] for k in chunk], experiments=experiments, seed=seed, uniform_seeds=uniform or None, reader=reader, **extra)):
-                    r.pop("items", None)
+                # reader items (13 MB per vpd4l score) are dropped at once without a reader server; reader_top 0
+                # (score_batch(reader=False)) made the published 54fa4efb09 server exit silently mid-score
+                for k, r in zip(chunk, c.score_batch([items[k]["source"] for k in chunk], experiments=experiments, seed=seed, uniform_seeds=uniform or None, **extra)):
+                    if not os.environ.get("GRAPH_READER"):
+                        r.pop("items", None)
                     out[k] = r
 
     per_worker = [[] for _ in range(WORKERS)]
