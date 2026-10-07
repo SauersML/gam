@@ -6,7 +6,10 @@
 For every family in families.py and every variant, this tokenizes each item with the model's tokenizer,
 pairs it with an aligned counterfactual, runs the model on clean and counterfactual prompts, and writes
 ~/mpd-data/graph_oracle/behaviors/<model>/<family>.<variant>.json (design.txt section 5). A behavior is kept
-when the answer is the model's top-1 token on at least half of its targets; the others go to <model>/dropped/.
+when the answer is the model's top-1 token on at least half of its targets ("kept_top1"), or when the model ranks
+the answer above the counterfactual's answer on at least nine prompts in ten, counting both prompts of each pair
+("kept_contrast": agreement and similar tasks, where the verb competes with other continuations for top-1); the
+others go to <model>/dropped/.
 The summary of both models is ~/mpd-data/graph_oracle/behaviors/summary.tsv.
 
 Prompt conventions. `token_ids` is the whole text including the answer. A target position t is a position
@@ -34,7 +37,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from families import FAMILIES, MIN_PROMPTS, Item  # noqa: E402
 
 OUT = Path.home() / "mpd-data/graph_oracle/behaviors"
-KEEP_ACCURACY = 0.5  # kept when the answer is the model's top-1 token on most targets
+KEEP_ACCURACY = 0.5  # kept when the answer is the model's top-1 token on most targets ("top1"),
+KEEP_PAIR = 0.9  # or when the model ranks the answer above the counterfactual's answer on nine pairs in ten ("contrast")
 TOP = 5
 MAX_PROMPTS = 128  # enough prompts per behavior for the score's sampled experiments; keeps files small
 
@@ -141,7 +145,7 @@ class Model:
             self.m = load_target("mps")
 
     @torch.no_grad()
-    def logprobs(self, seqs: list[list[int]], positions: list[list[int]], batch: int = 32) -> list[torch.Tensor]:
+    def logprobs(self, seqs: list[list[int]], positions: list[list[int]], batch: int = 16) -> list[torch.Tensor]:
         """Log-probabilities [len(positions_i), vocab] at the given positions of each sequence (right padding:
         causal attention leaves the real positions unchanged)."""
         out = []
@@ -154,12 +158,12 @@ class Model:
                 ids[i, :len(s)] = torch.tensor(s)
                 mask[i, :len(s)] = 1
             ids, mask = ids.to("mps"), mask.to("mps")
-            if self.model == "qwen3-0.6b":
-                logits = self.m(input_ids=ids, attention_mask=mask).logits
+            if self.model == "qwen3-0.6b":  # the head only at the scored positions
+                h, head = self.m.model(input_ids=ids, attention_mask=mask).last_hidden_state, self.m.lm_head
             else:
-                logits = self.m(ids)
+                h, head = self.m.hidden(ids), lambda x: x @ self.m.wte.T
             for i, pos in enumerate(positions[b:b + batch]):
-                out.append(torch.log_softmax(logits[i, pos].double(), -1).cpu())
+                out.append(torch.log_softmax(head(h[i, pos]).float().cpu().double(), -1))
         return out
 
 
@@ -211,18 +215,20 @@ def main():
         rng = random.Random(f"{a.seed}:{fam}")
         for v in FAMILIES[fam](tok, rng):
             bid = f"{fam}.{v.name}"
-            prompts = build_prompts(tok, v.items, random.Random(f"{a.seed}:{bid}"))[:MAX_PROMPTS]
+            prompts = build_prompts(tok, v.items, random.Random(f"{a.seed}:{bid}"))
+            random.Random(f"{a.seed}:{bid}:order").shuffle(prompts)
+            prompts = prompts[:MAX_PROMPTS]
             row = {"model": a.model, "id": bid, "family": fam, "variant": v.name, "prompts": len(prompts), "split": split_of(fam)}
             if not prompts:
                 rows.append({**row, "status": "no_prompts"})
                 print(f"{bid:40s} no prompts", flush=True)
                 continue
             acc = score(tok, model, prompts)
-            status = "kept" if acc["model_accuracy"] >= KEEP_ACCURACY and len(prompts) >= MIN_PROMPTS else (
-                "too_few" if len(prompts) < MIN_PROMPTS else "dropped")
+            reason = "top1" if acc["model_accuracy"] >= KEEP_ACCURACY else "contrast" if (acc["pair_accuracy"] or 0) >= KEEP_PAIR else ""
+            status = "too_few" if len(prompts) < MIN_PROMPTS else f"kept_{reason}" if reason else "dropped"
             beh = {"id": bid, "model": a.model, "family": fam, "variant": v.name, "description": v.description, "frequency": None,
-                   "prompts": prompts, "split": row["split"], **acc}
-            dest = root / f"{bid}.json" if status == "kept" else root / "dropped" / f"{bid}.json"
+                   "prompts": prompts, "split": row["split"], **acc, "keep": status}
+            dest = root / f"{bid}.json" if reason and status != "too_few" else root / "dropped" / f"{bid}.json"
             for stale in (root / f"{bid}.json", root / "dropped" / f"{bid}.json"):
                 stale.unlink(missing_ok=True)
             dest.write_text(json.dumps(beh))

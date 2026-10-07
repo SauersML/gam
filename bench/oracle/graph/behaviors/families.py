@@ -217,21 +217,14 @@ COUNTRIES = [  # country, capital, language, continent, demonym adjective
 MIN_PROMPTS = 64  # the suite's floor of prompts per behavior
 
 
-def fact_variants(rows, templates, desc, name=None):
-    """One variant per template when the rows fill one; otherwise one variant mixing all templates. Items carry
-    `tmpl` so build.py pairs entities only within a template and with equal token lengths."""
-    if len(rows) >= MIN_PROMPTS or len(templates) == 1:
-        groups = [(vname, [(i, t)]) for i, (vname, t) in enumerate(templates)]
-    else:
-        groups = [(name or "mixed", list(enumerate(t for _, t in templates)))]
-    out = []
-    for vname, ts in groups:
-        v = Variant(vname, desc)
-        for i, t in ts:
-            for subj, ans in rows:
-                v.items.append(Item(t.format(X=subj), " " + ans, tmpl=i))
-        out.append(v)
-    return out
+def fact_variants(rows, templates, desc, name="mixed"):
+    """One variant holding every template's phrasing of the relation. Items carry `tmpl` so build.py pairs
+    entities only within a template and with equal token lengths."""
+    v = Variant(name, desc + " Phrasings: " + " | ".join(repr(t) for _, t in templates) + ".")
+    for i, (_, t) in enumerate(templates):
+        for subj, ans in rows:
+            v.items.append(Item(t.format(X=subj), " " + ans, tmpl=i))
+    return [v]
 
 
 @family
@@ -292,13 +285,9 @@ LANDMARKS = [("the Eiffel Tower", "Paris"), ("the Colosseum", "Rome"), ("Big Ben
 @family
 def landmark_city(tok, rng):
     """The city of a landmark."""
-    out = []
-    for i, (vname, t) in enumerate([("located", "{X} is located in the city of"), ("visit", "To see {X}, tourists travel to")]):
-        v = Variant(vname, "Factual recall: the city where a named landmark stands.")
-        for subj, ans in LANDMARKS:
-            v.items.append(Item(t.format(X=subj[0].upper() + subj[1:] if t.startswith("{X}") else subj), " " + ans, tmpl=i))
-        out.append(v)
-    return out
+    rows = [(x[0].upper() + x[1:], c) for x, c in LANDMARKS]
+    return fact_variants(rows, [("located", "{X} is located in the city of"), ("visit", "Tourists who want to see {X} travel to")],
+                         "Factual recall: the city where a named landmark stands.")
 
 
 @family
@@ -800,13 +789,8 @@ BIGRAMS = [("New", "York"), ("United", "States"), ("Los", "Angeles"), ("Hong", "
 @family
 def bigram(tok, rng):
     """Complete a frequent two-word name."""
-    out = []
-    for i, (vname, t) in enumerate([("sentence", "Last year I read a long article about {X}"), ("list", "Topics: weather, sports, {X}")]):
-        v = Variant(vname, "Frequent bigram: the second word of a common multiword name follows its first word.")
-        for a, b in BIGRAMS:
-            v.items.append(Item(t.format(X=a), " " + b, tmpl=i))
-        out.append(v)
-    return out
+    return fact_variants(BIGRAMS, [("sentence", "Last year I read a long article about {X}"), ("list", "Topics: weather, sports, {X}")],
+                         "Frequent bigram: the second word of a common multiword name follows its first word.")
 
 
 IDIOMS = [("as well", "as"), ("in order", "to"), ("on the other", "hand"), ("at the same", "time"), ("in addition", "to"),
@@ -827,13 +811,8 @@ IDIOMS = [("as well", "as"), ("in order", "to"), ("on the other", "hand"), ("at 
 @family
 def idiom(tok, rng):
     """Complete a fixed multiword expression."""
-    out = []
-    for i, (vname, t) in enumerate([("sentence", "She told me that, {X}"), ("start", "{X}")]):
-        v = Variant(vname, "Fixed expression: the last word of a frequent multiword expression.")
-        for a, b in IDIOMS:
-            v.items.append(Item(t.format(X=a if i == 0 else a[0].upper() + a[1:]), " " + b, tmpl=i))
-        out.append(v)
-    return out
+    return fact_variants(IDIOMS, [("sentence", "She told me that, {X}"), ("start", "It was, {X}")],
+                         "Fixed expression: the last word of a frequent multiword expression.")
 
 
 HTML_TAGS = "div span p table li ul ol strong em section header footer button form label td tr h1 h2 nav".split()
