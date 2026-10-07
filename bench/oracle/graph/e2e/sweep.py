@@ -48,7 +48,7 @@ def score_behavior(path: Path, experiments: int, seed: int, stand_in: str | None
     behavior = json.loads(path.read_text())
     results = {}
     with score.Checker(behavior["model"], export) as checker:
-        checker.behavior(path)
+        e2e.load_behavior(checker, path)
         for name, source in references_for(behavior, seed).items():
             t = time.time()
             try:

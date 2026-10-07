@@ -40,6 +40,14 @@ def sources(names: list[str], model: str, seed: int) -> dict[str, str]:
     return {Path(n).stem if n not in refs else n: refs[n] if n in refs else Path(n).read_text() for n in names}
 
 
+def load_behavior(checker, path: Path) -> dict:
+    """Loads a behavior into the checker without the site-operation manifest: the checker's vpd4l default
+    needs the export's `context` tokens, which ~/mpd-data/engine/vpd4l's export.json does not have
+    (the request fails and the server loses its model; reported to g-exec2, 10-07 02:25)."""
+    checker.behavior_record = json.loads(Path(path).read_text())
+    return checker.request({"op": "behavior", "path": str(Path(path).expanduser()), "manifest": None})
+
+
 def ir_of(source: str, model: str, stand_in: str | None = None) -> dict:
     """The program's IR (score.trace: mech's sandboxed tracer) with its program-wide stand-in form
     ("counterfactual", the checker's default, or "global") when one is given."""
@@ -85,7 +93,7 @@ def run(behavior_path: Path, names: list[str], experiments: int = 32, seed: int 
     text = prompt.render(behavior)  # the oracle's input; the reference programs do not read it
     results = {}
     with score.Checker(model, export) as checker:
-        checker.behavior(behavior_path)
+        load_behavior(checker, behavior_path)
         for name, source in sources(names, model, seed).items():
             t = time.time()
             result = checker.score(ir_of(source, model, stand_in), experiments=experiments, seed=seed,

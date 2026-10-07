@@ -93,7 +93,7 @@ class Pool:
         self.model, self.stand_in = model, stand_in
         self.checkers = [score.Checker(model, export) for _ in range(workers)]
         for c in self.checkers:
-            c.behavior(behavior)
+            e2e.load_behavior(c, behavior)
         self.calls = 0
 
     def score(self, programs: list[str], experiments: int, seed: int) -> list[dict]:

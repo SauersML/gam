@@ -24,6 +24,7 @@ os.environ.setdefault("MPD_MEM_GIB", "1")
 import mech  # noqa: E402
 import programs  # noqa: E402
 import prompt  # noqa: E402
+import run as e2e  # noqa: E402
 import score  # noqa: E402
 
 BEHAVIOR = Path.home() / "mpd-data/graph_oracle/behaviors/vpd4l/induction_random.words8.json"
@@ -60,7 +61,7 @@ def test_prompt_renders():
 @pytest.fixture(scope="module")
 def scores():
     with score.Checker("vpd4l") as c:
-        c.behavior(BEHAVIOR)
+        e2e.load_behavior(c, BEHAVIOR)
         return {name: c.score(source, experiments=16, seed=0, reader=False)
                 for name, source in programs.references("vpd4l").items()}
 
@@ -104,7 +105,7 @@ def best_search_program() -> str | None:
 @pytest.mark.skipif(best_search_program() is None, reason="no search result for the behavior yet")
 def test_search_beats_empty_and_random(scores):
     with score.Checker("vpd4l") as c:
-        c.behavior(BEHAVIOR)
+        e2e.load_behavior(c, BEHAVIOR)
         best = c.score(best_search_program(), experiments=16, seed=0, reader=False)
     assert best["total_bits"] < scores["empty"]["total_bits"], (best["total_bits"], scores["empty"]["total_bits"])
     assert best["total_bits"] < scores["random"]["total_bits"], (best["total_bits"], scores["random"]["total_bits"])
