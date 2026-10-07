@@ -42,6 +42,12 @@ json.dump({'source': {'descent': state_path, 'step': S['step'], 'attention': att
            'files': files}, open(os.path.join(out, 'export.json'), 'w'), indent=1)
 
 components = []
+# library_vpd needs a component at every stage of every layer: each attention map is one component of
+# all its slices, always on (the MLP-scoped run uses M's attention there anyway).
+for n in sites:
+    if '.attn.' in n:
+        C = files[f'{n}.U']['shape'][0]
+        components.append({'read': {'own': [index[n], 0]}, 'tau': -1e9, 'width': 1.0, 'slices': [[index[n], i] for i in range(C)]})
 tied = {fc: (dn, own) for dn, (fc, own) in S['tied'].items()}
 for n in sites:
     if '.attn.' in n or n in S['tied']:
