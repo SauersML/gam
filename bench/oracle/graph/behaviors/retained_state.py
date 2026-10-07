@@ -124,12 +124,14 @@ def main():
     ap.add_argument("--dtype", default="float32", choices=["float32", "bfloat16"])
     ap.add_argument("--seed", type=int, default=2951)
     ap.add_argument("--out", default=str(build.OUT))
+    ap.add_argument("--study-file", default="", help="a hidden_choice.py result (default: the study's results/<model>.json)")
     a = ap.parse_args()
     build.OUT = Path(a.out)
     from transformers import AutoModelForCausalLM, AutoTokenizer
     tok = AutoTokenizer.from_pretrained(HF[a.model])
     model = AutoModelForCausalLM.from_pretrained(HF[a.model], dtype=getattr(torch, a.dtype), attn_implementation="sdpa").to(a.device).eval()
-    study = json.load(open(STUDY / f"results/{a.model.replace('-', '_')}.json"))
+    src = Path(a.study_file) if a.study_file else STUDY / f"results/{a.model.replace('-', '_')}.json"
+    study = json.load(open(src))
     wording = study.get("wording", "A")
     runs = Runs(tok, wording)
     rng = random.Random(f"{a.seed}:retained")
@@ -187,7 +189,7 @@ def main():
                "counterfactual_accuracy": round(float(np.mean([p["counterfactual"]["correct"][0] for p in ps])), 4),
                "pair_accuracy": round(float(np.mean([x for p in ps for x in p["pair"]])), 4), "targets": len(ps),
                "effect": {"own_animal_raise_nats": float(raises(Lf, c).mean()), "animal_level_z": float(z), "p_two_sided": float(pval),
-                          "runs": len(ps), "top1_of_50": float(np.mean(Lf.argmax(1) == c)), "source": f"{STUDY}/results/{a.model.replace('-', '_')}.json"},
+                          "runs": len(ps), "top1_of_50": float(np.mean(Lf.argmax(1) == c)), "source": str(src)},
                "keep": "kept_effect"}
         (root / f"{fam}.{wording}.json").write_text(json.dumps(beh))
         rows.append({"model": a.model, "family": fam, "variant": wording, "id": beh["id"], "prompts": len(ps), "targets": len(ps),
