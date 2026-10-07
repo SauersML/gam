@@ -589,18 +589,17 @@ impl DevicePosterior {
                     .collect();
                 log::info!("library line step draw by block: {}", text.join(", "));
             }
-            // The draws' ratio is averaged in logarithm and read back through `E[ln χ²₁]`: one draw
-            // is a single χ²₁-like sample of the current direction's ratio, and the directions'
-            // ratios themselves jump by orders of magnitude (vpd4l tiny fit with hard gates: draws
-            // of 7e2, 1e4, then 1.7e10 and 2e10 at steps 2 and 3, then 3e6 and 13; every block of
-            // parameters at once). A plain mean of the ratios kept such a draw's weight for the
-            // whole running window (`ρ̄` near 1e10 and η near 1e-11 for the first epoch); the
-            // logarithm's mean moves by `ln(draw) / t` for it.
+            // `ρ̄` is the plain running mean of the draws' ratios. The logarithm's mean (kept beside
+            // it for the record, `log_rho`) read back through `E[ln χ²₁]` is the ratios' geometric
+            // mean, below their mean wherever the directions' ratios differ: from it η reached
+            // 3.7e-2 in the third epoch of vpd4l grouped direction gates with learned widths and the
+            // epoch diverged (decomp-vpd4l-h, 591bb575c2), where the plain mean held the same arm
+            // stable through seven epochs (decomp-vpd4l-f, 42e03873f6).
             if diagonal > 0.0 && draw_curvature > 0.0 {
                 self.rho_steps += 1;
                 let w = (1.0 / self.rho_steps as f64).max(1.0 - ivon.beta2);
+                self.rho += w * (draw_curvature / diagonal - self.rho);
                 self.log_rho += w * ((draw_curvature / diagonal).ln() - self.log_rho);
-                self.rho = (self.log_rho - LOG_CHI2_1).exp();
             }
             if own > 0.0 && own.is_finite() && fresh.is_finite() {
                 self.slope_steps += 1;
@@ -665,8 +664,8 @@ impl DevicePosterior {
 
     /// The trust region's ratio test on a tested move: `ratio` is the measured decrease of the
     /// objective over the model's prediction. Where the move raised the objective (`ratio < 0`)
-    /// the factor on the step's length falls to a quarter; where the model held (`ratio > ¾`) it
-    /// doubles, up to one, the model's own length; a smaller decrease leaves it. A small step's
+    /// the factor on the step's length falls to a quarter; where it lowered it the factor doubles,
+    /// up to one, the model's own length. A small step's
     /// ratio is the true slope over the model's estimate of it, and the estimate runs high: with
     /// the factor also cut below `ratio < ¼` it fell to 2.4e-4 in 536 steps, every move a
     /// decrease (decomp-vpd4l-i, vpd4l grouped direction gates with learned widths, 1c27e2831b).
@@ -677,7 +676,7 @@ impl DevicePosterior {
     pub fn trust_update(&mut self, ratio: f64) {
         if ratio < 0.0 {
             self.trust *= 0.25;
-        } else if ratio > 0.75 {
+        } else {
             self.trust = (2.0 * self.trust).min(1.0);
         }
     }
