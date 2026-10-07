@@ -225,6 +225,12 @@ impl Compensation {
             if explanation.artifact.owners.iter().any(|o| o.operator == out_name && o.native.starts_with("transcoder.")) {
                 continue;
             }
+            // Gated components (`library_vpd`, a layer read through `library.l{l}.attn.read`) are
+            // removed plainly too: their slices have no shared activations `H` of one output map, so
+            // the model above does not describe them.
+            if flat.operators.iter().all(|o| o.name != out_name) && flat.operators.iter().any(|o| o.name == format!("library.l{l}.attn.read")) {
+                continue;
+            }
             let out = operator(&flat, &out_name)?;
             // The activations are the node the output map reads (a term of the MLP's output, beside
             // the terms of its read–write ties).
