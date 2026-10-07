@@ -372,6 +372,8 @@ pub struct RowLists {
     cols: usize,
     offsets: Indices,
     columns: Indices,
+    /// Read only by the device kernels (CUDA on Linux, the Apple GPU on macOS).
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     row_of: Indices,
 }
 
@@ -1671,7 +1673,14 @@ impl Device {
                     }
                     offsets.push(u32::try_from(columns.len()).map_err(|_| shape(format!("{} listed entries", columns.len())))?);
                 }
-                Ok(RowLists { rows: mask.rows, cols, offsets: self.upload_indices(&offsets)?, columns: self.upload_indices(&columns)?, row_of: self.upload_indices(&row_of)? })
+                Ok(RowLists {
+                    rows: mask.rows,
+                    cols,
+                    offsets: self.upload_indices(&offsets)?,
+                    columns: self.upload_indices(&columns)?,
+                    #[cfg(any(target_os = "linux", target_os = "macos"))]
+                    row_of: self.upload_indices(&row_of)?,
+                })
             }
         }
     }
