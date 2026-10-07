@@ -20,7 +20,7 @@
 //! at the block's input takes that gate's column (a fixed selection of the gate's columns).
 //!
 //! Training uses the expected gate: each stage holds a fixed operator `{stage}.softness` (one
-//! entry per component, [`HARD`] in the program as built, so evaluation is the hard gate) that
+//! entry per component, `HARD` in the program as built, so evaluation is the hard gate) that
 //! `library_mdl` sets to the threshold's posterior deviation `σ_b` for a pass with a gradient, with
 //! the threshold at its mean there, so the gate is `Φ(z_b / σ_b)`, the step `H` integrated exactly
 //! over the threshold's posterior, and the gate's threshold and direction take gradients.

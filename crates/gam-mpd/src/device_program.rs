@@ -1211,7 +1211,7 @@ impl DeviceProgram {
     }
 
     /// How many entries of gated node `gated`'s value the pass that made `trace` listed, its rows'
-    /// components on ([`DeviceProgram::row_lists`]); `None` when it listed none (a dense pass).
+    /// components on (`DeviceProgram::row_lists`); `None` when it listed none (a dense pass).
     #[must_use]
     pub fn entries_listed(&self, trace: &DeviceTrace, gated: usize) -> Option<usize> {
         trace.lists.get(&gated).map(|lists| lists.len())
