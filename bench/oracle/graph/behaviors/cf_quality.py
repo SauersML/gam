@@ -101,29 +101,36 @@ def main():
     ap.add_argument("--max-tokens", type=int, default=8192)
     ap.add_argument("--root", default=str(OUT))
     ap.add_argument("--families", default="")
+    ap.add_argument("--skip-done", action="store_true", help="skip behaviors that already carry counterfactual_quality")
     a = ap.parse_args()
     root = Path(a.root)
     model = Model(a.model, a.device)
-    rows = []
     for f in sorted((root / a.model).glob("*.json")):
         beh = json.loads(f.read_text())
         if a.families and beh["family"] not in a.families.split(","):
             continue
+        if a.skip_done and "counterfactual_quality" in beh:
+            continue
         q = quality(model, beh, a.max_tokens)
         beh["counterfactual_quality"] = q
         f.write_text(json.dumps(beh))
-        rows.append({"model": a.model, "id": beh["id"], "family": beh["family"], "split": beh["split"], "keep": beh.get("keep", ""), **q})
         print(f"{beh['id']:40s} changed {q['changed_fraction']:.3f}  KL {q['mean_kl_bits']:.3f} bits (median {q['median_kl_bits']:.3f})", flush=True)
-    path = root / "cf_quality.tsv"
-    old = []
-    if path.exists():
-        with path.open() as fh:
-            old = [r for r in csv.DictReader(fh, delimiter="\t") if not (r["model"] == a.model and r["id"] in {x["id"] for x in rows})]
+    write_table(root)
+
+
+def write_table(root: Path):
+    """cf_quality.tsv from the counterfactual_quality of every kept behavior file (all models)."""
     cols = ["model", "id", "family", "split", "keep", "prompts", "targets", "changed_fraction", "mean_kl_bits", "median_kl_bits"]
-    with path.open("w") as fh:
+    rows = []
+    for f in sorted(root.glob("*/*.json")):
+        beh = json.loads(f.read_text())
+        if "counterfactual_quality" in beh:
+            rows.append({"model": beh["model"], "id": beh["id"], "family": beh["family"], "split": beh["split"], "keep": beh.get("keep", ""),
+                         **beh["counterfactual_quality"]})
+    with (root / "cf_quality.tsv").open("w") as fh:
         w = csv.DictWriter(fh, cols, delimiter="\t", extrasaction="ignore")
         w.writeheader()
-        for r in sorted(old + rows, key=lambda r: (r["model"], r["id"])):
+        for r in sorted(rows, key=lambda r: (r["model"], r["id"])):
             w.writerow(r)
 
 
