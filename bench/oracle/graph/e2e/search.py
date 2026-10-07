@@ -1,14 +1,14 @@
 """Search baseline on the graph oracle's score (#2951): the score the oracle must beat per behavior, found
 by exact greedy search through the checker, with the number of checker calls it used.
 
-Units are native pieces: each attention head, and each layer's MLP neurons as one block that the
-search may halve (index halves, recursively, down to --min-neurons). A program declares its units as
+Units are native pieces: each attention head, and each layer's MLP neurons as one block of which a
+move may take any dyadic sub-block (index halves, their halves, ... down to --min-neurons). A program declares its units as
 nodes and lists every causal edge among them (embed into every unit, every unit into every later unit
 and into the logits), so it equals M with its undeclared pieces replaced by stand-ins.
-  addition  from the empty program: each step adds the unit (or the half of an MLP block) that lowers
-            the total most; stops when no addition lowers it.
-  removal   from the full program: each step removes the unit (or half of an MLP block) whose removal
-            lowers the total most; stops when no removal lowers it.
+  addition  from the empty program: each step adds the head or MLP sub-block that lowers the total
+            most; stops when no addition lowers it.
+  removal   from the full program: each step removes the head or MLP sub-block whose removal lowers
+            the total most; stops when no removal lowers it.
 Every candidate of a step is scored under the same experiment seed; the final program is rescored
 under a held-out seed. Candidates are scored in parallel by --workers checker processes.
 
@@ -66,11 +66,16 @@ def source(units) -> str:
     return "\n".join(lines) + "\n"
 
 
-def halves(unit, min_neurons: int):
-    if unit[0] != "mlp" or unit[3] - unit[2] < 2 * min_neurons:
-        return []
-    mid = (unit[2] + unit[3]) // 2
-    return [("mlp", unit[1], unit[2], mid), ("mlp", unit[1], mid, unit[3])]
+def pieces_of(unit, min_neurons: int):
+    """Every dyadic sub-block b of `unit` (itself; for an MLP block its halves, their halves, ... down
+    to min_neurons) with the rest of the unit as dyadic blocks: [(b, rest)]."""
+    out = [(unit, [])]
+    if unit[0] == "mlp" and unit[3] - unit[2] >= 2 * min_neurons:
+        mid = (unit[2] + unit[3]) // 2
+        lo, hi = ("mlp", unit[1], unit[2], mid), ("mlp", unit[1], mid, unit[3])
+        out += [(b, rest + [hi]) for b, rest in pieces_of(lo, min_neurons)]
+        out += [(b, rest + [lo]) for b, rest in pieces_of(hi, min_neurons)]
+    return out
 
 
 class Pool:
@@ -108,7 +113,7 @@ def all_units(model: str):
 def greedy(pool: Pool, model: str, mode: str, experiments: int, seed: int, min_neurons: int, log) -> dict:
     full = all_units(model)
     current = [] if mode == "addition" else list(full)
-    # Addition draws from `outside`: whole units not yet declared, refined into halves on demand.
+    # Addition draws from `outside`: the pieces not declared yet, as dyadic blocks.
     outside = list(full) if mode == "addition" else []
     best = pool.score([source(current)], experiments, seed)[0]
     trajectory = [{"step": 0, "units": [name(u) for u in current], "total_bits": best["total_bits"],
@@ -117,34 +122,26 @@ def greedy(pool: Pool, model: str, mode: str, experiments: int, seed: int, min_n
     step = 0
     while True:
         step += 1
-        moves = []  # (new units, description)
+        moves = []  # (units, outside, (verb, block))
         if mode == "addition":
             for u in outside:
-                moves.append((current + [u], ("add", u)))
-                for h in halves(u, min_neurons):
-                    moves.append((current + [h], ("add_half", u, h)))
+                for b, rest in pieces_of(u, min_neurons):
+                    moves.append((current + [b], [v for v in outside if v != u] + rest, ("add", b)))
         else:
             for u in current:
-                moves.append(([v for v in current if v != u], ("remove", u)))
-                for h in halves(u, min_neurons):
-                    keep = [v for v in current if v != u] + [g for g in halves(u, min_neurons) if g != h]
-                    moves.append((keep, ("remove_half", u, h)))
+                for b, rest in pieces_of(u, min_neurons):
+                    moves.append(([v for v in current if v != u] + rest, outside + [b], ("remove", b)))
         if not moves:
             break
         t = time.time()
         results = pool.score([source(m[0]) for m in moves], experiments, seed)
         k = min(range(len(moves)), key=lambda i: results[i]["total_bits"])
-        log(f"{mode} step {step}: {len(moves)} candidates in {time.time() - t:.0f} s; best {moves[k][1]} "
-            f"{results[k]['total_bits']:.6g} vs {best['total_bits']:.6g}")
+        log(f"{mode} step {step}: {len(moves)} candidates in {time.time() - t:.0f} s; best {moves[k][2][0]} "
+            f"{name(moves[k][2][1])} {results[k]['total_bits']:.6g} vs {best['total_bits']:.6g}")
         if results[k]["total_bits"] >= best["total_bits"]:
             break
-        current, best = moves[k][0], results[k]
-        move = moves[k][1]
-        if mode == "addition":
-            outside.remove(move[1])
-            if move[0] == "add_half":
-                outside += [g for g in halves(move[1], min_neurons) if g != move[2]]
-        trajectory.append({"step": step, "move": [move[0]] + [name(u) for u in move[1:]], "units": [name(u) for u in current],
+        current, outside, best = moves[k][0], moves[k][1], results[k]
+        trajectory.append({"step": step, "move": [moves[k][2][0], name(moves[k][2][1])], "units": [name(u) for u in current],
                            "total_bits": best["total_bits"], "exec_error_bits": best["exec_error_bits"],
                            "opaque_bits": best["opaque_bits"], "calls": pool.calls})
     return {"units": current, "source": source(current), "score": best, "trajectory": trajectory}
@@ -158,7 +155,7 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--heldout-seed", type=int, default=1)
     ap.add_argument("--workers", type=int, default=4)
-    ap.add_argument("--min-neurons", type=int, default=48)
+    ap.add_argument("--min-neurons", type=int, default=384)
     ap.add_argument("--export", type=Path, help="the model's export directory (score.py's default otherwise)")
     ap.add_argument("--out", type=Path, default=OUT)
     a = ap.parse_args()

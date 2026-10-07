@@ -86,3 +86,41 @@ def test_empty_beats_random_heads(scores):
 def test_hand_beats_empty(scores):
     assert scores["hand"]["total_bits"] < scores["empty"]["total_bits"], {
         n: (r["total_bits"], r["exec_error_bits"], r["opaque_bits"]) for n, r in scores.items()}
+
+
+class FakePool:
+    """Scores a search program by its units: each declared head costs 1, a neuron 0.01; heads (1, 1)
+    and (2, 4) and MLP 0's neurons below 768 save 5, 5 and 0.04 per neuron when declared."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def score(self, sources, experiments, seed):
+        import search
+        out = []
+        for src in sources:
+            ir = mech.trace_inline(src, "vpd4l")
+            assert ir["valid"], ir["error"]
+            total = 100.0
+            for n in ir["nodes"]:
+                p = n["pieces"][0]
+                idx = [p["index"]] if isinstance(p["index"], int) else p["index"]
+                if p["kind"] == "head":
+                    total += 1 - 5 * ((p["layer"], idx[0]) in {(1, 1), (2, 4)})
+                else:
+                    total += sum(0.01 - 0.04 * (p["layer"] == 0 and i < 768) for i in idx)
+            out.append({"total_bits": total, "exec_error_bits": total, "opaque_bits": 0.0})
+        self.calls += len(sources)
+        return out
+
+
+def test_greedy_addition_and_removal_find_the_planted_units():
+    import search
+    for mode in ("addition", "removal"):
+        found = search.greedy(FakePool(), "vpd4l", mode, 1, 0, 384, lambda m: None)
+        units = set(found["units"])
+        assert ("head", 1, 1) in units and ("head", 2, 4) in units, (mode, units)
+        assert not any(u[0] == "head" and (u[1], u[2]) not in {(1, 1), (2, 4)} for u in units), (mode, units)
+        mlp = [u for u in units if u[0] == "mlp"]
+        assert mlp and all(u[1] == 0 and u[3] <= 768 for u in mlp), (mode, mlp)
+        assert sum(u[3] - u[2] for u in mlp) == 768, (mode, mlp)
