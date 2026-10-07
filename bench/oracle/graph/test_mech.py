@@ -84,6 +84,7 @@ def test_invalid_programs():
     assert "nodes a and b" in invalid(HEAD + "a = node(L[1].mlp[0, 1])\nb = node(L[1].mlp[1])")
     assert "cannot write" in invalid(HEAD + "a = node(L[1].mlp[0])\nedges(logits >> a)")
     assert "is a read" in invalid(HEAD + "a = node(L[1].head[0])\nb = node(L[2].mlp[0])\nedges(a.key >> b)")
+    assert "make it a node" in invalid(HEAD + "a = node(L[2].mlp[0])\nedges(L[1].head[0] >> a)")
     assert "not an edge" in invalid(HEAD + "a = node(L[1].mlp[0])\nedges(a)")
     assert "line 2" in invalid(HEAD + "node(L[9].head[0])")
     assert "one layer's attention" in invalid(HEAD + "node(L[1].head[0], L[2].head[0])")

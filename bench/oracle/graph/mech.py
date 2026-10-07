@@ -191,6 +191,9 @@ class Piece:
             return [("attn", l)]
         return [("hidden", l)]  # c_fc writes its layer's MLP hidden pre-activation
 
+    def __rshift__(self, other):
+        raise MechError(f"{self.name()} is a piece; make it a node, node({self.name()}), before connecting it")
+
     def ir(self) -> dict:
         """index: one int, a sorted list, or null for every unit of the site."""
         whole = self.size is not None and len(self.index) == self.size
