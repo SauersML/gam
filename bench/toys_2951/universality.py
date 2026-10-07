@@ -9,7 +9,8 @@ Each pair is one seed of one toy (train_toys.py TOY@sSEED) and a decomposition o
 dump). A part is compared across seeds in coordinates every seed shares, so the hidden units'
 permutation and any rotation of a hidden space drop out: its reads of the residual stream (the
 `V` of its slices on q, k, v and c_fc) and its writes to it (the `U` of its slices on o and
-down_proj), per layer. For a real-valued toy the stream's coordinates are the same in every seed by
+down_proj, and, for a part with no down_proj or o slice of its own, its c_fc or v slices' write
+carried to the stream by M's own down_proj or o_proj), per layer. For a real-valued toy the stream's coordinates are the same in every seed by
 construction (the inputs' slots, or the shared embedding); for a transformer they are mapped to
 token space, reads through the token embedding and writes through the readout. Two parts' similarity is the mean, over the
 sides (layer, read or write) either one has, of the overlap of their spans there,
@@ -47,17 +48,25 @@ def sides(toy: Toy, parts: Parts) -> list:
         spans = {}
         for op, (U, V) in p["slices"].items():
             layer, kind = int(op.split(".")[1]), op.split(".", 2)[2]
+            sides_of = []
             if kind in READS:
-                vectors, side = V, "read"
-                if to_tokens is not None:
+                sides_of.append((V, "read"))
+            if kind in WRITES:
+                sides_of.append((U, "write"))
+            # A slice writing a hidden space (c_fc's neurons, v's heads) writes the stream through
+            # M's own map out of it, so its write is compared in the stream's coordinates too: a
+            # start's read directions alone are the same in every seed (the frames are drawn on the
+            # inputs every seed shares) and say nothing of the model.
+            if kind == "mlp.c_fc" and f"blocks.{layer}.mlp.down_proj" not in p["slices"]:
+                sides_of.append((toy.weight(f"blocks.{layer}.mlp.down_proj") @ U, "write"))
+            if kind == "attn.v_proj" and f"blocks.{layer}.attn.o_proj" not in p["slices"]:
+                sides_of.append((toy.weight(f"blocks.{layer}.attn.o_proj") @ U, "write"))
+            for vectors, side in sides_of:
+                if side == "read" and to_tokens is not None:
                     vectors = to_tokens @ vectors
-            elif kind in WRITES:
-                vectors, side = U, "write"
-                if head is not None:
+                if side == "write" and head is not None:
                     vectors = head @ vectors
-            else:
-                continue
-            spans.setdefault((layer, side), []).append(vectors)
+                spans.setdefault((layer, side), []).append(vectors)
         bases = {}
         for key, blocks in spans.items():
             m = np.concatenate(blocks, 1)
