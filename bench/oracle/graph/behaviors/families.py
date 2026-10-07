@@ -1538,3 +1538,42 @@ def author_of(tok, rng):
     """The author of a famous work."""
     return fact_variants(AUTHORS, [("written_by", "{X} was written by the author whose surname is"), ("few_shot", "Hamlet: Shakespeare\nEmma: Austen\n{X}:"),
                                    ("qa", "Q: Who wrote {X}? Give the surname.\nA:")], "Factual recall: the surname of the author of a famous work.")
+
+
+NOVEL |= {"latex_close"}
+LATEX_ENVS = ["equation", "align", "itemize", "enumerate", "figure", "table", "theorem", "proof", "lemma", "abstract",
+              "center", "tabular", "document", "description", "matrix", "verbatim"]
+
+
+@family
+def latex_close(tok, rng):
+    """Close a LaTeX environment with its own name."""
+    v = Variant("end", "LaTeX environment closing: after a \\begin{env} block's body and '\\end{', the environment's name; the counterfactual opens another environment.")
+    bodies = ["x = y + z", "\\item first \\item second", "a^2 + b^2 = c^2", "Some text here.", "1 & 2 \\\\ 3 & 4", "f(x) = 0"]
+    for _ in range(400):
+        a, b = rng.sample(LATEX_ENVS, 2)
+        body = rng.choice(bodies)
+        t = "\\begin{{{e}}}\n{body}\n\\end{{"
+        v.items.append(Item(t.format(e=a, body=body), a, t.format(e=b, body=body), b))
+    return [v]
+
+
+BOILERPLATE = [("Licensed under the Apache License, Version", "2"), ("Permission is hereby granted, free of", "charge"),
+               ("THE SOFTWARE IS PROVIDED \"AS", "IS"), ("All rights", "reserved"), ("This program is free", "software"),
+               ("WITHOUT WARRANTIES OR CONDITIONS OF ANY", "KIND"), ("See the License for the specific language governing permissions and", "limitations"),
+               ("you may not use this file except in compliance with the", "License"), ("Redistribution and use in source and binary", "forms"),
+               ("GNU General Public", "License"), ("either version 3 of the License, or (at your", "option"),
+               ("but WITHOUT ANY WARRANTY; without even the implied warranty of", "MERCHANTABILITY"), ("Copyright (c)", "20"),
+               ("THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY", "KIND"), ("distributed under the License is distributed on an \"AS IS\"", "BASIS"),
+               ("The above copyright notice and this permission notice shall be included in all", "copies")]
+
+
+@family
+def boilerplate(tok, rng):
+    """Complete a phrase from a software license header."""
+    rows = BOILERPLATE
+    v = Variant("license", "Fixed text: the next word of a common software-license sentence, inside several comment styles.")
+    for i, pre in enumerate(["# ", "// ", " * ", "-- ", "; ", "", "/* "]):
+        for a, b in rows:
+            v.items.append(Item(pre + a, " " + b, tmpl=i))
+    return [v]
