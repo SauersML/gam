@@ -8,6 +8,13 @@ Masks are VPD's causal-importance network's (clamp(CI, 0, 1)), computed four way
                  of M beyond the exact attention it shares), the network made causal: autonomous
                  and causal, the fair bar
   own_1          as own_causal_1 with the published bidirectional network
+Per setting also VPD's implicit per-token edges, as the wiring prototype counts its explicit ones
+(budget_descent.py DESCENT_EDGES): pairs of subcomponents active on the token (mask above zero), a
+writer A (an earlier layer's down_proj subcomponent) and a reader B (a later layer's c_fc
+subcomponent), whose term in B's read, ((gain_l * v_B) . u_A) a_A / r_l, is nonzero above float32
+precision: larger than 2^-23 ||gain_l * v_B|| sqrt(d), the rounding scale of B's read of a normed stream
+(norm sqrt(d)); a_A is A's coefficient (its read times its mask), r_l the RMS of the run's own stream at
+layer l's pre-MLP norm and gain_l that norm's gain. Also the active writer-reader pairs, the bound.
 Usage: vpd_fair_mlp.py GAM TARGET VPD_PTH TOKENS OUT.json"""
 import sys, json, math, types
 from pathlib import Path
@@ -39,6 +46,40 @@ def causal_forward(self, x):
     return x + self.fc2(F.gelu(self.fc1(F.rms_norm(x, (D,)))))
 
 
+# The RMS of the stream at each layer's pre-MLP norm, recorded as the model computes it.
+STREAM_RMS = {}
+plain_rms = vpd_model.rms
+MLP_NORM = {id(T.norms[2 * l + 1]): l for l in range(4)}
+def recording_rms(x, w, eps):
+    if id(w) in MLP_NORM:
+        STREAM_RMS[MLP_NORM[id(w)]] = (x.float().pow(2).mean(-1, keepdim=True) + eps).sqrt()
+    return plain_rms(x, w, eps)
+vpd_model.rms = recording_rms
+
+
+def implicit_edges(acts, masks):
+    """Per token of a one-sequence run (`acts` its site inputs, `masks` its MLP masks, STREAM_RMS its
+    norms' scales): the writer-reader pairs both active, and those whose term is above precision."""
+    pairs = edges = 0.0
+    for l in range(1, 4):
+        fc = f'h.{l}.mlp.c_fc'
+        gv = T.norms[2 * l + 1][:, None] * T.site(fc).V
+        floor = 2.0 ** -23 * gv.norm(dim=0) * math.sqrt(gv.shape[0])
+        downs = [f'h.{k}.mlp.down_proj' for k in range(l)]
+        interaction = torch.cat([T.site(n).U for n in downs]) @ gv
+        a = torch.cat([(acts[n] @ T.site(n).V) * masks[n] for n in downs], -1)[0]
+        on_w = torch.cat([masks[n] > 0 for n in downs], -1)[0]
+        on_r = masks[fc][0] > 0
+        r = STREAM_RMS[l][0, :, 0]
+        for t in range(a.shape[0]):
+            w_idx, b_idx = torch.nonzero(on_w[t]).squeeze(1), torch.nonzero(on_r[t]).squeeze(1)
+            terms = (interaction[w_idx][:, b_idx] * a[t, w_idx, None] / r[t]).abs()
+            pairs += w_idx.numel() * b_idx.numel()
+            edges += (terms > floor[b_idx][None, :]).sum().item()
+    tokens = acts[f'h.0.mlp.c_fc'].shape[1]
+    return pairs / tokens, edges / tokens
+
+
 published = [b.forward for b in V.ci_fn.blocks]
 def ci(acts, causal):
     for b, f in zip(V.ci_fn.blocks, published):
@@ -64,7 +105,7 @@ def kl_bits(lm, lp):
     return ((pm.exp() * (pm - pp)).sum(-1) / math.log(2)).mean().item()
 
 
-res = {k: {'kl': [], 'active': [], 'per_map': []} for k in ('m_clean', 'm_causal', 'own_1', 'own_causal_1', 'all_on')}
+res = {k: {'kl': [], 'active': [], 'per_map': [], 'pairs': [], 'edges': []} for k in ('m_clean', 'm_causal', 'own_1', 'own_causal_1', 'all_on')}
 with torch.no_grad():
     for i in range(ev.shape[0]):
         ids = ev[i:i + 1]
@@ -75,12 +116,16 @@ with torch.no_grad():
                     'own_causal_1': ci(own_acts, True), 'all_on': None}
         for k, masks in settings.items():
             m = ones if masks is None else {n: masks[n] for n in mlp}
-            lp, _ = inputs_of(ids, m)
+            lp, run_acts = inputs_of(ids, m)
             res[k]['kl'].append(kl_bits(lm, lp))
+            if masks is not None:
+                pairs, edges = implicit_edges(run_acts, m)
+                res[k]['pairs'].append(pairs); res[k]['edges'].append(edges)
             counts = [(m[n] > 0).float().sum(-1).mean().item() for n in mlp]
             res[k]['active'].append(sum(counts)); res[k]['per_map'].append(counts)
         print(i, {k: round(v['kl'][-1], 3) for k, v in res.items()}, flush=True)
 summary = {k: {'kl': float(np.mean(v['kl'])), 'active': float(np.mean(v['active'])),
+               'active_pairs_per_token': float(np.mean(v['pairs'])) if v['pairs'] else None, 'edges_per_token': float(np.mean(v['edges'])) if v['edges'] else None,
                'per_map': [round(float(x), 2) for x in np.mean(v['per_map'], 0)]} for k, v in res.items()}
 print(json.dumps(summary, indent=1))
 json.dump(summary, open(out, 'w'), indent=1)
