@@ -275,6 +275,8 @@ class HfSampler:
             gen = pol.model.generate(input_ids=ids, attention_mask=torch.ones_like(ids), max_new_tokens=self.max_tokens, do_sample=True, temperature=1.0, top_p=1.0, top_k=0,
                                      eos_token_id=pol.end, pad_token_id=pol.end)[:, len(p) :].tolist()
             out.append([g[: g.index(pol.end) + 1] if pol.end in g else g for g in gen])
+        if pol.dev.type == "mps":
+            torch.mps.empty_cache()  # the generation's cached blocks, before the checker servers start beside this process
         return out
 
 
