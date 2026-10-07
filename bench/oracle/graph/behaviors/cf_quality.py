@@ -42,53 +42,53 @@ def additive_mask(lengths: list[int], T: int, blocks: list[list[list[int]]], dty
 
 
 @torch.no_grad()
-def target_logprobs(model: Model, seqs: list[list[int]], positions: list[list[int]], blocks: list[list], max_tokens: int):
-    """Log-probabilities [len(positions_i), vocab] at the targets of each sequence, in input order, in float32 on the host."""
-    order = sorted(range(len(seqs)), key=lambda i: len(seqs[i]))
-    out = [None] * len(seqs)
-    b = 0
-    while b < len(order):
-        e = b + 1
-        while e < len(order) and (e - b + 1) * len(seqs[order[e]]) <= max_tokens:
-            e += 1
-        idx = order[b:e]
-        T = len(seqs[idx[-1]])
-        ids = torch.zeros(len(idx), T, dtype=torch.long)
-        for r, i in enumerate(idx):
-            ids[r, :len(seqs[i])] = torch.tensor(seqs[i])
+def pair_stats(model: Model, ps: list[dict], max_tokens: int) -> tuple[list[bool], list[float]]:
+    """Per prompt whether the top token changes at any target, and per target KL(M(x) || M(x')) in bits. Each prompt's
+    x and x' run in the same forward pass, so only these numbers leave the device."""
+    changed, kls = [], []
+    T = max(len(p["token_ids"]) for p in ps)
+    chunk = max(1, max_tokens // (2 * T))
+    for c0 in range(0, len(ps), chunk):
+        part = ps[c0:c0 + chunk]
+        seqs = [p["token_ids"] for p in part] + [p["counterfactual"]["token_ids"] for p in part]
+        blocks = [p.get("attention_block", []) for p in part] + [p["counterfactual"].get("attention_block", p.get("attention_block", [])) for p in part]
+        Tc = max(map(len, seqs))
+        ids = torch.zeros(len(seqs), Tc, dtype=torch.long)
+        for r, x in enumerate(seqs):
+            ids[r, :len(x)] = torch.tensor(x)
         ids = ids.to(model.device)
         if model.model in HF:
-            if any(blocks[i] for i in idx):
+            if any(blocks):
                 dtype = next(model.m.parameters()).dtype
-                mask = additive_mask([len(seqs[i]) for i in idx], T, [blocks[i] for i in idx], dtype).to(model.device)
+                mask = additive_mask([len(x) for x in seqs], Tc, blocks, dtype).to(model.device)
             else:
-                mask = torch.tensor([[1] * len(seqs[i]) + [0] * (T - len(seqs[i])) for i in idx], device=model.device)
+                mask = torch.tensor([[1] * len(x) + [0] * (Tc - len(x)) for x in seqs], device=model.device)
             h, head = model.m.model(input_ids=ids, attention_mask=mask).last_hidden_state, model.m.lm_head
         else:
             h, head = model.m.hidden(ids), lambda x: x @ model.m.wte.T
-        bi = torch.tensor([r for r, i in enumerate(idx) for _ in positions[i]], device=h.device)
-        ti = torch.tensor([t for i in idx for t in positions[i]], device=h.device)
-        lp = torch.log_softmax(head(h[bi, ti]).float(), -1).cpu()
-        r = 0
-        for i in idx:
-            out[i] = lp[r:r + len(positions[i])]
-            r += len(positions[i])
-        b = e
-    return out
+        n = len(part)
+        rows_a = [(r, t) for r, p in enumerate(part) for t in p["target_positions"]]
+        bi = torch.tensor([r for r, _ in rows_a] + [n + r for r, _ in rows_a], device=h.device)
+        ti = torch.tensor([t for _, t in rows_a] * 2, device=h.device)
+        lp = torch.log_softmax(head(h[bi, ti]).float(), -1)
+        a, b = lp[:len(rows_a)], lp[len(rows_a):]
+        kl = ((a.exp() * (a - b)).sum(-1) / math.log(2)).cpu().tolist()
+        diff = (a.argmax(-1) != b.argmax(-1)).cpu().tolist()
+        k = 0
+        for p in part:
+            m = len(p["target_positions"])
+            changed.append(any(diff[k:k + m]))
+            kls += kl[k:k + m]
+            k += m
+        del h, lp, a, b
+    if model.device == "mps":
+        torch.mps.empty_cache()
+    return changed, kls
 
 
 def quality(model: Model, beh: dict, max_tokens: int) -> dict:
-    ps = beh["prompts"]
-    seqs = [p["token_ids"] for p in ps] + [p["counterfactual"]["token_ids"] for p in ps]
-    pos = [p["target_positions"] for p in ps] * 2
-    blocks = [p.get("attention_block", []) for p in ps] + [p["counterfactual"].get("attention_block", p.get("attention_block", [])) for p in ps]
-    lps = target_logprobs(model, seqs, pos, blocks, max_tokens)
-    n = len(ps)
-    changed, kls = [], []
-    for k in range(n):
-        a, b = lps[k], lps[n + k]
-        changed.append(bool((a.argmax(-1) != b.argmax(-1)).any()))
-        kls += ((a.exp() * (a - b)).sum(-1) / math.log(2)).tolist()
+    changed, kls = pair_stats(model, beh["prompts"], max_tokens)
+    n = len(changed)
     kls_sorted = sorted(kls)
     return {"changed_fraction": round(sum(changed) / n, 4), "mean_kl_bits": round(sum(kls) / len(kls), 4),
             "median_kl_bits": round(kls_sorted[len(kls_sorted) // 2], 4), "prompts": n, "targets": len(kls)}
