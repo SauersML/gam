@@ -147,10 +147,20 @@ def all_units(model: str, mlp_view: str = "native"):
     return [("head", l, h) for l in range(s["layers"]) for h in range(s["heads"])] + mlps
 
 
+def objective_of(kind: str):
+    """The quantity search minimizes: the score's total, or (kind "shared") the total with the execution
+    error taken over the experiment families every program shares (table.shared)."""
+    if kind == "total":
+        return lambda r: r["total_bits"]
+    import table
+    return lambda r: table.shared(r)[1] * r["N"]
+
+
 def greedy(pool: Pool, model: str, mode: str, experiments: int, seed: int, min_neurons: int, log, start=None,
-           mlp_view: str = "native", checkpoint=None) -> dict:
+           mlp_view: str = "native", checkpoint=None, objective=None) -> dict:
     """`start`: the units to start from (default: none for addition, every unit for removal). With mlp_view
     "vpd" (addition only), MLPs enter as VPD units grown by doubling along the removal ranking."""
+    objective = objective or (lambda r: r["total_bits"])
     full = all_units(model, mlp_view)
     current = list(start) if start is not None else [] if mode == "addition" else list(full)
     # Addition draws from `outside`: the pieces not declared yet, as dyadic blocks (whole units the
@@ -185,12 +195,12 @@ def greedy(pool: Pool, model: str, mode: str, experiments: int, seed: int, min_n
             break
         t = time.time()
         results = pool.score([source(m[0]) for m in moves], experiments, seed)
-        k = min(range(len(moves)), key=lambda i: results[i]["total_bits"])
+        k = min(range(len(moves)), key=lambda i: objective(results[i]))
         log(f"{mode} step {step}: {len(moves)} candidates in {time.time() - t:.0f} s; best {moves[k][2][0]} "
-            f"{name(moves[k][2][1])} {results[k]['total_bits']:.6g} vs {best['total_bits']:.6g}")
+            f"{name(moves[k][2][1])} {objective(results[k]):.6g} vs {objective(best):.6g}")
         candidates = [{"move": [m[2][0], name(m[2][1])], "total_bits": r["total_bits"], "exec_error_bits": r["exec_error_bits"],
                        "opaque_bits": r["opaque_bits"]} for m, r in zip(moves, results)]
-        if results[k]["total_bits"] >= best["total_bits"]:
+        if objective(results[k]) >= objective(best):
             trajectory.append({"step": step, "stopped": True, "candidates": candidates, "calls": pool.calls})
             break
         current, outside, best = moves[k][0], moves[k][1], results[k]
@@ -217,6 +227,8 @@ def main() -> None:
     ap.add_argument("--start", help="comma-separated units to start from (h<l>_<h>, m<l>_<start>_<stop>)")
     ap.add_argument("--tag", default="", help="suffix of the output names")
     ap.add_argument("--stand-in", choices=["counterfactual", "global"], help="the programs' stand-in form (checker default: counterfactual)")
+    ap.add_argument("--objective", default="total", choices=["total", "shared"],
+                    help="minimize the score's total, or the total over the experiment families every program shares")
     ap.add_argument("--mlp-view", default="native", choices=["native", "vpd"], help="MLP units: native neuron blocks or VPD subcomponents")
     ap.add_argument("--ranking", type=Path, help="with --mlp-view vpd: measured removal effects of VPD subcomponents (sites -> kl_bits)")
     a = ap.parse_args()
@@ -241,7 +253,7 @@ def main() -> None:
                 start = [unit_of(t) for t in a.start.split(",")] if a.start else None
                 partial = out / f"{stem}.partial.json"
                 found = greedy(pool, model, mode, a.experiments, a.seed, a.min_neurons, log, start, a.mlp_view,
-                               lambda state: partial.write_text(json.dumps(state, indent=1)))
+                               lambda state: partial.write_text(json.dumps(state, indent=1)), objective_of(a.objective))
                 heldout = pool.score([found["source"]], a.experiments, a.heldout_seed)[0]
                 found.update(units=[name(u) for u in found["units"]], heldout=heldout, calls=pool.calls - start, stand_in=a.stand_in, checker=Path(str(score.BINARY)).name,
                              experiments=a.experiments, seed=a.seed, heldout_seed=a.heldout_seed)
