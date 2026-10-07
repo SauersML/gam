@@ -4375,7 +4375,7 @@ mod tests {
         assert!(!super::layers_definition(&layers).contains("sink"));
         let mut sunk = layers.clone();
         sunk[1].sink = Some(7);
-        assert_eq!(super::layers_definition(&sunk), format!("{sunk:?}").replace(", sink: None", "").replace(", thresholds: []", ""));
+        assert_eq!(super::layers_definition(&sunk), format!("{sunk:?}").replace(", sink: None", "").replace(", thresholds: []", "").replace(", components: []", ""));
         assert_ne!(super::layers_definition(&sunk), super::layers_definition(&layers));
     }
 
