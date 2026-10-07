@@ -264,6 +264,26 @@ def expanded(piece: dict) -> dict:
 
 
 SHAPE: list[dict] = [{}]
+LIBRARY: dict[tuple[int, str], list[list[tuple[str, int]]]] = {}
+KINDS = ("q_proj", "k_proj", "v_proj", "o_proj", "c_fc", "down_proj")
+
+
+def library_pieces(piece: dict) -> list[dict]:
+    """A library piece as the VPD subcomponents its parts are made of (decomp's start, arm
+    mech.LIBRARY_ARM: part i of layer l's attention or MLP = the i-th component of that block in the file;
+    a component's slices are (site = layer x 6 + kind, subcomponent))."""
+    if not LIBRARY:
+        start = Path.home() / "mpd-data/decomp/start.components.json"
+        arm = next(r for r in json.loads(start.read_text()) if r["arm"] == mech.LIBRARY_ARM)
+        for c in arm["components"]:
+            site = c["read"]["own"][0] if "own" in c["read"] else c["read"]["direction"]["site"]
+            key = (site // len(KINDS), "attn" if site % len(KINDS) < 4 else "mlp")
+            LIBRARY.setdefault(key, []).append([(KINDS[s % len(KINDS)], k) for s, k in c["slices"]])
+    by: dict[str, set] = {}
+    for i in piece["index"]:
+        for kind, k in LIBRARY[(piece["layer"], piece["kind"])][i]:
+            by.setdefault(kind, set()).add(k)
+    return [{"view": "vpd", "layer": piece["layer"], "kind": kind, "index": sorted(v)} for kind, v in by.items()]
 
 
 def facts(engine, ir: dict, behavior: dict, chunk: int = 64) -> dict[str, dict]:
@@ -291,7 +311,8 @@ def facts(engine, ir: dict, behavior: dict, chunk: int = 64) -> dict[str, dict]:
             p0 = lp.exp()
             gold = lp.gather(-1, answer[:, None])[:, 0]
             for n in ir["nodes"]:
-                pieces = [expanded(p) for p in n["pieces"]]
+                pieces = [q for p in n["pieces"] for q in
+                          (library_pieces(expanded(p)) if p["view"] == "library" else [expanded(p)])]
                 lpr, _ = engine.forward(ids, rows, cols, remove=pieces)
                 f = sums[n["id"]]
                 f["answer_bits"] += ((lpr.gather(-1, answer[:, None])[:, 0] - gold).sum() / math.log(2)).item()
