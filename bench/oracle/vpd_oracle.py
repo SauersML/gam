@@ -260,6 +260,19 @@ class Table:
         w = float(self.lens[f"{n}.write"][c].float() @ self.lens["unembed"][int(token)].float())
         return (w - float(self.lens[f"{n}.write_centre"][c])) / float(self.lens[f"{n}.write_scale"][c])
 
+    def group_direct(self, layer: int, kind: str, c: int, members: torch.Tensor, acts: torch.Tensor, factor: float,
+                     peak: float, tokens: list[int]) -> list[float] | None:
+        """A group edit's direct effect on each token's logit through the write lens: the sum over the
+        members (site numbers) of factor * a_i * (w_i,X - centre_i), in subcomponent c's units (its largest
+        activity times its write scale), so a group of c alone gives lens_value's line; None without a write."""
+        n = site_name(layer, kind)
+        if self.lens is None or f"{n}.write" not in self.lens:
+            return None
+        m = members.long()
+        w = self.lens[f"{n}.write"][m].float() @ self.lens["unembed"][torch.tensor(tokens)].float().T  # [G, X]
+        val = factor * acts.float()[:, None] * (w - self.lens[f"{n}.write_centre"][m].float()[:, None])
+        return (val.sum(0) / (peak * float(self.lens[f"{n}.write_scale"][self.number(layer, kind, c)]))).tolist()
+
 
 def effect_index(table: Table, keys: list) -> list[np.ndarray]:
     """Per effect stratum, the (site, subcomponent, context) triples whose removal KL falls in it."""
@@ -275,8 +288,9 @@ def effect_index(table: Table, keys: list) -> list[np.ndarray]:
 
 # Row-edit variants (vpd_labels.py --edit row): where the edit acts and on what, in the question's words.
 VARIANT_WORDS = {"": " at the marked token only", "_from": " at every token of the text", "_group": " at the marked token only", "_groupfrom": " at every token of the text"}
-WHO = {"": "the component is", "_from": "the component is", "_group": "the component and the 7 other components of its site most active at the marked token are",
-       "_groupfrom": "the component and the 7 other components of its site most active at the marked token are"}
+GROUP = 8  # vpd_labels.py's group size
+WHO = {"": "the component is", "_from": "the component is", "_group": f"the component and the {GROUP - 1} other components of its site most active at the marked token are",
+       "_groupfrom": f"the component and the {GROUP - 1} other components of its site most active at the marked token are"}
 
 
 def effect_bin(bits: float) -> int:
@@ -504,6 +518,9 @@ def examples(table: Table, layers: set[int], count: int, seed: int, stratified: 
             ex.update(layer=-1, kind="", c=-1, j=-1, context=ctx, position=p, options=[f"C{i + 1} (layer {l}, {k})" for i, (l, k, _) in enumerate(cands)],
                       candidates=[(l, k, cc, 1.0, "up") for l, k, cc in cands], answer=order.index(0),
                       question=f"At the marked token the model predicts {table.piece(att['token'][r])} next. Which of the listed components raises that prediction most?")
+        if q in ("direction", "top") and variant is not None and "group" in variant[1] and "group_act" in d:
+            ex["direct"] = table.group_direct(layer, kind, c, d["group"][c, j], d["group_act"][c, j],
+                                              -1.0 if ex["edit"] == "ablate" else meta.get("amplify", 1.5) - 1.0, peak, ex["option_ids"])
         if row and ex.get("edit") and ex["c"] >= 0 and q != "continuation":
             ex["effect"] = float(d[f"effect_{ex['edit']}{ex.get('variant', '')}"][ex["c"], ex["j"]])  # KL(M_e || M) at the edited token, bits
         elif row and ex.get("edit") and ex["c"] >= 0:
@@ -603,6 +620,9 @@ def prompt(table: Table, ex: dict, condition: str) -> tuple[str, str]:
                 # times the edit's factor minus one, over 9) times the lens value; weights and the stated activity only.
                 info += "\nThe edit's direct effect on the logit through the unembedding (change of its activity, in units of its largest, times the lens value): " + ", ".join(
                     f"{table.piece(t)}: {ex['change'] * v:+.2f}" for t, v in zip(ex["option_ids"], values)) + "."
+            elif values and values[0] is not None and ex.get("direct") is not None:  # a group edit: the sum over its members
+                info += f"\nThe edit's direct effect on the logit through the unembedding, summed over the {GROUP} edited components (each one's change of activity times its write's projection on the token, in units of this component's largest activity times its lens standard deviation): " + ", ".join(
+                    f"{table.piece(t)}: {v:+.2f}" for t, v in zip(ex["option_ids"], ex["direct"])) + "."
         else:
             info += "\n".join(lens_text(table, l, k, c, f"C{i + 1}", reads=False) for i, (l, k, c, _, _) in enumerate(ex["candidates"]))
     text = table.text(ex["context"], ex["position"], ex["position"])
