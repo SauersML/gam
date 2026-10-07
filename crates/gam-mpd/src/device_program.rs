@@ -965,8 +965,9 @@ impl DeviceProgram {
             let mut first: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
             let mut out = vec![None; n];
             for (i, node) in program.nodes.iter().enumerate() {
-                // Fused heads, streamed heads, features and sparse ReLU reads keep their own paths.
-                if grouped[i].is_some() || exact_zeros[i] || matches!(node, Node::Feature { .. }) || matches!(steps[i], Step::Head | Step::Feature { .. }) {
+                // Fused heads, streamed heads, features, raw slots (each takes its slot's given rows
+                // once) and sparse ReLU reads keep their own paths.
+                if grouped[i].is_some() || exact_zeros[i] || matches!(node, Node::Feature { .. } | Node::Raw { .. }) || matches!(steps[i], Step::Head | Step::Feature { .. }) {
                     continue;
                 }
                 let mut node = node.clone();
@@ -2048,6 +2049,9 @@ impl DeviceProgram {
                     return Err(format!("device: a {:?} entry value for node {index} of {rows} x {}", value.dim(), self.widths[index]));
                 }
                 trace.slots[index] = Slot::Value(value);
+                // The entering stream may be another pass's (a patched lane's): a later node of the
+                // same computation computes its own.
+                replaced.insert(index);
                 continue;
             }
             if index > span.end {
