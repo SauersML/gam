@@ -1771,6 +1771,7 @@ impl WeightEdit {
         let m = Self::matrix(weights, layer, head, matrix)?;
         let saved = m.clone();
         match self {
+            Self::AttnSubcomponents { .. } => return Err("an attention subcomponent edit goes through attention_subcomponents".into()),
             Self::Subcomponents { .. } => {
                 let d = delta.ok_or("no change")?;
                 if d.dim() != m.dim() {
