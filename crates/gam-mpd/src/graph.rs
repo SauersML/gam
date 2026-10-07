@@ -1197,6 +1197,20 @@ impl Graph {
         Circuit { units, logits: routed(None, Route::Input), nodes: self.blocks.len() }
     }
 
+    /// `M` with the program's nodes writing their stand-ins (their values on the counterfactual) and
+    /// every other piece computing on the prompt, every edge kept; the logits read `embed`'s
+    /// stand-in when the program routes `embed` to them. The necessity experiments' `M`.
+    pub fn complement_model(&self, weights: &Weights) -> Circuit {
+        let mut circuit = self.model(weights);
+        for unit in circuit.units.iter_mut().take(self.blocks.len()) {
+            unit.computes = false;
+        }
+        if self.edges.iter().any(|(w, r, _)| *w == Writer::Embed && r.is_none()) {
+            circuit.logits = Incoming::AllBut([Writer::Embed].into());
+        }
+        circuit
+    }
+
     /// `M` as a circuit with the program's nodes as its first units: every piece computing, every
     /// edge kept.
     pub fn model(&self, weights: &Weights) -> Circuit {
@@ -2214,6 +2228,24 @@ const DISK_SEMANTICS: u64 = 2;
 /// rank-one perturbations and, with a manifest, its site operations, a third each) and half
 /// targeted at `targets`' strongest pieces and connections (a piece removed or scaled, a head's or
 /// an MLP's output swapped from the counterfactual at every token, a connection cut).
+/// The complement experiments of a score's experiment set (necessity, [`Checker::necessity_runs`]),
+/// the same for every program: the clean prompts, the set's first [`COMPLEMENT_EDITS`] weight edits
+/// and its first [`COMPLEMENT_SITES`] site operations that read no donor. None without
+/// counterfactuals.
+pub fn complements(experiments: &[Experiment], counterfactual: bool) -> Vec<Experiment> {
+    if !counterfactual {
+        return Vec::new();
+    }
+    let edits = experiments.iter().filter(|e| matches!(e, Experiment::Edit { .. })).take(COMPLEMENT_EDITS);
+    let sites = experiments.iter().filter(|e| matches!(e, Experiment::Sites { draw } if !Interventions::needs_donor(draw))).take(COMPLEMENT_SITES);
+    std::iter::once(Experiment::Clean).chain(edits.cloned()).chain(sites.cloned()).collect()
+}
+
+/// Weight edits and site operations of the experiment set each program's necessity is also
+/// measured under ([`complements`]).
+pub const COMPLEMENT_EDITS: usize = 1;
+pub const COMPLEMENT_SITES: usize = 1;
+
 pub fn sample(weights: &Weights, counterfactual: bool, count: usize, seed: u64, targets: &Targets, units: &SiteUnits) -> Vec<Experiment> {
     let sites = &units.pool;
     let mut out = vec![Experiment::Clean];
@@ -3506,6 +3538,11 @@ pub struct Checker {
 pub struct Score {
     pub total_bits: f64,
     pub exec_error_bits: f64,
+    /// `N` times the mean, over the complement experiments ([`complements`], equal weights), of
+    /// `KL(M_c ‖ P_c)` per scored token: `M` with the program's nodes at their counterfactual
+    /// values and every other piece on the prompt, against the program run with the roles swapped
+    /// ([`Checker::necessity_runs`]). Zero for a program of no nodes (it claims nothing).
+    pub necessity_error_bits: f64,
     pub reader_error_bits: f64,
     pub code_bits: f64,
     pub python_tokens: usize,
@@ -3880,6 +3917,27 @@ impl Checker {
         let plan = Plan { runs: &runs, groups: &groups, parsed: &parsed, circuits: &circuits, n, top, clean: clean.as_ref() };
         let result = self.measure_runs(plan, &mut measured);
         let widths = result?;
+        // Necessity, for each program with nodes: the same complement experiments for every program.
+        let complements = complements(&experiments, self.counterfactual.is_some());
+        let named: Vec<usize> = (0..parsed.len()).filter(|&i| !parsed[i].0.blocks.is_empty()).collect();
+        let quantized: Vec<Vec<(Block, Option<u32>)>> = named.iter().map(|&i| parsed[i].0.blocks.iter().cloned().zip(widths[i].iter().map(|w| w.bits)).collect()).collect();
+        let necessity_kl = self.necessity_runs(&named.iter().map(|&i| (&parsed[i].0, &circuits[i])).collect::<Vec<_>>(), &quantized, &complements)?;
+        let mut necessity = vec![(0.0, BTreeMap::new()); parsed.len()];
+        for (&i, kls) in named.iter().zip(&necessity_kl) {
+            let mut families: BTreeMap<String, Family> = BTreeMap::new();
+            let mut mean = 0.0;
+            for (e, kl) in complements.iter().zip(kls) {
+                let entry = families.entry(format!("necessity_{}", e.family())).or_default();
+                entry.experiments += 1;
+                entry.tokens += kl.len();
+                entry.mean_kl_bits += kl.iter().sum::<f64>();
+                mean += kl.iter().sum::<f64>() / kl.len().max(1) as f64 / complements.len() as f64;
+            }
+            for v in families.values_mut() {
+                v.mean_kl_bits /= v.tokens.max(1) as f64;
+            }
+            necessity[i] = (n * mean, families);
+        }
         let mut out = Vec::with_capacity(programs.len());
         let mut runs_and_measures = runs.into_iter().zip(measured);
         for (i, program) in programs.iter().enumerate() {
@@ -3901,13 +3959,16 @@ impl Checker {
             for v in per_family.values_mut() {
                 v.mean_kl_bits /= v.tokens.max(1) as f64;
             }
+            let (necessity_error_bits, necessity_families) = std::mem::take(&mut necessity[i]);
+            per_family.extend(necessity_families);
             let exec_error_bits = n * total.0 / total.1.max(1) as f64;
             let code_bits = if *valid && program.token_types > 1 { program.python_tokens as f64 * (program.token_types as f64).log2() } else { 0.0 };
             let opaque_numbers = graph.opaque_numbers(&self.weights);
             let opaque_bits: f64 = widths[i].iter().map(|w| w.cost_bits).sum();
             let score = Score {
-                total_bits: exec_error_bits + code_bits + opaque_bits,
+                total_bits: exec_error_bits + necessity_error_bits + code_bits + opaque_bits,
                 exec_error_bits,
+                necessity_error_bits,
                 reader_error_bits: 0.0,
                 code_bits,
                 python_tokens: if *valid { program.python_tokens } else { 0 },
@@ -3923,6 +3984,78 @@ impl Checker {
             out.push((score, outcomes));
         }
         Ok(out)
+    }
+
+    /// The necessity experiments' errors, per program per complement experiment: `M` with the
+    /// program's nodes at their counterfactual values and every other piece computing on the prompt
+    /// ([`Graph::complement_model`]), against the program's prediction for it, the program run with
+    /// the roles swapped (on the counterfactual, its stand-ins from the prompt) with its blocks
+    /// quantized to their widths. A program that names every part its information flows through
+    /// predicts it; a part it leaves out that carries its nodes' information moves `M` away.
+    pub(crate) fn necessity_runs(&mut self, programs: &[(&Graph, &Circuit)], quantized: &[Vec<(Block, Option<u32>)>], complements: &[Experiment]) -> Result<Vec<Vec<Vec<f64>>>, String> {
+        let mut out = vec![Vec::with_capacity(complements.len()); programs.len()];
+        if programs.is_empty() {
+            return Ok(out);
+        }
+        let standin = Graph::empty().program(&self.weights, true);
+        for e in complements {
+            let edit = match e {
+                Experiment::Edit { edit, .. } => Some(edit.clone()),
+                _ => None,
+            };
+            self.set_edit(e);
+            let result = (|| -> Result<(), String> {
+                // M's complement runs and the swapped runs' counterfactual runs, with M's exact
+                // weights (the experiment's edit applied).
+                let restore = edit.as_ref().map(|x| x.apply(&mut self.weights)).transpose()?;
+                let models: Result<Vec<Array2<f64>>, String> = programs.iter().map(|(g, _)| self.run(&g.complement_model(&self.weights), e)).collect();
+                let made = self.prewarm_swapped(&standin, e);
+                if let Some(r) = restore {
+                    r.restore(&mut self.weights)?;
+                }
+                let models = models?;
+                made?;
+                for (k, ((_, circuit), blocks)) in programs.iter().zip(quantized).enumerate() {
+                    let unquantize = self.weights.quantize(blocks)?;
+                    let restore = match edit.as_ref().map(|x| x.apply(&mut self.weights)).transpose() {
+                        Ok(r) => r,
+                        Err(err) => {
+                            unquantize.restore(&mut self.weights);
+                            return Err(err);
+                        }
+                    };
+                    let predicted = self.run_swapped(circuit, e);
+                    let restored = restore.map(|r| r.restore(&mut self.weights)).transpose();
+                    unquantize.restore(&mut self.weights);
+                    restored?;
+                    out[k].push(kl_bits(&models[k], &predicted?));
+                }
+                Ok(())
+            })();
+            self.set_edit(&Experiment::Clean);
+            result?;
+        }
+        Ok(out)
+    }
+
+    /// `circuit` under `e` with the roles of prompt and counterfactual swapped: run on the
+    /// counterfactuals, its stand-ins from the prompts (`e`'s weight edit applied by the caller).
+    fn run_swapped(&self, circuit: &Circuit, e: &Experiment) -> Result<Array2<f64>, String> {
+        match e {
+            Experiment::Sites { draw } => {
+                let (base, rows, _) = self.site_inputs_on(circuit, draw, true)?;
+                run_sites(&self.weights, circuit, (&base, &rows), None, draw, &self.sites)
+            }
+            _ => self.run(circuit, &Experiment::Counterfactual),
+        }
+    }
+
+    /// The counterfactual runs [`Checker::run_swapped`] reads, made with the current weights.
+    fn prewarm_swapped(&self, standin: &Circuit, e: &Experiment) -> Result<(), String> {
+        match e {
+            Experiment::Sites { draw } => self.site_inputs_on(standin, draw, true).map(|_| ()),
+            _ => self.referenced(standin, &self.counterfactual.as_ref().ok_or("the behavior has no counterfactuals")?.0).map(|_| ()),
+        }
     }
 
     /// The runs of a score: first `M` with its exact weights (each experiment once, its outcome
@@ -4262,12 +4395,25 @@ impl Checker {
     /// A site experiment's base batch with its counterfactual run under the same operations
     /// (`reference_under`), scored rows and donor batch with its own counterfactual run.
     fn site_inputs(&self, circuit: &Circuit, draw: &SiteDraw) -> Result<(Batch, Vec<usize>, Option<Batch>), String> {
-        let (base, rows, donor) = self.site_batches(Interventions::needs_donor(draw))?;
+        self.site_inputs_on(circuit, draw, false)
+    }
+
+    /// [`Checker::site_inputs`]; `swapped`, the counterfactuals as the base (their stand-ins from
+    /// the prompts) and no donor.
+    fn site_inputs_on(&self, circuit: &Circuit, draw: &SiteDraw, swapped: bool) -> Result<(Batch, Vec<usize>, Option<Batch>), String> {
+        let (base, rows, donor) = if swapped {
+            let (batch, rows) = self.counterfactual.as_ref().ok_or("the behavior has no counterfactuals")?;
+            (batch.clone(), rows.clone(), None)
+        } else {
+            self.site_batches(Interventions::needs_donor(draw))?
+        };
         let (mut base, donor) = (self.referenced(circuit, &base)?, donor.map(|d| self.referenced(circuit, &d)).transpose()?);
         // The stand-ins' run on the counterfactuals takes the same operations (reference_under).
         if base.reference.is_some() {
             let partner: Vec<Vec<u32>> = base.sequences().iter().map(|s| self.partners.get(s).cloned().ok_or("a prompt without a counterfactual")).collect::<Result<_, _>>()?;
-            let key = format!("{} {}", serde_json::to_string(draw).map_err(|e| e.to_string())?, partner.len());
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            std::hash::Hash::hash(&partner, &mut hasher);
+            let key = format!("{} {}", serde_json::to_string(draw).map_err(|e| e.to_string())?, std::hash::Hasher::finish(&hasher));
             let cell = cached_run(&self.site_references, key, self.reference_bytes)?;
             let r = cell
                 .get_or_init(|| {

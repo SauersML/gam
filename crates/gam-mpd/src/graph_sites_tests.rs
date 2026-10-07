@@ -3,7 +3,7 @@
 //! export (#2951): identical for `M` and a program that declares every piece, and equal to `M`'s
 //! own weight edits and donor runs where those define the same experiment.
 use crate::{
-    graph::{Batch, Behavior, Checker, Circuit, Counterfactual, EdgeIr, Graph, NodeIr, PieceIr, Program, Prompt, SiteDraw, SiteUnits, WeightEdit, Weights, execute, kl_bits, op_rows, reference, reference_under, run_sites, sample},
+    graph::{Batch, Behavior, Checker, Circuit, Counterfactual, EdgeIr, Graph, NodeIr, PieceIr, Program, Prompt, SiteDraw, SiteUnits, WeightEdit, Weights, complements, execute, kl_bits, op_rows, reference, reference_under, run_sites, sample},
     import::import_language_model,
     interchange::{self, Family, Operation, SharedSite, SiteOp},
     library_mdl,
@@ -686,4 +686,47 @@ fn device_runs_read_quantized_and_edited_vpd_factors() {
         assert!(kl < 1e-9, "{name}: KL(host ‖ device) = {kl:e} bits");
     }
     assert!(max(&kl_bits(&host[0], &host[1])) > 1e-9 && max(&kl_bits(&host[0], &host[3])) > 1e-9, "the quantization and the edit change the program");
+}
+
+/// Necessity: the full program predicts `M` with its nodes at their counterfactual values (no
+/// error); a program naming layer 0's heads alone, whose information reaches the logits through the
+/// later pieces it leaves out, pays; the empty program claims nothing and pays none (measured, its
+/// complement is `M` on the prompt and so is its swapped run) while it pays the whole sufficiency
+/// error.
+#[test]
+fn necessity_pays_for_left_out_mediators() {
+    // Float32 weights' rounding, as in graph_tests.
+    let f32_kl = 64.0 / 16_777_216.0 / std::f64::consts::LN_2;
+    let (weights, sequences) = model("graph_sites_necessity");
+    let units = units(&weights);
+    // Counterfactuals apart from every prompt (one token changed), so each sequence's partner is
+    // its own prompt or counterfactual.
+    let mut distinct = behavior(&sequences);
+    for p in &mut distinct.prompts {
+        if let Some(c) = p.counterfactual.as_mut() {
+            c.token_ids = p.token_ids.clone();
+            c.token_ids[5] = (c.token_ids[5] + 1) % 11;
+        }
+    }
+    let mut checker = Checker::new(weights, distinct).expect("checker");
+    checker.sites = SiteUnits { pool: vec![draw(Family::Zero, &[(SharedSite::Mlp(0), Operation::Scale(0))], 0, true), draw(Family::Push, &[(SharedSite::Stream(1), Operation::Push { direction: 0, size: 1 })], 5, false)], ..units };
+    let empty = Program { model: "tiny".into(), valid: true, ..Program::default() };
+    let mut partial = Program { model: "tiny".into(), valid: true, ..Program::default() };
+    partial.nodes = vec![NodeIr { id: "a0".into(), pieces: vec![piece(0, "head")], rule: None }];
+    partial.edges = ["query", "key", "value"].iter().map(|r| EdgeIr { from: "embed".into(), to: "a0".into(), route: (*r).into() }).chain(["embed", "a0"].iter().map(|w| EdgeIr { from: (*w).into(), to: "logits".into(), route: "input".into() })).collect();
+    let scores = checker.score_batch(&[full_program(), partial, empty], 30, 3, true, None, 0).expect("scores");
+    let (full, partial, none) = (&scores[0].0, &scores[1].0, &scores[2].0);
+    let families: Vec<&String> = full.per_family.keys().filter(|k| k.starts_with("necessity_")).collect();
+    assert!(families.iter().any(|k| *k == "necessity_clean") && families.iter().any(|k| k.starts_with("necessity_edit") || k.starts_with("necessity_rank")) && families.iter().any(|k| k.starts_with("necessity_site")), "{families:?}");
+    assert!(full.necessity_error_bits / full.n < f32_kl, "full program necessity {:e} bits per token", full.necessity_error_bits / full.n);
+    assert!(partial.necessity_error_bits / partial.n > 1e-3 && partial.necessity_error_bits > 100.0 * full.necessity_error_bits, "partial {:e}, full {:e} bits per token", partial.necessity_error_bits / partial.n, full.necessity_error_bits / full.n);
+    assert!((partial.total_bits - partial.exec_error_bits - partial.necessity_error_bits - partial.code_bits - partial.opaque_bits).abs() < 1e-6 * partial.total_bits);
+    assert_eq!(none.necessity_error_bits, 0.0);
+    assert!(none.exec_error_bits > full.exec_error_bits && none.exec_error_bits / none.n > 1e-3);
+    let empty_graph = Graph::empty();
+    let circuit = empty_graph.program(&checker.weights, true);
+    let targets = checker.targets().expect("targets");
+    let experiments = sample(&checker.weights, true, 30, 3, &targets, &checker.sites);
+    let measured = checker.necessity_runs(&[(&empty_graph, &circuit)], &[Vec::new()], &complements(&experiments, true)).expect("empty necessity");
+    assert!(measured[0].len() >= 3 && measured[0].iter().all(|kl| max(kl) < f32_kl), "{:?}", measured[0].iter().map(|kl| max(kl)).collect::<Vec<_>>());
 }
