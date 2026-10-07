@@ -4638,13 +4638,16 @@ pub fn fit_from(
                 // saturated and |g_k| is tiny: a toy fit (resid_mlp_1l, K = 55) took λ to 8,000 and
                 // diverged with the count flat.
                 if !progress.engaged && limit > 0.0 && expected > limit {
-                    // λ starts at the median over the gates of the balance |⟨∂F, ∂Ê⟩| / |∂Ê|² along
-                    // each gate's row of its parameters (a threshold's entry: |∂F/∂τ| / |∂Ê/∂τ|), every
-                    // gate whose count moves counted once (descent's prototype, 57510547fc). The
-                    // slope-weighted median of F's push alone, max(0, −⟨∂F, ∂Ê⟩) / |∂Ê|² (269b6645c2),
-                    // started λ near 1e-10 on vpd4l grouped direction gates with the count at 3,400
-                    // against K 128 (decomp-vpd4l-i, 1c27e2831b): most gates' push was zero or away
-                    // from the count there, and λ then needed some 23 passes at a factor e per pass.
+                    // λ starts where a pull would remove the count's excess to first order: each gate's
+                    // exchange rate r_b = max(0, −⟨∂F, ∂Ê⟩) / |∂Ê|² along its row of parameters (F's push
+                    // against the count per part; zero where F lowers the count itself), weighted by its
+                    // share of the count's response to a pull along ∂Ê, |∂Ê|². A pull λ moves the
+                    // count off the gates whose rate is below it, so λ₀ is the smallest positive rate
+                    // below which the weights carry at least the excess share (Ê − K) / Ê. A start
+                    // above the multiplier that holds the count at `K` closes gates that do not reopen:
+                    // the median of the unsigned balances |⟨∂F, ∂Ê⟩| / |∂Ê|² (2456421177) started λ at
+                    // 64–140 on the tiny decoder, the count fell from 15–18 to 7–9 parts within an
+                    // epoch against K near 11 and stayed below it while λ fell to 2 (GHA, seeds 4–7).
                     let mut ratios = Vec::new();
                     for (i, mean, _) in &terms {
                         let Some(g) = gradients.get(&explanation.trainable[*i]) else { continue };
@@ -4655,15 +4658,21 @@ pub fn fit_from(
                         for (f, k) in data.rows().into_iter().zip(count.rows()) {
                             let (along, square) = (f.dot(&k) * scale * LN_2, k.dot(&k));
                             if square > 0.0 && along.is_finite() {
-                                ratios.push(along.abs() / square);
+                                ratios.push(((-along).max(0.0) / square, square));
                             }
                         }
                     }
-                    ratios.sort_by(f64::total_cmp);
-                    if let Some(&balance) = ratios.get(ratios.len() / 2).filter(|r| **r > 0.0) {
+                    ratios.sort_by(|a, b| a.0.total_cmp(&b.0));
+                    let excess = ratios.iter().map(|r| r.1).sum::<f64>() * (expected - limit) / expected;
+                    let mut below = 0.0;
+                    let start = ratios.iter().find(|r| {
+                        below += r.1;
+                        below >= excess && r.0 > 0.0
+                    });
+                    if let Some(&(balance, _)) = start {
                         progress.engaged = true;
                         progress.multiplier = balance;
-                        log::info!("library budget bound at {expected:.4} parts per token (K {limit}): λ starts at {balance:.4e}, the median of {} gates' balances", ratios.len());
+                        log::info!("library budget bound at {expected:.4} parts per token (K {limit}): λ starts at {balance:.4e}, the rate at the excess share of {} gates' weights", ratios.len());
                     }
                 } else if progress.engaged && limit > 0.0 {
                     let horizon = (draws.len() as f64).max(1.0 / (1.0 - ivon.beta1));
