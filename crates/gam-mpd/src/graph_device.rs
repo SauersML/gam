@@ -27,6 +27,8 @@ use std::sync::{Mutex, OnceLock};
 pub(crate) struct DeviceState {
     device: Device,
     resident: HashMap<(usize, usize, usize), Tensor>,
+    /// The resident copies' keys, oldest first (past [`RESIDENT_BYTES`] the oldest go).
+    uploaded: Vec<(usize, usize, usize)>,
     references: Vec<(u64, BTreeMap<(Field, usize, usize), Tensor>)>,
 }
 
@@ -39,6 +41,10 @@ enum Field {
     Active,
     Mlp,
 }
+
+/// The bytes of resident copies of host matrices kept (Qwen3-0.6B's weights in float32 are about
+/// 3.2 GB; copies of matrices no run reads any more go first).
+const RESIDENT_BYTES: usize = 6 << 30;
 
 /// The bytes of counterfactual runs' arrays kept uploaded (the least recently used run's go first).
 const KEPT_REFERENCE_BYTES: usize = 2 << 30;
@@ -61,7 +67,7 @@ fn on_device<T: Send>(f: impl FnOnce(&mut DeviceState) -> T + Send) -> Option<T>
 
 impl DeviceState {
     pub(crate) fn new(device: Device) -> Self {
-        Self { device, resident: HashMap::new(), references: Vec::new() }
+        Self { device, resident: HashMap::new(), uploaded: Vec::new(), references: Vec::new() }
     }
 
     fn arithmetic(&self) -> Arithmetic {
@@ -77,6 +83,15 @@ impl DeviceState {
         if !self.resident.contains_key(&key) {
             let t = self.device.upload(m)?;
             self.resident.insert(key, t);
+            self.uploaded.retain(|k| self.resident.contains_key(k) && *k != key);
+            self.uploaded.push(key);
+            let mut bytes: usize = self.resident.values().map(|t| 4 * t.rows() * t.cols()).sum();
+            while bytes > RESIDENT_BYTES && self.uploaded.len() > 1 {
+                let old = self.uploaded.remove(0);
+                if let Some(t) = self.resident.remove(&old) {
+                    bytes -= 4 * t.rows() * t.cols();
+                }
+            }
         }
         Ok(key)
     }
