@@ -2023,6 +2023,10 @@ pub struct Checker {
     strongest: Option<Vec<(usize, usize)>>,
     /// The units and pool of site operations (`SiteUnits::manifest`); empty draws none.
     pub sites: SiteUnits,
+    /// When set to `m`, a score draws its experiments from seed `seed mod m`: `m` collections of
+    /// experiments recur across the seeds a caller steps through (an RL run's steps), so `M`'s
+    /// cached outcomes serve them all.
+    pub uniform_seeds: Option<u64>,
     /// Each prompt's tokens with its counterfactual's and back: a sequence's stand-in source.
     partners: std::collections::HashMap<Vec<u32>, Vec<u32>>,
     /// The weight edit applied now, if any (its JSON): part of a counterfactual run's cache key.
@@ -2123,6 +2127,7 @@ impl Checker {
             cache_bytes: cache_budget(),
             strongest: None,
             sites: SiteUnits::default(),
+            uniform_seeds: None,
             partners,
             edit: None,
             references: std::sync::Mutex::new(Vec::new()),
@@ -2296,6 +2301,7 @@ impl Checker {
     /// by their edit (the edit applied once, then every run that needs it).
     pub fn score_batch(&mut self, programs: &[Program], count: usize, seed: u64, edges: bool, n: Option<f64>, top: usize) -> Result<Vec<(Score, Vec<Measured>)>, String> {
         let n = n.unwrap_or_else(|| self.behavior.size());
+        let seed = self.uniform_seeds.map_or(seed, |m| seed % m.max(1));
         let strongest = self.strongest()?;
         self.site_references.lock().map_err(|e| e.to_string())?.clear();
         let parsed: Vec<(Graph, bool, Option<String>)> = programs

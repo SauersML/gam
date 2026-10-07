@@ -207,6 +207,9 @@ fn handle(request: &Value, weights: &mut Option<Weights>, checker: &mut Option<C
             // "stand_in": "input" (design: each neuron applied to its layer's mean input) or
             // "output" (each neuron's mean activation through its down column).
             c.stats.mean_output = request["stand_in"].as_str() == Some("output");
+            // "uniform_seeds": m draws from seed mod m (m collections of experiments recur across
+            // seeds, so M's cached outcomes serve them).
+            c.uniform_seeds = request["uniform_seeds"].as_u64();
             let k = request["reader_top"].as_u64().unwrap_or(0) as usize;
             let started = std::time::Instant::now();
             let scored = c.score_batch(&programs, count, seed, edges, n, k)?;
