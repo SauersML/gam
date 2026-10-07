@@ -4,7 +4,7 @@
 //! * `{"op": "load", "export": DIR, "vpd": DIR?, "transcoders": DIR?, "library": START_JSON?,
 //!   "library_arm": ARM?}`: the native model of an export (`import::import_language_model`), with
 //!   VPD's, the transcoders' or the library's view attached when named;
-//!   its weights taken from the start library (`library_mdl::explanation`, equal to `M`).
+//!   its weights read from the native program (`graph::Weights::from_native`).
 //! * `{"op": "behavior", "path": FILE}` or `{"op": "behavior", "behavior": {...}}`: a behavior file
 //!   (design.txt section 5); measures its stand-in averages on `M`. With `"manifest": FILE` (an
 //!   immutable experiment manifest, `mpd_library_mdl_2951`'s or `draw_manifest`'s; by default
@@ -35,8 +35,6 @@ use gam_mpd::{
     engine::log_to_stderr,
     graph::{Behavior, Checker, Experiment, Measured, Program, SiteUnits, WeightEdit, Weights},
     import::import_language_model,
-    library_mdl,
-    library_readout::Library,
     run_check::{layer_nodes, split_sites},
 };
 use serde_json::{Value, json};
@@ -75,13 +73,9 @@ fn load(export: &Path) -> Result<Weights, String> {
     let native = split_sites(&imported.program)?;
     drop(imported);
     let layers = layer_nodes(&native, layer_count)?;
-    let artifact = library_mdl::explanation(&native, &layers)?.artifact;
-    let device = Device::host();
-    // The library's operator values on the host: at most four times the export's tensors (Qwen3-0.6B
-    // holds 6.6 GB of them, past the 1 GiB that served vpd4l).
-    let tensors: u64 = std::fs::read_dir(export).map_err(error)?.flatten().filter(|e| e.path().extension().is_some_and(|x| x == "f64")).filter_map(|e| e.metadata().ok()).map(|m| m.len()).sum();
-    let library = Library::new(&device, &device, &native, &layers, &artifact, (4 * tensors).max(1 << 30) as usize, 256)?;
-    Ok(Weights::of(&library))
+    // Read straight from the native program: a start library on the host held several more copies
+    // of the model (Qwen3-0.6B's load went past 24 GiB).
+    Weights::from_native(&native, &layers)
 }
 
 /// The experiment in reader_score.py's form (its `words` renders it) for one prompt.

@@ -440,6 +440,99 @@ impl Weights {
         Ok(())
     }
 
+    /// `M`'s blocks read straight from its split native program (`run_check::split_sites`) and
+    /// its `layers` (`run_check::layer_nodes`), as [`Weights::of`] reads them from the start
+    /// library but without building one (a library on the host holds several more copies of a
+    /// model's matrices: Qwen3-0.6B's load went past 24 GiB).
+    pub fn from_native(native: &crate::operator_program::OperatorProgram, layers: &[crate::run_check::LayerNodes]) -> Result<Self, String> {
+        use crate::operator_program::Node;
+        let norm_of = |normed: usize| -> Result<Norm, String> {
+            let Node::Affine { terms, .. } = &native.nodes[normed] else { return Err(format!("node {normed} is not a normed stream")) };
+            let [(rms, gain)] = terms[..] else { return Err(format!("node {normed} is not one gain of a norm")) };
+            let Node::RmsNorm { epsilon, .. } = native.nodes[rms] else { return Err(format!("node {normed} does not read an RMS norm")) };
+            Ok(Norm { gain: native.operators[gain].matrix().diag().to_owned(), epsilon })
+        };
+        let map = |node: usize, input: usize| -> Result<(Array2<f64>, Option<Array1<f64>>), String> {
+            match &native.nodes[node] {
+                Node::Affine { terms, bias } if terms.len() == 1 && terms[0].0 == input => Ok((native.operators[terms[0].1].matrix(), bias.map(|b| native.operators[b].matrix().column(0).to_owned()))),
+                other => Err(format!("node {node} is not an affine map of node {input}: {other:?}")),
+            }
+        };
+        let head_norm = |node: usize| -> Result<Option<(Array1<f64>, f64)>, String> {
+            if crate::run_check::head_projection(native, node) == node {
+                return Ok(None);
+            }
+            let Node::Affine { terms, .. } = &native.nodes[node] else { return Err(format!("node {node}: a head norm")) };
+            let Node::RmsNorm { epsilon, .. } = native.nodes[terms[0].0] else { return Err(format!("node {node}: a head norm")) };
+            Ok(Some((native.operators[terms[0].1].matrix().diag().to_owned(), epsilon)))
+        };
+        let mut out = Vec::with_capacity(layers.len());
+        for (l, layer) in layers.iter().enumerate() {
+            let Node::Affine { terms: outputs, .. } = &native.nodes[layer.attention] else { return Err(format!("layer {l}: the attention output is not a map")) };
+            let mut heads = Vec::with_capacity(layer.reads.len());
+            for (h, &read) in layer.reads.iter().enumerate() {
+                let Node::Attend { query, key, value, scale, rotary, causal } = native.nodes[read].clone() else { return Err(format!("layer {l} head {h}: the read is not an attention")) };
+                let x = layer.normed_stream;
+                let output = outputs.iter().find(|(n, _)| *n == read).map(|(_, op)| native.operators[*op].matrix()).ok_or_else(|| format!("layer {l} head {h}: no output columns"))?;
+                heads.push(HeadWeights {
+                    query: map(crate::run_check::head_projection(native, query), x)?.0,
+                    query_norm: head_norm(query)?,
+                    key: map(crate::run_check::head_projection(native, key), x)?.0,
+                    key_norm: head_norm(key)?,
+                    value: map(value, x)?.0,
+                    output,
+                    scale: scale.value(),
+                    rotary,
+                    causal,
+                });
+            }
+            let x = layer.normed;
+            let zeros = |n: usize| Array1::<f64>::zeros(n);
+            let (gate_node, up_node, laws) = match &native.nodes[layer.active] {
+                Node::Hadamard { left, right } => {
+                    let Node::Pointwise { input, laws } = &native.nodes[*left] else { return Err(format!("layer {l}: the gated product's left factor is not one law")) };
+                    (*input, Some(*right), laws.clone())
+                }
+                Node::Pointwise { input, laws } => (*input, None, laws.clone()),
+                other => return Err(format!("layer {l}: the MLP's activations are {other:?}")),
+            };
+            let law = *laws.first().ok_or("an MLP of no units")?;
+            if laws.iter().any(|w| *w != law) {
+                return Err(format!("layer {l}: the MLP's units have different laws"));
+            }
+            let (gate, bias) = map(gate_node, x)?;
+            let n = gate.nrows();
+            let (up, up_bias) = match up_node {
+                Some(u) => {
+                    let (m, b) = map(u, x)?;
+                    (Some(m), b.unwrap_or_else(|| zeros(n)))
+                }
+                None => (None, zeros(n)),
+            };
+            out.push(LayerWeights {
+                attention: norm_of(layer.normed_stream)?,
+                heads,
+                mlp_norm: norm_of(x)?,
+                mlp: Some(MlpWeights { bias: bias.unwrap_or_else(|| zeros(n)), gate, up, up_bias, out: map(layer.mlp, layer.active)?.0, law }),
+            });
+        }
+        let head = crate::resident_causal_fit::fixed_head_target::Head::of(native)?;
+        let final_norm = norm_of(head.hidden)?;
+        let mut unembedding = head.embedding().to_owned();
+        unembedding.axis_iter_mut(Axis(0)).for_each(|mut row| row *= &final_norm.gain);
+        let feature = native.nodes.iter().position(|n| matches!(n, Node::Feature { .. })).ok_or("no token feature")?;
+        let embedding = native
+            .nodes
+            .iter()
+            .find_map(|n| match n {
+                Node::Affine { terms, bias: None } if terms.len() == 1 && terms[0].0 == feature => Some(native.operators[terms[0].1].matrix()),
+                _ => None,
+            })
+            .ok_or("no token embedding")?;
+        let embedding = if embedding.nrows() == unembedding.ncols() { embedding.t().to_owned() } else { embedding };
+        Ok(Self::new(out, final_norm, unembedding, embedding))
+    }
+
     /// The blocks of `library` (the start library of `M` equals `M`).
     pub fn of(library: &Library) -> Self {
         library.graph_weights()

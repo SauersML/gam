@@ -585,3 +585,23 @@ fn device_site_operations_on_the_host_backend_are_the_host_run() {
         assert_eq!(host.normed.keys().collect::<Vec<_>>(), device.normed.keys().collect::<Vec<_>>(), "{name}: recorded inputs");
     }
 }
+
+#[test]
+fn weights_read_from_the_native_program_are_the_librarys() {
+    for (tag, qwen) in [("graph_native_weights", false), ("graph_native_weights_qwen3", true)] {
+        let dir = if qwen { crate::test_support::tiny_qwen3_export(tag, LAYERS) } else { tiny_export(tag, LAYERS) };
+        let f = fixture_of(dir);
+        let library = Library::new(&f.device, &f.device, &f.native, &f.layers, &f.artifact, 1 << 28, 64).expect("library");
+        let (a, b) = (Weights::of(&library), Weights::from_native(&f.native, &f.layers).expect("native weights"));
+        let same = |x: &ndarray::Array2<f64>, y: &ndarray::Array2<f64>| x.dim() == y.dim() && x.iter().zip(y.iter()).all(|(p, q)| p == q);
+        assert!(same(&a.embedding, &b.embedding) && same(&a.unembedding, &b.unembedding) && a.final_norm.gain == b.final_norm.gain, "{tag}: embeddings");
+        for (la, lb) in a.layers.iter().zip(&b.layers) {
+            assert!(la.attention.gain == lb.attention.gain && la.mlp_norm.gain == lb.mlp_norm.gain, "{tag}: norms");
+            for (ha, hb) in la.heads.iter().zip(&lb.heads) {
+                assert!(same(&ha.query, &hb.query) && same(&ha.key, &hb.key) && same(&ha.value, &hb.value) && same(&ha.output, &hb.output) && ha.query_norm == hb.query_norm && ha.key_norm == hb.key_norm && ha.scale == hb.scale, "{tag}: heads");
+            }
+            let (ma, mb) = (la.mlp.as_ref().expect("mlp"), lb.mlp.as_ref().expect("mlp"));
+            assert!(same(&ma.gate, &mb.gate) && same(&ma.out, &mb.out) && ma.bias == mb.bias && ma.up_bias == mb.up_bias && ma.law == mb.law && ma.up.as_ref().map(|u| u.dim()) == mb.up.as_ref().map(|u| u.dim()), "{tag}: MLPs");
+        }
+    }
+}
