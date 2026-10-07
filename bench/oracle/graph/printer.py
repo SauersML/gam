@@ -152,7 +152,7 @@ class Qwen3:
         self.cfg = self.m.config
         self.tc = {}
         self.tokenizer = None
-        self.state = {"remove": [], "seen": None}
+        self.state = {"remove": [], "seen": None, "need": set()}
         D = self.cfg.head_dim
         for l, block in enumerate(self.m.model.layers):
             def pre_o(module, args, l=l):
@@ -163,7 +163,7 @@ class Qwen3:
                     y = y.clone()
                     for h in heads:
                         y[..., h * D : (h + 1) * D] = 0
-                if self.state["seen"] is not None:
+                if self.state["seen"] is not None and l in self.state["need"]:
                     self.state["seen"][("attn", l)] = y
                 return (y,)
 
@@ -174,13 +174,13 @@ class Qwen3:
                 if idx:
                     hid = hid.clone()
                     hid[..., idx] = 0
-                if self.state["seen"] is not None:
+                if self.state["seen"] is not None and l in self.state["need"]:
                     self.state["seen"][("mlp", l)] = hid
                 return (hid,)
 
             def post_mlp(module, args, out, l=l):
                 feats = [p for p in self.state["remove"] if p["view"] == "transcoder" and p["layer"] == l]
-                if self.state["seen"] is not None:
+                if self.state["seen"] is not None and l in self.state["need"]:
                     self.state["seen"][("mlp_in", l)] = args[0]
                 if feats:
                     enc, b, dec = self.transcoder(l)
@@ -270,6 +270,9 @@ def facts(engine, ir: dict, behavior: dict, chunk: int = 64) -> dict[str, dict]:
     """Per node id: removal and direct-path facts, averaged over the behavior's target tokens."""
     prompts = behavior["prompts"]
     dev = engine.dev
+    if isinstance(engine, Qwen3):  # record only the layers the program's pieces sit in
+        engine.state["need"] = {p["layer"] for n in ir["nodes"] for p in n["pieces"]}
+        chunk = min(chunk, 32)
     sums: dict[str, dict] = {n["id"]: {"answer_bits": 0.0, "kl_bits": 0.0, "answer_logit": 0.0, "ranks": [],
                                         "promoted": Counter(), "writes": True} for n in ir["nodes"]}
     count = 0
