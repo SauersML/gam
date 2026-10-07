@@ -1572,8 +1572,8 @@ BOILERPLATE = [("Licensed under the Apache License, Version", "2"), ("Permission
 def boilerplate(tok, rng):
     """Complete a phrase from a software license header."""
     rows = BOILERPLATE
-    v = Variant("license", "Fixed text: the next word of a common software-license sentence, inside several comment styles.")
-    for i, pre in enumerate(["# ", "// ", " * ", "-- ", "; ", "", "/* "]):
+    v = Variant("license", "Fixed text: the next word of a common software-license sentence, inside nine comment styles.")
+    for i, pre in enumerate(["# ", "// ", " * ", "-- ", "; ", "", "/* ", "% ", "REM "]):
         for a, b in rows:
             v.items.append(Item(pre + a, " " + b, tmpl=i))
     return [v]
