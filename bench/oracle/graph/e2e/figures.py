@@ -174,6 +174,37 @@ def r1(table_path: Path, out: Path, title: str) -> Path:
     return out
 
 
+def frontier(curves: list[tuple[str, Path]], points: list[tuple[str, Path]], out: Path, title: str, families=None) -> Path:
+    """Execution error against opaque cost (bits per scored token) along each search result's prefixes
+    (curves: label, search.py result JSON with a prefix trajectory) and for single programs (points:
+    label, {"score": ...} or a search result)."""
+    import table
+    families = families or table.SHARED
+    fig, ax = plt.subplots(figsize=(13, 8))
+    colors = iter(COLORS + ["#e87ba4", "#008300"])
+    for label, path in curves:
+        r = json.loads(path.read_text())
+        pts = sorted((s["opaque_bits"] / s["N"], table.shared(s, families)[0]) for k, s in r["trajectory"][0]["prefixes"]
+                     if s.get("valid", True) and table.shared(s, families))
+        c = next(colors)
+        ax.plot([x for x, _ in pts], [y for _, y in pts], "-o", color=c, linewidth=2, markersize=5, label=label)
+    for label, path in points:
+        r = json.loads(path.read_text())
+        s = r.get("score") or r
+        c = next(colors)
+        ax.scatter([s["opaque_bits"] / s["N"]], [table.shared(s, families)[0]], s=160, color=c, marker="D", label=label, zorder=4)
+    ax.set_xscale("symlog", linthresh=0.1)
+    ax.set_xlabel("weights the program reads, bits per scored token")
+    ax.set_ylabel("execution error, bits per scored token")
+    ax.set_title(title, loc="left")
+    ax.legend(frameon=False, fontsize=15, loc="lower left")
+    fig.tight_layout()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out, dpi=110)
+    plt.close(fig)
+    return out
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="command", required=True)
@@ -194,12 +225,19 @@ def main() -> None:
     m.add_argument("--names", nargs="*", default=[], help="name=label, in display order")
     m.add_argument("--title", default="Score of each program under each stand-in form")
     m.add_argument("--out", type=Path, default=FIGURES / "standin_forms.png")
+    fr = sub.add_parser("frontier")
+    fr.add_argument("--curve", nargs=2, action="append", default=[], metavar=("LABEL", "RESULT"))
+    fr.add_argument("--point", nargs=2, action="append", default=[], metavar=("LABEL", "RESULT"))
+    fr.add_argument("--title", default="Execution error against the cost of the weights read")
+    fr.add_argument("--out", type=Path, default=FIGURES / "frontier.png")
     q = sub.add_parser("r1")
     q.add_argument("table", type=Path)
     q.add_argument("--title", default="Best program per vpd4l behavior vs the empty program")
     q.add_argument("--out", type=Path, default=FIGURES / "r1_best_per_behavior.png")
     a = ap.parse_args()
-    if a.command == "r1":
+    if a.command == "frontier":
+        print(frontier([(l, Path(p)) for l, p in a.curve], [(l, Path(p)) for l, p in a.point], a.out, a.title))
+    elif a.command == "r1":
         print(r1(a.table, a.out, a.title))
     elif a.command == "modes":
         print(modes(json.loads(a.results.read_text()), dict(kv.split("=", 1) for kv in a.names), a.out, a.title))
