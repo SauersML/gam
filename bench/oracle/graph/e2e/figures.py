@@ -104,7 +104,7 @@ def compare(sweeps: list[Path], search: Path | None, oracle: Path | None, out: P
     ax.set_xlabel("total score, bits per scored token (lower is better)")
     ax.set_title(title or "Score per behavior: empty, hand-written, search, oracle", loc="left")
     ax.set_xlim(left=0)
-    ax.legend(frameon=False, loc="upper center", bbox_to_anchor=(0.5, -0.09 - 1.2 / (0.55 * len(rows) + 2.5)), ncol=4, fontsize=17)
+    ax.legend(frameon=True, framealpha=1, edgecolor="white", loc="upper right", fontsize=17)
     fig.tight_layout()
     out.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out, dpi=110)
