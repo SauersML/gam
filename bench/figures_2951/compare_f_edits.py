@@ -1,11 +1,12 @@
 """F on held-out edits per explanation, on the one shared experiment manifest only.
 
-A point is drawn only for an explanation scored by the edits driver on the shared,
-explanation-independent operations (swap, zero, scale, push), with one seed and the same held-out
-rows, from one binary (c7fa7f6dc5): EDITS files under ~/mpd-data/compare/new_ops/c7/<arm>/. An
-explanation without such a score (VPD until it is scored on the manifest, a fit without a
-checkpoint) is listed in the table with no number and is not drawn; a clean-text error never stands
-in for an edit gap.
+A point is drawn only for an explanation scored on one immutable manifest of shared,
+explanation-independent operations. vpd4l: ~/mpd-data/compare/manifest/MANIFEST_vpd4l_s1.json (swap,
+zero, scale, push, cut; seed 1; held-out rows 1024 to 1056), the transcoder arms scored by the edits
+driver (EDITS_*_m1.json) and VPD's three forms by mpd_battery_2951 site_edits on the same file
+(~/mpd-data/compare/manifest/vpd/EDITS_vpd_*.json). Qwen3-0.6B: the c7fa7f6dc5 draw (swap, zero,
+scale, push) under ~/mpd-data/compare/new_ops/c7/. An explanation without such a score is listed in
+the table with no number and is not drawn; a clean-text error never stands in for an edit gap.
 
 Description bits, one convention for every explanation: KL(q || p) of every described group (the
 fit's divergence: features, threshold groups, sink vectors), plus 32 bits per real for every executed
@@ -23,6 +24,7 @@ import matplotlib.ticker
 from safetensors import safe_open
 
 C7 = '/Users/user/mpd-data/compare/new_ops/c7'
+MANIFEST_DIR = '/Users/user/mpd-data/compare/manifest'
 RP = '/Users/user/mpd-data/runpod'
 L = lambda p: json.load(open(p)) if p and os.path.exists(p) else None
 
@@ -62,7 +64,7 @@ rows = []
 # vpd4l: transcoders as built (priced by the threshold-group fit's Laplace start, the same
 # explanation), and the two fits' best checkpoints.
 thr2 = latest(f'{RP}/compare-vpd4l-tc4096-thr2/out')
-arms = [('vpd4l', 'transcoders as built (4,096 per layer, priced at its Laplace start)', f'{C7}/vpd4l_as_is', 'EDITS_as_is_ops.json',
+arms = [('vpd4l', 'transcoders as built (4,096 per layer, priced at its Laplace start)', f'{MANIFEST_DIR}/vpd4l_as_is', 'EDITS_as_is_m1.json',
          thr2['start'] if thr2 else None, thr2['tokens'] if thr2 else None, f'{RP}/compare-vpd4l-tc4096-thr2/out')]
 for name, label in (('compare-vpd4l-tc4096-thr2', 'ours, fitted by F (read patches)'), ('compare-vpd4l-tc4096-thr-edits', 'ours, fitted by F (read patches and the shared operations)')):
     h = latest(f'{RP}/{name}/out')
@@ -72,7 +74,7 @@ for name, label in (('compare-vpd4l-tc4096-thr2', 'ours, fitted by F (read patch
         e = best['best'][1] if best.get('best') else max(best['epoch'] - 1, 0)
         rec = next((x['held_out'] for x in h['epochs'] if x['epoch'] == e), None)
         label += f' (epoch {e})'
-    arms.append(('vpd4l', label, f'{C7}/{name}', 'EDITS_thr_best_ops.json', rec, h['tokens'] if h else None, f'{RP}/{name}/out'))
+    arms.append(('vpd4l', label, f'{C7}/{name}', f"EDITS_{'thr2' if name.endswith('thr2') else 'thr_edits'}_m1.json", rec, h['tokens'] if h else None, f'{RP}/{name}/out'))
 arms.append(('Qwen3-0.6B', 'transcoders as built (f >= 1e-3, 28,545 features)', f'{C7}/qwen3_as_is', 'EDITS_as_is_ops.json', None, None, f'{C7}/qwen3_as_is'))
 for model, label, d, f, rec, N, out in arms:
     r = L(f'{d}/{f}')
@@ -87,14 +89,17 @@ for model, label, d, f, rec, N, out in arms:
             row['F_edits'] = row['description_bits'] / N + row['gap']
     rows.append(row)
 # VPD (vpdstart, 10-06): description = its subcomponents' KL(q || p) at 2^24 (vpd-pricing-n2p24b, 11.4M
-# bits) plus its causal-importance network priced at its Laplace start (77.2M bits); clean held-out KL
-# from the look-ahead test. These are clean-text numbers, not edit scores: listed, never drawn as an edit
-# gap, until VPD is scored on the shared manifest.
-for label, clean in (('VPD as published (its CI network reads the whole sequence, bidirectional)', 0.555),
-                     ('VPD with causal CI', 0.755), ('VPD autonomous, causal CI on its own activations', 0.763)):
-    rows.append({'model': 'vpd4l', 'method': label, 'edits': None, 'clean_kl_bits_per_token': clean, 'description_bits': 11.4e6 + 77.2e6, 'N': 2 ** 24,
-                 'F_lower_bound_bits_per_token': (11.4e6 + 77.2e6) / 2 ** 24 + 0.767 if label.startswith('VPD as published') else None,
-                 'note': 'clean held-out KL, not scored on the shared manifest; F lower bound 1.47 (subcomponents, sampled data 0.767) + 4.6 (CI network) = 6.1 bits/token'})
+# bits) plus its causal-importance network priced at its Laplace start (77.2M bits), N = 2^24; gaps on
+# the vpd4l manifest from mpd_battery_2951 site_edits (each form's masks recomputed under each edit).
+for form, label in (('published', 'VPD as published (its CI network reads the whole edited M, bidirectional)'),
+                    ('causal', 'VPD with causal CI on the edited M'), ('autonomous', 'VPD autonomous, causal CI on its own activations')):
+    path = f'{MANIFEST_DIR}/vpd/EDITS_vpd_{form}.json'
+    r = L(path)
+    row = {'model': 'vpd4l', 'method': label, 'edits': path if r else None, 'description_bits': 11.4e6 + 77.2e6, 'N': 2 ** 24, 'active': '213 subcomponents unmasked per token'}
+    if r:
+        row['gap'], row['gap_by_effect'], row['families'] = manifest_gap(r)
+        row['F_edits'] = row['description_bits'] / row['N'] + row['gap']
+    rows.append(row)
 # M's tensors an MLP-only explanation runs unchanged (vpd4l's attention) are charged at the precision an
 # explanation needs: their description at the Laplace start with means held at M (compare-vpd4l-attn-price).
 attn = L('/Users/user/mpd-data/compare/attention_price.json')
@@ -115,8 +120,8 @@ if len(sys.argv) > 1:
         pts = [r for r in rows if r['model'] == model and r.get('gap') is not None and r.get('description_bits')]
         for r in pts:
             ax.scatter([r['description_bits']], [r['gap']], s=80, color='#4c72b0' if r['method'].startswith('ours') else '#8172b2')
-            act = '/'.join(f'{a:.0f}' for a in r['active_per_token'])
-            ax.annotate('\n'.join(textwrap.wrap(r['method'], 38)) + f'\nactive per token by layer: {act}', (r['description_bits'], r['gap']), textcoords='offset points', xytext=(8, 6), fontsize=10)
+            act = 'active per token by layer: ' + '/'.join(f'{a:.0f}' for a in r['active_per_token']) if 'active_per_token' in r else r.get('active', '')
+            ax.annotate('\n'.join(textwrap.wrap(r['method'], 38)) + f'\n{act}', (r['description_bits'], r['gap']), textcoords='offset points', xytext=(8, 6), fontsize=10)
         ax.set_xscale('log')
         ax.xaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(lambda v, _: f'{v / 1e6:g}M'))
         ax.xaxis.set_minor_formatter(matplotlib.ticker.NullFormatter())
