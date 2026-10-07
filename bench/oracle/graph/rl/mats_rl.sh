@@ -28,4 +28,8 @@ py=$HOME/rl-venv/bin/python
 ) 9> "$HOME/.rl-venv.lock"
 # score.py starts the checker under the Mac's mem-lease unless MEM_LEASE_GIB is set; the cluster has no ledger.
 export TOKENIZERS_PARALLELISM=false MEM_LEASE_GIB=${MEM_LEASE_GIB:-0}
+if [ "${1:-}" = test ]; then  # the loop's tests in this venv (CPU): mats-run oracle-rl-test 8 24 0.5 -- bash .../mats_rl.sh test
+    "$py" "$here/test_train.py"
+    exec "$py" "$here/test_scorer.py"
+fi
 exec "$py" "$here/train.py" "$@"
