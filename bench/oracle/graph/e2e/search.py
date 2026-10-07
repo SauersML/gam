@@ -60,17 +60,29 @@ def load_ranking(path: Path) -> None:
 
 def site(unit) -> int:
     """The residual stream a unit reads (design.txt section 5): attention at 2l, MLP at 2l+1."""
-    return 2 * unit[1] + (unit[0] in ("mlp", "vpd"))
+    return 2 * unit[1] + (unit[0] in ("mlp", "vpd") or (unit[0] == "sub" and unit[2] in ("c_fc", "down_proj")))
 
 
 def name(unit) -> str:
-    return {"head": "h", "mlp": "m", "vpd": "v"}[unit[0]] + "_".join(str(x) for x in unit[1:]) if unit[0] != "head" else f"h{unit[1]}_{unit[2]}"
+    return {"head": "h", "mlp": "m", "vpd": "v", "sub": "s"}[unit[0]] + "_".join(str(x) for x in unit[1:]) if unit[0] != "head" else f"h{unit[1]}_{unit[2]}"
 
 
 def unit_of(text: str):
-    """The unit a name() denotes: h<l>_<h>, m<l>_<start>_<stop> or v<l>_<kc>_<kd>."""
+    """The unit a name() denotes: h<l>_<h>, m<l>_<start>_<stop>, v<l>_<kc>_<kd> or s<l>_<matrix>_<index>."""
+    if text[0] == "s":
+        layer, rest = text[1:].split("_", 1)
+        matrix, index = rest.rsplit("_", 1)
+        return ("sub", int(layer), matrix, int(index))
     parts = [int(x) for x in text[1:].split("_")]
     return ({"h": "head", "m": "mlp", "v": "vpd"}[text[0]], *parts)
+
+
+def ranked_subcomponents(path: Path) -> list[tuple]:
+    """Every VPD subcomponent ("sub", layer, matrix, index), largest measured removal effect first (g-mech's
+    measure/vpd_induction_removal.py output: sites -> {"kl_bits": [per subcomponent]})."""
+    sites = json.loads(Path(path).read_text())["sites"]
+    subs = [(kl, ("sub", int(key.split(".")[1]), key.split(".")[-1], i)) for key, v in sites.items() for i, kl in enumerate(v["kl_bits"])]
+    return [u for kl, u in sorted(subs, key=lambda x: -x[0])]
 
 
 def piece(unit) -> str:
@@ -84,17 +96,57 @@ def piece(unit) -> str:
     return f"PD.vpd[{l}].c_fc[{c}], PD.vpd[{l}].down_proj[{d}]"
 
 
+def _slices(indices) -> str:
+    """Sorted unique indices in mech's slice syntax: consecutive runs as start:stop."""
+    xs, out, i = sorted(set(indices)), [], 0
+    while i < len(xs):
+        j = i
+        while j + 1 < len(xs) and xs[j + 1] == xs[j] + 1:
+            j += 1
+        out.append(str(xs[i]) if i == j else f"{xs[i]}:{xs[j] + 1}")
+        i = j + 1
+    return ", ".join(out)
+
+
+SITES_OF = {"attn": ("q_proj", "k_proj", "v_proj", "o_proj"), "mlp": ("c_fc", "down_proj")}
+
+
+def nodes_of(units) -> list[tuple[str, str, int, bool, bool]]:
+    """(node name, pieces, residual site, reads the residual, writes it) per node: a head per node; a layer's
+    native MLP blocks merged into one node, and a layer's VPD subcomponents ("sub", layer, matrix, index)
+    into one node per block (attention or MLP), since every causal edge is declared and a merged node then
+    computes the same. A VPD node reads the residual only through c_fc / q, k, v subcomponents and writes
+    it only through down_proj / o_proj ones."""
+    out, mlp, sub = [], {}, {}
+    for u in units:
+        if u[0] == "mlp":
+            mlp.setdefault(u[1], set()).update(range(u[2], u[3]))
+        elif u[0] == "sub":
+            block = "mlp" if u[2] in SITES_OF["mlp"] else "attn"
+            sub.setdefault((u[1], block), {}).setdefault(u[2], set()).add(u[3])
+        else:
+            out.append((name(u), piece(u), site(u), True, True))
+    for l, idx in mlp.items():
+        out.append((f"m{l}", f"L[{l}].mlp[{_slices(idx)}]", 2 * l + 1, True, True))
+    for (l, block), sites in sub.items():
+        pieces = ", ".join(f"PD.vpd[{l}].{m}[{_slices(sites[m])}]" for m in SITES_OF[block] if m in sites)
+        reads = bool(set(sites) & {"c_fc", "q_proj", "k_proj", "v_proj"})
+        writes = bool(set(sites) & {"down_proj", "o_proj"})
+        out.append((f"{'va' if block == 'attn' else 'vm'}{l}", pieces, 2 * l + (block == "mlp"), reads, writes))
+    return sorted(out, key=lambda n: (n[2], n[0]))
+
+
 def source(units) -> str:
     """The program declaring `units` as nodes with every causal edge among them listed."""
-    units = sorted(units, key=lambda u: (site(u), u))
+    nodes = nodes_of(units)
     lines = ['"""Found by greedy search on the score (e2e/search.py)."""', "from mech import node, edges, L, PD, embed, logits"]
-    for u in units:
-        lines.append(f"{name(u)} = node({piece(u)})")
+    lines += [f"{n[0]} = node({n[1]})" for n in nodes]
     wires = []
-    for i, u in enumerate(units):
-        wires += [f"    {w} >> {name(u)}," for w in ["embed"] + [name(v) for v in units[:i] if site(v) < site(u)]]
-    wires += [f"    {w} >> logits," for w in ["embed"] + [name(u) for u in units]]
-    if units:
+    for i, (n, _, s_, reads, _) in enumerate(nodes):
+        if reads:
+            wires += [f"    {w} >> {n}," for w in ["embed"] + [m[0] for m in nodes[:i] if m[2] < s_ and m[4]]]
+    wires += [f"    {w} >> logits," for w in ["embed"] + [n[0] for n in nodes if n[4]]]
+    if nodes:
         lines += ["edges("] + wires + [")"]
     return "\n".join(lines) + "\n"
 
@@ -160,10 +212,10 @@ def objective_of(kind: str):
     """The quantity search minimizes: the score's total, or (kind "shared") the total with the execution
     error taken over the experiment families every program shares (table.shared)."""
     if kind == "total":
-        return lambda r: r["total_bits"]
+        return lambda r: r["total_bits"] if r.get("valid", True) else float("inf")
     import table
     families = {"shared": table.SHARED, "fit": table.FIT}[kind]
-    return lambda r: table.shared(r, families)[1] * r["N"]
+    return lambda r: table.shared(r, families)[1] * r["N"] if r.get("valid", True) else float("inf")
 
 
 def greedy(pool: Pool, model: str, mode: str, experiments: int, seed: int, min_neurons: int, log, start=None,
@@ -225,7 +277,7 @@ def greedy(pool: Pool, model: str, mode: str, experiments: int, seed: int, min_n
 
 
 def prefix_search(pool: Pool, model: str, experiments: int, seed: int, block: int, log, rank_experiments: int = 0,
-                  checkpoint=None, objective=None, units=None) -> dict:
+                  checkpoint=None, objective=None, units=None, ranked=None, max_prune: int = 64) -> dict:
     """Measured ranking, then prefixes, then pruning, all exact through the checker:
     1. every unit alone (heads, MLP neuron blocks of `block`) as a one-node program: under counterfactual
        stand-ins this is the unit's activation patch from x into x', and the drop in KL on the clean and
@@ -238,14 +290,18 @@ def prefix_search(pool: Pool, model: str, experiments: int, seed: int, block: in
     units = units or ([("head", l, h) for l in range(s_["layers"]) for h in range(s_["heads"])]
                       + [("mlp", l, i, min(i + block, s_["d_mlp"])) for l in range(s_["layers"]) for i in range(0, s_["d_mlp"], block)])
     import table
-    empty, *alone = pool.score([source([])] + [source([u]) for u in units], rank_experiments, seed)
-    # The effect on the clean and counterfactual prompts only: every program has those two experiments,
-    # while the rest of a program's draws depend on what it declares.
-    kl = lambda r: table.shared(r, ("clean", "counterfactual"))[0] * r["N"]
-    effect = {u: kl(empty) - kl(r) for u, r in zip(units, alone)}
-    ranked = sorted(units, key=lambda u: -effect[u])
-    log(f"ranked {len(units)} units by their patch on {rank_experiments} experiments; top: " +
-        ", ".join(f"{name(u)} {effect[u] / empty['N']:.3f}" for u in ranked[:8]))
+    if ranked is None:
+        empty, *alone = pool.score([source([])] + [source([u]) for u in units], rank_experiments, seed)
+        # The effect on the clean and counterfactual prompts only: every program has those two experiments,
+        # while the rest of a program's draws depend on what it declares.
+        kl = lambda r: table.shared(r, ("clean", "counterfactual"))[0] * r["N"]
+        effect = {u: kl(empty) - kl(r) for u, r in zip(units, alone)}
+        ranked = sorted(units, key=lambda u: -effect[u])
+        log(f"ranked {len(units)} units by their patch; top: " + ", ".join(f"{name(u)} {effect[u] / empty['N']:.3f}" for u in ranked[:8]))
+    else:  # a ranking measured elsewhere (a removal scan): its order only
+        empty = pool.score([source([])], experiments, seed)[0]
+        effect = {u: float(len(ranked) - i) for i, u in enumerate(ranked)}
+        log(f"{len(ranked)} units ranked by a given measurement; top: " + ", ".join(name(u) for u in ranked[:8]))
     ks, k = [], 1
     while k < len(ranked):
         ks.append(k)
@@ -258,7 +314,16 @@ def prefix_search(pool: Pool, model: str, experiments: int, seed: int, block: in
     trajectory = [{"ranking": [[name(u), effect[u]] for u in ranked], "empty": empty, "prefixes": [[k, r] for k, r in zip(ks, results)]}]
     if checkpoint:
         checkpoint({"units": [name(u) for u in current], "source": source(current), "score": best, "trajectory": trajectory, "partial": True})
-    while len(current) > 1:
+    if len(current) > max_prune:  # too many units to drop one by one: refine k between the best prefix's neighbours
+        lo, hi = ks[max(j - 1, 0)], ks[min(j + 1, len(ks) - 1)]
+        fine = sorted({lo + (hi - lo) * i // 8 for i in range(9)} - {ks[j]} - {0})
+        rs = pool.score([source(ranked[:k]) for k in fine], experiments, seed)
+        log("refine: " + ", ".join(f"{k}:{objective(r) / r['N']:.3f}" for k, r in zip(fine, rs)))
+        trajectory.append({"refine": [[k, r] for k, r in zip(fine, rs)]})
+        i = min(range(len(fine)), key=lambda i: objective(rs[i]))
+        if objective(rs[i]) < objective(best):
+            current, best = ranked[:fine[i]], rs[i]
+    while 1 < len(current) <= max_prune:
         moves = [[v for v in current if v != u] for u in current]
         rs = pool.score([source(m) for m in moves], experiments, seed)
         i = min(range(len(moves)), key=lambda i: objective(rs[i]))
@@ -277,6 +342,7 @@ def main() -> None:
     ap.add_argument("behavior", type=Path)
     ap.add_argument("--mode", default="both", choices=["addition", "removal", "both", "prefix"])
     ap.add_argument("--block", type=int, default=96, help="prefix mode: MLP neurons per unit")
+    ap.add_argument("--max-units", type=int, default=8192, help="prefix mode with --mlp-view vpd: the top ranked subcomponents considered")
     ap.add_argument("--rank-experiments", type=int, default=0, help="prefix mode: draws beyond clean and counterfactual per one-unit ranking program")
     ap.add_argument("--experiments", type=int, default=16)
     ap.add_argument("--seed", type=int, default=0)
@@ -311,7 +377,8 @@ def main() -> None:
     if a.mlp_view == "vpd":
         global GROW
         GROW = a.grow
-        load_ranking(a.ranking)
+        if a.mode != "prefix":
+            load_ranking(a.ranking)
     views = {"vpd": a.vpd} if a.mlp_view == "vpd" else None
     pool = Pool(model, path, a.workers, a.export, a.stand_in, views, out / f"{behavior['id']}{a.tag}.candidates.jsonl")
     try:
@@ -328,7 +395,9 @@ def main() -> None:
                 partial = out / f"{stem}.partial.json"
                 save = lambda state: partial.write_text(json.dumps(state, indent=1))
                 if mode == "prefix":
-                    found = prefix_search(pool, model, a.experiments, a.seed, a.block, log, a.rank_experiments, save, objective_of(a.objective))
+                    ranked = ranked_subcomponents(a.ranking)[: a.max_units] if a.mlp_view == "vpd" else None
+                    found = prefix_search(pool, model, a.experiments, a.seed, a.block, log, a.rank_experiments, save,
+                                          objective_of(a.objective), ranked=ranked)
                 else:
                     found = greedy(pool, model, mode, a.experiments, a.seed, a.min_neurons, log, start_units, a.mlp_view,
                                    save, objective_of(a.objective))
