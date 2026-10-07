@@ -57,6 +57,10 @@ fn full_program() -> Program {
     Program { model: "tiny".into(), nodes, edges, python_tokens: 0, token_types: 0, source: String::new(), valid: true, error: None, standin: None }
 }
 
+/// The Checker keeps `M`'s log-probabilities in float32 (relative rounding `2^-24`): on
+/// log-probabilities above −64 a token's KL moves by at most `2^-24 · 64 / ln 2` bits.
+const F32_KL: f64 = 64.0 / 16_777_216.0 / std::f64::consts::LN_2;
+
 fn max(values: &[f64]) -> f64 {
     values.iter().fold(0.0f64, |a, b| a.max(b.abs()))
 }
@@ -150,7 +154,7 @@ fn checker_scores_the_full_program_at_zero_error() {
     };
     let (full, outcomes) = checker.score(&global(full_program()), 24, 7, true, None).expect("score");
     assert!(full.valid);
-    assert!(full.exec_error_bits / full.n < 1e-9, "full program error {:e} bits per token over {:?}", full.exec_error_bits / full.n, outcomes.iter().map(|o| o.0.family()).collect::<Vec<_>>());
+    assert!(full.exec_error_bits / full.n < F32_KL, "full program error {:e} bits per token over {:?}", full.exec_error_bits / full.n, outcomes.iter().map(|o| o.0.family()).collect::<Vec<_>>());
     assert!(outcomes.iter().any(|o| matches!(o.0, Experiment::Edit { .. })));
     let (empty, _) = checker.score(&global(Program { model: "tiny".into(), valid: true, ..Program::default() }), 24, 7, true, None).expect("score");
     assert!(empty.exec_error_bits > full.exec_error_bits && empty.opaque_numbers < full.opaque_numbers);
@@ -239,8 +243,8 @@ fn checker_counterfactual_default_scores_the_empty_program_at_the_behavior_signa
     let clean_rows: Vec<usize> = (0..f.sequences.len()).map(|s| (s + 1) * 12 - 1).collect();
     let signal = kl_bits(&clean.select(ndarray::Axis(0), &clean_rows), &target.select(ndarray::Axis(0), &clean_rows));
     let measured = outcomes.iter().find(|o| o.0 == Experiment::Clean).map(|o| o.1.clone()).expect("clean");
-    assert!(max(&signal.iter().zip(&measured).map(|(a, b)| a - b).collect::<Vec<_>>()) < 1e-9, "empty program clean error {measured:?} vs KL(M(x) ‖ M(x')) {signal:?}");
+    assert!(max(&signal.iter().zip(&measured).map(|(a, b)| a - b).collect::<Vec<_>>()) < F32_KL, "empty program clean error {measured:?} vs KL(M(x) ‖ M(x')) {signal:?}");
     assert!(empty.valid);
     let (full, _) = checker.score(&full_program(), 16, 3, true, None).expect("score");
-    assert!(full.exec_error_bits / full.n < 1e-9, "full program error {:e} bits per token", full.exec_error_bits / full.n);
+    assert!(full.exec_error_bits / full.n < F32_KL, "full program error {:e} bits per token", full.exec_error_bits / full.n);
 }
