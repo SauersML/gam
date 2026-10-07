@@ -14,7 +14,7 @@
 //! through a frame, while an MLP whose law is elementwise nonlinear keeps its neuron groups (the
 //! law privileges the neuron axis): per neuron its c_fc row and down_proj column.
 //!
-//! Three frames ([`FrameKind`]):
+//! Three frames (`FrameKind`):
 //! * `Tight`: `C` standard normal atoms made a Parseval frame, `F ← F (FᵀF)^{-1/2}`, so its dual
 //!   is itself; no data.
 //! * `Dictionary`: a one-sparse dictionary of `M`'s activations at the read on fitting rows

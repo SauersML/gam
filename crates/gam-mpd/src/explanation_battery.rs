@@ -2654,7 +2654,7 @@ impl<'a> FormRuns<'a> {
 /// VPD under the edits driver's shared operations (`interchange::Interchange::sample_ops`: swaps,
 /// zeroings, scalings, pushes and cuts at sites every explanation shares with `M`), the experiments
 /// `batches` (each a batch of held-out sequences of `length` rows with its drawn experiments)
-/// applied verbatim to `M` and to VPD in three forms ([`FormRuns`]), each running its own
+/// applied verbatim to `M` and to VPD in three forms (`FormRuns`), each running its own
 /// computation under the edit. A swap reads the donor's value from the same program's own unedited
 /// run of the batch. Per form and family: `KL(M_e ‖ VPD_e)` in bits per token over every scored
 /// token (from the edited one on) and at the edited token, and those gaps binned by the edit's
