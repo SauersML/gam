@@ -43,7 +43,11 @@ part of the task. The next-token fields also come for three larger edits (suffix
 every row from the first token after the sink on (at p, every earlier row's edit reaches it too); _group,
 the subcomponent with the other GROUP - 1 subcomponents of its site most active at p (|v . x|), removed or
 doubled together at row p (their numbers in `group`, their activities at p in `group_act`); _groupfrom,
-the group from the first token on.
+the group from the first token on; _sites, a multi-site edit: the subcomponent and, at the site of its kind
+in every other layer, the subcomponent most active at p in the clean run (`sites_member` [C, K, layers]:
+each layer's number, the subcomponent's own in its layer; `sites_act` their activities at p), edited
+together at row p; _sitesfrom, the same from the first token on. Continuations also come for the group
+from p on (cont_groupfrom_<alpha>), the size of edit whose continuation changes often enough to ask about.
 
   vpd_labels.py --out DIR [--offset 0] [--pool 2048] [--top 16] [--random 16] [--sites h.0.mlp.c_fc,...]
                 [--limit N] [--rows 256] [--seed 0] [--edit all|row] [--stride 1] [--continue 1]
@@ -73,7 +77,10 @@ ROW_ALPHAS = (("ablate", 0.0), ("amplify", 2.0))
 # Row-edit variants (field suffix, edited rows, edited subcomponents): the subcomponent at row p only; from
 # the first token after the sink on (rows 1..T-1, so at p every earlier row's edit reaches it too); and the
 # same two for its group, the GROUP subcomponents of its site most active (|v . x|) at p, itself included.
-VARIANTS = (("", "row", False), ("_from", "from", False), ("_group", "row", True), ("_groupfrom", "from", True))
+# The multi-site variants: the subcomponent with, at its kind's site in every other layer, the subcomponent
+# most active at p (clean run), together.
+VARIANTS = (("", "row", "one"), ("_from", "from", "one"), ("_group", "row", "group"), ("_groupfrom", "from", "group"),
+            ("_sites", "row", "sites"), ("_sitesfrom", "from", "sites"))
 GROUP = 8
 T, S, TOP = 128, 12, 10
 
@@ -118,19 +125,23 @@ class Model:
         self.t = VM.load_target(str(dev))
         self.wide = torch.float32 if dev.type == "mps" else torch.float64
 
-    def layer(self, i: int, x: torch.Tensor, edit=None):
+    def layer(self, i: int, x: torch.Tensor, edit=None, record: dict | None = None):
         """Layer i on the stream x; edit = (site name, v [R, d_in], u [R, d_out], coef [R][, start [R][, stop
-        [R]]]): the edit at every row, or at rows start_r <= t (< stop_r) only. Returns the stream after
-        the layer and, with an edit, the edited site's input."""
+        [R]]]): the edit at every row, or at rows start_r <= t (< stop_r) only; or a list of such edits at
+        several sites (each acts at its own site; others are ignored). Returns the stream after the layer
+        and, with an edit, the edited site's input; `record` collects every site's input by name."""
         t = self.t
         B, L, _ = x.shape
         seen = None
+        edits = [] if edit is None else (edit if isinstance(edit, list) else [edit])
 
         def site(kind, h):
             nonlocal seen
             name = f"h.{i}.{'mlp' if kind in ('c_fc', 'down_proj') else 'attn'}.{kind}"
             out = t.site(name)(h)
-            if edit is not None and edit[0] == name:
+            if record is not None:
+                record[name] = h
+            for edit in (e for e in edits if e[0] == name):
                 _, v, u, coef = edit[:4]
                 seen = h
                 if v.dim() == 2:  # one subcomponent per row, or k of them: v [R, k, d_in], u [R, k, d_out]
@@ -165,9 +176,11 @@ class Model:
 
     @torch.no_grad()
     def from_layer(self, l: int, x: torch.Tensor, edit):
+        """Layers l on from the stream entering layer l (edits name their sites, so each acts in its own
+        layer); the final normed stream and the input of the edited site of layer l."""
         seen = None
         for i in range(l, self.t.n_layer):
-            x, s = self.layer(i, x, edit if i == l else None)
+            x, s = self.layer(i, x, edit)
             seen = s if i == l else seen
         return VM.rms(x, self.t.ln_f, self.t.eps), seen
 
@@ -210,7 +223,7 @@ def greedy(model: Model, prefixes: list[torch.Tensor], edit, steps: int) -> torc
         cur = int(lengths.max())
         x_ = model.t.wte[ids[:, :cur]]
         for i in range(model.t.n_layer):
-            x_, _ = model.layer(i, x_, edit if edit is not None and int(edit[0].split(".")[1]) == i else None)
+            x_, _ = model.layer(i, x_, edit)  # an edit (or list of them) acts at its own sites
         final = VM.rms(x_, model.t.ln_f, model.t.eps)
         nxt = (final[rows, lengths - 1] @ model.t.wte.T).argmax(-1)
         out[:, s] = nxt
@@ -244,7 +257,9 @@ def row_labels(args, model: Model, ids: torch.Tensor, entering, final, peaks, na
         activity = torch.empty(C, K, T, device=dev)
         position = torch.empty(C, K, dtype=torch.int64, device=dev)
         fields = {a: {} for a, _ in ROW_ALPHAS}
-        groups, group_acts = [], []
+        groups, group_acts, site_members, site_acts = [], [], [], []
+        kind = name.split(".")[-1]
+        others = [f"h.{l}.{name.split('.')[2]}.{kind}" for l in range(model.t.n_layer)]  # its kind's site in every layer
         pairs = torch.cartesian_prod(torch.arange(C, device=dev), torch.arange(K, device=dev))
         for s in range(0, len(pairs), args.rows):
             cs, ks = pairs[s : s + args.rows, 0], pairs[s : s + args.rows, 1]
@@ -265,10 +280,30 @@ def row_labels(args, model: Model, ids: torch.Tensor, entering, final, peaks, na
             group = every.topk(GROUP, dim=-1).indices  # [R, GROUP]
             groups.append(group.to(torch.int32).cpu())
             group_acts.append(signed.gather(-1, group).float().cpu())
-            for (alpha_name, alpha), (suffix, span, grouped) in [(a, v_) for a in ROW_ALPHAS for v_ in VARIANTS]:
-                ev, eu = (V.T[group], U[group]) if grouped else (v, u)
+            # Its sites: in every other layer, the subcomponent of its kind's site most active at p in the clean run.
+            inputs = {}
+            x0 = entering[0][rows_ctx]
+            for i in range(model.t.n_layer):
+                x0, _ = model.layer(i, x0, None, inputs)
+            members, member_acts = [], []
+            for n_ in others:
+                if n_ == name:
+                    members.append(sub); member_acts.append(signed[at, sub])
+                    continue
+                a_ = inputs[n_][at, pos] @ UV[n_][1]  # [R, the site's subcomponents]
+                m_ = a_.abs().argmax(-1)
+                members.append(m_); member_acts.append(a_[at, m_])
+            site_members.append(torch.stack(members, -1).to(torch.int32).cpu())
+            site_acts.append(torch.stack(member_acts, -1).float().cpu())
+            for (alpha_name, alpha), (suffix, span, what) in [(a, v_) for a in ROW_ALPHAS for v_ in VARIANTS]:
                 rows_ = (pos, pos + 1) if span == "row" else (torch.ones_like(pos),)
-                h, _ = model.from_layer(layer, entering[layer][rows_ctx], (name, ev, eu, torch.full((R,), alpha - 1.0, device=dev), *rows_))
+                coef = torch.full((R,), alpha - 1.0, device=dev)
+                if what == "sites":  # one subcomponent per layer, from the first layer on
+                    edits = [(n_, UV[n_][1][:, m_].T, UV[n_][0][m_], coef, *rows_) for n_, m_ in zip(others, members)]
+                    h, _ = model.from_layer(0, entering[0][rows_ctx], edits)
+                else:
+                    ev, eu = (V.T[group], U[group]) if what == "group" else (v, u)
+                    h, _ = model.from_layer(layer, entering[layer][rows_ctx], (name, ev, eu, coef, *rows_))
                 lp_e = model.log_probs(h[at, pos])
                 delta, dp = lp_e - lp_c, lp_e.exp() - lp_c.exp()
                 upi, dni = dp.topk(TOP, dim=-1).indices, (-dp).topk(TOP, dim=-1).indices
@@ -287,12 +322,15 @@ def row_labels(args, model: Model, ids: torch.Tensor, entering, final, peaks, na
                 rec[f"{key}_{alpha_name}{suffix}"] = val.to(torch.int32) if key.endswith("_ids") else val.to(torch.float32)
         rec["group"] = torch.cat(groups).reshape(C, K, GROUP)
         rec["group_act"] = torch.cat(group_acts).reshape(C, K, GROUP)  # their activities v . x at p
+        rec["sites_member"] = torch.cat(site_members).reshape(C, K, -1)  # per layer, the edited subcomponent of its kind's site
+        rec["sites_act"] = torch.cat(site_acts).reshape(C, K, -1)
         # Continuations after p in each subcomponent's first `--continue` top contexts.
         J = args.cont
         conts = {"cont_clean": torch.empty(C, J, S, dtype=torch.int32)}
         for alpha_name, _ in ROW_ALPHAS:
             conts[f"cont_row_{alpha_name}"] = torch.empty(C, J, S, dtype=torch.int32)
             conts[f"cont_from_{alpha_name}"] = torch.empty(C, J, S, dtype=torch.int32)
+            conts[f"cont_groupfrom_{alpha_name}"] = torch.empty(C, J, S, dtype=torch.int32)
         cj = torch.cartesian_prod(torch.arange(C), torch.arange(J))
         step = max(1, args.rows // 4)
         for s in range(0, len(cj), step):
@@ -306,6 +344,8 @@ def row_labels(args, model: Model, ids: torch.Tensor, entering, final, peaks, na
                 coef = torch.full((len(cs),), alpha - 1.0, device=dev)
                 conts[f"cont_row_{alpha_name}"][cs, js] = greedy(model, prefixes, (name, v, u, coef, pos, pos + 1), S).to(torch.int32).cpu()
                 conts[f"cont_from_{alpha_name}"][cs, js] = greedy(model, prefixes, (name, v, u, coef, pos), S).to(torch.int32).cpu()
+                g_ = rec["group"][cs, js].long().to(dev)  # the group most active at p in this context
+                conts[f"cont_groupfrom_{alpha_name}"][cs, js] = greedy(model, prefixes, (name, V.T[g_], U[g_], coef, pos), S).to(torch.int32).cpu()
         rec.update(conts)
         rec.update({"subcomponents": chosen.to(torch.int32), "contexts": torch.from_numpy(ctx).to(torch.int32), "activity": activity.to(torch.float16).cpu(),
                     "position": position.to(torch.int16).cpu()})
