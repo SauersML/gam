@@ -322,6 +322,8 @@ def prefix_search(pool: Pool, model: str, experiments: int, seed: int, block: in
         ks.append(k)
         k = max(k + 1, int(k * 1.5))
     ks.append(len(ranked))
+    # k = 0, the empty program, competes too: no prefix may be worse than declaring nothing
+    ks = [0] + ks
     results = pool.score([source(ranked[:k]) for k in ks], experiments, seed)
     j = min(range(len(ks)), key=lambda i: objective(results[i]))
     log("prefixes: " + ", ".join(f"{k}:{objective(r) / r['N']:.3f}" for k, r in zip(ks, results)) + f"; best k = {ks[j]}")
