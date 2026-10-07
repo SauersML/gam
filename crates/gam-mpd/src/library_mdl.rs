@@ -2700,6 +2700,10 @@ struct Progress {
     /// The budget's multiplier `λ` (`Settings::budget`), carried across a resume.
     #[serde(default)]
     multiplier: f64,
+    /// The balance value `λ̂` the multiplier started at, whose one-pass horizon sets its step
+    /// (`Settings::budget`); zero before the budget first binds.
+    #[serde(default)]
+    balance: f64,
     /// The last epoch's snapshot, its per-batch estimates of `F` in nats, when convergence is being
     /// judged.
     previous: Option<Vec<f64>>,
@@ -3411,6 +3415,7 @@ pub fn fit_from(
         epochs: Vec::new(),
         removals: Vec::new(),
         multiplier: 0.0,
+        balance: 0.0,
         previous: None,
         collection: COLLECTION,
         active: posterior.active.clone(),
@@ -3646,13 +3651,15 @@ pub fn fit_from(
             // the Lagrangian `F + λ (E_q[k] − K)`. `λ ∂Ê/∂μ` joins the data gradient (in its units,
             // as the prior term's does), and by Price's theorem `∂E_q[f]/∂σ² = ½ E_q[∂²f]` the
             // term's expected curvature per token `2 λ ∂Ê/∂σ² / N` joins the step's curvature.
-            // Then `λ ← max(0, λ + η_λ (Ê − K))` with `η_λ = λ̂ / (K B)`: `λ̂ = |⟨g_F, g_k⟩| / |g_k|²`
-            // is the multiplier at which the term's gradient cancels the data gradient's
-            // component along `g_k = ∂Ê/∂μ` (both measured on this step), so a relative violation
-            // held for one pass of the `B` batches moves `λ` by about `λ̂` times it (a one-pass
-            // horizon). A step that finds the budget violated at `λ = 0` starts `λ` at that balance
-            // value `λ̂` and applies it on the same step, instead of ramping up from zero over the
-            // pass while the count runs away from `K`.
+            // `λ̂ = |⟨g_F, g_k⟩| / |g_k|²` is the multiplier at which the term's gradient cancels the
+            // data gradient's component along `g_k = ∂Ê/∂μ` (both measured on a step). The first
+            // step that finds the budget violated starts `λ` at its `λ̂₀` and applies it on that
+            // step, instead of ramping up from zero over the pass while the count runs away from
+            // `K`. Then `λ ← max(0, λ + η_λ (Ê − K))` with `η_λ = λ̂₀ / (K B)`: a relative
+            // violation held for one pass of the `B` batches moves `λ` by `λ̂₀` times it (a
+            // one-pass horizon). The rate stays at the starting balance: re-measured each step,
+            // `λ̂` moved from 69 to 2,813 nats per part per token within three steps of a tiny
+            // vpd4l fit (library_vpd, grouped own gates, K = 213) and drove `λ` with it.
             let mut parts_note = String::new();
             if let Some(limit) = settings.budget.filter(|k| k.is_finite()) {
                 let (expected, terms) = complexity_terms(&mut scorer, &device_posterior, explanation, &posterior.active, &batch, key)?;
@@ -3666,8 +3673,12 @@ pub fn fit_from(
                     }
                     square += mean.iter().map(|v| v * v).sum::<f64>();
                 }
-                let balance = if square > 0.0 { along.abs() / square } else { 0.0 };
-                let lambda = if progress.multiplier == 0.0 && expected > limit { balance } else { progress.multiplier };
+                let measured = if square > 0.0 { along.abs() / square } else { 0.0 };
+                if progress.balance == 0.0 && expected > limit {
+                    progress.balance = measured;
+                    progress.multiplier = measured;
+                }
+                let lambda = progress.multiplier;
                 for (i, mean, variance) in &terms {
                     let op = explanation.trainable[*i];
                     // At λ = 0 the term adds nothing, and the step is the budget-free one bit for bit.
@@ -3691,8 +3702,8 @@ pub fn fit_from(
                         }
                     }
                 }
-                if square > 0.0 && limit > 0.0 {
-                    let rate = balance / (limit * draws.len() as f64);
+                if limit > 0.0 {
+                    let rate = progress.balance / (limit * draws.len() as f64);
                     progress.multiplier = (lambda + rate * (expected - limit)).max(0.0);
                 }
                 parts_note = format!(", parts per token {expected:.4} (K {limit}), λ {:.4e}", progress.multiplier);
@@ -5559,6 +5570,7 @@ mod tests {
             epochs: Vec::new(),
             removals: Vec::new(),
             multiplier: 0.0,
+            balance: 0.0,
             previous: Some(vec![1.0, 2.0]),
             collection: COLLECTION,
             active: vec![false, true],
