@@ -3708,8 +3708,11 @@ impl Checker {
         // each chunk (a Qwen3-0.6B run holds 2.8 GB), never during one, so no run is remade under
         // quantized weights.
         for members in groups.values() {
-            let restore = match &runs[members[0]].1 {
-                Experiment::Edit { edit, .. } => Some(edit.apply(&mut self.weights)?),
+            // The group's weight edit: applied to M's exact weights while its counterfactual runs are
+            // made, and on top of each program's quantized weights while it runs (an experiment
+            // edits the program's own weights).
+            let edit = match &runs[members[0]].1 {
+                Experiment::Edit { edit, .. } => Some(edit.clone()),
                 _ => None,
             };
             self.set_edit(&runs[members[0]].1.clone());
@@ -3722,9 +3725,12 @@ impl Checker {
                     let chunk: Vec<usize> = experiments[at..(at + size.unwrap_or(1)).min(experiments.len())].to_vec();
                     self.reference_bytes = usize::MAX;
                     let before = self.held_references();
-                    for &r in &chunk {
-                        self.prewarm(&runs[r].1)?;
+                    let restore = edit.as_ref().map(|e| e.apply(&mut self.weights)).transpose()?;
+                    let made: Result<(), String> = chunk.iter().try_for_each(|&r| self.prewarm(&runs[r].1));
+                    if let Some(r) = restore {
+                        r.restore(&mut self.weights)?;
                     }
+                    made?;
                     // Chunks as large as the budget holds, measured by the first experiment's runs.
                     let grown = self.held_references().saturating_sub(before).max(1);
                     size = Some(size.unwrap_or((budget / grown).clamp(1, 8)));
@@ -3735,6 +3741,13 @@ impl Checker {
                             continue;
                         }
                         let unquantize = self.weights.quantize(blocks)?;
+                        let restore = match edit.as_ref().map(|e| e.apply(&mut self.weights)).transpose() {
+                            Ok(r) => r,
+                            Err(e) => {
+                                unquantize.restore(&mut self.weights);
+                                return Err(e);
+                            }
+                        };
                         let this = &*self;
                         let score_p = |&r: &usize| -> Result<(usize, Vec<f64>, Option<Candidates>), String> {
                             let (i, e, key) = &runs[r];
@@ -3745,7 +3758,9 @@ impl Checker {
                             Ok((r, kl, candidates))
                         };
                         let scored: Result<Vec<(usize, Vec<f64>, Option<Candidates>)>, String> = if mine.len() == 1 { mine.iter().map(score_p).collect() } else { mine.par_iter().map(score_p).collect() };
+                        let restored = restore.map(|r| r.restore(&mut self.weights)).transpose();
                         unquantize.restore(&mut self.weights);
+                        restored?;
                         for (r, kl, candidates) in scored? {
                             measured[r] = Some((kl, candidates));
                         }
@@ -3758,9 +3773,6 @@ impl Checker {
             })();
             self.reference_bytes = budget;
             self.set_edit(&Experiment::Clean);
-            if let Some(r) = restore {
-                r.restore(&mut self.weights)?;
-            }
             result?;
         }
         Ok(widths)
