@@ -224,12 +224,12 @@ def greedy(pool: Pool, model: str, mode: str, experiments: int, seed: int, min_n
     return {"units": current, "source": source(current), "score": best, "trajectory": trajectory}
 
 
-def prefix_search(pool: Pool, model: str, experiments: int, seed: int, block: int, log, rank_experiments: int = 2,
+def prefix_search(pool: Pool, model: str, experiments: int, seed: int, block: int, log, rank_experiments: int = 0,
                   checkpoint=None, objective=None, units=None) -> dict:
     """Measured ranking, then prefixes, then pruning, all exact through the checker:
-    1. every unit alone (heads, MLP neuron blocks of `block`) as a one-node program, scored on
-       `rank_experiments` experiments: under counterfactual stand-ins this is the unit's activation patch
-       from x into x', and the drop in execution error from the empty program is its measured effect;
+    1. every unit alone (heads, MLP neuron blocks of `block`) as a one-node program: under counterfactual
+       stand-ins this is the unit's activation patch from x into x', and the drop in KL on the clean and
+       counterfactual prompts from the empty program's is its measured effect;
     2. the programs of the k most effective units for k = 1, 2, 3, 4, 6, 8, 12, ... (pieces that pay only
        together enter together, which one-piece-at-a-time addition misses), the best kept;
     3. greedy removal from it until no removal lowers the objective."""
@@ -237,8 +237,12 @@ def prefix_search(pool: Pool, model: str, experiments: int, seed: int, block: in
     s_ = mech.shapes(model)
     units = units or ([("head", l, h) for l in range(s_["layers"]) for h in range(s_["heads"])]
                       + [("mlp", l, i, min(i + block, s_["d_mlp"])) for l in range(s_["layers"]) for i in range(0, s_["d_mlp"], block)])
+    import table
     empty, *alone = pool.score([source([])] + [source([u]) for u in units], rank_experiments, seed)
-    effect = {u: empty["exec_error_bits"] - r["exec_error_bits"] for u, r in zip(units, alone)}
+    # The effect on the clean and counterfactual prompts only: every program has those two experiments,
+    # while the rest of a program's draws depend on what it declares.
+    kl = lambda r: table.shared(r, ("clean", "counterfactual"))[0] * r["N"]
+    effect = {u: kl(empty) - kl(r) for u, r in zip(units, alone)}
     ranked = sorted(units, key=lambda u: -effect[u])
     log(f"ranked {len(units)} units by their patch on {rank_experiments} experiments; top: " +
         ", ".join(f"{name(u)} {effect[u] / empty['N']:.3f}" for u in ranked[:8]))
@@ -273,7 +277,7 @@ def main() -> None:
     ap.add_argument("behavior", type=Path)
     ap.add_argument("--mode", default="both", choices=["addition", "removal", "both", "prefix"])
     ap.add_argument("--block", type=int, default=96, help="prefix mode: MLP neurons per unit")
-    ap.add_argument("--rank-experiments", type=int, default=2, help="prefix mode: experiments per one-unit ranking program")
+    ap.add_argument("--rank-experiments", type=int, default=0, help="prefix mode: draws beyond clean and counterfactual per one-unit ranking program")
     ap.add_argument("--experiments", type=int, default=16)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--heldout-seed", type=int, default=1)

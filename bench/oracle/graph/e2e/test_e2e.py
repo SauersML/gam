@@ -246,7 +246,8 @@ def test_prefix_search_takes_pieces_that_pay_only_together():
                 heads = {(n["pieces"][0]["layer"], n["pieces"][0]["index"]) for n in ir["nodes"] if n["pieces"][0]["kind"] == "head"}
                 exec_ = 100.0 - 50.0 * ({(1, 1), (2, 4)} <= heads) - 0.5 * len(heads & {(1, 1), (2, 4)})
                 total = exec_ + 2.0 * len(ir["nodes"])
-                out.append({"total_bits": total, "exec_error_bits": exec_, "opaque_bits": total - exec_, "N": 1})
+                out.append({"total_bits": total, "exec_error_bits": exec_, "opaque_bits": total - exec_, "N": 1,
+                            "per_family": {"clean": {"tokens": 1, "mean_kl_bits": exec_}, "counterfactual": {"tokens": 1, "mean_kl_bits": exec_}}})
             self.calls += len(sources)
             return out
 
