@@ -1652,11 +1652,14 @@ fn run(weights: &Weights, stats: &Stats, circuit: &Circuit, batch: &Batch, score
     Ok(Execution { log_probabilities, writes: st.writes, recorded: record.then_some((head_stats, mlp_stats, active_stats)), normed: normed_kept, captured })
 }
 
-/// `a · b`, row blocks of `a` on parallel threads: one run's products use every core when few runs
-/// are pending (a weight edit's group, a counterfactual run every program of a batch waits for).
+/// `a · b`, row blocks of `a` on parallel threads when called outside rayon's pool (a run the
+/// batch makes alone: a weight edit's group of one, a counterfactual run every program waits
+/// for). Inside the pool it multiplies on its own thread: a worker that waits on nested parallel
+/// work steals other runs, and a stolen run that waits on the counterfactual run this worker is
+/// computing (a `OnceLock`) never returns, which deadlocked a vpd4l batch.
 fn par_dot(a: &Array2<f64>, b: ndarray::ArrayView2<f64>) -> Array2<f64> {
     const BLOCK: usize = 64;
-    if a.nrows() <= BLOCK {
+    if a.nrows() <= BLOCK || rayon::current_thread_index().is_some() {
         return a.dot(&b);
     }
     let mut out = Array2::<f64>::zeros((a.nrows(), b.ncols()));
@@ -3212,9 +3215,7 @@ impl Checker {
                         }
                     }
                     let this = &*self;
-                    let made: Vec<(String, Arc<Array2<f64>>)> = missing
-                        .par_iter()
-                        .map(|&r| {
+                    let compute_m = |&r: &usize| -> Result<(String, Arc<Array2<f64>>), String> {
                             let key = &runs[r].2;
                             if let Some(m) = this.disk_get(key) {
                                 return Ok((key.clone(), Arc::new(m)));
@@ -3222,21 +3223,20 @@ impl Checker {
                             let m = this.run(&models[runs[r].0], &runs[r].1)?;
                             this.disk_put(key, &m);
                             Ok((key.clone(), Arc::new(m)))
-                        })
-                        .collect::<Result<_, String>>()?;
+                    };
+                    // One run alone goes on this thread, so its products spread over the pool (par_dot).
+                    let made: Vec<(String, Arc<Array2<f64>>)> = if missing.len() == 1 { missing.iter().map(compute_m).collect::<Result<_, String>>()? } else { missing.par_iter().map(compute_m).collect::<Result<_, String>>()? };
                     let fresh: BTreeMap<String, Arc<Array2<f64>>> = made.iter().cloned().collect();
                     let this = &*self;
-                    let scored: Vec<(usize, Vec<f64>, Option<Candidates>)> = members
-                        .par_iter()
-                        .map(|&r| {
+                    let score_p = |&r: &usize| -> Result<(usize, Vec<f64>, Option<Candidates>), String> {
                             let (i, e, key) = &runs[r];
                             let m = fresh.get(key).or_else(|| this.cache.get(key)).ok_or("M's outcome went missing")?;
                             let p = this.run(&circuits[*i], e)?;
                             let kl = kl_bits(m, &p);
                             let candidates = clean.as_ref().map(|c| Candidates::of(c, m, &p, &this.rows_of(e), &this.rows_of(&Experiment::Clean), top));
                             Ok((r, kl, candidates))
-                        })
-                        .collect::<Result<_, String>>()?;
+                    };
+                    let scored: Vec<(usize, Vec<f64>, Option<Candidates>)> = if members.len() == 1 { members.iter().map(score_p).collect::<Result<_, String>>()? } else { members.par_iter().map(score_p).collect::<Result<_, String>>()? };
                     for (key, m) in made {
                         self.keep(key, m);
                     }
