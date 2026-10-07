@@ -36,10 +36,10 @@ Write ONE Python file that explains how the model produces the behavior below. I
   logits. Writers must come before readers.
 - Anything you do not declare behaves as it would on the counterfactual prompt, so declare the pieces
   and connections that carry the information that decides the answer.
-- The score, in bits (lower is better), adds: the code's Python tokens; the error of the program
-  against the model under random experiments applied identically to both (prompt edits, weight edits,
-  node value swaps, edge cuts); and the error of a reader that predicts the model from the program's
-  comments and docstrings alone. Comments and docstrings cost nothing: say in English what each node
+- The score, in bits (lower is better), adds: the code's Python tokens; every weight number of the
+  declared pieces ({prices}); the error of the program against the model under random experiments
+  applied identically to both (prompt edits, weight edits, node value swaps, edge cuts); and the error
+  of a reader that predicts the model from the program's comments and docstrings alone. Comments and docstrings cost nothing: say in English what each node
   computes and why the edges are there."""
 
 
@@ -74,6 +74,20 @@ def views(model: str) -> tuple[str, str]:
         pieces.append(f"  PD.tc[l][i, ...] (transcoder features replacing layer l's MLP; "
                       f"{s['views']['transcoder'][0]} per layer)")
     return sizes, ",\n".join(pieces) + ".\n"
+
+
+def prices(model: str) -> str:
+    """How many weight numbers the common pieces of `model` use (each costs 1/2 log2 N bits)."""
+    s = mech.shapes(model)
+    d, hd, gated = s["d_model"], s["head_dim"], model.startswith("qwen")
+    head = (2 + 2 * s["kv_heads"] / s["heads"]) * d * hd  # q rows and o columns, plus its share of k and v
+    neuron = (3 if gated else 2) * d
+    out = f"a head uses about {head / 1e3:.0f}k, an MLP neuron {neuron:,}"
+    if s["views"].get("transcoder"):
+        out += f", a transcoder feature {2 * d:,}"
+    if s["views"].get("vpd"):
+        out += f", a VPD subcomponent {2 * d:,} to {d + s['d_mlp']:,}"
+    return out + "; each costs 1/2 log2 N bits, N the behavior's scored tokens"
 
 
 def show(model: str, ids: list[int], t: int, top) -> str:
@@ -114,7 +128,7 @@ def examples(behavior: dict, shots: int) -> list[tuple[str, dict, str]]:
 def render(behavior: dict, prompts: int = 4, shots: int = 1) -> str:
     model = behavior["model"]
     sizes, pieces = views(model)
-    parts = [REFERENCE.format(pieces=pieces)]
+    parts = [REFERENCE.format(pieces=pieces, prices=prices(model))]
     for name, entry, source in examples(behavior, shots):
         parts.append(f"Example program ({entry['model']}; its docstring states the behavior):\n"
                      f"```python\n{source.strip()}\n```")

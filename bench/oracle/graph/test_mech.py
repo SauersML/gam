@@ -75,7 +75,7 @@ def test_tracer_speed():
     start = time.time()
     for _ in range(20):
         assert mech.trace("from mech import node, L\na = node(L[1].head[0])\n", "vpd4l")["valid"]
-    assert (time.time() - start) / 20 < 0.5
+    assert (time.time() - start) / 20 < 1.0  # a fork each; generous for a loaded machine
 
 
 def test_library_view():

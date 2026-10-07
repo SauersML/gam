@@ -39,7 +39,8 @@ Write the program."""
 def request(source: str, model: str) -> str:
     """The coder's message for `source`: the mech reference, the model's sizes, the program's English."""
     sizes, pieces = prompt.views(model)
-    return prompt.REFERENCE.format(pieces=pieces) + "\n\n" + ASK.format(sizes=sizes, english=mech.english(source))
+    return (prompt.REFERENCE.format(pieces=pieces, prices=prompt.prices(model)) + "\n\n"
+            + ASK.format(sizes=sizes, english=mech.english(source)))
 
 
 def units(ir: dict) -> tuple[set, set]:
