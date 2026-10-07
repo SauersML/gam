@@ -568,21 +568,28 @@ for n in site_names():
     T.site(n)._forward = with_edits(n, plain_forward[n])
 
 KINDS_ = ('q_proj', 'k_proj', 'v_proj', 'o_proj', 'c_fc', 'down_proj')
-FAMILIES = ('neuron_remove', 'neuron_scale', 'head_remove', 'head_scale', 'head_swap', 'random')
+FAMILIES = ('neurons_remove', 'neurons_scale', 'neurons_in_remove', 'neurons_in_scale', 'head_remove', 'head_scale', 'head_swap', 'random')
 def site_of(l, k):
     return f"h.{l}.{'mlp' if k in ('c_fc', 'down_proj') else 'attn'}.{k}"
 
 def draw_edit(g, family):
-    """One weight edit of M, as {map: (A, B)}, from the generator g. Neuron edits act on the neuron's
-    down_proj column (remove: zero it; scale: times 0.5, 2 or 3), head edits on the head's o_proj
+    """One weight edit of M, as {map: (A, B)}, from the generator g. Neuron edits act on a group of a
+    layer's neurons, its size log-uniform from 1 to all 3,072 (one neuron alone moves M by about 2e-4
+    bits): on their down_proj columns (neurons_*) or their c_fc rows (neurons_in_*), removed (zeroed) or
+    scaled by 0.5, 2 or 3; head edits on the head's o_proj
     columns, a head swap puts head h2's q, k, v rows and o columns in head h1's place, and a random edit
     is A B^T on one map with rank log-uniform from 1 to full and size log-uniform from 5% to 100% of
     the map's typical output norm."""
     l = int(g.integers(4)); W = lambda k: T.site(site_of(l, k)).W
     eye = lambda d, idx: torch.eye(d, device=dev)[:, idx]
-    if family in ('neuron_remove', 'neuron_scale'):
-        j = int(g.integers(W('down_proj').shape[1])); a = -1.0 if family == 'neuron_remove' else float(g.choice([0.5, 2.0, 3.0])) - 1
-        return {site_of(l, 'down_proj'): (a * W('down_proj')[:, j:j + 1], eye(W('down_proj').shape[1], [j]))}
+    if family.startswith('neurons'):
+        width = W('down_proj').shape[1]
+        size = max(1, int(round(math.exp(g.uniform(0, math.log(width))))))
+        G = sorted(int(j) for j in g.choice(width, size, replace=False))
+        a = -1.0 if family.endswith('remove') else float(g.choice([0.5, 2.0, 3.0])) - 1
+        if family.startswith('neurons_in'):
+            return {site_of(l, 'c_fc'): (eye(width, G), a * W('c_fc')[G].T)}
+        return {site_of(l, 'down_proj'): (a * W('down_proj')[:, G], eye(width, G))}
     nh, hd = T.n_head, T.hd
     cols = lambda h: list(range(h * hd, (h + 1) * hd))
     if family in ('head_remove', 'head_scale'):
@@ -749,7 +756,7 @@ def residual(n, x):
     R = RES[n]['sample'] if RES[n].get('sample') is not None else T.site(n).W.T - assembled(n)
     out = x @ R
     if state['mode'] == 'all':
-        return out
+        return out * 0.0 if state.get('drop_leftover') else out
     z = (out.norm(dim=-1) - RES[n]['tau']) / RES[n]['s']
     hard = (z > 0).float()
     state['hard'].append(hard.reshape(-1) * RES[n]['rank'])
@@ -860,6 +867,11 @@ def evaluate(final=False):
         if EDGES:
             r['edges_on_soft'].append(torch.stack(state['edges_soft']).sum(0).mean().item())
         lp = run(ids, 'all'); r['kl_all_on'].append(kl_bits(lm, lp).mean().item())
+        if RES:
+            # M with its leftover removed: every part on, the leftover off (= W - R in every map).
+            state['drop_leftover'] = True
+            lp = run(ids, 'all'); r.setdefault('kl_parts_on', []).append(kl_bits(lm, lp).mean().item())
+            state['drop_leftover'] = False
     out = {k: float(np.mean(v)) for k, v in r.items() if k != 'per_map' and v}
     out['per_map'] = [round(float(x), 2) for x in np.mean(r['per_map'], 0)]
     if RES:
