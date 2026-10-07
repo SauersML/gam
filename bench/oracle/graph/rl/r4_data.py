@@ -5,8 +5,8 @@
 - DIR/programs/<name>.json: g-mech's example programs (examples/index.json, split "train", a behavior
   file present) printed by printer.printed, whose comments state measured facts; {"behavior", "source",
   "example", "printed": true}, unscored, so train.py --mode sft uses every one.
-- g-int's printed search exports (~/mpd-data/graph_oracle/printed/*.py with *.graph.json naming the
-  behavior), when they exist, copied the same way for train-split behaviors.
+- g-int's best programs (~/mpd-data/graph_oracle/runs/best/<behavior>.json, e2e/export_best.py) for
+  train-split behaviors whose best is not the empty program, printed the same way.
 - DIR/questions.jsonl: g-predict's prediction questions, at most --per-type of each type (records are
   shuffled at the source, so the first ones of a type are a uniform sample).
 Held-out families never enter: the behavior file's split decides, and the questions file already
@@ -22,7 +22,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 BEHAVIORS = Path.home() / "mpd-data/graph_oracle/behaviors"
-PRINTED = Path.home() / "mpd-data/graph_oracle/printed"
+BEST = Path.home() / "mpd-data/graph_oracle/runs/best"
 
 
 def main():
@@ -58,19 +58,23 @@ def main():
             skipped.append((name, f"printer: {type(e).__name__}: {e}"))
         (out / "programs" / f"{name}.json").write_text(json.dumps({"behavior": behavior["id"], "source": source, "example": name, "printed": printed}))
         written.append(name)
-    for graph in sorted(PRINTED.glob("*.graph.json")) if PRINTED.exists() else []:
-        g = json.loads(graph.read_text())
-        bid = g.get("behavior")
-        path = BEHAVIORS / a.model / f"{bid}.json"
-        if not bid or not path.exists() or json.loads(path.read_text()).get("split") != "train":
+    for path in sorted(BEST.glob("*.json")) if BEST.exists() else []:  # g-int's best programs that beat the empty program
+        r = json.loads(path.read_text())
+        bfile = BEHAVIORS / a.model / f"{r.get('behavior')}.json"
+        if r.get("split") != "train" or str(r.get("origin", "")).startswith("empty") or not bfile.exists():
             continue
-        src = graph.with_name(graph.name[: -len(".graph.json")] + ".py")
-        if src.exists():
-            rec = {"behavior": bid, "source": src.read_text(), "printed": True, "search": src.name}
-            if "score" in g:
-                rec["score"] = g["score"]
-            (out / "programs" / f"search_{src.stem}.json").write_text(json.dumps(rec))
-            written.append(src.name)
+        behavior = json.loads(bfile.read_text())
+        ir = mech.trace(r["source"], a.model)
+        if not ir["valid"]:
+            skipped.append((path.name, ir["error"]))
+            continue
+        try:
+            source, printed = printer.printed(ir, behavior)[0], True
+        except Exception as e:
+            source, printed = ir["source"], False
+            skipped.append((path.name, f"printer: {type(e).__name__}: {e}"))
+        (out / "programs" / f"best_{behavior['id']}.json").write_text(json.dumps({"behavior": behavior["id"], "source": source, "search_best": r.get("origin"), "printed": printed}))
+        written.append(path.name)
     counts = {}
     if a.questions:
         with open(out / "questions.jsonl", "w") as f:

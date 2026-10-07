@@ -48,6 +48,7 @@ BATCH = 4  # programs per score request (vpd4l: 11 programs of 16 experiments pa
 MEMORY_GIB = None  # the checker server's lease (score.py's default when None)
 VIEWS = None  # decomposition views the checker attaches ({"vpd": DIR}; score.Checker's views)
 DEVICE = None  # "gpu": the checker's single-precision device path
+ITEMS_EVERY = 0  # keep the reader items of every ITEMS_EVERY-th scored program (0: none)
 
 
 def checker(items: list[dict]) -> list[dict]:
@@ -84,10 +85,10 @@ def checker(items: list[dict]) -> list[dict]:
             extra = {"options": json.loads(options)} if json.loads(options) else {}
             for s in range(0, len(batch), BATCH):  # a server's memory grows with the programs of one request
                 chunk = batch[s : s + BATCH]
-                # reader items (13 MB per vpd4l score) are dropped at once without a reader server; reader_top 0
-                # (score_batch(reader=False)) made the published 54fa4efb09 server exit silently mid-score
+                # without a reader server the reader items (13 MB per vpd4l score) are kept only for every
+                # ITEMS_EVERY-th program (g-reader scores those offline), dropped otherwise
                 for k, r in zip(chunk, c.score_batch([items[k]["source"] for k in chunk], experiments=experiments, seed=seed, uniform_seeds=uniform or None, **extra)):
-                    if not os.environ.get("GRAPH_READER"):
+                    if not os.environ.get("GRAPH_READER") and not (ITEMS_EVERY and k % ITEMS_EVERY == 0):
                         r.pop("items", None)
                     out[k] = r
 
