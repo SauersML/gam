@@ -169,3 +169,29 @@ def test_cached_reader_matches_full_forward():
         full = torch.log_softmax(logits[len(prefix) + len(s) - 1], -1).numpy()
         first = torch.log_softmax(logits[len(prefix)], -1).numpy()[[5, 6]]
         assert np.abs(g[0] - full).max() < 1e-3 and np.abs(g[1] - first).max() < 1e-3
+
+
+def test_server_score_and_score_many():
+    import json as _json
+    import socket
+    import socketserver
+    import threading
+
+    tok = qwen_tokenizer()
+    server = socketserver.TCPServer(("127.0.0.1", 0), S._Handler)
+    server.scorer = S.Scorer(StubReader(tok), "qwen3-0.6b")
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    good = HEAD + '"""The model predicts Rome."""\n'
+
+    def ask(message):
+        with socket.create_connection(server.server_address) as s:
+            s.sendall((_json.dumps(message) + "\n").encode())
+            return _json.loads(s.makefile().readline())
+
+    one = ask({"op": "score", "N": 10, "items": [item()], "programs": [{"id": "g", "source": good}]})["ok"]["results"][0]
+    many = ask({"op": "score_many", "jobs": [{"program": {"id": "g", "source": good}, "items": [item()], "N": 10},
+                                              {"program": {"id": "e", "source": ""}, "items": [item(), item(p=(0.1, 0.1))], "N": 20}]})["ok"]["results"]
+    assert many[0]["reader_error_bits"] == pytest.approx(one["reader_error_bits"]) and "english_saved_bits" not in many[0]
+    assert many[1]["N"] == 20 and many[1]["items"] == 2
+    assert "error" in ask({"op": "nope"})
+    server.shutdown()
