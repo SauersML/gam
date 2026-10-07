@@ -4427,16 +4427,16 @@ fn laplace_start(
         };
         h.mapv_inplace(|square| square / n);
         // A gate's threshold or width (`library_vpd`'s `.thresholds` and `.widths` groups) starts
-        // at its group's prior, `σ² = v_G`: the curvature of a gate at its start is not a valid
-        // Laplace curvature (a nearly hard gate's is a step's), and from it the thresholds'
-        // deviations started near 10⁻³ and only shrank (vpd4l, decomp-vpd4l-b, -c at 6387505b50).
-        ndarray::Zip::from(&mut h).and(&posterior.membership[i]).for_each(|h, group| {
-            if gate[*group as usize] {
-                *h = 0.0;
-            }
-        });
+        // its deviation at its group's prior, `σ² = v_G`: the curvature of a gate at its start is
+        // not a valid Laplace curvature (a nearly hard gate's is a step's), and from it the
+        // thresholds' deviations started near 10⁻³ and only shrank (vpd4l, decomp-vpd4l-b, -c at
+        // 6387505b50). The step's curvature estimate keeps the measured `h`: with it zeroed there
+        // (9b53f32bda) IVON's direction `G / (h + δ)` put most of its length on the gates, and the
+        // line step's joint-to-diagonal curvature ratio ρ̄ started near 1e9 and held η near 1e-8
+        // for the first epoch (decomp-vpd4l-f, -g at 5c54cd5f20).
         ndarray::Zip::from(&mut *posterior.log_sd[i]).and(&h).and(&posterior.membership[i]).for_each(|s, h, group| {
             let v = variance[*group as usize];
+            let h = if gate[*group as usize] { 0.0 } else { *h };
             if *s != f64::NEG_INFINITY && v > 0.0 {
                 *s = -0.5 * (n * h + 1.0 / v).ln();
             }
