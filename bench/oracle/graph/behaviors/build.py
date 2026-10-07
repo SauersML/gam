@@ -251,14 +251,16 @@ def main():
     write_summary(a.model, fams, rows)
 
 
-def write_summary(model: str, fams: list[str], rows: list[dict]):
-    """Replace this model's rows for these families in summary.tsv."""
+def write_summary(model: str, fams: list[str], rows: list[dict], by_id: bool = False):
+    """Replace this model's rows for these families in summary.tsv (with by_id, only the rows of these behaviors)."""
     cols = ["model", "family", "variant", "id", "prompts", "targets", "model_accuracy", "counterfactual_accuracy", "pair_accuracy", "split", "status"]
     path = OUT / "summary.tsv"
     old = []
     if path.exists():
         with path.open() as f:
-            old = [r for r in csv.DictReader(f, delimiter="\t") if not (r["model"] == model and r["family"] in fams)]
+            ids = {r["id"] for r in rows}
+            old = [r for r in csv.DictReader(f, delimiter="\t")
+                   if not (r["model"] == model and (r["id"] in ids if by_id else r["family"] in fams))]
     with path.open("w") as f:
         w = csv.DictWriter(f, cols, delimiter="\t", extrasaction="ignore")
         w.writeheader()

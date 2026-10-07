@@ -250,7 +250,7 @@ def main():
                      "pair_accuracy": beh["pair_accuracy"], "split": "heldout", "status": f"kept_effect z={z:+.2f}"})
         print(f"{fam}.{wording}: runs {len(ps)}  raise {beh['effect']['own_animal_raise_nats']:+.4f} nats  animal-level z {z:+.2f}  p {pval:.3g}  "
               f"top-1 of 50 {beh['effect']['top1_of_50']:.3f}  first-token top-1 {acc:.3f}", flush=True)
-    write_summary(a.model, list(prompts), rows)
+    write_summary(a.model, list(prompts), rows, by_id=True)  # one wording at a time
 
 
 if __name__ == "__main__":
