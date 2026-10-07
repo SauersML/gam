@@ -346,6 +346,13 @@ pub struct Owner {
     pub right: Vec<String>,
     #[serde(default)]
     pub transposed: bool,
+    /// Where `P` computes the native block as a sum of slices that no single operator of `P` holds
+    /// (`Σ_i U_i V_iᵀ`): the nodes of the rule body `body` holding the native map's input (its
+    /// `native_cols` at columns `cols` of that node) and its output (its `native_rows` at rows `rows`
+    /// of that node, an affine node), and `operator` names none. A native edit of the block joins the
+    /// output node as a term on the input node (`weight_edit`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uses: Option<(usize, usize)>,
 }
 
 impl Owner {

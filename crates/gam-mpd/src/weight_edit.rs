@@ -14,6 +14,10 @@
 //!   apart from `B`, so a fit that writes `P`'s samples into `B` keeps the edit, and every node
 //!   applying `B` (a key map several heads read) takes it.
 //!
+//! * where `P` computes a block of `W` as a sum of slices no single operator holds (`Σ_i U_i V_iᵀ`),
+//!   through the block's use (`Owner::uses`: the rule body's nodes holding the map's input and its
+//!   output): the block of `ΔW` as a term of the output node on the input node.
+//!
 //! An explanation that holds no copy of some edited `W`, neither by name nor through an owner, cannot
 //! take the edit: [`compile`] reports it as not applicable (`None`). Where `P` owns only some blocks
 //! of `W` (a simplified decomposition that dropped units), the rest of `ΔW` reaches `M` alone, and
@@ -119,8 +123,10 @@ pub fn compile(native: &OperatorProgram, explanation: &Artifact, edits: &[Weight
     let mut model = native.clone();
     let mut out = explanation.clone();
     let (mut total, mut taken) = (0.0, 0.0);
-    // Per operator of P owning an edited block, its term's values.
+    // Per operator of P owning an edited block, its term's values; per use of a summed block
+    // (`Owner::uses`), its rule body, input and output nodes, its place there and its values.
     let mut terms: BTreeMap<usize, Array2<f64>> = BTreeMap::new();
+    let mut summed_uses: Vec<(String, (usize, usize), (std::ops::Range<usize>, std::ops::Range<usize>), Array2<f64>)> = Vec::new();
     for (name, delta) in &summed {
         let w = named(native, name)?.ok_or_else(|| error(format!("M has no operator {name}")))?;
         let source = &native.operators[w];
@@ -142,7 +148,9 @@ pub fn compile(native: &OperatorProgram, explanation: &Artifact, edits: &[Weight
         // record per head, all alike), every entry of W owned at most once.
         let mut records: Vec<&Owner> = Vec::new();
         for o in out.owners.iter().filter(|o| o.native == *name) {
-            let same = |r: &&Owner| r.operator == o.operator && r.rows == o.rows && r.cols == o.cols && r.native_rows == o.native_rows && r.native_cols == o.native_cols && r.left == o.left && r.right == o.right && r.transposed == o.transposed;
+            let same = |r: &&Owner| {
+                r.operator == o.operator && r.rows == o.rows && r.cols == o.cols && r.native_rows == o.native_rows && r.native_cols == o.native_cols && r.left == o.left && r.right == o.right && r.transposed == o.transposed && r.uses == o.uses && (o.uses.is_none() || r.body == o.body)
+            };
             if !records.iter().any(same) {
                 records.push(o);
             }
@@ -154,17 +162,27 @@ pub fn compile(native: &OperatorProgram, explanation: &Artifact, edits: &[Weight
             taken += size;
             continue;
         }
-        let mut owned = 0.0;
-        let mut covered = Array2::<bool>::from_elem(delta.dim(), false);
+        // Every entry of W is owned at most once by P's operators, and computed at most once in each
+        // body that sums slices of it (several bodies may each compute it: heads reading one map).
+        let mut covered: BTreeMap<Option<&str>, Array2<bool>> = BTreeMap::new();
         for o in &records {
             if o.native_rows.end > delta.nrows() || o.native_cols.end > delta.ncols() {
                 return Err(error(format!("{}: an owned block {:?} × {:?} outside {name}", o.operator, o.native_rows, o.native_cols)));
             }
-            let mut mask = covered.slice_mut(s![o.native_rows.clone(), o.native_cols.clone()]);
+            let place = covered.entry(o.uses.map(|_| o.body.as_str())).or_insert_with(|| Array2::from_elem(delta.dim(), false));
+            let mut mask = place.slice_mut(s![o.native_rows.clone(), o.native_cols.clone()]);
             if mask.iter().any(|c| *c) {
                 return Err(error(format!("{name}: an entry owned by two blocks of P (a summed decomposition needs its uses recorded, not its blocks)")));
             }
             mask.fill(true);
+            if let Some(at) = o.uses {
+                if !o.left.is_empty() || !o.right.is_empty() || o.transposed {
+                    return Err(error(format!("{}: a summed block's use with factors", o.body)));
+                }
+                let block = delta.slice(s![o.native_rows.clone(), o.native_cols.clone()]).to_owned();
+                summed_uses.push((o.body.clone(), at, (o.rows.clone(), o.cols.clone()), block));
+                continue;
+            }
             let op = named(&out.program, &o.operator)?.ok_or_else(|| error(format!("P has no operator {}", o.operator)))?;
             // The same block of P standing for another native block at another site (a shared body)
             // cannot take one site's edit through its operator.
@@ -181,8 +199,8 @@ pub fn compile(native: &OperatorProgram, explanation: &Artifact, edits: &[Weight
             let term = terms.entry(op).or_insert_with(|| Array2::zeros((target.rows.width(), target.cols.width())));
             let mut at = term.slice_mut(s![o.rows.clone(), o.cols.clone()]);
             at += &block;
-            owned += delta.slice(s![o.native_rows.clone(), o.native_cols.clone()]).iter().map(|v| v * v).sum::<f64>();
         }
+        let owned: f64 = delta.indexed_iter().filter(|(at, _)| covered.values().any(|c| c[*at])).map(|(_, v)| v * v).sum();
         taken += if kept.is_some() { size } else { owned };
     }
     // Each owning operator's term joins every node applying it, on that node's input.
@@ -211,6 +229,34 @@ pub fn compile(native: &OperatorProgram, explanation: &Artifact, edits: &[Weight
         }
         if uses == 0 {
             return Err(error(format!("{}: owns an edited block but no node applies it", target.name)));
+        }
+    }
+    // Each use of a summed block takes the edit's block as a term of the output node on the input
+    // node, in the nodes' own coordinates (the output's rows as its affine terms', the input's as a
+    // map reading it in the body has them).
+    for (body, (input, output), (rows, cols), block) in summed_uses {
+        let rule = out.program.rules.iter().position(|r| r.name == body).ok_or_else(|| error(format!("no rule body {body}")))?;
+        let nodes = &out.program.rules[rule].nodes;
+        let Some(Node::Affine { terms: written, .. }) = nodes.get(output) else {
+            return Err(error(format!("{body}: node {output} is not an affine node")));
+        };
+        let first = written.first().ok_or_else(|| error(format!("{body}: an empty affine node")))?.1;
+        let reader = nodes
+            .iter()
+            .find_map(|n| if let Node::Affine { terms, .. } = n { terms.iter().find(|t| t.0 == input).map(|t| t.1) } else { None })
+            .ok_or_else(|| error(format!("{body}: no map reads node {input}")))?;
+        let (row_interface, col_interface) = (out.program.operators[first].rows.clone(), out.program.operators[reader].cols.clone());
+        let mut values = Array2::zeros((row_interface.width(), col_interface.width()));
+        if rows.end > values.nrows() || cols.end > values.ncols() || block.dim() != (rows.len(), cols.len()) {
+            return Err(error(format!("{body}: a block {rows:?} × {cols:?} outside its nodes")));
+        }
+        values.slice_mut(s![rows, cols]).assign(&block);
+        let precision = exact_precision(values.iter().copied()).map_err(error)?;
+        let term = Operator::dense(format!("edit.{body}.{output}"), row_interface, col_interface, values, precision, Provenance::derived(&[], format!("native edit at {body}"))).map_err(error)?;
+        out.program.operators.push(Arc::new(term));
+        let added = out.program.operators.len() - 1;
+        if let Node::Affine { terms: written, .. } = &mut out.program.rules[rule].nodes[output] {
+            written.push((input, added));
         }
     }
     out.program.interfaces().map_err(error)?;
@@ -346,6 +392,32 @@ mod tests {
                 assert!(ignored > 1e-4, "{name}: the edit moves M ({ignored})");
             }
         }
+    }
+
+    /// A summed block's use (`Owner::uses`): layer 1's down map recorded not by its owning operator
+    /// but by its use in the MLP's body (the gated activations, node 4, read into the output, node
+    /// 5), as a decomposition into slices records it. The edit joins the output node as a term on
+    /// the activations, and the exact copy scores 0 bits (1e-9) while the edit moves `M`.
+    #[test]
+    fn an_edit_reaches_a_summed_block_through_its_use() {
+        let s = setup("weight_edit_use");
+        let mut rng = StdRng::seed_from_u64(9);
+        let site = "library.l1.mlp";
+        let down = native_of(&s, site, "out");
+        let (d, n) = shape(&s.native, &down);
+        let program = &s.explanation.artifact.program;
+        let body = &program.rules[program.rules.iter().position(|r| r.name == site).expect("the MLP's body")];
+        assert!(matches!(&body.nodes[5], Node::Affine { terms, .. } if terms.iter().any(|t| t.0 == 4)), "node 5 writes the activations of node 4");
+        let mut explanation = s.explanation.artifact.clone();
+        explanation.owners.retain(|o| !(o.site == site && o.role == "out"));
+        explanation.owners.push(Owner { rows: 0..d, cols: 0..n, body: site.into(), site: site.into(), native: down.clone(), native_rows: 0..d, native_cols: 0..n, role: "out".into(), uses: Some((4, 5)), ..Owner::default() });
+        let edit = [WeightEdit { native: down.clone(), delta: random(&mut rng, (d, n), 1.0) }];
+        let compiled = compile(&s.native, &explanation, &edit).expect("compiles").expect("applicable");
+        assert!((compiled.owned - 1.0).abs() < 1e-12);
+        let edited = bits(&s, &compiled.model, &compiled.explanation);
+        assert!(edited.abs() <= 1e-9, "the exact copy scores {edited} bits under the edit");
+        let ignored = bits(&s, &compiled.model, &s.explanation.artifact);
+        assert!(ignored > 1e-4, "the edit moves M ({ignored})");
     }
 
     /// A component spanning the gate, up and out maps of layer 1's MLP (units 2, 5 and 11), removed
