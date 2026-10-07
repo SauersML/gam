@@ -534,7 +534,8 @@ fn device_path_on_the_host_backend_is_the_host_run() {
     let job = crate::graph_device::Run { tokens: &cf_batch.tokens, spans: &cf_batch.spans, scored: &[], swaps: &BTreeMap::new(), capture: true, reference: None, ops: &crate::graph::Interventions::default() };
     let captured = crate::graph_device::run_on(&mut state, &weights, &circuit, &job).expect("capture").captured().expect("captured");
     let gap = |a: &ndarray::Array2<f64>, b: &ndarray::Array2<f64>| (a - b).iter().fold(0.0f64, |m, v| m.max(v.abs()));
-    assert!(gap(&captured.active[1], &counterfactual.active[1]) < 1e-9 && gap(&captured.reads[1][0], &counterfactual.reads[1][0]) < 1e-9 && gap(&captured.attention_inputs[0], &counterfactual.attention_inputs[0]) < 1e-9);
+    // (Normed inputs are captured only when a view reads them; none is attached here.)
+    assert!(gap(&captured.active[1], &counterfactual.active[1]) < 1e-9 && gap(&captured.reads[1][0], &counterfactual.reads[1][0]) < 1e-9 && gap(&captured.mlp[0], &counterfactual.mlp[0]) < 1e-9);
 }
 
 #[test]
