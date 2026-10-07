@@ -30,6 +30,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.ticker
 from safetensors import safe_open
+from compare_common import experiments_of, latest_scores
 
 C7 = '/Users/user/mpd-data/compare/new_ops/c7'
 MANIFEST_DIR = '/Users/user/mpd-data/compare/manifest'
@@ -79,7 +80,7 @@ rows = []
 # vpd4l: transcoders as built (priced by the threshold-group fit's Laplace start, the same
 # explanation), and the two transcoder fits' final best checkpoints (stopped 10-06 17:15), baselines.
 thr2 = latest(f'{RP}/compare-vpd4l-tc4096-thr2/out')
-arms = [('vpd4l', 'transcoders as built (4,096 per layer)', f'{MANIFEST_DIR}/vpd4l_as_is', 'EDITS_as_is_m1.json', thr2['start'] if thr2 else None, f'{RP}/compare-vpd4l-tc4096-thr2/out')]
+arms = [('vpd4l', 'transcoders as built (4,096 per layer)', f'{MANIFEST_DIR}/vpd4l_as_is', latest_scores(f'{MANIFEST_DIR}/vpd4l_as_is', 'as_is'), thr2['start'] if thr2 else None, f'{RP}/compare-vpd4l-tc4096-thr2/out')]
 for name, label in (('compare-vpd4l-tc4096-thr2', 'transcoder baseline: fit by F, read patches'), ('compare-vpd4l-tc4096-thr-edits', 'transcoder baseline: fit by F, read patches and the shared operations')):
     h = latest(f'{RP}/{name}/out')
     best = L(f'{C7}/{name}/checkpoint.best.json')
@@ -88,14 +89,18 @@ for name, label in (('compare-vpd4l-tc4096-thr2', 'transcoder baseline: fit by F
         e = best['best'][1] if best.get('best') else max(best['epoch'] - 1, 0)
         rec = next((x['held_out'] for x in h['epochs'] if x['epoch'] == e), None)
         label += f', epoch {e}'
-    arms.append(('vpd4l', label, f'{C7}/{name}', f"EDITS_{'thr2' if name.endswith('thr2') else 'thr_edits'}_m1.json", rec, f'{RP}/{name}/out'))
+    arms.append(('vpd4l', label, f'{C7}/{name}', latest_scores(f'{C7}/{name}', 'thr2' if name.endswith('thr2') else 'thr_edits'), rec, f'{RP}/{name}/out'))
 arms.append(('Qwen3-0.6B', 'transcoders as built (f >= 1e-3, 28,545 features)', f'{C7}/qwen3_as_is', 'EDITS_as_is_ops.json', None, f'{C7}/qwen3_as_is'))
 attn = L('/Users/user/mpd-data/compare/attention_price.json')
 for model, label, d, f, rec, out in arms:
     r = L(f'{d}/{f}')
-    row = {'model': model, 'method': label, 'edits': f'{d}/{f}' if r else None, 'manifest': (r or {}).get('manifest', {}).get('sha256')}
+    row = {'model': model, 'method': label, 'edits': f'{d}/{f}' if r else None, 'manifest': experiments_of(r)}
     if r:
         row['gap'], row['gap_by_effect'], row['families'] = manifest_gap(r)
+        if r.get('weights'):
+            # The manifest's native weight edits (EDITS "weights"): the gap, the edit-ignoring
+            # baseline and the effect on M over the applicable edits, and how many were not.
+            row['weights'] = {k: r['weights'].get(k) for k in ('edits', 'not_applicable', 'mean_bits_per_token', 'ignoring_mean_bits_per_token', 'effect_mean_bits_per_token')}
     if rec:
         row['description_bits'] = description(rec) + fixed_bits(out)
         row['active_per_token'] = [l['nonzero_per_token'] for l in rec['layers'] if l['functions']]
@@ -110,20 +115,28 @@ reference = next((r['manifest'] for r in rows if r['model'] == 'vpd4l' and r.get
 for form, label in (('published', 'VPD as published (CI reads the edited M, both ways)'), ('causal', 'VPD, causal CI on the edited M'), ('autonomous', 'VPD autonomous (causal CI on its own run)')):
     path = f'{MANIFEST_DIR}/vpd/EDITS_vpd_{form}.json'
     r = L(path)
-    row = {'model': 'vpd4l', 'method': label, 'edits': path if r else None, 'manifest': (r or {}).get('manifest', {}).get('sha256'),
+    row = {'model': 'vpd4l', 'method': label, 'edits': path if r else None, 'manifest': experiments_of(r),
            'description_bits': 11.4e6 + 77.2e6, 'description_note': '11.4M subcomponents + 77.2M CI network', 'active': '213 subcomponents unmasked per token'}
     if r:
         row['gap'], row['gap_by_effect'], row['families'] = manifest_gap(r)
+        if r.get('weights'):
+            # The manifest's native weight edits (EDITS "weights"): the gap, the edit-ignoring
+            # baseline and the effect on M over the applicable edits, and how many were not.
+            row['weights'] = {k: r['weights'].get(k) for k in ('edits', 'not_applicable', 'mean_bits_per_token', 'ignoring_mean_bits_per_token', 'effect_mean_bits_per_token')}
     rows.append(row)
 # Other workstreams' arms (decomp's decompositions), from the frontier's points file.
 for p in L('/Users/user/mpd-data/compare/frontier_points.json') or []:
     if p['label'].startswith('VPD'):
         continue
     r = L(p.get('edits'))
-    row = {'model': 'vpd4l', 'method': p['label'], 'edits': p.get('edits') if r else None, 'manifest': (r or {}).get('manifest', {}).get('sha256'),
+    row = {'model': 'vpd4l', 'method': p['label'], 'edits': p.get('edits') if r else None, 'manifest': experiments_of(r),
            'description_bits': p.get('description_bits'), 'description_note': p.get('description_note'), 'attention_bits': p.get('attention_bits')}
     if r:
         row['gap'], row['gap_by_effect'], row['families'] = manifest_gap(r)
+        if r.get('weights'):
+            # The manifest's native weight edits (EDITS "weights"): the gap, the edit-ignoring
+            # baseline and the effect on M over the applicable edits, and how many were not.
+            row['weights'] = {k: r['weights'].get(k) for k in ('edits', 'not_applicable', 'mean_bits_per_token', 'ignoring_mean_bits_per_token', 'effect_mean_bits_per_token')}
     rows.append(row)
 for r in rows:
     if r['model'] == 'vpd4l' and r.get('gap') is not None and r.get('manifest') != reference:
@@ -137,14 +150,18 @@ for r in rows:
 json.dump(rows, open('/Users/user/mpd-data/compare/f_edits_table.json', 'w'), indent=1)
 for r in rows:
     print(r['model'], '|', r['method'], '| gap', r.get('gap') and round(r['gap'], 3), '| description', r.get('description_bits_total') and f"{r['description_bits_total']:.4g}",
-          '| F on edits (N = 2^24)', r.get('F_edits') and round(r['F_edits'], 3), '| bins', {k: (n, round(g, 3)) for k, (n, g) in (r.get('gap_by_effect') or {}).items()}, r.get('refused', ''))
+          '| F on edits (N = 2^24)', r.get('F_edits') and round(r['F_edits'], 3),
+          '| weight edits: gap', (r.get('weights') or {}).get('mean_bits_per_token') and round(r['weights']['mean_bits_per_token'], 4),
+          'ignoring', (r.get('weights') or {}).get('ignoring_mean_bits_per_token') and round(r['weights']['ignoring_mean_bits_per_token'], 4),
+          'not applicable', (r.get('weights') or {}).get('not_applicable'), '| bins', {k: (n, round(g, 3)) for k, (n, g) in (r.get('gap_by_effect') or {}).items()}, r.get('refused', ''))
 if len(sys.argv) > 1:
     plt.rcParams.update({'font.size': 14})
     models = [m for m in ('vpd4l', 'Qwen3-0.6B') if any(r['model'] == m and r.get('F_edits') is not None for r in rows)]
     fig, axes = plt.subplots(1, len(models), figsize=(14 * len(models), 7.5), facecolor='white', squeeze=False)
     colors = ['#8172b2', '#4c72b0', '#55a868', '#c44e52', '#dd8452', '#937860', '#da8bc3', '#64b5cd', '#8c8c8c']
     for ax, model in zip(axes[0], models):
-        pts = [r for r in rows if r['model'] == model and r.get('F_edits') is not None]
+        # VPD as published is the one labelled reference point; its other forms stay in the table.
+        pts = [r for r in rows if r['model'] == model and r.get('F_edits') is not None and not (r['method'].startswith('VPD') and not r['method'].startswith('VPD as published'))]
         xs = [r['description_bits_total'] / N for r in pts]
         top = max(r['gap'] for r in pts) * 1.15
         right = max(xs) * 1.15

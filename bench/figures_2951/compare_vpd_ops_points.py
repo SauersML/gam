@@ -1,12 +1,14 @@
 """VPD on the edits driver's immutable manifest (mpd_battery_2951 site_edits): check that the battery
 applies the manifest's operations as the driver does (per experiment its family, position and effect
 KL(M_e || M) at the edited token, against an EDITS experiments file the driver scored on the same
-manifest), write each form's scores as an EDITS-like file carrying the manifest's SHA-256, and add the
-three VPD points to ~/mpd-data/compare/frontier_points.json.
+manifest), write each form's scores as an EDITS-like file carrying the manifest, with its scores under
+the manifest's native weight edits where given (mpd_battery_2951 weight_edits), and add VPD as
+published to ~/mpd-data/compare/frontier_points.json as the one labelled reference point.
 
-usage: vpd_ops_points.py BATTERY_OUT.json DRIVER_EDITS.experiments.jsonl"""
+usage: vpd_ops_points.py BATTERY_OUT.json DRIVER_EDITS.experiments.jsonl [WEIGHTS_OUT.json]"""
 import json, sys, os
 out, ref = sys.argv[1], sys.argv[2]
+weights = json.load(open(sys.argv[3]))['weight_edits'] if len(sys.argv) > 3 else None
 r = json.load(open(out))
 mine = r['site_edits']['experiments']
 theirs = [json.loads(l) for l in open(ref)]
@@ -22,8 +24,18 @@ points = [p for p in points if not p['label'].startswith('VPD')]
 for form, label in labels.items():
     path = f'{D}/EDITS_vpd_{form}.json'
     m = r['manifest']
-    json.dump({'sequences': m['sequences'], 'seed': m['seed'], 'edits_per_sequence': m['edits_per_sequence'], 'manifest': {'file': m['file'], 'sha256': m['sha256']},
-               'families': r['site_edits'][form]['families'], 'manifest_check': check, 'source_revision': r.get('source_revision')}, open(path, 'w'), indent=1)
+    record = {'sequences': m['sequences'], 'seed': m['seed'], 'edits_per_sequence': m['edits_per_sequence'], 'manifest': {'file': m['file'], 'sha256': m['sha256']},
+              'families': r['site_edits'][form]['families'], 'manifest_check': check, 'source_revision': r.get('source_revision')}
+    if weights:
+        # As the edits driver reports an explanation's weight edits (EDITS "weights").
+        record['weights'] = {'edits': weights['edits'], 'not_applicable': weights['not_applicable'], 'sequences': weights['sequences'],
+                             'mean_bits_per_token': weights[form]['mean_bits_per_token'], 'ignoring_mean_bits_per_token': weights[form]['ignoring_mean_bits_per_token'],
+                             'effect_mean_bits_per_token': weights['effect_mean_bits_per_token'],
+                             'records': [{'operator': w['operator'], 'applicable': w['applicable'], 'mean_bits_per_token': w.get(f'{form}_mean_bits_per_token'),
+                                          'ignoring_mean_bits_per_token': w.get(f'{form}_ignoring_mean_bits_per_token'), 'effect_mean_bits_per_token': w.get('effect_mean_bits_per_token')} for w in weights['records']]}
+    json.dump(record, open(path, 'w'), indent=1)
+    if form != 'published':
+        continue
     # Executed per token, in rank-one units: every subcomponent (38,912, each computed before its
     # mask), the causal-importance network at each matrix's rank (input 2,048, 8 blocks of q, k, v,
     # o, fc1, fc2 at 2,048, head 2,048: 102,400), and the run its masks read: M's forward at its

@@ -1,29 +1,31 @@
 """The vpd4l frontier on the shared verbatim manifest (#2951 head-to-head).
 
-x = parts executed per token, counting all executed machinery in rank-one units: an explanation's own
-parts that are evaluated on every token (a transcoder's features: every gate is computed; VPD's
-subcomponents: every one is computed before its mask) plus every map of M it runs unchanged, counted
-at its rank (vpd4l's attention, run as M's own by an MLP-only explanation: q, k, v, o of 768 x 768 per
-layer, 4 x 4 x 768 = 12,288), and every network and pass whose output the explanation needs (VPD:
-its causal-importance network at each matrix's rank, 102,400, and the run its masks read, M's forward
-at its rank, 18,432, or for the autonomous form VPD's own all-on pass, 38,912). A second, open
-marker at the parts active per token (nonzero, or unmasked; VPD's 213) plus the same unchanged maps.
+x = parts on per token (filled marker), what a reader of the explanation follows on a token: its parts
+active there (nonzero, or unmasked; VPD's 213) plus every map of M it runs unchanged, counted at its
+rank in rank-one units (vpd4l's attention, run as M's own by an MLP-only explanation: q, k, v, o of
+768 x 768 per layer, 4 x 4 x 768 = 12,288). A second, open marker at the parts executed per token, the
+cost: an explanation's own parts evaluated on every token (a transcoder's features: every gate is
+computed; VPD's subcomponents: every one is computed before its mask) plus the same unchanged maps and
+every network and pass whose output the explanation needs (VPD: its causal-importance network at each
+matrix's rank, 102,400, and the run its masks read, M's forward at its rank, 18,432, or for the
+autonomous form VPD's own all-on pass, 38,912).
 y = mean KL(M_e || P_e) in bits/token over every scored token of the manifest's operations.
 Labels: description bits under the one convention of compare_f_edits.py, and, for an explanation that runs
 M's attention unchanged, that attention's own description at the Laplace start with its means held at M
 (compare-vpd4l-attn-price, ~/mpd-data/compare/attention_price.json), labelled separately.
 
-A point is drawn only from an EDITS file scored on the reference arm's manifest: the same immutable
-manifest file (its SHA-256) where the edits driver wrote one, else the same held-out sequences, seed,
+A point is drawn only from an EDITS file scored on the reference arm's experiments: the same
+experiments of an immutable manifest (their digest) where the edits driver wrote one, else the same held-out sequences, seed,
 family names and edits per sequence, scored by the same binary or by one whose experiments are
 checked to be the same draws (same families and positions, every edited token's effect KL(M_e || M)
 within 1e-3 bits); any other is refused with its difference.
-Points that other workstreams score (VPD as published, VPD fair, the decompositions at K = 213, 107,
-53) come from ~/mpd-data/compare/frontier_points.json: a list of {"label", "edits" (an EDITS json),
+Points that other workstreams score (VPD as published, one labelled reference point; the
+decompositions) come from ~/mpd-data/compare/frontier_points.json: a list of {"label", "edits" (an EDITS json),
 "executed", "active", "description_bits"}.
 
 usage: frontier.py OUT.png"""
 import json, os, sys, glob, textwrap
+from compare_common import experiments_of, latest_scores
 import numpy as np
 import matplotlib
 matplotlib.use('Agg')
@@ -42,12 +44,11 @@ MANIFEST = ('sequences', 'seed', 'families', 'edits_per_sequence')
 
 
 def manifest(r):
-    """The manifest an EDITS file was scored on: the immutable manifest file's SHA-256 where the edits
-    driver wrote one (mpd_library_mdl_2951 EditSettings::manifest), which fixes every experiment;
-    else rows, seed, experiments per sequence, family names."""
-    sha = (r.get('manifest') or {}).get('sha256')
-    if sha:
-        return {'sha256': sha}
+    """The experiments an EDITS file was scored on (compare_common.experiments_of); else rows, seed,
+    experiments per sequence, family names."""
+    digest = experiments_of(r)
+    if digest:
+        return {'sha256': digest}
     return {'sequences': r.get('sequences'), 'seed': r.get('seed'), 'edits_per_sequence': r.get('edits_per_sequence'), 'families': sorted(k for k in r['families'] if k != 'clean')}
 
 
@@ -80,7 +81,7 @@ def features(out):
 points = []
 ref = None
 thr2 = L(f'{RP}/compare-vpd4l-tc4096-thr2/out/checkpoint.json')
-arms = [('transcoders as built (4,096 per layer)', f'{MANIFEST_DIR}/vpd4l_as_is', 'EDITS_as_is_m1.json', thr2['start'] if thr2 else None)]
+arms = [('transcoders as built (4,096 per layer)', f'{MANIFEST_DIR}/vpd4l_as_is', latest_scores(f'{MANIFEST_DIR}/vpd4l_as_is', 'as_is'), thr2['start'] if thr2 else None)]
 for name, label in (('compare-vpd4l-tc4096-thr2', 'fit by F, read patches'), ('compare-vpd4l-tc4096-thr-edits', 'fit by F, read patches and the shared operations')):
     best = L(f'{C7}/{name}/checkpoint.best.json')
     h = L(f'{RP}/{name}/out/checkpoint.json')
@@ -90,7 +91,7 @@ for name, label in (('compare-vpd4l-tc4096-thr2', 'fit by F, read patches'), ('c
         rec = next((x['held_out'] for x in h['epochs'] if x['epoch'] == e), None)
         label += f', epoch {e}'
     # The pair's fits were stopped at 17:15 on 10-06: their last best epochs are the final baselines.
-    arms.append(('transcoder baseline: ' + label, f'{C7}/{name}', f"EDITS_{'thr2' if name.endswith('thr2') else 'thr_edits'}_m1.json", rec))
+    arms.append(('transcoder baseline: ' + label, f'{C7}/{name}', latest_scores(f'{C7}/{name}', 'thr2' if name.endswith('thr2') else 'thr_edits'), rec))
 for label, d, f, rec in arms:
     r = L(f'{d}/{f}')
     if not r or not rec:
@@ -152,17 +153,17 @@ if len(sys.argv) > 1 and points:
         y = max(placed[i], line * len(texts[i]) / 2) if above is None else max(placed[i], above[0] + line * (above[1] + len(texts[i]) + 1) / 2)
         placed[i], above = y, (y, len(texts[i]))
     for i, (p, c) in enumerate(zip(points, colors * 3)):
-        ax.scatter([p['executed']], [p['gap']], s=90, color=c)
-        ax.scatter([p['active']], [p['gap']], s=90, facecolors='none', edgecolors=c)
+        ax.scatter([p['active']], [p['gap']], s=90, color=c, zorder=3)
+        ax.scatter([p['executed']], [p['gap']], s=90, facecolors='none', edgecolors=c, zorder=3)
         ax.plot([p['active'], p['executed']], [p['gap'], p['gap']], color=c, lw=1)
-        ax.annotate('\n'.join(texts[i]), (p['executed'], p['gap']), xytext=(6e5, placed[i]), textcoords='data', va='center', fontsize=10, color=c,
+        ax.annotate('\n'.join(texts[i]), (p['active'], p['gap']), xytext=(6e5, placed[i]), textcoords='data', va='center', fontsize=10, color=c,
                     arrowprops=dict(arrowstyle='-', lw=0.6, color=c, relpos=(0, 0.5)))
     ax.set_xscale('log')
     ax.set_xlim(30, 5e5)
     ax.set_ylim(0, max(top, max(placed[i] + line * len(texts[i]) / 2 for i in placed)))
     ax.xaxis.set_minor_formatter(matplotlib.ticker.NullFormatter())
     ax.xaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(lambda v, _: f'{v:,.0f}'))
-    ax.set_xlabel('parts executed per token, rank-one units (filled); active (open)')
+    ax.set_xlabel('parts on per token (filled); parts executed per token (open); rank-one units')
     ax.set_ylabel('held-out edit KL(M_e || P_e), bits/token')
     ax.spines[['top', 'right']].set_visible(False)
     fig.tight_layout()
