@@ -51,3 +51,6 @@ def test_rebuild():
     [r] = rebuild.rebuild([NATIVE], "vpd4l", generate)
     assert r["english"] in answers[0] and "L[1].head[1]" not in answers[0]
     assert r["source"] == program and r["ir"]["valid"] and r["ir"]["nodes"][0]["id"] == "h"
+    assert 0 < r["overlap"]["pieces"] < 1 and 0 < r["overlap"]["edges"] < 1  # L2.H4 >> logits is shared
+    [same] = rebuild.rebuild([NATIVE], "vpd4l", lambda asks: ["```python\n" + NATIVE + "```"])
+    assert same["overlap"] == {"pieces": 1.0, "edges": 1.0}

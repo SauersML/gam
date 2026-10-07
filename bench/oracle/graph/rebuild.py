@@ -42,15 +42,39 @@ def request(source: str, model: str) -> str:
     return prompt.REFERENCE.format(pieces=pieces) + "\n\n" + ASK.format(sizes=sizes, english=mech.english(source))
 
 
+def units(ir: dict) -> tuple[set, set]:
+    """The IR's declared piece units and its edges, each edge named by the units of its two nodes."""
+    def unit_set(n: dict) -> frozenset:
+        out = set()
+        for p in n["pieces"]:
+            index = p["index"] if isinstance(p["index"], list) else [p["index"]]
+            out |= {(p["view"], p["layer"], p["kind"], i) for i in index}
+        return frozenset(out)
+
+    nodes = {n["id"]: unit_set(n) for n in ir["nodes"]}
+    pieces = set().union(*nodes.values()) if nodes else set()
+    edges = {(nodes.get(e["from"], e["from"]), nodes.get(e["to"], e["to"]), e["route"]) for e in ir["edges"]}
+    return pieces, edges
+
+
+def overlap(original: dict, rebuilt: dict) -> dict:
+    """Jaccard overlap of declared pieces and of edges between the original's IR and the rebuild's."""
+    (pa, ea), (pb, eb) = units(original), units(rebuilt)
+    jaccard = lambda a, b: len(a & b) / len(a | b) if a | b else 1.0  # noqa: E731
+    return {"pieces": jaccard(pa, pb), "edges": jaccard(ea, eb)}
+
+
 def rebuild(sources: list[str], model: str, generate) -> list[dict]:
-    """Per source: {"english", "request", "answer", "source" (the rebuild), "ir" (its trace)};
+    """Per source: {"english", "request", "answer", "source" (the rebuild), "ir" (its trace), "overlap"
+    (Jaccard overlap of pieces and edges with the original, None for an invalid rebuild)};
     `generate` maps a list of user messages to a list of answers (textgen.Generator)."""
     asks = [request(s, model) for s in sources]
     out = []
     for source, ask, answer in zip(sources, asks, generate(asks)):
         program = prompt.program_of(answer)
-        out.append({"english": mech.english(source), "request": ask, "answer": answer, "source": program,
-                    "ir": mech.trace(program, model)})
+        ir = mech.trace(program, model)
+        out.append({"english": mech.english(source), "request": ask, "answer": answer, "source": program, "ir": ir,
+                    "overlap": overlap(mech.trace(source, model), ir) if ir["valid"] else None})
     return out
 
 
@@ -81,7 +105,7 @@ def main():
     with a.out.open("w") as f:
         for path, r in zip(a.programs, results):
             f.write(json.dumps({"program": str(path), **r}) + "\n")
-            print(path, "rebuild valid:", r["ir"]["valid"], r["ir"]["error"] or "",
+            print(path, "rebuild valid:", r["ir"]["valid"], r["ir"]["error"] or "", "overlap", r["overlap"],
                   "| original", (r.get("original_score") or {}).get("total_bits"),
                   "rebuild", (r.get("rebuild_score") or {}).get("total_bits"))
 
