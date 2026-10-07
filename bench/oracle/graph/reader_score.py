@@ -75,7 +75,6 @@ SYSTEM = "You predict the measured behaviour of a language model, the target mod
 INSTRUCTIONS = """The program below explains how the target model produces a behaviour. It is written with the `mech` library:
 - L[l].head[h] is attention head h of layer l (its query, key, value and output weights). L[l].mlp[i, j] are neurons i and j of the MLP of layer l (their input and output weights). PD.vpd[l].<matrix>[i] is subcomponent i of the parameter decomposition of that weight matrix of layer l. PD.tc[l][f] is transcoder feature f of layer l.
 - node(...) groups pieces of the weights into one node. `a >> b.key` states that the output of node a reaches the key input of node b; the inputs are query, key and value for heads and input for MLP pieces. embed is the token embedding and logits is the output.
-- Every piece outside the program's nodes, and every connection the program does not list, contributes its average over the behaviour's prompts.
 - The comments and docstrings state what the nodes compute and how the target model's output depends on them.
 
 Program:
@@ -142,10 +141,15 @@ def words(e: dict) -> str:
     if kind == "prompt_edit":
         return f"the input text is changed; the original text was <<<{e['clean_text']}>>>, and the model's weights are unchanged"
     if kind == "scale":
+        # The checker scales a head's output weights and neurons' output (down) weights; a decomposition
+        # subcomponent is scaled whole.
         f = e["factor"]
+        ps = e["pieces"]
+        native = isinstance(ps, list) and all(p["view"] == "native" for p in ps)
+        what = f"the output weights of {_pieces(ps)}" if native else _pieces(ps)
         if f == 0:
-            return f"remove {_pieces(e['pieces'])} (its weights multiplied by 0) at every position"
-        return f"multiply the weights of {_pieces(e['pieces'])} by {f:g} at every position"
+            return f"remove {_pieces(ps)}: {what} multiplied by 0"
+        return f"multiply {what} by {f:g}"
     if kind == "low_rank":
         return f"add a random rank-{e['rank']} matrix to the {e['matrix']} weights of layer {e['layer']}, of norm {e['relative_norm']:.3g} times the norm of those weights"
     if kind == "swap":

@@ -75,8 +75,9 @@ def test_words_every_kind():
     cases = [
         ({"kind": "clean"}, "none"),
         ({"kind": "prompt_edit", "clean_text": "A B"}, "<<<A B>>>"),
-        ({"kind": "scale", "pieces": head, "factor": 0}, "remove L[2].head[4]"),
-        ({"kind": "scale", "pieces": vpd, "factor": 2.0}, "PD.vpd[1].c_fc[3, 7] by 2"),
+        ({"kind": "scale", "pieces": head, "factor": 0}, "remove L[2].head[4]: the output weights of L[2].head[4] multiplied by 0"),
+        ({"kind": "scale", "pieces": head, "factor": 0.5}, "multiply the output weights of L[2].head[4] by 0.5"),
+        ({"kind": "scale", "pieces": vpd, "factor": 2.0}, "multiply PD.vpd[1].c_fc[3, 7] by 2"),
         ({"kind": "low_rank", "rank": 1, "matrix": "head 3 q", "layer": 2, "relative_norm": 0.5}, "rank-1"),
         ({"kind": "swap", "pieces": head, "source_text": "X Y"}, "<<<X Y>>>"),
         ({"kind": "swap", "pieces": None, "source_text": "X"}, "a node of the program"),
