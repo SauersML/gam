@@ -51,6 +51,8 @@ def main():
     ap.add_argument("--min-neurons", type=int, default=768)
     ap.add_argument("--workers", type=int, default=1)
     ap.add_argument("--out", type=Path, default=Path.home() / "mpd-data/graph_oracle/runs/r6")
+    ap.add_argument("--stages", default="prefix,removal,addition", help="which stages run after the prefixes (removal, addition)")
+    ap.add_argument("--prefixes", default="1,2,4,8,12,16,24,32", help="prefix lengths scored besides the empty program")
     a = ap.parse_args()
     beh_path = a.behavior.expanduser()
     beh = json.loads(beh_path.read_text())
@@ -67,7 +69,7 @@ def main():
                                 "seconds": round(time.time() - t0, 1)}) + "\n")
 
     # 1. prefixes of the ranking
-    ks = [0] + [k for k in (1, 2, 4, 8, 12, 16, 24, 32) if k <= min(a.max_prefix, len(rank))]
+    ks = [0] + [k for k in map(int, a.prefixes.split(",")) if k <= min(a.max_prefix, len(rank))]
     results = pool.score([search.source(rank[:k]) for k in ks], a.experiments, a.seed)
     for k, r in zip(ks, results):
         record(f"prefix{k}", rank[:k], r)
@@ -76,12 +78,14 @@ def main():
     start = rank[:kbest]
 
     # 2. greedy removal from the best prefix
-    removed = search.greedy(pool, beh["model"], "removal", a.experiments, a.seed, a.min_neurons, print, start=start)
-    current, best = removed["units"], removed["score"]
-    record("removal", current, best)
+    current, best = start, results[ks.index(kbest)]
+    if "removal" in a.stages and current:
+        removed = search.greedy(pool, beh["model"], "removal", a.experiments, a.seed, a.min_neurons, print, start=start)
+        current, best = removed["units"], removed["score"]
+        record("removal", current, best)
 
     # 3. greedy addition from the next ranked components
-    while True:
+    while "addition" in a.stages:
         names = {search.name(u) for u in current}
         cand = [u for u in rank[:kbest + a.pool] if search.name(u) not in names and not any(u[0] == "mlp" and v[0] == "mlp" and u[1] == v[1] for v in current)]
         if not cand:
