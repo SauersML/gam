@@ -325,14 +325,14 @@ fn run_arm(vpd: &Vpd, arm: &Arm, family: &FamilyInputs) -> Result<(Tensor, Vec<f
 
 /// The arms fitted on `fit_rows` and scored on `held_out` (module note): per arm, held-out
 /// `KL(M ‖ P)` in bits per token, the slices executed per token (rank-one equivalents) per layer and
-/// in all, its components and the slices it keeps. The grouped components are written to
+/// in all, its components and the slices it keeps. Every arm's components are written to
 /// `components` (JSON: per component its gate read, threshold and slices).
 pub fn vpd_start(vpd: &Vpd, fit_rows: &[Vec<u32>], held_out: &[Vec<u32>], batch: usize, components: &Path) -> Result<Value, String> {
     let d = vpd.e.program.device().clone();
     let fit = fit_data(vpd, fit_rows, batch)?;
     let arms = arms(vpd, &fit)?;
     drop(fit);
-    let records: Vec<Value> = arms[1..]
+    let records: Vec<Value> = arms
         .iter()
         .map(|arm| {
             json!({

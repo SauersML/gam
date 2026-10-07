@@ -42,6 +42,10 @@
 //! blocks alone and `M` everywhere else (`library_mdl::scoped`): the fast loop for comparing method
 //! changes, F against N for one block before a whole-model run.
 //!
+//! With `vpd` (`{"decomposition": D, "start": S, "arm": A}`), every block is VPD's slices with
+//! intrinsic gates (`library_vpd`), arm `A` of the start file `S` that `mpd_battery_2951 start`
+//! writes (`per_slice_own`, `grouped_own`, `grouped_direction`).
+//!
 //! With `transcoders` (`{"dir": D, "layers": [l, ...]}`, `D/layer_{l}.safetensors` circuit-tracer
 //! transcoder files), those layers' MLPs are the transcoders' features (`library_transcoder`, with
 //! one described vector at each sequence's first token, started at `M`'s MLP output there averaged
@@ -90,7 +94,19 @@ struct Settings {
     /// Layers whose MLPs are transcoder features, and the directory of the transcoder files.
     #[serde(default)]
     transcoders: Option<Transcoders>,
+    /// VPD's slices with intrinsic gates in every block (`library_vpd`): the decomposition, the
+    /// start file `vpd_start` writes and its arm.
+    #[serde(default)]
+    vpd: Option<VpdStart>,
     fit: library_mdl::Settings,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VpdStart {
+    decomposition: PathBuf,
+    start: PathBuf,
+    arm: String,
 }
 
 #[derive(Deserialize)]
@@ -485,12 +501,14 @@ fn main() -> Result<(), String> {
     // The imported program's operators the split replaced are not read again.
     drop(program);
     let layers = layer_nodes(&native, layer_count)?;
-    let explanation = match &settings.transcoders {
-        Some(transcoders) => {
+    let explanation = match (&settings.transcoders, &settings.vpd) {
+        (Some(_), Some(_)) => return Err("transcoders and vpd are two different starts".into()),
+        (Some(transcoders), None) => {
             let files = transcoder_files(&device, &native, &layers, transcoders, &train, settings.fit.batch_sequences, out)?;
             library_mdl::explanation_with(&native, &layers, &files)?
         }
-        None => library_mdl::explanation(&native, &layers)?,
+        (None, Some(vpd)) => gam_mpd::library_vpd::explanation(&native, &layers, &vpd.decomposition, &vpd.start, &vpd.arm)?,
+        (None, None) => library_mdl::explanation(&native, &layers)?,
     };
     let explanation = match &settings.blocks {
         Some(blocks) => library_mdl::scoped(&explanation, blocks)?,

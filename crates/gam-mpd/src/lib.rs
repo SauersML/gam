@@ -61,6 +61,8 @@ pub mod library_complexity;
 pub mod library_removal;
 // Transcoder features as the library's MLP functions: relu(g·x + c) u per feature that fires.
 pub mod library_transcoder;
+/// VPD's slices with intrinsic gates as a library explanation.
+pub mod library_vpd;
 // Its posterior resident on the device: sample, Adam step and group divergences without transfers.
 pub mod device_posterior;
 
