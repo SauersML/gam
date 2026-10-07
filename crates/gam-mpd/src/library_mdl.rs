@@ -2253,26 +2253,25 @@ fn complexity_terms(scorer: &mut Scorer, device_posterior: &DevicePosterior, exp
     for (l, (layer, mlp)) in explanation.layers.iter().zip(&scorer.mlps).enumerate() {
         count += (layer.heads.iter().filter(|(_, values)| values.iter().any(alive)).count() * rows) as f64;
         let Some(mlp) = mlp else {
-            // Gated components (`library_vpd`): each counts its rank where its gate is on.
+            // Gated components (`library_vpd`): each counts its rank where its gate is on, on the
+            // device (`gated_expected`).
             for stage in &scorer.stages[l] {
-                let input = d.download(trace.value(stage.input)?).map_err(|e| e.to_string())?;
                 let rank = stage.ranks(active);
                 let j = scorer.at(stage.threshold)?;
-                let bias = (device_posterior.iterate(j)?.column(0).to_owned(), device_posterior.values(j)?.1.column(0).mapv(|s| (2.0 * s).exp()));
-                let per = 1.0 / rows as f64;
-                let expected = match stage.direction {
-                    None => crate::library_complexity::own(input.view(), (bias.0.view(), bias.1.view()), &rank)?,
+                let bias = (device_posterior.iterate(j)?.column(0).to_vec(), device_posterior.values(j)?.1.column(0).mapv(|s| (2.0 * s).exp()).to_vec());
+                let direction = match stage.direction {
                     Some(g) => {
                         let i = scorer.at(g)?;
-                        let mean = device_posterior.iterate(i)?;
-                        let variance = device_posterior.values(i)?.1.mapv(|s| (2.0 * s).exp());
-                        let alive: Vec<bool> = rank.iter().map(|r| *r > 0.0).collect();
-                        let gate = crate::library_complexity::Gate { x: input.view(), mean: mean.view(), variance: variance.view(), bias: Some((bias.0.view(), bias.1.view())), alive: &alive };
-                        let expected = crate::library_complexity::weighted(&gate, &rank)?;
-                        terms.push((i, expected.mean.clone() * per, expected.variance.clone() * per));
-                        expected
+                        Some((i, device_posterior.iterate(i)?, device_posterior.values(i)?.1.mapv(|s| (2.0 * s).exp())))
                     }
+                    None => None,
                 };
+                let per = 1.0 / rows as f64;
+                let gate = direction.as_ref().map(|(_, mean, variance)| (mean, variance));
+                let (expected, gate_terms) = gated_expected(d, program.arithmetic(), trace.value(stage.input)?, gate, (&bias.0, &bias.1), &rank)?;
+                if let (Some((i, _, _)), Some((mean, variance))) = (&direction, gate_terms) {
+                    terms.push((*i, mean * per, variance * per));
+                }
                 count += expected.count;
                 terms.push((j, expected.bias_mean.insert_axis(ndarray::Axis(1)) * per, expected.bias_variance.insert_axis(ndarray::Axis(1)) * per));
             }
@@ -2320,6 +2319,86 @@ fn complexity_terms(scorer: &mut Scorer, device_posterior: &DevicePosterior, exp
         }
     }
     Ok((count / rows as f64, terms))
+}
+
+/// A gated stage's expected rank executed on the rows of its gate's input `input` (rows × parts
+/// of read norms for an own gate, rows × d of the stage's input for a direction gate `gate`, its
+/// rows' means and variances), with the thresholds' means and variances `bias` and per component
+/// its rank: `library_complexity::own` and `library_complexity::weighted` on the device
+/// (`Device::gate_function`), their counts and the thresholds' derivatives downloaded, and for a
+/// direction gate its rows' derivatives. On the host they took about 5 s of a 5.5 s step of the
+/// vpd4l grouped direction arm at 4,096 rows (decomp-vpd4l-b), against 0.35–0.57 s for a step
+/// without the budget.
+fn gated_expected(
+    d: &Device,
+    arithmetic: gam_gpu::tensor::Arithmetic,
+    input: &Tensor,
+    gate: Option<(&Array2<f64>, &Array2<f64>)>,
+    (bias_mean, bias_variance): (&[f64], &[f64]),
+    rank: &[f64],
+) -> Result<(crate::library_complexity::Expected, Option<(Array2<f64>, Array2<f64>)>), String> {
+    use gam_gpu::tensor::GateFunction;
+    let rows = input.rows();
+    let parts = rank.len();
+    let row = |values: &[f64]| d.upload_vec(1, values.len(), values.to_vec()).map_err(error);
+    // m = x μ_gᵀ + μ_c and s² = x² σ²_gᵀ + σ²_c (a direction gate), or m = ‖V_bᵀx‖ + μ_c and
+    // s² = σ²_c (an own gate).
+    let squares = match gate {
+        Some(_) => {
+            let mut squares = d.empty(rows, input.cols()).map_err(error)?;
+            d.hadamard(&mut squares, input, input, false).map_err(error)?;
+            Some(squares)
+        }
+        None => None,
+    };
+    let (mut m, mut s2) = match (gate, &squares) {
+        (Some((mean, variance)), Some(squares)) => {
+            let (mut m, mut s2) = (d.empty(rows, parts).map_err(error)?, d.empty(rows, parts).map_err(error)?);
+            d.gemm(&mut m, 1.0, input, Op::N, &d.upload(mean.view()).map_err(error)?, Op::T, 0.0, arithmetic).map_err(error)?;
+            d.gemm(&mut s2, 1.0, squares, Op::N, &d.upload(variance.view()).map_err(error)?, Op::T, 0.0, arithmetic).map_err(error)?;
+            (m, s2)
+        }
+        _ => {
+            if input.cols() != parts {
+                return Err(format!("library budget: {} read norms for {parts} components", input.cols()));
+            }
+            (d.copy(input).map_err(error)?, d.zeros(rows, parts).map_err(error)?)
+        }
+    };
+    d.add_row(&mut m, 1.0, &row(bias_mean)?).map_err(error)?;
+    d.add_row(&mut s2, 1.0, &row(bias_variance)?).map_err(error)?;
+    let s = d.gate_function(GateFunction::Sqrt, &s2, None).map_err(error)?;
+    // Per row and component, weighted by its rank: P = Φ(m/s), ∂P/∂m = φ(m/s)/s and
+    // 2 ∂P/∂s² = −φ(m/s) m / s³.
+    let weight = row(rank)?;
+    let weighted = |f: &Tensor| -> Result<Tensor, String> {
+        let mut out = d.empty(rows, parts).map_err(error)?;
+        d.scale_columns(&mut out, f, &weight, false).map_err(error)?;
+        Ok(out)
+    };
+    let probability = weighted(&d.gate_function(GateFunction::Cdf, &m, Some(&s)).map_err(error)?)?;
+    let slope = weighted(&d.gate_function(GateFunction::CdfSlope, &m, Some(&s)).map_err(error)?)?;
+    let spread = weighted(&d.gate_function(GateFunction::Ratio, &d.gate_function(GateFunction::CdfScaleSlope, &m, Some(&s)).map_err(error)?, Some(&s)).map_err(error)?)?;
+    let ones = d.upload_vec(1, rows, vec![1.0; rows]).map_err(error)?;
+    let column_sums = |t: &Tensor| -> Result<ndarray::Array1<f64>, String> {
+        let mut out = d.empty(1, parts).map_err(error)?;
+        d.gemm(&mut out, 1.0, &ones, Op::N, t, Op::N, 0.0, arithmetic).map_err(error)?;
+        Ok(d.download(&out).map_err(error)?.row(0).to_owned())
+    };
+    let count = column_sums(&probability)?.sum();
+    let bias_mean = column_sums(&slope)?;
+    let bias_variance = column_sums(&spread)? * 0.5;
+    let gate_terms = match &squares {
+        Some(squares) => {
+            let (mut mean, mut variance) = (d.empty(parts, input.cols()).map_err(error)?, d.empty(parts, input.cols()).map_err(error)?);
+            d.gemm(&mut mean, 1.0, &slope, Op::T, input, Op::N, 0.0, arithmetic).map_err(error)?;
+            d.gemm(&mut variance, 0.5, &spread, Op::T, squares, Op::N, 0.0, arithmetic).map_err(error)?;
+            Some((d.download(&mean).map_err(error)?, d.download(&variance).map_err(error)?))
+        }
+        None => None,
+    };
+    let expected = crate::library_complexity::Expected { count, rows, mean: Array2::zeros((parts, 0)), variance: Array2::zeros((parts, 0)), bias_mean, bias_variance };
+    Ok((expected, gate_terms))
 }
 
 /// Returns the experiments in the order of their bits.
