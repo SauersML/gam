@@ -2900,6 +2900,41 @@ impl Behavior {
     }
 }
 
+/// A counterfactual run computed once by whichever run asks first.
+type RunCell = Arc<std::sync::OnceLock<Result<Arc<Reference>, String>>>;
+
+/// The cell under `key` in `cache` (made when absent, then the newest), the oldest computed runs
+/// dropped while the computed ones hold more than `budget` bytes.
+fn cached_run(cache: &std::sync::Mutex<Vec<(String, RunCell)>>, key: String, budget: usize) -> Result<RunCell, String> {
+    let mut cache = cache.lock().map_err(|e| e.to_string())?;
+    if let Some(at) = cache.iter().position(|(k, _)| *k == key) {
+        let entry = cache.remove(at);
+        let cell = entry.1.clone();
+        cache.push(entry);
+        return Ok(cell);
+    }
+    let size = |c: &RunCell| match c.get() {
+        Some(Ok(r)) => r.bytes(),
+        _ => 0,
+    };
+    let mut held: usize = cache.iter().map(|(_, c)| size(c)).sum();
+    while held > budget && !cache.is_empty() {
+        let (_, old) = cache.remove(0);
+        held -= size(&old);
+    }
+    let cell: RunCell = Arc::new(std::sync::OnceLock::new());
+    cache.push((key, cell.clone()));
+    Ok(cell)
+}
+
+impl Reference {
+    /// The bytes its tables hold.
+    pub fn bytes(&self) -> usize {
+        let tables = std::iter::once(&self.embed).chain(self.reads.iter().flatten()).chain(&self.active).chain(&self.mlp).chain(&self.inputs).chain(&self.attention_inputs);
+        8 * tables.map(|a| a.len()).sum::<usize>()
+    }
+}
+
 /// A behavior prepared for scoring: its prompts and counterfactuals as batches, the scored rows,
 /// the swap donors, the stand-in averages, and `M`'s outcome per experiment (cached by its key).
 pub struct Checker {
@@ -2935,10 +2970,13 @@ pub struct Checker {
     /// The weight edit applied now, if any (its JSON): part of a counterfactual run's cache key.
     edit: Option<String>,
     /// Counterfactual runs by (edit, sequences), each computed once by whichever run asks first.
-    references: std::sync::Mutex<Vec<(String, Arc<std::sync::OnceLock<Result<Arc<Reference>, String>>>)>>,
+    references: std::sync::Mutex<Vec<(String, RunCell)>>,
     /// Counterfactual runs under site operations (`reference_under`) by experiment, for one
     /// [`Checker::score_batch`] (cleared at its start).
-    site_references: std::sync::Mutex<BTreeMap<String, Arc<std::sync::OnceLock<Result<Arc<Reference>, String>>>>>,
+    site_references: std::sync::Mutex<Vec<(String, RunCell)>>,
+    /// The bytes of counterfactual runs kept across scores (each cache), oldest dropped first: an
+    /// experiment set's runs are computed once per behavior and serve every later score of it.
+    pub reference_bytes: usize,
 }
 
 /// Every score term (bits) and the counts behind them.
@@ -3042,7 +3080,8 @@ impl Checker {
             blocks,
             edit: None,
             references: std::sync::Mutex::new(Vec::new()),
-            site_references: std::sync::Mutex::new(BTreeMap::new()),
+            site_references: std::sync::Mutex::new(Vec::new()),
+            reference_bytes: 3 << 30,
         })
     }
 
@@ -3062,20 +3101,7 @@ impl Checker {
             // Each piece's mean output per token position over the behavior's prompts, M's run
             // with the current weights.
             let key = format!("{} position", self.edit.as_deref().unwrap_or(""));
-            let cell = {
-                let mut cache = self.references.lock().map_err(|e| e.to_string())?;
-                match cache.iter().find(|(k, _)| *k == key) {
-                    Some((_, c)) => c.clone(),
-                    None => {
-                        if cache.len() >= 6 {
-                            cache.remove(0);
-                        }
-                        let c = Arc::new(std::sync::OnceLock::new());
-                        cache.push((key, c.clone()));
-                        c
-                    }
-                }
-            };
+            let cell = cached_run(&self.references, key, self.reference_bytes)?;
             let prompts = cell
                 .get_or_init(|| {
                     let mut b = self.clean.0.clone();
@@ -3090,21 +3116,7 @@ impl Checker {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         std::hash::Hash::hash(&partner, &mut hasher);
         let key = format!("{} {}", self.edit.as_deref().unwrap_or(""), std::hash::Hasher::finish(&hasher));
-        let cell = {
-            let mut cache = self.references.lock().map_err(|e| e.to_string())?;
-            match cache.iter().find(|(k, _)| *k == key) {
-                Some((_, c)) => c.clone(),
-                None => {
-                    // A few batches recur per edit (the prompts, their counterfactuals, a swap's subset).
-                    if cache.len() >= 6 {
-                        cache.remove(0);
-                    }
-                    let c = Arc::new(std::sync::OnceLock::new());
-                    cache.push((key, c.clone()));
-                    c
-                }
-            }
-        };
+        let cell = cached_run(&self.references, key, self.reference_bytes)?;
         let r = cell
             .get_or_init(|| {
                 let mut b = Batch::new(&partner)?;
@@ -3116,16 +3128,13 @@ impl Checker {
         Ok(out)
     }
 
-    /// Sets the weight edit applied now (`None` after restoring) and drops the counterfactual runs
-    /// of any other edit.
+    /// Sets the weight edit applied now (`None` after restoring): part of a counterfactual run's
+    /// key, so each edit's runs are kept apart.
     fn set_edit(&mut self, e: &Experiment) {
         self.edit = match e {
             Experiment::Edit { edit, .. } => serde_json::to_string(edit).ok(),
             _ => None,
         };
-        if let Ok(mut cache) = self.references.lock() {
-            cache.retain(|(k, _)| k.starts_with(' '));
-        }
     }
 
     /// The experiment's key for `M`'s cache: what it does to which pieces.
@@ -3287,7 +3296,6 @@ impl Checker {
         let n = n.unwrap_or_else(|| self.behavior.size());
         let seed = self.uniform_seeds.map_or(seed, |m| seed % m.max(1));
         let targets = self.targets()?;
-        self.site_references.lock().map_err(|e| e.to_string())?.clear();
         let parsed: Vec<(Graph, bool, Option<String>)> = programs
             .iter()
             .map(|program| match Graph::parse(program, &self.weights) {
@@ -3334,8 +3342,8 @@ impl Checker {
             };
             self.set_edit(&runs[members[0]].1.clone());
             let result = (|| -> Result<(), String> {
-                // At most CHUNK distinct experiments at a time: their counterfactual runs under site
-                // operations (about 200 MB each on vpd4l) are dropped between chunks.
+                // At most CHUNK distinct experiments at a time, which bounds the runs held at once
+                // (counterfactual runs are kept within Checker::reference_bytes).
                 const CHUNK: usize = 8;
                 let mut order: Vec<&str> = Vec::new();
                 let mut chunks: Vec<Vec<usize>> = Vec::new();
@@ -3387,8 +3395,7 @@ impl Checker {
                     for (r, kl, candidates) in scored {
                         measured[r] = Some((kl, candidates));
                     }
-                    self.site_references.lock().map_err(|e| e.to_string())?.clear();
-                }
+                            }
                 Ok(())
             })();
             self.set_edit(&Experiment::Clean);
@@ -3571,10 +3578,7 @@ impl Checker {
         if base.reference.is_some() {
             let partner: Vec<Vec<u32>> = base.sequences().iter().map(|s| self.partners.get(s).cloned().ok_or("a prompt without a counterfactual")).collect::<Result<_, _>>()?;
             let key = format!("{} {}", serde_json::to_string(draw).map_err(|e| e.to_string())?, partner.len());
-            let cell = {
-                let mut cache = self.site_references.lock().map_err(|e| e.to_string())?;
-                cache.entry(key).or_insert_with(|| Arc::new(std::sync::OnceLock::new())).clone()
-            };
+            let cell = cached_run(&self.site_references, key, self.reference_bytes)?;
             let r = cell.get_or_init(|| Batch::new(&partner).and_then(|b| reference_under(&self.weights, &self.stats, &b, draw, &self.sites)).map(Arc::new)).clone()?;
             base.reference = Some(r);
         }
