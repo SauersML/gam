@@ -1967,8 +1967,6 @@ struct GatedStage {
     component_gate: usize,
     /// A shared stage's assignment operator.
     assign: Option<usize>,
-    /// The gates' widths `w` (the Gated nodes' `Φ(z / w)`).
-    width: usize,
 }
 
 impl GatedStage {
@@ -2028,8 +2026,7 @@ impl GatedStage {
                 Some(a) => flat.nodes.iter().position(|n| matches!(n, Node::Transposed { input, operator } if *input == gate && *operator == a)).ok_or_else(|| format!("{prefix}: no gate through the assignment"))?,
                 None => gate,
             };
-            let width = index_of(flat, &format!("{prefix}.width"))?;
-            stages.push(Self { input, threshold, direction, slices, component_gate, assign, width });
+            stages.push(Self { input, threshold, direction, slices, component_gate, assign });
             Ok(())
         };
         let mut attention = blocks(index_of(program, &format!("{name}.attn.read"))?)?;
@@ -2519,12 +2516,7 @@ fn complexity_terms(scorer: &mut Scorer, device_posterior: &DevicePosterior, exp
                     Some(op) => Some(scorer.assignments.iter().find(|a| a.operator == op).ok_or("a shared stage without its assignment")?.values(relaxation)),
                     None => None,
                 };
-                let k = scorer.at(stage.width)?;
-                let width = device_posterior.iterate(k)?.column(0).to_vec();
-                // The widths enter the count (what the pass executes) but take no pull from it:
-                // nothing keeps a width positive, and the pull drove widths to where the toy fit
-                // diverged (resid_mlp_1l, K = 55: 28.3 → 38.6 bits per token over 8 epochs at λ ≈ 8,500).
-                let (expected, gate_terms, assigned, _) = gated_expected(d, arithmetic, trace.value(stage.input)?, gate, (&bias.0, &bias.1, &width), &rank, assign.as_ref())?;
+                let (expected, gate_terms, assigned) = gated_expected(d, arithmetic, trace.value(stage.input)?, gate, (&bias.0, &bias.1), &rank, assign.as_ref())?;
                 if let (Some(op), Some(g)) = (stage.assign, assigned) {
                     assignment_terms.push((op, g * per));
                 }
@@ -2596,19 +2588,15 @@ fn complexity_terms(scorer: &mut Scorer, device_posterior: &DevicePosterior, exp
 /// norms its input holds) and variances `s²`, and each component takes `m A` and `s² (A ⊙ A)`,
 /// as its Gated node does; the gates' derivatives gather the components' through `A`, and the
 /// count's derivative in `A` itself is returned (summed over the rows; none for an unshared stage).
-/// The pass's gates are soft, `Φ(z / w)` with the gates' widths `widths` (each component's `w A`
-/// in a shared stage), and `E[Φ(z / w)] = Φ(m / √(w² + s²))` for `z ~ N(m, s²)`: the count is of
-/// what the pass executes, `w²` joining each component's `s²`, and its derivative in the widths is
-/// returned too.
 fn gated_expected(
     d: &Device,
     arithmetic: gam_gpu::tensor::Arithmetic,
     input: &Tensor,
     gate: Option<(&Tensor, &Tensor)>,
-    (bias_mean, bias_variance, widths): (&[f64], &[f64], &[f64]),
+    (bias_mean, bias_variance): (&[f64], &[f64]),
     rank: &[f64],
     assign: Option<&Array2<f64>>,
-) -> Result<(crate::library_complexity::Expected, Option<(Tensor, Tensor)>, Option<Array2<f64>>, ndarray::Array1<f64>), String> {
+) -> Result<(crate::library_complexity::Expected, Option<(Tensor, Tensor)>, Option<Array2<f64>>), String> {
     use gam_gpu::tensor::GateFunction;
     let rows = input.rows();
     let parts = rank.len();
@@ -2673,16 +2661,6 @@ fn gated_expected(
         }
         None => (d.copy(&m_gate).map_err(error)?, d.copy(&s2_gate).map_err(error)?),
     };
-    // Each component's width `w A` (the gate's own without sharing), its square joining `s²`.
-    if widths.len() != gates {
-        return Err(format!("library budget: {} widths for {gates} gates", widths.len()));
-    }
-    let component_width: Vec<f64> = match assign {
-        Some(a) => (0..parts).map(|b| (0..gates).map(|g| a[[g, b]] * widths[g]).sum()).collect(),
-        None => widths.to_vec(),
-    };
-    let mut s2 = s2;
-    d.add_row(&mut s2, 1.0, &row(&component_width.iter().map(|w| w * w).collect::<Vec<_>>())?).map_err(error)?;
     let s = d.gate_function(GateFunction::Sqrt, &s2, None).map_err(error)?;
     // Per row and component, weighted by its rank: P = Φ(m/s), ∂P/∂m = φ(m/s)/s and
     // 2 ∂P/∂s² = −φ(m/s) m / s³.
@@ -2695,20 +2673,6 @@ fn gated_expected(
     let probability = weighted(&d.gate_function(GateFunction::Cdf, &m, Some(&s)).map_err(error)?)?;
     let slope = weighted(&d.gate_function(GateFunction::CdfSlope, &m, Some(&s)).map_err(error)?)?;
     let spread = weighted(&d.gate_function(GateFunction::Ratio, &d.gate_function(GateFunction::CdfScaleSlope, &m, Some(&s)).map_err(error)?, Some(&s)).map_err(error)?)?;
-    // Per component `Σ_rows 2 ∂P/∂s²` and `w_b` times it: the widths' derivative
-    // `∂/∂w_g = Σ_b A_gb w_b Σ_rows 2 ∂P/∂s²_b` (`∂s²_b/∂w_b = 2 w_b`), and the assignment's path
-    // through the components' widths `w_g w_b Σ_rows 2 ∂P/∂s²_b`.
-    let spread_sums = {
-        let ones = d.upload_vec(1, rows, vec![1.0; rows]).map_err(error)?;
-        let mut out = d.empty(1, parts).map_err(error)?;
-        d.gemm(&mut out, 1.0, &ones, Op::N, &spread, Op::N, 0.0, arithmetic).map_err(error)?;
-        d.download(&out).map_err(error)?.row(0).to_owned()
-    };
-    let width_spread: ndarray::Array1<f64> = spread_sums.iter().zip(&component_width).map(|(p, w)| p * w).collect();
-    let width_terms: ndarray::Array1<f64> = match assign {
-        Some(a) => a.dot(&width_spread),
-        None => width_spread.clone(),
-    };
     // Back to the gates through the assignment: ∂/∂m_g = Σ_b A_gb ∂/∂m_b, ∂/∂s²_g = Σ_b A_gb² ∂/∂s²_b.
     let (slope_gate, spread_gate) = match &shared {
         Some((a, a2)) => {
@@ -2729,7 +2693,6 @@ fn gated_expected(
             d.gemm(&mut direct, 1.0, &m_gate, Op::T, &slope, Op::N, 0.0, arithmetic).map_err(error)?;
             d.gemm(&mut varied, 1.0, &s2_gate, Op::T, &spread, Op::N, 0.0, arithmetic).map_err(error)?;
             let mut total = d.download(&direct).map_err(error)? + d.download(&varied).map_err(error)? * host;
-            total += &Array2::from_shape_fn((gates, parts), |(g, b)| widths[g] * width_spread[b]);
             if gate.is_none() {
                 let mut pooled = d.empty(gates, parts).map_err(error)?;
                 d.gemm(&mut pooled, 1.0, &slope_gate, Op::T, input, Op::N, 0.0, arithmetic).map_err(error)?;
@@ -2759,7 +2722,7 @@ fn gated_expected(
         None => None,
     };
     let expected = crate::library_complexity::Expected { count, rows, mean: Array2::zeros((gates, 0)), variance: Array2::zeros((gates, 0)), bias_mean, bias_variance };
-    Ok((expected, gate_terms, assigned, width_terms))
+    Ok((expected, gate_terms, assigned))
 }
 
 /// The test of the posterior's pending move (`DevicePosterior::pending_divergence`) on this step's
