@@ -91,8 +91,9 @@ def main() -> None:
             print(f"{path.stem}: {type(e).__name__}: {e}", flush=True)
             return
         (out / path.name).write_text(json.dumps(result, indent=1))
-        e2e.record([e2e.status_line(a.model, result["behavior"], n, r, a.stand_in) for n, r in result["programs"].items()
-                    if "total_bits" in r], out / "status.tsv")
+        lines = [e2e.status_line(a.model, result["behavior"], n, r, a.stand_in) for n, r in result["programs"].items() if "total_bits" in r]
+        e2e.record(lines, out / "status.tsv")
+        e2e.record(lines)  # and the team's status table
         print(path.stem, {n: round(r.get("total_bits", float("nan")), 0) for n, r in result["programs"].items()}, flush=True)
 
     with ThreadPoolExecutor(a.workers) as ex:
