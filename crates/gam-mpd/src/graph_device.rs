@@ -30,6 +30,20 @@ pub(crate) struct DeviceState {
 
 static DEVICE: OnceLock<Mutex<DeviceState>> = OnceLock::new();
 
+/// The one thread that touches the device. Device calls convert values on the rayon pool; a
+/// rayon worker holding the device lock that waits on that work can steal another run, which then
+/// waits on the lock its own thread holds (a deadlock seen on vpd4l). Every device entry point
+/// therefore runs on this single-thread pool: callers wait in `install`, the device serves one
+/// call at a time, and its own nested parallel work runs inline.
+static WORKER: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+
+/// `f` on the device's thread with the device state, or `None` when no device is set.
+fn on_device<T: Send>(f: impl FnOnce(&mut DeviceState) -> T + Send) -> Option<T> {
+    let state = DEVICE.get()?;
+    let pool = WORKER.get_or_init(|| rayon::ThreadPoolBuilder::new().num_threads(1).thread_name(|_| "graph-device".into()).build().ok()).as_ref()?;
+    pool.install(|| state.lock().ok().map(|mut s| f(&mut s)))
+}
+
 impl DeviceState {
     pub(crate) fn new(device: Device) -> Self {
         Self { device, resident: HashMap::new() }
@@ -75,21 +89,20 @@ pub fn use_device(device: Device) -> bool {
 /// copy of that shape is dropped, so neither `m` nor a matrix later allocated at a reused address
 /// reads a stale copy.
 pub(crate) fn edited(m: &Array2<f64>) {
-    if let Some(state) = DEVICE.get()
-        && let Ok(mut s) = state.lock()
-    {
-        s.resident.retain(|k, _| (k.1, k.2) != m.dim());
-    }
+    let dim = m.dim();
+    on_device(|s| s.resident.retain(|k, _| (k.1, k.2) != dim));
 }
 
 /// `a · b` on the device, or `None` (no device, a product below `2^22` multiply-adds, or a device
 /// error, after which the host multiplies).
 pub(crate) fn dot(a: &Array2<f64>, b: ArrayView2<f64>) -> Option<Array2<f64>> {
-    let state = DEVICE.get()?;
-    if a.nrows() * a.ncols() * b.ncols() < 1 << 22 {
+    if DEVICE.get().is_none() || a.nrows() * a.ncols() * b.ncols() < 1 << 22 {
         return None;
     }
-    let s = state.lock().ok()?;
+    on_device(|s| dot_on(s, a, b)).flatten()
+}
+
+fn dot_on(s: &mut DeviceState, a: &Array2<f64>, b: ArrayView2<f64>) -> Option<Array2<f64>> {
     let d = &s.device;
     let product = |w: &Tensor, op: Op| -> Result<Array2<f64>, GpuError> {
         let x = d.upload(a.view())?;
@@ -105,7 +118,10 @@ pub(crate) fn dot(a: &Array2<f64>, b: ArrayView2<f64>) -> Option<Array2<f64>> {
 
 /// `last · Uᵀ` on the device with `U` (the unembedding, never edited) resident.
 pub(crate) fn logits(last: &Array2<f64>, unembedding: &Array2<f64>) -> Option<Array2<f64>> {
-    let mut s = DEVICE.get()?.lock().ok()?;
+    on_device(|s| logits_on(s, last, unembedding)).flatten()
+}
+
+fn logits_on(s: &mut DeviceState, last: &Array2<f64>, unembedding: &Array2<f64>) -> Option<Array2<f64>> {
     let u = s.ensure(unembedding.view()).ok()?;
     let d = &s.device;
     let x = d.upload(last.view()).ok()?;
@@ -183,8 +199,7 @@ pub(crate) fn run(weights: &Weights, circuit: &Circuit, job: &Run) -> Option<Res
     if !circuit.units.iter().all(|u| matches!(u.block, Block::Heads { .. } | Block::Neurons { .. })) {
         return None;
     }
-    let mut s = DEVICE.get()?.lock().ok()?;
-    Some(run_on(&mut s, weights, circuit, job))
+    on_device(|s| run_on(s, weights, circuit, job))
 }
 
 /// [`run`] on a given device state (the tests run it on the host backend).
