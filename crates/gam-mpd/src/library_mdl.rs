@@ -2866,7 +2866,13 @@ fn gated_expected(
 /// the batches, `N` the training tokens, `ΔKL` the move's change of the prior's divergence and
 /// `λ` the budget's multiplier (nats of the whole `F` per part per token, as the step's pull
 /// takes it). A batch the move was not made on, so the test is not the move's
-/// own fit. Accepted when `ΔL ≤ 0`; returns the decision and `ΔL`. A line step's quadratic model
+/// own fit. The data term's change is measured per sequence of the batch (paired: both sides on
+/// the same experiments and draws), so the batch's `ΔL` has a standard error from the spread of
+/// its sequences' changes, `B ln 2 √(n var_s) / N` over its `n` sequences. A move is rejected only
+/// when `ΔL` exceeds that standard error: a single batch cannot tell a small true gain from its
+/// own noise, and at `ΔL > 0` alone 30% of grouped_direction's moves were rejected by its sixth
+/// epoch at 2^22 (decomp-vpd4l-f, 42e03873f6). Returns the decision, `ΔL` and its standard
+/// error. A line step's quadratic model
 /// can be wrong (toys: TMS-id grouped own gates, η −9.5e-3 with ρ̄ NaN, the mean's KL from 4e-4 to
 /// 2e182 over epochs 2–6; resid_mlp_2l per-slice gates, η changing sign, 1.9 → 3.8e19); a move
 /// that raises the measured objective is not taken.
@@ -2876,14 +2882,14 @@ fn step_accepted(
     explanation: &Explanation,
     active: &[bool],
     (batch, experiments, key): (&Batch, &[Experiment], u64),
-    (bits, expected): (f64, Option<f64>),
+    (bits, expected): (&[Vec<f64>], Option<f64>),
     (scale, tokens, lambda): (f64, usize, f64),
-) -> Result<(bool, f64), String> {
+) -> Result<(bool, f64, f64), String> {
     let divergence = device_posterior.pending_divergence().ok_or("no pending move")?;
     // The same parts and draws as the step's (`antithetic_step`).
     let parts = step_parts(batch, experiments.to_vec());
     let keys = [key, key ^ gam_gpu::tensor::ANTITHETIC];
-    let mut previous = 0.0;
+    let mut previous: Vec<f64> = Vec::with_capacity(experiments.len());
     scorer.write_assignments(Relaxation::Previous)?;
     for (part, k) in parts.iter().zip(keys) {
         let targets = scorer.experiments.targets(batch, part)?;
@@ -2896,17 +2902,29 @@ fn step_accepted(
         if evaluation.bits.iter().flatten().any(|b| !b.is_finite()) {
             return Err("nonfinite explanation divergence before the move".into());
         }
-        previous += evaluation.bits.iter().flatten().sum::<f64>();
+        previous.extend(evaluation.bits.iter().map(|b| b.iter().sum::<f64>()));
     }
+    if previous.len() != bits.len() {
+        return Err(format!("the move's test scored {} experiments against the step's {}", previous.len(), bits.len()));
+    }
+    // Per sequence (base) of the batch, its experiments' change of the data bits.
+    let mut by_base: BTreeMap<usize, f64> = BTreeMap::new();
+    for ((e, new), old) in experiments.iter().zip(bits).zip(&previous) {
+        *by_base.entry(e.base).or_default() += new.iter().sum::<f64>() - old;
+    }
+    let n = by_base.len() as f64;
+    let total: f64 = by_base.values().sum();
+    let spread = if n > 1.0 { by_base.values().map(|d| (d - total / n).powi(2)).sum::<f64>() / (n - 1.0) } else { 0.0 };
+    let standard_error = scale * LN_2 * (n * spread).sqrt() / tokens as f64;
     let budget = match expected {
         Some(moved) if lambda > 0.0 => lambda * (moved - complexity_terms(scorer, device_posterior, explanation, active, batch, (key, true))?.0),
         _ => 0.0,
     };
-    let change = (scale * LN_2 * (bits - previous) + divergence + budget) / tokens as f64;
+    let change = (scale * LN_2 * total + divergence + budget) / tokens as f64;
     if !change.is_finite() {
         return Err(format!("a nonfinite change of the objective at the move's test ({change})"));
     }
-    Ok((change <= 0.0, change))
+    Ok((change <= standard_error, change, standard_error))
 }
 
 /// Returns the experiments in the order of their bits.
@@ -4329,9 +4347,9 @@ pub fn fit_from(
             // The previous step's move stands only if this batch's measured objective is lower at
             // it (`step_accepted`); a rejected move is undone and this batch takes no step.
             if device_posterior.pending_divergence().is_some() {
-                let new = (bits.iter().flatten().sum::<f64>(), budget.as_ref().map(|(_, (expected, _))| *expected));
+                let new = (bits.as_slice(), budget.as_ref().map(|(_, (expected, _))| *expected));
                 let lambda = progress.multiplier;
-                let (accepted, change) = step_accepted(&mut scorer, &device_posterior, explanation, &posterior.active, (&batch, &experiments, key), new, (scale, tokens, lambda))?;
+                let (accepted, change, standard_error) = step_accepted(&mut scorer, &device_posterior, explanation, &posterior.active, (&batch, &experiments, key), new, (scale, tokens, lambda))?;
                 if accepted {
                     device_posterior.accept();
                     scorer.accept_assignments();
@@ -4339,7 +4357,7 @@ pub fn fit_from(
                     device_posterior.revert()?;
                     scorer.revert_assignments();
                     progress.step += 1;
-                    log::info!("library step {epoch}.{b}: the last move rejected (its change of the objective on this batch {change:.4e} nats per token), undone; no step on this batch");
+                    log::info!("library step {epoch}.{b}: the last move rejected (its change of the objective on this batch {change:.4e} ± {standard_error:.2e} nats per token), undone; no step on this batch");
                     continue;
                 }
             }
