@@ -1442,6 +1442,20 @@ impl Interventions {
     }
 }
 
+/// `circuit` on `base` (its batch and scored rows) under site operations `draw`: the circuit split
+/// at the heads the operations name, the donor run of the same circuit on `donor` when they swap
+/// or cut, the operations resolved ([`Interventions::resolve`]) and the run's log-probabilities.
+pub fn run_sites(weights: &Weights, stats: &Stats, circuit: &Circuit, base: (&Batch, &[usize]), donor: Option<&Batch>, draw: &SiteDraw, units: &SiteUnits) -> Result<Array2<f64>, String> {
+    let heads: BTreeSet<(usize, usize)> = draw.ops.iter().filter_map(|o| if let SharedSite::Head(h) = o.site { head_of(weights, h).ok() } else { None }).collect();
+    let circuit = circuit.split_heads(&heads);
+    let donor_run = match donor {
+        Some(b) if Interventions::needs_donor(draw) => Some(execute_with(weights, stats, &circuit, b, &[], &BTreeMap::new(), false, &Interventions::recording(Interventions::donor_record(draw, weights)))?),
+        _ => None,
+    };
+    let ops = Interventions::resolve(draw, &circuit, weights, base.0, units, donor_run.as_ref(), donor)?;
+    Ok(execute_with(weights, stats, &circuit, base.0, base.1, &BTreeMap::new(), false, &ops)?.log_probabilities)
+}
+
 /// Head `h` numbered layer by layer (`SharedSite::Head`) as (layer, head).
 fn head_of(weights: &Weights, h: usize) -> Result<(usize, usize), String> {
     let mut rest = h;
@@ -1903,18 +1917,11 @@ impl Checker {
         Ok((base, rows, Some(donors)))
     }
 
-    /// `circuit` under site operations `draw` ([`Interventions`]): its log-probabilities at the
+    /// `circuit` under site operations `draw` ([`run_sites`]): its log-probabilities at the
     /// scored rows.
     fn sites_outcome(&self, circuit: &Circuit, draw: &SiteDraw) -> Result<Array2<f64>, String> {
-        let heads: BTreeSet<(usize, usize)> = draw.ops.iter().filter_map(|o| if let SharedSite::Head(h) = o.site { head_of(&self.weights, h).ok() } else { None }).collect();
-        let circuit = circuit.split_heads(&heads);
         let (base, rows, donor) = self.site_batches(Interventions::needs_donor(draw))?;
-        let donor_run = match &donor {
-            Some(b) => Some(execute_with(&self.weights, &self.stats, &circuit, b, &[], &BTreeMap::new(), false, &Interventions::recording(Interventions::donor_record(draw, &self.weights)))?),
-            None => None,
-        };
-        let ops = Interventions::resolve(draw, &circuit, &self.weights, &base, &self.sites, donor_run.as_ref(), donor.as_ref())?;
-        Ok(execute_with(&self.weights, &self.stats, &circuit, &base, &rows, &BTreeMap::new(), false, &ops)?.log_probabilities)
+        run_sites(&self.weights, &self.stats, circuit, (&base, &rows), donor.as_ref(), draw, &self.sites)
     }
 
     /// An experiment's scored tokens as (prompt, position), in its rows' order: a node swap's and a

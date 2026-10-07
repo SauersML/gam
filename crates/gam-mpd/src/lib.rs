@@ -50,6 +50,8 @@ pub mod library_readout;
 pub mod graph;
 #[cfg(test)]
 mod graph_tests;
+#[cfg(test)]
+mod graph_sites_tests;
 // Shared functions of the library: one query-key function read by heads of several layers.
 pub mod library_sharing;
 // A learned mixture prior over the gate directions: read–write ties found by gradient.
