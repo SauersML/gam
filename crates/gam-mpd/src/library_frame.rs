@@ -21,7 +21,8 @@
 //!   (spherical k-means: each row is assigned the atom of largest `|f·x|` among unit atoms, each
 //!   atom becomes the leading eigenvector of its rows' second moment; started at the tight frame,
 //!   repeated until no assignment changes). The atoms are directions the activations take one at a
-//!   time; no ground truth is used.
+//!   time; no ground truth is used. Directions the activations never take are completed by the
+//!   unresolved eigenvectors of the atoms' Gram, so the frame spans its space.
 //!
 //! Each component is one atom's slices on the maps reading its space, with one own gate at that
 //! read, started at `τ = 0`: on wherever it reads anything, which is everywhere its output is
@@ -111,6 +112,19 @@ impl Frame {
                 let top = eigh(moment.view(), SymmetricAssembly::Mirrored, Some((dim - 1, dim))).map_err(|e| error(format!("{e:?}")))?;
                 atom.assign(&top.vectors.column(0));
             }
+        }
+        // Directions the rows never take (a toy's stream slots that hold zeros at this read) have
+        // no atom; they are completed by the unresolved eigenvectors of the atoms' Gram, so the
+        // frame spans the space and every map is still cut exactly (their components read nothing
+        // on the fitting rows).
+        let gram = fast_ata(&atoms);
+        let decomposition = eigh(gram.view(), SymmetricAssembly::Mirrored, None).map_err(|e| error(format!("{e:?}")))?;
+        let largest = decomposition.values.iter().fold(0.0_f64, |m, v| m.max(*v));
+        let floor = decomposition.band.max(largest * f64::EPSILON * dim as f64);
+        let missing: Vec<usize> = (0..dim).filter(|&k| decomposition.values[k] <= floor).collect();
+        if !missing.is_empty() {
+            let complement = decomposition.vectors.select(Axis(1), &missing).t().to_owned();
+            atoms = concatenate(Axis(0), &[atoms.view(), complement.view()]).map_err(error)?;
         }
         let frame = Self { atoms };
         frame.dual()?;
