@@ -56,5 +56,7 @@
  "qwen3_alphabet_lower": {"model": "qwen3-0.6b", "behavior": "alphabet.lower", "family": "alphabet", "split": "train"},
  "qwen3_alphabet_upper": {"model": "qwen3-0.6b", "behavior": "alphabet.upper", "family": "alphabet", "split": "train"},
  "qwen3_greater_than_war": {"model": "qwen3-0.6b", "behavior": "greater_than.war", "family": "greater_than", "split": "train"},
- "qwen3_sva_simple": {"model": "qwen3-0.6b", "behavior": "sva.simple", "family": "sva", "split": "heldout"}
+ "qwen3_sva_simple": {"model": "qwen3-0.6b", "behavior": "sva.simple", "family": "sva", "split": "heldout"},
+ "vpd4l_induction_random_words8_vpd": {"model": "vpd4l", "behavior": "induction_random.words8", "family": "induction_random", "split": "train"},
+ "vpd4l_greater_than_war_vpd": {"model": "vpd4l", "behavior": "greater_than.war", "family": "greater_than", "split": "train"}
 }
