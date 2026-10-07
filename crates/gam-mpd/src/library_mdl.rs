@@ -289,6 +289,14 @@ pub struct Share {
 /// (d6ad2537cb), its own gate holds `e⁶ / (e⁶ + K − 1)` of the relaxed assignment (98% at K = 8).
 const OWN_LOGIT: f64 = 6.0;
 
+/// A training batch's all-on experiment ([`Scorer::all_on_pass`]): its experiments, their bits and
+/// the gradient of their sum.
+struct AllOn {
+    experiments: Vec<Experiment>,
+    bits: Vec<Vec<f64>>,
+    gradient: BTreeMap<usize, Tensor>,
+}
+
 /// Where a training pass's gate thresholds sit ([`Scorer::train_gates`]): at the iterate, at the
 /// posterior's average or at the iterate before the pending move.
 #[derive(Clone, Copy)]
@@ -2104,6 +2112,8 @@ struct Scorer {
     /// explanation's gates are scored ([`GateScoring`]).
     hard_gates: Vec<(usize, usize, usize)>,
     scoring: GateScoring,
+    /// Every gated stage's threshold operator and its rows ([`Scorer::all_on_pass`]).
+    thresholds: Vec<(usize, usize)>,
     /// Each trainable operator's position in `Explanation::trainable`.
     position: BTreeMap<usize, usize>,
     /// The blocks the explanation explains ([`scope`]), when not all of them ([`scoped`]): every
@@ -2173,7 +2183,8 @@ impl Scorer {
         let program = &explanation.artifact.program;
         let hard_gates = stages.iter().flatten().filter(|s| !position.contains_key(&s.width)).map(|s| (s.width, s.threshold, program.operators[s.width].rows.width())).collect();
         let scoring = explanation.scoring;
-        let mut scorer = Self { experiments, mlps, stages, hard_gates, scoring, position, scope, families: settings.families.clone(), edits: std::cell::RefCell::new(BTreeMap::new()), assignments, written: None, version: 0, assignment_step: None, assignment_budget: Vec::new() };
+        let thresholds = stages.iter().flatten().map(|s| (s.threshold, program.operators[s.threshold].rows.width())).collect();
+        let mut scorer = Self { experiments, mlps, stages, hard_gates, scoring, thresholds, position, scope, families: settings.families.clone(), edits: std::cell::RefCell::new(BTreeMap::new()), assignments, written: None, version: 0, assignment_step: None, assignment_budget: Vec::new() };
         scorer.train_gates(None)?;
         Ok(scorer)
     }
@@ -2186,6 +2197,58 @@ impl Scorer {
     /// the pass's weight sample; a learned width's gate is `Φ(z / w)`. With none, the evaluation
     /// law: every hard stage at `library_vpd::HARD` (the hard gate `H(z_b)`), and a learned width's
     /// gate by its scoring ([`GateScoring`]: the ramp or the hard gate).
+    /// The all-on experiment of a training batch (`library_vpd`'s gated components): each of its
+    /// clean experiments of `P` alone run again with every gated component forced on (each stage's
+    /// thresholds at 10³⁰), at the pass's weight sample about `center` and its gates' training law,
+    /// scored against `M`'s targets. With every part on the explanation is the sum of its parts, so
+    /// this is `KL(M ‖ Σ parts)` on the batch: a term of F's data term whose value is the drift of
+    /// the parts from `M`'s maps. Without it the parts drift freely (vpd4l grouped direction gates,
+    /// learned widths: held-out KL with every part on 1.38 → 12.1 bits per token over two epochs at
+    /// 2^22, decomp-vpd4l-h at 591bb575c2), and a native weight edit acts on the drifted parts.
+    /// Returns the experiments, their bits and, with `gradient`, the gradient of their sum per
+    /// trainable operator (thresholds' and assignments' left out: forced, they take none); none
+    /// for an explanation without gated components or a batch without a clean experiment of `P`
+    /// alone.
+    fn all_on_pass(
+        &mut self,
+        posterior: &DevicePosterior,
+        (batch, experiments, key): (&Batch, &[Experiment], u64),
+        center: Center,
+        gradient: bool,
+    ) -> Result<Option<AllOn>, String> {
+        let thresholds = self.thresholds.clone();
+        let clean: Vec<Experiment> = experiments.iter().filter(|e| e.patch.is_none() && e.explained.iter().all(|x| *x)).cloned().collect();
+        if thresholds.is_empty() || clean.is_empty() {
+            return Ok(None);
+        }
+        let targets = self.experiments.targets(batch, &clean)?;
+        match center {
+            Center::Previous => posterior.previous_into(self.experiments.explanation_mut(), key)?,
+            Center::Iterate => posterior.iterate_into(self.experiments.explanation_mut(), key)?,
+            Center::Average => posterior.sample_into(self.experiments.explanation_mut(), key)?,
+        }
+        self.train_gates(Some((posterior, center)))?;
+        for &(t, rows) in &thresholds {
+            let program = self.experiments.explanation_mut();
+            let on = program.device().upload(Array2::from_elem((rows, 1), 1e30).view()).map_err(error)?;
+            program.replace_dense_parameter(t, on)?;
+        }
+        self.experiments.explanation_mut().refresh_fused()?;
+        let evaluation = self.reversed(|e| e.evaluate_probed(batch, &clean, Some(&targets), gradient, None));
+        self.train_gates(None)?;
+        let mut evaluation = evaluation?;
+        if evaluation.bits.iter().flatten().any(|b| !b.is_finite()) {
+            return Err("nonfinite divergence with every gated component on".into());
+        }
+        for (t, _) in &thresholds {
+            evaluation.gradient.remove(t);
+        }
+        for a in &self.assignments {
+            evaluation.gradient.remove(&a.operator);
+        }
+        Ok(Some(AllOn { experiments: clean, bits: evaluation.bits, gradient: evaluation.gradient }))
+    }
+
     fn train_gates(&mut self, posterior: Option<(&DevicePosterior, Center)>) -> Result<(), String> {
         match self.scoring {
             GateScoring::Ramp => self.experiments.explanation_mut().set_ramp(posterior.is_none()),
@@ -2927,6 +2990,7 @@ fn step_accepted(
     active: &[bool],
     (batch, experiments, key): (&Batch, &[Experiment], u64),
     (bits, expected): (&[Vec<f64>], Option<f64>),
+    all_on: Option<&AllOn>,
     (scale, tokens, lambda): (f64, usize, f64),
 ) -> Result<(bool, f64, f64), String> {
     let divergence = device_posterior.pending_divergence().ok_or("no pending move")?;
@@ -2955,6 +3019,13 @@ fn step_accepted(
     let mut by_base: BTreeMap<usize, f64> = BTreeMap::new();
     for ((e, new), old) in experiments.iter().zip(bits).zip(&previous) {
         *by_base.entry(e.base).or_default() += new.iter().sum::<f64>() - old;
+    }
+    // The all-on experiment, both sides (`Scorer::all_on_pass`).
+    if let Some(on) = all_on {
+        let before = scorer.all_on_pass(device_posterior, (batch, &on.experiments, key), Center::Previous, false)?.ok_or("no all-on experiment before the move")?;
+        for ((e, new), old) in on.experiments.iter().zip(&on.bits).zip(&before.bits) {
+            *by_base.entry(e.base).or_default() += new.iter().sum::<f64>() - old.iter().sum::<f64>();
+        }
     }
     let n = by_base.len() as f64;
     let total: f64 = by_base.values().sum();
@@ -4340,6 +4411,20 @@ pub fn fit_from(
             let scored = bits.iter().map(Vec::len).sum::<usize>();
             let (scale, weight) = batch_weights(draws.len(), tokens);
             data_sum += scale * LN_2 * bits.iter().flatten().sum::<f64>();
+            // The all-on experiment (`Scorer::all_on_pass`): its bits join the data term and its
+            // gradient the step's.
+            let all_on = scorer.all_on_pass(&device_posterior, (&batch, &experiments, key), Center::Iterate, true)?;
+            if let Some(on) = &all_on {
+                data_sum += scale * LN_2 * on.bits.iter().flatten().sum::<f64>();
+                for (op, g) in &on.gradient {
+                    match gradients.get_mut(op) {
+                        Some(total) => device.axpy(total, 1.0, g).map_err(error)?,
+                        None => {
+                            gradients.insert(*op, device.copy(g).map_err(error)?);
+                        }
+                    }
+                }
+            }
             // The prior term at the step's two antithetic samples, around the iterate as the data
             // step's (`PriorTerm::sample_device`), and its seconds: its value and gradient averaged
             // over the pair, the gradient joining the data term's (which the step weighs by `scale`
@@ -4403,7 +4488,7 @@ pub fn fit_from(
             if device_posterior.pending_divergence().is_some() {
                 let new = (bits.as_slice(), budget.as_ref().map(|(_, (expected, _))| *expected));
                 let lambda = progress.multiplier;
-                let (accepted, change, standard_error) = step_accepted(&mut scorer, &device_posterior, explanation, &posterior.active, (&batch, &experiments, key), new, (scale, tokens, lambda))?;
+                let (accepted, change, standard_error) = step_accepted(&mut scorer, &device_posterior, explanation, &posterior.active, (&batch, &experiments, key), new, all_on.as_ref(), (scale, tokens, lambda))?;
                 if accepted {
                     device_posterior.accept();
                     scorer.accept_assignments();
