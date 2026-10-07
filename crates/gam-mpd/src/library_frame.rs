@@ -152,27 +152,27 @@ impl Frame {
     /// The frame of `kind` for a space of `rows` (`M`'s activations there, one per row).
     pub fn of(kind: FrameKind, rows: &Array2<f64>, seed: u64) -> Result<Self, String> {
         let dim = rows.ncols();
-        let tight = Self::random_tight(REDUNDANCY * dim, dim, seed)?;
         match kind {
-            FrameKind::Tight => Ok(tight),
-            FrameKind::Dictionary => Self::dictionary(rows, tight),
-            FrameKind::Sparse => Ok(Self::sparse_dictionary(rows, tight)?.0),
+            FrameKind::Tight => Self::random_tight(REDUNDANCY * dim, dim, seed),
+            FrameKind::Dictionary => Self::dictionary(rows, Self::random_tight(REDUNDANCY * dim, dim, seed)?),
+            FrameKind::Sparse => Ok(Self::sparse_dictionary(rows, REDUNDANCY * dim, seed)?.0),
         }
     }
 
-    /// A k-sparse dictionary of `rows` (one per row), started at `start`, and the rows' mean atom
-    /// count. Each row is coded by orthogonal matching pursuit over the unit atoms, its atom count
-    /// the one of shortest two-part code: per atom its index and coefficient,
-    /// `log₂ C + ½ log₂ N` bits (`N` the rows), and the residual at its own mean square per
-    /// dimension, `(d/2) log₂(‖r‖²/d)`, down to the rounding of the row (`‖r‖² ≥ d (ε‖x‖)²`), so
-    /// the count is the data's own sparsity, measured, not set. The atoms are then the least squares
-    /// fit to the codes (the method of optimal directions), unit again; repeated until no row's
-    /// support changes. Directions the rows never take are completed as in [`Frame::dictionary`].
-    pub fn sparse_dictionary(rows: &Array2<f64>, start: Frame) -> Result<(Self, f64), String> {
-        let (count, dim) = start.atoms.dim();
+    /// A k-sparse dictionary of `count` atoms for `rows` (one per row) and the rows' mean atom count.
+    /// The atoms start as `count` distinct nonzero rows (a seeded draw; where the rows are sparse in
+    /// some basis, many of them are single basis vectors, which a random start never finds). Each row
+    /// is coded by orthogonal matching pursuit over the unit atoms, its atom count the one of
+    /// shortest two-part code: per atom its index and coefficient, `log₂ C + ½ log₂ N` bits (`N` the
+    /// rows), and the residual at its own mean square per dimension, `(d/2) log₂(‖r‖²/d)`, down to
+    /// the rounding of the row (`‖r‖² ≥ d (ε‖x‖)²`), so the count is the data's own sparsity,
+    /// measured, not set. The atoms then take the least squares fit to the codes (the method of
+    /// optimal directions), kept only while the rows' total code length falls. Directions the rows
+    /// never take are completed as in [`Frame::dictionary`].
+    pub fn sparse_dictionary(rows: &Array2<f64>, count: usize, seed: u64) -> Result<(Self, f64), String> {
+        let dim = rows.ncols();
         let live: Vec<usize> = (0..rows.nrows()).filter(|&r| rows.row(r).iter().any(|v| *v != 0.0)).collect();
         let x = rows.select(Axis(0), &live);
-        let mut atoms = start.atoms;
         let unit = |atoms: &mut Array2<f64>| {
             for mut atom in atoms.rows_mut() {
                 let norm = atom.dot(&atom).sqrt();
@@ -181,18 +181,35 @@ impl Frame {
                 }
             }
         };
-        unit(&mut atoms);
-        let bits_per_atom = (count as f64).log2() + 0.5 * (x.nrows().max(1) as f64).log2();
-        let mut supports: Vec<Vec<usize>> = Vec::new();
-        let mut mean_k = 0.0;
-        for _ in 0..100 {
-            let codes: Vec<(Vec<usize>, Vec<f64>)> = (0..x.nrows()).map(|r| pursuit(x.row(r), &atoms, bits_per_atom)).collect::<Result<_, _>>()?;
-            let next: Vec<Vec<usize>> = codes.iter().map(|(support, _)| support.clone()).collect();
-            mean_k = next.iter().map(Vec::len).sum::<usize>() as f64 / next.len().max(1) as f64;
-            if next == supports {
+        // `count` distinct rows by a seeded shuffle (fewer when the rows hold fewer).
+        let mut rng = StdRng::seed_from_u64(seed);
+        let mut order: Vec<usize> = (0..x.nrows()).collect();
+        for i in (1..order.len()).rev() {
+            order.swap(i, rng.random_range(0..=i));
+        }
+        let mut picked: Vec<usize> = Vec::with_capacity(count);
+        for &r in &order {
+            if picked.len() == count {
                 break;
             }
-            supports = next;
+            if !picked.iter().any(|&q| x.row(q) == x.row(r)) {
+                picked.push(r);
+            }
+        }
+        if picked.is_empty() {
+            return Ok((Self::random_tight(count.max(dim), dim, seed)?, 0.0));
+        }
+        let mut atoms = x.select(Axis(0), &picked);
+        unit(&mut atoms);
+        let count = atoms.nrows();
+        let bits_per_atom = (count as f64).log2() + 0.5 * (x.nrows().max(1) as f64).log2();
+        let code = |atoms: &Array2<f64>| -> Result<(Vec<(Vec<usize>, Vec<f64>)>, f64), String> {
+            let codes: Vec<(Vec<usize>, Vec<f64>, f64)> = (0..x.nrows()).map(|r| pursuit(x.row(r), atoms, bits_per_atom)).collect::<Result<_, _>>()?;
+            let bits = codes.iter().map(|c| c.2).sum();
+            Ok((codes.into_iter().map(|(s, a, _)| (s, a)).collect(), bits))
+        };
+        let (mut codes, mut bits) = code(&atoms)?;
+        for _ in 0..100 {
             // The method of optimal directions: atoms = (AᵀA)⁺ Aᵀ X over the codes A.
             let mut ata = Array2::<f64>::zeros((count, count));
             let mut atx = Array2::<f64>::zeros((count, dim));
@@ -211,11 +228,18 @@ impl Frame {
             let sub = ata.select(Axis(0), &used).select(Axis(1), &used);
             let inverse = eigh(sub.view(), SymmetricAssembly::Mirrored, None).map_err(|e| error(format!("{e:?}")))?.psd_map(0.0, |v| 1.0 / v).map_err(|e| error(format!("{e:?}")))?;
             let fitted = inverse.dot(&atx.select(Axis(0), &used));
+            let mut next = atoms.clone();
             for (k, &i) in used.iter().enumerate() {
-                atoms.row_mut(i).assign(&fitted.row(k));
+                next.row_mut(i).assign(&fitted.row(k));
             }
-            unit(&mut atoms);
+            unit(&mut next);
+            let (next_codes, next_bits) = code(&next)?;
+            if next_bits >= bits {
+                break;
+            }
+            (atoms, codes, bits) = (next, next_codes, next_bits);
         }
+        let mean_k = codes.iter().map(|c| c.0.len()).sum::<usize>() as f64 / codes.len().max(1) as f64;
         let frame = Self::dictionary_completed(atoms)?;
         Ok((frame, mean_k))
     }
@@ -276,12 +300,13 @@ impl Frame {
 }
 
 /// Orthogonal matching pursuit of `x` over the unit `atoms` (rows), its atom count the one of
-/// shortest two-part code ([`Frame::sparse_dictionary`]): the support and its coefficients.
-fn pursuit(x: ndarray::ArrayView1<f64>, atoms: &Array2<f64>, bits_per_atom: f64) -> Result<(Vec<usize>, Vec<f64>), String> {
+/// shortest two-part code ([`Frame::sparse_dictionary`]): the support, its coefficients and the
+/// code length in bits.
+fn pursuit(x: ndarray::ArrayView1<f64>, atoms: &Array2<f64>, bits_per_atom: f64) -> Result<(Vec<usize>, Vec<f64>, f64), String> {
     let dim = x.len();
     let energy = x.dot(&x);
     if energy == 0.0 {
-        return Ok((Vec::new(), Vec::new()));
+        return Ok((Vec::new(), Vec::new(), 0.0));
     }
     let floor = dim as f64 * (f64::EPSILON * energy.sqrt()).powi(2);
     let code_bits = |k: usize, residual: f64| k as f64 * bits_per_atom + 0.5 * dim as f64 * (residual.max(floor) / dim as f64).log2();
@@ -307,7 +332,7 @@ fn pursuit(x: ndarray::ArrayView1<f64>, atoms: &Array2<f64>, bits_per_atom: f64)
             break;
         }
     }
-    Ok((best.1, best.2))
+    Ok((best.1, best.2, best.0))
 }
 
 /// The gates a component of the shared arm may move to, its own first (library_vpd's gate sharing;
