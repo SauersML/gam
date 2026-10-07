@@ -3,7 +3,7 @@
 //! export (#2951): identical for `M` and a program that declares every piece, and equal to `M`'s
 //! own weight edits and donor runs where those define the same experiment.
 use crate::{
-    graph::{Batch, Behavior, Checker, Circuit, Counterfactual, EdgeIr, Graph, NodeIr, PieceIr, Program, Prompt, SiteDraw, SiteUnits, Stats, WeightEdit, Weights, execute, kl_bits, op_rows, reference, reference_under, run_sites, sample},
+    graph::{Batch, Behavior, Checker, Circuit, Counterfactual, EdgeIr, Graph, NodeIr, PieceIr, Program, Prompt, SiteDraw, SiteUnits, WeightEdit, Weights, execute, kl_bits, op_rows, reference, reference_under, run_sites, sample},
     import::import_language_model,
     interchange::{self, Family, Operation, SharedSite, SiteOp},
     library_mdl,
@@ -74,7 +74,6 @@ fn max(values: &[f64]) -> f64 {
 
 struct Setup {
     weights: Weights,
-    stats: Stats,
     base: Batch,
     donor: Batch,
     rows: Vec<usize>,
@@ -85,16 +84,15 @@ fn setup(tag: &str) -> Setup {
     let (weights, sequences) = model(tag);
     // Each sequence's donor is the next one (all of one length), as a counterfactual would be.
     let donors: Vec<Vec<u32>> = (0..sequences.len()).map(|i| sequences[(i + 1) % sequences.len()].clone()).collect();
-    let stats = Stats::measure(&weights, &sequences).expect("stats");
     let base = Batch::new(&sequences).expect("batch");
     let rows: Vec<usize> = (0..base.tokens.len()).collect();
     let units = units(&weights);
-    Setup { weights, stats, base, donor: Batch::new(&donors).expect("donors"), rows, units }
+    Setup { weights, base, donor: Batch::new(&donors).expect("donors"), rows, units }
 }
 
 impl Setup {
     fn run(&self, circuit: &Circuit, d: &SiteDraw) -> Array2<f64> {
-        run_sites(&self.weights, &self.stats, circuit, (&self.base, &self.rows), Some(&self.donor), d, &self.units).expect("site run")
+        run_sites(&self.weights, circuit, (&self.base, &self.rows), Some(&self.donor), d, &self.units).expect("site run")
     }
 }
 
@@ -120,7 +118,7 @@ fn full_program_responds_as_the_model_to_site_operations() {
             let kl = max(&kl_bits(&m, &p));
             assert!(kl < 1e-9, "{:?} ({name}): KL(M_e ‖ P_e) = {kl:e} bits", d.family);
         }
-        let clean = execute(&s.weights, &s.stats, &model, &s.base, &s.rows, &BTreeMap::new(), false).expect("clean").log_probabilities;
+        let clean = execute(&s.weights, &model, &s.base, &s.rows, &BTreeMap::new()).expect("clean").log_probabilities;
         assert!(max(&kl_bits(&clean, &m)) > 1e-6, "{:?} changes nothing", d.family);
     }
 }
@@ -139,7 +137,7 @@ fn site_scales_at_every_token_are_weight_edits() {
     for (d, edit) in cases {
         let site = s.run(&model, &d);
         let restore = edit.apply(&mut s.weights).expect("edit");
-        let edited = execute(&s.weights, &s.stats, &model, &s.base, &s.rows, &BTreeMap::new(), false).expect("edited").log_probabilities;
+        let edited = execute(&s.weights, &model, &s.base, &s.rows, &BTreeMap::new()).expect("edited").log_probabilities;
         restore.restore(&mut s.weights).expect("restore");
         let kl = max(&kl_bits(&edited, &site));
         assert!(kl < 1e-9, "{edit:?}: KL(weight edit ‖ site operation) = {kl:e} bits");
@@ -152,7 +150,7 @@ fn site_scales_at_every_token_are_weight_edits() {
 fn swaps_at_every_token_are_the_donor_run() {
     let s = setup("graph_sites_swaps");
     let model = Graph::empty().model(&s.weights);
-    let donor = execute(&s.weights, &s.stats, &model, &s.donor, &s.rows, &BTreeMap::new(), false).expect("donor").log_probabilities;
+    let donor = execute(&s.weights, &model, &s.donor, &s.rows, &BTreeMap::new()).expect("donor").log_probabilities;
     for site in [SharedSite::Embedding, SharedSite::Stream(2 * LAYERS - 1)] {
         let swapped = s.run(&model, &draw(Family::Swap, &[(site, Operation::Swap)], 0, true));
         let kl = max(&kl_bits(&donor, &swapped));
@@ -227,10 +225,10 @@ fn counterfactual_stand_ins_take_the_same_site_operations() {
         draw(Family::Push, &[(SharedSite::Stream(0), push), (SharedSite::Mlp(0), push), (SharedSite::Embedding, push)], 4, true),
         draw(Family::Scale, &[(SharedSite::Attention(1), Operation::Scale(3)), (SharedSite::Stream(2), Operation::Scale(1))], 6, false),
     ] {
-        let on_partner = run_sites(&s.weights, &s.stats, &model, (&s.donor, &s.rows), None, &d, &s.units).expect("M on x'");
+        let on_partner = run_sites(&s.weights, &model, (&s.donor, &s.rows), None, &d, &s.units).expect("M on x'");
         let mut base = Batch::new(&s.base.sequences()).expect("batch");
-        base.reference = Some(std::sync::Arc::new(reference_under(&s.weights, &s.stats, &s.donor, &d, &s.units).expect("reference")));
-        let program = run_sites(&s.weights, &s.stats, &empty, (&base, &s.rows), None, &d, &s.units).expect("empty program");
+        base.reference = Some(std::sync::Arc::new(reference_under(&s.weights, &s.donor, &d, &s.units).expect("reference")));
+        let program = run_sites(&s.weights, &empty, (&base, &s.rows), None, &d, &s.units).expect("empty program");
         let kl = max(&kl_bits(&on_partner, &program));
         assert!(kl < 1e-9, "{:?}: KL(M_e(x') ‖ empty P_e(x)) = {kl:e} bits", d.family);
     }
@@ -242,9 +240,9 @@ fn counterfactual_stand_ins_take_the_same_site_operations() {
 fn a_zeroed_head_in_the_reference_is_the_removed_head() {
     let mut s = setup("graph_sites_reference_edit");
     let heads = s.weights.layers[0].heads.len();
-    let zeroed = reference_under(&s.weights, &s.stats, &s.donor, &draw(Family::Zero, &[(SharedSite::Head(heads), Operation::Scale(0))], 0, true), &s.units).expect("reference");
+    let zeroed = reference_under(&s.weights, &s.donor, &draw(Family::Zero, &[(SharedSite::Head(heads), Operation::Scale(0))], 0, true), &s.units).expect("reference");
     let restore = WeightEdit::Head { layer: 1, head: 0, factor: 0.0 }.apply(&mut s.weights).expect("edit");
-    let removed = reference(&s.weights, &s.stats, &s.donor).expect("reference");
+    let removed = reference(&s.weights, &s.donor).expect("reference");
     restore.restore(&mut s.weights).expect("restore");
     let gap = |a: &Array2<f64>, b: &Array2<f64>| (a - b).iter().fold(0.0f64, |m, v| m.max(v.abs()));
     for l in 0..LAYERS {
@@ -258,7 +256,7 @@ fn a_zeroed_head_in_the_reference_is_the_removed_head() {
 #[test]
 fn typical_norms_cover_every_site_and_manifests_round_trip() {
     let s = setup("graph_sites_typical");
-    let typical = SiteUnits::measure_typical(&s.weights, &s.stats, &s.base.sequences()).expect("typical");
+    let typical = SiteUnits::measure_typical(&s.weights, &s.base.sequences()).expect("typical");
     let (sites, _) = SiteUnits::shared(&s.weights);
     assert_eq!(typical.keys().copied().collect::<Vec<_>>(), sites);
     assert!(typical.values().all(|v| v.is_finite() && *v > 0.0), "{typical:?}");
@@ -266,8 +264,8 @@ fn typical_norms_cover_every_site_and_manifests_round_trip() {
     std::fs::create_dir_all(&dir).expect("dir");
     let path = dir.join("MANIFEST_tiny.json");
     let families = [Family::Swap, Family::Zero, Family::Scale, Family::Push, Family::Cut];
-    let written = SiteUnits::write_manifest(&path, "tiny", &s.weights, &s.stats, &s.base.sequences(), &families, 40, 5, 64).expect("write");
-    assert!(SiteUnits::write_manifest(&path, "tiny", &s.weights, &s.stats, &s.base.sequences(), &families, 40, 5, 64).is_err(), "a manifest is immutable");
+    let written = SiteUnits::write_manifest(&path, "tiny", &s.weights, &s.base.sequences(), &families, 40, 5, 64).expect("write");
+    assert!(SiteUnits::write_manifest(&path, "tiny", &s.weights, &s.base.sequences(), &families, 40, 5, 64).is_err(), "a manifest is immutable");
     let read = SiteUnits::manifest(&path, 512, s.weights.embedding.ncols()).expect("read");
     assert_eq!(read.pool, written.pool);
     assert_eq!(read.typical, written.typical);
@@ -353,10 +351,10 @@ fn subcomponent_edits_are_their_rank_one_changes() {
         let (u, v) = if down { (vpd.down_u.row(2).to_vec(), vpd.down_v.column(2).to_vec()) } else { (vpd.fc_u.row(2).to_vec(), vpd.fc_v.column(2).to_vec()) };
         let rank_one = WeightEdit::RankOne { layer: 0, head: None, matrix, u: u.iter().map(|x| -0.5 * x).collect(), v };
         let restore = rank_one.apply(&mut s.weights).expect("rank one");
-        let expected = execute(&s.weights, &s.stats, &model, &s.base, &s.rows, &BTreeMap::new(), false).expect("run").log_probabilities;
+        let expected = execute(&s.weights, &model, &s.base, &s.rows, &BTreeMap::new()).expect("run").log_probabilities;
         restore.restore(&mut s.weights).expect("restore");
         let restore = WeightEdit::Subcomponents { layer: 0, down, indices: vec![2], factor: 0.5 }.apply(&mut s.weights).expect("subcomponents");
-        let got = execute(&s.weights, &s.stats, &model, &s.base, &s.rows, &BTreeMap::new(), false).expect("run").log_probabilities;
+        let got = execute(&s.weights, &model, &s.base, &s.rows, &BTreeMap::new()).expect("run").log_probabilities;
         let factor = if down { s.weights.vpd[&0].down_u.row(2).to_vec() } else { s.weights.vpd[&0].fc_u.row(2).to_vec() };
         restore.restore(&mut s.weights).expect("restore");
         assert!(max(&kl_bits(&expected, &got)) < 1e-12, "down {down}: the subcomponent edit is not its rank-one change");

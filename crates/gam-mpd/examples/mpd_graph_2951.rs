@@ -260,9 +260,6 @@ fn handle(request: &Value, weights: &mut Option<Weights>, checker: &mut Option<C
             let seed = request["seed"].as_u64().unwrap_or(0);
             let edges = request["routing"].as_str().unwrap_or("edges") == "edges";
             let n = request["N"].as_f64();
-            // "stand_in": "input" (design: each neuron applied to its layer's mean input) or
-            // "output" (each neuron's mean activation through its down column).
-            c.stats.mean_output = request["stand_in"].as_str() == Some("output");
             // "uniform_seeds": m draws from seed mod m (m collections of experiments recur across
             // seeds, so M's cached outcomes serve them).
             c.uniform_seeds = request["uniform_seeds"].as_u64();
@@ -303,7 +300,7 @@ fn handle(request: &Value, weights: &mut Option<Weights>, checker: &mut Option<C
                 _ => serde_json::from_value(json!(["swap", "zero", "scale", "push", "cut"])).map_err(error)?,
             };
             let identity = gam_mpd::engine::sha256(&dir.join("export.json"))?;
-            c.sites = SiteUnits::write_manifest(out, &identity, &c.weights, &c.stats, &sequences, &families, count, seed, length)?;
+            c.sites = SiteUnits::write_manifest(out, &identity, &c.weights, &sequences, &families, count, seed, length)?;
             Ok(json!({"ok": true, "manifest": out.display().to_string(), "site_experiments": c.sites.pool.len(), "typical_sites": c.sites.typical.len()}))
         }
         other => Err(format!("unknown op {other}")),

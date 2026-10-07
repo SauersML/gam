@@ -1,7 +1,7 @@
 #![cfg(test)]
 //! The graph checker against the library's own runs of `M` on the tiny export (#2951).
 use crate::{
-    graph::{Batch, Behavior, Checker, EdgeIr, Experiment, Graph, Index, NodeIr, PieceIr, Program, Prompt, Stats, WeightEdit, Weights, execute, kl_bits, reference},
+    graph::{Batch, Behavior, Checker, Counterfactual, EdgeIr, Experiment, Graph, Index, NodeIr, PieceIr, Program, Prompt, WeightEdit, Weights, execute, kl_bits, reference},
     import::import_language_model,
     library_mdl,
     library_readout::{Activity, Edit, Library},
@@ -77,10 +77,9 @@ fn full_graph_with_every_edge_is_the_model() {
     let reference = library.log_probabilities(&library.run(&f.sequences, &BTreeMap::new()).expect("run").last).expect("log p");
     let batch = Batch::new(&f.sequences).expect("batch");
     let rows: Vec<usize> = (0..batch.tokens.len()).collect();
-    let stats = Stats::measure(&weights, &f.sequences).expect("stats");
     let graph = Graph::parse(&full_program(), &weights).expect("parse");
     for (name, circuit) in [("edges", graph.program(&weights, true)), ("nodes", graph.program(&weights, false)), ("model", graph.model(&weights))] {
-        let run = execute(&weights, &stats, &circuit, &batch, &rows, &BTreeMap::new(), false).expect("execute");
+        let run = execute(&weights, &circuit, &batch, &rows, &BTreeMap::new()).expect("execute");
         let kl = max(&kl_bits(&reference, &run.log_probabilities));
         assert!(kl < 1e-9, "{name}: KL(M ‖ graph) = {kl:e} bits");
     }
@@ -100,27 +99,12 @@ fn head_removal_matches_the_library_edit() {
     let reference = library.log_probabilities(&edited.last).expect("log p");
     let batch = Batch::new(&f.sequences).expect("batch");
     let rows: Vec<usize> = (0..batch.tokens.len()).collect();
-    let stats = Stats::measure(&weights, &f.sequences).expect("stats");
     let restore = WeightEdit::Head { layer: 1, head: 0, factor: 0.0 }.apply(&mut weights).expect("edit");
     let circuit = Graph::empty().model(&weights);
-    let run = execute(&weights, &stats, &circuit, &batch, &rows, &BTreeMap::new(), false).expect("execute");
+    let run = execute(&weights, &circuit, &batch, &rows, &BTreeMap::new()).expect("execute");
     restore.restore(&mut weights).expect("restore");
     let kl = max(&kl_bits(&reference, &run.log_probabilities));
     assert!(kl < 1e-9, "KL(library edit ‖ graph edit) = {kl:e} bits");
-}
-
-#[test]
-fn empty_graph_is_every_stand_in() {
-    let f = fixture("graph_empty");
-    let library = Library::new(&f.device, &f.device, &f.native, &f.layers, &f.artifact, 1 << 28, 64).expect("library");
-    let weights = Weights::of(&library);
-    let batch = Batch::new(&f.sequences).expect("batch");
-    let rows: Vec<usize> = (0..batch.tokens.len()).collect();
-    let stats = Stats::measure(&weights, &f.sequences).expect("stats");
-    let run = execute(&weights, &stats, &Graph::empty().program(&weights, true), &batch, &rows, &BTreeMap::new(), false).expect("execute");
-    let first = run.log_probabilities.row(0).to_owned();
-    let spread = run.log_probabilities.outer_iter().map(|r| (&r - &first).iter().fold(0.0f64, |a, b| a.max(b.abs()))).fold(0.0f64, f64::max);
-    assert!(spread < 1e-12, "the empty graph's distribution varies by {spread:e} across tokens");
 }
 
 #[test]
@@ -148,19 +132,16 @@ fn checker_scores_the_full_program_at_zero_error() {
     let f = fixture("graph_score");
     let library = Library::new(&f.device, &f.device, &f.native, &f.layers, &f.artifact, 1 << 28, 64).expect("library");
     let weights = Weights::of(&library);
-    let prompts = f.sequences.iter().map(|s| Prompt { text: String::new(), token_ids: s.clone(), target_positions: vec![s.len() - 2, s.len() - 1], counterfactual: None, attention_block: Vec::new() }).collect();
+    // Each prompt's counterfactual is the next sequence (stand-ins come from it).
+    let n = f.sequences.len();
+    let prompts = f.sequences.iter().enumerate().map(|(i, s)| Prompt { text: String::new(), token_ids: s.clone(), target_positions: vec![s.len() - 2, s.len() - 1], counterfactual: Some(Counterfactual { text: String::new(), token_ids: f.sequences[(i + 1) % n].clone() }), attention_block: Vec::new() }).collect();
     let behavior = Behavior { id: "tiny".into(), model: "tiny".into(), family: String::new(), description: String::new(), frequency: None, prompts, split: "train".into(), model_accuracy: None };
     let mut checker = Checker::new(weights, behavior).expect("checker");
-    // These prompts have no counterfactuals: average stand-ins.
-    let global = |mut p: Program| {
-        p.standin = Some("global".into());
-        p
-    };
-    let (full, outcomes) = checker.score(&global(full_program()), 24, 7, true, None).expect("score");
+    let (full, outcomes) = checker.score(&full_program(), 24, 7, true, None).expect("score");
     assert!(full.valid);
     assert!(full.exec_error_bits / full.n < F32_KL, "full program error {:e} bits per token over {:?}", full.exec_error_bits / full.n, outcomes.iter().map(|o| o.0.family()).collect::<Vec<_>>());
     assert!(outcomes.iter().any(|o| matches!(o.0, Experiment::Edit { .. })));
-    let (empty, _) = checker.score(&global(Program { model: "tiny".into(), valid: true, ..Program::default() }), 24, 7, true, None).expect("score");
+    let (empty, _) = checker.score(&Program { model: "tiny".into(), valid: true, ..Program::default() }, 24, 7, true, None).expect("score");
     assert!(empty.exec_error_bits > full.exec_error_bits && empty.opaque_numbers < full.opaque_numbers);
 }
 
@@ -183,12 +164,11 @@ fn counterfactual_empty_graph_is_the_model_on_the_counterfactual() {
     let weights = Weights::of(&library);
     let cf = counterfactuals(&f.sequences);
     let target = library.log_probabilities(&library.run(&cf, &BTreeMap::new()).expect("run").last).expect("log p");
-    let stats = Stats::measure(&weights, &f.sequences).expect("stats");
     let mut batch = Batch::new(&f.sequences).expect("batch");
-    batch.reference = Some(std::sync::Arc::new(reference(&weights, &stats, &Batch::new(&cf).expect("cf batch")).expect("reference")));
+    batch.reference = Some(std::sync::Arc::new(reference(&weights, &Batch::new(&cf).expect("cf batch")).expect("reference")));
     let rows: Vec<usize> = (0..batch.tokens.len()).collect();
     for (name, circuit) in [("empty", Graph::empty().program(&weights, true)), ("full", Graph::parse(&full_program(), &weights).expect("parse").program(&weights, true))] {
-        let run = execute(&weights, &stats, &circuit, &batch, &rows, &BTreeMap::new(), false).expect("execute");
+        let run = execute(&weights, &circuit, &batch, &rows, &BTreeMap::new()).expect("execute");
         let expected = if name == "empty" { target.clone() } else { library.log_probabilities(&library.run(&f.sequences, &BTreeMap::new()).expect("run").last).expect("log p") };
         let kl = max(&kl_bits(&expected, &run.log_probabilities));
         assert!(kl < 1e-9, "{name}: KL = {kl:e} bits");
@@ -211,19 +191,18 @@ fn counterfactual_undeclared_head_is_patched_from_the_counterfactual() {
         nodes: vec![node("a0", 0, "head", None), node("m0", 0, "mlp", None), node("a1", 1, "head", Some(Index::One(1))), node("m1", 1, "mlp", Some(Index::Many((0..16).collect())))],
         ..Program::default()
     };
-    let stats = Stats::measure(&weights, &f.sequences).expect("stats");
     let mut batch = Batch::new(&f.sequences).expect("batch");
-    batch.reference = Some(std::sync::Arc::new(reference(&weights, &stats, &Batch::new(&cf).expect("cf batch")).expect("reference")));
+    batch.reference = Some(std::sync::Arc::new(reference(&weights, &Batch::new(&cf).expect("cf batch")).expect("reference")));
     let rows: Vec<usize> = (0..batch.tokens.len()).collect();
     let circuit = Graph::parse(&program, &weights).expect("parse").program(&weights, false);
-    let run = execute(&weights, &stats, &circuit, &batch, &rows, &BTreeMap::new(), false).expect("execute");
+    let run = execute(&weights, &circuit, &batch, &rows, &BTreeMap::new()).expect("execute");
     let kl = max(&kl_bits(&expected, &run.log_probabilities));
     assert!(kl < 1e-9, "KL(activation patch ‖ graph) = {kl:e} bits");
     // A few neurons left out of layer 1's MLP: the complement is assembled by subtraction.
     let mut partial = program.clone();
     partial.nodes[3] = node("m1", 1, "mlp", Some(Index::Many((0..13).collect())));
     let circuit = Graph::parse(&partial, &weights).expect("parse").program(&weights, false);
-    let left = execute(&weights, &stats, &circuit, &batch, &rows, &BTreeMap::new(), false).expect("execute");
+    let left = execute(&weights, &circuit, &batch, &rows, &BTreeMap::new()).expect("execute");
     assert!(max(&kl_bits(&expected, &left.log_probabilities)) > 1e-12, "leaving neurons out changes nothing");
 }
 
@@ -266,11 +245,10 @@ fn transcoder_features_write_the_transcoder_and_the_rest_is_exact() {
     let program = Program { model: "tiny".into(), valid: true, nodes: vec![feature("f", Index::Many((0..6).collect()))], ..Program::default() };
     let graph = Graph::parse(&program, &weights).expect("parse");
     weights.load_features(&graph).expect("features");
-    let stats = Stats::measure(&weights, &f.sequences).expect("stats");
     let batch = Batch::new(&f.sequences).expect("batch");
     let rows: Vec<usize> = (0..batch.tokens.len()).collect();
     // M with the features as a node: the features plus the rest (other features and the error) is M.
-    let run = execute(&weights, &stats, &graph.model(&weights), &batch, &rows, &BTreeMap::new(), false).expect("execute");
+    let run = execute(&weights, &graph.model(&weights), &batch, &rows, &BTreeMap::new()).expect("execute");
     let reference_p = library.log_probabilities(&library.run(&f.sequences, &BTreeMap::new()).expect("run").last).expect("log p");
     assert!(max(&kl_bits(&reference_p, &run.log_probabilities)) < 1e-9);
     // The node's write is the transcoder's output on layer 1's normed MLP input, less its decoder bias.
@@ -301,19 +279,18 @@ fn attention_block_hides_the_prefix_like_running_the_suffix_alone() {
     let f = fixture("graph_mask");
     let library = Library::new(&f.device, &f.device, &f.native, &f.layers, &f.artifact, 1 << 28, 64).expect("library");
     let weights = Weights::of(&library);
-    let stats = Stats::measure(&weights, &f.sequences).expect("stats");
     // Queries from position 4 on do not see keys before 4: with rotary (relative) positions and no
     // absolute ones, positions 4.. then compute exactly what the suffix computes alone.
     let (t, length) = (4, f.sequences[0].len());
     let mut batch = Batch::new(&f.sequences).expect("batch");
     batch.blocks = vec![vec![[t, length, 0, t]]; f.sequences.len()];
     let rows: Vec<usize> = (0..f.sequences.len()).flat_map(|s| (t..length).map(move |p| s * length + p)).collect();
-    let run = execute(&weights, &stats, &Graph::empty().model(&weights), &batch, &rows, &BTreeMap::new(), false).expect("execute");
+    let run = execute(&weights, &Graph::empty().model(&weights), &batch, &rows, &BTreeMap::new()).expect("execute");
     let suffixes: Vec<Vec<u32>> = f.sequences.iter().map(|s| s[t..].to_vec()).collect();
     let expected = library.log_probabilities(&library.run(&suffixes, &BTreeMap::new()).expect("run").last).expect("log p");
     let kl = max(&kl_bits(&expected, &run.log_probabilities));
     assert!(kl < 1e-9, "KL(suffix alone ‖ masked prefix) = {kl:e} bits");
-    let open = execute(&weights, &stats, &Graph::empty().model(&weights), &Batch::new(&f.sequences).expect("batch"), &rows, &BTreeMap::new(), false).expect("execute");
+    let open = execute(&weights, &Graph::empty().model(&weights), &Batch::new(&f.sequences).expect("batch"), &rows, &BTreeMap::new()).expect("execute");
     assert!(max(&kl_bits(&expected, &open.log_probabilities)) > 1e-6, "the prefix changes nothing unmasked");
 }
 
@@ -353,20 +330,19 @@ fn vpd_mlp_view_reads_the_hidden_stream_through_its_edges() {
     let mut joined = cut.clone();
     joined.edges.push(edge("F", "D", "input"));
     let cf = counterfactuals(&f.sequences);
-    let stats = Stats::measure(&weights, &f.sequences).expect("stats");
     let mut batch = Batch::new(&f.sequences).expect("batch");
-    batch.reference = Some(std::sync::Arc::new(reference(&weights, &stats, &Batch::new(&cf).expect("cf batch")).expect("reference")));
+    batch.reference = Some(std::sync::Arc::new(reference(&weights, &Batch::new(&cf).expect("cf batch")).expect("reference")));
     let rows: Vec<usize> = (0..batch.tokens.len()).collect();
     let clean = library.log_probabilities(&library.run(&f.sequences, &BTreeMap::new()).expect("run").last).expect("log p");
     let run_of = |program: &Program, edges: bool| {
         let graph = Graph::parse(program, &weights).expect("parse");
-        execute(&weights, &stats, &graph.program(&weights, edges), &batch, &rows, &BTreeMap::new(), false).expect("execute").log_probabilities
+        execute(&weights, &graph.program(&weights, edges), &batch, &rows, &BTreeMap::new()).expect("execute").log_probabilities
     };
     // Every edge, the hidden one included: M. M itself with VPD nodes: M.
     assert!(max(&kl_bits(&clean, &run_of(&joined, true))) < 1e-9);
     assert!(max(&kl_bits(&clean, &run_of(&cut, false))) < 1e-9);
     let model = Graph::parse(&cut, &weights).expect("parse").model(&weights);
-    assert!(max(&kl_bits(&clean, &execute(&weights, &stats, &model, &batch, &rows, &BTreeMap::new(), false).expect("execute").log_probabilities)) < 1e-9);
+    assert!(max(&kl_bits(&clean, &execute(&weights, &model, &batch, &rows, &BTreeMap::new()).expect("execute").log_probabilities)) < 1e-9);
     // Without F >> D, D reads the counterfactual hidden activations: layer 1's MLP patched from x'.
     let cf_stream = library.run(&cf, &BTreeMap::new()).expect("cf run").streams[3].clone();
     let lw = &weights.layers[1];
@@ -420,20 +396,19 @@ fn vpd_attention_view_reads_queries_keys_values_through_its_edges() {
     let mut joined = cut.clone();
     joined.edges.push(edge("QKV", "O"));
     let cf = counterfactuals(&f.sequences);
-    let stats = Stats::measure(&weights, &f.sequences).expect("stats");
     let mut batch = Batch::new(&f.sequences).expect("batch");
-    batch.reference = Some(std::sync::Arc::new(reference(&weights, &stats, &Batch::new(&cf).expect("cf batch")).expect("reference")));
+    batch.reference = Some(std::sync::Arc::new(reference(&weights, &Batch::new(&cf).expect("cf batch")).expect("reference")));
     let rows: Vec<usize> = (0..batch.tokens.len()).collect();
     let clean = library.log_probabilities(&library.run(&f.sequences, &BTreeMap::new()).expect("run").last).expect("log p");
     let run_of = |program: &Program, edges: bool| {
         let graph = Graph::parse(program, &weights).expect("parse");
-        execute(&weights, &stats, &graph.program(&weights, edges), &batch, &rows, &BTreeMap::new(), false).expect("execute").log_probabilities
+        execute(&weights, &graph.program(&weights, edges), &batch, &rows, &BTreeMap::new()).expect("execute").log_probabilities
     };
     assert!(max(&kl_bits(&clean, &run_of(&joined, true))) < 1e-9, "every edge");
     assert!(max(&kl_bits(&clean, &run_of(&cut, false))) < 1e-9, "node level");
     let model = Graph::parse(&cut, &weights).expect("parse").model(&weights);
     let plain = Batch::new(&f.sequences).expect("batch");
-    assert!(max(&kl_bits(&clean, &execute(&weights, &stats, &model, &plain, &rows, &BTreeMap::new(), false).expect("execute").log_probabilities)) < 1e-9, "M");
+    assert!(max(&kl_bits(&clean, &execute(&weights, &model, &plain, &rows, &BTreeMap::new()).expect("execute").log_probabilities)) < 1e-9, "M");
     // Without QKV >> O, O reads the counterfactual queries, keys and values: layer 1's heads patched from x'.
     let reads = library.run(&cf, &BTreeMap::new()).expect("cf run").reads;
     let patched = library.log_probabilities(&library.run(&f.sequences, &[(2, reads[2].clone()), (3, reads[3].clone())].into()).expect("patched").last).expect("log p");
@@ -498,13 +473,12 @@ fn qwen3_like_model_full_graph_and_counterfactual_empty_graph() {
     let clean = library.log_probabilities(&library.run(&f.sequences, &BTreeMap::new()).expect("run").last).expect("log p");
     let cf = counterfactuals(&f.sequences);
     let target = library.log_probabilities(&library.run(&cf, &BTreeMap::new()).expect("run").last).expect("log p");
-    let stats = Stats::measure(&weights, &f.sequences).expect("stats");
     let mut batch = Batch::new(&f.sequences).expect("batch");
-    batch.reference = Some(std::sync::Arc::new(reference(&weights, &stats, &Batch::new(&cf).expect("cf batch")).expect("reference")));
+    batch.reference = Some(std::sync::Arc::new(reference(&weights, &Batch::new(&cf).expect("cf batch")).expect("reference")));
     let rows: Vec<usize> = (0..batch.tokens.len()).collect();
     let full = Graph::parse(&full_program(), &weights).expect("parse");
     for (name, circuit, expected) in [("full", full.program(&weights, true), &clean), ("empty", Graph::empty().program(&weights, true), &target)] {
-        let run = execute(&weights, &stats, &circuit, &batch, &rows, &BTreeMap::new(), false).expect("execute");
+        let run = execute(&weights, &circuit, &batch, &rows, &BTreeMap::new()).expect("execute");
         let kl = max(&kl_bits(expected, &run.log_probabilities));
         assert!(kl < 1e-9, "{name}: KL = {kl:e} bits");
     }
@@ -518,30 +492,12 @@ fn qwen3_like_model_full_graph_and_counterfactual_empty_graph() {
 }
 
 #[test]
-fn position_stand_ins_are_each_positions_mean_output() {
-    let f = fixture("graph_position");
-    let library = Library::new(&f.device, &f.device, &f.native, &f.layers, &f.artifact, 1 << 28, 64).expect("library");
-    let weights = Weights::of(&library);
-    // Identical prompts: every position's mean is the prompt's own value, so the empty program is M.
-    let same = vec![f.sequences[0].clone(); 3];
-    let prompts: Vec<Prompt> = same.iter().map(|s| Prompt { text: String::new(), token_ids: s.clone(), target_positions: vec![s.len() - 1], counterfactual: None, attention_block: Vec::new() }).collect();
-    let behavior = Behavior { id: "tiny".into(), model: "tiny".into(), family: String::new(), description: String::new(), frequency: None, prompts, split: "train".into(), model_accuracy: None };
-    let mut checker = Checker::new(weights, behavior).expect("checker");
-    let empty = Program { model: "tiny".into(), valid: true, standin: Some("position".into()), ..Program::default() };
-    let (score, outcomes) = checker.score(&empty, 0, 1, true, None).expect("score");
-    let clean = outcomes.iter().find(|o| o.0 == Experiment::Clean).expect("clean");
-    assert!(max(&clean.1) < 1e-9, "empty program under position means of identical prompts: {:?}", clean.1);
-    assert_eq!(score.opaque_numbers, 0);
-}
-
-#[test]
 fn device_path_on_the_host_backend_is_the_host_run() {
     let f = fixture("graph_device");
     let library = Library::new(&f.device, &f.device, &f.native, &f.layers, &f.artifact, 1 << 28, 64).expect("library");
     let weights = Weights::of(&library);
-    let stats = Stats::measure(&weights, &f.sequences).expect("stats");
     let cf = counterfactuals(&f.sequences);
-    let counterfactual = std::sync::Arc::new(reference(&weights, &stats, &Batch::new(&cf).expect("cf batch")).expect("reference"));
+    let counterfactual = std::sync::Arc::new(reference(&weights, &Batch::new(&cf).expect("cf batch")).expect("reference"));
     let mut state = crate::graph_device::DeviceState::new(Device::host());
     let plain = Batch::new(&f.sequences).expect("batch");
     let mut with_reference = plain.clone();
@@ -560,8 +516,8 @@ fn device_path_on_the_host_backend_is_the_host_run() {
         ("partial model", some.model(&weights), &plain),
     ];
     for (name, circuit, batch) in cases {
-        let host = execute(&weights, &stats, &circuit, batch, &rows, &BTreeMap::new(), false).expect("host");
-        let (e, all) = crate::graph::standins_of(&weights, &stats, &circuit, batch, false).expect("stand-ins");
+        let host = execute(&weights, &circuit, batch, &rows, &BTreeMap::new()).expect("host");
+        let (e, all) = crate::graph::standins_of(&weights, &circuit, batch).expect("stand-ins");
         let is_model = batch.reference.is_none() && circuit.is_model();
         let job = crate::graph_device::Run { tokens: &batch.tokens, spans: &batch.spans, scored: &rows, swaps: &BTreeMap::new(), capture: false, standins: (!is_model).then_some((&e, &all[..])) };
         let device = crate::graph_device::run_on(&mut state, &weights, &circuit, &job).expect("device");
