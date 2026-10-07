@@ -2868,7 +2868,7 @@ impl DeviceProgram {
     /// transpose of the edit) before the node's own rule reads it; the hook keeps any other part
     /// of the edit's transpose itself (`interchange`). The operators' gradients are added into
     /// `gradients`, an operator's entry made where it has none (a pass's sums over its calls, each
-    /// added in place by its products; a new entry's first write sets it, [`Sums`]), and the kept
+    /// added in place by its products; a new entry's first write sets it, `Sums`), and the kept
     /// nodes' cotangents returned.
     pub fn vjp_values_dense_edited(
         &self,
