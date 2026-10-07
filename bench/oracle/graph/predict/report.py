@@ -15,7 +15,8 @@ from pathlib import Path
 
 
 def read(run: Path):
-    out = {"eval": json.loads((run / "eval.json").read_text()) if (run / "eval.json").exists() else None, "curve": [], "kl": {}}
+    e = run / "eval.json" if (run / "eval.json").exists() else run / "eval_only.json"  # sft.py --eval-only writes the latter
+    out = {"eval": json.loads(e.read_text()) if e.exists() else None, "curve": [], "kl": {}}
     if (run / "train.jsonl").exists():
         for line in open(run / "train.jsonl"):
             r = json.loads(line)
@@ -39,7 +40,10 @@ def table(name, r):
     lines = [f"== {name}"]
     if r["eval"]:
         base, trained = sets_of(r["eval"]["base"]), sets_of(r["eval"]["trained"])
-        lines.append(f"steps {r['eval']['steps']}, hours {r['eval']['hours']:.2f}")
+        if "steps" in r["eval"]:
+            lines.append(f"steps {r['eval']['steps']}, hours {r['eval']['hours']:.2f}")
+        else:
+            lines.append(f"adapters {r['eval'].get('adapters')}")
         for s in trained:
             lines.append(f"  [{s}] answer bits per question, base -> trained (se)")
             for k in sorted(trained[s]):
