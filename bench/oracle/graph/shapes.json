@@ -119,5 +119,41 @@
    "huggingface Qwen/Qwen3-0.6B config.json",
    "transcoders/qwen3-0.6b-lowl0/layer_*.safetensors"
   ]
+ },
+ "qwen3-1.7b": {
+  "layers": 28,
+  "heads": 16,
+  "kv_heads": 8,
+  "head_dim": 128,
+  "d_model": 2048,
+  "d_mlp": 6144,
+  "vocab": 151936,
+  "views": {
+   "native": true,
+   "vpd": null,
+   "library": null,
+   "transcoder": null
+  },
+  "source": [
+   "huggingface Qwen/Qwen3-1.7B config.json"
+  ]
+ },
+ "qwen3-8b": {
+  "layers": 36,
+  "heads": 32,
+  "kv_heads": 8,
+  "head_dim": 128,
+  "d_model": 4096,
+  "d_mlp": 12288,
+  "vocab": 151936,
+  "views": {
+   "native": true,
+   "vpd": null,
+   "library": null,
+   "transcoder": null
+  },
+  "source": [
+   "huggingface Qwen/Qwen3-8B config.json"
+  ]
  }
 }

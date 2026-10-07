@@ -20,10 +20,7 @@ sys.path.insert(0, str(HERE))
 
 import mech  # noqa: E402
 
-TOKENIZERS = {
-    "vpd4l": Path.home() / "mpd-data/vpd/t-9d2b8f02/tokenizer.json",
-    "qwen3-0.6b": Path.home() / ".cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots",
-}
+VPD4L_TOKENIZER = Path.home() / "mpd-data/vpd/t-9d2b8f02/tokenizer.json"
 
 REFERENCE = """\
 Write ONE Python file that explains how the model produces the behavior below. It may import only
@@ -45,12 +42,15 @@ Write ONE Python file that explains how the model produces the behavior below. I
 
 @lru_cache(None)
 def tokenizer(model: str):
+    """The target's tokenizer: vpd4l's file, or Qwen3's tokenizer.json (every size shares it) through the
+    Hugging Face cache (HF_HOME / HF_HUB_CACHE honored; downloaded when missing)."""
     import tokenizers
 
-    path = TOKENIZERS[model]
-    if path.is_dir():
-        path = next(path.glob("*/tokenizer.json"))
-    return tokenizers.Tokenizer.from_file(str(path))
+    if model == "vpd4l":
+        return tokenizers.Tokenizer.from_file(str(VPD4L_TOKENIZER))
+    from huggingface_hub import hf_hub_download
+
+    return tokenizers.Tokenizer.from_file(hf_hub_download(mech.QWEN3[model], "tokenizer.json"))
 
 
 def views(model: str) -> tuple[str, str]:

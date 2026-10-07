@@ -262,8 +262,6 @@ def test_shapes_match_files():
 def test_prompt():
     import prompt
 
-    if not prompt.TOKENIZERS["qwen3-0.6b"].exists():
-        return
     ids = prompt.tokenizer("qwen3-0.6b").encode(" red green blue . red green blue").ids
     behavior = {"id": "toy", "model": "qwen3-0.6b", "description": "Induction.", "prompts": [
         {"token_ids": ids, "target_positions": [len(ids) - 2], "model_top": [[[" blue", 0.9], [" red", 0.05]]],

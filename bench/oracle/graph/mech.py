@@ -55,7 +55,8 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 SHAPES_FILE = HERE / "shapes.json"
-MODELS = ("qwen3-0.6b", "vpd4l")
+MODELS = ("qwen3-0.6b", "qwen3-1.7b", "qwen3-8b", "vpd4l")
+QWEN3 = {"qwen3-0.6b": "Qwen/Qwen3-0.6B", "qwen3-1.7b": "Qwen/Qwen3-1.7B", "qwen3-8b": "Qwen/Qwen3-8B"}
 VIEWS = ("native", "vpd", "library", "transcoder")
 SITES = ("q_proj", "k_proj", "v_proj", "o_proj", "c_fc", "down_proj")
 ROUTES = ("query", "key", "value", "input")
@@ -104,14 +105,26 @@ def build_shapes(data: Path) -> dict:
             site = c["read"]["own"][0] if "own" in c["read"] else c["read"]["direction"]["site"]
             parts[site // len(SITES)]["attn" if site % len(SITES) < 4 else "mlp"] += 1
         library = {"source": "decomp/start.components.json", "arm": LIBRARY_ARM, "parts": parts}
-    hub = Path.home() / ".cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots"
-    qwen = json.loads(next(hub.glob("*/config.json")).read_text())
+    from huggingface_hub import hf_hub_download
+
     transcoders = data / "transcoders/qwen3-0.6b-lowl0"
-    widths = []
-    for l in range(qwen["num_hidden_layers"]):
-        with open(transcoders / f"layer_{l}.safetensors", "rb") as f:
-            header = json.loads(f.read(struct.unpack("<Q", f.read(8))[0]))
-        widths.append(header["W_enc"]["shape"][0])
+    qwens = {}
+    for name, repo in QWEN3.items():
+        qwen = json.loads(Path(hf_hub_download(repo, "config.json")).read_text())
+        widths = None
+        if name == "qwen3-0.6b":
+            widths = []
+            for l in range(qwen["num_hidden_layers"]):
+                with open(transcoders / f"layer_{l}.safetensors", "rb") as f:
+                    header = json.loads(f.read(struct.unpack("<Q", f.read(8))[0]))
+                widths.append(header["W_enc"]["shape"][0])
+        qwens[name] = {
+            "layers": qwen["num_hidden_layers"], "heads": qwen["num_attention_heads"],
+            "kv_heads": qwen["num_key_value_heads"], "head_dim": qwen["head_dim"],
+            "d_model": qwen["hidden_size"], "d_mlp": qwen["intermediate_size"], "vocab": qwen["vocab_size"],
+            "views": {"native": True, "vpd": None, "library": None, "transcoder": widths},
+            "source": [f"huggingface {repo} config.json"] + (["transcoders/qwen3-0.6b-lowl0/layer_*.safetensors"] if widths else []),
+        }
     return {
         "vpd4l": {
             "layers": engine["n_layers"], "heads": engine["n_heads"], "kv_heads": engine["n_kv_heads"],
@@ -120,13 +133,7 @@ def build_shapes(data: Path) -> dict:
             "views": {"native": True, "vpd": vpd, "library": library, "transcoder": None},
             "source": ["engine/vpd4l/export.json", "engine/vpd4l_decomposition/export.json"],
         },
-        "qwen3-0.6b": {
-            "layers": qwen["num_hidden_layers"], "heads": qwen["num_attention_heads"],
-            "kv_heads": qwen["num_key_value_heads"], "head_dim": qwen["head_dim"],
-            "d_model": qwen["hidden_size"], "d_mlp": qwen["intermediate_size"], "vocab": qwen["vocab_size"],
-            "views": {"native": True, "vpd": None, "library": None, "transcoder": widths},
-            "source": ["huggingface Qwen/Qwen3-0.6B config.json", "transcoders/qwen3-0.6b-lowl0/layer_*.safetensors"],
-        },
+        **qwens,
     }
 
 
