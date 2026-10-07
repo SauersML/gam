@@ -76,8 +76,8 @@ def halves(unit, min_neurons: int):
 class Pool:
     """`workers` checker processes with the behavior loaded; scores programs in parallel."""
 
-    def __init__(self, model: str, behavior: Path, workers: int):
-        self.checkers = [score.Checker(model) for _ in range(workers)]
+    def __init__(self, model: str, behavior: Path, workers: int, export: Path | None = None):
+        self.checkers = [score.Checker(model, export) for _ in range(workers)]
         for c in self.checkers:
             c.behavior(behavior)
         self.calls = 0
@@ -159,16 +159,19 @@ def main() -> None:
     ap.add_argument("--heldout-seed", type=int, default=1)
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--min-neurons", type=int, default=48)
+    ap.add_argument("--export", type=Path, help="the model's export directory (score.py's default otherwise)")
+    ap.add_argument("--out", type=Path, default=OUT)
     a = ap.parse_args()
     path = a.behavior.expanduser()
     behavior = json.loads(path.read_text())
     model = behavior["model"]
-    OUT.mkdir(parents=True, exist_ok=True)
-    pool = Pool(model, path, a.workers)
+    out = a.out.expanduser()
+    out.mkdir(parents=True, exist_ok=True)
+    pool = Pool(model, path, a.workers, a.export)
     try:
         for mode in (["addition", "removal"] if a.mode == "both" else [a.mode]):
             start = pool.calls
-            log_path = OUT / f"{behavior['id']}.{mode}.log"
+            log_path = out / f"{behavior['id']}.{mode}.log"
             with log_path.open("w") as logf:
                 def log(msg):
                     print(msg, flush=True)
@@ -180,7 +183,7 @@ def main() -> None:
                              experiments=a.experiments, seed=a.seed, heldout_seed=a.heldout_seed)
                 log(f"{mode}: {len(found['units'])} units, {found['score']['total_bits']:.6g} bits (held-out seed "
                     f"{heldout['total_bits']:.6g}), {found['calls']} checker calls")
-            (OUT / f"{behavior['id']}.{mode}.json").write_text(json.dumps(found, indent=1))
+            (out / f"{behavior['id']}.{mode}.json").write_text(json.dumps(found, indent=1))
             e2e.record([e2e.status_line(model, behavior["id"], f"search_{mode}", found["heldout"])])
     finally:
         pool.close()

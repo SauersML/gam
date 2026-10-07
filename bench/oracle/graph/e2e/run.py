@@ -57,7 +57,10 @@ def record(lines: list[list[str]], path: Path = STATUS) -> None:
 
 
 def run(behavior_path: Path, names: list[str], experiments: int = 32, seed: int = 0, reader: bool = True,
-        write_status: bool = True) -> dict[str, dict]:
+        write_status: bool = True, items_dir: Path | None = None) -> dict[str, dict]:
+    """Scores each program; without a reader server (GRAPH_READER) and with `items_dir`, writes each
+    program's reader items to items_dir/<behavior>.<program>.items.jsonl and the program to
+    items_dir/<behavior>.<program>.program.jsonl, the inputs of `reader_score.py score`."""
     behavior = json.loads(behavior_path.read_text())
     model = behavior["model"]
     text = prompt.render(behavior)  # the oracle's input; the reference programs do not read it
@@ -66,8 +69,13 @@ def run(behavior_path: Path, names: list[str], experiments: int = 32, seed: int 
         checker.behavior(behavior_path)
         for name, source in sources(names, model, seed).items():
             t = time.time()
-            result = checker.score(source, experiments=experiments, seed=seed, reader=reader)
-            result.pop("items", None)
+            result = checker.score(source, experiments=experiments, seed=seed, reader=reader or items_dir is not None)
+            items = result.pop("items", None)
+            if items and items_dir is not None:
+                items_dir.mkdir(parents=True, exist_ok=True)
+                stem = items_dir / f"{behavior['id']}.{name}"
+                Path(f"{stem}.items.jsonl").write_text("".join(json.dumps(it) + "\n" for it in items))
+                Path(f"{stem}.program.jsonl").write_text(json.dumps({"id": name, "source": source, "valid": result["valid"]}) + "\n")
             result["seconds"] = time.time() - t
             results[name] = result
     if write_status:
@@ -96,8 +104,9 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--no-reader", action="store_true")
     ap.add_argument("--json", type=Path, help="also write the full results here")
+    ap.add_argument("--items", type=Path, help="without GRAPH_READER: write the reader items of each program here")
     a = ap.parse_args()
-    results = run(a.behavior.expanduser(), a.programs, a.experiments, a.seed, reader=not a.no_reader)
+    results = run(a.behavior.expanduser(), a.programs, a.experiments, a.seed, reader=not a.no_reader, items_dir=a.items)
     print(table(results))
     if a.json:
         a.json.write_text(json.dumps(results, indent=1))
