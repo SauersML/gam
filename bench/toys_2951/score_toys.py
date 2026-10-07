@@ -23,7 +23,8 @@ spans are absent from P (the toys' biases and fixed embeddings are not decompose
 
 Reports per PARTS_DIR, as JSON on stdout and in PARTS_DIR/SCORE_<toy>.json:
  (a) recovery: per known mechanism the fitted part of largest cosine (the parts' weights on every
-     operator, concatenated), its cosine, and whether its rank on each operator equals the
+     operator, concatenated), its cosine, its norm on the mechanism's operators over the
+     mechanism's (SPD's ML2R for a whole part), and whether its rank on each operator equals the
      mechanism's; distinct parts matched; parts matching no mechanism.
  (b) active parts per row against the mechanisms' (truth_active), and per matched mechanism the
      agreement of its part's gate with its activity (precision, recall).
@@ -194,7 +195,9 @@ def score(toy: Toy, parts: Parts, seed: int = 0) -> dict:
         b = int(np.argmax(cos)) if cos else -1
         truth_rank = {op: numerical_rank(d) for op, d in delta.items()}
         part_rank = {op: parts.parts[b]["slices"][op][0].shape[1] for op in parts.parts[b]["slices"]} if b >= 0 else {}
+        norm = lambda w: math.sqrt(sum(float(np.sum(v * v)) for v in w.values()))
         recovery.append({"mechanism": m["name"], "part": parts.parts[b]["name"] if b >= 0 else None, "cosine": cos[b] if b >= 0 else 0.0,
+                         "norm_ratio": norm({op: fitted[b][op] for op in delta if op in fitted[b]}) / norm(delta) if b >= 0 else 0.0,
                          "rank_right": all(part_rank.get(op) == r for op, r in truth_rank.items()) and set(part_rank) == set(truth_rank)})
         matched.add(b)
     best_for_part = [max((cosine(d, f) for d in deltas), default=0.0) for f in fitted]
@@ -204,6 +207,7 @@ def score(toy: Toy, parts: Parts, seed: int = 0) -> dict:
         "mechanisms": len(toy.mechanisms),
         "recovery": {
             "mean_cosine": float(cosines.mean()),
+            "mean_norm_ratio_of_recovered": float(np.mean([r["norm_ratio"] for r in recovery if r["cosine"] >= 0.9] or [float("nan")])),
             "min_cosine": float(cosines.min()),
             "recovered_cos_0.9": int(np.sum(cosines >= 0.9)),
             "rank_right_of_recovered": int(sum(r["rank_right"] for r in recovery if r["cosine"] >= 0.9)),

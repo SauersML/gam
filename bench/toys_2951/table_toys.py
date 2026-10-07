@@ -8,7 +8,7 @@ import json
 import sys
 from pathlib import Path
 
-cols = ["toy", "parts", "recovered/known", "mean cos", "rank right", "distinct", "spurious", "active P/truth", "gate prec/rec",
+cols = ["toy", "parts", "recovered/known", "mean cos", "norm ratio", "rank right", "distinct", "spurious", "active P/truth", "gate prec/rec",
         "clean gap", "edit gap z/s/p/w", "edit effect z/s/p/w", "P/M bits"]
 print(" | ".join(cols))
 for f in sys.argv[1:]:
@@ -20,6 +20,7 @@ for f in sys.argv[1:]:
         str(s["parts"]),
         f"{r['recovered_cos_0.9']}/{s['mechanisms']}",
         f"{r['mean_cosine']:.3f}",
+        f"{r.get('mean_norm_ratio_of_recovered', float('nan')):.3f}",
         str(r["rank_right_of_recovered"]),
         str(r["distinct_parts_matched"]),
         str(r["parts_matching_no_mechanism_cos_0.5"]),
