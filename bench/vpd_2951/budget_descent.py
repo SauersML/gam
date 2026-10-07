@@ -8,9 +8,9 @@ threshold tau_i:
   training    the expected gate Phi((r_i - tau_i) / s_i) under Gaussian threshold noise of fixed
               scale s_i (0.1 x the root mean square of r_i over the fit tokens at the start)
   evaluation  the hard gate 1[r_i > tau_i]
-Objective: KL(M || P) in bits per token on training tokens + lambda log(E[k] / K), where
+Objective: KL(M || P) in bits per token on training tokens + lambda (E[k] - K), where
 E[k] = sum_i Phi over all 8 maps (expected active slices per token, rank-one equivalents);
-lambda >= 0 rises by dual ascent on log(E[k] / K) until E[k] <= K.
+lambda >= 0 by dual ascent with library_mdl's measured step (below) until E[k] <= K.
 Starts:
   svd  the input-whitened SVD of each map (W C^(1/2) = U S V^T on M's inputs of rows 0..15;
        reads C^(-1/2) v, writes s u; all on = M), thresholds 3 s_i below zero, so every gate is on
@@ -19,7 +19,10 @@ Starts:
        trained per slice
   vpdgroup  as vpd, with each down_proj slice tied to the gate of the c_fc slice of its layer whose
        firing is nearest its own (below)
-Gate arms (DESCENT_ARM): own (above) or dir, a separate signed gate direction per slice (below).
+Gate arms (DESCENT_ARM): own (above); dir, a separate signed gate direction per slice; router, a
+small causal router per layer added to the own read (below).
+Dual step (DESCENT_DUAL): measured (default, library_mdl's rule, below) or fixed (lambda <- lambda +
+0.01 log(E[k] / K) on the loss KL + lambda log E[k], the first runs' rule).
 Training rows 0..1023 of tokens.f64, held-out evaluation rows 1024..1031 (4096 tokens), where VPD's
 causal-importance masks give KL 0.737 at 129 active MLP slices per token.
 Usage: budget_descent.py START K STEPS OUT.json GATE EVAL SECONDS GAM TARGET VPD TOKENS
@@ -122,12 +125,25 @@ if start == 'vpdgroup':
             GROUP[dn] = (fc, owner)
             MULT[fc] = 1 + torch.bincount(owner[owner >= 0], minlength=gf.shape[1]).float()
             print(dn, 'tied', int((owner >= 0).sum()), 'of', owner.numel(), 'to', int((MULT[fc] > 1).sum()), 'c_fc slices', flush=True)
+# DESCENT_ARM=router: each MLP layer gets a small causal router on the layer's own input x (the c_fc
+# input at that position only): z_i = (r_i + [G2 relu(G1 x)]_i - tau_i) / s_i for every slice of the
+# layer's two maps, G1 of shape d x 64 shared by the layer, G2 of shape 64 x C per map, started at
+# zero (so the start is the own-read gate's).
+ROUTER = {}
+if ARM == 'router':
+    for l in range(4):
+        fc, dn = f'h.{l}.mlp.c_fc', f'h.{l}.mlp.down_proj'
+        d = P[fc]['V'].shape[0]
+        ROUTER[l] = {'G1': (torch.randn(d, 64, device=dev) / math.sqrt(d)).requires_grad_(),
+                     fc: torch.zeros(64, P[fc]['V'].shape[1], device=dev, requires_grad=True),
+                     dn: torch.zeros(64, P[dn]['V'].shape[1], device=dev, requires_grad=True)}
 del X
 
-state = {'mode': 'M', 'soft': [], 'hard': [], 'gates': {}}
+state = {'mode': 'M', 'soft': [], 'hard': [], 'gates': {}, 'route': {}}
 SQ2 = math.sqrt(2)
 def make(n):
     st = T.site(n); p = P[n]; grp = GROUP.get(n); mult = MULT.get(n)
+    layer = int(n.split('.')[1]); router = ROUTER.get(layer)
     if grp is not None:
         tied, own = grp[1] >= 0, grp[1].clamp_min(0)
     def fwd(x):
@@ -136,7 +152,12 @@ def make(n):
         c = x @ p['V']
         if state['mode'] == 'all':
             return c @ p['U']
-        z = ((x @ p['G'] if ARM == 'dir' else c.abs() * p['U'].norm(dim=1)) - p['tau']) / p['s']
+        read = x @ p['G'] if ARM == 'dir' else c.abs() * p['U'].norm(dim=1)
+        if router is not None:
+            if n.endswith('c_fc'):
+                state['route'][layer] = torch.relu(x @ router['G1'])
+            read = read + state['route'][layer] @ router[n]
+        z = (read - p['tau']) / p['s']
         hard = (z > 0).float()
         phi = 0.5 * (1 + torch.erf(z / SQ2))
         w = 1.0
@@ -185,9 +206,20 @@ params = [P[n][w] for n in mlp for w in (('V', 'U', 'G') if ARM == 'dir' else ('
 LR = float(os.environ.get('DESCENT_LR', '1'))
 groups = [{'params': [q], 'lr': LR * 3e-3 * q.detach().pow(2).mean().sqrt().item()} for q in params]
 groups += [{'params': [P[n]['tau']], 'lr': LR * 0.1 * P[n]['s'].mean().item()} for n in mlp]
+# Router: G1 at 0.3% of its root mean square, G2 (started at zero) at 0.3% of its map's noise scale.
+for l, R in ROUTER.items():
+    groups.append({'params': [R['G1']], 'lr': LR * 3e-3 * R['G1'].detach().pow(2).mean().sqrt().item()})
+    groups += [{'params': [R[n]], 'lr': LR * 3e-3 * P[n]['s'].mean().item()} for n in R if n != 'G1']
 opt = torch.optim.Adam(groups)
-lam, eta, rng = 0.0, 0.01, np.random.default_rng(0)
-log = {'start': start, 'K': K, 'steps': steps, 'gate': gate, 'trace': []}
+trainable = [q for g in groups for q in g['params']]
+# The budget's multiplier (library_mdl's rule, Settings::budget): the step descends KL + lam (E[k] - K),
+# then lam <- max(0, lam + eta (E[k] - K)) with eta = lam_hat / (K B), lam_hat = |<g_F, g_k>| / |g_k|^2
+# the multiplier at which the budget's gradient cancels the KL gradient's component along
+# g_k = dE[k]/dtheta (both measured on this step), B the batches in one pass over the training rows.
+B = train_rows * 512 / (batch * seq)
+DUAL = os.environ.get('DESCENT_DUAL', 'measured')
+lam, rng = 0.0, np.random.default_rng(0)
+log = {'start': start, 'K': K, 'steps': steps, 'gate': gate, 'arm': ARM, 'dual': DUAL, 'train_rows': train_rows, 'trace': []}
 e = evaluate(); print('start', e, flush=True); log['trace'].append({'step': 0, **e})
 t0 = time.time()
 for step in range(steps):
@@ -199,9 +231,21 @@ for step in range(steps):
     kl = kl_bits(lm, lp).mean()
     ek = torch.stack(state['soft']).sum(0).mean()
     hk = torch.stack(state['hard']).sum(0).mean().item()
-    loss = kl + lam * torch.log(ek)
-    opt.zero_grad(); loss.backward(); opt.step()
-    lam = max(0.0, lam + eta * math.log(ek.item() / K))
+    if DUAL == 'fixed':
+        opt.zero_grad(); (kl + lam * torch.log(ek)).backward(); opt.step()
+        lam = max(0.0, lam + 0.01 * math.log(ek.item() / K))
+        g_f = None
+    else:
+        g_f = torch.autograd.grad(kl, trainable, retain_graph=True, allow_unused=True)
+    if g_f is not None:
+        g_k = torch.autograd.grad(ek, trainable, allow_unused=True)
+        along = sum((a * b).sum() for a, b in zip(g_f, g_k) if a is not None and b is not None).item()
+        square = sum(b.pow(2).sum() for b in g_k if b is not None).item()
+        for q, a, b in zip(trainable, g_f, g_k):
+            q.grad = (torch.zeros_like(q) if a is None else a) + (0 if b is None else lam * b)
+        opt.step()
+        if square > 0:
+            lam = max(0.0, lam + abs(along) / square / (K * B) * (ek.item() - K))
     last = step == steps - 1 or time.time() - t0 > LIMIT
     if (step + 1) % EVAL == 0 or last:
         e = evaluate()
