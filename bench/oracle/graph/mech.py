@@ -251,6 +251,9 @@ class _NativeLayer:
     def __init__(self, l: int):
         self._l = l
 
+    def __getattr__(self, name: str):
+        raise MechError(f"L[{self._l}].{name}: a layer has .head[h], .attn (all heads) and .mlp[i]")
+
     @property
     def head(self) -> _Site:
         shape = _shape()
@@ -475,6 +478,7 @@ def node(*pieces, rule=None) -> Node:
     attention rule (attend(...)) for a node of native heads."""
     if rule is not None and not isinstance(rule, Rule):
         raise MechError("rule=: an attention rule such as attend(offset=1)")
+    pieces = tuple(q for p in pieces for q in (p if isinstance(p, (list, tuple)) else (p,)))  # node([a, b]) too
     if not pieces:
         raise MechError("node() needs at least one piece")
     pieces = tuple(p.whole() if isinstance(p, _Site) else p for p in pieces)
@@ -508,7 +512,7 @@ def standin(mode: str) -> None:
 
 def edges(*declared) -> None:
     """Lists the program's edges (each `writer >> reader` is declared where it is written)."""
-    for e in declared:
+    for e in (f for d in declared for f in (d if isinstance(d, (list, tuple)) else (d,))):  # edges([...]) too
         if not isinstance(e, Edge):
             raise MechError(f"edges(): {e!r} is not an edge `writer >> reader`")
 
@@ -552,15 +556,20 @@ def _docstring_ranges(tree: ast.AST, source: str) -> list[tuple]:
             if isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant) and isinstance(n.value.value, str)]
 
 
-def check(tree: ast.AST) -> list[str]:
-    """The names the program imports from mech; raises MechError on a forbidden construct."""
-    imported: list[str] = []
+def check(tree: ast.AST) -> list[tuple[str, str]]:
+    """What the program imports from mech, as (export or "*" or "mech", bound name); raises MechError on
+    a forbidden construct."""
+    imported: list[tuple[str, str]] = []
     docs = {id(n.value) for n in ast.walk(tree)
             if isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant) and isinstance(n.value.value, str)}
     for n in ast.walk(tree):
         line = getattr(n, "lineno", "?")
         if isinstance(n, ast.Import):
-            raise MechError(f"line {line}: only `from mech import ...` is allowed")
+            for a in n.names:
+                if a.name != "mech":
+                    raise MechError(f"line {line}: only `from mech import ...` (or `import mech`) is allowed")
+                imported.append(("mech", a.asname or "mech"))
+            continue
         if not isinstance(n, ALLOWED_NODES):
             raise MechError(f"line {line}: {type(n).__name__} is not allowed in a mech program")
         if isinstance(n, ast.ImportFrom):
@@ -569,7 +578,7 @@ def check(tree: ast.AST) -> list[str]:
             for a in n.names:
                 if a.name != "*" and a.name not in EXPORTS:
                     raise MechError(f"line {line}: mech has no {a.name!r}; it exports {', '.join(EXPORTS)}")
-                imported.append(a.name)
+                imported.append((a.name, a.asname or a.name))
         elif isinstance(n, ast.Attribute) and (n.attr.startswith("_") or n.attr in BANNED_ATTRIBUTES):
             raise MechError(f"line {line}: attribute {n.attr!r} is not allowed")
         elif isinstance(n, ast.Name) and n.id.startswith("__"):
@@ -579,6 +588,23 @@ def check(tree: ast.AST) -> list[str]:
         elif isinstance(n, ast.Constant) and isinstance(n.value, str) and id(n) not in docs and "__" in n.value:
             raise MechError(f"line {line}: strings containing '__' are not allowed outside docstrings")
     return imported
+
+
+class _MechModule:
+    """`import mech` inside a program: the exports as attributes."""
+
+    def __init__(self, exports: dict):
+        for name, value in exports.items():
+            setattr(self, name, value)
+
+
+class _NoImports(ast.NodeTransformer):
+    """Replaces the (checked) import statements by `pass`: their names are bound beforehand."""
+
+    def visit_Import(self, n):
+        return ast.copy_location(ast.Pass(), n)
+
+    visit_ImportFrom = visit_Import
 
 
 def _line_of(exc: BaseException) -> int | None:
@@ -604,9 +630,14 @@ def trace_inline(source: str, model: str) -> dict:
         imported = check(tree)
         exports = {name: globals()[name] for name in EXPORTS}
         namespace = {"__builtins__": SAFE_BUILTINS, "__name__": "program"}
-        for name in imported:
-            namespace.update(exports if name == "*" else {name: exports[name]})
-        tree.body = [s for s in tree.body if not isinstance(s, ast.ImportFrom)]
+        for name, bound in imported:
+            if name == "*":
+                namespace.update(exports)
+            elif name == "mech":
+                namespace[bound] = _MechModule(exports)
+            else:
+                namespace[bound] = exports[name]
+        tree = ast.fix_missing_locations(_NoImports().visit(tree))
         _PROGRAM = program = _Program(model)
         try:
             exec(compile(tree, "<program>", "exec"), namespace)

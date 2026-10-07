@@ -107,6 +107,15 @@ def test_rules():
     assert "attention rule such as" in invalid(head + "node(L[1].head[0], rule=1)")
 
 
+def test_forgiving_forms():
+    ir = mech.trace_inline("import mech as m\nfrom mech import node as n, L\na = n([L[1].head[0], L[1].head[2]])\n"
+                           "b = m.node(m.L[2].mlp[4])\nm.edges([a >> b, b >> m.logits])\n", "vpd4l")
+    assert ir["valid"], ir["error"]
+    assert ir["nodes"][0]["pieces"][0]["index"] == [0, 2] and len(ir["edges"]) == 2
+    assert "a layer has .head" in invalid(HEAD + "node(L[1].heads[0])")
+    assert "or `import mech`" in invalid("import os, mech\n")
+
+
 def test_qwen_views():
     ir = mech.trace_inline(HEAD + "f = node(PD.tc[14][163839, 7])\nh = node(L[20].head[15])\n"
                            "edges(f >> h.value, h >> logits)\n", "qwen3-0.6b")
@@ -150,6 +159,7 @@ def test_invalid_programs():
 
 def test_sandbox():
     assert "only `from mech import" in invalid("import os\n")
+    assert "only `from mech import" in invalid("def f():\n    import os\n")
     assert "only `from mech import" in invalid("from os import system\n")
     assert "mech has no" in invalid("from mech import trace\n")
     assert "not allowed" in invalid("x = ().__class__\n")
