@@ -116,11 +116,11 @@ class Vpd4l:
         D = t.hd
         if piece["view"] == "native" and piece["kind"] == "head":
             y = seen[("attn", l)][rows, cols]
-            W = t.site(f"h.{l}.attn.o_proj").weight  # [d_model, d_model]
+            W = t.site(f"h.{l}.attn.o_proj").W  # [d_model, d_model], out = x @ W.T
             return sum(y[:, h * D : (h + 1) * D] @ W[:, h * D : (h + 1) * D].T for h in piece["index"])
         if piece["view"] == "native" and piece["kind"] == "mlp":
             hid = seen[("mlp", l)][rows, cols][:, piece["index"]]
-            return hid @ t.site(f"h.{l}.mlp.down_proj").weight[:, piece["index"]].T
+            return hid @ t.site(f"h.{l}.mlp.down_proj").W[:, piece["index"]].T
         if piece["view"] == "vpd" and piece["kind"] in ("o_proj", "down_proj"):
             src = seen[("attn", l)] if piece["kind"] == "o_proj" else seen[("mlp", l)]
             U, V = self.factors(f"h.{l}.{'attn' if piece['kind'] == 'o_proj' else 'mlp'}.{piece['kind']}")
