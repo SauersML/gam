@@ -16,7 +16,9 @@ edit_cols = ["toy / explanation", "clean gap", "gap swap/zero/scale/push", "effe
 parts_rows, edit_rows = [], []
 for f in sys.argv[1:]:
     s = json.loads(Path(f).read_text())
-    label = f"{Path(f).stem.removeprefix('SCORE_').removesuffix('_edits')} {Path(f).parent.name}"
+    # a parts dump's scores sit in OUT/parts: label them by the fit's directory
+    where = Path(f).parent.parent if Path(f).parent.name == "parts" else Path(f).parent
+    label = f"{Path(f).stem.removeprefix('SCORE_').removesuffix('_edits')} {where.name}"
     if "edits" in s:
         fam = s["edits"]["families"]
         order = [k for k in ["swap", "zero", "scale", "push"] if k in fam]
