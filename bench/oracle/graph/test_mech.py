@@ -88,6 +88,25 @@ def test_library_view():
     assert "two views" in invalid(HEAD + "a = node(PD.lib[1].mlp[0])\nb = node(L[1].mlp[0])")
 
 
+def test_rules():
+    head = "from mech import node, edges, L, embed, logits, attend, tokens, shift\n"
+    ir = mech.trace_inline(head + "prev = node(L[1].head[1], rule=attend(offset=1))\n"
+                           "ind = node(L[2].head[4], rule=attend(query=tokens, key=shift(tokens, 1)))\n"
+                           "sink = node(L[0].head[2], rule=attend(first=True))\n"
+                           "edges(embed >> prev.value, prev >> ind.value, ind >> logits, embed >> sink)\n", "vpd4l")
+    assert ir["valid"], ir["error"]
+    assert [n["rule"] for n in ir["nodes"]] == [
+        {"op": "attend", "offset": 1},
+        {"op": "attend", "query": {"op": "tokens"}, "key": {"op": "shift", "arg": {"op": "tokens"}, "by": 1}},
+        {"op": "attend", "first": True}]
+    assert "replaces its key" in invalid(head + "a = node(L[1].head[0])\nb = node(L[2].head[1], rule=attend(offset=2))\n"
+                                         "edges(a >> b.key)")
+    assert "native heads" in invalid(head + "node(L[1].mlp[0], rule=attend(offset=1))")
+    assert "exactly one" in invalid(head + "attend(offset=1, first=True)")
+    assert "positive int" in invalid(head + "shift(tokens, 0)")
+    assert "attention rule such as" in invalid(head + "node(L[1].head[0], rule=1)")
+
+
 def test_qwen_views():
     ir = mech.trace_inline(HEAD + "f = node(PD.tc[14][163839, 7])\nh = node(L[20].head[15])\n"
                            "edges(f >> h.value, h >> logits)\n", "qwen3-0.6b")

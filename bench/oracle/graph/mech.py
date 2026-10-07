@@ -25,7 +25,9 @@ Addresses (layer l, indices i, j, ... from 0):
 Indices may be ints, slices or ranges; a site without indices (L[3].mlp) is all of its units.
 `node(*pieces)` makes one node (its pieces in one layer's attention or one layer's MLP); `writer >> reader` declares an
 edge (writer: a node or embed; reader: a route handle, a node = all of its reads, or logits) and
-`edges(...)` lists them. `standin(mode)` says what undeclared pieces carry: "counterfactual" (default:
+`edges(...)` lists them. node(L[1].head[1], rule=attend(offset=1)) replaces a head's query and key by
+an attention rule (attend(offset=k), attend(query=tokens, key=shift(tokens, 1)), attend(first=True)).
+`standin(mode)` says what undeclared pieces carry: "counterfactual" (default:
 the model's values on the prompt's counterfactual), "global" or "position" (averages). Comments and docstrings are free text: the English of the explanation.
 
 trace(source, model) checks a program and runs it in a sandboxed child process, returning the IR the
@@ -57,7 +59,7 @@ MODELS = ("qwen3-0.6b", "vpd4l")
 VIEWS = ("native", "vpd", "library", "transcoder")
 SITES = ("q_proj", "k_proj", "v_proj", "o_proj", "c_fc", "down_proj")
 ROUTES = ("query", "key", "value", "input")
-EXPORTS = ("node", "edges", "L", "PD", "embed", "logits", "standin")
+EXPORTS = ("node", "edges", "L", "PD", "embed", "logits", "standin", "attend", "tokens", "shift")
 ATTRIBUTES = ("head", "attn", "mlp", "vpd", "lib", "tc", "query", "key", "value", "input") + SITES
 STANDINS = ("counterfactual", "global", "position")
 LIBRARY_ARM = "grouped_own"  # the arm of decomp's start that PD.lib addresses
@@ -330,10 +332,13 @@ class Node:
     def __init__(self, pieces: tuple[Piece, ...]):
         self.pieces = pieces
         self.id: str | None = None
+        self.rule: Rule | None = None
         if _PROGRAM is not None:
             _PROGRAM.nodes.append(self)
 
     def _route(self, route: str) -> "Route":
+        if self.rule is not None and route in ("query", "key"):
+            raise MechError(f"node {self.label()}'s rule replaces its {route}; route its value or input")
         if not any(route in r for p in self.pieces for (_, _, r) in p.reads()):
             raise MechError(f"node {self.label()} has no {route} read (query/key/value need a head or a q/k/v_proj piece)")
         return Route(self, route)
@@ -421,10 +426,55 @@ def _edge(src, dst) -> Edge:
     return edge
 
 
+class Expr:
+    """A token-level quantity a rule compares: `tokens` (the token at a position) or shift(expr, k)
+    (expr at the position k earlier)."""
+
+    def __init__(self, ir: dict):
+        self.ir = ir
+
+
+tokens = Expr({"op": "tokens"})
+
+
+def shift(expr: Expr, k: int) -> Expr:
+    """`expr` read k positions earlier: shift(tokens, 1) is the previous token."""
+    if not isinstance(expr, Expr) or not isinstance(k, int) or isinstance(k, bool) or k < 1:
+        raise MechError("shift(expr, k): expr is tokens or a shift, k a positive int")
+    return Expr({"op": "shift", "arg": expr.ir, "by": k})
+
+
+class Rule:
+    def __init__(self, ir: dict):
+        self.ir = ir
+
+
+def attend(offset: int | None = None, query: Expr | None = None, key: Expr | None = None,
+           first: bool = False) -> Rule:
+    """An attention rule for a head node, replacing its query and key computation: the head attends
+    uniformly to the earlier positions j that satisfy the rule, and computes its value and output with
+    the model's own weights on its actual (routed) value input. attend(offset=k): j = t - k;
+    attend(query=q, key=k): every j < t with k at j equal to q at t (induction: query=tokens,
+    key=shift(tokens, 1)); attend(first=True): j = 0. With no such j the head attends to position 0."""
+    given = (offset is not None) + (query is not None or key is not None) + bool(first)
+    if given != 1:
+        raise MechError("attend(): give exactly one of offset=k, query=... with key=..., or first=True")
+    if offset is not None:
+        if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+            raise MechError("attend(offset=k): k is an int >= 0")
+        return Rule({"op": "attend", "offset": offset})
+    if first:
+        return Rule({"op": "attend", "first": True})
+    if not isinstance(query, Expr) or not isinstance(key, Expr):
+        raise MechError("attend(query=..., key=...): both are tokens or shift(tokens, k)")
+    return Rule({"op": "attend", "query": query.ir, "key": key.ir})
+
+
 def node(*pieces, rule=None) -> Node:
-    """One node made of `pieces` (addresses such as L[1].head[1] or PD.vpd[2].c_fc[5, 9])."""
-    if rule is not None:
-        raise MechError("rules are not supported yet")
+    """One node made of `pieces` (addresses such as L[1].head[1] or PD.vpd[2].c_fc[5, 9]); `rule`: an
+    attention rule (attend(...)) for a node of native heads."""
+    if rule is not None and not isinstance(rule, Rule):
+        raise MechError("rule=: an attention rule such as attend(offset=1)")
     if not pieces:
         raise MechError("node() needs at least one piece")
     pieces = tuple(p.whole() if isinstance(p, _Site) else p for p in pieces)
@@ -434,10 +484,14 @@ def node(*pieces, rule=None) -> Node:
     if len({(p.layer, p.block()) for p in pieces}) > 1:
         raise MechError("a node's pieces must lie in one layer's attention or one layer's MLP; "
                         "make one node per site and connect them with edges")
+    if rule is not None and any(p.kind != "head" for p in pieces):
+        raise MechError("an attention rule applies to a node of native heads (L[l].head[...])")
     merged: dict[tuple, set] = {}
     for p in pieces:
         merged.setdefault((p.view, p.layer, p.kind, p.size), set()).update(p.index)
-    return Node(tuple(Piece(v, l, k, tuple(sorted(i)), n) for (v, l, k, n), i in merged.items()))
+    made = Node(tuple(Piece(v, l, k, tuple(sorted(i)), n) for (v, l, k, n), i in merged.items()))
+    made.rule = rule
+    return made
 
 
 def standin(mode: str) -> None:
@@ -603,7 +657,8 @@ def _validate(program: _Program, namespace: dict, ir: dict) -> None:
                     raise MechError(f"{Piece(p.view, p.layer, p.kind, (i,)).name()} is in nodes {o} and {n.id}; "
                                     f"a piece belongs to one node")
     ir["standin"] = program.standin or DEFAULT_STANDIN
-    ir["nodes"] = [{"id": n.id, "pieces": [p.ir() for p in n.pieces], "rule": None} for n in program.nodes]
+    ir["nodes"] = [{"id": n.id, "pieces": [p.ir() for p in n.pieces], "rule": n.rule and n.rule.ir}
+                   for n in program.nodes]
     ir["edges"] = [{"from": "embed" if e.src is embed else e.src.id,
                     "to": "logits" if e.dst is logits else e.dst.id, "route": e.route}
                    for e in program.edges.values()]
