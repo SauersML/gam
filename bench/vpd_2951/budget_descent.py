@@ -822,8 +822,17 @@ B = train_rows * 512 / (batch * seq)
 DUAL = os.environ.get('DESCENT_DUAL', 'measured')
 lam, rng = 0.0, np.random.default_rng(0)
 log = {'start': start, 'K': K, 'steps': steps, 'gate': gate, 'arm': ARM, 'dual': DUAL, 'train_rows': train_rows, 'F': FMODE, 'edges': EDGES, 'trace': []}
+# DESCENT_SAVE=PATH: after every evaluation, the MLP maps' slices and gates at the posterior mean
+# (reads V [d_in, C], writes U [C, d_out], thresholds tau [C] and noise scales s [C] per map, and the
+# neuron start's tied down slices), for export_to_rust.py (library_vpd's importer).
+def save(step):
+    if os.environ.get('DESCENT_SAVE'):
+        torch.save({'step': step, 'start': start, 'arm': ARM, 'gate': gate,
+                    'maps': {n: {k: P[n][k].detach().float().cpu() for k in ('V', 'U', 'tau', 's')} for n in mlp},
+                    'tied': {dn: (fc, own.cpu()) for dn, (fc, own) in GROUP.items()}}, os.environ['DESCENT_SAVE'])
+
 draw(True)
-e = evaluate(); print('start', e, flush=True); log['trace'].append({'step': 0, **e})
+e = evaluate(); print('start', e, flush=True); log['trace'].append({'step': 0, **e}); save(0)
 t0 = time.time()
 for step in range(steps):
     rows = rng.integers(0, train_rows, batch); rows = np.where(rows >= 1024, rows + 8, rows); offs = rng.integers(0, 513 - seq, batch)
@@ -874,7 +883,7 @@ for step in range(steps):
         rec = {'step': step + 1, 'lambda': lam, 'K_t': Kt, 'train_kl': kl.item(), 'description_bits': desc.item(), 'train_edge_bits': float(edge_bits),
                'train_F': objective.item(), 'train_k_soft': ek.item(), 'train_k_hard': hk, **e,
                'seconds': time.time() - t0}
-        log['trace'].append(rec); print(rec, flush=True)
+        log['trace'].append(rec); print(rec, flush=True); save(step + 1)
         json.dump(log, open(out, 'w'), indent=1)
     if last:
         break
