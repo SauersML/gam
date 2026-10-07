@@ -14,8 +14,10 @@ shift 5
 PY=${PY:-$HOME/oracle-venv/bin/python}
 [ -x "$PY" ] || PY=python3
 if [ ! -d "$ORACLE" ]; then
-    export HF_HUB_OFFLINE=1
-    ORACLE=$($PY -c "from huggingface_hub import snapshot_download; print(snapshot_download('$ORACLE'))")
+    # The cached snapshot directory itself (offline snapshot_download refuses snapshots without README/LICENSE).
+    snap=$(ls -d "$HOME/.cache/huggingface/hub/models--${ORACLE//\//--}/snapshots/"*/ 2> /dev/null | head -1)
+    [ -n "$snap" ] || snap=$($PY -c "from huggingface_hub import snapshot_download; print(snapshot_download('$ORACLE'))")
+    ORACLE=${snap%/}
 fi
 sets=()
 for spec in "$@"; do sets+=(--heldout "$spec"); done

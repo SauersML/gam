@@ -12,12 +12,14 @@ MODEL=$1 OUT=$2 WIN=$3 SPLIT=$4 PSPLIT=$5 TEXTS=$6 TASK=$7
 shift 7
 PY=${PY:-$HOME/oracle-venv/bin/python}
 [ -x "$PY" ] || PY=python3
-export HF_HUB_OFFLINE=1
 mkdir -p "$(dirname "$OUT")"
 if [ "$MODEL" = vpd4l ]; then
     target=(--target vpd4l)
 else
-    target=(--model "$($PY -c "from huggingface_hub import snapshot_download; print(snapshot_download('$MODEL'))")")
+    # The cached snapshot directory itself (offline snapshot_download refuses snapshots without README/LICENSE).
+    snap=$(ls -d "$HOME/.cache/huggingface/hub/models--${MODEL//\//--}/snapshots/"*/ 2> /dev/null | head -1)
+    [ -n "$snap" ] || snap=$($PY -c "from huggingface_hub import snapshot_download; print(snapshot_download('$MODEL'))")
+    target=(--model "${snap%/}")
 fi
 windows=()
 [ "$WIN" = - ] || windows=(--windows "$WIN" --texts "$TEXTS" --offset $((TASK * TEXTS)))
