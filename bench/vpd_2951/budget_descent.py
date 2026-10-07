@@ -49,9 +49,10 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.manual_seed(0)
 T = load_target(dev)
 mlp = [n for n in site_names() if '.mlp.' in n]
-tok = np.memmap(TOKENS, dtype=np.float64, mode='r').reshape(-1, 513)
+tok = np.memmap(TOKENS, dtype=np.uint16 if TOKENS.endswith('.u16') else np.float64, mode='r').reshape(-1, 513)
 ev = torch.tensor(tok[1024:1032, :512].astype(np.int64), device=dev)
-train_rows, batch, seq = 1024, 8, 256
+# Training rows: DESCENT_TRAIN_ROWS rows of the file, skipping the held-out rows 1024..1031 (default 1024).
+train_rows, batch, seq = int(os.environ.get('DESCENT_TRAIN_ROWS', '1024')), 8, 256
 # VPD's mean active (causal importance > 0) slices per token at each MLP map, rows 1024..1031,
 # from M's clean inputs (fitmath proto.log); 129 in total.
 VPD_COUNTS = {'h.0.mlp.c_fc': 18.62, 'h.0.mlp.down_proj': 20.20, 'h.1.mlp.c_fc': 4.23,
@@ -190,7 +191,7 @@ log = {'start': start, 'K': K, 'steps': steps, 'gate': gate, 'trace': []}
 e = evaluate(); print('start', e, flush=True); log['trace'].append({'step': 0, **e})
 t0 = time.time()
 for step in range(steps):
-    rows = rng.integers(0, train_rows, batch); offs = rng.integers(0, 513 - seq, batch)
+    rows = rng.integers(0, train_rows, batch); rows = np.where(rows >= 1024, rows + 8, rows); offs = rng.integers(0, 513 - seq, batch)
     ids = torch.tensor(np.stack([tok[r, o:o + seq] for r, o in zip(rows, offs)]).astype(np.int64), device=dev)
     with torch.no_grad():
         lm = run(ids, 'M')
