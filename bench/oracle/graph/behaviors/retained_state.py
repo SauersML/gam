@@ -173,6 +173,7 @@ def main():
     ap.add_argument("--study-file", default="", help="a hidden_choice.py result (default: the study's results/<model>.json)")
     ap.add_argument("--generate", type=int, default=0, help="make this many turn-1 runs first (written to --study-file)")
     ap.add_argument("--wording", default="A", choices=sorted(WORDINGS))
+    ap.add_argument("--gen-batch", type=int, default=32, help="sequences per generate call (the Mac needs 8)")
     a = ap.parse_args()
     build.OUT = Path(a.out)
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -180,7 +181,7 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(HF[a.model], dtype=getattr(torch, a.dtype), attn_implementation="sdpa").to(a.device).eval()
     src = Path(a.study_file) if a.study_file else STUDY / f"results/{a.model.replace('-', '_')}.json"
     if a.generate:
-        src.write_text(json.dumps(generate_runs(model, tok, a.wording, a.generate, a.device, a.seed)))
+        src.write_text(json.dumps(generate_runs(model, tok, a.wording, a.generate, a.device, a.seed, batch=a.gen_batch)))
     study = json.load(open(src))
     wording = study.get("wording", "A")
     runs = Runs(tok, wording)
