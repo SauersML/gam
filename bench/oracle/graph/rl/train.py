@@ -154,6 +154,7 @@ class Policy:
                                                          target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]))
             self.rank = args.lora_rank
         self.has_ref = bool(args.init)
+        self.pack = getattr(args, "pack", False)
         self.params = [p for n, p in self.model.named_parameters() if ".default." in n]
         for p in self.params:
             p.requires_grad_(True)
@@ -167,27 +168,56 @@ class Policy:
         self.model.save_pretrained(str(path), selected_adapters=["default"])
 
     def token_logprobs(self, prompts: list[list[int]], completions: list[list[int]], ref: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
-        """log pi(y_t | x, y_<t) at every completion token: (B, T) log-probabilities and a 0/1 mask,
-        right-padded. The output layer (151,936 wide) runs only at completion tokens, in checkpointed
-        chunks. ref=True evaluates pi_ref without gradients."""
+        """log pi(y_t | x, y_<t) at every completion token: (B, T) log-probabilities and a 0/1 mask. The
+        output layer (151,936 wide) runs only at completion tokens, in checkpointed chunks. ref=True
+        evaluates pi_ref without gradients. With self.pack and one prompt shared by every completion (a
+        GRPO group, a DPO pair), the batch is ONE sequence: the prompt once, then each completion, each
+        completion attending to the prompt and to its own earlier tokens only, at the positions it would
+        have alone (a 4-D attention mask and explicit position ids), so the prompt's forward and backward
+        run once per group instead of once per completion."""
         from torch.utils.checkpoint import checkpoint
 
-        width = max(len(p) + len(c) for p, c in zip(prompts, completions))
-        ids = torch.zeros(len(prompts), width, dtype=torch.long)
-        att = torch.zeros(len(prompts), width, dtype=torch.long)
-        comp = torch.zeros(len(prompts), width, dtype=torch.bool)
-        for r, (p, c) in enumerate(zip(prompts, completions)):
-            ids[r, : len(p) + len(c)] = torch.tensor(p + c)
-            att[r, : len(p) + len(c)] = 1
-            comp[r, len(p) : len(p) + len(c)] = True
-        ids, att, comp = ids.to(self.dev), att.to(self.dev), comp.to(self.dev)
         causal = self.model.base_model.model
-        rows, cols = comp[:, 1:].nonzero(as_tuple=True)
-        target = ids[:, 1:][rows, cols]
+        if self.pack and len(completions) > 1 and all(p == prompts[0] for p in prompts):
+            prompt, P = prompts[0], len(prompts[0])
+            seg, pos, src, rows, cols = [0] * P, list(range(P)), [], [], []
+            for i, c in enumerate(completions):
+                start = len(seg)
+                seg += [i + 1] * len(c)
+                pos += list(range(P, P + len(c)))
+                src += [P - 1] + list(range(start, start + len(c) - 1))
+                rows += [i] * len(c)
+                cols += list(range(len(c)))
+            ids = torch.tensor([prompt + [t for c in completions for t in c]], device=self.dev)
+            seg_t = torch.tensor(seg, device=self.dev)
+            q = torch.arange(len(seg), device=self.dev)
+            allowed = (q[None, :] <= q[:, None]) & ((seg_t[None, :] == seg_t[:, None]) | (seg_t[None, :] == 0))
+            dtype = next(causal.parameters()).dtype
+            inputs = {"input_ids": ids, "position_ids": torch.tensor([pos], device=self.dev),
+                      "attention_mask": torch.zeros(len(seg), len(seg), device=self.dev, dtype=dtype).masked_fill(~allowed, torch.finfo(dtype).min)[None, None]}
+            src = torch.tensor(src, device=self.dev)
+            target = ids[0, P:]
+            shape = (len(completions), max(len(c) for c in completions))
+        else:
+            width = max(len(p) + len(c) for p, c in zip(prompts, completions))
+            ids = torch.zeros(len(prompts), width, dtype=torch.long)
+            att = torch.zeros(len(prompts), width, dtype=torch.long)
+            comp = torch.zeros(len(prompts), width, dtype=torch.bool)
+            for r, (p, c) in enumerate(zip(prompts, completions)):
+                ids[r, : len(p) + len(c)] = torch.tensor(p + c)
+                att[r, : len(p) + len(c)] = 1
+                comp[r, len(p) : len(p) + len(c)] = True
+            ids, att, comp = ids.to(self.dev), att.to(self.dev), comp.to(self.dev)
+            inputs = {"input_ids": ids, "attention_mask": att}
+            rows, cols = comp[:, 1:].nonzero(as_tuple=True)
+            src = rows * width + cols  # the hidden state at position t predicts token t + 1
+            target = ids[:, 1:][rows, cols]
+            shape = (len(prompts), width - 1)
+        rows, cols = torch.as_tensor(rows, device=self.dev), torch.as_tensor(cols, device=self.dev)
 
         def run():
-            hidden = causal.model(input_ids=ids, attention_mask=att).last_hidden_state[:, :-1]
-            flat = hidden[rows, cols]
+            hidden = causal.model(**inputs).last_hidden_state
+            flat = hidden.reshape(-1, hidden.shape[-1])[src]
 
             def piece(h, t):
                 return torch.log_softmax(causal.lm_head(h).float(), -1).gather(-1, t[:, None])[:, 0]
@@ -209,8 +239,9 @@ class Policy:
                         lp = run()
         else:
             lp = run()
-        out = torch.zeros(ids.shape[0], width - 1, device=self.dev, dtype=torch.float32).index_put((rows, cols), lp)
-        return out, comp[:, 1:].float()
+        out = torch.zeros(shape, device=self.dev, dtype=torch.float32).index_put((rows, cols), lp)
+        mask = torch.zeros(shape, device=self.dev).index_put((rows, cols), torch.ones_like(lp))
+        return out, mask
 
     def train_mode(self, on: bool):
         inner = self.model.base_model.model
@@ -372,6 +403,7 @@ def main():
     ap.add_argument("--sft-epochs", type=int, default=1)
     ap.add_argument("--lora-rank", type=int, default=32)
     ap.add_argument("--micro", type=int, default=2)
+    ap.add_argument("--pack", action="store_true", help="GRPO / DPO: one sequence per group (the shared prompt once; see Policy.token_logprobs); sets GRPO's micro-batch to the group")
     ap.add_argument("--sampler", choices=["auto", "vllm", "hf"], default="auto")
     ap.add_argument("--gpu-memory", type=float, default=0.85, help="vLLM's share of its GPU (lower it when the trainer shares the GPU)")
     ap.add_argument("--prompt-holdout", type=int, default=4, help="every K-th prompt of each training behavior is held out for evaluation (0: none)")
@@ -448,10 +480,10 @@ def main():
             r = -S
             std = r.std(1, keepdims=True)
             adv = np.where(std > 0, (r - r.mean(1, keepdims=True)) / np.where(std > 0, std, 1.0), 0.0).reshape(-1)
-            stats = grpo_update(pol, flat_p, flat_c, adv.tolist(), beta, args.micro)
+            stats = grpo_update(pol, flat_p, flat_c, adv.tolist(), beta, args.samples if args.pack else args.micro)
         elif args.mode == "dpo":
             pairs = [(g, int(S[g].argmin()), int(S[g].argmax())) for g in range(len(chosen)) if S[g].max() > S[g].min()]
-            stats = dpo_update(pol, [prompts[g] for g, _, _ in pairs], [groups[g][w] for g, w, _ in pairs], [groups[g][l] for g, _, l in pairs], beta, args.micro) if pairs else {}
+            stats = dpo_update(pol, [prompts[g] for g, _, _ in pairs], [groups[g][w] for g, w, _ in pairs], [groups[g][l] for g, _, l in pairs], beta, 1 if args.pack else args.micro) if pairs else {}
             stats["pairs"] = len(pairs)
         else:
             keep = [(g, int(np.where(valid[g], S[g], np.inf).argmin())) for g in range(len(chosen)) if valid[g].any()]

@@ -75,10 +75,36 @@ def main():
         (-(torch.tensor(adv) * (lp * mask).sum(1)).sum() / 2).backward()
         for a, b in zip(got, (p.grad for p in pol.params)):
             assert torch.allclose(a, b, atol=1e-6)
+        check_pack(pol)
         check_init_adapter(Path(d))
     check_split_prompts()
     print("ok: token log-probabilities, KL 0 and DPO ln 2 at the reference, GRPO gradient = summed log-probability policy gradient, "
-          "g-predict's adapters = their PEFT conversion, prompt split")
+          "packed groups = separate sequences, g-predict's adapters = their PEFT conversion, prompt split")
+
+
+def check_pack(pol):
+    """One sequence per group (pack) gives every completion's token log-probabilities, and the GRPO
+    gradient, of separate sequences."""
+    g = torch.Generator().manual_seed(3)
+    prompt = torch.randint(0, 1000, (7,), generator=g).tolist()
+    comps = [torch.randint(0, 1000, (n,), generator=g).tolist() for n in (4, 1, 9)]
+    prompts = [prompt] * len(comps)
+    pol.pack = False
+    lp, mask = pol.token_logprobs(prompts, comps)
+    want = [lp[r][mask[r] > 0] for r in range(len(comps))]
+    adv = [1.0, -2.0, 0.5]
+    pol.model.zero_grad()
+    train.grpo_update(pol, prompts, comps, adv, beta=0.5, micro=3)
+    grads = [p.grad.clone() for p in pol.params]
+    pol.pack = True
+    lp, mask = pol.token_logprobs(prompts, comps)
+    for r in range(len(comps)):
+        assert torch.allclose(lp[r][mask[r] > 0], want[r], atol=1e-5), (r, lp[r][mask[r] > 0], want[r])
+    pol.model.zero_grad()
+    train.grpo_update(pol, prompts, comps, adv, beta=0.5, micro=3)
+    for a, p in zip(grads, pol.params):
+        assert torch.allclose(a, p.grad, atol=1e-5), float((a - p.grad).abs().max())
+    pol.pack = False
 
 
 def check_init_adapter(base: Path):
