@@ -1068,7 +1068,7 @@ def email_domain(tok, rng):
     """Copy the domain of a person's e-mail address."""
     names = words(tok, NAMES_F + NAMES_M)
     v = Variant("domain", "Copy from a contact record: the domain of the named person's e-mail address among two contacts; the counterfactual asks for the other contact.")
-    for _ in range(300):
+    for _ in range(800):
         a, b = rng.sample(names, 2)
         da, db = rng.sample(DOMAINS, 2)
         t = "Contacts:\n{a}: {la}@{da}.com\n{b}: {lb}@{db}.com\n\n{q}'s e-mail provider is"
@@ -1128,9 +1128,9 @@ def possessive_pronoun(tok, rng):
     f, m = words(tok, NAMES_F), words(tok, NAMES_M)
     objs = ["keys", "phone", "wallet", "umbrella", "notebook", "glasses", "jacket"]
     v = Variant("lost", "Possessive pronoun: after a named person loses something, 'her' or 'his' follows by the name's usual gender; the counterfactual swaps the name's gender.")
-    for _ in range(300):
+    for _ in range(400):
         a, b, o = rng.choice(f), rng.choice(m), rng.choice(objs)
-        t = "This morning {n} could not find"
+        t = rng.choice(["This morning", "Yesterday", "On Monday", "After lunch", "Last night", "Before the trip"]) + " {n} could not find"
         if rng.random() < 0.5:
             v.items.append(Item(t.format(n=a), " her", t.format(n=b), " his"))
         else:
