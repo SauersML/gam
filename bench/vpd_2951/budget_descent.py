@@ -687,7 +687,11 @@ if ARM == 'rot':
     MASK = torch.triu(torch.ones(ROTG, ROTG, device=dev), 1)
 ROT_ALL = list(ROT.values())
 
-def rot_train_gate(hard, phi):
+# GATE stw: the hard gate forward with the gradient of a gate DESCENT_STW (10) times wider, Phi(z / w), so a block
+# far below its threshold still feels its value.
+STW = float(os.environ.get('DESCENT_STW', '10'))
+
+def rot_train_gate(hard, phi, z):
     """A block's gate in training. mf: the expected gate Phi(z); st: the hard gate (as the scorer runs it) with
     Phi(z)'s gradient; bern: on with probability Phi(z), drawn each pass (on or off, as the scorer runs it, and on
     average the expected gate), with Phi(z)'s gradient. Under st a block pushed off gets no gradient back (the
@@ -697,6 +701,9 @@ def rot_train_gate(hard, phi):
         return phi
     if gate == 'bern':
         return torch.bernoulli(phi.detach()) + phi - phi.detach()
+    if gate == 'stw':
+        pw = 0.5 * (1 + torch.erf(z / (STW * SQ2)))
+        return hard + pw - pw.detach()
     return hard + phi - phi.detach()
 
 def rot_Q(R):
@@ -786,7 +793,7 @@ def make_rot_fc(n, l):
             if state['mode'] == 'hard':
                 gam = torch.einsum('...nj,nij->...ni', hard, hot)
             else:
-                gb = rot_train_gate(hard, phi)
+                gb = rot_train_gate(hard, phi, z)
                 state['soft'].append((gb * Lj).sum((-1, -2)).reshape(-1))
                 gam = torch.einsum('...nj,nij->...ni', gb, Lsm)
         state['rot'][l] = (gam, Q)
@@ -875,7 +882,7 @@ def rot_gate(Rb, R, Lj, hot, Lsm, calib_key):
     state['rot_on'].append(hard.sum((-1, -2)).reshape(-1))
     if state['mode'] == 'hard':
         return torch.einsum('...nj,nij->...ni', hard, hot)
-    gb = rot_train_gate(hard, phi)
+    gb = rot_train_gate(hard, phi, z)
     state['soft'].append((gb * Lj).sum((-1, -2)).reshape(-1))
     return torch.einsum('...nj,nij->...ni', gb, Lsm)
 
