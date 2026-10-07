@@ -62,7 +62,6 @@ import torch
 
 HERE = Path(__file__).resolve().parent
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")  # CUDA may be initialized here (torch.cuda.is_available) before vLLM starts its engine process
-os.environ.setdefault("MPD_MEM_GIB", "1")  # mech.trace's child is a venv script, which otherwise waits for the venv default of 4 GiB of the Mac's memory ledger
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent))
 import prompt  # noqa: E402
