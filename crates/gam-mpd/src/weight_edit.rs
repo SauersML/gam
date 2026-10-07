@@ -452,7 +452,8 @@ mod tests {
                 slices[usize::from(k >= 4)].extend((0..c).map(|i| [6 * l + k, i]));
             }
             for (stage, slices) in slices.into_iter().enumerate() {
-                components.push(serde_json::json!({"read": {"own": [6 * l + 4 * stage, 0]}, "tau": -1.0, "slices": slices}));
+                // Width 10⁻³: the gate Φ(z/w) at z ≥ 1 is 1 in float64, so the decomposition is exact.
+                components.push(serde_json::json!({"read": {"own": [6 * l + 4 * stage, 0]}, "tau": -1.0, "width": 1e-3, "slices": slices}));
             }
         }
         std::fs::write(factors.join("export.json"), serde_json::json!({"config": {"sites": sites}, "files": files}).to_string()).expect("the factors' record");
