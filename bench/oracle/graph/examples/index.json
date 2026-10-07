@@ -58,5 +58,8 @@
  "qwen3_greater_than_war": {"model": "qwen3-0.6b", "behavior": "greater_than.war", "family": "greater_than", "split": "train"},
  "qwen3_sva_simple": {"model": "qwen3-0.6b", "behavior": "sva.simple", "family": "sva", "split": "heldout"},
  "vpd4l_induction_random_words8_vpd": {"model": "vpd4l", "behavior": "induction_random.words8", "family": "induction_random", "split": "train"},
- "vpd4l_greater_than_war_vpd": {"model": "vpd4l", "behavior": "greater_than.war", "family": "greater_than", "split": "train"}
+ "vpd4l_greater_than_war_vpd": {"model": "vpd4l", "behavior": "greater_than.war", "family": "greater_than", "split": "train"},
+ "vpd4l_sva_simple_vpd": {"model": "vpd4l", "behavior": "sva.simple", "family": "sva", "split": "heldout"},
+ "vpd4l_acronym_three_word_vpd": {"model": "vpd4l", "behavior": "acronym.three_word", "family": "acronym", "split": "train"},
+ "vpd4l_pronoun_gender_said_vpd": {"model": "vpd4l", "behavior": "pronoun_gender.said", "family": "pronoun_gender", "split": "train"}
 }
