@@ -12,6 +12,10 @@ attention map its heads' slices as full-map rank-one slices (zero outside the he
 own component under the same own read; otherwise attention maps are copied from an exact
 decomposition (ATTN_DIR), and a run scoped to the MLP blocks (`blocks` 1, 3, 5, 7) keeps M's attention.
 With --all-on every threshold is -1e9: every component on, so P is M (a gap of 0 checks the import).
+library_vpd gates every stage one way: with a direction gate anywhere, an own read's gate is the
+constant 0 (Φ(0) = 1/2 at a hard gate's width, which halved every attention map of the neuron start's
+exports). So a neuron start's always-on components read the zero direction (z = 0 - tau > 0), and its
+head slices, which need own reads, are refused.
 
 usage: export_to_rust.py STATE.pt ATTN_DIR OUT_DIR ARM [--all-on]"""
 import sys, json, os, shutil
@@ -26,6 +30,8 @@ index = {n: i for i, n in enumerate(sites)}
 os.makedirs(out, exist_ok=False)
 attn_record = json.load(open(os.path.join(attn_dir, 'export.json')))
 heads = S.get('attn') or {}
+if heads and S['start'] == 'neuron':
+    raise SystemExit('a neuron start with head slices: own reads beside direction gates (library_vpd gates every stage one way)')
 files = {}
 
 
@@ -81,8 +87,9 @@ for n in sites:
         for i in range(tau.numel()):
             components.append({'read': {'own': [index[n], i]}, 'tau': -1e9 if all_on else float(tau[i]), 'width': float(s[i]), 'slices': [[index[n], i]]})
     elif '.attn.' in n:
-        C = files[f'{n}.U']['shape'][0]
-        components.append({'read': {'own': [index[n], 0]}, 'tau': -1e9, 'width': 1.0, 'slices': [[index[n], i] for i in range(C)]})
+        C, d = files[f'{n}.U']['shape'][0], files[f'{n}.V']['shape'][0]
+        read = {'direction': {'site': index[n], 'coefficients': [0.0] * (d + 1)}} if S['start'] == 'neuron' else {'own': [index[n], 0]}
+        components.append({'read': read, 'tau': -1e9, 'width': 1.0, 'slices': [[index[n], i] for i in range(C)]})
 tied = {fc: (dn, own) for dn, (fc, own) in S['tied'].items()}
 for n in sites:
     if '.attn.' in n or n in S['tied']:
