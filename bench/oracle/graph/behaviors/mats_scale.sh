@@ -9,7 +9,7 @@
 set -Eeuo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 OUT=$1 SVA=$2 STUDY=$3 MODELS=${4:-qwen3-1.7b,qwen3-4b,qwen3-8b} FAMS=${5:-}  # FAMS: a family subset, no retained-state run
-PY=$HOME/oracle-venv/bin/python
+PY=${PY:-$HOME/oracle-venv/bin/python}  # a RunPod run passes PY=python3 (RP_PYENV=oracle)
 mkdir -p "$OUT"
 for m in ${MODELS//,/ }; do
   [ -n "${RETAINED_ONLY:-}" ] || $PY "$here/build.py" --model "$m" --device cuda --out "$OUT" --sva "$SVA" ${FAMS:+--families "$FAMS"}
