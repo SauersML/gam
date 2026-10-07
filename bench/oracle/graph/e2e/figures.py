@@ -137,6 +137,43 @@ def modes(results: dict, labels: dict[str, str], out: Path, title: str) -> Path:
     return out
 
 
+def r1(table_path: Path, out: Path, title: str) -> Path:
+    """Per behavior, the shared-family total (bits per scored token) of the empty program, the hand-written
+    program, the best search program with native pieces, with VPD subcomponents, and the oracle's, from
+    table.py's TSV (rows by program name)."""
+    import csv
+    rows = list(csv.DictReader(table_path.open(), delimiter="\t"))
+    kinds = [("empty program", lambda p: p == "empty"), ("hand-written", lambda p: p == "hand"),
+             ("search, native pieces", lambda p: p.startswith("search") and "vpd" not in p),
+             ("search, VPD subcomponents", lambda p: p.startswith("search") and "vpd" in p),
+             ("oracle", lambda p: p.startswith("oracle"))]
+    best: dict[str, dict[str, float]] = {}
+    for r in rows:
+        if not r.get("shared_total"):
+            continue
+        for label, test in kinds:
+            if test(r["program"]):
+                v = float(r["shared_total"])
+                best.setdefault(r["behavior"], {})
+                best[r["behavior"]][label] = min(v, best[r["behavior"]].get(label, v))
+    behaviors = sorted(best, key=lambda b: best[b].get("empty program", 0.0))
+    fig, ax = plt.subplots(figsize=(14, 0.45 * len(behaviors) + 2.5))
+    for (label, _), color in zip(kinds, COLORS + ["#e87ba4"]):
+        pts = [(best[b][label], i) for i, b in enumerate(behaviors) if label in best[b]]
+        if pts:
+            ax.scatter([x for x, _ in pts], [i for _, i in pts], s=90, color=color, label=label, zorder=3, edgecolor="white", linewidth=1.5)
+    ax.set_yticks(range(len(behaviors)), behaviors, fontsize=13)
+    ax.set_xlim(left=0)
+    ax.set_xlabel("total over experiments every program shares, bits per scored token (lower is better)")
+    ax.set_title(title, loc="left")
+    ax.legend(frameon=True, framealpha=1, edgecolor="white", loc="lower right", fontsize=15)
+    fig.tight_layout()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out, dpi=110)
+    plt.close(fig)
+    return out
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="command", required=True)
@@ -157,8 +194,14 @@ def main() -> None:
     m.add_argument("--names", nargs="*", default=[], help="name=label, in display order")
     m.add_argument("--title", default="Score of each program under each stand-in form")
     m.add_argument("--out", type=Path, default=FIGURES / "standin_forms.png")
+    q = sub.add_parser("r1")
+    q.add_argument("table", type=Path)
+    q.add_argument("--title", default="Best program per vpd4l behavior vs the empty program")
+    q.add_argument("--out", type=Path, default=FIGURES / "r1_best_per_behavior.png")
     a = ap.parse_args()
-    if a.command == "modes":
+    if a.command == "r1":
+        print(r1(a.table, a.out, a.title))
+    elif a.command == "modes":
         print(modes(json.loads(a.results.read_text()), dict(kv.split("=", 1) for kv in a.names), a.out, a.title))
     elif a.command == "terms":
         results = json.loads(a.results.read_text())
