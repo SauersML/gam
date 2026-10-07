@@ -40,25 +40,44 @@ def mock(items: list[dict]) -> list[dict]:
 
 
 _CHECKERS = {}
+WORKERS = 1
 
 
 def checker(items: list[dict]) -> list[dict]:
-    """score.py's Checker, one long-lived server per target model; the reader term when GRAPH_READER
-    (reader_score.py serve's HOST:PORT) is set. Programs of one behavior and step share the experiments'
-    seed, so a group's scores differ by the programs only."""
+    """score.py's Checker: WORKERS long-lived servers per target model, each taking whole behaviors (it loads
+    a behavior once and caches M's outcomes on its seed-shared experiments); the reader term when
+    GRAPH_READER (reader_score.py serve's HOST:PORT) is set. Programs of one behavior and step share the
+    experiments' seed, so a group's scores differ by the programs only."""
+    from concurrent.futures import ThreadPoolExecutor
+
     import score
 
-    out = []
-    for it in items:
-        b = it["behavior"]
-        c = _CHECKERS.get(b["model"])
+    groups = {}
+    for k, it in enumerate(items):
+        groups.setdefault((it["behavior"]["model"], it["behavior"]["path"]), []).append(k)
+    out = [None] * len(items)
+
+    def run(w: int, model: str, path: str, ks: list[int]):
+        c = _CHECKERS.get((model, w))
         if c is None:
-            c = _CHECKERS[b["model"]] = score.Checker(b["model"])
+            c = _CHECKERS[(model, w)] = score.Checker(model)
             c.loaded = None
-        if c.loaded != b["path"]:
-            c.behavior(b["path"])
-            c.loaded = b["path"]
-        out.append(c.score(it["source"], seed=it.get("seed", 0)))
+        if c.loaded != path:
+            c.behavior(path)
+            c.loaded = path
+        for k in ks:
+            out[k] = c.score(items[k]["source"], seed=items[k].get("seed", 0))
+
+    per_worker = [[] for _ in range(WORKERS)]
+    for g, (key, ks) in enumerate(groups.items()):
+        per_worker[g % WORKERS].append((key, ks))
+
+    def worker(w: int):
+        for (model, path), ks in per_worker[w]:
+            run(w, model, path, ks)
+
+    with ThreadPoolExecutor(WORKERS) as ex:
+        list(ex.map(worker, range(WORKERS)))
     return out
 
 

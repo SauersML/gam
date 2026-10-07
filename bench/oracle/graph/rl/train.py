@@ -53,6 +53,7 @@ sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent))
 import prompt  # noqa: E402
 from prompt import program_of, render  # noqa: E402
+import scorer  # noqa: E402
 from scorer import SCORERS  # noqa: E402
 
 BEHAVIORS = Path.home() / "mpd-data/graph_oracle/behaviors"
@@ -264,6 +265,7 @@ def main():
     ap.add_argument("--model", required=True, help="target model whose behaviors are explained: qwen3-0.6b | vpd4l")
     ap.add_argument("--behaviors", default=str(BEHAVIORS))
     ap.add_argument("--scorer", choices=sorted(SCORERS), default="checker")
+    ap.add_argument("--score-workers", type=int, default=1, help="checker servers per target model, each scoring whole behaviors in parallel")
     ap.add_argument("--out", required=True)
     ap.add_argument("--steps", type=int, default=1)
     ap.add_argument("--hours", type=float, help="stop and save after this many hours")
@@ -300,6 +302,7 @@ def main():
     if sampler is None:
         sampler = HfSampler(pol, args.max_tokens)
     score = SCORERS[args.scorer]
+    scorer.WORKERS = args.score_workers
     pool = behaviors(Path(args.behaviors), args.model, "heldout" if args.mode == "eval" else "train")
     optimizer = torch.optim.AdamW(pol.params, lr=lr, weight_decay=0.0)
     log = open(out / "train.jsonl" if args.mode != "eval" else out / "eval.jsonl", "a")
