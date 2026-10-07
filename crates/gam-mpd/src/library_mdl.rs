@@ -289,12 +289,13 @@ pub struct Share {
 /// (d6ad2537cb), its own gate holds `e⁶ / (e⁶ + K − 1)` of the relaxed assignment (98% at K = 8).
 const OWN_LOGIT: f64 = 6.0;
 
-/// A training batch's all-on experiment ([`Scorer::all_on_pass`]): its experiments, their bits and
-/// the gradient of their sum.
+/// A training batch's all-on experiment ([`Scorer::all_on_pass`]): its experiments, their bits,
+/// the gradient of their sum and a draw of their Gauss–Newton factor.
 struct AllOn {
     experiments: Vec<Experiment>,
     bits: Vec<Vec<f64>>,
     gradient: BTreeMap<usize, Tensor>,
+    factor: Option<interchange::Factor>,
 }
 
 /// Where a training pass's gate thresholds sit ([`Scorer::train_gates`]): at the iterate, at the
@@ -2234,7 +2235,9 @@ impl Scorer {
             program.replace_dense_parameter(t, on)?;
         }
         self.experiments.explanation_mut().refresh_fused()?;
-        let evaluation = self.reversed(|e| e.evaluate_probed(batch, &clean, Some(&targets), gradient, None));
+        // With the gradient, a draw of the factor under its own probe (independent of the step's).
+        let probe = gradient.then(|| probe_key(key ^ gam_gpu::tensor::ANTITHETIC ^ 1));
+        let evaluation = self.reversed(|e| e.evaluate_probed(batch, &clean, Some(&targets), gradient, probe));
         self.train_gates(None)?;
         let mut evaluation = evaluation?;
         if evaluation.bits.iter().flatten().any(|b| !b.is_finite()) {
@@ -2242,11 +2245,17 @@ impl Scorer {
         }
         for (t, _) in &thresholds {
             evaluation.gradient.remove(t);
+            if let Some(f) = evaluation.factor.as_mut() {
+                f.gradient.remove(t);
+            }
         }
         for a in &self.assignments {
             evaluation.gradient.remove(&a.operator);
+            if let Some(f) = evaluation.factor.as_mut() {
+                f.gradient.remove(&a.operator);
+            }
         }
-        Ok(Some(AllOn { experiments: clean, bits: evaluation.bits, gradient: evaluation.gradient }))
+        Ok(Some(AllOn { experiments: clean, bits: evaluation.bits, gradient: evaluation.gradient, factor: evaluation.factor }))
     }
 
     fn train_gates(&mut self, posterior: Option<(&DevicePosterior, Center)>) -> Result<(), String> {
@@ -4391,7 +4400,7 @@ pub fn fit_from(
             let experiments = scorer.experiments(draw, sequences)?;
             let key = training_key(settings.seed, epoch, b);
             scorer.clear_assignment_gradients();
-            let (experiments, bits, mut gradients, factor) = antithetic_step(&mut scorer, (device, &device_posterior), &batch, experiments, key)?;
+            let (experiments, bits, mut gradients, mut factor) = antithetic_step(&mut scorer, (device, &device_posterior), &batch, experiments, key)?;
             for (e, bits) in experiments.iter().zip(&bits) {
                 if e.patch.is_some() { patched.add(bits) } else { clean.add(bits) }
             }
@@ -4595,6 +4604,25 @@ pub fn fit_from(
             // The factor's scale: its square estimates the curvature per token of the tokens it
             // sums (one antithetic half's, `antithetic_step`).
             let factor_weight = weight * scored as f64 / factor.tokens as f64;
+            // The all-on experiment's curvature joins the step's (the line step's `ρ̄` and IVON's
+            // `h`): its factor draw, scaled to the step's factor weight, is added to the step's
+            // draw. Their probes are independent, so the sum's square is unbiased for the sum of the
+            // two curvatures; without it the step's model did not see the term it descends.
+            if let Some(AllOn { bits: on_bits, factor: Some(on_factor), .. }) = &all_on {
+                let on_scored: usize = on_bits.iter().map(Vec::len).sum();
+                let on_weight = weight * on_scored as f64 / on_factor.tokens.max(1) as f64;
+                let ratio = (on_weight / factor_weight).sqrt();
+                for (op, u) in &on_factor.gradient {
+                    match factor.gradient.get_mut(op) {
+                        Some(total) => device.axpy(total, ratio, u).map_err(error)?,
+                        None => {
+                            let mut scaled = device.zeros(u.rows(), u.cols()).map_err(error)?;
+                            device.axpy(&mut scaled, ratio, u).map_err(error)?;
+                            factor.gradient.insert(*op, scaled);
+                        }
+                    }
+                }
+            }
             let posterior_started = Instant::now();
             device_posterior.step(&gradients, weight * LN_2, (&factor.gradient, factor_weight), &prior_curvature, &ivon)?;
             scorer.step_assignments(weight * LN_2);
