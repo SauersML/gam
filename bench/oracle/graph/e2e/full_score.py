@@ -107,7 +107,7 @@ def main() -> None:
                                                                                "model": a.model}
             r["reader_error_bits"] = reader["reader_error_bits"]
             r["total_bits"] = r["exec_error_bits"] + r["code_bits"] + r["opaque_bits"] + r["reader_error_bits"]
-            lines.append(e2e.status_line(a.target, a.behavior, f"{name}+reader", r, r.get("stand_in")))
+            lines.append(e2e.status_line(a.target, a.behavior, f"{name}+reader:{a.model.split('/')[-1]}", r, r.get("stand_in")))
             print(name, {k: round(r[k] / r["N"], 4) for k in ("total_bits", "exec_error_bits", "opaque_bits", "code_bits", "reader_error_bits")},
                   "english saved/N", round(reader.get("english_saved_bits", float("nan")) / r["N"], 4), flush=True)
         e2e.record(lines)
