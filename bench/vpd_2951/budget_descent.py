@@ -827,6 +827,9 @@ if ARM == 'rot':
 #   write, sqrt(sum_i |a_G . Q_i|^2 ||W_o,G Q_i||^2).
 # With every block on, P's attention is M's. A QK plane's description is its two q rows and two k rows, an OV
 # slice's its read and write (dense, at their own widths, under zero-mean priors per layer and map), as in the MLP.
+# DESCENT_QKREAD=uniform: a QK block's read weighs every causal key alike instead of by the all-on pattern; a
+# pattern concentrated on one key (a sink) gives a plane that sets it apart no variance under the pattern itself.
+QK_READ = os.environ.get('DESCENT_QKREAD', 'pattern')
 ROTA = {}
 if ARM == 'rot' and attn:
     NPL = HD // 2
@@ -898,7 +901,11 @@ def rot_attention(i, h, causal):
     if state['mode'] == 'all':
         gq = None
     else:
-        full = ((qh @ kh.transpose(-1, -2)) / math.sqrt(HD)).masked_fill(~causal, float('-inf')).softmax(-1)
+        if QK_READ == 'uniform':
+            # Every causal key alike.
+            full = causal.float() / causal.float().sum(-1, keepdim=True)
+        else:
+            full = ((qh @ kh.transpose(-1, -2)) / math.sqrt(HD)).masked_fill(~causal, float('-inf')).softmax(-1)
         q2 = torch.stack((qh[..., :NPL], qh[..., NPL:]), -1); k2 = torch.stack((kh[..., :NPL], kh[..., NPL:]), -1)  # [B, H, T, NPL, 2]
         mk = (full @ k2.flatten(-2)).view(B_, NH, T_, NPL, 2)
         kk = (full @ (k2[..., :, None] * k2[..., None, :]).flatten(-3)).view(B_, NH, T_, NPL, 2, 2)
