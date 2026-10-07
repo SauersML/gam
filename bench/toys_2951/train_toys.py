@@ -228,6 +228,78 @@ def resid_mlp_truth(E, Wi, Wo, xs):
     return mechanisms, np.stack(active, 1)
 
 
+# ---------------------------------------------------------------------------- gated copy
+
+
+def gated_copy(out: Path, seed: int):
+    """A high-rank operation at a known place: built, not trained. Two gated copies of a subspace,
+    y_A = c_A a (a in [-1, 1]^8) and y_B = c_B b (b in [-1, 1]^4), c_A and c_B each 1 with
+    probability 1/4, else 0, beside 8 sparse features passed through a ReLU, y_f = ReLU(f) (f_j
+    present with probability 1/10, uniform on [0, 1]). Coordinate i of a copy is a pair of ReLU
+    neurons, ReLU(+-a_i + G c - G) with G = 2 (off for every |a_i| <= 1 when c = 0), written
+    +-e_i: one neuron of the pair fires on a token with c = 1, by the sign of a_i. The bias -G is
+    a stream coordinate held at 1. The task's targets carry Gaussian noise of standard deviation
+    SIGMA, the Gaussian head's task residual (the built model is otherwise exact). Seeds permute
+    the neurons."""
+    copies, features, G, SIGMA = [("A", 8), ("B", 4)], 8, 2.0, 0.05
+    gen = torch.Generator().manual_seed(1)
+    rows = HELD_OUT + TRAIN_ROWS
+    width = sum(r for _, r in copies)
+    # The stream: [1 | c_A c_B | a b | f | y_A y_B | y_f]
+    one, gate0, pay0, f0 = 0, 1, 1 + len(copies), 1 + len(copies) + width
+    y0 = f0 + features
+    d = y0 + width + features
+    stream = np.zeros((rows, d))
+    stream[:, one] = 1.0
+    stream[:, gate0:pay0] = (torch.rand(rows, len(copies), generator=gen) < 0.25).double().numpy()
+    stream[:, pay0:f0] = (torch.rand(rows, width, generator=gen) * 2 - 1).double().numpy()
+    stream[:, f0:y0] = sparse_features(gen, rows, features, 0.1, 0.0, 1.0).double().numpy()
+    neurons = 2 * width + features
+    up, down = np.zeros((neurons, d)), np.zeros((d, neurons))
+    owner, n, at = [], 0, 0
+    for k, (_, r) in enumerate(copies):
+        for i in range(r):
+            for sign in (1.0, -1.0):
+                up[n, pay0 + at + i] = sign
+                up[n, gate0 + k] = G
+                up[n, one] = -G
+                down[y0 + at + i, n] = sign
+                owner.append(k)
+                n += 1
+        at += r
+    for j in range(features):
+        up[n, f0 + j] = 1.0
+        down[y0 + width + j, n] = 1.0
+        owner.append(len(copies) + j)
+        n += 1
+    perm = np.random.default_rng(seed).permutation(neurons) if seed else np.arange(neurons)
+    up, down, owner = up[perm], down[:, perm], np.array(owner)[perm]
+    head = np.zeros((width + features, d))
+    head[:, y0:] = np.eye(width + features)
+    files = {}
+    config = real_export(out, files, stream, [(up, down)], "relu", head, None, False, SIGMA)
+    xs = stream[:HELD_OUT]
+    mechanisms, active = [], []
+    for k, (name, r) in enumerate(copies):
+        mine = owner == k
+        mechanisms.append({"name": f"copy {name}", "rank": int(np.linalg.matrix_rank(up[mine])),
+                           "operators": {"blocks.0.mlp.c_fc": up * mine[:, None], "blocks.0.mlp.down_proj": down * mine[None, :]},
+                           "gate": f"c_{name} = 1"})
+        active.append(xs[:, gate0 + k] > 0.5)
+    for j in range(features):
+        mine = owner == len(copies) + j
+        mechanisms.append({"name": f"feature {j}", "rank": 1,
+                           "operators": {"blocks.0.mlp.c_fc": up * mine[:, None], "blocks.0.mlp.down_proj": down * mine[None, :]},
+                           "gate": f"f[{j}] > 0"})
+        active.append(xs[:, f0 + j] > 0)
+    record = {
+        "model": out.name, "kind": "language_model", "real_valued": "gated_copy", "config": config, "seed": seed,
+        "task": f"two gated copies of a subspace (ranks {', '.join(str(r) for _, r in copies)}, each on with probability 1/4) beside {features} sparse ReLU features; built, not trained",
+        "spd_published": "none (a toy of this gate)",
+    }
+    finish(out, files, record, mechanisms, np.stack(active, 1))
+
+
 # ------------------------------------------------------------------------------- transformers
 
 
@@ -633,6 +705,7 @@ if __name__ == "__main__":
         "resid_mlp_1l": lambda: resid_mlp(out, 1, seed),
         "resid_mlp_2l": lambda: resid_mlp(out, 2, seed),
         "resid_mlp_3l": lambda: resid_mlp(out, 3, seed),
+        "gated_copy": lambda: gated_copy(out, seed),
         "modadd_113": lambda: modadd(out, seed),
         "induction": lambda: induction(out, seed),
     }[name]()
