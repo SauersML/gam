@@ -50,6 +50,13 @@ def test_ir_fields():
                            {"from": "b", "to": "logits", "route": "input"}, {"from": "node0", "to": "a", "route": "key"}]
 
 
+def test_whole_site():
+    ir = mech.trace_inline(HEAD + "m = node(L[3].mlp)\nh = node(L[2].head[0:6])\nv = node(PD.vpd[1].c_fc[0:3072])\n"
+                           "edges(h >> m, m >> logits)\n", "vpd4l")
+    assert ir["valid"], ir["error"]
+    assert [p["index"] for n in ir["nodes"] for p in n["pieces"]] == [None, None, None]
+
+
 def test_qwen_views():
     ir = mech.trace_inline(HEAD + "f = node(PD.tc[14][163839, 7])\nh = node(L[20].head[15])\n"
                            "edges(f >> h.value, h >> logits)\n", "qwen3-0.6b")
@@ -80,6 +87,7 @@ def test_invalid_programs():
     assert "not an edge" in invalid(HEAD + "a = node(L[1].mlp[0])\nedges(a)")
     assert "line 2" in invalid(HEAD + "node(L[9].head[0])")
     assert "one layer's attention" in invalid(HEAD + "node(L[1].head[0], L[2].head[0])")
+    assert "nodes a and b" in invalid(HEAD + "a = node(L[1].mlp)\nb = node(L[1].mlp[7])")
     assert "one layer's attention" in invalid(HEAD + "node(L[1].head[0], L[1].mlp[0])")
     assert "syntax error" in invalid(HEAD + "a = node(")
     assert "unknown model" in invalid(HEAD, model="gpt2")

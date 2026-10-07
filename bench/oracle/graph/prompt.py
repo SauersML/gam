@@ -29,8 +29,8 @@ REFERENCE = """\
 Write ONE Python file that explains how the model produces the behavior below. It may import only
 `from mech import node, edges, L, PD, embed, logits`.
 - node(*pieces) declares a node: pieces of the model's weights that compute with their actual inputs.
-{pieces}  Indices may be several ints, slices or ranges. A node's pieces lie in one layer's attention
-  or one layer's MLP.
+{pieces}  Indices may be several ints, slices or ranges; a site without indices (L[3].mlp) is all of
+  its units. A node's pieces lie in one layer's attention or one layer's MLP.
 - writer >> reader declares an edge, listed in edges(...). The writer is a node or embed; the reader is
   node.query, node.key or node.value (attention), node.input or the node itself (all of its reads), or
   logits. Writers must come before readers.

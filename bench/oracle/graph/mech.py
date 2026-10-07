@@ -20,7 +20,8 @@ Addresses (layer l, indices i, j, ... from 0):
   PD.vpd[l].<site>[i, ...]   VPD subcomponents U_i V_i^T, site in q_proj k_proj v_proj o_proj c_fc down_proj
   PD.lib[l].<site>[i, ...]   our library's parts (not available yet)
   PD.tc[l][i, ...]           transcoder features of layer l's MLP (Qwen3-0.6B)
-Indices may be ints, slices or ranges. `node(*pieces)` makes one node; `writer >> reader` declares an
+Indices may be ints, slices or ranges; a site without indices (L[3].mlp) is all of its units.
+`node(*pieces)` makes one node (its pieces in one layer's attention or one layer's MLP); `writer >> reader` declares an
 edge (writer: a node or embed; reader: a route handle, a node = all of its reads, or logits) and
 `edges(...)` lists them. Comments and docstrings are free text: the English of the explanation.
 
@@ -152,8 +153,8 @@ def _indices(key, size: int | None, what: str) -> tuple[int, ...]:
 class Piece:
     """Pieces of one of M's sites: (view, layer, kind, indices)."""
 
-    def __init__(self, view: str, layer: int, kind: str, index: tuple[int, ...]):
-        self.view, self.layer, self.kind, self.index = view, layer, kind, index
+    def __init__(self, view: str, layer: int, kind: str, index: tuple[int, ...], size: int | None = None):
+        self.view, self.layer, self.kind, self.index, self.size = view, layer, kind, index, size
 
     def name(self) -> str:
         i = ", ".join(map(str, self.index[:4])) + (", ..." if len(self.index) > 4 else "")
@@ -191,8 +192,10 @@ class Piece:
         return [("hidden", l)]  # c_fc writes its layer's MLP hidden pre-activation
 
     def ir(self) -> dict:
+        """index: one int, a sorted list, or null for every unit of the site."""
+        whole = self.size is not None and len(self.index) == self.size
         return {"view": self.view, "layer": self.layer, "kind": self.kind,
-                "index": self.index[0] if len(self.index) == 1 else list(self.index)}
+                "index": None if whole else self.index[0] if len(self.index) == 1 else list(self.index)}
 
 
 class _Site:
@@ -201,7 +204,13 @@ class _Site:
 
     def __getitem__(self, key) -> Piece:
         what = Piece(self.view, self.layer, self.kind, (0,)).name().rsplit("[", 1)[0]
-        return Piece(self.view, self.layer, self.kind, _indices(key, self.size, what))
+        return Piece(self.view, self.layer, self.kind, _indices(key, self.size, what), self.size)
+
+    def whole(self) -> Piece:
+        """Every unit of the site, e.g. node(L[3].mlp)."""
+        if self.size is None:
+            raise MechError("a whole site needs the model's size")
+        return Piece(self.view, self.layer, self.kind, tuple(range(self.size)), self.size)
 
 
 def _layer(l, what: str) -> int:
@@ -373,6 +382,7 @@ def node(*pieces, rule=None) -> Node:
         raise MechError("rules are not supported yet")
     if not pieces:
         raise MechError("node() needs at least one piece")
+    pieces = tuple(p.whole() if isinstance(p, _Site) else p for p in pieces)
     for p in pieces:
         if not isinstance(p, Piece):
             raise MechError(f"node(): {p!r} is not a piece address such as L[1].head[1]")
@@ -381,8 +391,8 @@ def node(*pieces, rule=None) -> Node:
                         "make one node per site and connect them with edges")
     merged: dict[tuple, set] = {}
     for p in pieces:
-        merged.setdefault((p.view, p.layer, p.kind), set()).update(p.index)
-    return Node(tuple(Piece(v, l, k, tuple(sorted(i))) for (v, l, k), i in merged.items()))
+        merged.setdefault((p.view, p.layer, p.kind, p.size), set()).update(p.index)
+    return Node(tuple(Piece(v, l, k, tuple(sorted(i)), n) for (v, l, k, n), i in merged.items()))
 
 
 def edges(*declared) -> None:
