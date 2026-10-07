@@ -3,9 +3,11 @@ attach its score: ~/mpd-data/graph_oracle/printed/<example>.{py,wrong.py,graph.j
 and for training data). Examples already printed with a score are skipped.
 
   MPD_MEM_GIB=3 mem-lease 3 ~/mpd-data/venv/bin/python print_winners.py RESCORE.jsonl [...]
+(PRINTED_DIR / BEHAVIORS_DIR override the output and behavior directories)
 """
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -14,7 +16,7 @@ sys.path.insert(0, str(G))
 import mech  # noqa: E402
 import printer  # noqa: E402
 
-OUT = Path.home() / "mpd-data/graph_oracle/printed"
+OUT = Path(os.environ.get("PRINTED_DIR") or Path.home() / "mpd-data/graph_oracle/printed")
 KEYS = ("total_bits", "exec_error_bits", "opaque_bits", "code_bits", "N", "experiments", "per_family", "valid")
 
 
@@ -32,7 +34,8 @@ def main():
         graph_path = OUT / f"{name}.graph.json"
         if graph_path.exists() and "score" in json.loads(graph_path.read_text()):
             continue
-        behavior = json.loads((Path.home() / f"mpd-data/graph_oracle/behaviors/vpd4l/{r['behavior']}.json").read_text())
+        behaviors = Path(os.environ.get("BEHAVIORS_DIR") or Path.home() / "mpd-data/graph_oracle/behaviors/vpd4l")
+        behavior = json.loads((behaviors / f"{r['behavior']}.json").read_text())
         ir = mech.trace_inline((G / "examples" / f"{name}.py").read_text(), "vpd4l")
         printer.SHAPE[0] = mech.shapes("vpd4l")
         measured = printer.facts(printer.engine_for("vpd4l"), ir, behavior)
