@@ -105,6 +105,8 @@ def site_inputs(ids):
 
 X = site_inputs(torch.tensor(tok[0:16, :512].astype(np.int64), device=dev))
 vpdlike = start in ('vpd', 'vpdgroup')
+# Starts: svd, vpd, vpdgroup, neuron (the privileged axis: each MLP neuron's c_fc row and down_proj
+# column one exact part under one gate on its own pre-activation).
 if vpdlike and str(VPD_DIR).endswith('.pth'):
     raw = torch.load(str(VPD_DIR), map_location='cpu', weights_only=True, mmap=True)
     load = lambda k: raw['_components.' + k.rsplit('.', 1)[0].replace('.', '-') + '.' + k.rsplit('.', 1)[1]].float().to(dev)
@@ -130,8 +132,15 @@ for n in mlp:
         Us, S, Vt = sl.svd(Wd @ ((Q * np.sqrt(lam_)) @ Q.T), full_matrices=False)
         V = torch.tensor(((Q / np.sqrt(lam_)) @ Q.T) @ Vt.T, dtype=torch.float32, device=dev)
         U = torch.tensor((Us * S).T, dtype=torch.float32, device=dev)
+    elif start == 'neuron':
+        # The privileged axis: neuron j of the layer's MLP is one part, its c_fc row w_j (a c_fc slice
+        # reading w_j . x and writing e_j) and its down_proj column (a down_proj slice reading e_j and
+        # writing W_down[:, j]) under one gate (below); every part on is M exactly.
+        V, U = (W.T.clone(), torch.eye(W.shape[0], device=dev)) if n.endswith('c_fc') else (torch.eye(W.shape[1], device=dev), W.T.clone())
     else:
         V, U = load(n + '.V'), load(n + '.U')
+    if EXACT and start == 'neuron':
+        raise SystemExit('the neuron start is exact without frames (DESCENT_FREEZE=1 keeps it exact)')
     if EXACT:
         # The start's reads kept (the canonical dual is an involution: the frame R (R^T R)^-1 has dual
         # R), its writes replaced by the exact ones. The SVD start's down_proj has fewer slices than
@@ -144,10 +153,19 @@ for n in mlp:
         with torch.no_grad():
             V, U = frame(F0, W)
     with torch.no_grad():
-        r = (X[n] @ V).abs() * U.norm(dim=1)
+        # A neuron's gate reads its own pre-activation w_j . x, signed (the neuron is on when it is
+        # large and positive), threshold one per layer at the quantile matching VPD's mean count of
+        # the layer's MLP slices, halved (a neuron part counts its two rank-one slices).
+        r = (X[n] @ V) if start == 'neuron' else (X[n] @ V).abs() * U.norm(dim=1)
         s = 0.1 * r.pow(2).mean(0).sqrt().clamp_min(1e-12)
         if start == 'svd':
             tau = -3 * s
+        elif start == 'neuron':
+            l_ = n.split('.')[1]
+            q = 1 - (VPD_COUNTS[f'h.{l_}.mlp.c_fc'] + VPD_COUNTS[f'h.{l_}.mlp.down_proj']) / 2 / V.shape[1]
+            flat = r.reshape(-1)
+            idx = torch.randperm(flat.numel(), device=dev)[:2_000_000]
+            tau = torch.full_like(s, torch.quantile(flat[idx], q).item())
         else:
             q = 1 - VPD_COUNTS[n] / V.shape[1]
             flat = r.reshape(-1)
@@ -166,6 +184,12 @@ for n in mlp:
 # its layer's c_fc slices than to never firing is tied to that c_fc slice: one gate, the c_fc
 # slice's own, for the group. A group on counts 1 + its tied down slices (rank-one equivalents).
 GROUP, MULT = {}, {}
+if start == 'neuron':
+    # Neuron j's down_proj slice fires with its c_fc slice's gate; the part counts 2 when on.
+    for l in range(4):
+        fc, dn = f'h.{l}.mlp.c_fc', f'h.{l}.mlp.down_proj'
+        GROUP[dn] = (fc, torch.arange(P[dn]['V'].shape[1], device=dev))
+        MULT[fc] = torch.full((P[fc]['V'].shape[1],), 2.0, device=dev)
 if start == 'vpdgroup':
     with torch.no_grad():
         for l in range(4):
@@ -392,7 +416,7 @@ def make(n):
                 return emit(c * hard)
             state['soft'].append(soft.sum(-1).reshape(-1))
             return emit(c * soft)
-        read = x @ p['G'] if ARM == 'dir' else c.abs() * p['U'].norm(dim=1)
+        read = x @ p['G'] if ARM == 'dir' else c if start == 'neuron' else c.abs() * p['U'].norm(dim=1)
         if router is not None:
             if n.endswith('c_fc'):
                 state['route'][layer] = torch.relu(x @ router['G1'])
@@ -725,8 +749,11 @@ def evaluate(final=False):
 # threshold's its map's noise scale x 33. DESCENT_LR multiplies every step size (default 1).
 LR = float(os.environ.get('DESCENT_LR', '1'))
 rms = lambda q: q.detach().pow(2).mean().sqrt().item()
+# DESCENT_FREEZE=1: the slices stay as they start (M's own, for the neuron start) and only the gates
+# train, so every part on is M exactly at every step.
+FREEZE = os.environ.get('DESCENT_FREEZE') == '1'
 slots = [(P[n], w, rms(P[n][w])) for n in mlp for w in (('F',) if EXACT else ('V', 'U')) + (('G',) if ARM == 'dir' else ())
-         if not (EXACT and NEURON_DOWN and n.endswith('down_proj') and w == 'F')]
+         if not (EXACT and NEURON_DOWN and n.endswith('down_proj') and w == 'F') and not (FREEZE and w in ('V', 'U', 'F'))]
 slots += [(A[n], 'F', rms(A[n]['F'])) for n in attn] + [(A[n], 'tau', 100 / 3 * A[n]['s'].mean().item()) for n in attn]
 for l, S in SHARE_A.items():
     slots += [(S, 't', 100 / 3 * S['s'].mean().item()), (S, 'L_v', 20 / 3), (S, 'L_o', 20 / 3)]
