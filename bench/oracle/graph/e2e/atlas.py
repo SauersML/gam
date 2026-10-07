@@ -125,10 +125,19 @@ def figure(rows: dict, columns: list[str], out: Path) -> None:
         return
     m = np.array([[rows[b].get(c, 0.0) for c in used] for b in rows])
     plt.rcParams.update({"font.size": 18, "figure.facecolor": "white", "axes.facecolor": "white", "savefig.facecolor": "white"})
-    fig, ax = plt.subplots(figsize=(1.0 + 0.45 * len(used) + 4, 0.45 * len(rows) + 3))
+    fig, ax = plt.subplots(figsize=(max(12.0, 1.1 * len(used) + 6), 0.8 * len(rows) + 3))
     ax.imshow(m, cmap="Blues", vmin=0, vmax=1, aspect="auto")
-    ax.set_xticks(range(len(used)), used, rotation=90, fontsize=14)
-    ax.set_yticks(range(len(rows)), list(rows), fontsize=14)
+    for i in range(m.shape[0]):  # MLP cells carry the fraction of the layer's units the program uses
+        for j, c in enumerate(used):
+            if ".mlp" in c or ".vpd" in c:
+                if m[i, j] > 0:
+                    ax.text(j, i, f"{m[i, j]:.0%}", ha="center", va="center", fontsize=15, color="white" if m[i, j] > 0.5 else "black")
+    ax.set_xticks(range(len(used)), used, rotation=90, fontsize=16)
+    ax.set_yticks(range(len(rows)), list(rows), fontsize=16)
+    ax.set_xticks([x - 0.5 for x in range(1, len(used))], minor=True)
+    ax.set_yticks([y - 0.5 for y in range(1, len(rows))], minor=True)
+    ax.grid(which="minor", color="white", linewidth=3)
+    ax.tick_params(which="minor", length=0)
     ax.set_title("Pieces each behavior's best program uses", loc="left")
     fig.tight_layout()
     out.parent.mkdir(parents=True, exist_ok=True)

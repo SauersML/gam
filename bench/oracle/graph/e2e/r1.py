@@ -109,6 +109,14 @@ def main() -> None:
     a.out.parent.mkdir(parents=True, exist_ok=True)
     Path(f"{a.out}.tsv").write_text("\t".join(cols) + "\n" + "".join("\t".join(fmt(r[c]) for c in cols) + "\n" for r in rows))
     print(figure(rows, FIGURES / f"{a.out.name}.png", a.title))
+    # the programs that beat the empty program, as {"behavior", "source", "score"} (atlas.py, export_best.py)
+    best = Path(f"{a.out}_best")
+    best.mkdir(parents=True, exist_ok=True)
+    for r in rows:
+        if r["recovered"] > 0:
+            found = json.loads(Path(r["file"]).read_text())
+            (best / f"{r['behavior']}.json").write_text(json.dumps({"behavior": r["behavior"], "source": found["source"],
+                                                                    "score": found["score"], "origin": r["file"]}))
     for r in rows:
         print(f"{r['behavior']:30s} {r['heads']:2d} heads {r['neurons']:5d} neurons  {r['total']:6.2f} vs {r['empty_total']:6.2f}  "
               f"recovered {r['recovered']:5.2f}  held-out exec {fmt(r['heldout_exec'])} vs {fmt(r['empty_heldout_exec'])}")
