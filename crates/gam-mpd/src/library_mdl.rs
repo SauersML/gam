@@ -2081,6 +2081,9 @@ struct Scorer {
     written: Option<(Relaxation, u64)>,
     version: u64,
     assignment_step: Option<f64>,
+    /// Per shared stage (its assignment operator) the budget count's derivative per token in its
+    /// assignment at the step's relaxed assignment (`complexity_terms`).
+    assignment_budget: Vec<(usize, Array2<f64>)>,
 }
 
 impl Scorer {
@@ -2127,7 +2130,7 @@ impl Scorer {
         let stages = mlps.iter().enumerate().map(|(l, mlp)| if mlp.is_some() { Ok(Vec::new()) } else { GatedStage::of(&flat, explanation, l) }).collect::<Result<_, String>>()?;
         let position = explanation.trainable.iter().enumerate().map(|(i, op)| (*op, i)).collect();
         let scope = Some(scope(explanation)).filter(|blocks| !blocks.iter().all(|b| *b));
-        Ok(Self { experiments, mlps, stages, position, scope, families: settings.families.clone(), edits: std::cell::RefCell::new(BTreeMap::new()), assignments, written: None, version: 0, assignment_step: None })
+        Ok(Self { experiments, mlps, stages, position, scope, families: settings.families.clone(), edits: std::cell::RefCell::new(BTreeMap::new()), assignments, written: None, version: 0, assignment_step: None, assignment_budget: Vec::new() })
     }
 
     /// Writes the shared stages' assignments into `P`'s program under `relaxation`, unless they
@@ -2170,6 +2173,19 @@ impl Scorer {
         for a in &self.assignments {
             map.remove(&a.operator);
         }
+    }
+
+    /// The budget's pull on the assignments (`Settings::budget`): `factor` times the count's
+    /// derivative per token in each, chained to its logits and added to the step's gathered
+    /// gradient, in the data term's units (as the budget's pull on the posterior's operators is).
+    fn pull_assignments(&mut self, factor: f64) {
+        let pulls = std::mem::take(&mut self.assignment_budget);
+        for (op, g) in &pulls {
+            if let Some(a) = self.assignments.iter_mut().find(|a| a.operator == *op) {
+                a.gather(&g.mapv(|v| v * factor));
+            }
+        }
+        self.assignment_budget = pulls;
     }
 
     /// Clears the step's gathered assignment gradients (before a step's passes).
@@ -2460,6 +2476,8 @@ fn complexity_terms(scorer: &mut Scorer, device_posterior: &DevicePosterior, exp
     let alive = |g: &usize| active[*g];
     let mut count = 0.0;
     let mut terms = Vec::new();
+    // Per shared stage the count's derivative per token in its assignment.
+    let mut assignment_terms = Vec::new();
     for (l, (layer, mlp)) in explanation.layers.iter().zip(&scorer.mlps).enumerate() {
         count += (layer.heads.iter().filter(|(_, values)| values.iter().any(alive)).count() * rows) as f64;
         let Some(mlp) = mlp else {
@@ -2484,7 +2502,10 @@ fn complexity_terms(scorer: &mut Scorer, device_posterior: &DevicePosterior, exp
                     Some(op) => Some(scorer.assignments.iter().find(|a| a.operator == op).ok_or("a shared stage without its assignment")?.values(relaxation)),
                     None => None,
                 };
-                let (expected, gate_terms) = gated_expected(d, arithmetic, trace.value(stage.input)?, gate, (&bias.0, &bias.1), &rank, assign.as_ref())?;
+                let (expected, gate_terms, assigned) = gated_expected(d, arithmetic, trace.value(stage.input)?, gate, (&bias.0, &bias.1), &rank, assign.as_ref())?;
+                if let (Some(op), Some(g)) = (stage.assign, assigned) {
+                    assignment_terms.push((op, g * per));
+                }
                 if let (Some((i, _, _)), Some((mean, variance))) = (&direction, gate_terms) {
                     terms.push((*i, mean * per, variance * per));
                 }
@@ -2534,6 +2555,10 @@ fn complexity_terms(scorer: &mut Scorer, device_posterior: &DevicePosterior, exp
             terms.push((j, expected.bias_mean.insert_axis(ndarray::Axis(1)) * per, expected.bias_variance.insert_axis(ndarray::Axis(1)) * per));
         }
     }
+    // The step's own (not the move's test's) for the assignment's pull ([`Scorer::pull_assignments`]).
+    if !previous {
+        scorer.assignment_budget = assignment_terms;
+    }
     Ok((count / rows as f64, terms))
 }
 
@@ -2547,7 +2572,8 @@ fn complexity_terms(scorer: &mut Scorer, device_posterior: &DevicePosterior, exp
 /// without the budget. A shared stage (`assign`, gates × components, as the pass wrote it) has
 /// its gates' pre-activations `m` (an own gate's `Σ_b A_mb n_b + μ_c`, `n_b` the squared read
 /// norms its input holds) and variances `s²`, and each component takes `m A` and `s² (A ⊙ A)`,
-/// as its Gated node does; the gates' derivatives gather the components' through `A`.
+/// as its Gated node does; the gates' derivatives gather the components' through `A`, and the
+/// count's derivative in `A` itself is returned (summed over the rows; none for an unshared stage).
 fn gated_expected(
     d: &Device,
     arithmetic: gam_gpu::tensor::Arithmetic,
@@ -2556,7 +2582,7 @@ fn gated_expected(
     (bias_mean, bias_variance): (&[f64], &[f64]),
     rank: &[f64],
     assign: Option<&Array2<f64>>,
-) -> Result<(crate::library_complexity::Expected, Option<(Array2<f64>, Array2<f64>)>), String> {
+) -> Result<(crate::library_complexity::Expected, Option<(Array2<f64>, Array2<f64>)>, Option<Array2<f64>>), String> {
     use gam_gpu::tensor::GateFunction;
     let rows = input.rows();
     let parts = rank.len();
@@ -2608,14 +2634,15 @@ fn gated_expected(
     d.add_row(&mut m, 1.0, &row(bias_mean)?).map_err(error)?;
     d.add_row(&mut s2, 1.0, &row(bias_variance)?).map_err(error)?;
     // Per component: through the assignment where the stage is shared.
+    let (m_gate, s2_gate) = (m, s2);
     let (m, s2) = match &shared {
         Some((a, a2)) => {
             let (mut mb, mut s2b) = (d.empty(rows, parts).map_err(error)?, d.empty(rows, parts).map_err(error)?);
-            d.gemm(&mut mb, 1.0, &m, Op::N, a, Op::N, 0.0, arithmetic).map_err(error)?;
-            d.gemm(&mut s2b, 1.0, &s2, Op::N, a2, Op::N, 0.0, arithmetic).map_err(error)?;
+            d.gemm(&mut mb, 1.0, &m_gate, Op::N, a, Op::N, 0.0, arithmetic).map_err(error)?;
+            d.gemm(&mut s2b, 1.0, &s2_gate, Op::N, a2, Op::N, 0.0, arithmetic).map_err(error)?;
             (mb, s2b)
         }
-        None => (m, s2),
+        None => (d.copy(&m_gate).map_err(error)?, d.copy(&s2_gate).map_err(error)?),
     };
     let s = d.gate_function(GateFunction::Sqrt, &s2, None).map_err(error)?;
     // Per row and component, weighted by its rank: P = Φ(m/s), ∂P/∂m = φ(m/s)/s and
@@ -2630,15 +2657,35 @@ fn gated_expected(
     let slope = weighted(&d.gate_function(GateFunction::CdfSlope, &m, Some(&s)).map_err(error)?)?;
     let spread = weighted(&d.gate_function(GateFunction::Ratio, &d.gate_function(GateFunction::CdfScaleSlope, &m, Some(&s)).map_err(error)?, Some(&s)).map_err(error)?)?;
     // Back to the gates through the assignment: ∂/∂m_g = Σ_b A_gb ∂/∂m_b, ∂/∂s²_g = Σ_b A_gb² ∂/∂s²_b.
-    let (slope, spread) = match &shared {
+    let (slope_gate, spread_gate) = match &shared {
         Some((a, a2)) => {
             let (mut sg, mut pg) = (d.empty(rows, gates).map_err(error)?, d.empty(rows, gates).map_err(error)?);
             d.gemm(&mut sg, 1.0, &slope, Op::N, a, Op::T, 0.0, arithmetic).map_err(error)?;
             d.gemm(&mut pg, 1.0, &spread, Op::N, a2, Op::T, 0.0, arithmetic).map_err(error)?;
             (sg, pg)
         }
-        None => (slope, spread),
+        None => (d.copy(&slope).map_err(error)?, d.copy(&spread).map_err(error)?),
     };
+    // The count's derivative in the assignment (gates × components, summed over the rows): through
+    // each component's pre-activation `m A` (`mᵀ ∂/∂m_b`), its variance `s² (A ⊙ A)`
+    // (`2 A_gb (s²ᵀ ∂/∂s²_b)`, `spread` being `2 ∂/∂s²`), and an own gate's pooling `n Aᵀ` of the
+    // read norms (`(∂/∂m_g)ᵀ n`).
+    let assigned = match (&shared, assign) {
+        (Some(_), Some(host)) => {
+            let (mut direct, mut varied) = (d.empty(gates, parts).map_err(error)?, d.empty(gates, parts).map_err(error)?);
+            d.gemm(&mut direct, 1.0, &m_gate, Op::T, &slope, Op::N, 0.0, arithmetic).map_err(error)?;
+            d.gemm(&mut varied, 1.0, &s2_gate, Op::T, &spread, Op::N, 0.0, arithmetic).map_err(error)?;
+            let mut total = d.download(&direct).map_err(error)? + d.download(&varied).map_err(error)? * host;
+            if gate.is_none() {
+                let mut pooled = d.empty(gates, parts).map_err(error)?;
+                d.gemm(&mut pooled, 1.0, &slope_gate, Op::T, input, Op::N, 0.0, arithmetic).map_err(error)?;
+                total += &d.download(&pooled).map_err(error)?;
+            }
+            Some(total)
+        }
+        _ => None,
+    };
+    let (slope, spread) = (slope_gate, spread_gate);
     let ones = d.upload_vec(1, rows, vec![1.0; rows]).map_err(error)?;
     let column_sums = |t: &Tensor| -> Result<ndarray::Array1<f64>, String> {
         let mut out = d.empty(1, t.cols()).map_err(error)?;
@@ -2658,7 +2705,7 @@ fn gated_expected(
         None => None,
     };
     let expected = crate::library_complexity::Expected { count, rows, mean: Array2::zeros((gates, 0)), variance: Array2::zeros((gates, 0)), bias_mean, bias_variance };
-    Ok((expected, gate_terms))
+    Ok((expected, gate_terms, assigned))
 }
 
 /// The test of the posterior's pending move (`DevicePosterior::pending_divergence`) on this step's
@@ -4170,6 +4217,9 @@ pub fn fit_from(
                             prior_curvature.insert(op, bend);
                         }
                     }
+                }
+                if lambda != 0.0 {
+                    scorer.pull_assignments(lambda / (scale * LN_2));
                 }
                 parts_note = format!(", parts per token {expected:.4} (K {limit}), λ {:.4e}", progress.multiplier);
             }
