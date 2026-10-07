@@ -64,9 +64,9 @@ def test_strip_english_complements_mech_english():
         assert text not in code and text in mech.english(PROGRAM)
     assert "prev = node(L[1].head[1])" in code and "edges(embed >> prev.query, prev >> logits)" in code
     compile(code, "<stripped>", "exec")
-    assert mech.code_length(code)[0] == mech.code_length(PROGRAM)[0] + 1  # the emptied body's `...`
+    assert mech.code_length(code)[0] == mech.code_length(PROGRAM)[0]  # the English costs no code tokens
     # An unparseable program loses its comments only.
-    assert "# c" not in S.strip_english("x = (1 +  # c\n")
+    assert "# c" not in S.strip_english("x = = 1  # c\n")
 
 
 def test_words_every_kind():
@@ -115,7 +115,7 @@ class StubReader:
     def __init__(self, tokenizer):
         self.tokenizer = tokenizer
         self.calls = 0
-        self.rome = tokenizer.encode("Rome", add_special_tokens=False)
+        self.rome = tokenizer.encode(" Rome", add_special_tokens=False)
 
     def describe(self):
         return {"backend": self.name}

@@ -142,15 +142,15 @@ def words(e: dict) -> str:
 
 def strip_english(source: str) -> str:
     """The program's code without its English: every string expression statement (docstrings included)
-    and every comment removed. A program that does not parse loses its comments only."""
+    and every comment removed. A program that does not parse loses its comments only, and one that does
+    not tokenize stays as it is."""
     try:
         tree = ast.parse(source)
     except SyntaxError:
-        out = []
-        for t in tokenize.generate_tokens(io.StringIO(source).readline):
-            if t.type != tokenize.COMMENT:
-                out.append(t)
-        return tokenize.untokenize(out)
+        try:
+            return tokenize.untokenize([t for t in tokenize.generate_tokens(io.StringIO(source).readline) if t.type != tokenize.COMMENT])
+        except tokenize.TokenError:  # not even tokenizable: the text as it is
+            return source
     for node in ast.walk(tree):
         body = getattr(node, "body", None)
         if isinstance(body, list):
