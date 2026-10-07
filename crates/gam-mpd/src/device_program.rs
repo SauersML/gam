@@ -1520,8 +1520,9 @@ impl DeviceProgram {
     /// component of `c` is on, and for a write from a gated node (its value zero off its lists)
     /// column `c` sums `x[r, c] cot[r, :]` over them. Each gated node's rows per component
     /// (`by_group`) are made once a reverse. `None` for the dense product.
-    fn listed_gradient(&self, trace: &DeviceTrace, (node, input): (usize, usize), cot: &Tensor, storage: Storage, (edited, seeded): (&BTreeSet<usize>, &BTreeSet<usize>), by_group: &mut BTreeMap<usize, Arc<RowLists>>) -> Result<Option<Tensor>, String> {
-        if storage == Storage::Bf16 || cot.storage() != storage || matches!(self.steps[input], Step::Feature { .. }) {
+    fn listed_gradient(&self, trace: &DeviceTrace, (node, input): (usize, usize), cot: &Tensor, (storage, arithmetic): (Storage, Arithmetic), (edited, seeded): (&BTreeSet<usize>, &BTreeSet<usize>), by_group: &mut BTreeMap<usize, Arc<RowLists>>) -> Result<Option<Tensor>, String> {
+        // As the lists' products (`listed_operand`): a bfloat16 pass takes the dense product.
+        if storage == Storage::Bf16 || arithmetic == Arithmetic::Bf16 || cot.storage() != storage || matches!(self.steps[input], Step::Feature { .. }) {
             return Ok(None);
         }
         let read = self.gated_reads[node].filter(|r| trace.lists.contains_key(r) && !seeded.contains(&node) && !edited.contains(&node));
@@ -1547,9 +1548,18 @@ impl DeviceProgram {
         gradient.map(Some).map_err(error)
     }
 
-    /// `A` held dense in f32 or f64 in `x`'s storage, for a product on per-row lists; `None` for
-    /// the dense product.
-    fn listed_operand(&self, operator: usize, x: &Tensor) -> Result<Option<&Tensor>, String> {
+    /// `A` held dense in f32 or f64 in `x`'s storage, for a product on per-row lists in
+    /// `arithmetic`; `None` for the dense product. The lists' products read `A`'s rows per listed
+    /// entry without reuse across rows, so they are bound by memory where the dense product is
+    /// bound by arithmetic: on an A40 at vpd4l's MLP sizes (768 → 3072, 2048 rank-one columns,
+    /// 4096 rows; mpd_gated_block_bench_2951) the forward with 1% of the entries on took 12.3 ms
+    /// against the dense f32 forward's 13.6 and with 3% 17.8 against 13.8, and only at 0.2% did it
+    /// match the bfloat16 tensor-core forward (9.6 against 9.8 ms). A pass in bfloat16 (the
+    /// training passes on CUDA) therefore takes the dense products.
+    fn listed_operand(&self, operator: usize, x: &Tensor, arithmetic: Arithmetic) -> Result<Option<&Tensor>, String> {
+        if arithmetic == Arithmetic::Bf16 {
+            return Ok(None);
+        }
         Ok(match self.held(operator, Role::Product)? {
             Held::Dense(a) if a.storage() != Storage::Bf16 && a.storage() == x.storage() => Some(a),
             _ => None,
@@ -1561,12 +1571,12 @@ impl DeviceProgram {
     /// components on in that row only. `None` for the dense product.
     fn gated_read(&self, trace: &mut DeviceTrace, node: usize, (argument, operator): (usize, usize)) -> Result<Option<Tensor>, String> {
         let Some(gated) = self.gated_reads[node] else { return Ok(None) };
-        if self.listed_operand(operator, trace.value(argument)?)?.is_none() {
+        if self.listed_operand(operator, trace.value(argument)?, self.arithmetic)?.is_none() {
             return Ok(None);
         }
         let Some(lists) = self.row_lists(trace, gated)? else { return Ok(None) };
         let x = trace.value(argument)?;
-        let a = self.listed_operand(operator, x)?.ok_or("device: a listed operand")?;
+        let a = self.listed_operand(operator, x, self.arithmetic)?.ok_or("device: a listed operand")?;
         self.device.sampled_product(x, a, &lists).map(Some).map_err(error)
     }
 
@@ -1575,13 +1585,13 @@ impl DeviceProgram {
     /// components on in that row only (`v Aᵀ` from `v`'s listed entries). `None` for the dense
     /// product.
     fn listed_write(&self, trace: &mut DeviceTrace, (argument, operator): (usize, usize)) -> Result<Option<Tensor>, String> {
-        if self.listed[argument].is_none() || self.listed_operand(operator, trace.value(argument)?)?.is_none() {
+        if self.listed[argument].is_none() || self.listed_operand(operator, trace.value(argument)?, self.arithmetic)?.is_none() {
             return Ok(None);
         }
         let Some(lists) = self.row_lists(trace, argument)? else { return Ok(None) };
         let d = &self.device;
         let v = trace.value(argument)?;
-        let a = self.listed_operand(operator, v)?.ok_or("device: a listed operand")?;
+        let a = self.listed_operand(operator, v, self.arithmetic)?.ok_or("device: a listed operand")?;
         d.listed_product(v, &lists, &d.transpose(a).map_err(error)?).map(Some).map_err(error)
     }
 
@@ -2594,7 +2604,7 @@ impl DeviceProgram {
                     for (i, (argument, operator)) in terms.iter().enumerate() {
                         // A cotangent of the argument kept or edited is the dense one.
                         let observed = keep.contains(argument) || edited.contains(argument);
-                        if needed[*argument] && !matches!(self.steps[*argument], Step::Feature { .. }) && let Some(term) = self.listed_pull(trace, (index, *argument, *operator), &cot, (observed, edited, &seeded))? {
+                        if needed[*argument] && !matches!(self.steps[*argument], Step::Feature { .. }) && let Some(term) = self.listed_pull(trace, (index, *argument, *operator), &cot, (observed, edited, &seeded), arithmetic)? {
                             add(&mut g, *argument, term)?;
                             continue;
                         }
@@ -2856,15 +2866,15 @@ impl DeviceProgram {
     /// the rest of its value's cotangent), and from a gated read's cotangent, zero off its lists,
     /// `cot A` from the listed entries alone. `None` for the dense pull: the argument's cotangent
     /// kept or edited (`observed`), or this node's cotangent seeded or edited.
-    fn listed_pull(&self, trace: &DeviceTrace, (node, argument, operator): (usize, usize, usize), cot: &Tensor, (observed, edited, seeded): (bool, &BTreeSet<usize>, &BTreeSet<usize>)) -> Result<Option<Tensor>, String> {
+    fn listed_pull(&self, trace: &DeviceTrace, (node, argument, operator): (usize, usize, usize), cot: &Tensor, (observed, edited, seeded): (bool, &BTreeSet<usize>, &BTreeSet<usize>), arithmetic: Arithmetic) -> Result<Option<Tensor>, String> {
         let d = &self.device;
         if let Some(lists) = self.gated_reads[node].and_then(|r| trace.lists.get(&r)).filter(|_| !seeded.contains(&node) && !edited.contains(&node))
-            && let Some(a) = self.listed_operand(operator, cot)?
+            && let Some(a) = self.listed_operand(operator, cot, arithmetic)?
         {
             return d.listed_product(cot, lists, a).map(Some).map_err(error);
         }
         if let Some(lists) = trace.lists.get(&argument).filter(|_| !observed && self.listed[argument].is_some())
-            && let Some(a) = self.listed_operand(operator, cot)?
+            && let Some(a) = self.listed_operand(operator, cot, arithmetic)?
         {
             return d.sampled_product(cot, &d.transpose(a).map_err(error)?, lists).map(Some).map_err(error);
         }
@@ -3176,7 +3186,7 @@ impl DeviceProgram {
             if let Step::Affine { terms, .. } = step {
                 for (input, op) in terms {
                     if let Some(storage) = gradients.values.get(op).map(Tensor::storage)
-                        && let Some(part) = self.listed_gradient(trace, (node, *input), cot, storage, (edited, &seeded), &mut by_group)?
+                        && let Some(part) = self.listed_gradient(trace, (node, *input), cot, (storage, arithmetic), (edited, &seeded), &mut by_group)?
                     {
                         let (gradient, beta) = gradients.ready(&self.device, *op, true)?.ok_or("device: a gradient slot")?;
                         if beta == 0.0 {
