@@ -1084,6 +1084,11 @@ def residual_bits():
 # that holds E[k] where it is.
 B = train_rows * 512 / (batch * seq)
 DUAL = os.environ.get('DESCENT_DUAL', 'measured')
+# DESCENT_DUAL=logint: the budget term lambda (E[k] - K) with log lambda integrated, log lambda <- log
+# lambda + (E[k] - K) / (K B_H), lambda started at the median over thresholds of the balance
+# |dF/dtau| / |dE[k]/dtau| (edits' rule in the Rust fitter); B_H, the horizon in steps, is a tenth of the
+# evaluation interval (about 0.5M tokens), as a whole pass over the training rows is never reached here.
+B_H = max(1, EVAL // 10)
 lam, rng = 0.0, np.random.default_rng(0)
 log = {'start': start, 'K': K, 'steps': steps, 'gate': gate, 'arm': ARM, 'dual': DUAL, 'train_rows': train_rows, 'F': FMODE, 'edges': EDGES, 'trace': []}
 # DESCENT_SAVE=PATH: after every evaluation, the MLP maps' slices and gates at the posterior mean
@@ -1147,7 +1152,18 @@ for step in range(steps):
         Kt = K0 * (K / K0) ** min(1.0, step / B)
     else:
         Kt = K
-    if DUAL == 'fixed':
+    if DUAL == 'logint':
+        if step == 0:
+            # lambda starts at the median over thresholds of the balance |dF/dtau| / |dE[k]/dtau|.
+            taus = [mu for _, key, mu, _ in leaves if key == 'tau'] if FMODE else [cont[key] for cont, key, _ in slots if key == 'tau']
+            gF = torch.autograd.grad(objective, taus, retain_graph=True, allow_unused=True)
+            gk = torch.autograd.grad(ek, taus, retain_graph=True, allow_unused=True)
+            ratio = torch.cat([(a.abs() / b.abs()).reshape(-1)[b.abs().reshape(-1) > 0] for a, b in zip(gF, gk) if a is not None and b is not None])
+            lam = max(ratio.median().item(), 1e-12) if ratio.numel() else 1e-3
+        opt.zero_grad(); (objective + lam * (ek - K)).backward(); opt.step()
+        lam = lam * math.exp((ek.item() - K) / (K * B_H))
+        g_f = None
+    elif DUAL == 'fixed':
         opt.zero_grad(); (objective + lam * torch.log(ek)).backward(); opt.step()
         lam = max(0.0, lam + 0.01 * math.log(ek.item() / K))
         g_f = None
