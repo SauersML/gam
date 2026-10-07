@@ -755,7 +755,8 @@ impl Units {
 /// component, an o or down_proj slice gated on its own read), `grouped_own` and
 /// `grouped_direction` (the grouped components gated by their first read slice, in units of its
 /// spread), and `grouped_mixed` (`grouped_own`'s MLP components rotated and gate-shared within
-/// co-firing groups of neurons, [`cofiring`]). Gates start at `τ = 0`, widths the reads' spreads on the fitting rows, as for the
+/// co-firing groups of neurons, [`cofiring`]; `direction_mixed` the same on `grouped_direction`'s
+/// gates). Gates start at `τ = 0`, widths the reads' spreads on the fitting rows, as for the
 /// frames. Heads must own their keys and values (no grouped-query sharing).
 fn unit_start(native: &OperatorProgram, layers: &[LayerNodes], value: &dyn Fn(usize) -> Result<Array2<f64>, String>, dir: &Path, axes: bool) -> Result<Value, String> {
     std::fs::create_dir_all(dir).map_err(error)?;
@@ -925,16 +926,19 @@ fn unit_start(native: &OperatorProgram, layers: &[LayerNodes], value: &dyn Fn(us
     for (b, c) in shared {
         per_slice_shared[b]["candidates"] = json!(c);
     }
-    let mut grouped_mixed = grouped.clone();
+    // The mixed arms' components (`grouped` and `direction` list the same units in one order).
+    let (mut grouped_mixed, mut direction_mixed) = (grouped.clone(), direction.clone());
     for (b, c) in mixed_candidates {
         grouped_mixed[b]["candidates"] = json!(c);
+        direction_mixed[b]["candidates"] = json!(c);
     }
     let arms = json!([
         {"arm": "per_slice_own", "components": per_slice},
         {"arm": "per_slice_own_shared", "components": per_slice_shared},
         {"arm": "grouped_own", "components": grouped},
         {"arm": "grouped_mixed", "components": grouped_mixed, "mixing": mixing},
-        {"arm": "grouped_direction", "components": direction}
+        {"arm": "grouped_direction", "components": direction},
+        {"arm": "direction_mixed", "components": direction_mixed, "mixing": mixing}
     ]);
     std::fs::write(dir.join("start.json"), arms.to_string()).map_err(error)?;
     Ok(json!({"frame": name, "components": grouped.len(), "slices": per_slice.len(), "sites": sites.len()}))
