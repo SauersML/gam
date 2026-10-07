@@ -659,6 +659,20 @@ for n in sliced: T.site(n)._forward = make_attn(n)
 # K of VPD's MLP subcomponents under the same rule (VPD's per-map counts times K / 129, each subcomponent at a
 # width of 1% of its tensor's root mean square, as ours start, plus its index).
 ROT, ROTG = {}, int(os.environ.get('DESCENT_ROT', '32'))
+# DESCENT_ROT_ATTN (default: a head's coordinates): the attention groups' size, in coordinates of the map's whole
+# output (q, k, v) or input (o) across heads; 768 is the whole map, so a block's direction may span heads (as
+# VPD's q and k subcomponents do: with groups inside a head the budget's one to four q slices per layer reached
+# one to four heads, and the rest attended uniformly).
+ROTGA = int(os.environ.get('DESCENT_ROT_ATTN', '0'))
+# A slice's assignment logits start at ln(99 (g - 1)) on its own block and 0 elsewhere: 99% of its weight on its own
+# block whatever the group size (a fixed 6 gives 93% at g = 32 and 34% at g = 768).
+ASSIGN0 = lambda g: math.log(99 * (g - 1))
+_masks = {}
+def mask_of(g):
+    """The strict upper triangle of a g x g matrix (where the angles live)."""
+    if g not in _masks:
+        _masks[g] = torch.triu(torch.ones(g, g, device=dev), 1)
+    return _masks[g]
 # A layer's neuron permutation and its inverse are gathers whose backward is the other permutation's gather
 # (indexing's backward, an accumulating scatter through a sort, took 55 of 248 ms of a whole-model step's device
 # time on an A40).
@@ -694,10 +708,10 @@ if ARM == 'rot':
                 free[pick] = False; perm += pick
             perm = torch.tensor(perm, device=dev); ng = perm.numel() // ROTG
             Gf = Wf[perm].view(ng, ROTG, -1); Gd = Wd[:, perm].T.reshape(ng, ROTG, -1)
-            ROT[l] = {'perm': perm, 'inv': torch.argsort(perm), 'ng': ng, 'di': Wf.shape[1], 'do': Wd.shape[0],
+            ROT[l] = {'perm': perm, 'inv': torch.argsort(perm), 'ng': ng, 'g': ROTG, 'di': Wf.shape[1], 'do': Wd.shape[0],
                       'Gfc': Gf @ Gf.transpose(1, 2), 'Gdn': Gd @ Gd.transpose(1, 2),                 # [ng, g, g] Grams
                       'A': torch.zeros(ng, ROTG, ROTG, device=dev, requires_grad=True),
-                      'L': (6.0 * torch.eye(ROTG, device=dev)).repeat(ng, 1, 1).requires_grad_(),
+                      'L': (ASSIGN0(ROTG) * torch.eye(ROTG, device=dev)).repeat(ng, 1, 1).requires_grad_(),
                       'tau': torch.zeros(ng, ROTG, device=dev, requires_grad=True), 's': torch.ones(ng, ROTG, device=dev),
                       'ls_fc': torch.full((ng, ROTG), math.log(0.01 * Wf.pow(2).mean().sqrt().item()), device=dev, requires_grad=True),
                       'ls_dn': torch.full((ng, ROTG), math.log(0.01 * Wd.pow(2).mean().sqrt().item()), device=dev, requires_grad=True)}
@@ -758,12 +772,12 @@ def rot_hi(A_):
 def rot_Q_all(As):
     """rot_Q of each angle tensor in As, the products batched (each group set squared as often as rot_Q
     squares it alone)."""
-    Ss = [A_ - A_.transpose(1, 2) for A_ in (rot_hi(a_ * MASK) for a_ in As)]
+    Ss = [A_ - A_.transpose(1, 2) for A_ in (rot_hi(a_ * mask_of(a_.shape[-1])) for a_ in As)]
     ks = [max(0, math.ceil(math.log2(max(v, 1e-12) / 0.25))) for v in torch.stack([S_.detach().abs().sum((1, 2)).max() for S_ in Ss]).tolist()]
     order = sorted(range(len(As)), key=lambda i: -ks[i])
     sizes = [As[i].shape[0] for i in order]
     X_ = torch.cat([Ss[i] / 2 ** ks[i] for i in order])
-    E_ = torch.eye(ROTG, device=X_.device, dtype=X_.dtype).expand_as(X_) + X_; term = X_
+    E_ = torch.eye(X_.shape[-1], device=X_.device, dtype=X_.dtype).expand_as(X_) + X_; term = X_
     for j in range(2, 10):
         term = term @ X_ / j; E_ = E_ + term
     for m in range(ks[order[0]] if As else 0):
@@ -778,11 +792,17 @@ def rot_Q(R):
     """The groups' bases Q = exp(S), S the skew part of A's strict upper triangle (Taylor series after
     scaling, then squaring: matrix products only, orthogonal to rounding), with every installed (or every
     posterior-mean) angle tensor's in one pass."""
-    A = R['A']
-    for name, As in (('installed', [R_['A'] for R_ in ROT_ALL]), ('mean', [R_['A_leaf'][0] for R_ in ROT_ALL if 'A_leaf' in R_])):
+    A = R['A']; g = A.shape[-1]
+    if g > 64:
+        # Large groups: the Cayley transform (I + S)^-1 (I - S), orthogonal for any skew S, one solve.
+        A_ = rot_hi(A * mask_of(g)); S_ = A_ - A_.transpose(1, 2)
+        I_ = torch.eye(g, device=S_.device, dtype=S_.dtype).expand_as(S_)
+        return torch.linalg.solve(I_ + S_, I_ - S_).float()
+    for name, As in (('installed', [R_['A'] for R_ in ROT_ALL if R_['A'].shape[-1] == g]),
+                     ('mean', [R_['A_leaf'][0] for R_ in ROT_ALL if 'A_leaf' in R_ and R_['A'].shape[-1] == g])):
         at = [i for i, t in enumerate(As) if t is A]
         if at:
-            return rot_memo((name, torch.is_grad_enabled()), As, lambda: rot_Q_all(As))[at[0]]
+            return rot_memo((name, torch.is_grad_enabled(), g), As, lambda: rot_Q_all(As))[at[0]]
     return rot_Q_all([A])[0]
 
 def rot_slice_bits(R, Q):
@@ -800,9 +820,10 @@ def rot_angle_bits(R):
     if 'A_leaf' not in R:
         return 0.0
     mu, ls = R['A_leaf']
-    e = (mu.pow(2) + (2 * ls).exp()) * MASK
-    vA = e.sum() / (MASK.sum() * mu.shape[0])
-    kl = 0.5 * (torch.log(vA) - 2 * ls + e / vA - 1) * MASK
+    M_ = mask_of(mu.shape[-1])
+    e = (mu.pow(2) + (2 * ls).exp()) * M_
+    vA = e.sum() / (M_.sum() * mu.shape[0])
+    kl = 0.5 * (torch.log(vA) - 2 * ls + e / vA - 1) * M_
     return 0.5 * (kl.sum(-1) + kl.sum(-2)) / math.log(2)
 
 def rot_tau_bits(R):
@@ -912,19 +933,19 @@ if ARM == 'rot' and attn:
     with torch.no_grad():
         for l in range(T.n_layer):
             Wq, Wk, Wv, Wo = (T.site(f'h.{l}.attn.{k}').W for k in ('q_proj', 'k_proj', 'v_proj', 'o_proj'))
-            ng = NH * HD // ROTG
-            sub = lambda: {'ng': ng, 'A': torch.zeros(ng, ROTG, ROTG, device=dev, requires_grad=True),
-                           'L': (6.0 * torch.eye(ROTG, device=dev)).repeat(ng, 1, 1).requires_grad_(),
-                           'tau': torch.zeros(ng, ROTG, device=dev, requires_grad=True), 's': torch.ones(ng, ROTG, device=dev)}
+            GA = ROTGA or HD; ng = NH * HD // GA
+            sub = lambda: {'ng': ng, 'g': GA, 'A': torch.zeros(ng, GA, GA, device=dev, requires_grad=True),
+                           'L': (ASSIGN0(GA) * torch.eye(GA, device=dev)).repeat(ng, 1, 1).requires_grad_(),
+                           'tau': torch.zeros(ng, GA, device=dev, requires_grad=True), 's': torch.ones(ng, GA, device=dev)}
             ROTA[l] = {}
             for name, W in (('q', Wq), ('k', Wk)):
-                G_ = W.view(ng, ROTG, -1)
+                G_ = W.view(ng, GA, -1)
                 ROTA[l][name] = {**sub(), 'G': G_ @ G_.transpose(1, 2), 'di': W.shape[1],
-                                 'ls': torch.full((ng, ROTG), math.log(0.01 * W.pow(2).mean().sqrt().item()), device=dev, requires_grad=True)}
-            Gv = Wv.view(ng, ROTG, -1); Go = Wo.T.reshape(ng, ROTG, -1)
+                                 'ls': torch.full((ng, GA), math.log(0.01 * W.pow(2).mean().sqrt().item()), device=dev, requires_grad=True)}
+            Gv = Wv.view(ng, GA, -1); Go = Wo.T.reshape(ng, GA, -1)
             ROTA[l]['ov'] = {**sub(), 'Gfc': Gv @ Gv.transpose(1, 2), 'Gdn': Go @ Go.transpose(1, 2), 'di': Wv.shape[1], 'do': Wo.shape[0],
-                             'ls_fc': torch.full((ng, ROTG), math.log(0.01 * Wv.pow(2).mean().sqrt().item()), device=dev, requires_grad=True),
-                             'ls_dn': torch.full((ng, ROTG), math.log(0.01 * Wo.pow(2).mean().sqrt().item()), device=dev, requires_grad=True)}
+                             'ls_fc': torch.full((ng, GA), math.log(0.01 * Wv.pow(2).mean().sqrt().item()), device=dev, requires_grad=True),
+                             'ls_dn': torch.full((ng, GA), math.log(0.01 * Wo.pow(2).mean().sqrt().item()), device=dev, requires_grad=True)}
 ROT_ALL = list(ROT.values()) + [R[x] for R in ROTA.values() for x in ('q', 'k', 'ov')]
 
 def rot_read_bits(R, Q):
@@ -954,7 +975,7 @@ def rot_gate(Rb, R, Lj, hot, Lsm, calib_key):
 
 def rot_blocks(R, r, bits_i, calib_key):
     """The gates of R's slices from their reads r [B, T, ng, g] and their bits bits_i [ng, g]."""
-    hot = F.one_hot(R['L'].argmax(-1), ROTG).float(); Lsm = torch.softmax(R['L'], -1)
+    hot = F.one_hot(R['L'].argmax(-1), R['L'].shape[-1]).float(); Lsm = torch.softmax(R['L'], -1)
     M_ = hot if state['mode'] == 'hard' else Lsm
     Rb = (qeinsum('btni,nij->btnj', r.pow(2), M_) + 1e-20).sqrt()
     Lj = qeinsum('ni,nij->nj', bits_i, M_) + rot_tau_bits(R) + rot_index_bits()
@@ -965,7 +986,7 @@ def rot_attention(i, h, causal):
     the heads' output at the query, M's weights throughout."""
     Rq, Rk, Ro = ROTA[i]['q'], ROTA[i]['k'], ROTA[i]['ov']; B_, T_ = h.shape[0], h.shape[1]
     site = lambda k: T.site(f'h.{i}.attn.{k}')
-    grp = lambda t_: t_.view(B_, T_, -1, ROTG)
+    grp = lambda t_: t_.view(B_, T_, -1, Rq['g'])
     q, k, v = site('q_proj')(h), site('k_proj')(h), site('v_proj')(h)
     Qq, Qk = rot_Q(Rq), rot_Q(Rk)
     cq = qeinsum('btnk,nki->btni', grp(q), Qq); ck = qeinsum('btnk,nki->btni', grp(k), Qk)
@@ -987,7 +1008,7 @@ def rot_attention(i, h, causal):
         co, si = T.cos[:T_, :NPL], T.sin[:T_, :NPL]
         d0 = co ** 2 * cv[..., 0, 0] + 2 * co * si * cv[..., 0, 1] + si ** 2 * cv[..., 1, 1]
         d1 = si ** 2 * cv[..., 0, 0] - 2 * co * si * cv[..., 0, 1] + co ** 2 * cv[..., 1, 1]
-        D = torch.cat((d0, d1), -1).clamp_min(0).transpose(1, 2).reshape(B_, T_, -1, ROTG)     # [B, T, ng, g] by coordinate
+        D = torch.cat((d0, d1), -1).clamp_min(0).transpose(1, 2).reshape(B_, T_, -1, Rq['g'])  # [B, T, ng, g] by coordinate
         rq = (cq.pow(2) * qeinsum('btnk,nki->btni', D, Qq.pow(2)) / HD + 1e-20).sqrt()
         cq = cq * rot_blocks(Rq, rq, rot_read_bits(Rq, Qq), f'h.{i}.attn.q_proj')
         ck = ck * rot_blocks(Rk, ck.abs(), rot_read_bits(Rk, Qk), f'h.{i}.attn.k_proj')
@@ -1646,12 +1667,13 @@ def description_bits():
         for nn_, s2, d_ in ((nf, sf, R['di']), (nd, sd, R['do'])):
             v = (nn_.sum() + d_ * s2.sum()) / (d_ * nn_.numel())
             total = total + 0.5 * (d_ * torch.log(v / s2) + (nn_ + d_ * s2) / v - d_).sum()
-    for _, key, mu, ls in leaves:
+    for cont, key, mu, ls in leaves:
         e = mu.pow(2) + (2 * ls).exp()
-        if key == 'A' and mu.dim() == 3 and mu.shape[-1] == ROTG:
+        if key == 'A' and any(cont is R for R in ROT_ALL):
             # Rotation angles: the strict upper triangle only.
-            v = (e * MASK).sum() / (MASK.sum() * mu.shape[0])
-            total = total + 0.5 * ((torch.log(v) - 2 * ls + e / v - 1) * MASK).sum()
+            M_ = mask_of(mu.shape[-1])
+            v = (e * M_).sum() / (M_.sum() * mu.shape[0])
+            total = total + 0.5 * ((torch.log(v) - 2 * ls + e / v - 1) * M_).sum()
             continue
         if PART_PRIOR and key in ('V', 'U') and mu.dim() >= 2:
             # A read's part is its last axis (MLP [d_in, r], heads [H, d, C]), a write's its second last
