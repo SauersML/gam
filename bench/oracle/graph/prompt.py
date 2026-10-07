@@ -60,18 +60,18 @@ def views(model: str) -> tuple[str, str]:
     heads = f"{s['heads']} attention heads" + (f" ({s['kv_heads']} key-value groups of {groups})" if groups > 1 else "")
     sizes = (f"Model {model}: {s['layers']} layers (0..{s['layers'] - 1}); per layer {heads} and {s['d_mlp']} MLP "
              f"neurons; vocabulary {s['vocab']} tokens.")
-    pieces = [f"  L[l].head[h] (head h of layer l: its query, key, value and output weights), "
-              f"L[l].mlp[i, ...] (MLP neurons),"]
+    pieces = ["  L[l].head[h] (head h of layer l: its query, key, value and output weights), "
+              "L[l].mlp[i, ...] (MLP neurons)"]
     if s["views"].get("vpd"):
         sites = ", ".join(f"{k} {v}" for k, v in s["views"]["vpd"][0].items())
         pieces.append(f"  PD.vpd[l].<site>[i, ...] (rank-one subcomponents of VPD's decomposition of a weight matrix; "
-                      f"per layer {sites}),")
+                      f"per layer {sites})")
     if s["views"].get("library"):
-        pieces.append("  PD.lib[l].<site>[i, ...] (parts of our decomposition),")
+        pieces.append("  PD.lib[l].<site>[i, ...] (parts of our decomposition)")
     if s["views"].get("transcoder"):
         pieces.append(f"  PD.tc[l][i, ...] (transcoder features replacing layer l's MLP; "
-                      f"{s['views']['transcoder'][0]} per layer),")
-    return sizes, "\n".join(pieces) + "\n"
+                      f"{s['views']['transcoder'][0]} per layer)")
+    return sizes, ",\n".join(pieces) + ".\n"
 
 
 def show(model: str, ids: list[int], t: int, top) -> str:
