@@ -8,7 +8,9 @@
 #   BINARY  mpd_library_mdl_2951 built at the commit under test (fastcheck build --release)
 #   TOY     the toys to run (all seven when none), each also as seeds 1 and 2 (TOY_s1, TOY_s2)
 # GATE_DEVICE (host or gpu, default host) is the fits' device; GATE_FITS (default the four below,
-# ARM:BUDGET separated by spaces) runs only those fits, so lanes can split a toy's fits.
+# ARM:BUDGET separated by spaces) runs only those fits, so lanes can split a toy's fits; GATE_LEASE
+# (GiB, default 4) is a fit's memory lease. A fit that fails (it diverges, or outgrows its lease) is
+# reported in FAILED.txt and the gate goes on to the next.
 #
 # Per toy and seed: train it if missing (train_toys.py); score the native and truth references
 # (score_toys.py --references); write the three start arms (toy_start.py); the engine's edits on
@@ -37,10 +39,13 @@ for toy in $toys; do
       out=$root/fit/$name.$arm.$budget
       mkdir -p $root/fit
       $py $here/gate_settings.py $t $root/start/$name $arm $budget $epochs $out.json
-      [[ -f $out/REPORT.json ]] || mem-lease 4 $binary $t $out.json $out $device > $out.log 2>&1
+      if ! { [[ -f $out/REPORT.json ]] || mem-lease ${GATE_LEASE:-4} $binary $t $out.json $out $device > $out.log 2>&1; }; then
+        echo "$name.$arm.$budget: $(tail -1 $out.log)" >> $root/FAILED.txt
+        continue
+      fi
       $binary $t $out.json $out host parts $out/parts >> $out.log 2>&1
       env MPD_MEM_GIB=3 ~/mpd-data/venv/bin/python $here/score_toys.py $t $out/parts > /dev/null
-      $py $here/engine_edits.py $binary $t $out $out.json checkpoint.bin $native/MANIFEST_native.json > /dev/null
+      $py $here/engine_edits.py $binary $t $out $out.json checkpoint.bin $native/MANIFEST_native.json > /dev/null || echo "$name.$arm.$budget edits: failed" >> $root/FAILED.txt
     done
   done
 done
