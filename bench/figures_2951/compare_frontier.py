@@ -7,7 +7,9 @@ at its rank (vpd4l's attention, run as M's own by an MLP-only explanation: q, k,
 layer, 4 x 4 x 768 = 12,288). A second, open marker at the parts active per token (nonzero, or
 unmasked) plus the same unchanged maps.
 y = mean KL(M_e || P_e) in bits/token over every scored token of the manifest's operations.
-Labels: description bits under the one convention of compare_f_edits.py.
+Labels: description bits under the one convention of compare_f_edits.py, and, for an explanation that runs
+M's attention unchanged, that attention's own description at the Laplace start with its means held at M
+(compare-vpd4l-attn-price, ~/mpd-data/compare/attention_price.json), labelled separately.
 
 A point is drawn only from an EDITS file whose manifest (held-out sequences, seed, families, edits
 per sequence, source revision) equals the reference arm's; any other is refused with its difference.
@@ -72,7 +74,9 @@ for label, d, f, rec in arms:
         ref = {k: r.get(k) for k in MANIFEST}
     k = features(d)
     active = sum(l['nonzero_per_token'] for l in rec['layers'] if l['functions'])
-    points.append({'label': label, 'executed': k + ATTENTION_RANK_ONE, 'active': active + ATTENTION_RANK_ONE, 'gap': gap(r), 'description_bits': rec['divergence_bits'] + fixed_bits(d), 'edits': f'{d}/{f}'})
+    attn = L('/Users/user/mpd-data/compare/attention_price.json')
+    points.append({'label': label, 'executed': k + ATTENTION_RANK_ONE, 'active': active + ATTENTION_RANK_ONE, 'gap': gap(r), 'description_bits': rec['divergence_bits'] + fixed_bits(d),
+                   'runs_m_attention': True, 'attention_bits': attn['divergence_bits'] if attn else None, 'edits': f'{d}/{f}'})
 for p in L(EXTRA) or []:
     r = L(p['edits'])
     if not r:
@@ -93,7 +97,8 @@ if len(sys.argv) > 1 and points:
         ax.scatter([p['executed']], [p['gap']], s=90, color=c)
         ax.scatter([p['active']], [p['gap']], s=90, facecolors='none', edgecolors=c)
         ax.plot([p['active'], p['executed']], [p['gap'], p['gap']], color=c, lw=1)
-        ax.annotate('\n'.join(textwrap.wrap(p['label'], 34)) + f"\n{p['description_bits'] / 1e6:.1f}M bits", (p['executed'], p['gap']), textcoords='offset points', xytext=(8, 4), fontsize=10)
+        attn = f"\n+ {p['attention_bits'] / 1e6:.1f}M bits for M's attention it runs" if p.get('attention_bits') else ("\n+ M's attention it runs (pricing pending)" if p.get('runs_m_attention') else '')
+        ax.annotate('\n'.join(textwrap.wrap(p['label'], 34)) + f"\n{p['description_bits'] / 1e6:.1f}M bits" + attn, (p['executed'], p['gap']), textcoords='offset points', xytext=(8, 4), fontsize=10)
     ax.set_xscale('log')
     ax.set_xlim(100, 1e5)
     ax.xaxis.set_minor_formatter(matplotlib.ticker.NullFormatter())

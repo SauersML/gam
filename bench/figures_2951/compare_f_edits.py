@@ -86,12 +86,28 @@ for model, label, d, f, rec, N, out in arms:
         if r:
             row['F_edits'] = row['description_bits'] / N + row['gap']
     rows.append(row)
-for label in ('VPD as published (retrospective: its causal-importance network reads M, bidirectional)', 'VPD autonomous (prefix-causal, its network reads P; vpdstart)'):
-    rows.append({'model': 'vpd4l', 'method': label, 'edits': None, 'note': 'not yet scored on the shared manifest'})
+# VPD (vpdstart, 10-06): description = its subcomponents' KL(q || p) at 2^24 (vpd-pricing-n2p24b, 11.4M
+# bits) plus its causal-importance network priced at its Laplace start (77.2M bits); clean held-out KL
+# from the look-ahead test. These are clean-text numbers, not edit scores: listed, never drawn as an edit
+# gap, until VPD is scored on the shared manifest.
+for label, clean in (('VPD as published (its CI network reads the whole sequence, bidirectional)', 0.555),
+                     ('VPD with causal CI', 0.755), ('VPD autonomous, causal CI on its own activations', 0.763)):
+    rows.append({'model': 'vpd4l', 'method': label, 'edits': None, 'clean_kl_bits_per_token': clean, 'description_bits': 11.4e6 + 77.2e6, 'N': 2 ** 24,
+                 'F_lower_bound_bits_per_token': (11.4e6 + 77.2e6) / 2 ** 24 + 0.767 if label.startswith('VPD as published') else None,
+                 'note': 'clean held-out KL, not scored on the shared manifest; F lower bound 1.47 (subcomponents, sampled data 0.767) + 4.6 (CI network) = 6.1 bits/token'})
+# M's tensors an MLP-only explanation runs unchanged (vpd4l's attention) are charged at the precision an
+# explanation needs: their description at the Laplace start with means held at M (compare-vpd4l-attn-price).
+attn = L('/Users/user/mpd-data/compare/attention_price.json')
+for r in rows:
+    if r['model'] == 'vpd4l' and not r['method'].startswith('VPD') and r.get('description_bits'):
+        r['attention_bits'] = attn['divergence_bits'] if attn else None
+        r['description_bits_with_attention'] = r['description_bits'] + attn['divergence_bits'] if attn else None
+        if attn and r.get('gap') is not None:
+            r['F_edits_with_attention'] = r['description_bits_with_attention'] / r['N'] + r['gap']
 json.dump(rows, open('/Users/user/mpd-data/compare/f_edits_table.json', 'w'), indent=1)
 for r in rows:
     print(r['model'], '|', r['method'], '| gap', r.get('gap') and round(r['gap'], 3), '| description', r.get('description_bits') and f"{r['description_bits']:.4g}",
-          '| F on edits', r.get('F_edits') and round(r['F_edits'], 3), '| bins', {k: (n, round(g, 3)) for k, (n, g) in (r.get('gap_by_effect') or {}).items()}, r.get('note', ''))
+          '| F on edits', r.get('F_edits') and round(r['F_edits'], 3), '| with attention', r.get('F_edits_with_attention') and round(r['F_edits_with_attention'], 3), '| clean', r.get('clean_kl_bits_per_token'), '| bins', {k: (n, round(g, 3)) for k, (n, g) in (r.get('gap_by_effect') or {}).items()}, r.get('note', ''))
 if len(sys.argv) > 1:
     plt.rcParams.update({'font.size': 14})
     fig, axes = plt.subplots(1, 2, figsize=(16, 6.5), facecolor='white')
