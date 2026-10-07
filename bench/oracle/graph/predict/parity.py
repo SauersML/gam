@@ -47,15 +47,18 @@ def request(address: str, payload: dict) -> dict:
 
 
 def parse_piece(text: str):
+    m = re.fullmatch(r"L\[(\d+)\]\.(?:mlp|attn)", text)  # the first shards' spelling of whole blocks
+    if m:
+        return ("mlp" if text.endswith("mlp") else "attn", int(m[1]))
     m = re.fullmatch(r"L\[(\d+)\]\.head\[(\d+)\]", text)
     if m:
         return ("head", int(m[1]), int(m[2]))
     m = re.fullmatch(r"L\[(\d+)\]\.mlp\[([\d, ]+)\]", text)
     if m:
         return ("neurons", int(m[1]), [int(x) for x in m[2].split(",")])
-    m = re.fullmatch(r"L\[(\d+)\]\.(mlp|attn)", text)
+    m = re.fullmatch(r"L\[(\d+)\]\.(mlp|head)\[:\]", text)
     if m:
-        return (m[2], int(m[1]))
+        return ("mlp" if m[2] == "mlp" else "attn", int(m[1]))
     raise ValueError(text)
 
 

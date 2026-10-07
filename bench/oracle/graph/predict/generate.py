@@ -2,18 +2,20 @@
 with an answer measured by an exact intervention on M, written as text for the oracle (its input and the
 answer it is trained to write) plus the measured numbers.
 
-Interventions are written in mech syntax (bench/oracle/graph/mech.py addresses). Pieces of Qwen3-0.6B
-(native view):
+Interventions are written with mech's addresses (bench/oracle/graph/mech.py: pieces, node(...), routes,
+logits) inside three question verbs, scale / cut / swap. Pieces of Qwen3-0.6B (native view):
   L[l].head[h]          head h of layer l. Edits act on its write: scale(L[l].head[h], a) multiplies the
                         head's attention read z_h (the input of its o_proj columns) by a, which is
                         oracle.rs's Component::Head, W_o[:, h] <- a W_o[:, h].
   L[l].mlp[i, j, ...]   MLP neurons i, j, ...: scale multiplies their activations SiLU(g_i.x)(u_i.x) by a,
                         i.e. their down columns (oracle.rs's Component::Neuron, summed).
-  L[l].mlp, L[l].attn   the whole MLP (every neuron) or the whole attention (every head) of layer l.
+  L[l].mlp[:], L[l].head[:]   the whole MLP (every neuron) or the whole attention (every head) of layer l.
   a = 0 removes the piece. A weight edit acts at every position (and every generated step).
-  cut(A >> B.route)     path patching: B's input (route query, key or value of a head, input of an MLP)
-                        receives A's AVERAGE write (over this shard's texts, every position after the first)
-                        in place of A's actual write; every other reader keeps A's actual write.
+  cut(node(A) >> node(B).route)
+                        path patching: B's read (route query, key or value of a head, input of an MLP,
+                        or logits = the final residual) receives A's AVERAGE write (over this shard's
+                        texts, every position after the first) in place of A's actual write; every
+                        other reader keeps A's actual write.
   swap(P, source)       P's value at the last position (a head's z_h, or the neurons' activations) is the
                         value P computes at the last position of the source text.
 
@@ -230,9 +232,9 @@ def piece_text(p) -> str:
     if kind == "neurons":
         return f"L[{p[1]}].mlp[{', '.join(str(i) for i in p[2])}]"
     if kind == "mlp":
-        return f"L[{p[1]}].mlp"
+        return f"L[{p[1]}].mlp[:]"
     if kind == "attn":
-        return f"L[{p[1]}].attn"
+        return f"L[{p[1]}].head[:]"
     raise ValueError(p)
 
 
@@ -429,8 +431,8 @@ def batch_questions(m: Qwen3, w: Writer, draw: Draw, tokens: torch.Tensor, sourc
             lo = first if ak == "mlp" else first + 1
             bk, bl, bh, route = "head", int(rng.integers(lo, min(m.L, lo + 4))), int(rng.integers(m.H)), ROUTES[int(rng.integers(3))]
         iv.cuts[r] = (ak, al, ah, bk, bl, bh, route)
-        a_txt = f"L[{al}].head[{ah}]" if ak == "head" else f"L[{al}].{ak}"
-        b_txt = {"logits": "logits", "mlp": f"L[{bl}].mlp.input", "head": f"L[{bl}].head[{bh}].{route}"}[bk]
+        a_txt = "node(" + piece_text(("head", al, ah) if ak == "head" else (ak, al)) + ")"
+        b_txt = {"logits": "logits", "mlp": f"node(L[{bl}].mlp[:]).input", "head": f"node(L[{bl}].head[{bh}]).{route}"}[bk]
         desc.append(f"<intervention> cut({a_txt} >> {b_txt})\n")
         extra.append({"edge": f"{a_txt} >> {b_txt}"})
     edited_questions("cut", iv, desc, extra)
