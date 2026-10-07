@@ -128,6 +128,31 @@ def test_tracer_after_fork():
     assert os.waitpid(pid, 0)[1] == 0
 
 
+def test_program_from_patch(tmp_path):
+    import json
+    import subprocess
+
+    patch = {"behavior": "toy.a", "base_bits": 4.0,
+             "heads": [{"layer": l, "head": h, "recovery_bits": 2.0 if (l, h) == (2, 4) else 0.1 if (l, h) == (1, 1) else 0.0}
+                       for l in range(4) for h in range(6)],
+             "mlps": [{"layer": l, "recovery_bits": [3.9, 0.5, 0.0, 1.0][l]} for l in range(4)]}
+    neurons = {"behavior": "toy.a", "layer": 0, "base_bits": 4.0, "order": list(range(3071, -1, -1)),
+               "curve": [{"k": 4, "kl_bits": 1.0, "total": 1.1}], "best": {"k": 4}}
+    behavior = {"id": "toy.a", "model": "vpd4l", "model_accuracy": 0.9, "description": "A toy."}
+    for name, obj in (("p", patch), ("n", neurons), ("b", behavior)):
+        (tmp_path / f"{name}.json").write_text(json.dumps(obj))
+    run = lambda *extra: subprocess.run(  # noqa: E731
+        [sys.executable, str(HERE / "examples/measure/program_from_patch.py"), str(tmp_path / "p.json"),
+         str(tmp_path / "b.json"), *extra], capture_output=True, text=True, check=True).stdout
+    plain = mech.trace_inline(run(), "vpd4l")
+    assert plain["valid"] and [n["id"] for n in plain["nodes"]] == ["mlp0", "mlp1", "h2_4", "mlp3"]
+    priced = mech.trace_inline(run("--neurons", str(tmp_path / "n.json"), "--head-price", "0.28", "--mlp-price", "3.375"),
+                               "vpd4l")
+    assert priced["valid"], priced["error"]
+    assert [n["id"] for n in priced["nodes"]] == ["mlp0", "h2_4"]  # whole MLPs 1 and 3 do not pay
+    assert priced["nodes"][0]["pieces"][0]["index"] == [3068, 3069, 3070, 3071]
+
+
 def test_qwen_views():
     ir = mech.trace_inline(HEAD + "f = node(PD.tc[14][163839, 7])\nh = node(L[20].head[15])\n"
                            "edges(f >> h.value, h >> logits)\n", "qwen3-0.6b")
