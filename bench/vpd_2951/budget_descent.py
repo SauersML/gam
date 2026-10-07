@@ -312,36 +312,7 @@ for n in attn:
         cond = (sv[:, 0] / sv[:, -1]).max().item()
     A[n] = {'F': F0.clone().requires_grad_(), 'V': V, 'U': U, 'tau': tau.clone().requires_grad_(), 's': s_, 'o': o}
     print(n, 'slices', NH * V.shape[-1], 'all-on error', err, 'worst head frame cond', round(cond, 1), flush=True)
-# DESCENT_ARM=share with DESCENT_SITES=all, attention: the same learned sharing within each head. A
-# head's part is gated at its input side by the norm of its q, k and v members' own reads on the
-# layer's normed stream x at that position, sqrt(sum_j r_j^2) > t_m; each o slice fires with a part of
-# its head or alone on its own read of the head's output. Every q/k/v slice keeps 8 candidate parts
-# (its own and the 7 q/k/v parts of its head nearest in firing on M's fit tokens), every o slice its
-# own read and the 7 nearest parts of its head; softmax assignments (6 at the start's choice) in
-# training, argmax at evaluation. The start is the own-read start, every part of rank one.
 SHARE_A = {}
-if ARM == 'share' and attn:
-    with torch.no_grad():
-        for l in range(4):
-            qkv = [f'h.{l}.attn.{k}' for k in ('q_proj', 'k_proj', 'v_proj')]
-            on_ = lambda m: ((head_coefficients(X[m], A[m]['V'], A[m]['o']).abs() * A[m]['U'].norm(dim=-1)[:, None, :]) > A[m]['tau'][:, None, :]).float()
-            gi = torch.cat([on_(m) for m in qkv], -1)                         # [H, tokens, Cin]
-            go = on_(f'h.{l}.attn.o_proj')                                    # [H, tokens, Co]
-            ni, no = gi.sum(1), go.sum(1)
-            ii = ni[:, :, None] + ni[:, None, :] - 2 * gi.transpose(1, 2) @ gi
-            ii.diagonal(dim1=1, dim2=2).fill_(-1.0)
-            cand_in = ii.topk(8, dim=2, largest=False).indices                # [H, Cin, 8], own first
-            io = ni[:, :, None] + no[:, None, :] - 2 * gi.transpose(1, 2) @ go # [H, Cin, Co]
-            near = io.topk(7, dim=1, largest=False).indices.transpose(1, 2)   # [H, Co, 7]
-            cand_o = torch.cat([torch.full_like(near[..., :1], -1), near], -1)
-            cols, c0 = {}, 0
-            for m in qkv:
-                cols[m] = (c0, c0 + A[m]['V'].shape[-1]); c0 = cols[m][1]
-            L_in = torch.zeros(NH, c0, 8, device=dev); L_in[..., 0] = 6.0
-            L_o = torch.zeros(NH, cand_o.shape[1], 8, device=dev); L_o[..., 0] = 6.0
-            SHARE_A[l] = {'cand_in': cand_in, 'cand_o': cand_o, 'L_in': L_in.requires_grad_(), 'L_o': L_o.requires_grad_(),
-                          't': torch.cat([A[m]['tau'].detach() for m in qkv], -1).clone().requires_grad_(),
-                          's': torch.cat([A[m]['s'] for m in qkv], -1), 'cols': cols, 'qkv': qkv}
 del X
 
 state = {'mode': 'M', 'soft': [], 'hard': [], 'gates': {}, 'route': {}, 'share': {}, 'r': {}, 'writers': {}, 'on': {}, 'gate': {}, 'edges_soft': [], 'edges_hard': [], 'share_a': {}}
@@ -451,27 +422,11 @@ def make(n):
 for n in mlp: T.site(n)._forward = make(n)
 
 
-def share_attn(n, xin, c, p):
-    """(hard, soft) gates [H, tokens, C] of map n's slices under the head's learned sharing."""
-    l = int(n.split('.')[1]); S = SHARE_A[l]
-    if not p['o']:
-        if n.endswith('q_proj'):
-            # The head's parts from the q, k and v slices' own reads on the shared input x.
-            r = torch.cat([head_coefficients(xin, A[m]['V'], False).abs() * A[m]['U'].norm(dim=-1)[:, None, :] for m in S['qkv']], -1)
-            Aw = torch.softmax(S['L_in'], -1)                                  # [H, Cin, 8]
-            R2 = torch.zeros_like(r)
-            for k in range(8):
-                R2 = R2.scatter_add(-1, S['cand_in'][:, None, :, k].expand_as(r), r.pow(2) * Aw[:, None, :, k])
-            zp = ((R2 + 1e-12).sqrt() - S['t'][:, None, :]) / S['s'][:, None, :]
-            hp, pp = (zp > 0).float(), 0.5 * (1 + torch.erf(zp / SQ2))
-            pick = S['cand_in'].gather(-1, Aw.argmax(-1, keepdim=True)).squeeze(-1)   # [H, Cin]
-            hard = hp.gather(-1, pick[:, None, :].expand_as(hp))
-            soft = sum(Aw[:, None, :, k] * pp.gather(-1, S['cand_in'][:, None, :, k].expand_as(pp)) for k in range(8))
-            state['share_a'][l] = (hp, pp, hard, soft)
-        hp, pp, hard, soft = state['share_a'][l]
-        a, b = S['cols'][n]
-        return hard[..., a:b], soft[..., a:b]
-    hp, pp, _, _ = state['share_a'][l]
+def share_o(l, c, p):
+    """(hard, soft) gates [H, tokens, C] of layer l's o slices: each fires with a v part of its head
+    (from this pass's post-attention parts) or alone on its own read of the head's output."""
+    S = SHARE_A[l]
+    hp, pp = state['share_a'][l]
     Aw = torch.softmax(S['L_o'], -1)                                           # [H, Co, 8]
     z = (c.abs() * p['U'].norm(dim=-1)[:, None, :] - p['tau'][:, None, :]) / p['s'][:, None, :]
     ho, po = (z > 0).float(), 0.5 * (1 + torch.erf(z / SQ2))
@@ -489,8 +444,10 @@ def make_attn(n):
             return x @ st.W.T
         xin = x.reshape(-1, x.shape[-1])
         c = head_coefficients(xin, p['V'], p['o'])
-        if SHARE_A and state['mode'] != 'all':
-            hard, soft = share_attn(n, xin, c, p)
+        if state.get('capture') is not None and p['o']:
+            state['capture'].setdefault(n, []).append(c.abs() * p['U'].norm(dim=-1)[:, None, :])
+        if SHARE_A and p['o'] and state['mode'] != 'all':
+            hard, soft = share_o(int(n.split('.')[1]), c, p)
             state['hard'].append(hard.sum((0, 2)))
             if state['mode'] == 'hard':
                 g = hard
@@ -513,6 +470,105 @@ def make_attn(n):
         return head_output(c * g, p['U'], p['o']).view(x.shape[0], x.shape[1], -1)
     return fwd
 for n in attn: T.site(n)._forward = make_attn(n)
+
+# Attention gates after attention: a v slice's coefficient c_i(s) on each key position s is mixed by
+# the head's attention pattern into m_i(t) = sum_s a(t, s) c_i(s) at the query position t, and the
+# slice is gated there, on its own post-attention read r_i(t) = |m_i(t)| ||f_i|| (what it delivers to
+# the head's output at t; causal). Its contribution to the head's output is f_i m_i(t) g_i(t), so with
+# every gate on the head's output is M's exactly. q and k slices keep their own reads at their own
+# positions (they shape the pattern); o slices read the head's output, which is already post-attention.
+# With DESCENT_ARM=share the head's v slices form parts gated by the norm of their members'
+# post-attention reads, and o slices join a v part of their head or keep their own read.
+def attn_v(l, h, pattern):
+    n = f'h.{l}.attn.v_proj'; p = A[n]
+    B_, T_ = h.shape[0], h.shape[1]
+    c = head_coefficients(h.reshape(-1, h.shape[-1]), p['V'], False)           # [H, B*T, C]
+    m = pattern @ c.view(NH, B_, T_, -1).permute(1, 0, 2, 3)                   # [B, H, T, C]
+    if state['mode'] == 'all':
+        g = 1.0
+        if state.get('capture') is not None:
+            state['capture'].setdefault(n, []).append((m.abs() * p['U'].norm(dim=-1)[None, :, None, :]).permute(1, 0, 2, 3).reshape(NH, -1, m.shape[-1]))
+    else:
+        r = m.abs() * p['U'].norm(dim=-1)[None, :, None, :]
+        if SHARE_A:
+            S = SHARE_A[l]
+            rr = r.permute(1, 0, 2, 3).reshape(NH, -1, r.shape[-1])               # [H, tokens, C]
+            Aw = torch.softmax(S['L_v'], -1)
+            R2 = torch.zeros_like(rr)
+            for k in range(8):
+                R2 = R2.scatter_add(-1, S['cand_v'][:, None, :, k].expand_as(rr), rr.pow(2) * Aw[:, None, :, k])
+            zp = ((R2 + 1e-12).sqrt() - S['t'][:, None, :]) / S['s'][:, None, :]
+            hp, pp = (zp > 0).float(), 0.5 * (1 + torch.erf(zp / SQ2))
+            state['share_a'][l] = (hp, pp)
+            pick = S['cand_v'].gather(-1, Aw.argmax(-1, keepdim=True)).squeeze(-1)
+            hard = hp.gather(-1, pick[:, None, :].expand_as(hp))
+            soft = sum(Aw[:, None, :, k] * pp.gather(-1, S['cand_v'][:, None, :, k].expand_as(pp)) for k in range(8))
+            back = lambda t: t.view(NH, B_, T_, -1).permute(1, 0, 2, 3)
+            hard, soft = back(hard), back(soft)
+        else:
+            z = (r - p['tau'][None, :, None, :]) / p['s'][None, :, None, :]
+            hard = (z > 0).float(); soft = 0.5 * (1 + torch.erf(z / SQ2))
+        state['hard'].append(hard.sum((1, 3)).reshape(-1))
+        if state['mode'] == 'hard':
+            g = hard
+        else:
+            state['soft'].append(soft.sum((1, 3)).reshape(-1))
+            g = soft if gate == 'mf' or SHARE_A else hard + soft - soft.detach()
+    y = (m * g) @ p['U'][None]                                                 # [B, H, T, HD]
+    return y.transpose(1, 2).reshape(B_, T_, -1)
+
+plain_hidden = T.hidden
+def hidden(ids):
+    """M's forward (mode M) or P's: vpd_model's Target.hidden with the attention pattern explicit, so
+    that v slices are gated after it."""
+    if state['mode'] == 'M':
+        return plain_hidden(ids)
+    B_, T_ = ids.shape
+    x = T.wte[ids]
+    causal = torch.ones(T_, T_, dtype=torch.bool, device=x.device).tril()
+    for i in range(T.n_layer):
+        site = lambda k: T.site(f"h.{i}.{'mlp' if k in ('c_fc', 'down_proj') else 'attn'}.{k}")
+        h = vpd_model.rms(x, T.norms[2 * i], T.eps)
+        q = T._rope(site('q_proj')(h).view(B_, T_, NH, HD).transpose(1, 2), T_)
+        k = T._rope(site('k_proj')(h).view(B_, T_, NH, HD).transpose(1, 2), T_)
+        pattern = ((q @ k.transpose(-1, -2)) / math.sqrt(HD)).masked_fill(~causal, float('-inf')).softmax(-1)
+        x = x + site('o_proj')(attn_v(i, h, pattern))
+        h = vpd_model.rms(x, T.norms[2 * i + 1], T.eps)
+        x = x + site('down_proj')(vpd_model.gelu_tanh(site('c_fc')(h)))
+    return vpd_model.rms(x, T.ln_f, T.eps)
+if attn:
+    T.hidden = hidden
+    # Calibration on P's own run with every slice on (= M): each v slice's noise scale and the v map's
+    # threshold from the post-attention reads (the quantile matching VPD's mean count at the map).
+    with torch.no_grad():
+        state['capture'] = {}
+        for i in range(0, 4, 2):
+            state['mode'], state['soft'], state['hard'] = 'all', [], []
+            T(torch.tensor(tok[i:i + 2, :512].astype(np.int64), device=dev))
+        cap = {n: torch.cat(v, 1) for n, v in state['capture'].items()}
+        state['capture'] = None
+        for l in range(4):
+            n = f'h.{l}.attn.v_proj'; r = cap[n]
+            A[n]['s'] = 0.1 * r.pow(2).mean(1).sqrt().clamp_min(1e-12)
+            q = 1 - VPD_ATTN_COUNTS.get(n, 1.0) / r.shape[0] / r.shape[2]
+            flat = r.reshape(-1); idx = torch.randperm(flat.numel(), device=dev)[:2_000_000]
+            A[n]['tau'] = torch.full_like(A[n]['s'], torch.quantile(flat[idx], q).item()).requires_grad_()
+        if ARM == 'share':
+            for l in range(4):
+                v, o = f'h.{l}.attn.v_proj', f'h.{l}.attn.o_proj'
+                gv = (cap[v] > A[v]['tau'][:, None, :]).float(); go = (cap[o] > A[o]['tau'][:, None, :]).float()
+                nv, no = gv.sum(1), go.sum(1)
+                vv = nv[:, :, None] + nv[:, None, :] - 2 * gv.transpose(1, 2) @ gv
+                vv.diagonal(dim1=1, dim2=2).fill_(-1.0)
+                cand_v = vv.topk(8, dim=2, largest=False).indices                  # [H, Cv, 8], own first
+                vo = nv[:, :, None] + no[:, None, :] - 2 * gv.transpose(1, 2) @ go
+                near = vo.topk(7, dim=1, largest=False).indices.transpose(1, 2)    # [H, Co, 7]
+                cand_o = torch.cat([torch.full_like(near[..., :1], -1), near], -1)
+                L_v = torch.zeros(NH, cand_v.shape[1], 8, device=dev); L_v[..., 0] = 6.0
+                L_o = torch.zeros(NH, cand_o.shape[1], 8, device=dev); L_o[..., 0] = 6.0
+                SHARE_A[l] = {'cand_v': cand_v, 'cand_o': cand_o, 'L_v': L_v.requires_grad_(), 'L_o': L_o.requires_grad_(),
+                              't': A[v]['tau'].detach().clone().requires_grad_(), 's': A[v]['s'].clone()}
+        del cap
 
 def kl_bits(lm, lp):
     pm = F.log_softmax(lm.float(), -1); pp = F.log_softmax(lp.float(), -1)
@@ -627,11 +683,11 @@ def evaluate(final=False):
     if SHARE:
         out['parts'] = [share_parts(l, S) for l, S in SHARE.items()]
     if SHARE_A:
-        # Attention parts under the hardened assignment, per layer: ranks (q/k/v members plus o slices
-        # that joined) over the heads' parts that have a q/k/v member.
+        # Attention parts under the hardened assignment, per layer: ranks (v members plus o slices
+        # that joined) over the heads' parts that have a v member.
         out['attn_parts'] = []
         for l, S in SHARE_A.items():
-            pick = S['cand_in'].gather(-1, S['L_in'].argmax(-1, keepdim=True)).squeeze(-1)    # [H, Cin]
+            pick = S['cand_v'].gather(-1, S['L_v'].argmax(-1, keepdim=True)).squeeze(-1)    # [H, Cv]
             ch = S['L_o'].argmax(-1)
             po = torch.where(ch == 0, torch.full_like(ch, -1), S['cand_o'].gather(-1, ch[..., None]).squeeze(-1))
             rk = torch.zeros(NH, pick.shape[1], device=dev).scatter_add_(-1, pick, torch.ones_like(pick, dtype=torch.float))
@@ -652,7 +708,7 @@ rms = lambda q: q.detach().pow(2).mean().sqrt().item()
 slots = [(P[n], w, rms(P[n][w])) for n in mlp for w in (('F',) if EXACT else ('V', 'U')) + (('G',) if ARM == 'dir' else ())]
 slots += [(A[n], 'F', rms(A[n]['F'])) for n in attn] + [(A[n], 'tau', 100 / 3 * A[n]['s'].mean().item()) for n in attn]
 for l, S in SHARE_A.items():
-    slots += [(S, 't', 100 / 3 * S['s'].mean().item()), (S, 'L_in', 20 / 3), (S, 'L_o', 20 / 3)]
+    slots += [(S, 't', 100 / 3 * S['s'].mean().item()), (S, 'L_v', 20 / 3), (S, 'L_o', 20 / 3)]
 slots += [(P[n], 'tau', 100 / 3 * P[n]['s'].mean().item()) for n in mlp]
 # The ramp's log width, started at log s (a ramp as wide as the threshold noise), by 1% per step.
 if gate == 'ramp':
