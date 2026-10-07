@@ -80,6 +80,32 @@ def figure(runs, path):
     fig.savefig(path, dpi=150, facecolor="white")
 
 
+BINS = ((0.0, 0.01), (0.01, 0.1), (0.1, 1.0), (1.0, float("inf")))
+
+
+def strata(run: Path):
+    """eval_kl's per-question records (eval_kl_trained.questions.jsonl) split by the measured change
+    KL(M || M_e): per set, type and bin, the trained oracle's mean KL, the no-change answer's, and the
+    paired difference with its standard error."""
+    p = run / "eval_kl_trained.questions.jsonl"
+    if not p.exists():
+        return ""
+    groups = {}
+    for line in open(p):
+        r = json.loads(line)
+        if r.get("measured_kl_bits") is None or r.get("no_change_kl_bits") is None:
+            continue
+        b = next(i for i, (lo, hi) in enumerate(BINS) if lo <= max(r["measured_kl_bits"], 0.0) < hi)
+        groups.setdefault((r["set"], r["type"], b), []).append(r["oracle_kl_bits"] - r["no_change_kl_bits"])
+    lines = ["  eval_kl by measured change (bits): trained - no change, mean (se) [n]"]
+    for (s, k, b), d in sorted(groups.items()):
+        m = sum(d) / len(d)
+        se = (sum((x - m) ** 2 for x in d) / max(1, len(d) - 1) / len(d)) ** 0.5
+        lo, hi = BINS[b]
+        lines.append(f"    [{s}] {k:7s} {lo:g}-{hi:g}: {m:+.3f} ({se:.3f}) [{len(d)}]")
+    return "\n".join(lines)
+
+
 def kl_figure(name, r, path):
     """Per held-out set (panels) and question type: KL(M_e || answer) in bits for the base oracle, the trained
     oracle and the no-change answer on the same questions (log scale)."""
@@ -121,9 +147,12 @@ def main():
     runs = {}
     for spec in args.run:
         name, _, d = spec.rpartition("=")
-        runs[name or Path(d).name] = read(Path(d))
+        runs[name or Path(d).name] = dict(read(Path(d)), dir=Path(d))
     for name, r in runs.items():
         print(table(name, r))
+        st = strata(r["dir"])
+        if st:
+            print(st)
     if args.kl_figure:
         name, r = next(iter(runs.items()))
         kl_figure(name, r, args.kl_figure)
