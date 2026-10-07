@@ -31,6 +31,9 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker
 
 C7 = '/Users/user/mpd-data/compare/new_ops/c7'
+# The vpd4l manifest (edits driver at bfb0e50df4: swap, zero, scale, push, cut; seed 1; held-out
+# sequences [0, 32); 32 per sequence), drawn on the transcoders as built; every arm is scored on it.
+MANIFEST_DIR = '/Users/user/mpd-data/compare/manifest'
 RP = '/Users/user/mpd-data/runpod'
 EXTRA = '/Users/user/mpd-data/compare/frontier_points.json'
 ATTENTION_RANK_ONE = 4 * 4 * 768
@@ -71,7 +74,7 @@ def features(out):
 points = []
 ref = None
 thr2 = L(f'{RP}/compare-vpd4l-tc4096-thr2/out/checkpoint.json')
-arms = [('transcoders as built (4,096 per layer)', f'{C7}/vpd4l_as_is', 'EDITS_as_is_ops.json', thr2['start'] if thr2 else None)]
+arms = [('transcoders as built (4,096 per layer)', f'{MANIFEST_DIR}/vpd4l_as_is', 'EDITS_as_is_m1.json', thr2['start'] if thr2 else None)]
 for name, label in (('compare-vpd4l-tc4096-thr2', 'transcoder fit by F, read patches'), ('compare-vpd4l-tc4096-thr-edits', 'transcoder fit by F, read patches and the shared operations')):
     best = L(f'{C7}/{name}/checkpoint.best.json')
     h = L(f'{RP}/{name}/out/checkpoint.json')
@@ -81,7 +84,7 @@ for name, label in (('compare-vpd4l-tc4096-thr2', 'transcoder fit by F, read pat
         rec = next((x['held_out'] for x in h['epochs'] if x['epoch'] == e), None)
         label += f', epoch {e}'
     # The pair's fits were stopped at 17:15 on 10-06: their last best epochs are the final baselines.
-    arms.append(('baseline: ' + label, f'{C7}/{name}', 'EDITS_thr_best_ops.json', rec))
+    arms.append(('baseline: ' + label, f'{C7}/{name}', f"EDITS_{'thr2' if name.endswith('thr2') else 'thr_edits'}_m1.json", rec))
 for label, d, f, rec in arms:
     r = L(f'{d}/{f}')
     if not r or not rec:
