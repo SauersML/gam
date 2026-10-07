@@ -106,8 +106,9 @@ def kl_figure(name, r, path):
         n = min(trained[s][k]["questions"] for k in types)
         ax.set_title(f"{s} (n >= {n} per type)")
         ax.set_ylabel("KL(M_e || answer), bits")
-    axes[0][0].legend(frameon=False)
-    fig.tight_layout()
+    handles, labels = axes[0][0].get_legend_handles_labels()
+    fig.legend(handles, labels, frameon=False, ncol=3, loc="upper center")
+    fig.tight_layout(rect=(0, 0, 1, 0.92))
     fig.savefig(path, dpi=150, facecolor="white")
 
 

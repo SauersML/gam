@@ -75,6 +75,9 @@ def kl_bits(measured_strs, measured_p, answer) -> float:
     return out + rest * math.log2(rest / q_rest)
 
 
+records = []  # per-question results of every set, written beside the summary (OUT.questions.jsonl)
+
+
 def score_set(model, tok, heldout, args, dev, name):
     """Per question type: the oracle's KL and the no-change answer's on the same questions."""
     result = {}
@@ -93,10 +96,14 @@ def score_set(model, tok, heldout, args, dev, name):
                 n = q["numbers"]["edited"]
                 strs = [tok.decode([i]) for i in n["ids"]]
                 ours.append(kl_bits(strs, n["p"], read_answer(text)))
+                # Per question, for effect-size strata: the measured change, both scores and the answer written.
+                records.append({"set": name, "type": kind, "text_id": q["text_id"], "measured_kl_bits": q["numbers"].get("kl_bits"),
+                                "oracle_kl_bits": ours[-1], "answer": text})
                 if "clean" in q["numbers"]:
                     c = q["numbers"]["clean"]
                     clean_answer = ({tok.decode([i]): p for i, p in zip(c["ids"][:5], c["p"][:5])}, max(0.0, 1.0 - sum(c["p"][:5])))
                     ref.append(kl_bits(strs, n["p"], clean_answer))
+                    records[-1]["no_change_kl_bits"] = ref[-1]
         mean = sum(ours) / len(ours)
         se = (sum((x - mean) ** 2 for x in ours) / max(1, len(ours) - 1) / len(ours)) ** 0.5
         row = {"questions": len(ours), "kl_bits": mean, "se": se}
@@ -144,6 +151,9 @@ def main():
         name = name or "heldout"
         out[name] = score_set(model, tok, load(pattern), args, dev, name)
     Path(args.out).write_text(json.dumps({"model": args.model, "adapters": args.adapters, "sets": out}, indent=1))
+    with open(Path(args.out).with_suffix(".questions.jsonl"), "w") as f:
+        for r in records:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
 
 if __name__ == "__main__":
