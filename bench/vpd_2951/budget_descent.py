@@ -324,10 +324,16 @@ def head_coefficients(x, V, o):
     return (x.view(-1, NH, HD).permute(1, 0, 2) @ V) if o else (x @ V)
 
 
-def head_output(c, U, o):
-    """The map's output [tokens, d_out] from the gated coefficients c [H, tokens, C]."""
+def head_output(c, U, o, swaps=()):
+    """The map's output [tokens, d_out] from the gated coefficients c [H, tokens, C]; for o, `swaps`
+    (h1, h2, token rows) replaces head h1's contribution by head h2's on those rows."""
     y = c @ U
-    return y.sum(0) if o else y.permute(1, 0, 2).reshape(c.shape[1], -1)
+    if not o:
+        return y.permute(1, 0, 2).reshape(c.shape[1], -1)
+    out = y.sum(0)
+    for h1, h2, rows in swaps:
+        out = out.index_add(0, rows, y[h2, rows] - y[h1, rows])
+    return out
 
 
 # DESCENT_ATTN_FREE=1: the heads' slices start at the exact frames' reads and writes and then train
@@ -533,6 +539,10 @@ def share_o(l, c, p):
     soft = Aw[:, None, :, 0] * po + sum(Aw[:, None, :, k] * pp.gather(-1, idx[:, None, :, k].expand(-1, pp.shape[1], -1)) for k in range(1, 8))
     return hard, soft
 
+def swaps_of(n, T_):
+    """Head swaps on map n (o_proj) in the installed edits: (h1, h2, the edited sequence's token rows)."""
+    return [(h[0], h[1], torch.arange(b * T_, (b + 1) * T_, device=dev)) for b, kind, h, _ in state['entry'].get(n, ()) if kind == 'swap']
+
 def make_attn(n):
     st = T.site(n); p = A[n]
     def fwd(x):
@@ -540,6 +550,14 @@ def make_attn(n):
             return x @ st.W.T
         xin = x.reshape(-1, x.shape[-1])
         c = head_coefficients(xin, p['V'], p['o'])
+        if p['o'] and state['entry'].get(n):
+            # A head edit scales the head's input coordinates of o_proj: every o slice of that head reads
+            # them, so its coefficient on that sequence is scaled by 1 + a (its gate reads the scaled value).
+            scale = torch.ones(NH, c.shape[1], 1, device=c.device)
+            for b, kind, G, a in state['entry'][n]:
+                if kind == 'in':
+                    scale[int(G[0]) // HD, b * x.shape[1]:(b + 1) * x.shape[1]] = 1 + a
+            c = c * scale
         if state.get('capture') is not None and p['o']:
             state['capture'].setdefault(n, []).append(c.abs() * p['U'].norm(dim=-1)[:, None, :])
         if SHARE_A and p['o'] and state['mode'] != 'all':
@@ -550,7 +568,7 @@ def make_attn(n):
             else:
                 state['soft'].append(soft.sum((0, 2)))
                 g = soft
-            y = head_output(c * g, p['U'], p['o']).view(x.shape[0], x.shape[1], -1)
+            y = head_output(c * g, p['U'], p['o'], swaps_of(n, x.shape[1])).view(x.shape[0], x.shape[1], -1)
             return y + residual(n, x) if n in RES else y
         if state['mode'] == 'all':
             g = 1.0
@@ -564,7 +582,7 @@ def make_attn(n):
                 phi = 0.5 * (1 + torch.erf(z / SQ2))
                 state['soft'].append(phi.sum((0, 2)))
                 g = phi if gate == 'mf' else hard + phi - phi.detach()
-        y = head_output(c * g, p['U'], p['o']).view(x.shape[0], x.shape[1], -1)
+        y = head_output(c * g, p['U'], p['o'], swaps_of(n, x.shape[1])).view(x.shape[0], x.shape[1], -1)
         return y + residual(n, x) if n in RES else y
     return fwd
 for n in attn: T.site(n)._forward = make_attn(n)
@@ -612,11 +630,17 @@ def draw_edit(g, family):
     cols = lambda h: list(range(h * hd, (h + 1) * hd))
     if family in ('head_remove', 'head_scale'):
         h = int(g.integers(nh)); a = -1.0 if family == 'head_remove' else float(g.choice([0.5, 2.0, 3.0])) - 1
-        return {site_of(l, 'o_proj'): (a * W('o_proj')[:, cols(h)], eye(W('o_proj').shape[1], cols(h)))}
+        return {site_of(l, 'o_proj'): (a * W('o_proj')[:, cols(h)], eye(W('o_proj').shape[1], cols(h))),
+                '_entry': {site_of(l, 'o_proj'): ('in', torch.tensor(cols(h), device=dev), a)}}
     if family == 'head_swap':
         h1, h2 = (int(x) for x in g.choice(nh, 2, replace=False))
         out = {site_of(l, k): (eye(W(k).shape[0], cols(h1)), (W(k)[cols(h2)] - W(k)[cols(h1)]).T) for k in ('q_proj', 'k_proj', 'v_proj')}
         out[site_of(l, 'o_proj')] = (W('o_proj')[:, cols(h2)] - W('o_proj')[:, cols(h1)], eye(W('o_proj').shape[1], cols(h1)))
+        # Entry-wise on P: head h1's q, k, v, o entries become head h2's inside every part and the
+        # leftover, so head h1 computes what head h2 computes and its contribution to the stream is head
+        # h2's; applied where that contribution is summed (o_proj), q, k, v left as they are.
+        out['_entry'] = {site_of(l, k): ('noop', None, 0.0) for k in ('q_proj', 'k_proj', 'v_proj')}
+        out['_entry'][site_of(l, 'o_proj')] = ('swap', (h1, h2), 0.0)
         return out
     k = KINDS_[int(g.integers(6))]; n = site_of(l, k); d_out, d_in = W(k).shape
     r = max(1, int(round(math.exp(g.uniform(0, math.log(min(d_out, d_in)))))))
@@ -645,7 +669,7 @@ def install(edits):
             if n == '_entry':
                 continue
             state['wedits_M'].setdefault(n, []).append((b, *v))
-            if n in entry:
+            if n in entry and (n in P or n in A):
                 state['entry'].setdefault(n, []).append((b, *entry[n]))
             else:
                 state['wedits_P'].setdefault(n, []).append((b, *v))
@@ -798,7 +822,12 @@ def residual(n, x):
     out = x @ R
     for b, kind, G, a in state['entry'].get(n, ()):
         idx = torch.tensor([b], device=out.device)
-        if kind == 'in':
+        if kind == 'noop':
+            continue
+        if kind == 'swap':
+            c1, c2 = (torch.arange(h * HD, (h + 1) * HD, device=out.device) for h in G)
+            out = out.index_add(0, idx, (x[b][..., c2] @ R[c2] - x[b][..., c1] @ R[c1])[None])
+        elif kind == 'in':
             out = out.index_add(0, idx, (a * (x[b][..., G] @ R[G]))[None])
         else:
             out = out.index_add(0, idx, (a * (x[b] @ R[:, G]) @ torch.eye(out.shape[-1], device=out.device)[G])[None])
