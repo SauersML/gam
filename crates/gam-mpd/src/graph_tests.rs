@@ -517,9 +517,7 @@ fn device_path_on_the_host_backend_is_the_host_run() {
     ];
     for (name, circuit, batch) in cases {
         let host = execute(&weights, &circuit, batch, &rows, &BTreeMap::new()).expect("host");
-        let (e, all) = crate::graph::standins_of(&weights, &circuit, batch).expect("stand-ins");
-        let is_model = batch.reference.is_none() && circuit.is_model();
-        let job = crate::graph_device::Run { tokens: &batch.tokens, spans: &batch.spans, scored: &rows, swaps: &BTreeMap::new(), capture: false, standins: (!is_model).then_some((&e, &all[..])) };
+        let job = crate::graph_device::Run { tokens: &batch.tokens, spans: &batch.spans, scored: &rows, swaps: &BTreeMap::new(), capture: false, reference: batch.reference.as_deref() };
         let device = crate::graph_device::run_on(&mut state, &weights, &circuit, &job).expect("device");
         let kl = max(&kl_bits(&host.log_probabilities, &device.log_probabilities));
         assert!(kl < 1e-9, "{name}: KL(host ‖ device) = {kl:e} bits");
@@ -527,7 +525,7 @@ fn device_path_on_the_host_backend_is_the_host_run() {
     // A capture is the host's Reference.
     let circuit = Graph::empty().model(&weights);
     let cf_batch = Batch::new(&cf).expect("cf batch");
-    let job = crate::graph_device::Run { tokens: &cf_batch.tokens, spans: &cf_batch.spans, scored: &[], swaps: &BTreeMap::new(), capture: true, standins: None };
+    let job = crate::graph_device::Run { tokens: &cf_batch.tokens, spans: &cf_batch.spans, scored: &[], swaps: &BTreeMap::new(), capture: true, reference: None };
     let captured = crate::graph_device::run_on(&mut state, &weights, &circuit, &job).expect("capture").captured().expect("captured");
     let gap = |a: &ndarray::Array2<f64>, b: &ndarray::Array2<f64>| (a - b).iter().fold(0.0f64, |m, v| m.max(v.abs()));
     assert!(gap(&captured.active[1], &counterfactual.active[1]) < 1e-9 && gap(&captured.reads[1][0], &counterfactual.reads[1][0]) < 1e-9 && gap(&captured.attention_inputs[0], &counterfactual.attention_inputs[0]) < 1e-9);

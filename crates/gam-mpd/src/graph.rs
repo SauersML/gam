@@ -1282,15 +1282,15 @@ fn run(weights: &Weights, circuit: &Circuit, batch: &Batch, scored: &[usize], sw
     }
     let embed = weights.embedding.select(Axis(0), &batch.tokens.iter().map(|t| *t as usize).collect::<Vec<_>>());
     let units = circuit.units.len();
-    let (embed_standin, standins) = standins_of(weights, circuit, batch)?;
-    // The device runs what it covers (`graph_device`); everything else runs here.
+    // The device runs what it covers (`graph_device`, stand-ins assembled there); everything else
+    // runs here.
     if ops.is_empty() && batch.blocks.iter().all(Vec::is_empty) {
-        let is_model = batch.reference.is_none() && circuit.is_model();
-        let job = crate::graph_device::Run { tokens: &batch.tokens, spans: &batch.spans, scored, swaps, capture, standins: (!is_model).then_some((&embed_standin, &standins[..])) };
+        let job = crate::graph_device::Run { tokens: &batch.tokens, spans: &batch.spans, scored, swaps, capture, reference: batch.reference.as_deref() };
         if let Some(out) = crate::graph_device::run(weights, circuit, &job) {
             return out;
         }
     }
+    let (embed_standin, standins) = standins_of(weights, circuit, batch)?;
     let mut captured = capture.then(|| Reference {
         embed: embed.clone(),
         reads: weights.layers.iter().map(|l| vec![Array2::zeros((0, 0)); l.heads.len()]).collect(),

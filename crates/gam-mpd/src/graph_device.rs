@@ -115,15 +115,66 @@ pub(crate) fn logits(last: &Array2<f64>, unembedding: &Array2<f64>) -> Option<Ar
 }
 
 /// One run's inputs from `graph::run`: the batch's tokens and sequences, the scored rows, the
-/// swapped units' values, whether to capture a [`Reference`], and the host's stand-ins (`embed`'s
-/// and each unit's, rows × width, `None` for `M` itself, which reads none).
+/// swapped units' values, whether to capture a [`Reference`], and the counterfactual run the
+/// stand-ins come from (`None` for `M` itself, every unit computing, which reads none).
 pub(crate) struct Run<'a> {
     pub tokens: &'a [u32],
     pub spans: &'a [(usize, usize)],
     pub scored: &'a [usize],
     pub swaps: &'a BTreeMap<usize, Array2<f64>>,
     pub capture: bool,
-    pub standins: Option<(&'a Array2<f64>, &'a [Array2<f64>])>,
+    pub reference: Option<&'a Reference>,
+}
+
+/// The stand-ins (`embed`'s and each unit's write in the counterfactual run `r`, rows × width),
+/// assembled on the device with the current weights as `Reference::write` does on the host.
+fn standins(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, r: &Reference) -> Result<(Tensor, Vec<Tensor>), String> {
+    let e = |e: GpuError| e.to_string();
+    let (rows, width, arithmetic) = (r.embed.nrows(), weights.width(), s.arithmetic());
+    let embed = s.device.upload(r.embed.view()).map_err(e)?;
+    // Each layer's activations and MLP write uploaded once for every unit that reads them.
+    let mut layers: BTreeMap<usize, (Tensor, Tensor)> = BTreeMap::new();
+    let mut out = Vec::with_capacity(circuit.units.len());
+    for unit in &circuit.units {
+        let mut w = s.device.zeros(rows, width).map_err(e)?;
+        match &unit.block {
+            Block::Heads { layer, heads } => {
+                for &h in heads {
+                    let z = r.reads.get(*layer).and_then(|l| l.get(h)).ok_or("a head the reference did not record")?;
+                    let z = s.device.upload(z.view()).map_err(e)?;
+                    let wo = s.ensure(weights.layers[*layer].heads[h].output.view()).map_err(e)?;
+                    s.device.gemm(&mut w, 1.0, &z, Op::N, s.get(wo).map_err(e)?, Op::T, 1.0, arithmetic).map_err(e)?;
+                }
+            }
+            Block::Neurons { layer, neurons } => {
+                let mlp = weights.layers[*layer].mlp.as_ref().ok_or("a neuron block without an MLP")?;
+                let n = mlp.gate.nrows();
+                if !layers.contains_key(layer) {
+                    let a = r.active.get(*layer).ok_or("an MLP the reference did not record")?;
+                    layers.insert(*layer, (s.device.upload(a.view()).map_err(e)?, s.device.upload(r.mlp[*layer].view()).map_err(e)?));
+                }
+                let out_key = s.ensure(mlp.out.view()).map_err(e)?;
+                let (active, whole) = layers.get(layer).ok_or("an MLP's activations")?;
+                // A large block: the MLP's write less the few neurons outside it.
+                let (picked, sign) = if 2 * neurons.len() > n {
+                    s.device.axpy(&mut w, 1.0, whole).map_err(e)?;
+                    let inside: std::collections::BTreeSet<usize> = neurons.iter().copied().collect();
+                    ((0..n).filter(|i| !inside.contains(i)).map(|i| i as u32).collect::<Vec<_>>(), -1.0)
+                } else {
+                    (neurons.iter().map(|&i| i as u32).collect(), 1.0)
+                };
+                if !picked.is_empty() {
+                    let ids = s.device.upload_indices(&picked).map_err(e)?;
+                    let a = s.device.gather_columns(active, &ids).map_err(e)?;
+                    let o = s.device.gather_columns(s.get(out_key).map_err(e)?, &ids).map_err(e)?;
+                    s.device.gemm(&mut w, sign, &a, Op::N, &o, Op::T, 1.0, arithmetic).map_err(e)?;
+                }
+            }
+            _ => return Err("a block the device path does not cover".into()),
+        }
+        out.push(w);
+    }
+    Ok((embed, out))
 }
 
 /// `circuit` run on the process's device ([`use_device`]), or `None` when there is none or the
@@ -151,10 +202,12 @@ pub(crate) fn run_on(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, 
     let ids = s.device.upload_indices(job.tokens).map_err(e)?;
     let embed = s.device.gather_rows(s.get(table).map_err(e)?, &ids).map_err(e)?;
     let units = circuit.units.len();
-    // Stand-ins: the host's, or zeros for `M` (it reads none).
-    let (embed_standin, standins): (Tensor, Vec<Tensor>) = match job.standins {
-        Some((e0, all)) => (s.device.upload(e0.view()).map_err(e)?, all.iter().map(|a| s.device.upload(a.view())).collect::<Result<_, _>>().map_err(e)?),
-        None => (s.device.zeros(rows, width).map_err(e)?, (0..units).map(|_| s.device.zeros(rows, width)).collect::<Result<_, _>>().map_err(e)?),
+    // Stand-ins: from the counterfactual run, or zeros for `M` (it reads none).
+    let (embed_standin, standins): (Tensor, Vec<Tensor>) = match job.reference {
+        Some(r) if r.embed.nrows() != rows => return Err(format!("a counterfactual run of {} tokens for a batch of {rows}", r.embed.nrows())),
+        Some(r) => standins(s, weights, circuit, r)?,
+        None if circuit.units.iter().all(|u| u.computes) => (s.device.zeros(rows, width).map_err(e)?, (0..units).map(|_| s.device.zeros(rows, width)).collect::<Result<_, _>>().map_err(e)?),
+        None => return Err("a program's undeclared pieces take their values from the counterfactual run, which this batch lacks".into()),
     };
     let mut order: Vec<usize> = (0..units).collect();
     order.sort_by_key(|&u| circuit.units[u].block.site());
