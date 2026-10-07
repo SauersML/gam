@@ -239,12 +239,17 @@ def main():
             rows.append({**row, **acc, "status": status})
             print(f"{bid:40s} n={len(prompts):4d} acc={acc['model_accuracy']:.3f} cf={acc['counterfactual_accuracy']:.3f} "
                   f"pair={acc['pair_accuracy']} {status}", flush=True)
+    write_summary(a.model, fams, rows)
+
+
+def write_summary(model: str, fams: list[str], rows: list[dict]):
+    """Replace this model's rows for these families in summary.tsv."""
     cols = ["model", "family", "variant", "id", "prompts", "targets", "model_accuracy", "counterfactual_accuracy", "pair_accuracy", "split", "status"]
     path = OUT / "summary.tsv"
     old = []
     if path.exists():
         with path.open() as f:
-            old = [r for r in csv.DictReader(f, delimiter="\t") if not (r["model"] == a.model and r["family"] in fams)]
+            old = [r for r in csv.DictReader(f, delimiter="\t") if not (r["model"] == model and r["family"] in fams)]
     with path.open("w") as f:
         w = csv.DictWriter(f, cols, delimiter="\t", extrasaction="ignore")
         w.writeheader()
