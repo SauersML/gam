@@ -50,7 +50,7 @@ def load_behavior(checker, path: Path) -> dict:
 
 def ir_of(source: str, model: str, stand_in: str | None = None) -> dict:
     """The program's IR (score.trace: mech's sandboxed tracer) with its program-wide stand-in form
-    ("counterfactual", the checker's default, or "global") when one is given."""
+    ("counterfactual") when one is given."""
     try:
         ir = score.trace(source, model)
     except Exception as e:  # the tracer's error is the program's error
@@ -87,7 +87,7 @@ def run(behavior_path: Path, names: list[str], experiments: int = 32, seed: int 
     """Scores each program; without a reader server (GRAPH_READER) and with `items_dir`, writes each
     program's reader items to items_dir/<behavior>.<program>.items.jsonl and the program to
     items_dir/<behavior>.<program>.program.jsonl, the inputs of `reader_score.py score`. `stand_in`
-    is the programs' stand-in form ("counterfactual", the checker's default, or "global")."""
+    is the programs' stand-in form ("counterfactual")."""
     behavior = json.loads(behavior_path.read_text())
     model = behavior["model"]
     text = prompt.render(behavior)  # the oracle's input; the reference programs do not read it
@@ -133,7 +133,7 @@ def main() -> None:
     ap.add_argument("--no-reader", action="store_true")
     ap.add_argument("--json", type=Path, help="also write the full results here")
     ap.add_argument("--items", type=Path, help="without GRAPH_READER: write the reader items of each program here")
-    ap.add_argument("--stand-in", choices=["counterfactual", "global"], help="the programs' stand-in form (checker default: counterfactual)")
+    ap.add_argument("--stand-in", choices=["counterfactual"], help="the programs' stand-in form (counterfactual, the only one since the average stand-ins were deleted)")
     ap.add_argument("--export", type=Path, help="the model's export directory (score.py's default otherwise)")
     a = ap.parse_args()
     results = run(a.behavior.expanduser(), a.programs, a.experiments, a.seed, reader=not a.no_reader, items_dir=a.items,

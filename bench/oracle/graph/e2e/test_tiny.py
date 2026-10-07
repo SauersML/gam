@@ -1,7 +1,8 @@
 """The graph oracle's whole path on a tiny random model (#2951), for CI: mech traces the reference and
 search programs, the Rust checker (GRAPH_CHECKER, built from crates/gam-mpd/examples/mpd_graph_2951.rs)
 scores them on e2e/tiny.py's export and behavior, and the terms obey what every valid score must:
-  - the full program (every piece, every edge) has execution error ~0 under any stand-in;
+  - the full program (every piece, every edge) costs at most its numbers' exact price (precision pricing
+    may quantize, exact weights being one option);
   - with counterfactual stand-ins the empty program's execution error is the behavior's own signal
     KL(M(x) || M(x')) at the targets: positive, and it costs no opaque numbers;
   - a program's opaque count grows with the pieces it declares; code bits are its Python tokens times
@@ -60,11 +61,14 @@ def scored(c, irs, seed=0):
 
 
 def test_full_program_is_the_model(checker):
+    """Every piece declared: with precision pricing each block may run quantized, but exact weights are one
+    of its options, so the total never exceeds the exact price of its numbers, and its execution error is
+    all quantization error (none from stand-ins: there are none)."""
     units = search.all_units("tiny")
-    for stand_in in ("counterfactual", "global"):
-        (s,) = scored(checker, [ir(units, stand_in)])
-        assert s["valid"], s["error"]
-        assert abs(s["exec_error_bits"]) / s["N"] < 1e-6, (stand_in, s["per_family"])
+    (s,) = scored(checker, [ir(units)])
+    assert s["valid"], s["error"]
+    exact = 0.5 * math.log2(s["N"]) * s["opaque_numbers"]
+    assert s["opaque_bits"] <= exact + 1e-6 and s["total_bits"] <= exact + s["code_bits"] + 1e-6, (s["total_bits"], exact)
 
 
 def test_empty_program_carries_the_signal_for_free(checker):

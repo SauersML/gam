@@ -13,7 +13,7 @@ Every candidate of a step is scored under the same experiment seed; the final pr
 under a held-out seed. Candidates go to --workers checker processes as score_batch requests (each
 checker scores its share in parallel threads, RAYON_NUM_THREADS).
 
-  search.py BEHAVIOR.json [--mode addition|removal|both] [--experiments 16] [--workers 1] [--stand-in counterfactual|global]
+  search.py BEHAVIOR.json [--mode addition|removal|both] [--experiments 16] [--workers 1] [--stand-in counterfactual]
 Writes ~/mpd-data/graph_oracle/runs/search/<behavior>.<mode>.json (trajectory, final program source,
 its terms, checker calls) and appends the final program to status.tsv as program "search_<mode>".
 """
@@ -370,7 +370,7 @@ def main() -> None:
     ap.add_argument("--out", type=Path, default=OUT)
     ap.add_argument("--start", help="comma-separated units to start from (h<l>_<h>, m<l>_<start>_<stop>)")
     ap.add_argument("--tag", default="", help="suffix of the output names")
-    ap.add_argument("--stand-in", choices=["counterfactual", "global"], help="the programs' stand-in form (checker default: counterfactual)")
+    ap.add_argument("--stand-in", choices=["counterfactual"], help="the programs' stand-in form (counterfactual, the only one since the average stand-ins were deleted)")
     ap.add_argument("--objective", default="total", choices=["total", "shared", "fit"],
                     help="minimize the score's total, the total over the families every program shares, or over the fit "
                          "families (table.FIT; the held-out ones, table.HELDOUT, stay for reporting)")

@@ -72,7 +72,7 @@ def main() -> None:
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--experiments", type=int, default=16)
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--stand-in", choices=["counterfactual", "global"], help="the programs' stand-in form (checker default: counterfactual)")
+    ap.add_argument("--stand-in", choices=["counterfactual"], help="the programs' stand-in form (counterfactual, the only one since the average stand-ins were deleted)")
     ap.add_argument("--out", type=Path, default=OUT)
     ap.add_argument("--export", type=Path)
     ap.add_argument("--only", nargs="*", help="behavior ids to run (default: all)")
