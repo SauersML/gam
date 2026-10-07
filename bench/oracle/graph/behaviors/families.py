@@ -1232,3 +1232,177 @@ def number_pattern(tok, rng):
                     sequence_items([str(x) for x in seq], rng, False, [], n=400))
         out.append(v)
     return out
+
+
+NOVEL |= {"musical_notes", "list_reverse", "markdown_close", "quote_type", "un_prefix", "count_repeats", "planet_order"}
+PLANETS = "Mercury Venus Earth Mars Jupiter Saturn Uranus Neptune".split()
+SOLFEGE = "do re mi fa sol la ti".split()
+
+
+@family
+def planet_order(tok, rng):
+    """The next planet outward from the Sun."""
+    return [Variant("order", "Planet order: a run of planets outward from the Sun, or the planet after a named one; the next planet continues the order.",
+                    sequence_items(PLANETS, rng, False, ["The planet after {X}, going outward from the Sun, is", "Moving outward from {X}, the next planet is"], n=400))]
+
+
+@family
+def musical_notes(tok, rng):
+    """The next solfege syllable."""
+    return [Variant("solfege", "Solfege succession: a run of solfege syllables (do re mi ...); the next syllable continues the scale, wrapping to do.",
+                    sequence_items(SOLFEGE, rng, True, ["In the scale, the note after {X} is"], n=400))]
+
+
+@family
+def list_reverse(tok, rng):
+    """Write a list in reverse order."""
+    ws = words(tok, NOUNS)
+    v = Variant("reverse", "List reversal: a four-word list is being written in reverse; after three reversed words the next is the list's first word; the counterfactual reverses a list whose first two words are swapped.")
+    for _ in range(300):
+        a = rng.sample(ws, 4)
+        b = [a[1], a[0]] + a[2:]
+        f = lambda xs: f"List: {', '.join(xs)}\nReversed: {', '.join(xs[::-1][:2])},"
+        # counterfactual: swapping the first two words changes the next reversed word
+        v.items.append(Item(f(a), " " + a[1], f(b), " " + b[1]))
+    return [v]
+
+
+@family
+def min_of_list(tok, rng):
+    """The smallest number in a short list."""
+    v = Variant("smallest", "Minimum: the smallest of three two-digit numbers; the counterfactual lowers another number below it.")
+    for _ in range(300):
+        xs = rng.sample(range(20, 100), 3)
+        i = xs.index(min(xs))
+        j = rng.choice([k for k in range(3) if k != i])
+        ys = list(xs)
+        ys[j] = rng.randrange(10, min(xs))
+        t = "The smallest of {a}, {b} and {c} is"
+        v.items.append(Item(t.format(a=xs[0], b=xs[1], c=xs[2]), f" {min(xs)}", t.format(a=ys[0], b=ys[1], c=ys[2]), f" {min(ys)}"))
+    return [v]
+
+
+UN_WORDS = "happy kind fair able known usual likely lucky safe true tidy wise clear common even fit".split()
+
+
+@family
+def un_prefix(tok, rng):
+    """Negate an adjective with the prefix un-."""
+    ws = words(tok, UN_WORDS)
+    v = Variant("few_shot", "Morphology: after two examples, the adjective with the prefix un-.")
+    for _ in range(400):
+        a, b, c, d = rng.sample(ws, 4)
+        t = "{a} -> un{a}\n{b} -> un{b}\n{c} ->"
+        v.items.append(Item(t.format(a=a, b=b, c=c), " un" + c, t.format(a=a, b=b, c=d), " un" + d))
+    return [v]
+
+
+ELEMENT_NUMBERS = [("hydrogen", 1), ("helium", 2), ("lithium", 3), ("carbon", 6), ("nitrogen", 7), ("oxygen", 8), ("fluorine", 9),
+                   ("neon", 10), ("sodium", 11), ("magnesium", 12), ("aluminum", 13), ("silicon", 14), ("sulfur", 16), ("chlorine", 17),
+                   ("argon", 18), ("potassium", 19), ("calcium", 20), ("iron", 26), ("copper", 29), ("zinc", 30), ("silver", 47),
+                   ("gold", 79), ("mercury", 80), ("lead", 82), ("uranium", 92), ("beryllium", 4), ("boron", 5), ("phosphorus", 15),
+                   ("nickel", 28), ("tin", 50), ("iodine", 53), ("platinum", 78)]
+
+
+@family
+def element_number(tok, rng):
+    """The atomic number of an element."""
+    return fact_variants([(e, str(n)) for e, n in ELEMENT_NUMBERS],
+                         [("number", "The atomic number of {X} is"), ("few_shot", "hydrogen: 1\ncarbon: 6\n{X}:")],
+                         "Factual recall: the atomic number of a named element.")
+
+
+STATES = [("California", "CA"), ("Texas", "TX"), ("Florida", "FL"), ("Ohio", "OH"), ("Georgia", "GA"), ("Michigan", "MI"),
+          ("Virginia", "VA"), ("Washington", "WA"), ("Arizona", "AZ"), ("Colorado", "CO"), ("Oregon", "OR"), ("Nevada", "NV"),
+          ("Illinois", "IL"), ("Alabama", "AL"), ("Alaska", "AK"), ("Hawaii", "HI"), ("Idaho", "ID"), ("Iowa", "IA"),
+          ("Kansas", "KS"), ("Kentucky", "KY"), ("Louisiana", "LA"), ("Maine", "ME"), ("Maryland", "MD"), ("Minnesota", "MN"),
+          ("Missouri", "MO"), ("Montana", "MT"), ("Nebraska", "NE"), ("Utah", "UT"), ("Vermont", "VT"), ("Wisconsin", "WI"),
+          ("Wyoming", "WY"), ("Tennessee", "TN"), ("Indiana", "IN"), ("Oklahoma", "OK"), ("Arkansas", "AR"), ("Mississippi", "MS")]
+
+
+@family
+def state_abbreviation(tok, rng):
+    """The postal abbreviation of a US state."""
+    return fact_variants(STATES, [("parens", "Texas (TX), Ohio (OH), {X} ("), ("code", "The two-letter postal code for {X} is")],
+                         "Factual recall: the postal abbreviation of a named US state.")
+
+
+@family
+def markdown_close(tok, rng):
+    """Close an open Markdown emphasis marker."""
+    ws = words(tok, NOUNS)
+    v = Variant("emphasis", "Markdown closing: after a word opened with ** (bold) or _ (italic), the next token closes the same marker; the counterfactual opens the other marker.")
+    for _ in range(300):
+        a, b = rng.sample(ws, 2)
+        t = "Remember to bring the {m}{a}"
+        v.items.append(Item(t.format(m="**", a=a), "**", t.format(m="_", a=a), "_"))
+    return [v]
+
+
+@family
+def quote_type(tok, rng):
+    """Close a quotation with the same quote mark that opened it."""
+    ws = words(tok, NOUNS)
+    v = Variant("python_string", "Quote matching: a Python string opened with a single or a double quote is closed with the same mark; the counterfactual opens with the other mark.")
+    for _ in range(300):
+        a, b = rng.sample(ws, 2)
+        t = "name = {q}{a}_{b}"
+        v.items.append(Item(t.format(q="'", a=a, b=b), "'", t.format(q='"', a=a, b=b), '"'))
+    return [v]
+
+
+CONTRACTIONS = [("do not", "don't"), ("can not", "can't"), ("will not", "won't"), ("is not", "isn't"), ("are not", "aren't"),
+                ("was not", "wasn't"), ("were not", "weren't"), ("does not", "doesn't"), ("did not", "didn't"), ("have not", "haven't"),
+                ("has not", "hasn't"), ("had not", "hadn't"), ("would not", "wouldn't"), ("should not", "shouldn't"),
+                ("could not", "couldn't"), ("I am", "I'm"), ("you are", "you're"), ("they are", "they're"), ("we are", "we're"),
+                ("it is", "it's"), ("I will", "I'll"), ("you will", "you'll"), ("I have", "I've"), ("we have", "we've"),
+                ("they have", "they've"), ("I would", "I'd"), ("she is", "she's"), ("he is", "he's"), ("let us", "let's"),
+                ("must not", "mustn't")]
+
+
+@family
+def contraction(tok, rng):
+    """The contracted form of a phrase."""
+    return fact_variants(CONTRACTIONS, [("arrow", "cannot -> can't\nI am -> I'm\n{X} ->"), ("short", "The short form of \"{X}\" is \"")],
+                         "Morphology: the English contraction of a two-word phrase.")
+
+
+SUPERLATIVES = [(a, b[:-2] + "est" if b.endswith("er") else b) for a, b in COMPARATIVES if a not in ("good", "bad", "far")] + \
+               [("good", "best"), ("bad", "worst"), ("far", "farthest")]
+
+
+@family
+def superlative(tok, rng):
+    """The superlative form of an adjective."""
+    return fact_variants(SUPERLATIVES, [("few_shot", "tall: tallest\nfast: fastest\n{X}:"), ("sentence", "This box is {X}, but that box is the")],
+                         "Morphology: the superlative form of an adjective.")
+
+
+GERUNDS = [("run", "running"), ("swim", "swimming"), ("sit", "sitting"), ("make", "making"), ("write", "writing"), ("read", "reading"),
+           ("play", "playing"), ("sing", "singing"), ("dance", "dancing"), ("cook", "cooking"), ("stop", "stopping"), ("plan", "planning"),
+           ("drive", "driving"), ("ride", "riding"), ("walk", "walking"), ("jump", "jumping"), ("eat", "eating"), ("sleep", "sleeping"),
+           ("lie", "lying"), ("die", "dying"), ("begin", "beginning"), ("forget", "forgetting"), ("hope", "hoping"), ("come", "coming"),
+           ("take", "taking"), ("give", "giving"), ("shop", "shopping"), ("hit", "hitting"), ("cut", "cutting"), ("win", "winning"),
+           ("study", "studying"), ("try", "trying"), ("fly", "flying"), ("open", "opening"), ("listen", "listening"), ("travel", "traveling")]
+
+
+@family
+def gerund(tok, rng):
+    """The -ing form of a verb."""
+    return fact_variants(GERUNDS, [("few_shot", "go: going\nsit: sitting\n{X}:"), ("sentence", "I like to {X}. Right now I am")],
+                         "Morphology: the -ing form of a verb, with its spelling changes.")
+
+
+@family
+def count_repeats(tok, rng):
+    """Count how many times a word is repeated."""
+    ws = words(tok, NOUNS)
+    nums = ["two", "three", "four", "five"]
+    v = Variant("how_many", "Counting: a word repeated two to five times, then 'That word appeared'; the next word is the count; the counterfactual repeats it once more or less.")
+    for _ in range(300):
+        a = rng.choice(ws)
+        n = rng.randrange(2, 6)
+        m = n + 1 if n < 5 and rng.random() < 0.5 else n - 1 if n > 2 else n + 1
+        t = "{s}. That word appeared"
+        v.items.append(Item(t.format(s=" ".join([a] * n)), " " + nums[n - 2], t.format(s=" ".join([a] * m)), " " + nums[m - 2]))
+    return [v]
