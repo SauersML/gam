@@ -45,7 +45,8 @@ WORKERS = 1
 
 def checker(items: list[dict]) -> list[dict]:
     """score.py's Checker: WORKERS long-lived servers per target model, each taking whole behaviors (it loads
-    a behavior once and caches M's outcomes on its seed-shared experiments); the reader term when
+    a behavior once and caches M's outcomes on its seed-shared experiments) and scoring a behavior's
+    programs of one seed in one score_batch request; the reader term when
     GRAPH_READER (reader_score.py serve's HOST:PORT) is set. Programs of one behavior and step share the
     experiments' seed, so a group's scores differ by the programs only."""
     from concurrent.futures import ThreadPoolExecutor
@@ -65,8 +66,11 @@ def checker(items: list[dict]) -> list[dict]:
         if c.loaded != path:
             c.behavior(path)
             c.loaded = path
-        for k in ks:
-            out[k] = c.score(items[k]["source"], seed=items[k].get("seed", 0))
+        seeds = sorted({items[k].get("seed", 0) for k in ks})
+        for seed in seeds:  # one batch request per seed: the server runs M once per experiment and the programs in parallel
+            batch = [k for k in ks if items[k].get("seed", 0) == seed]
+            for k, r in zip(batch, c.score_batch([items[k]["source"] for k in batch], seed=seed)):
+                out[k] = r
 
     per_worker = [[] for _ in range(WORKERS)]
     for g, (key, ks) in enumerate(groups.items()):

@@ -84,17 +84,28 @@ class Checker:
         source is scored as the empty program, flagged invalid. The reader term comes from the reader_score
         server at GRAPH_READER (host:port); without one it is left out (reader_error_bits None) and the items
         are returned for a later reader pass."""
-        if isinstance(program, str):
-            try:
-                ir = trace(program, self.model)
-            except Exception as e:  # the tracer's error is the program's error
-                ir = {"model": self.model, "nodes": [], "edges": [], "python_tokens": 0, "token_types": 0,
-                      "source": program, "valid": False, "error": f"{type(e).__name__}: {e}"}
-        else:
-            ir = program
-        answer = self.request({"op": "score", "program": ir, "experiments": experiments, "seed": seed,
+        return self.score_batch([program], experiments, seed, routing, N, reader, reader_top, stand_in)[0]
+
+    def score_batch(self, programs, experiments=32, seed=0, routing="edges", N=None, reader=True, reader_top=8, stand_in="input"):
+        """score() for many programs of the current behavior under one seed, in one checker request (the server
+        runs M once per experiment it has not cached and the programs in parallel)."""
+        irs = [self.ir(p) for p in programs]
+        answer = self.request({"op": "score", "programs": irs, "experiments": experiments, "seed": seed,
                                "routing": routing, "N": N, "reader_top": reader_top if reader else 0,
                                "stand_in": stand_in})
+        return [self.finish(ir, a, reader) for ir, a in zip(irs, answer["scores"])]
+
+    def ir(self, program):
+        if not isinstance(program, str):
+            return program
+        try:
+            return trace(program, self.model)
+        except Exception as e:  # the tracer's error is the program's error
+            return {"model": self.model, "nodes": [], "edges": [], "python_tokens": 0, "token_types": 0,
+                    "source": program, "valid": False, "error": f"{type(e).__name__}: {e}"}
+
+    def finish(self, ir, answer, reader):
+        """Adds the reader term to one program's checker answer."""
         items = answer.pop("items", None)
         answer["reader_error_bits"] = None
         if reader and items:
