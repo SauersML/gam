@@ -374,6 +374,24 @@ impl WeightDraw {
         }
     }
 
+    /// The draw as an explanation compiles it (`weight_edit::compile_entries`): its coordinate edits
+    /// (units of rows or columns scaled) entry-wise, every other edit as `ΔW`.
+    fn compiled(&self, native: &OperatorProgram) -> Result<(Vec<gam_mpd::weight_edit::WeightEdit>, Vec<gam_mpd::weight_edit::EntryEdit>), String> {
+        match self {
+            Self::Group { edits, .. } => {
+                let (mut deltas, mut entries) = (Vec::new(), Vec::new());
+                for e in edits {
+                    let (d, x) = e.compiled(native)?;
+                    deltas.extend(d);
+                    entries.extend(x);
+                }
+                Ok((deltas, entries))
+            }
+            Self::Units { operator, rows, units, alpha } => Ok((Vec::new(), vec![gam_mpd::weight_edit::EntryEdit { native: operator.clone(), rows: *rows, units: units.clone(), alpha: *alpha }])),
+            _ => Ok((self.edits(native)?, Vec::new())),
+        }
+    }
+
     /// The edit `ΔW` of one of `M`'s operators (`native` its program).
     fn delta(&self, native: &OperatorProgram) -> Result<ndarray::Array2<f64>, String> {
         let matrix = |name: &str| native.operators.iter().find(|op| op.name == name).map(|op| op.matrix()).ok_or_else(|| format!("edits: M has no operator {name}"));
@@ -877,17 +895,14 @@ fn edit_faithfulness(
 }
 
 /// Native weight edits of `M`'s maps (`EditSettings::weights`), the same for every explanation,
-/// drawn once into the manifest (`draw_weights`): per edit one map of a layer (an operator of `M`
-/// whose name starts with `blocks.`, neither a vector nor a norm's diagonal; a map stored per head
-/// is one tensor, of which one head's block is drawn), tensors uniformly, and either
-/// `k = 2^u` of its rows or of its columns (`u` uniform in `0..=4`) scaled by a factor of `SCALES`,
-/// or a rank-one push `s ‖W‖_F / √min(r, c) · u vᵀ` with `u`, `v` seeded unit directions and `s`
-/// of `SIZES`. Each is compiled into `M` and into `P` (`weight_edit::compile`: `M` computes with
-/// `W + ΔW`, `P` with its decoded `W` plus `ΔW` through its owners) and scored on `rows` with `P`
-/// autonomous: the gap `KL(M_e ‖ P_e)`, the effect `KL(M_e ‖ M)`, the edit-ignoring baseline
-/// `KL(M_e ‖ P)` and the response diagnostic, in bits per token, with the share of the edit `P` took
-/// (`Compiled::owned`); an explanation holding no copy of the edited map counts it as not
-/// applicable.
+/// drawn once into the manifest (`draw_weights`: heads and neuron groups scaled, heads replaced,
+/// random ΔW, kept by a measured screen). Each is compiled into `M` and into `P`
+/// (`weight_edit::compile_entries`: `M` computes with `W + ΔW`; `P` takes coordinate edits entry-wise
+/// inside every slice and leftover where it sums slices, and `ΔW` through its owners otherwise) and
+/// scored on `rows` with `P` autonomous: the gap `KL(M_e ‖ P_e)`, the effect `KL(M_e ‖ M)`, the
+/// edit-ignoring baseline `KL(M_e ‖ P)` and the response diagnostic, in bits per token, with the
+/// share of the edit `P` took (`Compiled::owned`); an explanation holding no copy of the edited map
+/// counts it as not applicable.
 fn weight_faithfulness(
     device: &Device,
     (native, layers): (&OperatorProgram, &[LayerNodes]),
@@ -915,7 +930,8 @@ fn weight_faithfulness(
     let mut records = Vec::new();
     for (i, draw) in draws.iter().enumerate() {
         let (operator, kind) = (draw.operator(), draw.kind());
-        let Some(compiled) = gam_mpd::weight_edit::compile(native, artifact, &draw.edits(native)?)? else {
+        let (deltas, entries) = draw.compiled(native)?;
+        let Some(compiled) = gam_mpd::weight_edit::compile_entries(native, artifact, &deltas, &entries)? else {
             records.push(json!({"operator": operator, "kind": kind, "family": draw.family().0, "screen_bits": draw.family().1, "applicable": false}));
             continue;
         };

@@ -263,6 +263,96 @@ pub fn compile(native: &OperatorProgram, explanation: &Artifact, edits: &[Weight
     Ok(Some(Compiled { model, explanation: out, owned: if total > 0.0 { taken / total } else { 1.0 } }))
 }
 
+/// A native edit of coordinates: `units` of the rows (`rows`) or columns of `M`'s operator `native`
+/// scaled by `alpha` (0 removes them).
+#[derive(Clone, Debug, PartialEq)]
+pub struct EntryEdit {
+    pub native: String,
+    pub rows: bool,
+    pub units: Vec<usize>,
+    pub alpha: f64,
+}
+
+/// [`compile`] with the coordinate edits `entries` compiled entry-wise where `P` computes the edited
+/// map as a sum of slices (`Owner::uses`): the edited entries are scaled inside every slice and the
+/// leftover, at the operators that write the use's output node (an edit of rows: their rows, and the
+/// node's bias) or that read its input node in the use's body (an edit of columns: their columns),
+/// instead of the always-on term `ΔW·x`, which adds `M`'s own weights back whatever the slices are
+/// and so cannot show slices that drifted from `M`. Where `P` holds the map by name or through an
+/// owning operator, the edit compiles as in [`compile`] (`W + ΔW` is the same entry-wise edit there).
+/// A map with an entry edit takes no other edit in the same call. An operator reading the input
+/// node in the use's body that is no slice (a direction gate) takes the column edit too.
+pub fn compile_entries(native: &OperatorProgram, explanation: &Artifact, edits: &[WeightEdit], entries: &[EntryEdit]) -> Result<Option<Compiled>, String> {
+    let mut all = edits.to_vec();
+    for e in entries {
+        if edits.iter().any(|w| w.native == e.native) {
+            return Err(error(format!("{}: an entry edit and another edit of one map", e.native)));
+        }
+        let w = named(native, &e.native)?.ok_or_else(|| error(format!("M has no operator {}", e.native)))?;
+        let values = native.operators[w].matrix();
+        let mut delta = Array2::zeros(values.dim());
+        for &u in &e.units {
+            if e.rows && u < values.nrows() {
+                delta.row_mut(u).assign(&values.row(u).mapv(|v| v * (e.alpha - 1.0)));
+            } else if !e.rows && u < values.ncols() {
+                delta.column_mut(u).assign(&values.column(u).mapv(|v| v * (e.alpha - 1.0)));
+            } else {
+                return Err(error(format!("{}: unit {u} outside the map", e.native)));
+            }
+        }
+        all.push(WeightEdit { native: e.native.clone(), delta });
+    }
+    let Some(mut compiled) = compile(native, explanation, &all)? else {
+        return Ok(None);
+    };
+    let program = &mut compiled.explanation.program;
+    for e in entries {
+        for o in explanation.owners.iter().filter(|o| o.native == e.native) {
+            let Some((input, output)) = o.uses else { continue };
+            let rule = program.rules.iter().position(|r| r.name == o.body).ok_or_else(|| error(format!("no rule body {}", o.body)))?;
+            // The additive term `compile` added for this use is dropped.
+            let added = format!("edit.{}.{output}", o.body);
+            let operators = &program.operators;
+            if let Some(Node::Affine { terms, .. }) = program.rules[rule].nodes.get_mut(output) {
+                terms.retain(|t| operators[t.1].name != added);
+            }
+            // The edited entries in the nodes' coordinates.
+            let (native_range, node_start) = if e.rows { (o.native_rows.clone(), o.rows.start) } else { (o.native_cols.clone(), o.cols.start) };
+            let units: Vec<usize> = e.units.iter().filter(|u| native_range.contains(u)).map(|u| node_start + u - native_range.start).collect();
+            if units.is_empty() {
+                continue;
+            }
+            // The operators holding those entries: the output node's terms and bias (rows), or every
+            // term of the body reading the input node (columns).
+            let nodes = &program.rules[rule].nodes;
+            let held: Vec<usize> = if e.rows {
+                match nodes.get(output) {
+                    Some(Node::Affine { terms, bias }) => terms.iter().map(|t| t.1).chain(*bias).collect(),
+                    _ => return Err(error(format!("{}: node {output} is not an affine node", o.body))),
+                }
+            } else {
+                nodes.iter().flat_map(|n| if let Node::Affine { terms, .. } = n { terms.iter().filter(|t| t.0 == input).map(|t| t.1).collect() } else { Vec::new() }).collect()
+            };
+            let mut seen = std::collections::BTreeSet::new();
+            for op in held.into_iter().filter(|op| seen.insert(*op)) {
+                let target = &program.operators[op];
+                let values = target.matrix();
+                let mut delta = Array2::zeros(values.dim());
+                for &u in &units {
+                    if e.rows && u < values.nrows() {
+                        delta.row_mut(u).assign(&values.row(u).mapv(|v| v * (e.alpha - 1.0)));
+                    } else if !e.rows && u < values.ncols() {
+                        delta.column_mut(u).assign(&values.column(u).mapv(|v| v * (e.alpha - 1.0)));
+                    }
+                }
+                program.operators[op] = Arc::new(plus(target, &delta)?);
+            }
+        }
+    }
+    program.interfaces().map_err(error)?;
+    Ok(Some(compiled))
+}
+
 /// The native edits that scale one component of `P`'s decomposition by `alpha` (0 removes it):
 /// `owners` are the component's blocks (its slices in each map it spans), and per map `W` the edit
 /// is `(α − 1) D_W(b)`, `D_W(b)` the sum of the component's blocks at their native places
