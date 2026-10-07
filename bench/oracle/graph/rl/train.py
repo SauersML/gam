@@ -133,7 +133,7 @@ def baselines(b: dict) -> dict[str, str]:
     out = {"empty": refs["empty"], "full": refs["full"]}
     index = json.loads((HERE.parent / "examples/index.json").read_text())
     for name, entry in sorted(index.items()):  # g-mech's hand-written or measured example programs for this behavior
-        if entry.get("behavior") == b["id"]:
+        if entry.get("behavior") == b["id"] and entry.get("model") == b.get("model"):
             out["example_" + name] = (HERE.parent / "examples" / f"{name}.py").read_text()
     for p in sorted(SEARCH.glob(f"{b['id']}.*.json")):
         out["search_" + p.stem[len(b["id"]) + 1 :]] = json.loads(p.read_text())["source"]
