@@ -2700,10 +2700,12 @@ struct Progress {
     /// The budget's multiplier `λ` (`Settings::budget`), carried across a resume.
     #[serde(default)]
     multiplier: f64,
-    /// The balance value `λ̂` the multiplier started at, whose one-pass horizon sets its step
-    /// (`Settings::budget`); zero before the budget first binds.
+    /// The budget's balance value `λ̄`, the running mean over one pass of each step's `λ̂`, and
+    /// whether the budget has bound (`Settings::budget`).
     #[serde(default)]
     balance: f64,
+    #[serde(default)]
+    engaged: bool,
     /// The last epoch's snapshot, its per-batch estimates of `F` in nats, when convergence is being
     /// judged.
     previous: Option<Vec<f64>>,
@@ -3416,6 +3418,7 @@ pub fn fit_from(
         removals: Vec::new(),
         multiplier: 0.0,
         balance: 0.0,
+        engaged: false,
         previous: None,
         collection: COLLECTION,
         active: posterior.active.clone(),
@@ -3651,15 +3654,20 @@ pub fn fit_from(
             // the Lagrangian `F + λ (E_q[k] − K)`. `λ ∂Ê/∂μ` joins the data gradient (in its units,
             // as the prior term's does), and by Price's theorem `∂E_q[f]/∂σ² = ½ E_q[∂²f]` the
             // term's expected curvature per token `2 λ ∂Ê/∂σ² / N` joins the step's curvature.
-            // `λ̂ = |⟨g_F, g_k⟩| / |g_k|²` is the multiplier at which the term's gradient cancels the
-            // data gradient's component along `g_k = ∂Ê/∂μ` (both measured on a step). The first
-            // step that finds the budget violated starts `λ` at its `λ̂₀` and applies it on that
-            // step, instead of ramping up from zero over the pass while the count runs away from
-            // `K`. Then `λ ← max(0, λ + η_λ (Ê − K))` with `η_λ = λ̂₀ / (K B)`: a relative
-            // violation held for one pass of the `B` batches moves `λ` by `λ̂₀` times it (a
-            // one-pass horizon). The rate stays at the starting balance: re-measured each step,
-            // `λ̂` moved from 69 to 2,813 nats per part per token within three steps of a tiny
-            // vpd4l fit (library_vpd, grouped own gates, K = 213) and drove `λ` with it.
+            // `λ̂ = max(0, −⟨g_F, g_k⟩) / |g_k|²` (`g_k = ∂Ê/∂μ`, both measured on the step) is the
+            // multiplier at which the term's gradient cancels F's push on the count: descending
+            // `g_F` raises `Ê` iff `⟨g_F, g_k⟩ < 0`, and where F lowers the count on its own no
+            // multiplier is needed. `λ̄` is its running mean over one pass of the `B` batches. From
+            // the first step that finds `Ê > K` on, `λ = λ̄ Ê / K`, applied on the step itself: above
+            // the budget the term outweighs F's push and the count falls, below it F's push wins
+            // and the count rises, and the only point where the descent holds the count still
+            // (`λ = λ̂`) is `Ê = K`. A budget that never binds leaves `λ = 0`, the step bit for bit
+            // the budget-free one. The multiplier follows the count at once and holds no memory of
+            // past violations. Integral rules lagged: `λ ← λ + λ̂₀ (Ê − K)/(K B)` (3732bc2c8d) rose
+            // to 4.5e7 nats per part per token on toys' resid_mlp_2l (per-slice own gates,
+            // K = 110), and with the count at 84 it had fallen only to 4.2e7 while the posterior
+            // mean's KL went from 1e-24 to 1.4e5 bits per token; re-measuring `λ̂` in its rate
+            // (3a279507d3) moved it from 69 to 2,813 within three steps of a tiny vpd4l fit.
             let mut parts_note = String::new();
             if let Some(limit) = settings.budget.filter(|k| k.is_finite()) {
                 let (expected, terms) = complexity_terms(&mut scorer, &device_posterior, explanation, &posterior.active, &batch, key)?;
@@ -3673,12 +3681,18 @@ pub fn fit_from(
                     }
                     square += mean.iter().map(|v| v * v).sum::<f64>();
                 }
-                let measured = if square > 0.0 { along.abs() / square } else { 0.0 };
-                if progress.balance == 0.0 && expected > limit {
+                let measured = if square > 0.0 { (-along).max(0.0) / square } else { 0.0 };
+                if !progress.engaged && expected > limit {
+                    progress.engaged = true;
                     progress.balance = measured;
-                    progress.multiplier = measured;
                 }
-                let lambda = progress.multiplier;
+                let lambda = if progress.engaged && limit > 0.0 {
+                    progress.balance += (measured - progress.balance) / draws.len() as f64;
+                    progress.balance * expected / limit
+                } else {
+                    0.0
+                };
+                progress.multiplier = lambda;
                 for (i, mean, variance) in &terms {
                     let op = explanation.trainable[*i];
                     // At λ = 0 the term adds nothing, and the step is the budget-free one bit for bit.
@@ -3701,10 +3715,6 @@ pub fn fit_from(
                             prior_curvature.insert(op, bend);
                         }
                     }
-                }
-                if limit > 0.0 {
-                    let rate = progress.balance / (limit * draws.len() as f64);
-                    progress.multiplier = (lambda + rate * (expected - limit)).max(0.0);
                 }
                 parts_note = format!(", parts per token {expected:.4} (K {limit}), λ {:.4e}", progress.multiplier);
             }
@@ -5571,6 +5581,7 @@ mod tests {
             removals: Vec::new(),
             multiplier: 0.0,
             balance: 0.0,
+            engaged: false,
             previous: Some(vec![1.0, 2.0]),
             collection: COLLECTION,
             active: vec![false, true],
