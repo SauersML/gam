@@ -285,6 +285,96 @@ pub struct Share {
     pub candidates: Vec<Vec<usize>>,
 }
 
+/// A component's starting logit for its own gate, the others' 0: as descent's share arm starts
+/// (d6ad2537cb), its own gate holds `e⁶ / (e⁶ + K − 1)` of the relaxed assignment (98% at K = 8).
+const OWN_LOGIT: f64 = 6.0;
+
+/// How a fit writes a shared stage's assignment ([`Assignment`]): relaxed (each component's
+/// softmax over its candidates) in a training pass, as before the pending move in that move's
+/// test, or hardened (each component on its largest candidate alone) in every evaluation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Relaxation {
+    Soft,
+    Previous,
+    Hard,
+}
+
+/// A shared stage's assignment in a fit ([`Share`]): its operator (gates × components), each
+/// component's candidate gates (its own first) and the logits of its assignment over them, the
+/// logits before the pending move, and the gradient of the step's data term in the logits
+/// gathered over the step's passes (bits). The logits are not part of the posterior: what a
+/// receiver needs is each component's gate, `ln K` nats for a component of `K` candidates
+/// (`Explanation::fixed_nats`, `library_vpd`), so they take mirror-descent steps on the data
+/// term's gradient ([`Scorer::step_assignments`]), tested with the posterior's move.
+#[derive(Clone, Debug)]
+struct Assignment {
+    operator: usize,
+    gates: usize,
+    candidates: Vec<Vec<usize>>,
+    logits: Vec<Vec<f64>>,
+    previous: Option<Vec<Vec<f64>>>,
+    gradient: Vec<Vec<f64>>,
+}
+
+impl Assignment {
+    fn of(program: &OperatorProgram, share: &Share) -> Result<Self, String> {
+        let operator = index_of(program, &share.operator)?;
+        let (gates, components) = (program.operators[operator].rows.width(), program.operators[operator].cols.width());
+        if share.candidates.len() != components || share.candidates.iter().flatten().any(|g| *g >= gates) {
+            return Err(format!("{}: candidates of another stage", share.operator));
+        }
+        let logits = share.candidates.iter().map(|c| (0..c.len()).map(|k| if k == 0 { OWN_LOGIT } else { 0.0 }).collect()).collect();
+        let gradient = share.candidates.iter().map(|c| vec![0.0; c.len()]).collect();
+        Ok(Self { operator, gates, candidates: share.candidates.clone(), logits, previous: None, gradient })
+    }
+
+    /// Each component's relaxed assignment over its candidates at `logits`.
+    fn softmax(logits: &[Vec<f64>]) -> Vec<Vec<f64>> {
+        logits
+            .iter()
+            .map(|l| {
+                let top = l.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                let e: Vec<f64> = l.iter().map(|v| (v - top).exp()).collect();
+                let sum: f64 = e.iter().sum();
+                e.into_iter().map(|v| v / sum).collect()
+            })
+            .collect()
+    }
+
+    /// The assignment operator's values (gates × components) under `relaxation`.
+    fn values(&self, relaxation: Relaxation) -> Array2<f64> {
+        let mut out = Array2::zeros((self.gates, self.candidates.len()));
+        let logits = match relaxation {
+            Relaxation::Previous => self.previous.as_ref().unwrap_or(&self.logits),
+            Relaxation::Soft | Relaxation::Hard => &self.logits,
+        };
+        for (b, (candidates, weights)) in self.candidates.iter().zip(Self::softmax(logits)).enumerate() {
+            if relaxation == Relaxation::Hard {
+                let best = weights.iter().enumerate().max_by(|x, y| x.1.total_cmp(y.1)).map_or(0, |(k, _)| k);
+                out[[candidates[best], b]] = 1.0;
+            } else {
+                for (g, w) in candidates.iter().zip(weights) {
+                    out[[*g, b]] += w;
+                }
+            }
+        }
+        out
+    }
+
+    /// The gradient `g` of a training pass in the operator (gates × components, at the relaxed
+    /// assignment) chained to the logits through each component's softmax,
+    /// `∂/∂ℓ_bk = a_bk (g_{c_bk, b} − Σ_j a_bj g_{c_bj, b})`, added to the step's.
+    fn gather(&mut self, g: &Array2<f64>) {
+        let weights = Self::softmax(&self.logits);
+        for (b, ((candidates, a), sum)) in self.candidates.iter().zip(&weights).zip(&mut self.gradient).enumerate() {
+            let mean: f64 = candidates.iter().zip(a).map(|(c, w)| w * g[[*c, b]]).sum();
+            for ((c, w), s) in candidates.iter().zip(a).zip(sum.iter_mut()) {
+                *s += w * (g[[*c, b]] - mean);
+            }
+        }
+    }
+}
+
 /// The library explanation of a language model: the artifact at its starting point, its trainable
 /// operators, its prior groups and its layers.
 #[derive(Clone, Debug)]
@@ -1873,6 +1963,11 @@ struct GatedStage {
     threshold: usize,
     direction: Option<usize>,
     slices: Vec<Vec<usize>>,
+    /// The node holding each component's gate pre-activation: the gate node, or in a shared
+    /// stage the gates' pre-activations through the assignment (`library_vpd`).
+    component_gate: usize,
+    /// A shared stage's assignment operator.
+    assign: Option<usize>,
 }
 
 impl GatedStage {
@@ -1927,7 +2022,12 @@ impl GatedStage {
             if program.operators[threshold].rows.width() != slices.len() {
                 return Err(format!("{prefix}: {} thresholds for {} components", program.operators[threshold].rows.width(), slices.len()));
             }
-            stages.push(Self { gate, input, threshold, direction, slices });
+            let assign = operator_named(flat, &format!("{prefix}.assign"));
+            let component_gate = match assign {
+                Some(a) => flat.nodes.iter().position(|n| matches!(n, Node::Transposed { input, operator } if *input == gate && *operator == a)).ok_or_else(|| format!("{prefix}: no gate through the assignment"))?,
+                None => gate,
+            };
+            stages.push(Self { gate, input, threshold, direction, slices, component_gate, assign });
             Ok(())
         };
         let mut attention = blocks(index_of(program, &format!("{name}.attn.read"))?)?;
@@ -1975,6 +2075,13 @@ struct Scorer {
     /// Each batch's drawn edits (by its seed and bases), drawn once: a draw runs `M` on the batch
     /// to find the parts firing there, and a fit asks for a batch's experiments many times.
     edits: std::cell::RefCell<BTreeMap<(u64, Vec<usize>), Vec<(usize, Patch, usize)>>>,
+    /// The shared stages' assignments (`Explanation::shares`), the relaxation and logits version
+    /// last written into `P`'s program, the logits' version, and the mirror-descent step size of
+    /// their next step ([`Scorer::step_assignments`]; none before the first).
+    assignments: Vec<Assignment>,
+    written: Option<(Relaxation, u64)>,
+    version: u64,
+    assignment_step: Option<f64>,
 }
 
 impl Scorer {
@@ -2006,8 +2113,12 @@ impl Scorer {
     fn new(device: &Device, native: &OperatorProgram, explanation: &Explanation, settings: &Settings) -> Result<Self, String> {
         let sites: Vec<LayerNodes> = explanation.layers.iter().map(|l| l.sites.clone()).collect();
         let reads = explanation.reads.clone();
+        // A shared stage's assignment operator takes gradients with the posterior's operators and
+        // is written by the fit itself ([`Assignment`]).
+        let assignments = explanation.shares.iter().map(|share| Assignment::of(&explanation.artifact.program, share)).collect::<Result<Vec<_>, String>>()?;
+        let differentiated: Vec<usize> = explanation.trainable.iter().copied().chain(assignments.iter().map(|a| a.operator)).collect();
         let mut experiments =
-            Interchange::new(device, native, &sites, &explanation.artifact, &explanation.trainable, reads, settings.numeric_bytes, settings.head_tile_rows)?;
+            Interchange::new(device, native, &sites, &explanation.artifact, &differentiated, reads, settings.numeric_bytes, settings.head_tile_rows)?;
         // Every scoring of the fit (its steps, held-out evaluations and removal comparisons) is of
         // one fixed collection of experiments, so `M`'s targets are kept on the host while the
         // process's memory budget admits them.
@@ -2017,7 +2128,112 @@ impl Scorer {
         let stages = mlps.iter().enumerate().map(|(l, mlp)| if mlp.is_some() { Ok(Vec::new()) } else { GatedStage::of(&flat, explanation, l) }).collect::<Result<_, String>>()?;
         let position = explanation.trainable.iter().enumerate().map(|(i, op)| (*op, i)).collect();
         let scope = Some(scope(explanation)).filter(|blocks| !blocks.iter().all(|b| *b));
-        Ok(Self { experiments, mlps, stages, position, scope, families: settings.families.clone(), edits: std::cell::RefCell::new(BTreeMap::new()) })
+        Ok(Self { experiments, mlps, stages, position, scope, families: settings.families.clone(), edits: std::cell::RefCell::new(BTreeMap::new()), assignments, written: None, version: 0, assignment_step: None })
+    }
+
+    /// Writes the shared stages' assignments into `P`'s program under `relaxation`, unless they
+    /// are there already.
+    fn write_assignments(&mut self, relaxation: Relaxation) -> Result<(), String> {
+        if self.assignments.is_empty() || self.written == Some((relaxation, self.version)) {
+            return Ok(());
+        }
+        for a in &self.assignments {
+            let values = self.experiments.models().1.program.device().upload(a.values(relaxation).view()).map_err(error)?;
+            self.experiments.explanation_mut().replace_dense_parameter(a.operator, values)?;
+        }
+        self.experiments.explanation_mut().refresh_fused()?;
+        self.written = Some((relaxation, self.version));
+        Ok(())
+    }
+
+    /// Takes the assignments' gradients out of a training pass's `gradients` (and its
+    /// Gauss–Newton factor's), chained to their logits ([`Assignment::gather`]); an evaluation's
+    /// are dropped.
+    fn take_assignment_gradients(&mut self, gradients: &mut BTreeMap<usize, Tensor>, factor: Option<&mut interchange::Factor>, training: bool) -> Result<(), String> {
+        let mut factor = factor;
+        for a in &mut self.assignments {
+            if let Some(f) = factor.as_deref_mut() {
+                f.gradient.remove(&a.operator);
+            }
+            if let Some(g) = gradients.remove(&a.operator)
+                && training
+            {
+                let g = self.experiments.models().1.program.device().download(&g).map_err(error)?;
+                a.gather(&g);
+            }
+        }
+        Ok(())
+    }
+
+    /// Clears the step's gathered assignment gradients (before a step's passes).
+    fn clear_assignment_gradients(&mut self) {
+        for a in &mut self.assignments {
+            a.gradient.iter_mut().flatten().for_each(|g| *g = 0.0);
+        }
+    }
+
+    /// One mirror-descent step of every assignment's logits along the step's gathered gradient,
+    /// `ℓ ← ℓ − α ḡ`, `ḡ` the gradient per token in nats (`scale`: the posterior step's, `B / N`
+    /// times ln 2): the logits before it are kept until the posterior's move is tested
+    /// ([`Scorer::accept_assignments`], [`Scorer::revert_assignments`]). The step size starts where
+    /// the largest logit moves by one nat and doubles at each accepted move, halves at each
+    /// rejected one (the test of the joint move on the next batch, `step_accepted`).
+    fn step_assignments(&mut self, scale: f64) {
+        if self.assignments.is_empty() {
+            return;
+        }
+        let largest = self.assignments.iter().flat_map(|a| a.gradient.iter().flatten()).fold(0.0f64, |m, g| m.max((g * scale).abs()));
+        if largest == 0.0 {
+            return;
+        }
+        let step = *self.assignment_step.get_or_insert(1.0 / largest);
+        for a in &mut self.assignments {
+            a.previous = Some(a.logits.clone());
+            for (l, g) in a.logits.iter_mut().flatten().zip(a.gradient.iter().flatten()) {
+                *l -= step * scale * g;
+            }
+        }
+        self.version += 1;
+    }
+
+    fn accept_assignments(&mut self) {
+        let moved = self.assignments.iter_mut().fold(false, |moved, a| a.previous.take().is_some() || moved);
+        if moved && let Some(step) = self.assignment_step.as_mut() {
+            *step *= 2.0;
+        }
+    }
+
+    fn revert_assignments(&mut self) {
+        let mut reverted = false;
+        for a in &mut self.assignments {
+            if let Some(previous) = a.previous.take() {
+                a.logits = previous;
+                reverted = true;
+            }
+        }
+        if reverted {
+            self.version += 1;
+            if let Some(step) = self.assignment_step.as_mut() {
+                *step *= 0.5;
+            }
+        }
+    }
+
+    /// The assignments' logits, as a checkpoint keeps them.
+    fn saved_assignments(&self) -> Option<Vec<Vec<Vec<f64>>>> {
+        (!self.assignments.is_empty()).then(|| self.assignments.iter().map(|a| a.logits.clone()).collect())
+    }
+
+    fn restore_assignments(&mut self, saved: &[Vec<Vec<f64>>]) -> Result<(), String> {
+        if saved.len() != self.assignments.len() || saved.iter().zip(&self.assignments).any(|(s, a)| s.len() != a.logits.len() || s.iter().zip(&a.logits).any(|(x, y)| x.len() != y.len())) {
+            return Err("a checkpoint's assignments of other shared stages".into());
+        }
+        for (a, s) in self.assignments.iter_mut().zip(saved) {
+            a.logits = s.clone();
+            a.previous = None;
+        }
+        self.version += 1;
+        Ok(())
     }
 
     /// With push among the families, the scorer with the pushed directions set from the seed and
@@ -2106,7 +2322,9 @@ impl Scorer {
         (gradient, factor): (bool, bool),
     ) -> Result<(Vec<Vec<f64>>, BTreeMap<usize, Tensor>, Option<interchange::Factor>), String> {
         // A step's gradient is taken around the iterate; every evaluation around the posterior's
-        // mean `μ̄` (`DevicePosterior`'s module note).
+        // mean `μ̄` (`DevicePosterior`'s module note). The shared stages' assignments are relaxed
+        // in a pass at a sample, hardened in an evaluation.
+        self.write_assignments(if sample.is_some() { Relaxation::Soft } else { Relaxation::Hard })?;
         match (sample, gradient) {
             (Some(seed), true) => posterior.iterate_into(self.experiments.explanation_mut(), seed)?,
             (Some(seed), false) => posterior.sample_into(self.experiments.explanation_mut(), seed)?,
@@ -2124,7 +2342,9 @@ impl Scorer {
         if evaluation.bits.iter().flatten().any(|b| !b.is_finite()) {
             return Err("nonfinite explanation divergence".into());
         }
-        Ok((evaluation.bits, evaluation.gradient, evaluation.factor))
+        let (mut gradients, mut factor) = (evaluation.gradient, evaluation.factor);
+        self.take_assignment_gradients(&mut gradients, factor.as_mut(), sample.is_some() && gradient)?;
+        Ok((evaluation.bits, gradients, factor))
     }
 }
 
@@ -2215,8 +2435,10 @@ fn complexity_terms(scorer: &mut Scorer, device_posterior: &DevicePosterior, exp
     // At the iterate's sample, or with `previous` around the iterate before the pending move (its
     // test, `step_accepted`).
     if previous {
+        scorer.write_assignments(Relaxation::Previous)?;
         device_posterior.previous_into(scorer.experiments.explanation_mut(), key)?;
     } else {
+        scorer.write_assignments(Relaxation::Soft)?;
         device_posterior.iterate_into(scorer.experiments.explanation_mut(), key)?;
     }
     let family = sequence_family(&batch.base.iter().map(Vec::as_slice).collect::<Vec<_>>())?;
@@ -2249,7 +2471,13 @@ fn complexity_terms(scorer: &mut Scorer, device_posterior: &DevicePosterior, exp
                 };
                 let per = 1.0 / rows as f64;
                 let gate = direction.as_ref().map(|(_, mean, variance)| (mean, variance));
-                let (expected, gate_terms) = gated_expected(d, arithmetic, trace.value(stage.input)?, gate, (&bias.0, &bias.1), &rank)?;
+                // A shared stage counts each component through its assignment, as the pass wrote it.
+                let relaxation = if previous { Relaxation::Previous } else { Relaxation::Soft };
+                let assign = match stage.assign {
+                    Some(op) => Some(scorer.assignments.iter().find(|a| a.operator == op).ok_or("a shared stage without its assignment")?.values(relaxation)),
+                    None => None,
+                };
+                let (expected, gate_terms) = gated_expected(d, arithmetic, trace.value(stage.input)?, gate, (&bias.0, &bias.1), &rank, assign.as_ref())?;
                 if let (Some((i, _, _)), Some((mean, variance))) = (&direction, gate_terms) {
                     terms.push((*i, mean * per, variance * per));
                 }
@@ -2309,7 +2537,10 @@ fn complexity_terms(scorer: &mut Scorer, device_posterior: &DevicePosterior, exp
 /// (`Device::gate_function`), their counts and the thresholds' derivatives downloaded, and for a
 /// direction gate its rows' derivatives. On the host they took about 5 s of a 5.5 s step of the
 /// vpd4l grouped direction arm at 4,096 rows (decomp-vpd4l-b), against 0.35–0.57 s for a step
-/// without the budget.
+/// without the budget. A shared stage (`assign`, gates × components, as the pass wrote it) has
+/// its gates' pre-activations `m` (an own gate's `Σ_b A_mb n_b + μ_c`, `n_b` the squared read
+/// norms its input holds) and variances `s²`, and each component takes `m A` and `s² (A ⊙ A)`,
+/// as its Gated node does; the gates' derivatives gather the components' through `A`.
 fn gated_expected(
     d: &Device,
     arithmetic: gam_gpu::tensor::Arithmetic,
@@ -2317,13 +2548,26 @@ fn gated_expected(
     gate: Option<(&Array2<f64>, &Array2<f64>)>,
     (bias_mean, bias_variance): (&[f64], &[f64]),
     rank: &[f64],
+    assign: Option<&Array2<f64>>,
 ) -> Result<(crate::library_complexity::Expected, Option<(Array2<f64>, Array2<f64>)>), String> {
     use gam_gpu::tensor::GateFunction;
     let rows = input.rows();
     let parts = rank.len();
+    let gates = bias_mean.len();
     let row = |values: &[f64]| d.upload_vec(1, values.len(), values.to_vec()).map_err(error);
+    // The assignment and its entries' squares, on the device.
+    let shared = match assign {
+        Some(a) => {
+            if a.dim() != (gates, parts) {
+                return Err(format!("library budget: an assignment of {:?} for {gates} gates and {parts} components", a.dim()));
+            }
+            Some((d.upload(a.view()).map_err(error)?, d.upload(a.mapv(|v| v * v).view()).map_err(error)?))
+        }
+        None if gates != parts => return Err(format!("library budget: {gates} thresholds for {parts} components")),
+        None => None,
+    };
     // m = x μ_gᵀ + μ_c and s² = x² σ²_gᵀ + σ²_c (a direction gate), or m = ‖V_bᵀx‖ + μ_c and
-    // s² = σ²_c (an own gate).
+    // s² = σ²_c (an own gate; through the assignment, m = n Aᵀ + μ_c), per gate.
     let squares = match gate {
         Some(_) => {
             let mut squares = d.empty(rows, input.cols()).map_err(error)?;
@@ -2334,7 +2578,7 @@ fn gated_expected(
     };
     let (mut m, mut s2) = match (gate, &squares) {
         (Some((mean, variance)), Some(squares)) => {
-            let (mut m, mut s2) = (d.empty(rows, parts).map_err(error)?, d.empty(rows, parts).map_err(error)?);
+            let (mut m, mut s2) = (d.empty(rows, gates).map_err(error)?, d.empty(rows, gates).map_err(error)?);
             d.gemm(&mut m, 1.0, input, Op::N, &d.upload(mean.view()).map_err(error)?, Op::T, 0.0, arithmetic).map_err(error)?;
             d.gemm(&mut s2, 1.0, squares, Op::N, &d.upload(variance.view()).map_err(error)?, Op::T, 0.0, arithmetic).map_err(error)?;
             (m, s2)
@@ -2343,11 +2587,29 @@ fn gated_expected(
             if input.cols() != parts {
                 return Err(format!("library budget: {} read norms for {parts} components", input.cols()));
             }
-            (d.copy(input).map_err(error)?, d.zeros(rows, parts).map_err(error)?)
+            let m = match &shared {
+                Some((a, _)) => {
+                    let mut m = d.empty(rows, gates).map_err(error)?;
+                    d.gemm(&mut m, 1.0, input, Op::N, a, Op::T, 0.0, arithmetic).map_err(error)?;
+                    m
+                }
+                None => d.copy(input).map_err(error)?,
+            };
+            (m, d.zeros(rows, gates).map_err(error)?)
         }
     };
     d.add_row(&mut m, 1.0, &row(bias_mean)?).map_err(error)?;
     d.add_row(&mut s2, 1.0, &row(bias_variance)?).map_err(error)?;
+    // Per component: through the assignment where the stage is shared.
+    let (m, s2) = match &shared {
+        Some((a, a2)) => {
+            let (mut mb, mut s2b) = (d.empty(rows, parts).map_err(error)?, d.empty(rows, parts).map_err(error)?);
+            d.gemm(&mut mb, 1.0, &m, Op::N, a, Op::N, 0.0, arithmetic).map_err(error)?;
+            d.gemm(&mut s2b, 1.0, &s2, Op::N, a2, Op::N, 0.0, arithmetic).map_err(error)?;
+            (mb, s2b)
+        }
+        None => (m, s2),
+    };
     let s = d.gate_function(GateFunction::Sqrt, &s2, None).map_err(error)?;
     // Per row and component, weighted by its rank: P = Φ(m/s), ∂P/∂m = φ(m/s)/s and
     // 2 ∂P/∂s² = −φ(m/s) m / s³.
@@ -2360,9 +2622,19 @@ fn gated_expected(
     let probability = weighted(&d.gate_function(GateFunction::Cdf, &m, Some(&s)).map_err(error)?)?;
     let slope = weighted(&d.gate_function(GateFunction::CdfSlope, &m, Some(&s)).map_err(error)?)?;
     let spread = weighted(&d.gate_function(GateFunction::Ratio, &d.gate_function(GateFunction::CdfScaleSlope, &m, Some(&s)).map_err(error)?, Some(&s)).map_err(error)?)?;
+    // Back to the gates through the assignment: ∂/∂m_g = Σ_b A_gb ∂/∂m_b, ∂/∂s²_g = Σ_b A_gb² ∂/∂s²_b.
+    let (slope, spread) = match &shared {
+        Some((a, a2)) => {
+            let (mut sg, mut pg) = (d.empty(rows, gates).map_err(error)?, d.empty(rows, gates).map_err(error)?);
+            d.gemm(&mut sg, 1.0, &slope, Op::N, a, Op::T, 0.0, arithmetic).map_err(error)?;
+            d.gemm(&mut pg, 1.0, &spread, Op::N, a2, Op::T, 0.0, arithmetic).map_err(error)?;
+            (sg, pg)
+        }
+        None => (slope, spread),
+    };
     let ones = d.upload_vec(1, rows, vec![1.0; rows]).map_err(error)?;
     let column_sums = |t: &Tensor| -> Result<ndarray::Array1<f64>, String> {
-        let mut out = d.empty(1, parts).map_err(error)?;
+        let mut out = d.empty(1, t.cols()).map_err(error)?;
         d.gemm(&mut out, 1.0, &ones, Op::N, t, Op::N, 0.0, arithmetic).map_err(error)?;
         Ok(d.download(&out).map_err(error)?.row(0).to_owned())
     };
@@ -2371,14 +2643,14 @@ fn gated_expected(
     let bias_variance = column_sums(&spread)? * 0.5;
     let gate_terms = match &squares {
         Some(squares) => {
-            let (mut mean, mut variance) = (d.empty(parts, input.cols()).map_err(error)?, d.empty(parts, input.cols()).map_err(error)?);
+            let (mut mean, mut variance) = (d.empty(gates, input.cols()).map_err(error)?, d.empty(gates, input.cols()).map_err(error)?);
             d.gemm(&mut mean, 1.0, &slope, Op::T, input, Op::N, 0.0, arithmetic).map_err(error)?;
             d.gemm(&mut variance, 0.5, &spread, Op::T, squares, Op::N, 0.0, arithmetic).map_err(error)?;
             Some((d.download(&mean).map_err(error)?, d.download(&variance).map_err(error)?))
         }
         None => None,
     };
-    let expected = crate::library_complexity::Expected { count, rows, mean: Array2::zeros((parts, 0)), variance: Array2::zeros((parts, 0)), bias_mean, bias_variance };
+    let expected = crate::library_complexity::Expected { count, rows, mean: Array2::zeros((gates, 0)), variance: Array2::zeros((gates, 0)), bias_mean, bias_variance };
     Ok((expected, gate_terms))
 }
 
@@ -2407,6 +2679,7 @@ fn step_accepted(
     let parts = step_parts(batch, experiments.to_vec());
     let keys = [key, key ^ gam_gpu::tensor::ANTITHETIC];
     let mut previous = 0.0;
+    scorer.write_assignments(Relaxation::Previous)?;
     for (part, k) in parts.iter().zip(keys) {
         let targets = scorer.experiments.targets(batch, part)?;
         device_posterior.previous_into(scorer.experiments.explanation_mut(), k)?;
@@ -2619,6 +2892,7 @@ fn held_out_on(
 /// Per layer, the survivors of `posterior` and its functions' activity on `sequences` at the
 /// posterior mean (`LayerCount`), counted on the device (`Device::resolved_counts`).
 fn activity(scorer: &mut Scorer, explanation: &Explanation, (posterior, device_posterior): (&Posterior, &DevicePosterior), sequences: &[Vec<u32>], settings: &Settings) -> Result<Vec<LayerCount>, String> {
+    scorer.write_assignments(Relaxation::Hard)?;
     device_posterior.mean_into(scorer.experiments.explanation_mut())?;
     let variance = |op: usize| -> Result<Array2<f64>, String> { Ok(posterior.log_sd[scorer.at(op)?].mapv(|s| (2.0 * s).exp())) };
     let (_, p) = scorer.experiments.models();
@@ -2695,7 +2969,7 @@ fn activity(scorer: &mut Scorer, explanation: &Explanation, (posterior, device_p
                 for stage in &scorer.stages[l] {
                     let rank = stage.ranks(&posterior.active);
                     surviving += rank.iter().filter(|r| **r > 0.0).count();
-                    let z = d.download(trace.value(stage.gate)?).map_err(error)?;
+                    let z = d.download(trace.value(stage.component_gate)?).map_err(error)?;
                     executed += z.rows().into_iter().map(|row| row.iter().zip(&rank).filter(|(z, _)| **z > 0.0).map(|(_, r)| r).sum::<f64>()).sum::<f64>();
                 }
                 count.functions = surviving;
@@ -2837,6 +3111,9 @@ struct Progress {
     /// The prior term's state, when the fit has one.
     #[serde(default)]
     prior: Option<serde_json::Value>,
+    /// The shared stages' assignment logits ([`Assignment`]), when the explanation has any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    assignments: Option<Vec<Vec<Vec<f64>>>>,
     /// The precision of each of the payload's arrays per operator ([`CHECKPOINT_ARRAYS`] of them,
     /// or [`LEGACY_ARRAYS`]): the storage the device posterior holds each in; none for a checkpoint
     /// written in float64 throughout, in the legacy layout.
@@ -3411,7 +3688,36 @@ pub fn checkpoint_posterior(explanation: &Explanation, path: &Path) -> Result<Po
 /// `path`, with `literals` (those of the fit's device, [`Literals::of`]): the explanation a
 /// running fit holds, read from its last save.
 pub fn checkpoint_artifact(explanation: &Explanation, path: &Path, literals: Literals) -> Result<Artifact, String> {
-    literals.apply(posterior_mean(explanation, &checkpoint_posterior(explanation, path)?)?)
+    let mut artifact = literals.apply(posterior_mean(explanation, &checkpoint_posterior(explanation, path)?)?)?;
+    // The shared stages' assignments as an evaluation holds them: each component on its gate.
+    if let Some(saved) = saved_assignments(path)? {
+        if saved.len() != explanation.shares.len() {
+            return Err(format!("{}: assignments of other shared stages", path.display()));
+        }
+        for (share, logits) in explanation.shares.iter().zip(saved) {
+            let mut a = Assignment::of(&artifact.program, share)?;
+            if logits.len() != a.logits.len() {
+                return Err(format!("{}: an assignment of another stage", path.display()));
+            }
+            a.logits = logits;
+            let old = std::sync::Arc::clone(&artifact.program.operators[a.operator]);
+            let values = a.values(Relaxation::Hard);
+            let precision = exact_precision(values.iter().copied()).map_err(error)?;
+            artifact.program.operators[a.operator] = std::sync::Arc::new(Operator::dense(old.name.clone(), old.rows.clone(), old.cols.clone(), values, precision, old.provenance.clone()).map_err(error)?);
+        }
+    }
+    Ok(artifact)
+}
+
+/// The shared stages' assignment logits a checkpoint at `path` keeps, when it keeps any.
+fn saved_assignments(path: &Path) -> Result<Option<Vec<Vec<Vec<f64>>>>, String> {
+    #[derive(Deserialize)]
+    struct Saved {
+        #[serde(default)]
+        assignments: Option<Vec<Vec<Vec<f64>>>>,
+    }
+    let (saved, _, _): (Saved, _, _) = checkpoint_header(path)?;
+    Ok(saved.assignments)
 }
 
 /// IVON's state a [`Start`] continues (a checkpoint's): per trainable operator (in
@@ -3544,6 +3850,7 @@ pub fn fit_from(
         full_seconds: 0.0,
         prior: None,
         precision: None,
+        assignments: None,
     };
     // The fixed held-out subset: the first batch of held-out bases (at least the two a source
     // needs), with `M`'s targets for its experiments made once for every evaluation of it.
@@ -3605,6 +3912,9 @@ pub fn fit_from(
         let (loaded, moments, held, iterate) = load_checkpoint(path, &progress, &mut posterior)?;
         held_means = Some(held);
         progress = loaded;
+        if let Some(saved) = &progress.assignments {
+            scorer.restore_assignments(saved)?;
+        }
         match (prior.as_deref_mut(), &progress.prior) {
             (Some(prior), Some(state)) => prior.load(state)?,
             (None, None) => {}
@@ -3725,6 +4035,7 @@ pub fn fit_from(
             let batch = draw.batch(sequences)?;
             let experiments = scorer.experiments(draw, sequences)?;
             let key = training_key(settings.seed, epoch, b);
+            scorer.clear_assignment_gradients();
             let (experiments, bits, mut gradients, factor) = antithetic_step(&mut scorer, (device, &device_posterior), &batch, experiments, key)?;
             for (e, bits) in experiments.iter().zip(&bits) {
                 if e.patch.is_some() { patched.add(bits) } else { clean.add(bits) }
@@ -3798,8 +4109,10 @@ pub fn fit_from(
                 let (accepted, change) = step_accepted(&mut scorer, &device_posterior, explanation, &posterior.active, (&batch, &experiments, key), new, (scale, tokens, lambda))?;
                 if accepted {
                     device_posterior.accept();
+                    scorer.accept_assignments();
                 } else {
                     device_posterior.revert()?;
+                    scorer.revert_assignments();
                     progress.step += 1;
                     log::info!("library step {epoch}.{b}: the last move rejected (its change of the objective on this batch {change:.4e} nats per token), undone; no step on this batch");
                     continue;
@@ -3859,6 +4172,7 @@ pub fn fit_from(
             let factor_weight = weight * scored as f64 / factor.tokens as f64;
             let posterior_started = Instant::now();
             device_posterior.step(&gradients, weight * LN_2, (&factor.gradient, factor_weight), &prior_curvature, &ivon)?;
+            scorer.step_assignments(weight * LN_2);
             let posterior_seconds = posterior_started.elapsed().as_secs_f64();
             let (eta, rho, draws_averaged, ratio) = device_posterior.step_state();
             log::info!("library line step {epoch}.{b}: η {eta:.4e}, ρ̄ {rho:.4e} over {draws_averaged} draws, r̄ {ratio:.4e}; posterior step {posterior_seconds:.3} s");
@@ -3962,6 +4276,9 @@ pub fn fit_from(
                     writer.wait()?;
                     let (restored, start) = read_checkpoint(explanation, &best_path)?;
                     posterior = restored;
+                    if let Some(saved) = saved_assignments(&best_path)? {
+                        scorer.restore_assignments(&saved)?;
+                    }
                     match (prior.as_deref_mut(), start.state.and_then(|state| state.prior)) {
                         (Some(prior), Some(state)) => prior.load(&state)?,
                         (None, None) => {}
@@ -3990,10 +4307,12 @@ pub fn fit_from(
                 let mut kept = progress.clone();
                 kept.active = posterior.active.clone();
                 kept.prior = prior.as_deref().map(PriorTerm::save).transpose()?;
+                kept.assignments = scorer.saved_assignments();
                 Snapshot::save(&mut kept, &device_posterior, (&best_path, None), &mut writer)?;
             }
         }
         progress.prior = prior.as_deref().map(PriorTerm::save).transpose()?;
+        progress.assignments = scorer.saved_assignments();
         save(&mut progress, &posterior, (&device_posterior, keep_best.then_some(best_path.as_path())), &mut writer)?;
     }
     writer.wait()?;
@@ -4535,6 +4854,44 @@ fn mean_artifact(mut artifact: Artifact, trainable: &[usize], means: Vec<Array2<
 
 #[cfg(test)]
 mod tests {
+    /// A shared stage's assignment ([`super::Assignment`]): the relaxed operator's columns are each
+    /// component's softmax over its candidates, the hardened one puts each component on its largest
+    /// candidate alone, and the gradient chained to the logits ([`super::Assignment::gather`])
+    /// equals central differences of `⟨G, A(ℓ)⟩` (1e-8).
+    #[test]
+    fn an_assignment_chains_its_gradient_to_its_logits() {
+        use super::{Assignment, Relaxation};
+        let candidates = vec![vec![0, 1, 2], vec![1, 0], vec![2, 0, 1]];
+        let logits = vec![vec![0.3, -1.2, 0.8], vec![1.5, -0.4], vec![-0.2, 0.9, 0.1]];
+        let mut a = Assignment { operator: 0, gates: 3, candidates: candidates.clone(), logits: logits.clone(), previous: None, gradient: candidates.iter().map(|c| vec![0.0; c.len()]).collect() };
+        let soft = a.values(Relaxation::Soft);
+        for b in 0..3 {
+            assert!((soft.column(b).sum() - 1.0).abs() < 1e-15, "component {b}'s assignment sums to one");
+            let e: Vec<f64> = logits[b].iter().map(|v| v.exp()).collect();
+            let z: f64 = e.iter().sum();
+            for (k, g) in candidates[b].iter().enumerate() {
+                assert!((soft[[*g, b]] - e[k] / z).abs() < 1e-15);
+            }
+        }
+        let hard = a.values(Relaxation::Hard);
+        assert_eq!(hard, ndarray::array![[0.0, 0.0, 1.0], [0.0, 1.0, 0.0], [1.0, 0.0, 0.0]], "each component on its largest candidate");
+        let g = ndarray::array![[0.7, -0.3, 1.1], [-0.5, 0.2, 0.4], [0.9, -1.4, -0.6]];
+        a.gather(&g);
+        let h = 1e-6;
+        for b in 0..3 {
+            for k in 0..candidates[b].len() {
+                let at = |shift: f64| {
+                    let mut l = logits.clone();
+                    l[b][k] += shift;
+                    let moved = Assignment { logits: l, ..a.clone() };
+                    (&g * &moved.values(Relaxation::Soft)).sum()
+                };
+                let numeric = (at(h) - at(-h)) / (2.0 * h);
+                assert!((numeric - a.gradient[b][k]).abs() < 1e-8, "logit ({b}, {k}): chained {} against {numeric}", a.gradient[b][k]);
+            }
+        }
+    }
+
     /// The definition hashes a layer without a sink exactly as `Layer`'s debug form did before the
     /// sink field existed (so earlier checkpoints keep their identity), and a sink when there is one.
     #[test]
@@ -5745,6 +6102,7 @@ mod tests {
             full_seconds: 1.0,
             prior: None,
             precision: precision.clone(),
+            assignments: None,
         };
         // The wire format: length-prefixed JSON, then each operator's arrays row-major in their
         // precisions. This fixture is independent of the streaming decoder and requires no GPU.

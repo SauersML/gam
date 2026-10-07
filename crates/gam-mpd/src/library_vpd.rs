@@ -552,7 +552,10 @@ pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes], decompositio
         let rule = Rule { name: format!("{name}.mlp"), inputs: vec![h2_interface.clone()], output: nodes.len() - 1, nodes };
         artifact = artifact.replace_block(&format!("{name}.mlp"), Callee::New(rule), vec![Argument::Native(h2)], layer.mlp, operators)?;
     }
-    Ok(Explanation { shares, ..groups_of(artifact, layers, direction)? })
+    // Each shared component's gate is a choice among its candidates: ln K nats to send.
+    let choices: f64 = shares.iter().flat_map(|s| s.candidates.iter()).map(|c| (c.len() as f64).ln()).sum();
+    let built = groups_of(artifact, layers, direction)?;
+    Ok(Explanation { shares, fixed_nats: built.fixed_nats + choices, ..built })
 }
 
 /// The prior groups, trainable operators and layers of the built artifact (module note).

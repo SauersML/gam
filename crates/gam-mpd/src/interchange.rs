@@ -3190,9 +3190,11 @@ impl Interchange {
     }
 
     /// Load `P`'s trainable operators, in the order given to [`Interchange::new`].
+    /// The first `values.len()` of them (a fit's posterior operators, ahead of operators it writes
+    /// itself, such as a shared stage's assignment, `library_mdl::Share`); the rest keep theirs.
     pub fn load<A: std::borrow::Borrow<ndarray::Array2<f64>>>(&mut self, values: &[A]) -> Result<(), String> {
-        if values.len() != self.trainable.len() {
-            return Err(error("one value per trainable operator required"));
+        if values.len() > self.trainable.len() {
+            return Err(error("more values than trainable operators"));
         }
         for (&op, value) in self.trainable.iter().zip(values) {
             let tensor = self.p.device().upload(value.borrow().view()).map_err(error)?;
