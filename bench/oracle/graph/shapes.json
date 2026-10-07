@@ -1,0 +1,102 @@
+{
+ "vpd4l": {
+  "layers": 4,
+  "heads": 6,
+  "kv_heads": 6,
+  "head_dim": 128,
+  "d_model": 768,
+  "d_mlp": 3072,
+  "vocab": 50277,
+  "views": {
+   "native": true,
+   "vpd": [
+    {
+     "q_proj": 512,
+     "k_proj": 512,
+     "v_proj": 1024,
+     "o_proj": 1024,
+     "c_fc": 3072,
+     "down_proj": 3584
+    },
+    {
+     "q_proj": 512,
+     "k_proj": 512,
+     "v_proj": 1024,
+     "o_proj": 1024,
+     "c_fc": 3072,
+     "down_proj": 3584
+    },
+    {
+     "q_proj": 512,
+     "k_proj": 512,
+     "v_proj": 1024,
+     "o_proj": 1024,
+     "c_fc": 3072,
+     "down_proj": 3584
+    },
+    {
+     "q_proj": 512,
+     "k_proj": 512,
+     "v_proj": 1024,
+     "o_proj": 1024,
+     "c_fc": 3072,
+     "down_proj": 3584
+    }
+   ],
+   "library": null,
+   "transcoder": null
+  },
+  "source": [
+   "engine/vpd4l/export.json",
+   "engine/vpd4l_decomposition/export.json"
+  ]
+ },
+ "qwen3-0.6b": {
+  "layers": 28,
+  "heads": 16,
+  "kv_heads": 8,
+  "head_dim": 128,
+  "d_model": 1024,
+  "d_mlp": 3072,
+  "vocab": 151936,
+  "views": {
+   "native": true,
+   "vpd": null,
+   "library": null,
+   "transcoder": [
+    163840,
+    163840,
+    163840,
+    163840,
+    163840,
+    163840,
+    163840,
+    163840,
+    163840,
+    163840,
+    163840,
+    163840,
+    163840,
+    163840,
+    163840,
+    163840,
+    163840,
+    163840,
+    163840,
+    163840,
+    163840,
+    163840,
+    163840,
+    163840,
+    163840,
+    163840,
+    163840,
+    163840
+   ]
+  },
+  "source": [
+   "huggingface Qwen/Qwen3-0.6B config.json",
+   "transcoders/qwen3-0.6b-lowl0/layer_*.safetensors"
+  ]
+ }
+}
