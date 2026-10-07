@@ -16,9 +16,13 @@ given z, the text and the edit in words, is from M's next-token distribution und
 doubling of the subcomponent at the peak of its strongest and other contexts (a row-edit table,
 vpd_labels.py --edit row; --labels must be one). The no-description reader is the baseline.
 
-GRPO. Per subcomponent, G episodes sampled at temperature 1; advantage (r - mean) / std within its group
-(0 when the group's rewards are equal); loss = -mean over episodes of advantage x (mean log-probability
-of the policy's own tokens, every turn, thinking and tool calls included); one gradient step per batch,
+GRPO without its length and difficulty biases (Dr. GRPO). Per subcomponent, G episodes sampled at
+temperature 1; advantage r - mean within its group (no division by the group's std, which weights
+groups by how alike their rewards are); loss = -sum over episodes of advantage x (summed log-probability
+of the policy's own tokens, every turn, thinking and tool calls included) / (episodes x the most tokens an
+episode may generate, turns x tokens), one constant, so no episode is reweighted by its own length (a
+preference for short descriptions belongs in the reward, whose L(z) already charges them); one gradient
+step per batch,
 on the policy that sampled it, so the probability ratio is 1 and needs no clipping; no KL term. TRL's
 GRPOTrainer is not used: the policy reads vectors injected into its residual stream at per-example
 placeholders, which neither TRL's generation nor vLLM's can carry, so the objective is written out here.
@@ -256,9 +260,10 @@ class Episodes:
         return convs, places, own, [description_of(t) for t in texts], texts, calls
 
 
-def policy_step(oracle: Oracle, table: Table, episodes: "Episodes", convs, places, own, comps, advantage, micro: int) -> float:
-    """Accumulate the GRPO gradient: -sum_e advantage_e x (mean log-probability of episode e's own
-    tokens) / episodes, micro-batch by micro-batch. The injection hook stays set until each micro-batch's
+def policy_step(oracle: Oracle, table: Table, episodes: "Episodes", convs, places, own, comps, advantage, micro: int, longest: int) -> float:
+    """Accumulate the GRPO gradient: -sum_e advantage_e x (summed log-probability of episode e's own
+    tokens) / (episodes x longest), longest the most tokens an episode may generate (a constant, so no
+    episode is reweighted by its own length), micro-batch by micro-batch. The injection hook stays set until each micro-batch's
     backward pass ends, so recomputed (checkpointed) layers inject as the forward did; the output layer
     runs only at the policy's tokens, in checkpointed chunks (the vocabulary is 151,936 wide)."""
     from torch.utils.checkpoint import checkpoint
@@ -289,8 +294,8 @@ def policy_step(oracle: Oracle, table: Table, episodes: "Episodes", convs, place
                 return torch.log_softmax(head(h).float(), -1).gather(-1, t[:, None])[:, 0]
 
             lp = torch.cat([checkpoint(piece, flat[k : k + 1024], target[k : k + 1024], use_reentrant=False) for k in range(0, len(target), 1024)])
-            per = torch.zeros(len(cs), device=oracle.dev).index_add(0, rows, lp) / weight[:, 1:].sum(1).clamp(min=1)
-            loss = -(adv * per).sum() / len(convs)
+            per = torch.zeros(len(cs), device=oracle.dev).index_add(0, rows, lp)  # summed, not averaged over the episode's length
+            loss = -(adv * per).sum() / (len(convs) * longest)
             loss.backward()
             total += float(loss.detach())
         finally:
@@ -345,13 +350,12 @@ def train(args):
         convs, places, own, descriptions, texts, calls = episodes.roll(comps)
         rewards = np.array(reward(args.reward, [{"component": list(c), "description": d} for c, d in zip(comps, descriptions)]))
         groups = rewards.reshape(args.components, args.group)
-        std = groups.std(1, keepdims=True)
-        advantage = np.where(std > 0, (groups - groups.mean(1, keepdims=True)) / np.where(std > 0, std, 1.0), 0.0).reshape(-1)
+        advantage = (groups - groups.mean(1, keepdims=True)).reshape(-1)  # bits; no division by the group's std
         oracle.model.train()
         oracle.model.base_model.model.gradient_checkpointing_enable()
         oracle.model.base_model.model.config.use_cache = False
         optimizer.zero_grad(set_to_none=True)
-        loss = policy_step(oracle, table, episodes, convs, places, own, comps, advantage, args.micro)
+        loss = policy_step(oracle, table, episodes, convs, places, own, comps, advantage, args.micro, args.turns * args.tokens)
         torch.nn.utils.clip_grad_norm_(oracle.trainable(), 1.0)
         optimizer.step()
         log.write(json.dumps({"step": step, "mean_reward_bits": float(rewards.mean()), "best_reward_bits": float(rewards.max()), "loss": loss,
