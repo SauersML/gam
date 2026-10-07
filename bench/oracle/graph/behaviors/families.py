@@ -1007,24 +1007,24 @@ def roman_numerals(tok, rng):
 def pattern_ab(tok, rng):
     """Continue an alternating pattern of two words."""
     ws = words(tok, NOUNS)
-    v = Variant("alternate", "Alternation: two words alternate several times; the next word continues the alternation; the counterfactual ends one step later.")
+    v = Variant("alternate", "Alternation: two words alternate several times; the next word continues the alternation; the counterfactual starts the alternation with the other word.")
     for _ in range(300):
         a, b = rng.sample(ws, 2)
         n = rng.randrange(3, 6)
-        seq = " ".join([a, b] * n)
-        v.items.append(Item(seq, " " + a, seq + " " + a, " " + b))
+        v.items.append(Item(" ".join([a, b] * n), " " + a, " ".join([b, a] * n), " " + b))
     return [v]
 
 
 @family
 def alphabet_skip(tok, rng):
     """Continue a run of letters that skips one letter each step."""
-    v = Variant("every_other", "Alphabet with a stride of two: a run of every other capital letter; the next letter continues the stride.")
-    for _ in range(300):
-        i, j = rng.sample(range(0, 26 - 8), 2)
-        k = rng.randrange(3, 5)
-        f = lambda s: ", ".join(LETTERS[s + 2 * q] for q in range(k)) + ","
-        v.items.append(Item(f(i), " " + LETTERS[i + 2 * k], f(j), " " + LETTERS[j + 2 * k]))
+    v = Variant("every_other", "Alphabet with a stride of two or three: a run of capital or lowercase letters at a fixed stride; the next letter continues the stride.")
+    for _ in range(600):
+        st, k = rng.choice([2, 3]), rng.randrange(3, 5)
+        al = rng.choice([LETTERS, LETTERS.lower()])
+        i, j = rng.sample(range(0, 26 - st * k), 2)
+        f = lambda s: ", ".join(al[s + st * q] for q in range(k)) + ","
+        v.items.append(Item(f(i), " " + al[i + st * k], f(j), " " + al[j + st * k]))
     return [v]
 
 
@@ -1032,13 +1032,17 @@ def alphabet_skip(tok, rng):
 def month_number(tok, rng):
     """The number of a month."""
     rows = [(m, str(i + 1)) for i, m in enumerate(MONTHS)]
-    v = Variant("number", "Month numbering: the position of a named month in the year; phrasings 'X is month number' and 'X = month'.")
-    for _ in range(300):
+    v = Variant("number", "Month numbering in both directions: the number of a named month, or the month with a given number, in several phrasings.")
+    to_num = ["In the calendar, {m} is month number", "Months: January = 1, February = 2. {m} =", "{m} is the month numbered"]
+    to_name = ["In the calendar, month number {n} is", "Months: 1 = January, 2 = February. {n} =", "The month numbered {n} is"]
+    for _ in range(600):
         i, j = rng.sample(range(12), 2)
-        if len(rows[i][1]) != len(rows[j][1]):
-            continue
-        t = rng.choice(["In the calendar, {m} is month number", "Months: January = 1, February = 2. {m} ="])
-        v.items.append(Item(t.format(m=rows[i][0]), " " + rows[i][1], t.format(m=rows[j][0]), " " + rows[j][1]))
+        if rng.random() < 0.5:
+            t = rng.choice(to_num)
+            v.items.append(Item(t.format(m=rows[i][0]), " " + rows[i][1], t.format(m=rows[j][0]), " " + rows[j][1]))
+        else:
+            t = rng.choice(to_name)
+            v.items.append(Item(t.format(n=rows[i][1]), " " + rows[i][0], t.format(n=rows[j][1]), " " + rows[j][0]))
     return [v]
 
 
