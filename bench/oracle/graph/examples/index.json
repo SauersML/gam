@@ -1,7 +1,7 @@
 {
- "vpd4l_induction_native": {"model": "vpd4l", "behavior": "induction_random.words8", "family": "induction_random", "split": "train"},
- "vpd4l_induction_vpd": {"model": "vpd4l", "behavior": null, "family": "induction_text", "split": "train"},
- "qwen3_induction_heads": {"model": "qwen3-0.6b", "behavior": "induction_random.words8", "family": "induction_random", "split": "train"},
+ "vpd4l_induction_native": {"model": "vpd4l", "behavior": "induction_random.words8", "family": "induction_random", "split": "train", "priority": 0},
+ "vpd4l_induction_vpd": {"model": "vpd4l", "behavior": null, "family": "induction_text", "split": "train", "priority": 1},
+ "qwen3_induction_heads": {"model": "qwen3-0.6b", "behavior": "induction_random.words8", "family": "induction_random", "split": "train", "priority": 0},
  "vpd4l_sva_simple": {"model": "vpd4l", "behavior": "sva.simple", "family": "sva", "split": "heldout"},
  "vpd4l_sva_nounpp": {"model": "vpd4l", "behavior": "sva.nounpp", "family": "sva", "split": "heldout"},
  "vpd4l_bracket_close_call": {"model": "vpd4l", "behavior": "bracket_close.call", "family": "bracket_close", "split": "train"},

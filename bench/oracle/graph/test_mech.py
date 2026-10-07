@@ -218,7 +218,7 @@ def test_prompt():
     assert "PD.tc[l][i, ...]" in text and "PD.vpd" not in text.split("Example program")[0]
     induction = dict(behavior, family="induction_random")
     shots = prompt.examples(induction, 9)
-    assert shots and all(e["family"] != "induction_random" and e["split"] == "train" for _, e, _ in shots)
+    assert shots and all(not e["family"].startswith("induction") and e["split"] == "train" for _, e, _ in shots)
     assert prompt.examples(behavior, 1)[0][0] == "qwen3_induction_heads"
     assert prompt.program_of("x\n```python\nfrom mech import node\n```\n") == "from mech import node\n"
 
