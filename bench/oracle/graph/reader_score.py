@@ -15,8 +15,8 @@ over the K candidates and "other".
 
 Reader prompt (the reader's chat template, thinking off):
   system     SYSTEM
-  user       INSTRUCTIONS, the program text in a python block, then the item: the experiment in words, M's
-             clean candidates with their clean probabilities and the clean rest
+  user       INSTRUCTIONS (the program text in a python block and the task), then the item: the experiment
+             in words, M's clean candidates with their clean probabilities and the clean rest
   assistant  the text M reads, verbatim and unmarked (so the reader's natural continuation is the answer);
              the answer slot is the position after it
 The reader's probability of a candidate is its probability of continuing the text with that candidate.
@@ -83,15 +83,15 @@ Program:
 {source}
 ```
 
+The question below gives an experiment on the target model and the target model's most probable next tokens without the experiment (each token as a JSON string, so spaces and newlines are explicit, then its probability). Your reply begins with the text the target model reads. Continue that text with one token: the target model's next token under the experiment, drawn with the probabilities the target model gives the tokens.
+
 """
 
 ITEM = """Experiment: {words}
 
-Without the experiment, the target model's most probable next tokens after the text of your reply are (each token as a JSON string, so spaces and newlines are explicit, then its probability):
+Without the experiment:
 {listing}
-every other token: {other:.3g}
-
-Your reply begins with the text the target model reads. Continue that text with one token: the target model's next token under the experiment, drawn with the probabilities the target model gives the tokens."""
+every other token: {other:.3g}"""
 
 
 def piece_name(p: dict) -> str:
