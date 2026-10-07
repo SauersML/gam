@@ -858,3 +858,68 @@ def html_close(tok, rng):
         v1.items.append(Item(f'<{a} class="box"><{b}>{txt}</{b}></', a, f'<{a2} class="box"><{b}>{txt}</{b}></', a2))
         v2.items.append(Item(f'<{a}>{txt}</', a, f'<{a2}>{txt}</', a2))
     return [v1, v2]
+
+
+BOX_ITEMS = "apple pen ball key coin ring cup book hat shoe watch card".split()
+
+
+@family
+def entity_binding(tok, rng):
+    """Entity tracking: recall which container an object was put in."""
+    items = words(tok, BOX_ITEMS)
+    v = Variant("boxes", "Entity binding: three objects are each placed in a lettered box; asked for one object's box, the answer is its letter. The counterfactual swaps the boxes of the queried object and another.")
+    for _ in range(200):
+        objs = rng.sample(items, 3)
+        boxes = rng.sample("ABCDEFG", 3)
+        q = rng.randrange(3)
+        o = rng.choice([i for i in range(3) if i != q])
+        alt = list(boxes)
+        alt[q], alt[o] = alt[o], alt[q]
+        f = lambda bs: " ".join(f"The {x} is in box {b}." for x, b in zip(objs, bs)) + f" The {objs[q]} is in box"
+        v.items.append(Item(f(boxes), " " + boxes[q], f(alt), " " + alt[q]))
+    return [v]
+
+
+@family
+def first_letter(tok, rng):
+    """The first letter of a word."""
+    ws = words(tok, NOUNS)
+    v = Variant("starts_with", "Spelling: the first letter of a quoted word; the counterfactual quotes a word with another first letter.")
+    for _ in range(200):
+        a, b = rng.sample(ws, 2)
+        if a[0] == b[0]:
+            continue
+        t = 'The word "{w}" starts with the letter'
+        v.items.append(Item(t.format(w=a), " " + a[0], t.format(w=b), " " + b[0]))
+    return [v]
+
+
+ELEMENTS = [("gold", "Au"), ("silver", "Ag"), ("iron", "Fe"), ("copper", "Cu"), ("sodium", "Na"), ("potassium", "K"), ("lead", "Pb"),
+            ("tin", "Sn"), ("mercury", "Hg"), ("oxygen", "O"), ("hydrogen", "H"), ("carbon", "C"), ("nitrogen", "N"), ("helium", "He"),
+            ("neon", "Ne"), ("calcium", "Ca"), ("magnesium", "Mg"), ("zinc", "Zn"), ("chlorine", "Cl"), ("sulfur", "S"),
+            ("phosphorus", "P"), ("aluminum", "Al"), ("silicon", "Si"), ("uranium", "U"), ("platinum", "Pt"), ("nickel", "Ni"),
+            ("lithium", "Li"), ("fluorine", "F"), ("argon", "Ar"), ("iodine", "I"), ("titanium", "Ti"), ("cobalt", "Co"),
+            ("tungsten", "W"), ("chromium", "Cr"), ("manganese", "Mn"), ("boron", "B")]
+
+
+@family
+def chemical_symbol(tok, rng):
+    """The chemical symbol of an element."""
+    return fact_variants(ELEMENTS, [("symbol", "The chemical symbol for {X} is"), ("few_shot", "oxygen: O\ncarbon: C\n{X}:")],
+                         "Factual recall: the chemical symbol of a named element.")
+
+
+CURRENCIES = [("Japan", "yen"), ("India", "rupee"), ("Russia", "ruble"), ("China", "yuan"), ("Mexico", "peso"), ("Brazil", "real"),
+              ("Britain", "pound"), ("Korea", "won"), ("Thailand", "baht"), ("Poland", "zloty"), ("Sweden", "krona"),
+              ("Switzerland", "franc"), ("Israel", "shekel"), ("Turkey", "lira"), ("Vietnam", "dong"), ("Germany", "euro"),
+              ("France", "euro"), ("Italy", "euro"), ("Spain", "euro"), ("Argentina", "peso"), ("Chile", "peso"),
+              ("Colombia", "peso"), ("Canada", "dollar"), ("Australia", "dollar"), ("Egypt", "pound"), ("Indonesia", "rupiah"),
+              ("Denmark", "krone"), ("Norway", "krone"), ("Hungary", "forint"), ("Ukraine", "hryvnia"), ("Malaysia", "ringgit"),
+              ("Philippines", "peso"), ("Pakistan", "rupee"), ("Iran", "rial"), ("Kenya", "shilling"), ("Nigeria", "naira")]
+
+
+@family
+def currency(tok, rng):
+    """The currency of a country."""
+    return fact_variants(CURRENCIES, [("currency", "The currency of {X} is the"), ("pay", "When shopping in {X}, you pay with the local")],
+                         "Factual recall: the currency of a named country.")
