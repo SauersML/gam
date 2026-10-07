@@ -1,0 +1,96 @@
+"""Tables and a figure of prediction-SFT runs (#2951): per held-out set and question type, the answer's
+bits per question for the base and the trained oracle (sft.py's eval.json), the learning curve (the
+held-out sets' mean bits per question every --eval-every steps, train.jsonl), and, when eval_kl.py has
+run, KL(M_e || answer) in bits beside the no-change answer's on the same questions.
+
+  report.py --run NAME=DIR [--run NAME=DIR ...] [--figure PNG]
+DIR is an sft.py output directory (eval.json, train.jsonl, eval_kl_base.json, eval_kl_trained.json).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+
+
+def read(run: Path):
+    out = {"eval": json.loads((run / "eval.json").read_text()) if (run / "eval.json").exists() else None, "curve": [], "kl": {}}
+    if (run / "train.jsonl").exists():
+        for line in open(run / "train.jsonl"):
+            r = json.loads(line)
+            if "heldout" in r:
+                out["curve"].append(r)
+    for which in ("base", "trained"):
+        p = run / f"eval_kl_{which}.json"
+        if p.exists():
+            d = json.loads(p.read_text())
+            out["kl"][which] = d.get("sets") or {"heldout": d.get("per_type", {})}
+    return out
+
+
+def sets_of(e):
+    """eval.json from a single-set run ({type: ...}) or a multi-set run ({set: {type: ...}})."""
+    first = next(iter(e.values()))
+    return e if "bits_per_question" not in first else {"heldout": e}
+
+
+def table(name, r):
+    lines = [f"== {name}"]
+    if r["eval"]:
+        base, trained = sets_of(r["eval"]["base"]), sets_of(r["eval"]["trained"])
+        lines.append(f"steps {r['eval']['steps']}, hours {r['eval']['hours']:.2f}")
+        for s in trained:
+            lines.append(f"  [{s}] answer bits per question, base -> trained (se)")
+            for k in sorted(trained[s]):
+                b, t = base[s][k], trained[s][k]
+                lines.append(f"    {k:9s} {b['bits_per_question']:7.1f} -> {t['bits_per_question']:6.1f} ({t['se']:.1f})")
+    for which, sets in r["kl"].items():
+        for s, types in sets.items():
+            lines.append(f"  [{s}] eval_kl {which}: KL(M_e || answer) bits, no-change answer, difference (se)")
+            for k, v in sorted(types.items()):
+                extra = f" vs {v['no_change_kl_bits']:.3f}, diff {v['difference_bits']:+.3f} ({v['difference_se']:.3f})" if "no_change_kl_bits" in v else ""
+                lines.append(f"    {k:9s} {v['kl_bits']:.3f} ({v['se']:.3f}){extra}")
+    return "\n".join(lines)
+
+
+def figure(runs, path):
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    plt.rcParams.update({"font.size": 15, "axes.spines.top": False, "axes.spines.right": False})
+    fig, ax = plt.subplots(figsize=(10, 6), facecolor="white")
+    for name, r in runs.items():
+        if not r["curve"]:
+            continue
+        for s in r["curve"][0]["heldout"]:
+            steps = [c["step"] for c in r["curve"]]
+            mean = [sum(v["bits_per_question"] for v in c["heldout"][s].values()) / len(c["heldout"][s]) for c in r["curve"]]
+            line, = ax.plot(steps, mean, marker="o")
+            ax.annotate(f"{name}, {s}", (steps[-1], mean[-1]), xytext=(6, 0), textcoords="offset points", va="center", color=line.get_color())
+    ax.set_xlabel("training step")
+    ax.set_ylabel("held-out answer bits per question\n(mean over question types)")
+    fig.tight_layout()
+    fig.savefig(path, dpi=150, facecolor="white")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--run", action="append", required=True)
+    ap.add_argument("--figure", default="")
+    args = ap.parse_args()
+    runs = {}
+    for spec in args.run:
+        name, _, d = spec.rpartition("=")
+        runs[name or Path(d).name] = read(Path(d))
+    for name, r in runs.items():
+        print(table(name, r))
+    if args.figure:
+        figure(runs, args.figure)
+        print("figure", args.figure)
+
+
+if __name__ == "__main__":
+    main()
