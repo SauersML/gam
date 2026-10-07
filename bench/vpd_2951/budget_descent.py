@@ -657,6 +657,23 @@ for n in sliced: T.site(n)._forward = make_attn(n)
 # K of VPD's MLP subcomponents under the same rule (VPD's per-map counts times K / 129, each subcomponent at a
 # width of 1% of its tensor's root mean square, as ours start, plus its index).
 ROT, ROTG = {}, int(os.environ.get('DESCENT_ROT', '32'))
+# DESCENT_FAST_PERM=1 (speed): a layer's neuron permutation and its inverse are gathers whose backward is the
+# other permutation's gather, in place of indexing's backward, an accumulating scatter through a sort (on an
+# A40 49 of 167 ms of an MLP step's device time, 55 of 248 ms of a whole-model step's). The same values: each
+# gradient entry receives exactly one term.
+FAST_PERM = os.environ.get('DESCENT_FAST_PERM') == '1'
+class _Permuted(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, idx, inv):
+        ctx.save_for_backward(inv)
+        return x.index_select(-1, idx)
+    @staticmethod
+    def backward(ctx, g):
+        (inv,) = ctx.saved_tensors
+        return g.index_select(-1, inv), None, None
+def permuted(x, idx, inv):
+    """x[..., idx] for a permutation idx with inverse inv."""
+    return _Permuted.apply(x, idx, inv) if FAST_PERM else x[..., idx]
 if ARM == 'rot':
     if start != 'neuron' or os.environ.get('DESCENT_F') != '1':
         raise SystemExit('DESCENT_ARM=rot: the neuron start, F')
@@ -712,9 +729,57 @@ def rot_train_gate(hard, phi, z):
         return 0.5 * (1 + torch.erf(z / (a * SQ2)))
     return hard + phi - phi.detach()
 
+# DESCENT_ROT_BATCH=1 (speed): the bases Q of every group set (the MLP's and attention's) are computed in one
+# batched pass when the first is needed, and log2 of the number of blocks once per draw of the assignments, each
+# kept while the same tensors are installed unmodified: one host wait per pass in place of one per call
+# (rot_index_bits waited on every group set in each of its calls, 256 times per whole-model step).
+ROT_BATCH = os.environ.get('DESCENT_ROT_BATCH') == '1'
+_rot_memo = {}
+def rot_memo(key, tensors, make):
+    """make(), kept while the same tensors (by identity, unmodified since) are installed."""
+    hit = _rot_memo.get(key)
+    if hit is not None and len(hit[0]) == len(tensors) and all(a is b and v == b._version for a, v, b in zip(hit[0], hit[1], tensors)):
+        return hit[2]
+    out = make()
+    _rot_memo[key] = (list(tensors), [t._version for t in tensors], out)
+    return out
+
+def rot_Q_batched(A):
+    """rot_Q of every installed (or every posterior-mean) angle tensor in one pass, A's own; None if A is
+    neither."""
+    for name, As in (('installed', [R['A'] for R in ROT_ALL]), ('mean', [R['A_leaf'][0] for R in ROT_ALL if 'A_leaf' in R])):
+        at = [i for i, t in enumerate(As) if t is A]
+        if at:
+            key = (name, torch.is_grad_enabled(), torch.backends.cuda.matmul.allow_tf32)
+            return rot_memo(key, As, lambda: rot_Q_all(As))[at[0]]
+    return None
+
+def rot_Q_all(As):
+    """rot_Q of each angle tensor in As, the products batched (each group set squared as often as rot_Q
+    squares it alone)."""
+    Ss = [A_ - A_.transpose(1, 2) for A_ in (a_ * MASK for a_ in As)]
+    ks = [max(0, math.ceil(math.log2(max(v, 1e-12) / 0.25))) for v in torch.stack([S_.detach().abs().sum((1, 2)).max() for S_ in Ss]).tolist()]
+    order = sorted(range(len(As)), key=lambda i: -ks[i])
+    sizes = [As[i].shape[0] for i in order]
+    X_ = torch.cat([Ss[i] / 2 ** ks[i] for i in order])
+    E_ = torch.eye(ROTG, device=X_.device).expand_as(X_) + X_; term = X_
+    for j in range(2, 10):
+        term = term @ X_ / j; E_ = E_ + term
+    for m in range(ks[order[0]] if As else 0):
+        n_ = sum(sz for sz, i in zip(sizes, order) if ks[i] > m)
+        E_ = E_ @ E_ if n_ == E_.shape[0] else torch.cat((E_[:n_] @ E_[:n_], E_[n_:]))
+    out = [None] * len(As)
+    for part, i in zip(E_.split(sizes), order):
+        out[i] = part
+    return out
+
 def rot_Q(R):
     """The groups' bases Q = exp(S), S the skew part of A's strict upper triangle (Taylor series after
     scaling, then squaring: matrix products only, orthogonal to rounding)."""
+    if ROT_BATCH:
+        Q = rot_Q_batched(R['A'])
+        if Q is not None:
+            return Q
     A_ = R['A'] * MASK
     S_ = A_ - A_.transpose(1, 2)
     k = max(0, math.ceil(math.log2(max(S_.detach().abs().sum((1, 2)).max().item(), 1e-12) / 0.25)))
@@ -756,6 +821,10 @@ def rot_tau_bits(R):
 
 def rot_index_bits():
     """log2 of the number of blocks (MLP, OV and QK blocks with a slice or plane)."""
+    if ROT_BATCH:
+        Ls = [R['L'] for R in ROT_ALL]
+        return rot_memo('index', Ls, lambda: math.log2(max(2, int(torch.stack(
+            [(torch.zeros(L.shape[:2], device=dev).scatter_(1, L.argmax(-1), 1.0) > 0).sum() for L in Ls]).sum()))))
     used = lambda L: int((torch.zeros(L.shape[:2], device=dev).scatter_(1, L.argmax(-1), 1.0) > 0).sum())
     return math.log2(max(2, sum(used(R['L']) for R in ROT_ALL)))
 
@@ -772,7 +841,7 @@ def make_rot_fc(n, l):
                 sc = torch.ones(p.shape[-1], device=p.device); sc[G] = 1 + a
                 p = p.index_copy(0, torch.tensor([b], device=p.device), (p[b] * sc)[None])
         Q = rot_Q(R)
-        c = torch.einsum('...nk,nki->...ni', p[..., R['perm']].view(*sh, R['ng'], ROTG), Q)
+        c = torch.einsum('...nk,nki->...ni', permuted(p, R['perm'], R['inv']).view(*sh, R['ng'], ROTG), Q)
         if state.get('noise'):
             eps = torch.randn(R['ng'] * ROTG, x.shape[-1], device=x.device)
             c = c + (x @ eps.T).view(*sh, R['ng'], ROTG) * R['ls_fc'].exp()
@@ -780,7 +849,7 @@ def make_rot_fc(n, l):
             gam = torch.ones_like(c)
         else:
             bits_i, wn = rot_slice_bits(R, Q)
-            abar = vpd_model.gelu_tanh(p)[..., R['perm']].view(*sh, R['ng'], ROTG)
+            abar = permuted(vpd_model.gelu_tanh(p), R['perm'], R['inv']).view(*sh, R['ng'], ROTG)
             r = torch.einsum('...nk,nki->...ni', abar, Q).abs() * wn
             Lsm = torch.softmax(R['L'], -1)
             hot = F.one_hot(R['L'].argmax(-1), ROTG).float()
@@ -803,7 +872,7 @@ def make_rot_fc(n, l):
                 state['soft'].append((gb * Lj).sum((-1, -2)).reshape(-1))
                 gam = torch.einsum('...nj,nij->...ni', gb, Lsm)
         state['rot'][l] = (gam, Q)
-        return torch.einsum('...ni,nki->...nk', c * gam, Q).reshape(*sh, -1)[..., R['inv']]
+        return permuted(torch.einsum('...ni,nki->...nk', c * gam, Q).reshape(*sh, -1), R['inv'], R['perm'])
     return fwd
 
 def make_rot_dn(n, l):
@@ -813,8 +882,8 @@ def make_rot_dn(n, l):
             return a @ W.T
         sh = a.shape[:-1]
         gam, Q = state['rot'][l]
-        c = torch.einsum('...nk,nki->...ni', a[..., R['perm']].view(*sh, R['ng'], ROTG), Q) * gam
-        z = torch.einsum('...ni,nki->...nk', c, Q).reshape(*sh, -1)[..., R['inv']]
+        c = torch.einsum('...nk,nki->...ni', permuted(a, R['perm'], R['inv']).view(*sh, R['ng'], ROTG), Q) * gam
+        z = permuted(torch.einsum('...ni,nki->...nk', c, Q).reshape(*sh, -1), R['inv'], R['perm'])
         for b, kind, G, a_ in state['entry'].get(n, ()):
             if kind == 'in':
                 # down_proj columns G scaled by 1 + a, entry-wise in every slice's write.
@@ -1506,7 +1575,37 @@ if FMODE:
     for cont, key, mu, ls in leaves:
         if any(cont is R for R in ROT_ALL) and key in ('A', 'tau'):
             cont[key + '_leaf'] = (mu, ls)
-opt = torch.optim.Adam(groups)
+class OneAdam(torch.optim.Adam):
+    """DESCENT_ONE_ADAM=1 (speed): torch's multi-tensor Adam (its default on CUDA) in one pass over every group
+    instead of one per group (each tensor here is its own group: the per-group passes held the host 24 ms of a
+    whole-model step on an A40). The same element-wise operations, each tensor at its group's step size."""
+    @torch.no_grad()
+    def step(self):
+        ps, gs, ms, vs, ss, lrs = [], [], [], [], [], []
+        for g in self.param_groups:
+            for p in g['params']:
+                if p.grad is None:
+                    continue
+                st = self.state[p]
+                if not st:
+                    st['step'] = torch.tensor(0.0)
+                    st['exp_avg'] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                    st['exp_avg_sq'] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                ps.append(p); gs.append(p.grad); ms.append(st['exp_avg']); vs.append(st['exp_avg_sq']); ss.append(st['step']); lrs.append(g['lr'])
+        if not ps:
+            return
+        (b1, b2), eps = self.defaults['betas'], self.defaults['eps']
+        torch._foreach_add_(ss, torch.tensor(1.0), alpha=1.0)
+        torch._foreach_lerp_(ms, gs, 1 - b1)
+        torch._foreach_mul_(vs, b2)
+        torch._foreach_addcmul_(vs, gs, gs, 1 - b2)
+        bc1 = [1 - b1 ** s_.item() for s_ in ss]
+        bc2 = [1 - b2 ** s_.item() for s_ in ss]
+        den = torch._foreach_sqrt(vs)
+        torch._foreach_div_(den, [bc ** 0.5 for bc in bc2])
+        torch._foreach_add_(den, eps)
+        torch._foreach_addcdiv_(ps, ms, den, [(lr_ / bc) * -1 for lr_, bc in zip(lrs, bc1)])
+opt = OneAdam(groups) if os.environ.get('DESCENT_ONE_ADAM') == '1' else torch.optim.Adam(groups)
 trainable = [q for g in groups for q in g['params']]
 
 def draw(mean):
