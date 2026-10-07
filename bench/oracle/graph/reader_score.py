@@ -410,6 +410,8 @@ class Scorer:
                 r["english_saved_bits"] = N * float(code.mean() - b.mean())
                 r["program_saved_bits"] = N * float(empty.mean() - b.mean())
                 r["per_family_empty"] = {f: float(np.mean([empty[j] for j, it in enumerate(items) if it.get("family", "all") == f])) for f in fams}
+                r["per_item_empty"] = [round(float(x), 6) for x in empty]
+                r["per_item_code_only"] = [round(float(x), 6) for x in code]
             out.append(r)
         return out
 

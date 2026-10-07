@@ -192,6 +192,11 @@ def report(args):
         se = x.std(ddof=1) / np.sqrt(len(x))
         return f"{a} - {b}: {x.mean():+.4f} bits/item (SE {se:.4f}, {x.mean() / se:+.1f} SE)"
 
+    for k, r in rows.items():
+        if "per_item_empty" in r:
+            bits[f"{k}:empty"], bits[f"{k}:code_alone"] = np.array(r["per_item_empty"]), np.array(r["per_item_code_only"])
+            lines.append(paired(f"{k}:empty", k))
+            lines.append(paired(f"{k}:code_alone", k))
     ref = "true_measured"
     for k in rows:
         if k != ref and ref in rows and not k.endswith("_paraphrase"):
