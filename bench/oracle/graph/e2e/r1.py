@@ -39,7 +39,7 @@ def pieces(units: list[str]) -> tuple[int, int]:
     return heads, neurons
 
 
-def rows_of(directories: list[Path], pattern: str) -> list[dict]:
+def rows_of(directories: list[Path], pattern: str, families=table.SHARED) -> list[dict]:
     out = {}
     for d in directories:
         for path in sorted(d.expanduser().glob(pattern)):
@@ -48,9 +48,11 @@ def rows_of(directories: list[Path], pattern: str) -> list[dict]:
                 continue
             behavior = path.name.split(".prefix")[0].split(".addition")[0]
             empty, found = r["trajectory"][0]["empty"], r["score"]
+            # the empty program as prefix k = 0, scored on the same experiments as the prefixes (runs after 4af85d1386)
+            empty = next((e for k, e in r["trajectory"][0].get("prefixes", []) if k == 0), empty)
             # the shared families both runs have (an empty program scored for the ranking has only the clean
             # and counterfactual prompts)
-            fams = tuple(f for f in table.SHARED if f in (empty.get("per_family") or {}) and f in (found.get("per_family") or {}))
+            fams = tuple(f for f in families if f in (empty.get("per_family") or {}) and f in (found.get("per_family") or {}))
             e, f = table.shared(empty, fams), table.shared(found, fams)
             use_empty = f is None or f[1] >= e[1]
             best = empty if use_empty else found
@@ -101,8 +103,10 @@ def main() -> None:
     ap.add_argument("--glob", default="*.prefix_*.json")
     ap.add_argument("--out", type=Path, default=RUNS / "r1_table")
     ap.add_argument("--title", default="vpd4l: search's best program vs the empty program")
+    ap.add_argument("--families", choices=["shared", "fit"], default="shared",
+                    help="the families the totals are taken over (fit: the search's selection families; the held-out ones are reported)")
     a = ap.parse_args()
-    rows = rows_of(a.results, a.glob)
+    rows = rows_of(a.results, a.glob, table.FIT if a.families == "fit" else table.SHARED)
     cols = ["behavior", "heads", "neurons", "total", "empty_total", "recovered", "opaque", "heldout_exec", "empty_heldout_exec",
             "heldout_seed_total", "calls", "families", "units", "file"]
     fmt = lambda v: "" if v is None else f"{v:.4f}" if isinstance(v, float) else ",".join(v) if isinstance(v, list) else str(v)
