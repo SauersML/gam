@@ -54,6 +54,11 @@ pub const REMOVAL_READS: usize = 64;
 /// per epoch) the eight steps are 0.2% of the first epoch.
 const RATIO_DRAWS: u64 = 8;
 
+/// `E[ln X]` for `X ~ χ²₁`, `ψ(½) + ln 2`: the curvature ratio's draws are averaged in logarithm
+/// ([`DevicePosterior::step`]), and a χ²₁-distributed draw of a fixed ratio `ρ` has
+/// `E[ln draw] = ln ρ + E[ln χ²₁]`.
+const LOG_CHI2_1: f64 = -1.270_362_845_461_478_2;
+
 fn error(e: impl std::fmt::Display) -> String {
     format!("device posterior: {e}")
 }
@@ -121,6 +126,7 @@ pub struct DevicePosterior {
     /// the last step's `η`; and whether the means are held (a pass that sets the deviations only,
     /// [`DevicePosterior::hold_means`]).
     rho: f64,
+    log_rho: f64,
     rho_steps: u64,
     slope: (f64, f64),
     slope_steps: u64,
@@ -328,6 +334,7 @@ impl DevicePosterior {
             average: Vec::new(),
             averaged: 0,
             rho: 1.0,
+            log_rho: LOG_CHI2_1,
             rho_steps: 0,
             slope: (0.0, 0.0),
             slope_steps: 0,
@@ -506,8 +513,8 @@ impl DevicePosterior {
     /// `h₀` the curvature before this step's draw) is the minimum along `d` of `F`'s local
     /// Gauss–Newton quadratic model, not of `F` along the line: the slope along `d` over the
     /// model's curvature along it, `η = r̄ Σ (h₀⁺ + δ) d² / (ρ̄ Σ h₀⁺ d² + Σ δ d²)`. The data
-    /// curvature along `d` is `ρ̄ Σ h₀⁺ d²`: `ρ̄` the average over the steps (uniform, then over
-    /// about one epoch, `w = max(1/t, 1 − β₂)`) of one draw's `c (u · d)² / Σ h₀⁺ d²` (`u` the
+    /// curvature along `d` is `ρ̄ Σ h₀⁺ d²`: `ρ̄` the average in logarithm over the steps (uniform,
+    /// then over about one epoch, `w = max(1/t, 1 − β₂)`), read back through `E[ln χ²₁]`, of one draw's `c (u · d)² / Σ h₀⁺ d²` (`u` the
     /// step's Gauss–Newton factor, `c` the factor turning its square into curvature per token).
     /// `d` is formed before `u` enters the curvature, so given the batch and the sample
     /// `E[c (u · d)²] = dᵀ G_n d` exactly, `G_n` the Gauss–Newton matrix per token of the tokens
@@ -577,10 +584,18 @@ impl DevicePosterior {
                     .collect();
                 log::info!("library line step draw by block: {}", text.join(", "));
             }
-            if diagonal > 0.0 {
+            // The draws' ratio is averaged in logarithm and read back through `E[ln χ²₁]`: one draw
+            // is a single χ²₁-like sample of the current direction's ratio, and the directions'
+            // ratios themselves jump by orders of magnitude (vpd4l tiny fit with hard gates: draws
+            // of 7e2, 1e4, then 1.7e10 and 2e10 at steps 2 and 3, then 3e6 and 13; every block of
+            // parameters at once). A plain mean of the ratios kept such a draw's weight for the
+            // whole running window (`ρ̄` near 1e10 and η near 1e-11 for the first epoch); the
+            // logarithm's mean moves by `ln(draw) / t` for it.
+            if diagonal > 0.0 && draw_curvature > 0.0 {
                 self.rho_steps += 1;
                 let w = (1.0 / self.rho_steps as f64).max(1.0 - ivon.beta2);
-                self.rho += w * (draw_curvature / diagonal - self.rho);
+                self.log_rho += w * ((draw_curvature / diagonal).ln() - self.log_rho);
+                self.rho = (self.log_rho - LOG_CHI2_1).exp();
             }
             if own > 0.0 && own.is_finite() && fresh.is_finite() {
                 self.slope_steps += 1;
@@ -820,6 +835,7 @@ impl DevicePosterior {
     /// The step's curvature-ratio average and its draws, restored from a checkpoint.
     pub fn set_line_ratio(&mut self, (rho, steps): (f64, u64)) {
         (self.rho, self.rho_steps) = (rho, steps);
+        self.log_rho = rho.ln() + LOG_CHI2_1;
     }
 
     /// The step's slope averages ([`DevicePosterior::step`]: of the fresh gradient's slope along
