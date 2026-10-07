@@ -15,15 +15,33 @@ from pathlib import Path
 
 RUNS = Path.home() / "mpd-data/graph_oracle/runs"
 TERMS = ["total_bits", "exec_error_bits", "opaque_bits", "code_bits", "reader_error_bits"]
+# The behavior's own experiment families: drawn from the seed alone, identical for every program, so a
+# total over them compares programs on the same experiments (the aimed, swap and cut families depend on
+# what the program declares).
+SHARED = ("clean", "counterfactual", "edit_uniform", "rank_one")
 COLUMNS = ["behavior", "program", "stand_in", "total", "exec_error", "opaque", "code", "reader_error", "opaque_numbers",
-           "checker_calls", "source_file"]
+           "shared_exec_error", "shared_total", "checker_calls", "source_file"]
+
+
+def shared(s: dict) -> tuple[float, float] | None:
+    """Mean KL per token over the shared families and the total with it in place of the execution error
+    (bits per scored token), or None without per-family terms."""
+    pf = s.get("per_family") or {}
+    tokens = sum(pf[f]["tokens"] for f in SHARED if f in pf)
+    if not tokens:
+        return None
+    mean = sum(pf[f]["mean_kl_bits"] * pf[f]["tokens"] for f in SHARED if f in pf) / tokens
+    n = s.get("N", 2**24)
+    return mean, mean + (s.get("opaque_bits", 0.0) + s.get("code_bits", 0.0) + (s.get("reader_error_bits") or 0.0)) / n
 
 
 def row(behavior: str, program: str, s: dict, stand_in, calls, source: str) -> list[str]:
     n = s.get("N", 2**24)
     cells = [behavior, program, str(stand_in or "default")]
     cells += ["" if s.get(k) is None else f"{s[k] / n:.4f}" for k in TERMS]
-    cells += [str(s.get("opaque_numbers", "")), "" if calls is None else str(calls), source]
+    sh = shared(s)
+    cells += [str(s.get("opaque_numbers", ""))] + (["", ""] if sh is None else [f"{sh[0]:.4f}", f"{sh[1]:.4f}"])
+    cells += ["" if calls is None else str(calls), source]
     return cells
 
 

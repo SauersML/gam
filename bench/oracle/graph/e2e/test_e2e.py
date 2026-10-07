@@ -188,7 +188,7 @@ def test_table_reads_sweep_search_and_oracle(tmp_path):
     for run, t in (("r1", 1.2), ("r2", 1.1)):
         (tmp_path / "oracle" / f"a.b.{run}.json").write_text(json.dumps({"behavior": "a.b", "score": terms(t)}))
     rows = table.collect(tmp_path / "sweep", [tmp_path / "search"], tmp_path / "oracle")
-    got = {r[1]: (r[3], r[9]) for r in rows}
+    got = {r[1]: (r[3], r[11]) for r in rows}
     assert got == {"empty": ("3.0000", ""), "hand": ("2.0000", ""), "search addition_cf": ("1.5000", "99"), "oracle": ("1.1000", "")}
 
 
