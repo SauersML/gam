@@ -238,7 +238,7 @@ fn checker_counterfactual_default_scores_the_empty_program_at_the_behavior_signa
     let (empty, outcomes) = checker.score(&Program { model: "tiny".into(), valid: true, ..Program::default() }, 0, 3, true, None).expect("score");
     let clean_rows: Vec<usize> = (0..f.sequences.len()).map(|s| (s + 1) * 12 - 1).collect();
     let signal = kl_bits(&clean.select(ndarray::Axis(0), &clean_rows), &target.select(ndarray::Axis(0), &clean_rows));
-    let measured = outcomes.iter().find(|o| o.0 == Experiment::Clean).map(|o| kl_bits(&o.1, &o.2)).expect("clean");
+    let measured = outcomes.iter().find(|o| o.0 == Experiment::Clean).map(|o| o.1.clone()).expect("clean");
     assert!(max(&signal.iter().zip(&measured).map(|(a, b)| a - b).collect::<Vec<_>>()) < 1e-9, "empty program clean error {measured:?} vs KL(M(x) ‖ M(x')) {signal:?}");
     assert!(empty.valid);
     let (full, _) = checker.score(&full_program(), 16, 3, true, None).expect("score");
