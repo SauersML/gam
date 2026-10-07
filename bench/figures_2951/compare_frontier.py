@@ -57,6 +57,12 @@ def gap(r):
     return sum(v['mean_bits_per_token'] * v['tokens'] for v in fams.values()) / tok
 
 
+def description(held_out):
+    """A fit's description in bits as its F counts it: KL(q || p) of the described groups, the active
+    groups' variances, its discrete choices and its prior's parameters (library_mdl::HeldOut)."""
+    return sum(held_out.get(k) or 0.0 for k in ('divergence_bits', 'variance_bits', 'choice_bits', 'prior_bits'))
+
+
 def fixed_bits(out):
     from safetensors import safe_open
     reals = 0
@@ -94,7 +100,7 @@ for label, d, f, rec in arms:
     k = features(d)
     active = sum(l['nonzero_per_token'] for l in rec['layers'] if l['functions'])
     attn = L('/Users/user/mpd-data/compare/attention_price.json')
-    points.append({'label': label, 'executed': k + ATTENTION_RANK_ONE, 'active': active + ATTENTION_RANK_ONE, 'gap': gap(r), 'description_bits': rec['divergence_bits'] + fixed_bits(d),
+    points.append({'label': label, 'executed': k + ATTENTION_RANK_ONE, 'active': active + ATTENTION_RANK_ONE, 'gap': gap(r), 'description_bits': description(rec) + fixed_bits(d),
                    'runs_m_attention': True, 'attention_bits': attn['divergence_bits'] if attn else None, 'edits': f'{d}/{f}'})
 for p in L(EXTRA) or []:
     r = L(p['edits'])

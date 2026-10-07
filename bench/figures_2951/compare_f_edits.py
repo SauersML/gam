@@ -8,8 +8,9 @@ driver (EDITS_*_m1.json) and VPD's three forms by mpd_battery_2951 site_edits on
 scale, push) under ~/mpd-data/compare/new_ops/c7/. An explanation without such a score is listed in
 the table with no number and is not drawn; a clean-text error never stands in for an edit gap.
 
-Description bits, one convention for every explanation: KL(q || p) of every described group (the
-fit's divergence: features, threshold groups, sink vectors), plus 32 bits per real for every executed
+Description bits, one convention for every explanation: a fit's description as its F counts it (KL(q || p)
+of every described group: features, threshold groups, sink vectors; the active groups' variances; its
+discrete choices and prior parameters), plus 32 bits per real for every executed
 fixed piece that is not one of M's own tensors (a transcoder block's b_dec); VPD's 11.4M bits of
 subcomponents plus 77.2M bits of causal-importance network; and for an explanation that runs M's
 attention unchanged, that attention's description at the Laplace start with its means held at M
@@ -53,6 +54,12 @@ def manifest_gap(r):
     return gap, {k: (n, s / n) for k, (n, s) in bins.items() if n}, r['families']
 
 
+def description(held_out):
+    """A fit's description in bits as its F counts it: KL(q || p) of the described groups, the active
+    groups' variances, its discrete choices and its prior's parameters (library_mdl::HeldOut)."""
+    return sum(held_out.get(k) or 0.0 for k in ('divergence_bits', 'variance_bits', 'choice_bits', 'prior_bits'))
+
+
 def fixed_bits(out):
     """32 bits per real of each transcoder layer's fixed output bias (not M's tensor)."""
     reals = 0
@@ -90,7 +97,7 @@ for model, label, d, f, rec, out in arms:
     if r:
         row['gap'], row['gap_by_effect'], row['families'] = manifest_gap(r)
     if rec:
-        row['description_bits'] = rec['divergence_bits'] + fixed_bits(out)
+        row['description_bits'] = description(rec) + fixed_bits(out)
         row['active_per_token'] = [l['nonzero_per_token'] for l in rec['layers'] if l['functions']]
         # An MLP-only explanation runs M's attention unchanged and is charged its description.
         if model == 'vpd4l':
