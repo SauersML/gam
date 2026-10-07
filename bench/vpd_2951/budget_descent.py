@@ -171,7 +171,7 @@ for n in mlp:
             tau = -3 * s
         elif start == 'neuron':
             l_ = n.split('.')[1]
-            q = 1 - (VPD_COUNTS[f'h.{l_}.mlp.c_fc'] + VPD_COUNTS[f'h.{l_}.mlp.down_proj']) / 2 / V.shape[1]
+            q = 1 - START_SCALE * (VPD_COUNTS[f'h.{l_}.mlp.c_fc'] + VPD_COUNTS[f'h.{l_}.mlp.down_proj']) / 2 / V.shape[1]
             flat = r.reshape(-1)
             idx = torch.randperm(flat.numel(), device=dev)[:2_000_000]
             tau = torch.full_like(s, torch.quantile(flat[idx], q).item())
@@ -348,8 +348,8 @@ def head_output(c, U, o, swaps=()):
 ATTN_FREE = os.environ.get('DESCENT_ATTN_FREE') == '1'
 A = {}
 for n in attn:
-    if start != 'vpd':
-        raise SystemExit('DESCENT_SITES=all: the vpd start only')
+    if start not in ('vpd', 'neuron'):
+        raise SystemExit('DESCENT_SITES=all: the vpd or neuron start (the heads from VPD\'s attention slices)')
     W = T.site(n).W; o = n.endswith('o_proj')
     Vv, Uv = load(n + '.V'), load(n + '.U')                                      # [768, C], [C, 768]
     if o:
@@ -1011,14 +1011,17 @@ def evaluate(final=False):
     state['collect'] = None
     return out
 
-# The VPD start's thresholds set in the gated run: each map's threshold is the quantile of its reads that
+# The VPD or neuron start's thresholds set in the gated run: each map's threshold is the quantile of its reads that
 # matches its target count (VPD's per-map count scaled to the budget) with every upstream map gated at its
 # own threshold, one pass per map in forward order (after pass j the first j maps are at their fixed
 # point). Thresholds set on M's inputs left maps dead whose reads shrink under upstream gating (the
 # whole model at K = 128: layer 0's v and o and layer 1's o at 0.0-0.1 on against 1.2-3.2 targeted, and a
 # gate far below its threshold gets no gradient back).
-if start == 'vpd' and not (SHARE or SHARE_A or ROUTER or EXACT or ARM == 'dir'):
-    target = {n: 1 - START_SCALE * VPD_COUNTS[n] / P[n]['V'].shape[1] for n in mlp}
+if start in ('vpd', 'neuron') and not (SHARE or SHARE_A or ROUTER or EXACT or ARM == 'dir'):
+    # A neuron part counts its two slices: its layer's neurons on match the mean of VPD's two counts.
+    vc = lambda n: (VPD_COUNTS[n] if start == 'vpd' else
+                    (VPD_COUNTS[n.rsplit('.', 1)[0] + '.c_fc'] + VPD_COUNTS[n.rsplit('.', 1)[0] + '.down_proj']) / 2)
+    target = {n: 1 - START_SCALE * vc(n) / P[n]['V'].shape[1] for n in mlp}
     target.update({n: 1 - START_SCALE * VPD_ATTN_COUNTS.get(n, 1.0) / (NH * A[n]['V'].shape[-1]) for n in attn})
     ids_c = torch.tensor(tok[0:4, :512].astype(np.int64), device=dev)
     with torch.no_grad():
