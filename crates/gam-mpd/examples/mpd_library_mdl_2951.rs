@@ -276,6 +276,103 @@ struct Manifest {
     directions: String,
     typical: Vec<(interchange::SharedSite, f64)>,
     experiments: Vec<Vec<interchange::Experiment>>,
+    /// The native weight edits (`EditSettings::weights`), as drawn.
+    #[serde(default)]
+    weights: Vec<WeightDraw>,
+}
+
+/// One native weight edit of `M`'s operator `operator`, as a manifest lists it
+/// (`weight_faithfulness`).
+#[derive(Clone, serde::Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+enum WeightDraw {
+    /// Its rows (`rows`), else its columns, `units` scaled by `alpha`.
+    Units { operator: String, rows: bool, units: Vec<usize>, alpha: f64 },
+    /// `scale · u vᵀ` added.
+    RankOne { operator: String, scale: f64, u: Vec<f64>, v: Vec<f64> },
+}
+
+impl WeightDraw {
+    fn operator(&self) -> &str {
+        match self {
+            Self::Units { operator, .. } | Self::RankOne { operator, .. } => operator,
+        }
+    }
+
+    fn kind(&self) -> String {
+        match self {
+            Self::Units { rows, units, alpha, .. } => format!("{} {} scaled by {alpha}", units.len(), if *rows { "rows" } else { "columns" }),
+            Self::RankOne { scale, .. } => format!("rank one of Frobenius size {scale:.4}"),
+        }
+    }
+
+    /// The edit `ΔW` of `M`'s operator (`native` its program).
+    fn delta(&self, native: &OperatorProgram) -> Result<ndarray::Array2<f64>, String> {
+        let op = native.operators.iter().find(|op| op.name == self.operator()).ok_or_else(|| format!("edits: M has no operator {}", self.operator()))?;
+        let w = op.matrix();
+        let (r, c) = w.dim();
+        match self {
+            Self::Units { rows, units, alpha, .. } => {
+                let mut delta = ndarray::Array2::zeros((r, c));
+                for &u in units {
+                    if *rows && u < r {
+                        delta.row_mut(u).assign(&w.row(u).mapv(|v| v * (alpha - 1.0)));
+                    } else if !*rows && u < c {
+                        delta.column_mut(u).assign(&w.column(u).mapv(|v| v * (alpha - 1.0)));
+                    } else {
+                        return Err(format!("edits: unit {u} outside {}", self.operator()));
+                    }
+                }
+                Ok(delta)
+            }
+            Self::RankOne { scale, u, v, .. } if u.len() == r && v.len() == c => Ok(ndarray::Array2::from_shape_fn((r, c), |(a, b)| scale * u[a] * v[b])),
+            Self::RankOne { .. } => Err(format!("edits: a rank-one edit of another shape than {}", self.operator())),
+        }
+    }
+}
+
+/// `family.edits` native weight edits drawn from `seed` (`weight_faithfulness`).
+fn draw_weights(native: &OperatorProgram, family: &WeightFamily, seed: u64) -> Result<Vec<WeightDraw>, String> {
+    use rand::RngExt;
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed ^ 0x5745_4947_4854);
+    let pool: Vec<usize> = native.operators.iter().enumerate().filter(|(_, op)| op.name.starts_with("blocks.") && op.rows.width() > 1 && op.cols.width() > 1 && op.diagonal().is_none()).map(|(i, _)| i).collect();
+    if pool.is_empty() {
+        return Err("edits: no map of M to edit".into());
+    }
+    let normal = |rng: &mut rand::rngs::StdRng, n: usize| -> Vec<f64> {
+        let v: Vec<f64> = (0..n)
+            .map(|_| {
+                let (a, b): (f64, f64) = (rng.random::<f64>().max(f64::MIN_POSITIVE), rng.random());
+                (-2.0 * a.ln()).sqrt() * (std::f64::consts::TAU * b).cos()
+            })
+            .collect();
+        let norm = v.iter().map(|x| x * x).sum::<f64>().sqrt();
+        v.into_iter().map(|x| x / norm).collect()
+    };
+    let mut out = Vec::with_capacity(family.edits);
+    for _ in 0..family.edits {
+        let op = &native.operators[pool[rng.random_range(0..pool.len())]];
+        let (r, c) = (op.rows.width(), op.cols.width());
+        let operator = op.name.clone();
+        if rng.random_range(0..2) == 0 {
+            let rows = rng.random_range(0..2) == 0;
+            let n = if rows { r } else { c };
+            let k = (1usize << rng.random_range(0..=4usize)).min(n);
+            let mut units: Vec<usize> = (0..n).collect();
+            for j in 0..k {
+                let t = rng.random_range(j..n);
+                units.swap(j, t);
+            }
+            units.truncate(k);
+            out.push(WeightDraw::Units { operator, rows, units, alpha: interchange::SCALES[rng.random_range(0..interchange::SCALES.len())] });
+        } else {
+            let size = interchange::SIZES[rng.random_range(0..interchange::SIZES.len())];
+            let (u, v) = (normal(&mut rng, r), normal(&mut rng, c));
+            let scale = size * op.matrix().iter().map(|x| x * x).sum::<f64>().sqrt() / (r.min(c) as f64).sqrt();
+            out.push(WeightDraw::RankOne { operator, scale, u, v });
+        }
+    }
+    Ok(out)
 }
 
 /// The 64-bit FNV-1a digest of `words`, in hexadecimal.
@@ -378,6 +475,9 @@ fn edit_faithfulness(
         if let Some((what, _)) = differs.iter().find(|d| d.1) {
             return Err(format!("edits: the manifest {} differs in its {what}", manifest_path.display()));
         }
+        if m.weights.len() != settings.weights.as_ref().map_or(0, |w| w.edits) {
+            return Err(format!("edits: the manifest {} lists {} weight edits", manifest_path.display(), m.weights.len()));
+        }
         experiments.set_typical(m.typical.iter().copied().collect());
         Some(m)
     } else {
@@ -423,22 +523,30 @@ fn edit_faithfulness(
             w.whole_rows
         );
     }
-    if loaded.is_none() {
-        let m = Manifest {
-            export: identity.export.clone(),
-            sequences: settings.sequences,
-            rows: rows.clone(),
-            seed: settings.seed,
-            families: settings.families.clone(),
-            edits_per_sequence: settings.edits_per_sequence,
-            batch_sequences: settings.batch_sequences,
-            binary: option_env!("GAM_BUILD_GIT_SHA").map(String::from),
-            directions: directions.clone(),
-            typical: experiments.typical_norms().into_iter().collect(),
-            experiments: batches.iter().map(|(_, _, drawn, _)| drawn.clone()).collect(),
-        };
-        std::fs::write(&manifest_path, serde_json::to_vec(&m).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-    }
+    let manifest_weights = match &loaded {
+        Some(m) => m.weights.clone(),
+        None => {
+            let m = Manifest {
+                export: identity.export.clone(),
+                sequences: settings.sequences,
+                rows: rows.clone(),
+                seed: settings.seed,
+                families: settings.families.clone(),
+                edits_per_sequence: settings.edits_per_sequence,
+                batch_sequences: settings.batch_sequences,
+                binary: option_env!("GAM_BUILD_GIT_SHA").map(String::from),
+                directions: directions.clone(),
+                typical: experiments.typical_norms().into_iter().collect(),
+                experiments: batches.iter().map(|(_, _, drawn, _)| drawn.clone()).collect(),
+                weights: match &settings.weights {
+                    Some(family) => draw_weights(native, family, settings.seed)?,
+                    None => Vec::new(),
+                },
+            };
+            std::fs::write(&manifest_path, serde_json::to_vec(&m).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+            m.weights
+        }
+    };
     let manifest = json!({"file": manifest_path.display().to_string(), "sha256": sha256(&manifest_path)?});
     // The response diagnostic KL(p_e ‖ p̃_e), p̃_e ∝ p_0 q_e / q_0 (p = M, q = P, 0 clean, e edited;
     // Interchange::response): whether P predicts M's change under the edit, apart from P's clean
@@ -506,7 +614,7 @@ fn edit_faithfulness(
     let weights = match &settings.weights {
         Some(family) => {
             let rows = &held_out[first..end.min(first + family.sequences)];
-            Some(weight_faithfulness(device, (native, layers), (&artifact, &explanation.reads), rows, family, settings)?)
+            Some(weight_faithfulness(device, (native, layers), (&artifact, &explanation.reads), rows, &manifest_weights, settings)?)
         }
         None => None,
     };
@@ -563,81 +671,40 @@ fn edit_faithfulness(
     save(&out.join(format!("EDITS_{}.json", settings.name)), &report)
 }
 
-/// Native weight edits of `M`'s maps (`EditSettings::weights`), compiled into `M` and into `P`
-/// (`weight_edit::compile`: `M` computes with `W + ΔW`, `P` with its decoded `W` plus `ΔW` through
-/// its owners), the same for every explanation: per edit one map of a layer (an operator of `M`
+/// Native weight edits of `M`'s maps (`EditSettings::weights`), the same for every explanation,
+/// drawn once into the manifest (`draw_weights`): per edit one map of a layer (an operator of `M`
 /// whose name starts with `blocks.`, neither a vector nor a norm's diagonal), uniformly, and either
 /// `k = 2^u` of its rows or of its columns (`u` uniform in `0..=4`) scaled by a factor of `SCALES`,
 /// or a rank-one push `s ‖W‖_F / √min(r, c) · u vᵀ` with `u`, `v` seeded unit directions and `s`
-/// of `SIZES`. Each is scored on `rows` with `P` autonomous: the gap `KL(M_e ‖ P_e)`, the effect
-/// `KL(M_e ‖ M)`, the edit-ignoring baseline `KL(M_e ‖ P)` and the response diagnostic, in bits per
-/// token, with the share of the edit `P` took (`Compiled::owned`); an explanation holding no copy
-/// of the edited map counts it as not applicable.
+/// of `SIZES`. Each is compiled into `M` and into `P` (`weight_edit::compile`: `M` computes with
+/// `W + ΔW`, `P` with its decoded `W` plus `ΔW` through its owners) and scored on `rows` with `P`
+/// autonomous: the gap `KL(M_e ‖ P_e)`, the effect `KL(M_e ‖ M)`, the edit-ignoring baseline
+/// `KL(M_e ‖ P)` and the response diagnostic, in bits per token, with the share of the edit `P` took
+/// (`Compiled::owned`); an explanation holding no copy of the edited map counts it as not
+/// applicable.
 fn weight_faithfulness(
     device: &Device,
     (native, layers): (&OperatorProgram, &[LayerNodes]),
     (artifact, reads): (&gam_mpd::artifact::Artifact, &[interchange::ReadVariable]),
     rows: &[Vec<u32>],
-    family: &WeightFamily,
+    draws: &[WeightDraw],
     settings: &EditSettings,
 ) -> Result<Value, String> {
-    let (seed, numeric_bytes) = (settings.seed, settings.numeric_bytes);
-    use rand::RngExt;
     let started = Instant::now();
-    let mut rng = rand::rngs::StdRng::seed_from_u64(seed ^ 0x5745_4947_4854);
-    let pool: Vec<usize> = native.operators.iter().enumerate().filter(|(_, op)| op.name.starts_with("blocks.") && op.rows.width() > 1 && op.cols.width() > 1 && op.diagonal().is_none()).map(|(i, _)| i).collect();
-    if pool.is_empty() || rows.is_empty() {
-        return Err("edits: no map of M to edit or no rows to score".into());
+    if rows.is_empty() {
+        return Err("edits: no rows to score the weight edits on".into());
     }
     let batch = interchange::Batch::new(rows.to_vec(), rows.to_vec())?;
     let clean: Vec<interchange::Experiment> = (0..rows.len()).map(|base| interchange::Experiment { base, source: base, explained: vec![true; 2 * layers.len()], patch: None, position: 0 }).collect();
-    let interchange = |model: &OperatorProgram, explanation: &gam_mpd::artifact::Artifact| interchange::Interchange::new(device, model, layers, explanation, &[], reads.to_vec(), numeric_bytes, 256);
+    let interchange = |model: &OperatorProgram, explanation: &gam_mpd::artifact::Artifact| interchange::Interchange::new(device, model, layers, explanation, &[], reads.to_vec(), settings.numeric_bytes, 256);
     let unedited = interchange(native, artifact)?;
     let mean = |bits: &[Vec<f64>]| bits.iter().flatten().sum::<f64>() / bits.iter().map(Vec::len).sum::<usize>().max(1) as f64;
-    let normal = |rng: &mut rand::rngs::StdRng, n: usize| -> Vec<f64> {
-        let v: Vec<f64> = (0..n)
-            .map(|_| {
-                let (a, b): (f64, f64) = (rng.random::<f64>().max(f64::MIN_POSITIVE), rng.random());
-                (-2.0 * a.ln()).sqrt() * (std::f64::consts::TAU * b).cos()
-            })
-            .collect();
-        let norm = v.iter().map(|x| x * x).sum::<f64>().sqrt();
-        v.into_iter().map(|x| x / norm).collect()
-    };
     let mut records = Vec::new();
-    for i in 0..family.edits {
-        let op = &native.operators[pool[rng.random_range(0..pool.len())]];
-        let w = op.matrix();
-        let (r, c) = w.dim();
-        let (kind, delta) = if rng.random_range(0..2) == 0 {
-            let along_rows = rng.random_range(0..2) == 0;
-            let n = if along_rows { r } else { c };
-            let k = (1usize << rng.random_range(0..=4usize)).min(n);
-            let mut units: Vec<usize> = (0..n).collect();
-            for j in 0..k {
-                let t = rng.random_range(j..n);
-                units.swap(j, t);
-            }
-            units.truncate(k);
-            let alpha = interchange::SCALES[rng.random_range(0..interchange::SCALES.len())];
-            let mut delta = ndarray::Array2::zeros((r, c));
-            for u in units {
-                if along_rows {
-                    delta.row_mut(u).assign(&w.row(u).mapv(|v| v * (alpha - 1.0)));
-                } else {
-                    delta.column_mut(u).assign(&w.column(u).mapv(|v| v * (alpha - 1.0)));
-                }
-            }
-            (format!("{k} {} scaled by {alpha}", if along_rows { "rows" } else { "columns" }), delta)
-        } else {
-            let size = interchange::SIZES[rng.random_range(0..interchange::SIZES.len())];
-            let (u, v) = (normal(&mut rng, r), normal(&mut rng, c));
-            let scale = size * w.iter().map(|x| x * x).sum::<f64>().sqrt() / (r.min(c) as f64).sqrt();
-            (format!("rank one of size {size}"), ndarray::Array2::from_shape_fn((r, c), |(a, b)| scale * u[a] * v[b]))
-        };
-        let edit = gam_mpd::weight_edit::WeightEdit { native: op.name.clone(), delta };
+    for (i, draw) in draws.iter().enumerate() {
+        let (operator, kind) = (draw.operator(), draw.kind());
+        let edit = gam_mpd::weight_edit::WeightEdit { native: operator.to_string(), delta: draw.delta(native)? };
         let Some(compiled) = gam_mpd::weight_edit::compile(native, artifact, &[edit])? else {
-            records.push(json!({"operator": op.name, "kind": kind, "applicable": false}));
+            records.push(json!({"operator": operator, "kind": kind, "applicable": false}));
             continue;
         };
         let edited = interchange(&compiled.model, &compiled.explanation)?;
@@ -647,7 +714,7 @@ fn weight_faithfulness(
         let ignoring = interchange(&compiled.model, artifact)?.evaluate(&batch, &clean, false)?.bits;
         let effect = interchange(&compiled.model, &gam_mpd::artifact::Artifact::native(native)?)?.evaluate(&batch, &clean, false)?.bits;
         let record = json!({
-            "operator": op.name, "kind": kind, "applicable": true, "owned": compiled.owned,
+            "operator": operator, "kind": kind, "applicable": true, "owned": compiled.owned,
             "mean_bits_per_token": mean(&gap), "effect_mean_bits_per_token": mean(&effect),
             "ignoring_mean_bits_per_token": mean(&ignoring), "response_mean_bits_per_token": mean(&response),
         });
