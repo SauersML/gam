@@ -34,9 +34,11 @@ from pathlib import Path
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import families  # noqa: E402
 from families import FAMILIES, MIN_PROMPTS, NOVEL, Item  # noqa: E402
 
 OUT = Path.home() / "mpd-data/graph_oracle/behaviors"
+HF = {"qwen3-0.6b": "Qwen/Qwen3-0.6B", "qwen3-1.7b": "Qwen/Qwen3-1.7B", "qwen3-4b": "Qwen/Qwen3-4B", "qwen3-8b": "Qwen/Qwen3-8B"}
 KEEP_ACCURACY = 0.5  # kept when the answer is the model's top-1 token on most targets ("top1"),
 KEEP_PAIR = 0.9  # or when the model ranks the answer above the counterfactual's answer on nine pairs in ten ("contrast")
 TOP = 5
@@ -52,9 +54,9 @@ def split_of(fam: str) -> str:
 class Tok:
     def __init__(self, model: str):
         self.model = model
-        if model == "qwen3-0.6b":
+        if model in HF:  # one tokenizer for every Qwen3 size
             from transformers import AutoTokenizer
-            self.hf = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
+            self.hf = AutoTokenizer.from_pretrained(HF[model])
             self.prefix_ids = []
         else:
             import tokenizers
@@ -62,7 +64,7 @@ class Tok:
             self.prefix_ids = [0]
 
     def encode(self, text: str) -> tuple[list[int], list[tuple[int, int]]]:
-        if self.model == "qwen3-0.6b":
+        if self.model in HF:
             e = self.hf(text, return_offsets_mapping=True, add_special_tokens=False)
             ids, offs = e["input_ids"], [tuple(o) for o in e["offset_mapping"]]
         else:
@@ -74,7 +76,7 @@ class Tok:
         return len(self.encode(s)[0]) - len(self.prefix_ids)
 
     def decode(self, i: int) -> str:
-        return self.hf.decode([i]) if self.model == "qwen3-0.6b" else self.tk.decode([i])
+        return self.hf.decode([i]) if self.model in HF else self.tk.decode([i])
 
 
 def encode_item(tok: Tok, prefix: str, answer: str):
@@ -135,11 +137,11 @@ def build_prompts(tok: Tok, items: list[Item], rng: random.Random) -> list[dict]
 
 
 class Model:
-    def __init__(self, model: str, device: str = "mps"):
+    def __init__(self, model: str, device: str = "mps", dtype: str = "float32"):
         self.model, self.device = model, device
-        if model == "qwen3-0.6b":
+        if model in HF:
             from transformers import AutoModelForCausalLM
-            self.m = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-0.6B", dtype=torch.float32).to(device).eval()
+            self.m = AutoModelForCausalLM.from_pretrained(HF[model], dtype=getattr(torch, dtype)).to(device).eval()
         else:
             sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "vpd_2951"))
             from vpd_model import load_target
@@ -159,7 +161,7 @@ class Model:
                 ids[i, :len(s)] = torch.tensor(s)
                 mask[i, :len(s)] = 1
             ids, mask = ids.to(self.device), mask.to(self.device)
-            if self.model == "qwen3-0.6b":  # the head only at the scored positions
+            if self.model in HF:  # the head only at the scored positions
                 h, head = self.m.model(input_ids=ids, attention_mask=mask).last_hidden_state, self.m.lm_head
             else:
                 h, head = self.m.hidden(ids), lambda x: x @ self.m.wte.T
@@ -204,14 +206,20 @@ def score(tok: Tok, model: Model, prompts: list[dict]) -> dict:
 
 
 def main():
+    global OUT
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", required=True, choices=["qwen3-0.6b", "vpd4l"])
+    ap.add_argument("--model", required=True, choices=[*HF, "vpd4l"])
     ap.add_argument("--families", default="", help="comma-separated subset (default all)")
     ap.add_argument("--seed", type=int, default=2951)
     ap.add_argument("--device", default="mps")
+    ap.add_argument("--dtype", default="float32", choices=["float32", "bfloat16"])
+    ap.add_argument("--out", default=str(OUT), help="root of the behavior files and summary.tsv")
+    ap.add_argument("--sva", default=str(families.SVA_DIR), help="Marks et al.'s agreement pairs")
     a = ap.parse_args()
+    OUT = Path(a.out)
+    families.SVA_DIR = Path(a.sva)
     tok = Tok(a.model)
-    model = Model(a.model, a.device)
+    model = Model(a.model, a.device, a.dtype)
     root = OUT / a.model
     (root / "dropped").mkdir(parents=True, exist_ok=True)
     rows = []

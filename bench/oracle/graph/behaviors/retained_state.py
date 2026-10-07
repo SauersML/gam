@@ -31,14 +31,16 @@ from pathlib import Path
 import numpy as np
 import torch
 
-STUDY = Path.home() / "retained-reply-state"  # read-only; its templates and statistics are imported as they are
+import os  # noqa: E402
+
+# read-only; its templates and statistics are imported as they are (MATS jobs pass a copy through RETAINED_STUDY)
+STUDY = Path(os.environ.get("RETAINED_STUDY", Path.home() / "retained-reply-state"))
 sys.path.insert(0, str(STUDY))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from hidden_choice import ANIMALS, WORDINGS  # noqa: E402
 from stats import animal_level, raises  # noqa: E402
-from build import OUT, TOP, write_summary  # noqa: E402
-
-HF = {"qwen3-0.6b": "Qwen/Qwen3-0.6B", "qwen3-1.7b": "Qwen/Qwen3-1.7B", "qwen3-4b": "Qwen/Qwen3-4B", "qwen3-8b": "Qwen/Qwen3-8B"}
+import build  # noqa: E402
+from build import HF, TOP, write_summary  # noqa: E402
 
 
 def substitute(thinking: str, a: str, b: str) -> str:
@@ -121,7 +123,9 @@ def main():
     ap.add_argument("--device", default="mps")
     ap.add_argument("--dtype", default="float32", choices=["float32", "bfloat16"])
     ap.add_argument("--seed", type=int, default=2951)
+    ap.add_argument("--out", default=str(build.OUT))
     a = ap.parse_args()
+    build.OUT = Path(a.out)
     from transformers import AutoModelForCausalLM, AutoTokenizer
     tok = AutoTokenizer.from_pretrained(HF[a.model])
     model = AutoModelForCausalLM.from_pretrained(HF[a.model], dtype=getattr(torch, a.dtype), attn_implementation="sdpa").to(a.device).eval()
@@ -168,7 +172,7 @@ def main():
         if len(chosen) % 100 == 0:
             print(f"{len(chosen)} runs", flush=True)
     c = np.array(chosen)
-    root = OUT / a.model
+    root = build.OUT / a.model
     root.mkdir(parents=True, exist_ok=True)
     nrng = np.random.default_rng(0)
     rows = []
