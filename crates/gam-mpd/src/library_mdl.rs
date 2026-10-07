@@ -3649,21 +3649,27 @@ pub fn fit_from(
             // Then `λ ← max(0, λ + η_λ (Ê − K))` with `η_λ = λ̂ / (K B)`: `λ̂ = |⟨g_F, g_k⟩| / |g_k|²`
             // is the multiplier at which the term's gradient cancels the data gradient's
             // component along `g_k = ∂Ê/∂μ` (both measured on this step), so a relative violation
-            // held for one pass of the `B` batches moves `λ` by about `λ̂` times it.
+            // held for one pass of the `B` batches moves `λ` by about `λ̂` times it (a one-pass
+            // horizon). A step that finds the budget violated at `λ = 0` starts `λ` at that balance
+            // value `λ̂` and applies it on the same step, instead of ramping up from zero over the
+            // pass while the count runs away from `K`.
             let mut parts_note = String::new();
             if let Some(limit) = settings.budget.filter(|k| k.is_finite()) {
                 let (expected, terms) = complexity_terms(&mut scorer, &device_posterior, explanation, &posterior.active, &batch, key)?;
                 parts.0 += expected;
                 parts.1 += 1;
-                let lambda = progress.multiplier;
                 let (mut along, mut square) = (0.0, 0.0);
-                for (i, mean, variance) in &terms {
-                    let op = explanation.trainable[*i];
-                    if let Some(g) = gradients.get(&op) {
+                for (i, mean, _) in &terms {
+                    if let Some(g) = gradients.get(&explanation.trainable[*i]) {
                         let data = device.download(g).map_err(error)?;
                         along += data.iter().zip(mean.iter()).map(|(a, b)| a * b).sum::<f64>() * scale * LN_2;
                     }
                     square += mean.iter().map(|v| v * v).sum::<f64>();
+                }
+                let balance = if square > 0.0 { along.abs() / square } else { 0.0 };
+                let lambda = if progress.multiplier == 0.0 && expected > limit { balance } else { progress.multiplier };
+                for (i, mean, variance) in &terms {
+                    let op = explanation.trainable[*i];
                     // At λ = 0 the term adds nothing, and the step is the budget-free one bit for bit.
                     if lambda == 0.0 {
                         continue;
@@ -3686,7 +3692,7 @@ pub fn fit_from(
                     }
                 }
                 if square > 0.0 && limit > 0.0 {
-                    let rate = (along.abs() / square) / (limit * draws.len() as f64);
+                    let rate = balance / (limit * draws.len() as f64);
                     progress.multiplier = (lambda + rate * (expected - limit)).max(0.0);
                 }
                 parts_note = format!(", parts per token {expected:.4} (K {limit}), λ {:.4e}", progress.multiplier);
