@@ -38,7 +38,8 @@ def main():
     assert sorted(calls) == sorted({(f"b{i % 4}", 1 + i % 2, 4) for i in range(16)}), calls
     check_repair()
     check_evaluate()
-    print("ok: checker scorer order, behaviors and one batch per (behavior, seed); repair keeps a revision only when it lowers S; evaluation summary")
+    check_sft_examples()
+    print("ok: checker scorer order, behaviors and one batch per (behavior, seed); repair keeps a revision only when it lowers S; evaluation summary; SFT data uses each training behavior's best program only")
 
 
 def check_repair():
@@ -95,6 +96,27 @@ def check_evaluate():
     assert set(seen) == {(7, 16)}, seen
     rows = [json.loads(line) for line in log.getvalue().splitlines()]
     assert [r.get("behavior") for r in rows[:2]] == ["a", "b"] and rows[-1]["step"] == 3
+
+
+
+def check_sft_examples():
+    """sft_examples keeps each TRAINING behavior's lowest-S program and never a behavior outside the pool."""
+    import json
+    import tempfile
+
+    import train
+
+    d = Path(tempfile.mkdtemp())
+    for name, behavior, bits, source in (("a1", "a", 50.0, "A1"), ("a2", "a", 20.0, "A2"), ("z", "z", 1.0, "Z")):
+        (d / f"{name}.json").write_text(json.dumps({"behavior": behavior, "source": source, "score": {"total_bits": bits}}))
+    (d / "q.jsonl").write_text(json.dumps({"messages": [{"role": "user", "content": "Q"}, {"role": "assistant", "content": "ANS"}]}) + "\n")
+    train.render = lambda b: "input " + b["id"]
+    tok = types.SimpleNamespace(encode=lambda text, add_special_tokens=False: [len(text)] if "A1" not in text else [-1])
+    pol = types.SimpleNamespace(tok=tok, end=0, prompt_ids=lambda text: [hash(text) % 97])
+    args = types.SimpleNamespace(programs=[str(d / "*.json")], data=[str(d / "q.jsonl")], max_model_len=100)
+    programs, questions = train.sft_examples(args, pol, [{"id": "a"}, {"id": "b"}])
+    assert len(programs) == 1 and programs[0][1] == [len("```python\nA2\n```"), 0], programs
+    assert questions == [([hash("Q") % 97], [3, 0])], questions
 
 
 if __name__ == "__main__":

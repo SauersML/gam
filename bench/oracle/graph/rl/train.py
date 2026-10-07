@@ -34,6 +34,7 @@ pi_ref is the base (adapter disabled). The loop writes the adapter every step (v
            [--init SFT_ADAPTER] [--behaviors DIR] [--scorer checker|mock] [--behaviors-per-step 8]
            [--samples 8] [--max-tokens 1536] [--lr 1e-5] [--beta 0.04] [--lora-rank 32] [--hours H]
   train.py --mode eval --base ... --init ADAPTER --model ... --out DIR
+  train.py --mode sft --programs 'SEARCH/*.json' --data QUESTIONS.jsonl --base ... --model ... --out DIR   (then evaluation)
 
 Evaluation (--mode eval, or every --eval-every steps of training) samples N programs per behavior on two
 sets and scores them under one experiment seed that no training step uses: the held-out behaviors (whole
@@ -397,6 +398,59 @@ def repair(chosen: list[dict], best: list[dict], pol, sampler, score, args, adap
     return replaced
 
 
+def sft_examples(args, pol, pool: list[dict]) -> tuple[list, list]:
+    """--mode sft's data as token ids (prompt, completion): program examples, the oracle's input for a
+    TRAINING behavior -> the best program of that behavior among --programs files (g-int's
+    {"behavior", "source", "score"} layout; behaviors outside the training pool are never used), and
+    --data examples (JSONL of {"messages": [user, assistant]} or {"prompt", "completion"}, e.g.
+    g-predict's prediction questions). The completion ends with <|im_end|>."""
+    import glob
+
+    by_id = {b["id"]: b for b in pool}
+    best = {}
+    for pattern in args.programs or []:
+        for path in sorted(glob.glob(os.path.expanduser(pattern))):
+            r = json.loads(Path(path).read_text())
+            if r.get("behavior") in by_id and r.get("source") and (r["behavior"] not in best or r["score"]["total_bits"] < best[r["behavior"]]["score"]["total_bits"]):
+                best[r["behavior"]] = r
+    end = [pol.end]
+    programs = [(pol.prompt_ids(render(by_id[k])), pol.tok.encode("```python\n" + r["source"].strip() + "\n```", add_special_tokens=False) + end) for k, r in sorted(best.items())]
+    questions = []
+    for path in args.data or []:
+        for line in open(os.path.expanduser(path)):
+            q = json.loads(line)
+            user, answer = (q["messages"][0]["content"], q["messages"][1]["content"]) if "messages" in q else (q["prompt"], q["completion"])
+            questions.append((pol.prompt_ids(user), pol.tok.encode(answer, add_special_tokens=False) + end))
+    keep = lambda xs: [(p, c) for p, c in xs if len(p) + len(c) <= args.max_model_len]  # noqa: E731
+    return keep(programs), keep(questions)
+
+
+def sft(args, pol, pool, optimizer, log) -> dict:
+    """--sft-steps steps of SFT: each batch draws --batch examples, a program example with probability
+    --program-share and a question otherwise; loss = -(1/B) sum_e sum_t log pi(y_et) (sft_update)."""
+    programs, questions = sft_examples(args, pol, pool)
+    if not programs and not questions:
+        raise SystemExit("no SFT examples (--programs, --data)")
+    rng = random.Random(args.seed)
+    meta = {"program_examples": len(programs), "question_examples": len(questions), "program_behaviors": len(programs)}
+    log.write(json.dumps({"sft": meta}) + "\n")
+    started = time.time()
+    for step in range(args.sft_steps):
+        if args.hours and time.time() - started > 3600 * args.hours:
+            break
+        batch = [rng.choice(programs) if programs and (not questions or rng.random() < args.program_share) else rng.choice(questions) for _ in range(args.batch)]
+        pol.train_mode(True)
+        stats = sft_update(pol, [p for p, _ in batch], [c for _, c in batch], args.micro)
+        stats["grad_norm"] = float(torch.nn.utils.clip_grad_norm_(pol.params, 1.0))
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        tokens = sum(len(c) for _, c in batch)
+        log.write(json.dumps({"step": step, "loss_nats_per_example": stats["loss"], "bits_per_token": stats["loss"] * len(batch) / tokens / np.log(2), **{k: v for k, v in stats.items() if k != "loss"},
+                              "programs": sum(1 for x in batch if x in programs), "elapsed": time.time() - started}) + "\n")
+        log.flush()
+    return meta
+
+
 ORACLE_RUNS = Path.home() / "mpd-data/graph_oracle/runs/oracle"
 
 
@@ -466,7 +520,7 @@ def evaluate(sets: dict[str, list[dict]], pol, sampler, score, args, adapter: Pa
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--mode", choices=["grpo", "dpo", "bestofn", "eval"], required=True)
+    ap.add_argument("--mode", choices=["grpo", "dpo", "bestofn", "sft", "eval"], required=True)
     ap.add_argument("--base", default="Qwen/Qwen3-8B")
     ap.add_argument("--init", help="SFT adapter the policy starts from and is held to (pi_ref): a PEFT directory or g-predict's sft.py output")
     ap.add_argument("--model", required=True, help="target model whose behaviors are explained: qwen3-0.6b | vpd4l")
@@ -500,10 +554,15 @@ def main():
     ap.add_argument("--eval-behaviors", type=int, default=0, help="evaluate a fixed random subset of this many behaviors per set (0: all)")
     ap.add_argument("--uniform-seeds", type=int, default=0, help="training draws experiments from step mod M (the checker's uniform_seeds: M's outcomes cached after M steps); the evaluation never")
     ap.add_argument("--no-baselines", dest="baselines", action="store_false", help="skip scoring the empty, full and search programs in evaluation")
+    ap.add_argument("--programs", nargs="*", help="sft: program files (globs) in g-int's layout; each training behavior's best is one example")
+    ap.add_argument("--data", nargs="*", help="sft: JSONL question files ({'messages': [user, assistant]})")
+    ap.add_argument("--program-share", type=float, default=0.3, help="sft: probability that a batch example is a program example")
+    ap.add_argument("--sft-steps", type=int, default=200)
+    ap.add_argument("--batch", type=int, default=8, help="sft: examples per optimizer step")
     ap.add_argument("--run-name", help="the run's name in runs/oracle/<behavior>.<run>.json (default: the --out directory's name)")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
-    lr = args.lr if args.lr is not None else {"bestofn": 1e-4}.get(args.mode, 1e-5)
+    lr = args.lr if args.lr is not None else {"bestofn": 1e-4, "sft": 1e-4}.get(args.mode, 1e-5)
     beta = args.beta if args.beta is not None else {"dpo": 0.1}.get(args.mode, 0.04)
     random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -540,6 +599,11 @@ def main():
     if not pool:
         raise SystemExit(f"no train behaviors under {root / args.model}")
     optimizer = torch.optim.AdamW(pol.params, lr=lr, weight_decay=0.0)
+    if args.mode == "sft":
+        sft(args, pol, pool, optimizer, open(out / "train.jsonl", "a"))
+        pol.save(adapter)
+        print(json.dumps(evaluate(sets, pol, sampler, score, args, adapter, 1, open(out / "eval.jsonl", "a"), args.sft_steps)))
+        return
     log = open(out / "train.jsonl", "a")
     eval_log = open(out / "eval.jsonl", "a")
     samples_log = open(out / "samples.jsonl", "a")
