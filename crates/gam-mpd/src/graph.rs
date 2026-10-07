@@ -2106,6 +2106,8 @@ pub struct Unquantize {
     heads: Vec<(usize, usize, HeadWeights)>,
     mlps: Vec<(usize, MlpWeights)>,
     vpd: Vec<(usize, VpdMlp)>,
+    attention: Vec<(usize, VpdAttention)>,
+    features: Vec<(usize, usize, (Array1<f64>, f64, Array1<f64>))>,
 }
 
 /// The device's resident copies of a head's or an MLP's matrices are uploaded again
@@ -2137,13 +2139,21 @@ impl Unquantize {
         for (l, v) in self.vpd.into_iter().rev() {
             weights.vpd.insert(l, v);
         }
+        for (l, a) in self.attention.into_iter().rev() {
+            weights.vpd_attention.insert(l, a);
+        }
+        for (l, f, row) in self.features.into_iter().rev() {
+            if let Some(t) = weights.transcoders.get_mut(&l) {
+                t.rows.insert(f, row);
+            }
+        }
     }
 }
 
-/// Whether `block`'s pieces quantize ([`Weights::quantize`]): heads, neurons and VPD MLP
-/// subcomponents. Transcoder features and VPD attention subcomponents stay exact.
+/// Whether `block`'s pieces quantize ([`Weights::quantize`]): every declared piece does (a
+/// remainder of the complement is never declared).
 fn quantizes(block: &Block) -> bool {
-    matches!(block, Block::Heads { .. } | Block::Neurons { .. } | Block::Slices { .. })
+    !matches!(block, Block::Features { rest: true, .. } | Block::Slices { rest: true, .. } | Block::AttnSlices { rest: true, .. })
 }
 
 /// The rows of `block`'s pieces, each quantized with its own scale: a head's query, key and
@@ -2163,7 +2173,15 @@ fn quantized_rows(weights: &Weights, block: &Block) -> usize {
             // A remainder's rows: the gate's (hidden) or the down map's (width).
             fc.iter().map(|&i| if i == counts.0 { hidden } else { 2 }).sum::<usize>() + down.iter().map(|&i| if i == counts.1 { d } else { 2 }).sum::<usize>()
         }
-        _ => 0,
+        // A subcomponent's two vectors; a remainder's rows: the stacked heads' (query, key, value)
+        // or the width's (output).
+        Block::AttnSlices { layer, q, k, v, o, .. } => {
+            let counts = weights.vpd_attention.get(layer).map_or([0; 4], |a| [a.q.0.nrows(), a.k.0.nrows(), a.v.0.nrows(), a.o.0.nrows()]);
+            let stacked: usize = weights.layers[*layer].heads.iter().map(|h| h.query.nrows()).sum();
+            [q, k, v, o].into_iter().zip(counts).enumerate().map(|(m, (list, n))| list.iter().map(|&i| if i == n { if m == 3 { weights.width() } else { stacked } } else { 2 }).sum::<usize>()).sum()
+        }
+        // A feature's encoder and decoder rows (its bias stays exact).
+        Block::Features { features, .. } => 2 * features.len(),
     }
 }
 
@@ -2172,7 +2190,7 @@ impl Weights {
     /// its rows): a VPD subcomponent's vectors are quantized and its matrix moves by the change of
     /// their product, so the remainder piece stays as it was. Returns what puts the weights back.
     pub fn quantize(&mut self, blocks: &[(Block, Option<u32>)]) -> Result<Unquantize, String> {
-        let mut out = Unquantize { heads: Vec::new(), mlps: Vec::new(), vpd: Vec::new() };
+        let mut out = Unquantize { heads: Vec::new(), mlps: Vec::new(), vpd: Vec::new(), attention: Vec::new(), features: Vec::new() };
         for (block, bits) in blocks {
             let Some(bits) = *bits else { continue };
             match block {
@@ -2232,8 +2250,62 @@ impl Weights {
                         }
                     }
                 }
-                // Transcoder features and VPD attention subcomponents stay exact (`quantizes`).
-                Block::Features { .. } | Block::AttnSlices { .. } => continue,
+                Block::AttnSlices { rest: true, .. } | Block::Features { rest: true, .. } => continue,
+                Block::AttnSlices { layer, q, k, v, o, .. } => {
+                    let a = self.vpd_attention.get_mut(layer).ok_or_else(|| format!("layer {layer}'s attention has no VPD view"))?;
+                    out.attention.push((*layer, a.clone()));
+                    let lw = self.layers.get_mut(*layer).ok_or("no such layer")?;
+                    for (h, w) in lw.heads.iter().enumerate() {
+                        device_head_edited(w);
+                        out.heads.push((*layer, h, w.clone()));
+                    }
+                    for (m, (list, factors)) in [q, k, v, o].into_iter().zip([&mut a.q, &mut a.k, &mut a.v, &mut a.o]).enumerate() {
+                        if list.is_empty() {
+                            continue;
+                        }
+                        let (u, vv) = factors;
+                        let count = u.nrows();
+                        // The change of the stacked map (out × in) the quantized pieces make.
+                        let mut change: Array2<f64> = Array2::zeros((u.ncols(), vv.nrows()));
+                        if list.contains(&count) {
+                            let w = attention_maps(lw)[m].clone();
+                            let all = u.t().dot(&vv.t());
+                            let rest = &w - &all;
+                            let mut quantized = rest.clone();
+                            quantized.rows_mut().into_iter().for_each(|r| quantize_row(r, bits));
+                            change += &(quantized - rest);
+                        }
+                        for &i in list.iter().filter(|&&i| i < count) {
+                            let (old_u, old_v) = (u.row(i).to_owned(), vv.column(i).to_owned());
+                            quantize_row(u.row_mut(i), bits);
+                            quantize_row(vv.column_mut(i), bits);
+                            let (new_u, new_v) = (u.row(i).to_owned(), vv.column(i).to_owned());
+                            change += &(new_u.insert_axis(Axis(1)).dot(&new_v.insert_axis(Axis(0))) - old_u.insert_axis(Axis(1)).dot(&old_v.insert_axis(Axis(0))));
+                        }
+                        // Split over the heads: rows of the stacked query, key or value map, columns of
+                        // the output map.
+                        let mut at = 0;
+                        for w in lw.heads.iter_mut() {
+                            let target = [&mut w.query, &mut w.key, &mut w.value, &mut w.output][m.min(3)].clone();
+                            let width = if m == 3 { target.ncols() } else { target.nrows() };
+                            let part = if m == 3 { change.slice(s![.., at..at + width]).to_owned() } else { change.slice(s![at..at + width, ..]).to_owned() };
+                            if part.dim() != target.dim() {
+                                return Err("VPD attention factors of another shape than the heads' maps".into());
+                            }
+                            *[&mut w.query, &mut w.key, &mut w.value, &mut w.output][m.min(3)] += &part;
+                            at += width;
+                        }
+                    }
+                }
+                Block::Features { layer, features, .. } => {
+                    let t = self.transcoders.get_mut(layer).ok_or_else(|| format!("layer {layer} has no transcoder"))?;
+                    for &f in features {
+                        let row = t.rows.get_mut(&f).ok_or_else(|| format!("feature {f} not loaded (Weights::load_features)"))?;
+                        out.features.push((*layer, f, row.clone()));
+                        quantize_row(row.0.view_mut(), bits);
+                        quantize_row(row.2.view_mut(), bits);
+                    }
+                }
             }
         }
         Ok(out)
@@ -3729,7 +3801,9 @@ impl Checker {
     /// `block`'s bit width (`None`: exact), searched once per behavior and kept: each width cheaper
     /// than exact numbers at `½ log2 N` is tried by quantizing the block in `M` and measuring
     /// `KL(M ‖ M_quantized)` on the fit experiments (the clean and counterfactual prompts), and the
-    /// width minimizing its numbers' and scales' bits plus `N` times that error wins.
+    /// width minimizing its numbers' and scales' bits plus `N` times that error wins. Transcoder
+    /// features are not `M`'s weights: their error is measured on the program of that block alone
+    /// (node-level, counterfactual stand-ins), exact against quantized.
     pub fn width(&mut self, block: &Block, n: f64) -> Result<Option<u32>, String> {
         let key = serde_json::to_string(block).map_err(|e| e.to_string())?;
         if let Some(b) = self.widths.get(&key) {
@@ -3744,8 +3818,16 @@ impl Checker {
                 fit.push(Experiment::Counterfactual);
             }
             let graph = Graph::empty();
-            let exact: Vec<Array2<f64>> = fit.iter().map(|e| self.model_outcome(&graph, e)).collect::<Result<_, _>>()?;
-            let model = graph.model(&self.weights);
+            let model = if matches!(block, Block::Features { .. }) {
+                Graph { ids: vec![String::new()], blocks: vec![block.clone()], edges: Vec::new(), internal: Vec::new() }.program(&self.weights, false)
+            } else {
+                graph.model(&self.weights)
+            };
+            let exact: Vec<Array2<f64>> = if matches!(block, Block::Features { .. }) {
+                fit.iter().map(|e| self.run(&model, e)).collect::<Result<_, _>>()?
+            } else {
+                fit.iter().map(|e| self.model_outcome(&graph, e)).collect::<Result<_, _>>()?
+            };
             for &bits in &WIDTHS {
                 let cost = width_cost(numbers, scales, Some(bits), n);
                 if cost >= best.1 {

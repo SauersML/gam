@@ -559,3 +559,31 @@ fn vpd_remainders_are_declarable_pieces() {
     let numbers = Graph::parse(&with(true), &weights).expect("parse").opaque_numbers(&weights) - Graph::parse(&with(false), &weights).expect("parse").opaque_numbers(&weights);
     assert_eq!(numbers, 2 * hidden * width, "a remainder costs its matrix");
 }
+
+/// VPD attention pieces quantize: a subcomponent's vectors round to their width, the heads' maps
+/// move by the change of its product (a remainder's rows round in place), and restoring returns
+/// every head and factor.
+#[test]
+fn vpd_attention_pieces_quantize() {
+    let (mut weights, _) = model("graph_sites_vpd_quantize");
+    let heads = weights.layers[0].heads.len();
+    let (dh, width) = weights.layers[0].heads[0].query.dim();
+    let wave = |rows: usize, cols: usize, phase: f64| Array2::from_shape_fn((rows, cols), |(i, j)| 0.1 * ((i * 5 + j * 3) as f64 + phase).cos());
+    let qkv = (wave(3, heads * dh, 0.2), wave(width, 3, 0.9));
+    weights.vpd_attention.insert(0, crate::graph::VpdAttention { q: qkv.clone(), k: qkv.clone(), v: qkv, o: (wave(3, width, 1.3), wave(heads * dh, 3, 0.4)) });
+    let before = weights.clone();
+    let block = crate::graph::Block::AttnSlices { layer: 0, q: vec![1], k: Vec::new(), v: Vec::new(), o: vec![0, 3], rest: false };
+    let restore = weights.quantize(&[(block, Some(2))]).expect("quantize");
+    let a = &weights.vpd_attention[&0];
+    let mut q1: Vec<f64> = a.q.0.row(1).to_vec();
+    q1.sort_by(f64::total_cmp);
+    q1.dedup();
+    assert!(q1.len() <= 3, "a 2-bit subcomponent row keeps at most 3 values");
+    assert_eq!(a.q.0.row(0), before.vpd_attention[&0].q.0.row(0), "an undeclared subcomponent stays");
+    assert!(weights.layers[0].heads.iter().zip(&before.layers[0].heads).any(|(w, b)| w.query != b.query) && weights.layers[0].heads.iter().zip(&before.layers[0].heads).any(|(w, b)| w.output != b.output));
+    assert!(weights.layers[0].heads.iter().zip(&before.layers[0].heads).all(|(w, b)| w.key == b.key && w.value == b.value));
+    restore.restore(&mut weights);
+    assert!(weights.layers[0].heads.iter().zip(&before.layers[0].heads).all(|(w, b)| w.query == b.query && w.output == b.output));
+    assert_eq!(weights.vpd_attention[&0].q.0, before.vpd_attention[&0].q.0);
+    assert_eq!(weights.vpd_attention[&0].o.0, before.vpd_attention[&0].o.0);
+}
