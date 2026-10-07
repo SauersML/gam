@@ -2837,7 +2837,7 @@ pub fn native_weight_edit(export: &Path, draw: &Value) -> Result<(String, Array2
     Ok((operator, delta))
 }
 
-/// VPD's three forms ([`FormRuns`]) under native weight edits of `M`'s maps, as the edits driver
+/// VPD's three forms (`FormRuns`) under native weight edits of `M`'s maps, as the edits driver
 /// scores an explanation (`mpd_library_mdl_2951` weight_faithfulness): each edit `(native, ΔW)`
 /// makes `M` compute with `W + ΔW` and VPD with its masked subcomponents plus the always-on term
 /// `ΔW·x` on the map's own input (`weight_edit`'s rule for a map computed as a sum of slices), its

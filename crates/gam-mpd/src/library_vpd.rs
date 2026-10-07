@@ -19,10 +19,10 @@
 //! the heads' rows of those slices' writes. A write-side slice (o, down_proj) of a component gated
 //! at the block's input takes that gate's column (a fixed selection of the gate's columns).
 //!
-//! The gate ([`Gate`]). Every Gated node's scale is its stage's operator `{stage}.width` (one
+//! The gate ([`Gate`](crate::library_vpd::Gate)). Every Gated node's scale is its stage's operator `{stage}.width` (one
 //! entry per component), read as a constant:
 //! - `Gate::Hard`, the main arms: the explanation is evaluated with the hard gate `H(z_b)` (the
-//!   width holds [`HARD`]) and trained with its expectation under the posterior, `E_q[H(z_b)]`:
+//!   width holds [`HARD`](crate::library_vpd::HARD)) and trained with its expectation under the posterior, `E_q[H(z_b)]`:
 //!   around a pass with a gradient `library_mdl` writes the threshold's posterior deviation `σ_b`
 //!   into the width and the threshold's mean into the threshold, so the gate is `Φ(z_b / σ_b)`, the
 //!   threshold integrated exactly and the reads and a direction by the pass's weight sample. The
