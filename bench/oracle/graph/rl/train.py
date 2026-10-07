@@ -552,8 +552,10 @@ def rescore(args, score) -> dict:
     behaviors_by_path = {}
     for r in rows:
         if r["behavior_path"] not in behaviors_by_path:
-            b = json.loads(Path(r["behavior_path"]).read_text())
-            behaviors_by_path[r["behavior_path"]] = {**b, "path": r["behavior_path"]}
+            path = Path(r["behavior_path"] or "")
+            if not path.is_file():  # written on another machine (a pod): the same behavior file here
+                path = Path(args.behaviors) / args.model / f"{r['behavior']}.json"
+            behaviors_by_path[r["behavior_path"]] = {**json.loads(path.read_text()), "path": str(path)}
     scores = score([{"source": r["source"], "behavior": behaviors_by_path[r["behavior_path"]], "seed": args.eval_seed, "experiments": args.eval_experiments, "options": options} for r in rows])
     out = Path(args.out)
     with open(out / f"rescore_{args.rescore_tag}.jsonl", "w") as f:
