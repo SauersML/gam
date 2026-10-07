@@ -523,3 +523,39 @@ fn head_operations_reach_a_vpd_view_attention() {
     let swap = run(&draw(Family::Swap, &[(SharedSite::Head(0), Operation::Swap)], 3, true));
     assert!(max(&kl_bits(&zero, &push)) > 1e-9 && zero.iter().chain(swap.iter()).all(|v| v.is_finite() || *v == f64::NEG_INFINITY));
 }
+
+/// A VPD MLP declared whole, its subcomponents and both remainders ("rest"), computes the MLP
+/// itself: the full program with it equals `M`; leaving out a remainder does not.
+#[test]
+fn vpd_remainders_are_declarable_pieces() {
+    let (mut weights, sequences) = model("graph_sites_vpd_rest");
+    let (hidden, width) = weights.layers[0].mlp.as_ref().expect("an MLP").gate.dim();
+    let wave = |rows: usize, cols: usize, phase: f64| Array2::from_shape_fn((rows, cols), |(i, j)| 0.1 * ((i * 7 + j * 3) as f64 + phase).sin());
+    weights.vpd.insert(0, crate::graph::VpdMlp { fc_u: wave(5, hidden, 0.3), fc_v: wave(width, 5, 1.1), down_u: wave(4, width, 2.0), down_v: wave(hidden, 4, 0.7) });
+    let vpd = |kind: &str, index: crate::graph::Index| PieceIr { view: "vpd".into(), layer: 0, kind: kind.into(), index: Some(index) };
+    let with = |rest: bool| {
+        let mut p = full_program();
+        let m0 = p.nodes.iter_mut().find(|n| n.id == "m0").expect("m0");
+        m0.pieces = vec![vpd("c_fc", crate::graph::Index::Many((0..5).collect())), vpd("down_proj", crate::graph::Index::Many((0..4).collect()))];
+        if rest {
+            m0.pieces.push(vpd("c_fc", crate::graph::Index::Name("rest".into())));
+            m0.pieces.push(vpd("down_proj", crate::graph::Index::Name("rest".into())));
+        }
+        p
+    };
+    let batch = Batch::new(&sequences).expect("batch");
+    let rows: Vec<usize> = (0..batch.tokens.len()).collect();
+    let mut cf = batch.clone();
+    cf.reference = None;
+    let m = execute(&weights, &Graph::empty().model(&weights), &batch, &rows, &BTreeMap::new()).expect("M").log_probabilities;
+    let mut referenced = batch.clone();
+    referenced.reference = Some(std::sync::Arc::new(reference(&weights, &Batch::new(&sequences.iter().rev().cloned().collect::<Vec<_>>()).expect("cf")).expect("reference")));
+    let run = |p: &Program| {
+        let graph = Graph::parse(p, &weights).expect("parse");
+        execute(&weights, &graph.program(&weights, true), &referenced, &rows, &BTreeMap::new()).expect("program").log_probabilities
+    };
+    assert!(max(&kl_bits(&m, &run(&with(true)))) < 1e-9, "subcomponents and remainders are the MLP");
+    assert!(max(&kl_bits(&m, &run(&with(false)))) > 1e-9, "without the remainders the MLP is incomplete");
+    let numbers = Graph::parse(&with(true), &weights).expect("parse").opaque_numbers(&weights) - Graph::parse(&with(false), &weights).expect("parse").opaque_numbers(&weights);
+    assert_eq!(numbers, 2 * hidden * width, "a remainder costs its matrix");
+}

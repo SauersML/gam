@@ -98,6 +98,8 @@ pub struct PieceIr {
 pub enum Index {
     One(usize),
     Many(Vec<usize>),
+    /// "rest": a VPD matrix's remainder `W − Σ U Vᵀ`, its own piece.
+    Name(String),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -233,7 +235,18 @@ pub struct VpdAttention {
 /// Subcomponents `picked` of a matrix `w` (out × in) with factors `(U, V)` applied to the rows of
 /// `x` (rows × in); with `rest`, every other subcomponent and the remainder, `x wᵀ − named`.
 fn sliced(factors: &(Array2<f64>, Array2<f64>), w: &Array2<f64>, picked: &[usize], rest: bool, x: &Array2<f64>) -> Array2<f64> {
-    let named = x.dot(&factors.1.select(Axis(1), picked)).dot(&factors.0.select(Axis(0), picked));
+    sliced_parts(&factors.0, &factors.1, w, picked, rest, x)
+}
+
+/// [`sliced`] with the factors apart: `U` (subcomponents × out), `V` (in × subcomponents); index
+/// `U`'s row count is the remainder `W − Σ U Vᵀ`.
+fn sliced_parts(u: &Array2<f64>, v: &Array2<f64>, w: &Array2<f64>, picked: &[usize], rest: bool, x: &Array2<f64>) -> Array2<f64> {
+    let count = u.nrows();
+    let subs: Vec<usize> = picked.iter().copied().filter(|&i| i < count).collect();
+    let mut named = x.dot(&v.select(Axis(1), &subs)).dot(&u.select(Axis(0), &subs));
+    if picked.contains(&count) {
+        named += &(x.dot(&w.t()) - x.dot(v).dot(u));
+    }
     if rest { x.dot(&w.t()) - named } else { named }
 }
 
@@ -265,15 +278,13 @@ impl VpdMlp {
     /// The hidden pre-activation `c_fc` subcomponents `fc` write from normed inputs `x_hat`
     /// (rows × hidden); with `rest` every other subcomponent and the remainder, `W x̂ − Σ`.
     fn fc(&self, mlp: &MlpWeights, fc: &[usize], rest: bool, x_hat: &Array2<f64>) -> Array2<f64> {
-        let named = x_hat.dot(&self.fc_v.select(Axis(1), fc)).dot(&self.fc_u.select(Axis(0), fc));
-        if rest { x_hat.dot(&mlp.gate.t()) - named } else { named }
+        sliced_parts(&self.fc_u, &self.fc_v, &mlp.gate, fc, rest, x_hat)
     }
 
     /// The residual write of `down_proj` subcomponents `down` from hidden activations `h`; with
     /// `rest` every other subcomponent and the remainder.
     fn down(&self, mlp: &MlpWeights, down: &[usize], rest: bool, h: &Array2<f64>) -> Array2<f64> {
-        let named = h.dot(&self.down_v.select(Axis(1), down)).dot(&self.down_u.select(Axis(0), down));
-        if rest { h.dot(&mlp.out.t()) - named } else { named }
+        sliced_parts(&self.down_u, &self.down_v, &mlp.out, down, rest, h)
     }
 }
 
@@ -572,11 +583,21 @@ pub struct Graph {
     pub internal: Vec<(usize, usize)>,
 }
 
+/// A VPD matrix's subcomponents `index` names ([`indices`]), or with "rest" its remainder
+/// `W − Σ U Vᵀ`, numbered `count` (one past the last subcomponent).
+fn subcomponents(index: &Option<Index>, count: usize, what: &str) -> Result<Vec<usize>, String> {
+    match index {
+        Some(Index::Name(n)) if n == "rest" => Ok(vec![count]),
+        other => indices(other, count, what),
+    }
+}
+
 fn indices(index: &Option<Index>, count: usize, what: &str) -> Result<Vec<usize>, String> {
     let out = match index {
         None => (0..count).collect(),
         Some(Index::One(i)) => vec![*i],
         Some(Index::Many(v)) => v.clone(),
+        Some(Index::Name(n)) => return Err(format!("{what}: index {n} names no unit (\"rest\" names a VPD matrix's remainder)")),
     };
     if let Some(i) = out.iter().find(|i| **i >= count) {
         return Err(format!("{what} {i} out of range (there are {count})"));
@@ -653,7 +674,7 @@ impl Graph {
                             "v_proj" => v.nrows(),
                             _ => o.nrows(),
                         };
-                        let picked = indices(&piece.index, count, kind)?;
+                        let picked = subcomponents(&piece.index, count, kind)?;
                         let mut lists: [Vec<usize>; 4] = Default::default();
                         lists[["q_proj", "k_proj", "v_proj", "o_proj"].iter().position(|k| *k == kind).unwrap_or(3)] = picked;
                         let [q, k, v, o] = lists;
@@ -665,7 +686,7 @@ impl Graph {
                         if piece.index.is_none() {
                             return Err(format!("{}: name the {kind} subcomponents of layer {l}", node.id));
                         }
-                        let picked = indices(&piece.index, count, kind)?;
+                        let picked = subcomponents(&piece.index, count, kind)?;
                         if fc { Block::Slices { layer: l, fc: picked, down: Vec::new(), rest: false } } else { Block::Slices { layer: l, fc: Vec::new(), down: picked, rest: false } }
                     }
                     (view, kind) => return Err(format!("{}: {view} piece of kind {kind} is not resolved (native heads and neurons, transcoder features, VPD c_fc and down_proj subcomponents)", node.id)),
@@ -973,10 +994,20 @@ impl Graph {
                 // A feature's encoder row, bias and decoder row.
                 Block::Features { features, .. } => count += features.len() * (2 * d + 1),
                 // A subcomponent's two vectors: width and hidden.
-                Block::Slices { layer, fc, down, .. } => count += (fc.len() + down.len()) * (d + weights.neurons(*layer)),
+                // A subcomponent's two vectors; a remainder (index = the subcomponent count) its matrix.
+                Block::Slices { layer, fc, down, .. } => {
+                    let hidden = weights.neurons(*layer);
+                    let counts = weights.vpd.get(layer).map_or((0, 0), |v| (v.fc_u.nrows(), v.down_u.nrows()));
+                    for (list, n) in [(fc, counts.0), (down, counts.1)] {
+                        count += list.iter().map(|&i| if i == n { hidden * d } else { d + hidden }).sum::<usize>();
+                    }
+                }
                 Block::AttnSlices { layer, q, k, v, o, .. } => {
                     let width: usize = weights.layers[*layer].heads.iter().map(|h| h.query.nrows()).sum();
-                    count += (q.len() + k.len() + v.len() + o.len()) * (d + width);
+                    let counts = weights.vpd_attention.get(layer).map_or([0; 4], |a| [a.q.0.nrows(), a.k.0.nrows(), a.v.0.nrows(), a.o.0.nrows()]);
+                    for (list, n) in [q, k, v, o].into_iter().zip(counts) {
+                        count += list.iter().map(|&i| if i == n { width * d } else { d + width }).sum::<usize>();
+                    }
                 }
             }
         }
@@ -2125,7 +2156,13 @@ fn quantized_rows(weights: &Weights, block: &Block) -> usize {
             w.query.nrows() + w.key.nrows() + w.value.nrows() + w.output.ncols()
         }).sum(),
         Block::Neurons { layer, neurons } => neurons.len() * weights.layers[*layer].mlp.as_ref().map_or(0, |m| 2 + usize::from(m.up.is_some())),
-        Block::Slices { fc, down, .. } => 2 * (fc.len() + down.len()),
+        Block::Slices { layer, fc, down, .. } => {
+            let counts = weights.vpd.get(layer).map_or((0, 0), |v| (v.fc_u.nrows(), v.down_u.nrows()));
+            let hidden = weights.neurons(*layer);
+            let d = weights.width();
+            // A remainder's rows: the gate's (hidden) or the down map's (width).
+            fc.iter().map(|&i| if i == counts.0 { hidden } else { 2 }).sum::<usize>() + down.iter().map(|&i| if i == counts.1 { d } else { 2 }).sum::<usize>()
+        }
         _ => 0,
     }
 }
@@ -2171,7 +2208,15 @@ impl Weights {
                     // c_fc: gate (hidden × width) holds U_fc[i] ⊗ V_fc[:, i]; down_proj: out (width ×
                     // hidden) holds U_down[j] ⊗ V_down[:, j].
                     for (indices, u, v, w) in [(fc, &mut vpd.fc_u, &mut vpd.fc_v, &mut mlp.gate), (down, &mut vpd.down_u, &mut vpd.down_v, &mut mlp.out)] {
-                        for &i in indices {
+                        if indices.contains(&u.nrows()) {
+                            // The remainder W − Σ U Vᵀ (out × in, as w): its rows quantized.
+                            let all = u.t().dot(&v.t());
+                            let mut rest = &*w - &all;
+                            rest.rows_mut().into_iter().for_each(|r| quantize_row(r, bits));
+                            *w = all + rest;
+                        }
+                        let count = u.nrows();
+                        for &i in indices.iter().filter(|&&i| i < count) {
                             if i >= u.nrows() || i >= v.ncols() {
                                 return Err(format!("subcomponent {i} out of range"));
                             }

@@ -1,8 +1,9 @@
 //! The graph oracle's checker as a JSON-lines server (#2951): one request per stdin line, one JSON
 //! answer per stdout line.
 //!
-//! * `{"op": "load", "export": DIR, "vpd": DIR?, "transcoders": DIR?}`: the native model of an export
-//!   (`import::import_language_model`), with VPD's or the transcoders' view attached when named;
+//! * `{"op": "load", "export": DIR, "vpd": DIR?, "transcoders": DIR?, "library": START_JSON?,
+//!   "library_arm": ARM?}`: the native model of an export (`import::import_language_model`), with
+//!   VPD's, the transcoders' or the library's view attached when named;
 //!   its weights taken from the start library (`library_mdl::explanation`, equal to `M`).
 //! * `{"op": "behavior", "path": FILE}` or `{"op": "behavior", "behavior": {...}}`: a behavior file
 //!   (design.txt section 5); measures its stand-in averages on `M`. With `"manifest": FILE` (an
@@ -205,6 +206,12 @@ fn handle(request: &Value, weights: &mut Option<Weights>, checker: &mut Option<C
             }
             if let Some(dir) = request["transcoders"].as_str() {
                 views.insert("transcoders".into(), json!(w.attach_transcoders(Path::new(dir))?));
+            }
+            // "library": a start file of components over VPD's slices (decomp's
+            // start.components.json), arm "library_arm" (grouped_own when absent), `Weights::attach_library`.
+            if let Some(start) = request["library"].as_str() {
+                let arm = request["library_arm"].as_str().unwrap_or("grouped_own");
+                views.insert("library".into(), json!(w.attach_library(Path::new(start), arm)?));
             }
             // "device": "gpu" runs the executor's large products on the single-precision device
             // (Metal on the Mac, CUDA elsewhere) for the rest of the process.
