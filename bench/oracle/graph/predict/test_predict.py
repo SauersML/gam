@@ -175,7 +175,8 @@ def test_concat_matches_separate_forwards(qwen):
     G.apply_scale(b, 1, ("attn", 2), 0.0)
     joint = qwen.log_probs(qwen.forward(t.repeat(2, 1), G.Interventions.concat([a, b])))
     apart = torch.cat([qwen.log_probs(qwen.forward(t, a)), qwen.log_probs(qwen.forward(t, b))])
-    assert (joint - apart).abs().max().item() < 1e-6
+    # Equal up to float32 rounding: a batch of 4 rows may block the matmuls differently from 2 (Linux CI: 1.7e-5).
+    assert (joint - apart).abs().max().item() < 1e-4
 
 
 def test_attend_weights_reproduce_the_head_read(qwen):
