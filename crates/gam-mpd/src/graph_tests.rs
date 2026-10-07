@@ -624,3 +624,28 @@ fn device_path_pads_sequences_of_different_lengths() {
     let kl = max(&kl_bits(&host.log_probabilities, &device.log_probabilities));
     assert!(kl < 1e-9, "KL(host ‖ device) over sequences of different lengths = {kl:e} bits");
 }
+
+#[test]
+fn device_path_on_a_qwen3_like_model_is_the_host_run() {
+    // Head norms, grouped keys and values, gated MLPs, prompts of different lengths: the batched
+    // heads path and the per-head path against the host.
+    let f = fixture_of(crate::test_support::tiny_qwen3_export("graph_device_qwen3", LAYERS));
+    let library = Library::new(&f.device, &f.device, &f.native, &f.layers, &f.artifact, 1 << 28, 64).expect("library");
+    let weights = Weights::of(&library);
+    let sequences: Vec<Vec<u32>> = f.sequences.iter().zip([12, 7, 9, 12, 5, 9]).map(|(s, n)| s[..n].to_vec()).collect();
+    let cf = counterfactuals(&f.sequences).into_iter().zip([12, 7, 9, 12, 5, 9]).map(|(s, n)| s[..n].to_vec()).collect::<Vec<_>>();
+    let mut batch = Batch::new(&sequences).expect("batch");
+    batch.reference = Some(std::sync::Arc::new(reference(&weights, &Batch::new(&cf).expect("cf batch")).expect("reference")));
+    let rows: Vec<usize> = (0..batch.tokens.len()).collect();
+    let node = |id: &str, layer: usize, kind: &str, index: Option<Index>| NodeIr { id: id.into(), pieces: vec![PieceIr { view: "native".into(), layer, kind: kind.into(), index }], rule: None };
+    let partial = Program { model: "tiny".into(), valid: true, nodes: vec![node("h", 1, "head", Some(Index::One(0))), node("n", 0, "mlp", Some(Index::Many(vec![1, 4, 9])))], ..Program::default() };
+    let graph = Graph::parse(&partial, &weights).expect("partial");
+    let mut state = crate::graph_device::DeviceState::new(Device::host());
+    for (name, circuit) in [("model", graph.model(&weights)), ("program", graph.program(&weights, true))] {
+        let host = execute(&weights, &circuit, &batch, &rows, &BTreeMap::new()).expect("host");
+        let job = crate::graph_device::Run { tokens: &batch.tokens, spans: &batch.spans, scored: &rows, swaps: &BTreeMap::new(), capture: false, reference: batch.reference.as_deref(), ops: &crate::graph::Interventions::default() };
+        let device = crate::graph_device::run_on(&mut state, &weights, &circuit, &job).expect("device");
+        let kl = max(&kl_bits(&host.log_probabilities, &device.log_probabilities));
+        assert!(kl < 1e-9, "{name}: KL(host ‖ device) = {kl:e} bits");
+    }
+}

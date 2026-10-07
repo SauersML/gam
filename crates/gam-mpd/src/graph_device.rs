@@ -29,6 +29,9 @@ pub(crate) struct DeviceState {
     resident: HashMap<(usize, usize, usize), Tensor>,
     /// The resident copies' keys, oldest first (past [`RESIDENT_BYTES`] the oldest go).
     uploaded: Vec<(usize, usize, usize)>,
+    /// Heads' maps stacked into one matrix (`heads_together`), by the stacked copies' keys and
+    /// whether they stack as rows; dropped whenever a weight edit drops resident copies.
+    stacks: HashMap<(Vec<Key>, bool), Tensor>,
     references: Vec<(u64, BTreeMap<(Field, usize, usize), Tensor>)>,
 }
 
@@ -76,7 +79,7 @@ fn on_device<T: Send>(f: impl FnOnce(&mut DeviceState) -> T + Send) -> Option<T>
 
 impl DeviceState {
     pub(crate) fn new(device: Device) -> Self {
-        Self { device, resident: HashMap::new(), uploaded: Vec::new(), references: Vec::new() }
+        Self { device, resident: HashMap::new(), uploaded: Vec::new(), stacks: HashMap::new(), references: Vec::new() }
     }
 
     fn arithmetic(&self) -> Arithmetic {
@@ -161,7 +164,10 @@ pub fn use_device(device: Device) -> bool {
 /// reads a stale copy.
 pub(crate) fn edited(m: &Array2<f64>) {
     let dim = m.dim();
-    on_device(|s| s.resident.retain(|k, _| (k.1, k.2) != dim));
+    on_device(|s| {
+        s.resident.retain(|k, _| (k.1, k.2) != dim);
+        s.stacks.clear();
+    });
 }
 
 /// `a · b` on the device, or `None` (no device, a product below `2^22` multiply-adds, or a device
@@ -522,6 +528,19 @@ pub(crate) fn run_on(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, 
                             c.attention_inputs[*layer] = s.device.download(&normed_inputs[0]).map_err(e)?;
                         }
                     }
+                    // All the unit's heads at once where they share their shapes, head-norm gains and
+                    // rotary (Qwen3, vpd4l): one product per map and one attention call per layer.
+                    let pad_job = Padding { places: padded.as_ref(), sequences, longest };
+                    if let Some(batched) = heads_together(s, lw, heads, &normed_inputs, &pad_job, captured.is_some()) {
+                        let (write, reads) = batched.map_err(e)?;
+                        if let (Some(c), Some(reads)) = (captured.as_mut(), reads) {
+                            for (i, &h) in heads.iter().enumerate() {
+                                let width = lw.heads[h].value.nrows();
+                                c.reads[*layer][h] = reads.slice(ndarray::s![.., i * width..(i + 1) * width]).to_owned();
+                            }
+                        }
+                        write
+                    } else {
                     let mut out = s.device.zeros(rows, width).map_err(e)?;
                     for &h in heads {
                         let hw = &lw.heads[h];
@@ -567,6 +586,7 @@ pub(crate) fn run_on(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, 
                         s.device.gemm(&mut out, 1.0, &z, Op::N, s.get(wo).map_err(e)?, Op::T, 1.0, arithmetic).map_err(e)?;
                     }
                     out
+                    }
                 }
                 Block::Neurons { layer, neurons } => {
                     let lw = &weights.layers[*layer];
@@ -641,6 +661,111 @@ pub(crate) fn run_on(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, 
         vec![None; units]
     };
     Ok(Execution::of(log_probabilities, writes, captured, kept))
+}
+
+/// How the run's rows sit in the padded layout attention reads (`run_on`).
+struct Padding<'a> {
+    places: Option<&'a gam_gpu::tensor::Indices>,
+    sequences: usize,
+    longest: usize,
+}
+
+/// Heads `heads` of `lw` on their normed query, key and value inputs, all at once: each map's
+/// heads stacked into one product, the heads split into whole sequences (padded) for one attention
+/// call, merged back and written through their stacked output columns. `None` when the heads differ
+/// in shape, head-norm gain or rotary (the caller runs them one by one). With `read`, the heads'
+/// reads side by side (rows × heads' value widths) as well.
+fn heads_together(s: &mut DeviceState, lw: &crate::graph::LayerWeights, heads: &[usize], normed: &[Tensor], pad: &Padding, read: bool) -> Option<Result<(Tensor, Option<Array2<f64>>), GpuError>> {
+    let first = &lw.heads[*heads.first()?];
+    let same = heads.iter().all(|&h| {
+        let w = &lw.heads[h];
+        w.query.dim() == first.query.dim() && w.key.dim() == first.key.dim() && w.value.dim() == first.value.dim() && w.output.dim() == first.output.dim() && w.query_norm == first.query_norm && w.key_norm == first.key_norm && w.rotary == first.rotary && w.scale == first.scale && w.causal == first.causal
+    });
+    if !same || first.query.nrows() != first.key.nrows() || first.query.nrows() != first.value.nrows() {
+        return None;
+    }
+    Some(heads_together_on(s, lw, heads, normed, pad, read))
+}
+
+fn heads_together_on(s: &mut DeviceState, lw: &crate::graph::LayerWeights, heads: &[usize], normed: &[Tensor], pad: &Padding, read: bool) -> Result<(Tensor, Option<Array2<f64>>), GpuError> {
+    let first = &lw.heads[heads[0]];
+    let (n, width, rows) = (heads.len(), first.query.nrows(), normed[0].rows());
+    let arithmetic = s.arithmetic();
+    // The stacked maps, built from the resident per-head copies (a weight edit drops those).
+    let stacked = |s: &mut DeviceState, maps: Vec<&Array2<f64>>, along_rows: bool| -> Result<Tensor, GpuError> {
+        let keys: Vec<Key> = maps.iter().map(|m| s.ensure(m.view())).collect::<Result<_, _>>()?;
+        if let Some(t) = s.stacks.get(&(keys.clone(), along_rows)) {
+            return s.device.copy(t);
+        }
+        let (r, c) = maps[0].dim();
+        let built = if along_rows {
+            let mut out = s.device.zeros(r * maps.len(), c)?;
+            for (i, k) in keys.iter().enumerate() {
+                s.device.set_rows(&mut out, i * r, s.get(*k)?)?;
+            }
+            out
+        } else {
+            // Output columns side by side: stack their transposes as rows, then transpose.
+            let mut out = s.device.zeros(c * maps.len(), r)?;
+            for (i, k) in keys.iter().enumerate() {
+                let t = s.device.transpose(s.get(*k)?)?;
+                s.device.set_rows(&mut out, i * c, &t)?;
+            }
+            s.device.transpose(&out)?
+        };
+        s.stacks.insert((keys, along_rows), s.device.copy(&built)?);
+        Ok(built)
+    };
+    let project = |s: &mut DeviceState, x: &Tensor, maps: Vec<&Array2<f64>>| -> Result<Tensor, GpuError> {
+        let w = stacked(s, maps, true)?;
+        let mut p = s.device.zeros(rows, w.rows())?;
+        s.device.gemm(&mut p, 1.0, x, Op::N, &w, Op::T, 0.0, arithmetic)?;
+        Ok(p)
+    };
+    let q = project(s, &normed[0], heads.iter().map(|&h| &lw.heads[h].query).collect())?;
+    let k = project(s, &normed[1], heads.iter().map(|&h| &lw.heads[h].key).collect())?;
+    let v = project(s, &normed[2], heads.iter().map(|&h| &lw.heads[h].value).collect())?;
+    let padded_rows = pad.sequences * pad.longest;
+    let to_padded = |s: &DeviceState, x: Tensor| -> Result<Tensor, GpuError> {
+        match pad.places {
+            None => Ok(x),
+            Some(places) => {
+                let mut out = s.device.zeros(padded_rows, x.cols())?;
+                s.device.scatter_rows(&mut out, places, &x, false)?;
+                Ok(out)
+            }
+        }
+    };
+    let (q, k, v) = (to_padded(s, q)?, to_padded(s, k)?, to_padded(s, v)?);
+    // Head-major whole sequences: row (b·n + h)·L + l is head h of sequence b at position l.
+    let split = |s: &DeviceState, x: &Tensor| s.device.split_heads(x, 0, n, width, pad.sequences, None, false);
+    let (mut qs, mut ks, vs) = (split(s, &q)?, split(s, &k)?, split(s, &v)?);
+    for (x, norm) in [(&mut qs, &first.query_norm), (&mut ks, &first.key_norm)] {
+        if let Some((g, epsilon)) = norm {
+            let unit = s.device.rms_norm(x, *epsilon)?;
+            let g = s.ensure(row(g))?;
+            s.device.scale_columns(x, &unit, s.get(g)?, false)?;
+        }
+    }
+    if let Some(r) = first.rotary {
+        let positions: Vec<u32> = (0..pad.sequences * n).flat_map(|_| 0..pad.longest as u32).collect();
+        let (cos, sin) = rotation_tables(&s.device, r, &positions)?;
+        qs = s.device.rotate(&qs, &cos, &sin, r.half_split, false)?;
+        ks = s.device.rotate(&ks, &cos, &sin, r.half_split, false)?;
+    }
+    let segments: Vec<Segment> = (0..pad.sequences * n).map(|b| Segment { rows: b * pad.longest..(b + 1) * pad.longest, first: 0, before: Vec::new() }).collect();
+    let zs = forward_segments(&s.device, (&qs, &ks, &vs), &segments, first.scale, first.causal, arithmetic)?;
+    let mut z = s.device.zeros(padded_rows, n * width)?;
+    s.device.merge_heads(&zs, &mut z, 0, n, pad.sequences, None, false)?;
+    let z = match pad.places {
+        None => z,
+        Some(places) => s.device.gather_rows(&z, places)?,
+    };
+    let reads = if read { Some(s.device.download(&z)?) } else { None };
+    let wo = stacked(s, heads.iter().map(|&h| &lw.heads[h].output).collect(), false)?;
+    let mut out = s.device.zeros(rows, wo.rows())?;
+    s.device.gemm(&mut out, 1.0, &z, Op::N, &wo, Op::T, 0.0, arithmetic)?;
+    Ok((out, reads))
 }
 
 /// Neurons `picked` (all when `None`) of an MLP on normed inputs `x_hat`: their write (rows ×
