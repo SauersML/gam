@@ -83,6 +83,13 @@ T = load_target(dev)
 mlp = [n for n in site_names() if '.mlp.' in n]
 # DESCENT_SITES=all: the attention maps are explained too (below; always exact by construction).
 attn = [n for n in site_names() if '.attn.' in n] if os.environ.get('DESCENT_SITES') == 'all' else []
+# DESCENT_HEADS=1 (with DESCENT_SITES=all): an attention part is a whole head, its q, k, v and o weights
+# together, gated on the norm of its own write at the query position, ||W_o,h a_h(t)|| (a_h(t) the head's
+# attention output), and counted 1 when on. q, k and v run ungated at every position, so the pattern is
+# always formed from the full q and k (a head off at t still serves later queries' keys and values) and
+# the gate multiplies only the head's write at t. With every head on, P's attention is M's.
+HEADS = bool(attn) and os.environ.get('DESCENT_HEADS') == '1'
+sliced = [] if HEADS else attn
 tok = np.memmap(TOKENS, dtype=np.uint16 if TOKENS.endswith('.u16') else np.float64, mode='r').reshape(-1, 513)
 ev = torch.tensor(tok[1024:1032, :512].astype(np.int64), device=dev)
 # Training rows: DESCENT_TRAIN_ROWS rows of the file, skipping the held-out rows 1024..1031 (default 1024).
@@ -101,6 +108,19 @@ VPD_ATTN_COUNTS = {'h.0.attn.q_proj': 0.91, 'h.0.attn.k_proj': 1.25, 'h.0.attn.v
                    'h.2.attn.q_proj': 4.28, 'h.2.attn.k_proj': 4.22, 'h.2.attn.v_proj': 10.16, 'h.2.attn.o_proj': 15.76,
                    'h.3.attn.q_proj': 1.99, 'h.3.attn.k_proj': 2.04, 'h.3.attn.v_proj': 7.74, 'h.3.attn.o_proj': 12.9}
 START_SCALE = min(1.0, K / (sum(VPD_COUNTS.values()) + (sum(VPD_ATTN_COUNTS.values()) if attn else 0.0)))
+H_START = {}
+if HEADS:
+    # Water-filling: each layer's share of the heads' start count, capped at the layer's heads.
+    w_ = {l: sum(v for n, v in VPD_ATTN_COUNTS.items() if n.startswith(f'h.{l}.')) for l in range(T.n_layer)}
+    left, free = min(T.n_layer * T.n_head, K * sum(VPD_ATTN_COUNTS.values()) / (sum(VPD_COUNTS.values()) + sum(VPD_ATTN_COUNTS.values()))), set(w_)
+    while free:
+        tot = sum(w_[l] for l in free)
+        over = [l for l in free if left * w_[l] / tot > T.n_head]
+        if not over:
+            H_START.update({l: left * w_[l] / tot for l in free}); break
+        for l in over:
+            H_START[l] = float(T.n_head); left -= T.n_head; free.discard(l)
+    START_SCALE = min(1.0, (K - sum(H_START.values())) / sum(VPD_COUNTS.values()))
 
 @torch.no_grad()
 def site_inputs(ids):
@@ -348,7 +368,7 @@ def head_output(c, U, o, swaps=()):
 # equal to M.
 ATTN_FREE = os.environ.get('DESCENT_ATTN_FREE') == '1'
 A = {}
-for n in attn:
+for n in sliced:
     if start not in ('vpd', 'neuron'):
         raise SystemExit('DESCENT_SITES=all: the vpd or neuron start (the heads from VPD\'s attention slices)')
     W = T.site(n).W; o = n.endswith('o_proj')
@@ -642,7 +662,59 @@ def make_attn(n):
         y = head_output(c * g, p['U'], p['o'], swaps_of(n, x.shape[1])).view(x.shape[0], x.shape[1], -1)
         return y + residual(n, x) if n in RES else y
     return fwd
-for n in attn: T.site(n)._forward = make_attn(n)
+for n in sliced: T.site(n)._forward = make_attn(n)
+
+# Whole-head parts (HEADS): each layer's q, k, v, o weights trained (HP, started at M's), and each head's
+# gate threshold and noise scale (HG, keyed by the layer's o_proj).
+HP, HG = {}, {}
+def make_head_in(n, l, k):
+    def fwd(x):
+        return x @ (T.site(n).W if state['mode'] == 'M' else HP[l][k]).T
+    return fwd
+
+def make_head_o(n, l):
+    def fwd(a):
+        if state['mode'] == 'M':
+            return a @ T.site(n).W.T
+        B_, T_ = a.shape[0], a.shape[1]
+        y = torch.einsum('bthk,dhk->bthd', a.view(B_, T_, NH, HD), HP[l]['o_proj'].view(-1, NH, HD))  # [B, T, H, d]
+        if state['entry'].get(n):
+            # Head edits, entry-wise in the head's o columns: a scale multiplies the head's write on its
+            # sequence (its gate reads the scaled write); a swap puts head h2's write in head h1's place.
+            scale = torch.ones(B_, NH, device=a.device); perm = torch.arange(NH, device=a.device).repeat(B_, 1)
+            for b, kind, G, a_ in state['entry'][n]:
+                if kind == 'in':
+                    scale[b, int(G[0]) // HD] = 1 + a_
+                elif kind == 'swap':
+                    perm[b, G[0]] = G[1]
+            y = y.gather(2, perm[:, None, :, None].expand(-1, T_, -1, y.shape[-1])) * scale[:, None, :, None]
+        r = y.norm(dim=-1)                                                       # [B, T, H]
+        if state.get('calib') is not None:
+            state['calib'].setdefault(n, []).append(r.detach().reshape(-1))
+        if state['mode'] == 'all':
+            return y.sum(2)
+        z = (r - HG[n]['tau']) / HG[n]['s']
+        hard, phi = (z > 0).float(), 0.5 * (1 + torch.erf(z / SQ2))
+        if state['force_on']:
+            on = torch.tensor(state['force_on'], device=z.device)
+            hard, phi = hard.index_fill(0, on, 1.0), phi.index_fill(0, on, 1.0)
+        state['hard'].append(hard.sum(-1).reshape(-1))
+        if state['mode'] == 'hard':
+            g = hard
+        else:
+            state['soft'].append(phi.sum(-1).reshape(-1))
+            g = phi if gate == 'mf' else hard + phi - phi.detach()
+        return (y * g[..., None]).sum(2)
+    return fwd
+
+if HEADS:
+    for l in range(T.n_layer):
+        HP[l] = {k: T.site(f'h.{l}.attn.{k}').W.detach().clone().requires_grad_() for k in ('q_proj', 'k_proj', 'v_proj', 'o_proj')}
+        for k in ('q_proj', 'k_proj', 'v_proj'):
+            T.site(f'h.{l}.attn.{k}')._forward = make_head_in(f'h.{l}.attn.{k}', l, k)
+        n = f'h.{l}.attn.o_proj'
+        HG[n] = {'tau': torch.zeros(NH, device=dev, requires_grad=True), 's': torch.ones(NH, device=dev)}
+        T.site(n)._forward = make_head_o(n, l)
 
 # Weight edits (DESCENT_WEDITS = edited sequences per training batch): an edit is an additive
 # Delta W = A B^T on one or more of M's maps, defined in M's terms and applied verbatim to both models
@@ -841,12 +913,28 @@ def hidden(ids):
         q = T._rope(site('q_proj')(h).view(B_, T_, NH, HD).transpose(1, 2), T_)
         k = T._rope(site('k_proj')(h).view(B_, T_, NH, HD).transpose(1, 2), T_)
         pattern = ((q @ k.transpose(-1, -2)) / math.sqrt(HD)).masked_fill(~causal, float('-inf')).softmax(-1)
-        x = x + site('o_proj')(attn_v(i, h, pattern))
+        if HEADS:
+            a = (pattern @ site('v_proj')(h).view(B_, T_, NH, HD).transpose(1, 2)).transpose(1, 2).reshape(B_, T_, -1)
+        else:
+            a = attn_v(i, h, pattern)
+        x = x + site('o_proj')(a)
         h = vpd_model.rms(x, T.norms[2 * i + 1], T.eps)
         x = x + site('down_proj')(vpd_model.gelu_tanh(site('c_fc')(h)))
     return vpd_model.rms(x, T.ln_f, T.eps)
 if attn:
     T.hidden = hidden
+if HEADS:
+    # Each head's noise scale: a tenth of the root mean square of its write's norm on P's run with every
+    # part on (= M).
+    with torch.no_grad():
+        state['calib'] = {}
+        for i in range(0, 4, 2):
+            state['mode'], state['soft'], state['hard'] = 'all', [], []
+            T(torch.tensor(tok[i:i + 2, :512].astype(np.int64), device=dev))
+        for n, v in state['calib'].items():
+            HG[n]['s'] = 0.1 * torch.stack(v).view(len(v), -1, NH).reshape(-1, NH).pow(2).mean(0).sqrt().clamp_min(1e-12)
+        state['calib'] = None
+if sliced:
     # Calibration on P's own run with every slice on (= M): each v slice's noise scale and the v map's
     # threshold from the post-attention reads (the quantile matching VPD's mean count at the map).
     with torch.no_grad():
@@ -957,7 +1045,7 @@ def evaluate(final=False):
         for n in mlp:
             if not (NEURON_DOWN and n.endswith('down_proj')):
                 P[n]['V'], P[n]['U'] = frame(P[n]['F'], T.site(n).W)
-    for n in attn if not ATTN_FREE else ():
+    for n in sliced if not ATTN_FREE else ():
         A[n]['V'], A[n]['U'] = head_frame(A[n]['F'], T.site(n).W, A[n]['o'])
     state['collect'] = {} if SHARE else None
     state['resid_on'] = {}
@@ -1034,7 +1122,9 @@ if start in ('vpd', 'neuron') and not (SHARE or SHARE_A or ROUTER or EXACT or AR
     vc = lambda n: (VPD_COUNTS[n] if start == 'vpd' else
                     (VPD_COUNTS[n.rsplit('.', 1)[0] + '.c_fc'] + VPD_COUNTS[n.rsplit('.', 1)[0] + '.down_proj']) / 2)
     target = {n: 1 - START_SCALE * vc(n) / P[n]['V'].shape[1] for n in mlp}
-    target.update({n: 1 - START_SCALE * VPD_ATTN_COUNTS.get(n, 1.0) / (NH * A[n]['V'].shape[-1]) for n in attn})
+    target.update({n: 1 - START_SCALE * VPD_ATTN_COUNTS.get(n, 1.0) / (NH * A[n]['V'].shape[-1]) for n in sliced})
+    # A layer's heads on at the start: H_START[l] of its NH.
+    target.update({n: max(0.0, 1 - H_START[int(n.split('.')[1])] / NH) for n in HG})
     ids_c = torch.tensor(tok[0:4, :512].astype(np.int64), device=dev)
     with torch.no_grad():
         install([None])
@@ -1043,7 +1133,7 @@ if start in ('vpd', 'neuron') and not (SHARE or SHARE_A or ROUTER or EXACT or AR
             run(ids_c, 'hard')
             for n, v in state['calib'].items():
                 flat = torch.cat(v); idx = torch.randperm(flat.numel(), device=dev)[:2_000_000]
-                (P[n] if n in P else A[n])['tau'].fill_(torch.quantile(flat[idx].float(), target[n]).item())
+                (P[n] if n in P else A[n] if n in A else HG[n])['tau'].fill_(torch.quantile(flat[idx].float(), target[n]).item())
         state['calib'] = None
         run(ids_c, 'hard')
         print('thresholds set in the gated run: parts on per token', round(torch.stack(state['hard']).sum(0).mean().item(), 1),
@@ -1059,7 +1149,8 @@ rms = lambda q: q.detach().pow(2).mean().sqrt().item()
 FREEZE = os.environ.get('DESCENT_FREEZE') == '1'
 slots = [(P[n], w, rms(P[n][w])) for n in mlp for w in (('F',) if EXACT else ('V', 'U')) + (('G',) if ARM == 'dir' else ())
          if not (EXACT and NEURON_DOWN and n.endswith('down_proj') and w == 'F') and not (FREEZE and w in ('V', 'U', 'F'))]
-slots += [(A[n], w, rms(A[n][w])) for n in attn for w in (('V', 'U') if ATTN_FREE else ('F',))] + [(A[n], 'tau', 100 / 3 * A[n]['s'].mean().item()) for n in attn]
+slots += [(A[n], w, rms(A[n][w])) for n in sliced for w in (('V', 'U') if ATTN_FREE else ('F',))] + [(A[n], 'tau', 100 / 3 * A[n]['s'].mean().item()) for n in sliced]
+slots += [(HP[l], k, rms(HP[l][k])) for l in HP for k in HP[l]] + [(HG[n], 'tau', 100 / 3 * HG[n]['s'].mean().item()) for n in HG]
 for l, S in SHARE_A.items():
     slots += [(S, 't', 100 / 3 * S['s'].mean().item()), (S, 'L_v', 20 / 3), (S, 'L_o', 20 / 3)]
 slots += [(P[n], 'tau', 100 / 3 * P[n]['s'].mean().item()) for n in mlp]
@@ -1081,6 +1172,8 @@ for l, R in ROUTER.items():
 # sigma^2) / 2 per tensor of n entries. Each step draws one sample of every tensor; evaluation is
 # at the posterior mean.
 FMODE = os.environ.get('DESCENT_F') == '1'
+# Each trained tensor's start (F's prior means), by the id of its posterior mean.
+MU0 = {}
 # DESCENT_COUNT=mean (F only): the budget's E[k] at the posterior mean, the explanation evaluated, rather
 # than at the step's sample. At the sample, parts whose reads or thresholds are wide fire at random (the whole
 # model at K = 128 under F: 602 parts on per training token against 77 at the mean after 915 steps, then the
@@ -1094,6 +1187,7 @@ if FMODE:
         mu = cont[key].detach().clone().requires_grad_()
         ls = torch.full_like(mu, math.log(0.01 * scale)).requires_grad_()
         leaves.append((cont, key, mu, ls))
+        MU0[id(mu)] = cont[key].detach().clone()
         # log sigma by 1% per step
         groups += [{'params': [mu], 'lr': LR * 3e-3 * scale}, {'params': [ls], 'lr': LR * 1e-2}]
 else:
@@ -1119,7 +1213,7 @@ def draw(mean):
         for n in mlp:
             if not (NEURON_DOWN and n.endswith('down_proj')):
                 P[n]['V'], P[n]['U'] = frame(P[n]['F'], T.site(n).W)
-    for n in attn if not ATTN_FREE else ():
+    for n in sliced if not ATTN_FREE else ():
         A[n]['V'], A[n]['U'] = head_frame(A[n]['F'], T.site(n).W, A[n]['o'])
 
 # DESCENT_PRIOR=part: each part's read and write get their own prior group N(0, v_j) (v_j at its optimum,
@@ -1135,7 +1229,11 @@ def description_bits():
     """KL(q || p) in bits (F only)."""
     total = 0.0
     for _, key, mu, ls in leaves:
-        e = mu.pow(2) + (2 * ls).exp()
+        # A weight tensor's prior is centred on its start, M's own slice for the neuron and head starts, so
+        # its description is what the parts change in M: a part left at M's weights costs nothing however
+        # wide its posterior, and a wide posterior can no longer hide in the scale of the used parts (under
+        # N(0, v) reads widened to sigma / RMS(mu) 1.57 by 20M tokens on the whole model).
+        e = (mu - MU0[id(mu)]).pow(2) + (2 * ls).exp()
         if PART_PRIOR and key in ('V', 'U') and mu.dim() >= 2:
             # A read's part is its last axis (MLP [d_in, r], heads [H, d, C]), a write's its second last
             # (MLP [r, d_out], heads [H, C, d_out]).
@@ -1190,7 +1288,12 @@ def save(step):
         torch.save({'step': step, 'start': start, 'arm': ARM, 'gate': gate,
                     'maps': {n: {k: P[n][k].detach().float().cpu() for k in ('V', 'U', 'tau', 's')} for n in mlp},
                     # The heads' slices (DESCENT_SITES=all): reads V [H, d_in_h, C], writes U [H, C, d_out_h].
-                    'attn': {n: {k: A[n][k].detach().float().cpu() for k in ('V', 'U', 'tau', 's')} for n in attn},
+                    'attn': {n: {k: A[n][k].detach().float().cpu() for k in ('V', 'U', 'tau', 's')} for n in sliced},
+                    # Whole-head parts (HEADS): per layer the trained q, k, v, o weights [d_out, d_in] (M's
+                    # layout) and per head the gate's threshold and noise scale [H] on ||W_o,h a_h(t)||.
+                    'heads': {l: {**{k: HP[l][k].detach().float().cpu() for k in HP[l]},
+                                  'tau': HG[f'h.{l}.attn.o_proj']['tau'].detach().float().cpu(),
+                                  's': HG[f'h.{l}.attn.o_proj']['s'].float().cpu()} for l in HP},
                     'tied': {dn: (fc, own.cpu()) for dn, (fc, own) in GROUP.items()}}, os.environ['DESCENT_SAVE'])
 
 draw(True)
