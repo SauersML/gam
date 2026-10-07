@@ -1207,7 +1207,6 @@ fn project(x: &Array2<f64>, map: &Array2<f64>, norm: Option<&(Array1<f64>, f64)>
 /// Heads `heads` of `layer` on their query, key and value inputs (residual streams), `normed`
 /// applied to each normed input (route slot, value). With `record`, each head's mean
 /// attention-weighted normalized value input as well.
-#[allow(clippy::type_complexity)]
 fn heads_write(layer: &LayerWeights, heads: &[usize], inputs: [&Array2<f64>; 3], spans: &[(usize, usize)], blocks: &[Vec<[usize; 4]>], record: bool, capture: bool, normed: &mut dyn FnMut(usize, &mut Array2<f64>)) -> (Array2<f64>, Vec<Array1<f64>>, Vec<Array2<f64>>) {
     let norm = &layer.attention;
     let (mut q_hat, mut k_hat) = (norm.apply(inputs[0]), norm.apply(inputs[1]));
@@ -1352,7 +1351,6 @@ pub fn execute(weights: &Weights, stats: &Stats, circuit: &Circuit, batch: &Batc
 /// [`execute`] under the row interventions `ops` (site operations, [`Interventions`]): after a
 /// site, writers' writes scaled or swapped and vectors pushed into the stream; at a site, its
 /// units' normed inputs scaled, pushed or swapped and cut writers read on the donor.
-#[allow(clippy::too_many_arguments)]
 pub fn execute_with(weights: &Weights, stats: &Stats, circuit: &Circuit, batch: &Batch, scored: &[usize], swaps: &BTreeMap<usize, Array2<f64>>, record: bool, ops: &Interventions) -> Result<Execution, String> {
     run(weights, stats, circuit, batch, scored, swaps, record, ops, false)
 }
@@ -1361,7 +1359,6 @@ pub fn execute_with(weights: &Weights, stats: &Stats, circuit: &Circuit, batch: 
 /// write ([`Reference`]; every unit must compute, each layer's heads and MLP one unit each).
 /// Stand-ins: with `batch.reference`, each unit's write in that run (counterfactual stand-ins),
 /// else each piece applied to its average input ([`Stats`]).
-#[allow(clippy::too_many_arguments)]
 fn run(weights: &Weights, stats: &Stats, circuit: &Circuit, batch: &Batch, scored: &[usize], swaps: &BTreeMap<usize, Array2<f64>>, record: bool, ops: &Interventions, capture: bool) -> Result<Execution, String> {
     let (rows, d) = (batch.tokens.len(), weights.width());
     let vocabulary = weights.embedding.nrows();
@@ -1446,7 +1443,7 @@ fn run(weights: &Weights, stats: &Stats, circuit: &Circuit, batch: &Batch, score
         let mut slice_writes: BTreeMap<usize, Array2<f64>> = BTreeMap::new();
         let slices: Vec<usize> = order[at..end].iter().copied().filter(|&u| matches!(circuit.units[u].block, Block::Slices { .. })).collect();
         if let Some(&first) = slices.first() {
-            let Block::Slices { layer, .. } = circuit.units[first].block else { unreachable!() };
+            let Block::Slices { layer, .. } = circuit.units[first].block else { return Err("a VPD-view unit of another block".into()) };
             let mlp = weights.layers[layer].mlp.as_ref().ok_or("a VPD view of a layer without an MLP")?;
             let vpd = weights.vpd.get(&layer).ok_or_else(|| format!("layer {layer} has no VPD view"))?;
             let norm = &weights.layers[layer].mlp_norm;
@@ -1455,8 +1452,8 @@ fn run(weights: &Weights, stats: &Stats, circuit: &Circuit, batch: &Batch, score
                 None => broadcast(&(&stats.mlps[layer] * &norm.gain)),
             };
             let fc_of = |b: &Block, x: &Array2<f64>| match b {
-                Block::Slices { fc, rest, .. } => vpd.fc(mlp, fc, *rest, x),
-                _ => unreachable!(),
+                Block::Slices { fc, rest, .. } => Ok(vpd.fc(mlp, fc, *rest, x)),
+                _ => Err("a VPD-view MLP unit of another block".to_string()),
             };
             let mut pre_ref = x_ref.dot(&mlp.gate.t());
             pre_ref += &mlp.bias.view().insert_axis(Axis(0));
@@ -1471,14 +1468,14 @@ fn run(weights: &Weights, stats: &Stats, circuit: &Circuit, batch: &Batch, score
                 ops.cut_inputs(site, unit, routes, &mut inputs, &st)?;
                 let mut x_hat = norm.apply(&inputs[0]);
                 ops.normed(site, u, 0, &mut x_hat, &mut normed_kept);
-                deltas.insert(u, fc_of(&unit.block, &x_hat) - fc_of(&unit.block, &x_ref));
+                deltas.insert(u, fc_of(&unit.block, &x_hat)? - fc_of(&unit.block, &x_ref)?);
             }
             for &u in &slices {
                 let unit = &circuit.units[u];
                 if !unit.computes || swaps.contains_key(&u) {
                     continue;
                 }
-                let Block::Slices { down, rest, .. } = &unit.block else { unreachable!() };
+                let Block::Slices { down, rest, .. } = &unit.block else { return Err("a VPD-view unit of another block".into()) };
                 if down.is_empty() && !rest {
                     slice_writes.insert(u, Array2::zeros((rows, d)));
                     continue;
@@ -1502,7 +1499,7 @@ fn run(weights: &Weights, stats: &Stats, circuit: &Circuit, batch: &Batch, score
         // the heads' attention on them and writes through its o_proj subcomponents.
         let attention: Vec<usize> = order[at..end].iter().copied().filter(|&u| matches!(circuit.units[u].block, Block::AttnSlices { .. })).collect();
         if let Some(&first) = attention.first() {
-            let Block::AttnSlices { layer, .. } = circuit.units[first].block else { unreachable!() };
+            let Block::AttnSlices { layer, .. } = circuit.units[first].block else { return Err("a VPD-view unit of another block".into()) };
             let lw = &weights.layers[layer];
             let vpd = weights.vpd_attention.get(&layer).ok_or_else(|| format!("layer {layer}'s attention has no VPD view"))?;
             let maps = attention_maps(lw);
@@ -1521,7 +1518,7 @@ fn run(weights: &Weights, stats: &Stats, circuit: &Circuit, batch: &Batch, score
                 if !unit.computes || swaps.contains_key(&u) {
                     continue;
                 }
-                let Block::AttnSlices { q, k, v, rest, .. } = &unit.block else { unreachable!() };
+                let Block::AttnSlices { q, k, v, rest, .. } = &unit.block else { return Err("a VPD-view unit of another block".into()) };
                 let routes = unit.block.routes();
                 let mut inputs: Vec<Array2<f64>> = routes.iter().map(|r| input(&unit.routes[r.slot()], &st)).collect();
                 ops.cut_inputs(site, unit, routes, &mut inputs, &st)?;
@@ -1538,7 +1535,7 @@ fn run(weights: &Weights, stats: &Stats, circuit: &Circuit, batch: &Batch, score
                 if !unit.computes || swaps.contains_key(&u) {
                     continue;
                 }
-                let Block::AttnSlices { o, rest, .. } = &unit.block else { unreachable!() };
+                let Block::AttnSlices { o, rest, .. } = &unit.block else { return Err("a VPD-view unit of another block".into()) };
                 if o.is_empty() && !rest {
                     slice_writes.insert(u, Array2::zeros((rows, d)));
                     continue;
@@ -2564,7 +2561,6 @@ impl SiteUnits {
     /// (`interchange::draw_site_ops` over every shared site on sequences of `length` tokens). The
     /// file has the keys of `mpd_library_mdl_2951`'s `Manifest` (one batch of experiments) plus
     /// `context` (`length`), and is refused if it exists.
-    #[allow(clippy::too_many_arguments)]
     pub fn write_manifest(path: &std::path::Path, export: &str, weights: &Weights, stats: &Stats, sequences: &[Vec<u32>], families: &[interchange::Family], count: usize, seed: u64, length: usize) -> Result<Self, String> {
         if path.exists() {
             return Err(format!("{} exists and is immutable", path.display()));
@@ -2677,11 +2673,8 @@ impl Candidates {
     }
 }
 
-/// The byte budget of `M`'s cached outcomes: `GRAPH_CACHE_GIB` GiB (2 when unset).
-fn cache_budget() -> usize {
-    let gib: f64 = std::env::var("GRAPH_CACHE_GIB").ok().and_then(|v| v.parse().ok()).unwrap_or(2.0);
-    (gib * f64::from(1u32 << 30)) as usize
-}
+/// The byte budget of `M`'s cached outcomes a checker starts with (`Checker::cache_bytes`): 2 GiB.
+const CACHE_BYTES: usize = 2 << 30;
 
 /// Site operations in words (the reader's description; the same for `M` and every program).
 fn describe_sites(draw: &SiteDraw) -> String {
@@ -2779,6 +2772,9 @@ pub struct Checker {
     cache: BTreeMap<String, Arc<Array2<f64>>>,
     cached: std::collections::VecDeque<String>,
     pub cache_bytes: usize,
+    /// The directory of the disk cache of `M`'s outcomes, which every checker process given the
+    /// same directory shares; `None` (the default) keeps them in memory only.
+    pub disk_cache: Option<std::path::PathBuf>,
     /// Heads by their measured removal effect on `M` (mean `KL(M ‖ M without the head)` at the
     /// targets), strongest first; measured on first use.
     strongest: Option<Vec<(usize, usize)>>,
@@ -2795,7 +2791,6 @@ pub struct Checker {
     /// The weight edit applied now, if any (its JSON): part of a counterfactual run's cache key.
     edit: Option<String>,
     /// Counterfactual runs by (edit, sequences), each computed once by whichever run asks first.
-    #[allow(clippy::type_complexity)]
     references: std::sync::Mutex<Vec<(String, Arc<std::sync::OnceLock<Result<Arc<Reference>, String>>>)>>,
     /// Counterfactual runs under site operations (`reference_under`) by experiment, for one
     /// [`Checker::score_batch`] (cleared at its start).
@@ -2894,7 +2889,8 @@ impl Checker {
             donors,
             cache: BTreeMap::new(),
             cached: Default::default(),
-            cache_bytes: cache_budget(),
+            cache_bytes: CACHE_BYTES,
+            disk_cache: None,
             strongest: None,
             sites: SiteUnits::default(),
             uniform_seeds: None,
@@ -3072,11 +3068,11 @@ impl Checker {
         Ok(out)
     }
 
-    /// The file of `M`'s outcome under `key` in the disk cache `GRAPH_DISK_CACHE` (shared by every
-    /// checker process): named by the behavior, a fingerprint of its prompts and of `M`'s weights,
+    /// The file of `M`'s outcome under `key` in the disk cache (`Checker::disk_cache`, shared by
+    /// every checker process given it): named by the behavior, a fingerprint of its prompts and of `M`'s weights,
     /// and the key; `None` when the cache is off.
     fn disk_path(&self, key: &str) -> Option<std::path::PathBuf> {
-        let dir = std::env::var_os("GRAPH_DISK_CACHE")?;
+        let dir = self.disk_cache.as_ref()?;
         // FNV-1a over little-endian words.
         let fnv = |mut h: u64, words: &mut dyn Iterator<Item = u64>| -> u64 {
             for w in words {
@@ -3124,7 +3120,9 @@ impl Checker {
         m.iter().for_each(|v| bytes.extend_from_slice(&v.to_le_bytes()));
         let partial = path.with_extension(format!("partial{}", std::process::id()));
         if std::fs::create_dir_all(dir).is_ok() && std::fs::write(&partial, bytes).is_ok() {
-            std::fs::rename(&partial, &path).ok();
+            if let Err(e) = std::fs::rename(&partial, &path) {
+                log::warn!("graph disk cache: {} not stored: {e}", path.display());
+            }
         }
     }
 
@@ -3400,6 +3398,12 @@ impl Checker {
 
     /// The graph a program parses to (for describing its experiments), or the empty graph.
     pub fn graph(&self, program: &Program) -> Graph {
-        Graph::parse(program, &self.weights).unwrap_or_else(|_| Graph::empty())
+        match Graph::parse(program, &self.weights) {
+            Ok(graph) => graph,
+            Err(e) => {
+                log::info!("graph: an invalid program is described as the empty graph: {e}");
+                Graph::empty()
+            }
+        }
     }
 }

@@ -1,3 +1,4 @@
+#![cfg(test)]
 //! The graph checker's site operations (interchange's `SiteOp`, `graph::Interventions`) on the tiny
 //! export (#2951): identical for `M` and a program that declares every piece, and equal to `M`'s
 //! own weight edits and donor runs where those define the same experiment.
@@ -184,7 +185,7 @@ fn manifest_experiments_load() {
     assert_eq!(units.pool, vec![SiteDraw { family: Family::Zero, ops: vec![SiteOp { site: SharedSite::Head(3), operation: Operation::Scale(0), onward: true }], position: 7, length: 512 }]);
     assert_eq!(units.typical.get(&SharedSite::Stream(0)), Some(&2.5));
     assert_eq!(units.directions, interchange::seeded_directions(interchange::DIRECTIONS, 8, 1));
-    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(&dir).expect("the test directory is removed");
 }
 
 /// The behavior's half of the draws depends on the seed alone: two programs face the same
@@ -263,7 +264,7 @@ fn typical_norms_cover_every_site_and_manifests_round_trip() {
     assert_eq!(read.typical, written.typical);
     assert_eq!(read.directions, written.directions);
     assert!(read.pool.iter().all(|d| d.length == 64 && !d.ops.is_empty()));
-    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(&dir).expect("the test directory is removed");
 }
 
 #[test]
@@ -320,22 +321,21 @@ fn batch_scores_equal_single_scores() {
     assert!(batch[0].0.exec_error_bits / batch[0].0.n < 1e-9, "the full program is M");
 }
 
-/// With `GRAPH_DISK_CACHE` set, a second checker of the same behavior reads `M`'s outcomes from
-/// the first one's files and scores the same.
+/// Given a disk cache (`Checker::disk_cache`), a second checker of the same behavior reads `M`'s
+/// outcomes from the first one's files and scores the same.
 #[test]
 fn the_disk_cache_serves_a_second_checker() {
     let (weights, sequences) = model("graph_sites_disk");
     let dir = std::env::temp_dir().join(format!("graph_sites_disk_{}", std::process::id()));
-    // SAFETY: the variable is read by checkers this test makes; tests that read it run nowhere else.
-    unsafe { std::env::set_var("GRAPH_DISK_CACHE", &dir) };
     let mut first = Checker::new(weights.clone(), behavior(&sequences)).expect("checker");
+    first.disk_cache = Some(dir.clone());
     let (a, _) = first.score(&Program { model: "tiny".into(), valid: true, ..Program::default() }, 12, 4, true, None).expect("score");
     let files = std::fs::read_dir(&dir).map(|d| d.flatten().flat_map(|e| std::fs::read_dir(e.path()).into_iter().flatten()).count()).unwrap_or(0);
     let mut second = Checker::new(weights, behavior(&sequences)).expect("checker");
+    second.disk_cache = Some(dir.clone());
     let (b, _) = second.score(&Program { model: "tiny".into(), valid: true, ..Program::default() }, 12, 4, true, None).expect("score");
-    unsafe { std::env::remove_var("GRAPH_DISK_CACHE") };
-    std::fs::remove_dir_all(&dir).ok();
     assert!(files > 0, "no outcome written");
+    std::fs::remove_dir_all(&dir).expect("the cache directory is removed");
     assert_eq!(a.exec_error_bits, b.exec_error_bits);
 }
 

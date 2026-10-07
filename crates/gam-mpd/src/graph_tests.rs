@@ -1,3 +1,4 @@
+#![cfg(test)]
 //! The graph checker against the library's own runs of `M` on the tiny export (#2951).
 use crate::{
     graph::{Batch, Behavior, Checker, EdgeIr, Experiment, Graph, Index, NodeIr, PieceIr, Program, Prompt, Stats, WeightEdit, Weights, execute, kl_bits, reference},

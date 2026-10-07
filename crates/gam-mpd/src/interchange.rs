@@ -72,6 +72,7 @@ use crate::{
     resident_causal_fit::fixed_head_target::{Head, ResidentHead, Target},
     run_check::LayerNodes,
 };
+use gam_gpu::gpu_error::GpuError;
 use gam_gpu::tensor::{Arithmetic, ColumnBlocks, Device, Op, RowNorm, Storage, Tensor};
 use gam_runtime::resource::{Governed, MemoryGovernor};
 use rand::RngExt;
@@ -485,7 +486,6 @@ pub fn seeded_directions(count: usize, width: usize, seed: u64) -> Vec<Vec<f64>>
 /// ([`Interchange::draw_ops`]), over the shared sites `shared` (ascending), `head_blocks` each
 /// head's block, `typical` the sites' typical norms, `directions` pushed directions and `blocks`
 /// blocks: what a model outside an [`Interchange`] (the graph checker, `graph`) draws from.
-#[allow(clippy::too_many_arguments)]
 pub fn draw_site_ops(rng: &mut impl RngExt, family: Family, length: usize, shared: &[SharedSite], head_blocks: &[usize], typical: &BTreeMap<SharedSite, f64>, directions: usize, blocks: usize) -> Result<(Patch, usize), String> {
     let sites: Vec<SharedSite> = shared
         .iter()
@@ -641,9 +641,14 @@ struct CutReads {
 }
 
 /// The device a cut computes on: float64 where the backend holds it, so `y = s + b − a` and the
-/// norm round as the host's float64 arithmetic did, each sum and product once.
-fn wide(d: &Device) -> Device {
-    d.with_storage(Storage::F64).unwrap_or_else(|_| d.clone())
+/// norm round as the host's float64 arithmetic did, each sum and product once. The Apple GPU holds
+/// no float64 tensors (`Device::with_storage`): there the cut computes in its own f32.
+fn wide(d: &Device) -> Result<Device, String> {
+    match d.with_storage(Storage::F64) {
+        Ok(wide) => Ok(wide),
+        Err(GpuError::NoDeviceKernel { .. }) => Ok(d.clone()),
+        Err(e) => Err(error(e)),
+    }
 }
 
 /// Per cut of `cuts` (in order) its record's base (`role` 0) or donor (1) value, or with `tangent`
@@ -1294,7 +1299,7 @@ impl Edits {
             // y = s + b − a per cut (`s` the stream entering the block, `b` and `a` the site's donor
             // and base values) and N(y), in float64: each sum and product rounded once, in the
             // host's order, so the rows are its values bit for bit.
-            let wide = wide(d);
+            let wide = wide(d)?;
             let width = value_of(c.norm.entry)?.cols();
             let mut y = wide.convert(&rows_of(value_of(c.norm.entry)?, &at)?).map_err(error)?;
             wide.axpy(&mut y, 1.0, &stacked(&wide, recorded, &c.rows, (1, false), width)?).map_err(error)?;
@@ -1345,7 +1350,7 @@ impl Edits {
             let at: Vec<usize> = c.rows.iter().map(|r| r.0).collect();
             // dy = ds + t₁ − t₀ (zero where no tangent reached the entering stream or a site) and
             // N's tangent at y, in float64 on the device as the forward's.
-            let wide = wide(d);
+            let wide = wide(d)?;
             let mut dy = match dv.get(c.norm.entry).and_then(Option::as_ref) {
                 Some(ds) => wide.convert(&rows_of(ds, &at)?).map_err(error)?,
                 None => wide.zeros(at.len(), width).map_err(error)?,
@@ -1375,7 +1380,7 @@ impl Edits {
             let recorded = self.recorded.as_ref().ok_or_else(|| error("a cut outside a plan"))?;
             let at: Vec<usize> = c.rows.iter().map(|r| r.0).collect();
             // N's pullback of the read rows' cotangent at y, in float64 on the device.
-            let wide = wide(d);
+            let wide = wide(d)?;
             let w = wide.convert(&d.gather_ranges(g, &single(at.iter().copied())).map_err(error)?).map_err(error)?;
             let kept = c.kept.borrow();
             let y = kept.as_ref().ok_or_else(|| error("a cut's reverse before its forward"))?;
@@ -1391,7 +1396,7 @@ impl Edits {
             let recorded = self.recorded.as_ref().ok_or_else(|| error("a cut outside a plan"))?;
             // The donor's value takes the carried cotangent and the base's its negation (a product
             // by −1, exact), in float64, rounded once into the cotangent's storage.
-            let wide = wide(d);
+            let wide = wide(d)?;
             let mut taken: BTreeMap<usize, Tensor> = BTreeMap::new();
             let mut added = wide.zeros(probes.len(), g.cols()).map_err(error)?;
             let negated = wide.upload_vec(1, g.cols(), vec![-1.0; g.cols()]).map_err(error)?;

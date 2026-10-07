@@ -24,6 +24,10 @@
 //!   "families": [...]}`: an immutable manifest of site operations for a model without one
 //!   (`graph::SiteUnits::write_manifest` on the export's first token rows), made the pool.
 //! * `{"op": "quit"}`.
+//!
+//! Command line: `--cache-gib G` sets each checker's budget of `M`'s cached outcomes
+//! (`Checker::cache_bytes`, 4 GiB by default) and `--disk-cache DIR` its disk cache, shared by
+//! every checker process given the same directory (`Checker::disk_cache`, none by default).
 use gam_gpu::tensor::Device;
 use gam_mpd::{
     engine::log_to_stderr,
@@ -39,6 +43,28 @@ use std::path::Path;
 
 fn error(e: impl std::fmt::Display) -> String {
     e.to_string()
+}
+
+/// The checkers' caches from the command line (module note).
+#[derive(Default)]
+struct Caches {
+    bytes: Option<usize>,
+    disk: Option<std::path::PathBuf>,
+}
+
+impl Caches {
+    fn parse(mut args: impl Iterator<Item = String>) -> Result<Self, String> {
+        let mut caches = Self::default();
+        while let Some(flag) = args.next() {
+            let value = args.next().ok_or_else(|| format!("{flag} without its value"))?;
+            match flag.as_str() {
+                "--cache-gib" => caches.bytes = Some((value.parse::<f64>().map_err(error)? * f64::from(1u32 << 30)) as usize),
+                "--disk-cache" => caches.disk = Some(value.into()),
+                _ => return Err(format!("unknown flag {flag} (--cache-gib G, --disk-cache DIR)")),
+            }
+        }
+        Ok(caches)
+    }
 }
 
 fn load(export: &Path) -> Result<Weights, String> {
@@ -166,7 +192,7 @@ fn manifest(request: &Value, export: &Path) -> Option<std::path::PathBuf> {
         Some(Value::Null) => None,
         Some(Value::String(path)) => Some(path.into()),
         _ => {
-            let home = std::path::PathBuf::from(std::env::var("HOME").ok()?);
+            let home = std::env::home_dir()?;
             let name = export.file_name()?.to_string_lossy().into_owned();
             let default = if name == "vpd4l" { home.join("mpd-data/compare/manifest/MANIFEST_vpd4l_s1.json") } else { home.join(format!("mpd-data/graph_oracle/experiments/MANIFEST_{name}_s1.json")) };
             default.exists().then_some(default)
@@ -174,7 +200,7 @@ fn manifest(request: &Value, export: &Path) -> Option<std::path::PathBuf> {
     }
 }
 
-fn handle(request: &Value, weights: &mut Option<Weights>, checker: &mut Option<Checker>, export: &mut Option<std::path::PathBuf>) -> Result<Value, String> {
+fn handle(request: &Value, weights: &mut Option<Weights>, checker: &mut Option<Checker>, export: &mut Option<std::path::PathBuf>, caches: &Caches) -> Result<Value, String> {
     match request["op"].as_str().ok_or("an op")? {
         "load" => {
             let path = request["export"].as_str().ok_or("export")?;
@@ -204,6 +230,10 @@ fn handle(request: &Value, weights: &mut Option<Weights>, checker: &mut Option<C
             };
             let (id, prompts) = (behavior.id.clone(), behavior.prompts.len());
             let mut c = Checker::new(w, behavior)?;
+            if let Some(bytes) = caches.bytes {
+                c.cache_bytes = bytes;
+            }
+            c.disk_cache = caches.disk.clone();
             if let Some(u) = units {
                 c.sites = u;
             }
@@ -274,6 +304,7 @@ fn handle(request: &Value, weights: &mut Option<Weights>, checker: &mut Option<C
 
 fn main() -> Result<(), String> {
     log_to_stderr();
+    let caches = Caches::parse(std::env::args().skip(1))?;
     let (mut weights, mut checker, mut export) = (None, None, None);
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
@@ -284,7 +315,7 @@ fn main() -> Result<(), String> {
         }
         let answer = match serde_json::from_str::<Value>(&line) {
             Ok(request) if request["op"] == "quit" => break,
-            Ok(request) => handle(&request, &mut weights, &mut checker, &mut export).unwrap_or_else(|e| json!({"ok": false, "error": e})),
+            Ok(request) => handle(&request, &mut weights, &mut checker, &mut export, &caches).unwrap_or_else(|e| json!({"ok": false, "error": e})),
             Err(e) => json!({"ok": false, "error": e.to_string()}),
         };
         writeln!(stdout, "{answer}").map_err(error)?;
