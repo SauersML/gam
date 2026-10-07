@@ -649,3 +649,69 @@ fn device_path_on_a_qwen3_like_model_is_the_host_run() {
         assert!(kl < 1e-9, "{name}: KL(host ‖ device) = {kl:e} bits");
     }
 }
+
+#[test]
+fn attend_rules_pick_their_positions() {
+    use crate::graph::{HeadRule, TokenExpr};
+    let tokens = [7u32, 3, 5, 7, 3, 9];
+    let offset = HeadRule::Offset(1).pattern(&tokens);
+    assert!(offset[[0, 0]] == 1.0 && (1..6).all(|t| offset[[t, t - 1]] == 1.0));
+    let first = HeadRule::First.pattern(&tokens);
+    assert!((0..6).all(|t| first[[t, 0]] == 1.0));
+    // Induction: attend to the position after an earlier copy of the current token.
+    let induction = HeadRule::Match { query: TokenExpr::Tokens, key: TokenExpr::Shift(Box::new(TokenExpr::Tokens), 1) }.pattern(&tokens);
+    assert_eq!(induction[[3, 1]], 1.0, "7 at 3 attends to the token after the 7 at 0");
+    assert_eq!(induction[[4, 2]], 1.0, "3 at 4 attends to the token after the 3 at 1");
+    assert_eq!(induction[[5, 0]], 1.0, "9 has no earlier copy: position 0");
+    let parsed = HeadRule::parse(&serde_json::json!({"op": "attend", "query": {"op": "tokens"}, "key": {"op": "shift", "arg": {"op": "tokens"}, "by": 1}})).expect("parse");
+    assert_eq!(parsed.pattern(&tokens), induction);
+}
+
+#[test]
+fn a_ruled_node_attends_by_its_rule_with_its_own_value_and_output() {
+    let f = fixture("graph_rule");
+    let library = Library::new(&f.device, &f.device, &f.native, &f.layers, &f.artifact, 1 << 28, 64).expect("library");
+    let weights = Weights::of(&library);
+    let mut program = full_program();
+    let a1 = program.nodes.iter().position(|n| n.id == "a1").expect("a1");
+    program.nodes[a1].rule = Some(serde_json::json!({"op": "attend", "offset": 1}));
+    // Edges into a ruled node reach only its value.
+    program.edges.retain(|e| !(e.to == "a1" && e.route != "value"));
+    let graph = Graph::parse(&program, &weights).expect("parse");
+    let batch = Batch::new(&f.sequences).expect("batch");
+    let rows: Vec<usize> = (0..batch.tokens.len()).collect();
+    let run = execute(&weights, &graph.program(&weights, true), &batch, &rows, &BTreeMap::new()).expect("execute");
+    // Independently: layer 1's heads read A v, v their value maps on the normed stream entering
+    // layer 1 (the model's own run), A the previous-token pattern.
+    let stream = library.run(&f.sequences, &BTreeMap::new()).expect("run").streams[2].clone();
+    let lw = &weights.layers[1];
+    let mut x_hat = stream.clone();
+    for mut row in x_hat.outer_iter_mut() {
+        let r = crate::operator_program::rms_scale(row.view(), lw.attention.epsilon);
+        row.zip_mut_with(&lw.attention.gain, |v, g| *v *= r * g);
+    }
+    let length = f.sequences[0].len();
+    let a = crate::graph::HeadRule::Offset(1).pattern(&f.sequences[0]);
+    let mut replace = BTreeMap::new();
+    for (h, w) in lw.heads.iter().enumerate() {
+        let v = x_hat.dot(&w.value.t());
+        let mut z = ndarray::Array2::<f64>::zeros(v.dim());
+        for s in 0..f.sequences.len() {
+            let span = s * length..(s + 1) * length;
+            z.slice_mut(ndarray::s![span.clone(), ..]).assign(&a.dot(&v.slice(ndarray::s![span, ..])));
+        }
+        replace.insert(weights.layers[0].heads.len() + h, z);
+    }
+    let expected = library.log_probabilities(&library.run(&f.sequences, &replace).expect("patched").last).expect("log p");
+    let kl = max(&kl_bits(&expected, &run.log_probabilities));
+    assert!(kl < 1e-9, "KL(rule computed by hand ‖ ruled node) = {kl:e} bits");
+    // M ignores the rule; query and key routes into a ruled node are refused; it prices no query or key.
+    let model = execute(&weights, &graph.model(&weights), &batch, &rows, &BTreeMap::new()).expect("model");
+    let clean = library.log_probabilities(&library.run(&f.sequences, &BTreeMap::new()).expect("run").last).expect("log p");
+    assert!(max(&kl_bits(&clean, &model.log_probabilities)) < 1e-9);
+    let mut bad = program.clone();
+    bad.edges.push(EdgeIr { from: "embed".into(), to: "a1".into(), route: "key".into() });
+    assert!(Graph::parse(&bad, &weights).is_err());
+    let unruled = Graph::parse(&full_program(), &weights).expect("full");
+    assert!(graph.opaque_numbers(&weights) < unruled.opaque_numbers(&weights));
+}

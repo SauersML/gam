@@ -644,6 +644,8 @@ pub struct Unit {
     /// For a VPD MLP block: the units of its site whose `c_fc` writes its `down_proj` subcomponents
     /// read (the hidden pre-activation; the rest at their counterfactual values).
     pub hidden: Incoming,
+    /// A program node's rule (its heads' attention pattern); none in `M`.
+    pub rule: Option<HeadRule>,
 }
 
 /// A program or `M` as units in site order of computation plus the logits' input. The program's
@@ -670,10 +672,93 @@ impl Circuit {
 pub struct Graph {
     pub ids: Vec<String>,
     pub blocks: Vec<Block>,
+    /// Per node its rule (v2, `mech.attend`), heads only.
+    pub rules: Vec<Option<HeadRule>>,
     pub edges: Vec<(Writer, Option<usize>, Route)>,
     /// Edges within one MLP site, (writer node, reader node): `c_fc` subcomponents to `down_proj`
     /// subcomponents through the hidden pre-activation.
     pub internal: Vec<(usize, usize)>,
+}
+
+/// A rule for a node of native heads (design.txt section 5, "Rules"): the heads attend uniformly to
+/// the positions `j ≤ t` the rule picks, to position 0 when it picks none, in place of their query
+/// and key; value and output stay the model's own.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HeadRule {
+    /// `j = t − k`.
+    Offset(usize),
+    /// Every `j < t` with `key(j) == query(t)`.
+    Match { query: TokenExpr, key: TokenExpr },
+    /// `j = 0`.
+    First,
+}
+
+/// A token expression of a match rule: the tokens, or an expression read `k` positions earlier.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TokenExpr {
+    Tokens,
+    Shift(Box<TokenExpr>, usize),
+}
+
+impl TokenExpr {
+    fn parse(v: &serde_json::Value) -> Result<Self, String> {
+        match v.get("op").and_then(serde_json::Value::as_str) {
+            Some("tokens") => Ok(Self::Tokens),
+            Some("shift") => {
+                let by = v.get("by").and_then(serde_json::Value::as_u64).ok_or("shift: a whole number of positions \"by\"")?;
+                Ok(Self::Shift(Box::new(Self::parse(v.get("arg").ok_or("shift: an \"arg\"")?)?), by as usize))
+            }
+            _ => Err(format!("token expression {v}: tokens or shift")),
+        }
+    }
+
+    /// The expression's value at position `t` of `tokens` (none before the sequence starts).
+    fn at(&self, tokens: &[u32], t: usize) -> Option<u32> {
+        match self {
+            Self::Tokens => tokens.get(t).copied(),
+            Self::Shift(e, k) => t.checked_sub(*k).and_then(|u| e.at(tokens, u)),
+        }
+    }
+}
+
+impl HeadRule {
+    pub fn parse(v: &serde_json::Value) -> Result<Self, String> {
+        if v.get("op").and_then(serde_json::Value::as_str) != Some("attend") {
+            return Err(format!("rule {v}: only attend rules"));
+        }
+        if let Some(k) = v.get("offset") {
+            return Ok(Self::Offset(k.as_u64().ok_or("attend: a whole-number offset")? as usize));
+        }
+        if v.get("first").and_then(serde_json::Value::as_bool) == Some(true) {
+            return Ok(Self::First);
+        }
+        match (v.get("query"), v.get("key")) {
+            (Some(q), Some(k)) => Ok(Self::Match { query: TokenExpr::parse(q)?, key: TokenExpr::parse(k)? }),
+            _ => Err(format!("attend rule {v}: offset, first, or query and key")),
+        }
+    }
+
+    /// The attention weights over one sequence of `tokens` (positions × positions).
+    pub fn pattern(&self, tokens: &[u32]) -> Array2<f64> {
+        let n = tokens.len();
+        let mut a = Array2::<f64>::zeros((n, n));
+        for t in 0..n {
+            let picked: Vec<usize> = match self {
+                Self::Offset(k) => t.checked_sub(*k).into_iter().collect(),
+                Self::First => vec![0],
+                Self::Match { query, key } => match query.at(tokens, t) {
+                    Some(q) => (0..t).filter(|&j| key.at(tokens, j) == Some(q)).collect(),
+                    None => Vec::new(),
+                },
+            };
+            let picked = if picked.is_empty() { vec![0] } else { picked };
+            let w = 1.0 / picked.len() as f64;
+            for j in picked {
+                a[[t, j]] = w;
+            }
+        }
+        a
+    }
 }
 
 /// A VPD matrix's subcomponents `index` names ([`indices`]), or with "rest" its remainder
@@ -713,6 +798,7 @@ impl Graph {
         let layers = weights.layers.len();
         let mut ids = Vec::new();
         let mut blocks = Vec::new();
+        let mut rules: Vec<Option<HeadRule>> = Vec::new();
         let mut owned: BTreeSet<(usize, bool, usize)> = BTreeSet::new();
         let mut featured: BTreeSet<(usize, usize)> = BTreeSet::new();
         let mut sliced: BTreeSet<(usize, usize, usize)> = BTreeSet::new();
@@ -721,9 +807,10 @@ impl Graph {
             if node.id == "embed" || node.id == "logits" || ids.contains(&node.id) {
                 return Err(format!("node id {} is reserved or repeated", node.id));
             }
-            if node.rule.as_ref().is_some_and(|r| !r.is_null()) {
-                return Err(format!("{}: rules are not executed yet", node.id));
-            }
+            let rule = match node.rule.as_ref().filter(|r| !r.is_null()) {
+                Some(r) => Some(HeadRule::parse(r).map_err(|e| format!("{}: {e}", node.id))?),
+                None => None,
+            };
             let mut block: Option<Block> = None;
             for piece in &node.pieces {
                 if piece.layer >= layers {
@@ -888,8 +975,12 @@ impl Graph {
             if block.is_empty() {
                 return Err(format!("{}: a node of no pieces", node.id));
             }
+            if rule.is_some() && !matches!(block, Block::Heads { .. }) {
+                return Err(format!("{}: only a node of native heads carries a rule", node.id));
+            }
             ids.push(node.id.clone());
             blocks.push(block);
+            rules.push(rule);
         }
         let final_site = 2 * layers;
         let mut edges = Vec::new();
@@ -927,7 +1018,8 @@ impl Graph {
             {
                 return Err(format!("edge {} >> {}: the writer does not write the residual stream before the reader reads", e.from, e.to));
             }
-            let routes: Vec<Route> = reader.map_or(vec![Route::Input], |r| blocks[r].reads());
+            // A ruled node reads only its value.
+            let routes: Vec<Route> = reader.map_or(vec![Route::Input], |r| if rules[r].is_some() { vec![Route::Value] } else { blocks[r].reads() });
             if routes.is_empty() {
                 return Err(format!("edge {} >> {}: the reader's subcomponents read only their site's own stream (down_proj, o_proj)", e.from, e.to));
             }
@@ -945,12 +1037,12 @@ impl Graph {
         if let Some(other) = program.standin.as_deref().filter(|s| *s != "counterfactual") {
             return Err(format!("stand-in {other}: undeclared pieces carry their values on the counterfactual (the average stand-ins were deleted)"));
         }
-        Ok(Self { ids, blocks, edges, internal })
+        Ok(Self { ids, blocks, rules, edges, internal })
     }
 
     /// The empty program: every piece a stand-in.
     pub fn empty() -> Self {
-        Self { ids: Vec::new(), blocks: Vec::new(), edges: Vec::new(), internal: Vec::new() }
+        Self { ids: Vec::new(), blocks: Vec::new(), rules: Vec::new(), edges: Vec::new(), internal: Vec::new() }
     }
 
     /// Every piece of `weights` not in a node, per site: the heads of each layer, then its neurons.
@@ -1040,10 +1132,10 @@ impl Graph {
                 }
                 // A node reads its own c_fc subcomponents; others' through declared same-site edges.
                 let hidden = if edges { Incoming::Only(self.internal.iter().filter(|(_, r)| *r == n).map(|(w, _)| Writer::Unit(*w)).chain([Writer::Unit(n)]).collect()) } else { Incoming::all() };
-                Unit { block: block.clone(), computes: true, routes, hidden }
+                Unit { block: block.clone(), computes: true, routes, hidden, rule: self.rules.get(n).cloned().flatten() }
             })
             .collect();
-        units.extend(self.complement(weights).into_iter().map(|block| Unit { block, computes: false, routes: [Incoming::all(), Incoming::all(), Incoming::all()], hidden: Incoming::all() }));
+        units.extend(self.complement(weights).into_iter().map(|block| Unit { block, computes: false, routes: [Incoming::all(), Incoming::all(), Incoming::all()], hidden: Incoming::all(), rule: None }));
         Circuit { units, logits: routed(None, Route::Input), nodes: self.blocks.len() }
     }
 
@@ -1053,6 +1145,7 @@ impl Graph {
         let mut circuit = self.program(weights, false);
         for unit in &mut circuit.units {
             unit.computes = true;
+            unit.rule = None;
         }
         circuit
     }
@@ -1065,8 +1158,20 @@ impl Graph {
     pub fn opaque_numbers(&self, weights: &Weights) -> usize {
         let d = weights.width();
         let mut count = 0;
-        for block in &self.blocks {
+        for (n, block) in self.blocks.iter().enumerate() {
             match block {
+                // A ruled node uses its heads' value and output weights only.
+                Block::Heads { layer, heads } if self.rules.get(n).is_some_and(Option::is_some) => {
+                    let all = &weights.layers[*layer].heads;
+                    let mut values: Vec<usize> = Vec::new();
+                    for &h in heads {
+                        count += all[h].output.len();
+                        if !values.iter().any(|&k| all[k].value == all[h].value) {
+                            values.push(h);
+                            count += all[h].value.len();
+                        }
+                    }
+                }
                 Block::Heads { layer, heads } => {
                     let all = &weights.layers[*layer].heads;
                     let mut keys: Vec<usize> = Vec::new();
@@ -1289,7 +1394,7 @@ fn project(x: &Array2<f64>, map: &Array2<f64>, norm: Option<&(Array1<f64>, f64)>
 
 /// Heads `heads` of `layer` on their query, key and value inputs (residual streams), `normed`
 /// applied to each normed input (route slot, value); with `capture`, each head's read as well.
-fn heads_write(layer: &LayerWeights, heads: &[usize], inputs: [&Array2<f64>; 3], spans: &[(usize, usize)], blocks: &[Vec<[usize; 4]>], capture: bool, normed: &mut dyn FnMut(usize, &mut Array2<f64>)) -> (Array2<f64>, Vec<Array2<f64>>) {
+fn heads_write(layer: &LayerWeights, heads: &[usize], inputs: [&Array2<f64>; 3], (spans, tokens, rule): (&[(usize, usize)], &[u32], Option<&HeadRule>), blocks: &[Vec<[usize; 4]>], capture: bool, normed: &mut dyn FnMut(usize, &mut Array2<f64>)) -> (Array2<f64>, Vec<Array2<f64>>) {
     let norm = &layer.attention;
     let (mut q_hat, mut k_hat, mut v_hat) = (norm.apply(inputs[0]), norm.apply(inputs[1]), norm.apply(inputs[2]));
     normed(0, &mut q_hat);
@@ -1305,9 +1410,14 @@ fn heads_write(layer: &LayerWeights, heads: &[usize], inputs: [&Array2<f64>; 3],
         for (n, &(start, length)) in spans.iter().enumerate() {
             let positions: Vec<u32> = (0..length as u32).collect();
             let span = start..start + length;
-            let (qs, ks) = (q.slice(s![span.clone(), ..]).to_owned(), k.slice(s![span.clone(), ..]).to_owned());
-            let (qs, ks) = (rotate(&qs, w.rotary, &positions, false), rotate(&ks, w.rotary, &positions, false));
-            let mut a = probabilities(qs.view(), ks.view(), &positions, 0, w.scale, w.causal);
+            let mut a = match rule {
+                Some(r) => r.pattern(&tokens[span.clone()]),
+                None => {
+                    let (qs, ks) = (q.slice(s![span.clone(), ..]).to_owned(), k.slice(s![span.clone(), ..]).to_owned());
+                    let (qs, ks) = (rotate(&qs, w.rotary, &positions, false), rotate(&ks, w.rotary, &positions, false));
+                    probabilities(qs.view(), ks.view(), &positions, 0, w.scale, w.causal)
+                }
+            };
             if let Some(b) = blocks.get(n).filter(|b| !b.is_empty()) {
                 block_attention(&mut a, b);
             }
@@ -1630,7 +1740,7 @@ fn run(weights: &Weights, circuit: &Circuit, batch: &Batch, scored: &[usize], sw
             let mut normed = |slot: usize, x: &mut Array2<f64>| ops.normed(site, u, slot, x, &mut normed_kept);
             let write = match &unit.block {
                 Block::Heads { layer, heads } => {
-                    let (w, reads) = heads_write(&weights.layers[*layer], heads, [&inputs[0], &inputs[1], &inputs[2]], &batch.spans, &batch.blocks, capture, &mut normed);
+                    let (w, reads) = heads_write(&weights.layers[*layer], heads, [&inputs[0], &inputs[1], &inputs[2]], (&batch.spans, &batch.tokens, unit.rule.as_ref()), &batch.blocks, capture, &mut normed);
                     if let Some(c) = captured.as_mut() {
                         for (h, z) in heads.iter().zip(reads) {
                             c.reads[*layer][*h] = z;
@@ -3693,7 +3803,7 @@ impl Checker {
             let mut chosen = Vec::with_capacity(graph.blocks.len());
             for (k, block) in graph.blocks.iter().enumerate() {
                 let bits = self.width(block, n)?;
-                let numbers = Graph { ids: vec![String::new()], blocks: vec![block.clone()], edges: Vec::new(), internal: Vec::new() }.opaque_numbers(&self.weights);
+                let numbers = Graph { ids: vec![String::new()], blocks: vec![block.clone()], rules: vec![graph.rules.get(k).cloned().flatten()], edges: Vec::new(), internal: Vec::new() }.opaque_numbers(&self.weights);
                 let scales = quantized_rows(&self.weights, block);
                 chosen.push(Width { node: graph.ids.get(k).cloned().unwrap_or_default(), bits, numbers, scales: if bits.is_some() { scales } else { 0 }, cost_bits: width_cost(numbers, scales, bits, n) });
             }
@@ -3981,7 +4091,7 @@ impl Checker {
         if let Some(b) = self.widths.get(&key) {
             return Ok(*b);
         }
-        let numbers = Graph { ids: vec![String::new()], blocks: vec![block.clone()], edges: Vec::new(), internal: Vec::new() }.opaque_numbers(&self.weights);
+        let numbers = Graph { ids: vec![String::new()], blocks: vec![block.clone()], rules: vec![None], edges: Vec::new(), internal: Vec::new() }.opaque_numbers(&self.weights);
         let scales = quantized_rows(&self.weights, block);
         let mut best = (None, width_cost(numbers, scales, None, n));
         if quantizes(block) {
@@ -3991,7 +4101,7 @@ impl Checker {
             }
             let graph = Graph::empty();
             let model = if matches!(block, Block::Features { .. }) {
-                Graph { ids: vec![String::new()], blocks: vec![block.clone()], edges: Vec::new(), internal: Vec::new() }.program(&self.weights, false)
+                Graph { ids: vec![String::new()], blocks: vec![block.clone()], rules: vec![None], edges: Vec::new(), internal: Vec::new() }.program(&self.weights, false)
             } else {
                 graph.model(&self.weights)
             };
