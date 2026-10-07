@@ -468,6 +468,35 @@ fn an_interchange_loaded_with_p_scores_as_the_host_reference() {
     }
 }
 
+/// `M`'s prefixes kept across scorings (`PrefixStore`, made by `keep_targets`): the hybrids whose
+/// first blocks are `M`'s keep their rows after those blocks at the first scoring, and a second
+/// scoring that restores them gives the bits and the gradients of a scoring that keeps nothing,
+/// bit for bit.
+#[test]
+fn kept_prefixes_score_as_the_runs_they_replace() {
+    let f = fixture();
+    let device = Device::host();
+    let (program, _) = fixture_sized(D, VOCAB, LENGTH, 6);
+    let native = split_sites(&program).expect("split");
+    let layers = layer_nodes(&native, LAYERS).expect("layers");
+    let explanation = Artifact::native(&native).expect("native artifact");
+    let mut x = Interchange::new(&device, &native, &layers, &explanation, &f.trainable, f.variables.clone(), usize::MAX, 5).expect("interchange");
+    let loaded: Vec<Array2<f64>> = f.trainable.iter().map(|op| f.p.flat.operators[*op].matrix()).collect();
+    x.load(&loaded).expect("load");
+    let experiments = experiments(&f);
+    let plain = x.evaluate(&f.batch, &experiments, true).expect("evaluate");
+    x.keep_targets(gam_runtime::resource::MemoryGovernor::global());
+    let first = x.evaluate(&f.batch, &experiments, true).expect("evaluate");
+    assert!(x.kept_prefixes() > 0, "the hybrids opening with M's blocks keep their prefixes");
+    let second = x.evaluate(&f.batch, &experiments, true).expect("evaluate");
+    let bits = |s: &super::interchange::Scored| s.bits.iter().flatten().map(|b| b.to_bits()).collect::<Vec<_>>();
+    let gradients = |s: &super::interchange::Scored| s.gradient.iter().flat_map(|g| g.iter().map(|v| v.to_bits())).collect::<Vec<_>>();
+    for (name, scored) in [("keeping", &first), ("restoring", &second)] {
+        assert_eq!(bits(scored), bits(&plain), "bits {name}");
+        assert_eq!(gradients(scored), gradients(&plain), "gradients {name}");
+    }
+}
+
 /// The starting library of the tiny export `dir` (`library_mdl::explanation`) under the native
 /// questions: its values sit at its rules' nodes (`Artifact::owners`), not at `M`'s, yet every
 /// patched experiment scores zero, since the library computes what `M` computes, while each patch

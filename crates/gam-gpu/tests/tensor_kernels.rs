@@ -768,3 +768,25 @@ fn overlapped_uploads_are_the_uploads() {
         assert_eq!(down(&d, &overlapped), down(&d, &plain), "upload {i} of {rows}x{cols}");
     }
 }
+
+/// `gemm_onto` (CUDA f32: cublasLt with an addend of its own) against the addend's copy and `gemm`
+/// with β = 1, in f32 and bfloat16, each operand as stored or transposed: equal within the products'
+/// rounding (the two may run different algorithms).
+#[test]
+fn products_onto_an_addend_are_the_copy_and_product() {
+    let Some(wide) = accelerator().filter(|_| cfg!(target_os = "linux")) else { return };
+    let d = wide.with_storage(gam_gpu::tensor::Storage::F32).expect("CUDA holds f32");
+    let (m, k, n) = (37, 70, 29);
+    for arithmetic in [Arithmetic::F32, Arithmetic::Bf16] {
+        for (ta, tb) in [(Op::N, Op::N), (Op::N, Op::T), (Op::T, Op::N), (Op::T, Op::T)] {
+            let shape = |op: Op, rows: usize, cols: usize| if op == Op::N { (rows, cols) } else { (cols, rows) };
+            let ((ar, ac), (br, bc)) = (shape(ta, m, k), shape(tb, k, n));
+            let (a, b, c) = (up(&d, &matrix(ar, ac, 51, 1.0)), up(&d, &matrix(br, bc, 52, 1.0)), up(&d, &matrix(m, n, 53, 1.0)));
+            let onto = d.gemm_onto(0.75, (&a, ta), (&b, tb), &c, arithmetic).unwrap();
+            let mut expected = d.scaled(1.0, &c).unwrap();
+            d.gemm(&mut expected, 0.75, &a, ta, &b, tb, 1.0, arithmetic).unwrap();
+            let off = (&down(&d, &onto) - &down(&d, &expected)).iter().fold(0.0_f64, |most, v| most.max(v.abs()));
+            assert!(off <= 1e-4 * k as f64, "{arithmetic:?} {ta:?} {tb:?}: off by {off}");
+        }
+    }
+}
