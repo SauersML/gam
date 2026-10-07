@@ -4,7 +4,8 @@ the measured answers of generate.py's causal questions about the target model (Q
 Example = the question text, then "<answer>\n", then the answer text and the end-of-text token; the loss
 is the answer tokens' negative log-likelihood (the question tokens are context only). Batches draw a
 question type uniformly, then a question of that type (the mixture over types), so rare and common types
-train equally. LoRA: every linear map of every block (q, k, v, o, gate, up, down), W x + (alpha / r) B A x,
+train equally; within a type, --changed-share of the draws come from the questions whose measured answer
+differs from no change (most edits of single pieces move M by under 0.1 bits). LoRA: every linear map of every block (q, k, v, o, gate, up, down), W x + (alpha / r) B A x,
 A Gaussian (std 1 / r), B zero, adapters in float32 over the bfloat16 model; AdamW, linear warmup, then
 constant.
 
@@ -72,6 +73,18 @@ def load(pattern):
     return by_type
 
 
+def changed(q) -> bool:
+    """Whether the measured answer differs from no change: KL above 0.1 bits (the largest of a rank
+    question's four), or a continuation that differs from the clean one."""
+    n = q["numbers"]
+    if "kl_bits" in n:
+        v = n["kl_bits"]
+        return (max(v) if isinstance(v, list) else v) > 0.1
+    if "tokens_unchanged" in n:
+        return n["tokens_unchanged"] < len(n["edited_ids"])
+    return True
+
+
 def encode(tok, q, max_tokens):
     prompt = tok(q["input"] + SEP, add_special_tokens=False)["input_ids"]
     answer = tok(q["answer"], add_special_tokens=False)["input_ids"] + [tok.eos_token_id]
@@ -137,6 +150,8 @@ def main():
     ap.add_argument("--alpha", type=float, default=32.0)
     ap.add_argument("--eval-per-type", type=int, default=128)
     ap.add_argument("--hours", type=float, default=1.8)
+    ap.add_argument("--changed-share", type=float, default=0.5,
+                    help="share of each type's draws taken from its questions whose measured answer differs from no change")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -155,8 +170,9 @@ def main():
     params = [p for a in adapters.values() for p in (a.A, a.B)]
     train, heldout = load(args.train), load(args.heldout)
     types = sorted(train)
+    moved = {k: [q for q in v if changed(q)] for k, v in train.items()}
     log = open(out / "train.jsonl", "a")
-    meta = {"args": vars(args), "train_questions": {k: len(v) for k, v in train.items()}, "heldout_questions": {k: len(v) for k, v in heldout.items()},
+    meta = {"args": vars(args), "train_questions": {k: len(v) for k, v in train.items()}, "changed_questions": {k: len(v) for k, v in moved.items()}, "heldout_questions": {k: len(v) for k, v in heldout.items()},
             "adapter_parameters": sum(p.numel() for p in params)}
     (out / "meta.json").write_text(json.dumps(meta, indent=1))
     print(json.dumps(meta), flush=True)
@@ -181,7 +197,11 @@ def main():
             print(json.dumps({"stopped_for_time_at_step": step}), flush=True)
             break
         model.train()
-        items = [random.choice(train[random.choice(types)]) for _ in range(args.batch)]
+        items = []
+        for _ in range(args.batch):
+            kind = random.choice(types)
+            pool = moved[kind] if moved[kind] and random.random() < args.changed_share else train[kind]
+            items.append(random.choice(pool))
         ids, labels, mask = collate(tok, items, args.max_tokens, dev)
         bits, n = answer_bits(model, ids, labels, mask)
         loss = bits.sum() / n.sum() * math.log(2)  # nats per answer token
