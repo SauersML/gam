@@ -146,6 +146,31 @@ pub struct DevicePosterior {
     /// ([`DevicePosterior::step`], [`DevicePosterior::revert`]): the iterate and its average
     /// before the move, and the move's change of the prior's divergence at the iterate in nats.
     pending: Option<Pending>,
+    /// Per prior group its block of the line step's record ([`BLOCKS`], by the group's name; none
+    /// for a posterior made from parts alone).
+    blocks: Vec<usize>,
+}
+
+/// The blocks of parameters the step's record splits its curvature ratio over ([`block_of`]).
+const BLOCKS: [&str; 6] = ["thresholds", "widths", "directions", "reads", "writes", "other"];
+
+/// A prior group's block by its name: a gate's thresholds or widths, a direction gate's row, a
+/// slice's or a function's read, its write.
+fn block_of(name: &str) -> usize {
+    let last = name.rsplit('.').next().unwrap_or("");
+    if last == "thresholds" || last.ends_with("_bias") {
+        0
+    } else if last == "widths" {
+        1
+    } else if last.strip_prefix('g').is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit())) {
+        2
+    } else if last == "read" || last == "gate" || last == "up" {
+        3
+    } else if last == "write" || last == "out" {
+        4
+    } else {
+        5
+    }
 }
 
 /// A step's move awaiting its test ([`DevicePosterior::pending`]).
@@ -203,7 +228,9 @@ impl DevicePosterior {
             count: explanation.groups.len(),
             reference: Some(posterior.references()),
         };
-        Self::from_parts(fitting, &parts, tokens, moments, steps)
+        let mut out = Self::from_parts(fitting, &parts, tokens, moments, steps)?;
+        out.blocks = explanation.groups.iter().map(|g| block_of(&g.name)).collect();
+        Ok(out)
     }
 
     /// The posterior of the trainable operators `parts.operators` of a program, each entry in group
@@ -313,6 +340,7 @@ impl DevicePosterior {
             steps,
             uploaded: Vec::new(),
             pending: None,
+            blocks: Vec::new(),
         };
         out.average = out.mean.iter().map(|m| out.fitting.copy(m).map_err(error)).collect::<Result<_, _>>()?;
         out.refresh()?;
@@ -533,6 +561,22 @@ impl DevicePosterior {
             let diagonal: f64 = column(2).iter().sum();
             let prior_curvature = weighted(column(0));
             let (fresh, own): (f64, f64) = (column(3).iter().sum(), column(4).iter().sum());
+            // The draw's curvature ratio within each block (its own `c (u·d_B)² / Σ_B h d²`, the
+            // block's share of the diagonal beside it), to find which parameters set the step.
+            if self.blocks.len() == terms.nrows() && diagonal > 0.0 {
+                let mut by = [[0.0_f64; 2]; BLOCKS.len()];
+                for (g, &b) in self.blocks.iter().enumerate() {
+                    by[b][0] += terms[[g, 1]];
+                    by[b][1] += terms[[g, 2]];
+                }
+                let text: Vec<String> = BLOCKS
+                    .iter()
+                    .zip(&by)
+                    .filter(|(_, v)| v[1] > 0.0)
+                    .map(|(name, v)| format!("{name} {:.3e} ({:.1}% of Σ h d²)", factor.1 * v[0] * v[0] / v[1], 100.0 * v[1] / diagonal))
+                    .collect();
+                log::info!("library line step draw by block: {}", text.join(", "));
+            }
             if diagonal > 0.0 {
                 self.rho_steps += 1;
                 let w = (1.0 / self.rho_steps as f64).max(1.0 - ivon.beta2);
