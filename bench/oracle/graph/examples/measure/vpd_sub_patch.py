@@ -85,7 +85,7 @@ class Runner:
 
 
 @torch.no_grad()
-def measure(run: Runner, beh: dict) -> dict:
+def measure(run: Runner, beh: dict, blocks_measured: tuple[str, ...] = ("attn", "mlp")) -> dict:
     t, dev = run.t, run.dev
     prompts = [p for p in beh["prompts"] if p.get("counterfactual")]
     T = max(len(p["token_ids"]) for p in prompts)
@@ -116,7 +116,7 @@ def measure(run: Runner, beh: dict) -> dict:
     base = kl(run.forward(entering[0], 0, {}, None, rows, cols), 1).item()
     recovery = {}
     for l in range(t.n_layer):
-        for kind in ATTN + MLP:
+        for kind in (ATTN if "attn" in blocks_measured else ()) + (MLP if "mlp" in blocks_measured else ()):
             U, V = run.uv[site_name(l, kind)]
             change = ((clean[(l, kind)] - cfrec[(l, kind)]) @ V).abs().sum((0, 1)) * U.norm(dim=1)
             candidates = torch.argsort(change, descending=True)[:CANDIDATES].tolist()
@@ -132,7 +132,7 @@ def measure(run: Runner, beh: dict) -> dict:
     price = {k: (d + (m if k in MLP else d)) * 0.5 * math.log2(N) / N for k in ATTN + MLP}
     blocks = {}
     for l in range(t.n_layer):
-        for name, kinds in (("attn", ATTN), ("mlp", MLP)):
+        for name, kinds in [(b, ATTN if b == "attn" else MLP) for b in blocks_measured]:
             ranked = sorted(((recovery[f"{l}.{k}"][i], k, i) for k in kinds for i in range(len(recovery[f"{l}.{k}"]))),
                             reverse=True)
             curve, k = [], 1
@@ -299,6 +299,7 @@ def main():
     ap.add_argument("behaviors", nargs="+", type=Path)
     ap.add_argument("--programs", type=Path)
     ap.add_argument("--library", action="store_true", help="measure decomp's library parts instead")
+    ap.add_argument("--blocks", default="attn,mlp", help="which blocks' subcomponents to measure (attn, mlp)")
     a = ap.parse_args()
     a.out_dir.mkdir(parents=True, exist_ok=True)
     run = Runner()
@@ -313,7 +314,7 @@ def main():
             if a.programs:
                 (a.programs / f"vpd4l_{beh['id'].replace('.', '_')}_lib.py").write_text(library_program(table, beh))
             continue
-        table = measure(run, beh)
+        table = measure(run, beh, tuple(a.blocks.split(",")))
         (a.out_dir / f"vpdpatch_{beh['id']}.json").write_text(json.dumps(table))
         print(beh["id"], "base", round(table["base_bits"], 3),
               {k: (b["best"]["k"], round(b["best"]["total"], 2)) for k, b in table["blocks"].items()}, flush=True)
