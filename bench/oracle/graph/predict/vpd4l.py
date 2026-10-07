@@ -57,6 +57,7 @@ class Vpd4l:
         self.tok = Tok(tokenizer)
         t = self.t
         self.L, self.H, self.hd, self.d = t.n_layer, t.n_head, t.hd, t.wte.shape[1]
+        self.vocab = t.wte.shape[0]
         self.KV, self.Fn = self.H, t.site("h.0.mlp.c_fc").W.shape[0]
         self.Wo = [t.site(f"h.{l}.attn.o_proj").W.view(self.d, self.H, self.hd) for l in range(self.L)]
         d = load_file(str(uv))

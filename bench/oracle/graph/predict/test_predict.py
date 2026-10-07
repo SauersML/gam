@@ -247,3 +247,13 @@ def test_cut_with_the_text_as_its_own_counterfactual_changes_nothing(qwen):
     rec_cf = {"write_requests": {r: c[:3] for r, c in iv.cuts.items()}}
     qwen.forward(other, None, rec_cf)
     assert (qwen.log_probs(qwen.forward(t, iv, None, rec_cf)) - clean).abs().max().item() > 1e-4
+
+
+def test_eval_kl_reads_the_targets_own_tokens():
+    """vpd4l and Qwen3 tokenizers differ: eval_kl takes the target's decoded tokens and vocabulary from the record."""
+    q = {"model": "vpd4l", "vocab": 50277, "numbers": {"edited": {"ids": [11, 12], "p": [0.6, 0.3], "tokens": [" the", " a"]}}}
+    assert eval_kl.target_tokens(q, "edited", tok=None) == [" the", " a"]
+    with pytest.raises(ValueError):
+        eval_kl.target_tokens({"model": "vpd4l", "numbers": {"edited": {"ids": [11], "p": [1.0]}}}, "edited", tok=None)
+    answer = eval_kl.read_answer('" the" 0.60 | " a" 0.30 | other 0.10')
+    assert eval_kl.kl_bits([" the", " a"], [0.6, 0.3], answer, 50277) < 1e-9

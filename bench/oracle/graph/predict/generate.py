@@ -130,6 +130,7 @@ class Qwen3:
         c = self.model.config
         self.L, self.H, self.KV, self.hd, self.Fn, self.d = c.num_hidden_layers, c.num_attention_heads, c.num_key_value_heads, c.head_dim, c.intermediate_size, c.hidden_size
         self.Wo = [layer.self_attn.o_proj.weight.view(self.d, self.H, self.hd) for layer in self.layers]
+        self.vocab = self.model.config.vocab_size  # the target's output size (eval_kl spreads "other" over it)
         self.name = {1024: "qwen3-0.6b", 2048: "qwen3-1.7b", 2560: "qwen3-4b", 4096: "qwen3-8b"}.get(self.d, f"qwen3-d{self.d}")
         self.tc = {}  # layer -> transcoder tensors (bfloat16 as stored)
 
@@ -372,7 +373,8 @@ class Writer:
         ids, ps = top.indices.tolist(), top.values.tolist()
         parts = [f"{self.token(t)} {q:.2f}" for t, q in zip(ids[:TOP], ps[:TOP])]
         parts.append(f"other {max(0.0, 1.0 - sum(ps[:TOP])):.2f}")
-        return " | ".join(parts), {"ids": ids, "p": [round(q, 6) for q in ps]}
+        # The tokens as the target's own tokenizer writes them, so a reader with another tokenizer can match them.
+        return " | ".join(parts), {"ids": ids, "p": [round(q, 6) for q in ps], "tokens": [json.loads(self.token(t)) for t in ids]}
 
 
 def kl_bits(lp_clean: torch.Tensor, lp_edit: torch.Tensor) -> torch.Tensor:
@@ -551,7 +553,7 @@ def batch_questions(m: Qwen3, w: Writer, draw: Draw, tokens: torch.Tensor, sourc
     rows = list(range(B))
 
     def emit(row, kind, inp, ans, numbers):
-        out.append({"model": m.name, "type": kind, "source": source, "split": split, "piece_split": draw.split, "text_id": ids[row],
+        out.append({"model": m.name, "vocab": m.vocab, "type": kind, "source": source, "split": split, "piece_split": draw.split, "text_id": ids[row],
                     "input": f"<model> {m.name}\n" + inp, "answer": ans, "numbers": numbers})
 
     # Probes for the where questions: a neuron or a head per text.

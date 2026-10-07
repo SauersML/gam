@@ -32,7 +32,18 @@ from sft import load, prompt_text, wrap
 
 TYPES = ("plain", "edit", "cut", "prompt", "swap")
 BINS = ((0.0, 0.01), (0.01, 0.1), (0.1, 1.0), (1.0, float("inf")))  # sizes of the measured change KL(M || M_e), bits
-V = 151936
+QWEN3_VOCAB = 151936  # older shards carry neither "vocab" nor decoded tokens; they are all Qwen3 targets
+
+
+def target_tokens(q, which, tok):
+    """The target's top tokens as its own tokenizer writes them: stored with the measurement, or (older Qwen3
+    shards only, whose tokenizer the Qwen3 oracle shares) decoded from the ids."""
+    n = q["numbers"][which]
+    if "tokens" in n:
+        return n["tokens"]
+    if not q["model"].startswith("qwen3"):
+        raise ValueError(f"{q['model']} question without decoded target tokens: regenerate it (generate.py stores them)")
+    return [tok.decode([i]) for i in n["ids"]]
 
 
 def read_answer(text: str):
@@ -60,8 +71,8 @@ def read_answer(text: str):
     return {k: v / total for k, v in listed.items()}, other / total
 
 
-def kl_bits(measured_strs, measured_p, answer) -> float:
-    """KL(M_e || Q) over M_e's top 5 tokens and the rest, in bits."""
+def kl_bits(measured_strs, measured_p, answer, V: int = QWEN3_VOCAB) -> float:
+    """KL(M_e || Q) over M_e's top 5 tokens and the rest, in bits (V = the target's output size)."""
     top = list(zip(measured_strs[:5], measured_p[:5]))
     rest = max(1e-12, 1.0 - sum(p for _, p in top))
     if answer is None:
@@ -101,15 +112,15 @@ def score_set(model, tok, heldout, args, dev, name):
             texts = tok.batch_decode(gen[:, enc["input_ids"].shape[1] :], skip_special_tokens=True)
             for q, text in zip(chunk, texts):
                 n = q["numbers"]["edited"]
-                strs = [tok.decode([i]) for i in n["ids"]]
-                ours.append(kl_bits(strs, n["p"], read_answer(text)))
+                strs, V = target_tokens(q, "edited", tok), q.get("vocab", QWEN3_VOCAB)
+                ours.append(kl_bits(strs, n["p"], read_answer(text), V))
                 # Per question, for effect-size strata: the measured change, both scores and the answer written.
                 records.append({"set": name, "type": kind, "text_id": q["text_id"], "measured_kl_bits": q["numbers"].get("kl_bits"),
                                 "oracle_kl_bits": ours[-1], "answer": text})
                 if "clean" in q["numbers"]:
                     c = q["numbers"]["clean"]
-                    clean_answer = ({tok.decode([i]): p for i, p in zip(c["ids"][:5], c["p"][:5])}, max(0.0, 1.0 - sum(c["p"][:5])))
-                    ref.append(kl_bits(strs, n["p"], clean_answer))
+                    clean_answer = (dict(zip(target_tokens(q, "clean", tok)[:5], c["p"][:5])), max(0.0, 1.0 - sum(c["p"][:5])))
+                    ref.append(kl_bits(strs, n["p"], clean_answer, V))
                     records[-1]["no_change_kl_bits"] = ref[-1]
         mean = sum(ours) / len(ours)
         se = (sum((x - mean) ** 2 for x in ours) / max(1, len(ours) - 1) / len(ours)) ** 0.5
