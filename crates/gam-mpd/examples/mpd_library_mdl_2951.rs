@@ -659,7 +659,7 @@ fn edit_faithfulness(
             }
             let mean = |key: &str| searches.iter().filter_map(|r| r[key].as_f64()).sum::<f64>() / searches.len().max(1) as f64;
             Some(json!({
-                "random_bits_per_token": mean("random_bits_per_token"), "adversarial_bits_per_token": mean("adversarial_bits_per_token"),
+                "clean_bits_per_token": mean("clean_bits_per_token"), "random_bits_per_token": mean("random_bits_per_token"), "adversarial_bits_per_token": mean("adversarial_bits_per_token"),
                 "effect_bits_per_token": mean("effect_bits_per_token"), "searches": searches,
             }))
         }
@@ -807,7 +807,8 @@ type Found = (Vec<Value>, Vec<(usize, interchange::SharedSite, usize, Vec<f64>)>
 /// differences along `probes` random tangent directions `u` (`θ` turned by ±0.05 rad toward `u`),
 /// then `θ` turns toward the estimated gradient by the best of π/16, π/8, π/4 and π/2, kept only
 /// where it raises the gap. Every candidate is one experiment of a batch, scored by
-/// `Interchange::evaluate`, so each step's gradient comes through both models' own runs.
+/// `Interchange::evaluate`, so each step's gradient comes through both models' own runs. Each
+/// record also gives `P`'s clean error over the same rows, which every gap includes.
 fn adversarial_search(experiments: &mut interchange::Interchange, rows: &[Vec<u32>], family: &AdversarialSettings, seed: u64, blocks: usize) -> Result<Found, String> {
     use rand::RngExt;
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed ^ 0x4144_5645_5253);
@@ -844,6 +845,10 @@ fn adversarial_search(experiments: &mut interchange::Interchange, rows: &[Vec<u3
                 .collect();
             Ok(experiments.evaluate(&batch, &drawn, false)?.bits.iter().map(|b| b.iter().sum::<f64>() / b.len().max(1) as f64).collect())
         };
+        // P's clean error over the same rows, which every push's gap includes.
+        let unpatched = interchange::Experiment { base: 0, source: 0, explained: vec![true; blocks], patch: None, position: 0 };
+        let clean = experiments.evaluate(&batch, &[unpatched], false)?.bits[0][position..].to_vec();
+        let clean = clean.iter().sum::<f64>() / clean.len().max(1) as f64;
         let mut theta = unit(normal(&mut rng));
         let mut current = score(experiments, vec![theta.clone()])?[0];
         let start = current;
@@ -879,7 +884,7 @@ fn adversarial_search(experiments: &mut interchange::Interchange, rows: &[Vec<u3
             path.push(current);
         }
         log::info!("edits: adversarial search {search}: {start:.4} → {current:.4} bits per token at {site:?}, row {position}");
-        records.push(json!({"sequence": sequence, "site": site, "position": position, "random_bits_per_token": start, "adversarial_bits_per_token": current, "path": path}));
+        records.push(json!({"sequence": sequence, "site": site, "position": position, "clean_bits_per_token": clean, "random_bits_per_token": start, "adversarial_bits_per_token": current, "path": path}));
         finals.push((sequence, site, position, theta));
     }
     Ok((records, finals))
