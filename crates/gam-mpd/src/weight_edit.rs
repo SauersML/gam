@@ -316,8 +316,10 @@ mod tests {
 
     /// Tied weights: the embedding `wte` (read again, transposed, by the readout) and the key map
     /// the two query heads of layer 1 share (one owner per head, one operator of P). Each model
-    /// computes with the edited matrix at every use, and the exact copy scores 0 (1e-9) while the
-    /// edits move `M`.
+    /// computes with the edited matrix at every use, and the exact copy scores 0 (1e-9). The key
+    /// map's edit moves `M`; the embedding's changes the readout the two models share, so `P` left
+    /// unedited is no longer comparable (the experiments refuse two heads), and `P` holds `M`'s one
+    /// edited operator instead.
     #[test]
     fn an_edit_of_a_tied_weight_reaches_every_use() {
         let s = setup("weight_edit_tied");
@@ -329,8 +331,14 @@ mod tests {
             let compiled = compile(&s.native, &s.explanation.artifact, &edit).expect("compiles").expect("applicable");
             let edited = bits(&s, &compiled.model, &compiled.explanation);
             assert!(edited.abs() <= 1e-9, "{name}: the exact copy scores {edited} bits under the edit");
-            let ignored = bits(&s, &compiled.model, &s.explanation.artifact);
-            assert!(ignored > 1e-4, "{name}: the edit moves M ({ignored})");
+            if name == "wte" {
+                let (m, p) = (named(&compiled.model, &name).unwrap().unwrap(), named(&compiled.explanation.program, &name).unwrap().unwrap());
+                assert!(Arc::ptr_eq(&compiled.model.operators[m], &compiled.explanation.program.operators[p]), "P holds M's edited embedding");
+                assert!(every_node(&compiled.model).filter(|n| matches!(n, Node::Transposed { operator, .. } if *operator == m) || matches!(n, Node::Affine { terms, .. } if terms.iter().any(|t| t.1 == m))).count() == 2, "M reads the embedding twice");
+            } else {
+                let ignored = bits(&s, &compiled.model, &s.explanation.artifact);
+                assert!(ignored > 1e-4, "{name}: the edit moves M ({ignored})");
+            }
         }
     }
 
