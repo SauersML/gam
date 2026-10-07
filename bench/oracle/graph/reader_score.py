@@ -15,17 +15,22 @@ over the K candidates and "other".
 
 Reader prompt (the reader's chat template, thinking off):
   system     SYSTEM
-  user       INSTRUCTIONS, the program text in a python block, then the item: the experiment in words, the
-             text M reads, M's clean candidates with their clean probabilities and the clean rest
-  assistant  the text M reads, verbatim; the answer slot is the position after it
+  user       INSTRUCTIONS, the program text in a python block, then the item: the experiment in words, M's
+             clean candidates with their clean probabilities and the clean rest
+  assistant  the text M reads, verbatim and unmarked (so the reader's natural continuation is the answer);
+             the answer slot is the position after it
 The reader's probability of a candidate is its probability of continuing the text with that candidate.
 The program part comes first, so vLLM's prefix cache shares it across the program's items.
 - Qwen3 targets share the reader's tokenizer: the text is M's own token ids and every candidate is one
   reader token, so the candidates are disjoint and q(other) = 1 - sum q(candidates) exactly.
-- Other targets (vpd4l): the text and the candidates' strings are encoded with the reader's tokenizer. A
-  candidate whose reader tokens extend another candidate's tokens is a sub-event of it, so
-  q(a) = P(a's tokens) - sum over the nearest candidates b extending a of P(b's tokens); the candidates are
-  then disjoint events of the reader's continuation and q(other) is the reader's remaining mass.
+- Other targets (vpd4l): the text is encoded with the reader's tokenizer and a candidate is the event that
+  the reader's continuation text starts with the candidate's string s. With the transformers backend,
+  P(s) = the reader's probability of every first token whose string starts with s, plus, when the reader's
+  own tokens of s are several, the probability of that token sequence (other splits of s are left out).
+  With vLLM (no whole distribution), P(s) = the probability of the reader's own tokens of s alone, which
+  misses first tokens longer than s ("PACKAGE" for the candidate "PACK"). A candidate whose event
+  contains another's (s a prefix of s') gets q(s) = P(s) - sum over the nearest such s' of P(s'); the
+  candidates are then disjoint and q(other) is the reader's remaining mass.
 q(other) and corrected candidates are floored at K * 2^-24, the rounding scale of a sum of K float32
 probabilities (vLLM returns float32 log-probabilities).
 
@@ -82,14 +87,11 @@ Program:
 
 ITEM = """Experiment: {words}
 
-The target model reads this text (between <<< and >>>):
-<<<{text}>>>
-
-Without the experiment, the target model's most probable next tokens are (each token as a JSON string, so spaces and newlines are explicit, then its probability):
+Without the experiment, the target model's most probable next tokens after the text of your reply are (each token as a JSON string, so spaces and newlines are explicit, then its probability):
 {listing}
 every other token: {other:.3g}
 
-Reply with the text exactly as written between the markers, then continue it with one more token: the next token of the target model under the experiment, chosen with the probabilities the target model gives the tokens."""
+Your reply begins with the text the target model reads. Continue that text with one token: the target model's next token under the experiment, drawn with the probabilities the target model gives the tokens."""
 
 
 def piece_name(p: dict) -> str:
@@ -179,7 +181,7 @@ class Prompter:
 
     def item(self, it: dict) -> list[int]:
         listing = "\n".join(f"{json.dumps(c['text'], ensure_ascii=False)} {c['clean']:.3g}" for c in it["candidates"])
-        user = ITEM.format(words=words(it["experiment"]), text=it["text"], listing=listing, other=it["clean_other"])
+        user = ITEM.format(words=words(it["experiment"]), listing=listing, other=it["clean_other"])
         text = list(it["token_ids"]) if self.shared else self.enc(it["text"])
         return self.enc(user) + self.enc(self.mid) + text
 
@@ -189,21 +191,19 @@ class Prompter:
         return [self.enc(c["text"]) for c in it["candidates"]]
 
 
-def disjoint(cands: list[list[int]], log_p: list[float]) -> np.ndarray:
-    """q per candidate: P(its tokens) minus P of the nearest candidates whose tokens extend its tokens.
-    Candidates with the same reader tokens are one event of the reader, shared equally between them."""
-    lp = dict(zip((tuple(c) for c in cands), log_p))
-    keys = list(lp)
-    p = {k: math.exp(v) for k, v in lp.items()}
+def disjoint(keys: list, p: list[float]) -> np.ndarray:
+    """q per candidate from P(event of its key), the event that the reader's continuation starts with the
+    key (a tuple of reader tokens or a string): P minus P of the nearest candidates whose keys extend the
+    key. Candidates with the same key are one event of the reader, shared equally between them."""
+    raw = dict(zip((k if isinstance(k, str) else tuple(k) for k in keys), (float(x) for x in p)))
     q = {}
-    for ka in keys:
-        ext = [kb for kb in keys if len(kb) > len(ka) and kb[: len(ka)] == ka]
+    for ka in raw:
+        ext = [kb for kb in raw if len(kb) > len(ka) and kb[: len(ka)] == ka]
         nearest = [kb for kb in ext if not any(len(kc) < len(kb) and kb[: len(kc)] == kc for kc in ext)]
-        q[ka] = p[ka] - sum(p[kb] for kb in nearest)
-    counts = {k: 0 for k in keys}
-    for c in cands:
-        counts[tuple(c)] += 1
-    return np.array([q[tuple(c)] / counts[tuple(c)] for c in cands])
+        q[ka] = raw[ka] - sum(raw[kb] for kb in nearest)
+    norm = [k if isinstance(k, str) else tuple(k) for k in keys]
+    counts = {k: norm.count(k) for k in raw}
+    return np.array([q[k] / counts[k] for k in norm])
 
 
 def kl_bits(p: np.ndarray, p_other: float, q: np.ndarray) -> float:
@@ -226,6 +226,27 @@ class Scorer:
         shared = target.lower().startswith("qwen3") and "qwen3" in backend.model_id.lower()
         self.prompter = Prompter(backend.tokenizer, shared)
         self.memo: dict[tuple[str, str], float] = {}
+        self._vocab = None
+
+    def vocabulary(self):
+        """The reader's token strings, and per candidate string the reader tokens whose string starts with
+        it (the continuation's first token then covers the whole candidate)."""
+        if self._vocab is None:
+            tok = self.backend.tokenizer
+            n = len(tok)
+
+            class Vocab:
+                ids = list(range(n))
+                strings = np.array([tok.decode([i]) for i in range(n)])
+                cache: dict[str, np.ndarray] = {}
+
+                def starting(self, t: str) -> np.ndarray:
+                    if t not in self.cache:
+                        self.cache[t] = np.nonzero(np.char.startswith(self.strings, t))[0]
+                    return self.cache[t]
+
+            self._vocab = Vocab()
+        return self._vocab
 
     @staticmethod
     def _key(text: str, it: dict) -> tuple[str, str]:
@@ -241,17 +262,25 @@ class Scorer:
             bodies = {b: pr.item(items[b]) for b in {b for _, b in todo}}
             cands = {b: pr.candidates(items[b]) for b in bodies}
             prompts = [prefixes[a] + bodies[b] for a, b in todo]
-            single = [[c[0] for c in cands[b] if len(c) == 1] for _, b in todo]
-            first = self.backend.next_log_probs(prompts, single)
+            aggregate = not pr.shared and self.backend.name == "transformers"
+            if aggregate:  # the reader's whole next-token distribution, for string events
+                vocab = self.vocabulary()
+                first = self.backend.next_log_probs(prompts, [vocab.ids] * len(prompts))
+            else:
+                first = self.backend.next_log_probs(prompts, [[c[0] for c in cands[b] if len(c) == 1] for _, b in todo])
             multi = [(j, k, c) for j, (_, b) in enumerate(todo) for k, c in enumerate(cands[b]) if len(c) > 1]
             longer = self.backend.token_log_probs([prompts[j] + c for j, _, c in multi], [list(range(len(prompts[j]), len(prompts[j]) + len(c))) for j, _, c in multi]) if multi else []
-            extra = {(j, k): float(lp.sum()) for (j, k, _), lp in zip(multi, longer)}
+            extra = {(j, k): math.exp(float(lp.sum())) for (j, k, _), lp in zip(multi, longer)}
             for j, (a, b) in enumerate(todo):
                 it = items[b]
-                lp, s = [], iter(first[j])
-                for k, c in enumerate(cands[b]):
-                    lp.append(float(next(s)) if len(c) == 1 else extra[(j, k)])
-                q = disjoint(cands[b], lp)
+                if aggregate:
+                    full = np.exp(first[j])
+                    strings = [c["text"] for c in it["candidates"]]
+                    raw = [(full[vocab.starting(t)].sum() + extra.get((j, k), 0.0)) if t else 0.0 for k, t in enumerate(strings)]
+                    q = disjoint(strings, raw)
+                else:
+                    s_ = iter(np.exp(first[j]))
+                    q = disjoint(cands[b], [float(next(s_)) if len(c) == 1 else extra[(j, k)] for k, c in enumerate(cands[b])])
                 p = np.array([c["p"] for c in it["candidates"]], dtype=np.float64)
                 self.memo[self._key(texts[a], it)] = kl_bits(p, float(it["other"]), q)
         for a, text in enumerate(texts):
