@@ -2402,6 +2402,6 @@ impl Library<'_> {
                 mlp: self.mlps.iter().find(|b| b.layer == l).map(|b| MlpWeights { gate: b.gate.clone(), bias: b.bias.clone(), up: b.up.as_ref().map(|(_, m)| m.clone()), up_bias: b.up_bias.clone(), out: b.out.clone(), law: b.law }),
             })
             .collect();
-        Weights { layers, final_norm: norm(&self.final_site), unembedding: self.unembedding.clone(), embedding: self.embedding.clone(), transcoders: BTreeMap::new() }
+        Weights { layers, final_norm: norm(&self.final_site), unembedding: self.unembedding.clone(), embedding: self.embedding.clone(), transcoders: BTreeMap::new(), vpd: BTreeMap::new() }
     }
 }
