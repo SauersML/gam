@@ -88,7 +88,9 @@ sliced = [] if os.environ.get('DESCENT_ARM') == 'rot' else attn
 tok = np.memmap(TOKENS, dtype=np.uint16 if TOKENS.endswith('.u16') else np.float64, mode='r').reshape(-1, 513)
 ev = torch.tensor(tok[1024:1032, :512].astype(np.int64), device=dev)
 # Training rows: DESCENT_TRAIN_ROWS rows of the file, skipping the held-out rows 1024..1031 (default 1024).
-train_rows, batch, seq = int(os.environ.get('DESCENT_TRAIN_ROWS', '1024')), 8, 256
+# DESCENT_BATCH sequences of DESCENT_SEQ tokens per step (default 8 x 256).
+train_rows = int(os.environ.get('DESCENT_TRAIN_ROWS', '1024'))
+batch, seq = int(os.environ.get('DESCENT_BATCH', '8')), int(os.environ.get('DESCENT_SEQ', '256'))
 # VPD's mean active (causal importance > 0) slices per token at each MLP map, rows 1024..1031,
 # from M's clean inputs (fitmath proto.log); 129 in total.
 # The VPD start's thresholds match VPD's per-map counts scaled down to the budget when the budget is
@@ -1093,13 +1095,14 @@ def install(edits):
             else:
                 state['wedits_P'].setdefault(n, []).append((b, *v))
 
-N_EDITS = int(os.environ.get('DESCENT_WEDITS', '0'))
-# DESCENT_ALLON=1: one sequence of every batch runs with every part's gate on and the leftover off,
-# against M (ties the parts' sum to M). DESCENT_LRM=1 (with DESCENT_RESID): one sequence runs the
+# DESCENT_WEDITS edited sequences per 8 of the batch (the same fraction at every batch size).
+N_EDITS = int(os.environ.get('DESCENT_WEDITS', '0')) * batch // 8
+# DESCENT_ALLON=1: one sequence per 8 of the batch runs with every part's gate on and the leftover off,
+# against M (ties the parts' sum to M). DESCENT_LRM=1 (with DESCENT_RESID): one sequence per 8 runs the
 # leftover-removal experiment, Delta W = -R on both models (M becomes its parts all on; P runs without
 # its leftover), tying P's sparse run to its own dense run.
-ALLON = int(os.environ.get('DESCENT_ALLON', '0') == '1')
-LRM = int(os.environ.get('DESCENT_LRM', '0') == '1' and RESID)
+ALLON = int(os.environ.get('DESCENT_ALLON', '0') == '1') * max(1, batch // 8)
+LRM = int(os.environ.get('DESCENT_LRM', '0') == '1' and RESID) * max(1, batch // 8)
 # Held-out weight edits: a fixed set, 4 per held-out sequence (32 in all), families in turn, seed 7.
 _g = np.random.default_rng(7)
 EVAL_EDITS = [(i, FAMILIES[(4 * i + k) % len(FAMILIES)]) for i in range(ev.shape[0]) for k in range(4)]
@@ -1502,8 +1505,9 @@ if ARM == 'rot':
 
 # Every trained tensor as (container, key, scale): Adam steps of 0.3% of the scale per step, the
 # scale a weight tensor's root mean square (a router G2 started at zero: its map's noise scale) and a
-# threshold's its map's noise scale x 33. DESCENT_LR multiplies every step size (default 1).
-LR = float(os.environ.get('DESCENT_LR', '1'))
+# threshold's its map's noise scale x 33. DESCENT_LR multiplies every step size (default 1), and every step
+# size scales with the square root of the tokens per step against 8 x 256 (the batch's gradient noise).
+LR = float(os.environ.get('DESCENT_LR', '1')) * math.sqrt(batch * seq / (8 * 256))
 rms = lambda q: q.detach().pow(2).mean().sqrt().item()
 # DESCENT_FREEZE=1: the slices stay as they start (M's own, for the neuron start) and only the gates
 # train, so every part on is M exactly at every step.
@@ -1726,10 +1730,10 @@ for step in range(steps):
     ids = torch.tensor(np.stack([tok[r, o:o + seq] for r, o in zip(rows, offs)]).astype(np.int64), device=dev)
     t_step = time.time()
     kinds = [draw_edit(g_edits, FAMILIES[(step * N_EDITS + b) % len(FAMILIES)]) if b < N_EDITS else None for b in range(batch)]
-    if ALLON:
-        kinds[N_EDITS] = 'allon'
-    if LRM:
-        kinds[N_EDITS + ALLON] = 'lrm'
+    for b in range(N_EDITS, N_EDITS + ALLON):
+        kinds[b] = 'allon'
+    for b in range(N_EDITS + ALLON, N_EDITS + ALLON + LRM):
+        kinds[b] = 'lrm'
     install(kinds)
     with torch.no_grad():
         lm = run(ids, 'M')
@@ -1739,8 +1743,8 @@ for step in range(steps):
         # at this step's parts (no gradient), and P runs the same sequence without its leftover.
         b_ = N_EDITS + ALLON
         with torch.no_grad():
-            install([None]); state['drop_leftover'] = True
-            lm = lm.index_copy(0, torch.tensor([b_], device=dev), run(ids[b_:b_ + 1], 'all'))
+            install([None] * LRM); state['drop_leftover'] = True
+            lm = lm.index_copy(0, torch.arange(b_, b_ + LRM, device=dev), run(ids[b_:b_ + LRM], 'all'))
             state['drop_leftover'] = False
         install(kinds)
     lp = run(ids, 'soft')
