@@ -657,11 +657,9 @@ for n in sliced: T.site(n)._forward = make_attn(n)
 # K of VPD's MLP subcomponents under the same rule (VPD's per-map counts times K / 129, each subcomponent at a
 # width of 1% of its tensor's root mean square, as ours start, plus its index).
 ROT, ROTG = {}, int(os.environ.get('DESCENT_ROT', '32'))
-# DESCENT_FAST_PERM=1 (speed): a layer's neuron permutation and its inverse are gathers whose backward is the
-# other permutation's gather, in place of indexing's backward, an accumulating scatter through a sort (on an
-# A40 49 of 167 ms of an MLP step's device time, 55 of 248 ms of a whole-model step's). The same values: each
-# gradient entry receives exactly one term.
-FAST_PERM = os.environ.get('DESCENT_FAST_PERM') == '1'
+# A layer's neuron permutation and its inverse are gathers whose backward is the other permutation's gather
+# (indexing's backward, an accumulating scatter through a sort, took 55 of 248 ms of a whole-model step's device
+# time on an A40).
 class _Permuted(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, idx, inv):
@@ -673,7 +671,7 @@ class _Permuted(torch.autograd.Function):
         return g.index_select(-1, inv), None, None
 def permuted(x, idx, inv):
     """x[..., idx] for a permutation idx with inverse inv."""
-    return _Permuted.apply(x, idx, inv) if FAST_PERM else x[..., idx]
+    return _Permuted.apply(x, idx, inv)
 if ARM == 'rot':
     if start != 'neuron' or os.environ.get('DESCENT_F') != '1':
         raise SystemExit('DESCENT_ARM=rot: the neuron start, F')
@@ -729,11 +727,11 @@ def rot_train_gate(hard, phi, z):
         return 0.5 * (1 + torch.erf(z / (a * SQ2)))
     return hard + phi - phi.detach()
 
-# DESCENT_ROT_BATCH=1 (speed): the bases Q of every group set (the MLP's and attention's) are computed in one
-# batched pass when the first is needed, and log2 of the number of blocks once per draw of the assignments, each
-# kept while the same tensors are installed unmodified: one host wait per pass in place of one per call
-# (rot_index_bits waited on every group set in each of its calls, 256 times per whole-model step).
-ROT_BATCH = os.environ.get('DESCENT_ROT_BATCH') == '1'
+# The bases Q of every group set (the MLP's and attention's) are computed in one batched pass when the first is
+# needed, and log2 of the number of blocks once per draw of the assignments, each kept while the same tensors are
+# installed unmodified: one host wait per pass. Every other product of the rot arm runs in full float32 (qeinsum):
+# under TF32's 10-bit mantissa the all-on pass drifted from M (9.0e-5 bits after 60 steps on the whole model,
+# 2.0e-6 in float32 at the same step time).
 _rot_memo = {}
 def rot_memo(key, tensors, make):
     """make(), kept while the same tensors (by identity, unmodified since) are installed."""
@@ -744,15 +742,10 @@ def rot_memo(key, tensors, make):
     _rot_memo[key] = (list(tensors), [t._version for t in tensors], out)
     return out
 
-def rot_Q_batched(A):
-    """rot_Q of every installed (or every posterior-mean) angle tensor in one pass, A's own; None if A is
-    neither."""
-    for name, As in (('installed', [R['A'] for R in ROT_ALL]), ('mean', [R['A_leaf'][0] for R in ROT_ALL if 'A_leaf' in R])):
-        at = [i for i, t in enumerate(As) if t is A]
-        if at:
-            key = (name, torch.is_grad_enabled(), torch.backends.cuda.matmul.allow_tf32)
-            return rot_memo(key, As, lambda: rot_Q_all(As))[at[0]]
-    return None
+def qeinsum(eq, *ops):
+    """torch.einsum in full float32."""
+    with full_float32():
+        return torch.einsum(eq, *ops)
 
 def rot_hi(A_):
     """The angles in float64 (float32 on MPS, which has none): in float32 the series and squarings drift off
@@ -781,27 +774,20 @@ def rot_Q_all(As):
 
 def rot_Q(R):
     """The groups' bases Q = exp(S), S the skew part of A's strict upper triangle (Taylor series after
-    scaling, then squaring: matrix products only, orthogonal to rounding)."""
-    if ROT_BATCH:
-        Q = rot_Q_batched(R['A'])
-        if Q is not None:
-            return Q
-    A_ = rot_hi(R['A'] * MASK)
-    S_ = A_ - A_.transpose(1, 2)
-    k = max(0, math.ceil(math.log2(max(S_.detach().abs().sum((1, 2)).max().item(), 1e-12) / 0.25)))
-    X_ = S_ / 2 ** k
-    E_ = torch.eye(ROTG, device=S_.device, dtype=S_.dtype).expand_as(S_) + X_; term = X_
-    for j in range(2, 10):
-        term = term @ X_ / j; E_ = E_ + term
-    for _ in range(k):
-        E_ = E_ @ E_
-    return E_.float()
+    scaling, then squaring: matrix products only, orthogonal to rounding), with every installed (or every
+    posterior-mean) angle tensor's in one pass."""
+    A = R['A']
+    for name, As in (('installed', [R_['A'] for R_ in ROT_ALL]), ('mean', [R_['A_leaf'][0] for R_ in ROT_ALL if 'A_leaf' in R_])):
+        at = [i for i, t in enumerate(As) if t is A]
+        if at:
+            return rot_memo((name, torch.is_grad_enabled()), As, lambda: rot_Q_all(As))[at[0]]
+    return rot_Q_all([A])[0]
 
 def rot_slice_bits(R, Q):
     """Per slice [ng, g]: its description in bits (dense read and write at its widths, its rotation angles' share)
     and its down write's norm ||W_dn,G Q_i||."""
     sf, sd = (2 * R['ls_fc']).exp(), (2 * R['ls_dn']).exp()
-    nf = torch.einsum('nki,nkm,nmi->ni', Q, R['Gfc'], Q); nd = torch.einsum('nki,nkm,nmi->ni', Q, R['Gdn'], Q)
+    nf = qeinsum('nki,nkm,nmi->ni', Q, R['Gfc'], Q); nd = qeinsum('nki,nkm,nmi->ni', Q, R['Gdn'], Q)
     di, do = R['di'], R['do']
     vf = (nf.sum() + di * sf.sum()) / (di * nf.numel()); vd = (nd.sum() + do * sd.sum()) / (do * nd.numel())
     bits = 0.5 * (di * torch.log(vf / sf) + (nf + di * sf) / vf - di) + 0.5 * (do * torch.log(vd / sd) + (nd + do * sd) / vd - do)
@@ -827,12 +813,9 @@ def rot_tau_bits(R):
 
 def rot_index_bits():
     """log2 of the number of blocks (MLP, OV and QK blocks with a slice or plane)."""
-    if ROT_BATCH:
-        Ls = [R['L'] for R in ROT_ALL]
-        return rot_memo('index', Ls, lambda: math.log2(max(2, int(torch.stack(
-            [(torch.zeros(L.shape[:2], device=dev).scatter_(1, L.argmax(-1), 1.0) > 0).sum() for L in Ls]).sum()))))
-    used = lambda L: int((torch.zeros(L.shape[:2], device=dev).scatter_(1, L.argmax(-1), 1.0) > 0).sum())
-    return math.log2(max(2, sum(used(R['L']) for R in ROT_ALL)))
+    Ls = [R['L'] for R in ROT_ALL]
+    return rot_memo('index', Ls, lambda: math.log2(max(2, int(torch.stack(
+        [(torch.zeros(L.shape[:2], device=dev).scatter_(1, L.argmax(-1), 1.0) > 0).sum() for L in Ls]).sum()))))
 
 def make_rot_fc(n, l):
     R = ROT[l]; W = T.site(n).W
@@ -847,7 +830,7 @@ def make_rot_fc(n, l):
                 sc = torch.ones(p.shape[-1], device=p.device); sc[G] = 1 + a
                 p = p.index_copy(0, torch.tensor([b], device=p.device), (p[b] * sc)[None])
         Q = rot_Q(R)
-        c = torch.einsum('...nk,nki->...ni', permuted(p, R['perm'], R['inv']).view(*sh, R['ng'], ROTG), Q)
+        c = qeinsum('...nk,nki->...ni', permuted(p, R['perm'], R['inv']).view(*sh, R['ng'], ROTG), Q)
         if state.get('noise'):
             eps = torch.randn(R['ng'] * ROTG, x.shape[-1], device=x.device)
             c = c + (x @ eps.T).view(*sh, R['ng'], ROTG) * R['ls_fc'].exp()
@@ -856,11 +839,11 @@ def make_rot_fc(n, l):
         else:
             bits_i, wn = rot_slice_bits(R, Q)
             abar = permuted(vpd_model.gelu_tanh(p), R['perm'], R['inv']).view(*sh, R['ng'], ROTG)
-            r = torch.einsum('...nk,nki->...ni', abar, Q).abs() * wn
+            r = qeinsum('...nk,nki->...ni', abar, Q).abs() * wn
             Lsm = torch.softmax(R['L'], -1)
             hot = F.one_hot(R['L'].argmax(-1), ROTG).float()
             M_ = hot if state['mode'] == 'hard' else Lsm
-            Rb = (torch.einsum('...ni,nij->...nj', r.pow(2), M_) + 1e-20).sqrt()
+            Rb = (qeinsum('...ni,nij->...nj', r.pow(2), M_) + 1e-20).sqrt()
             if state.get('calib') is not None:
                 state['calib'].setdefault(n, []).append(Rb.detach().reshape(-1))
             z = (Rb - R['tau']) / R['s']
@@ -868,17 +851,17 @@ def make_rot_fc(n, l):
             if state['force_on']:
                 on = torch.tensor(state['force_on'], device=z.device)
                 hard, phi = hard.index_fill(0, on, 1.0), phi.index_fill(0, on, 1.0)
-            Lj = torch.einsum('ni,nij->nj', bits_i, M_) + rot_tau_bits(R) + rot_index_bits()
+            Lj = qeinsum('ni,nij->nj', bits_i, M_) + rot_tau_bits(R) + rot_index_bits()
             state['hard'].append((hard * Lj).sum((-1, -2)).reshape(-1))
             state['rot_on'].append(hard.sum((-1, -2)).reshape(-1))
             if state['mode'] == 'hard':
-                gam = torch.einsum('...nj,nij->...ni', hard, hot)
+                gam = qeinsum('...nj,nij->...ni', hard, hot)
             else:
                 gb = rot_train_gate(hard, phi, z)
                 state['soft'].append((gb * Lj).sum((-1, -2)).reshape(-1))
-                gam = torch.einsum('...nj,nij->...ni', gb, Lsm)
+                gam = qeinsum('...nj,nij->...ni', gb, Lsm)
         state['rot'][l] = (gam, Q)
-        return permuted(torch.einsum('...ni,nki->...nk', c * gam, Q).reshape(*sh, -1), R['inv'], R['perm'])
+        return permuted(qeinsum('...ni,nki->...nk', c * gam, Q).reshape(*sh, -1), R['inv'], R['perm'])
     return fwd
 
 def make_rot_dn(n, l):
@@ -888,8 +871,8 @@ def make_rot_dn(n, l):
             return a @ W.T
         sh = a.shape[:-1]
         gam, Q = state['rot'][l]
-        c = torch.einsum('...nk,nki->...ni', permuted(a, R['perm'], R['inv']).view(*sh, R['ng'], ROTG), Q) * gam
-        z = permuted(torch.einsum('...ni,nki->...nk', c, Q).reshape(*sh, -1), R['inv'], R['perm'])
+        c = qeinsum('...nk,nki->...ni', permuted(a, R['perm'], R['inv']).view(*sh, R['ng'], ROTG), Q) * gam
+        z = permuted(qeinsum('...ni,nki->...nk', c, Q).reshape(*sh, -1), R['inv'], R['perm'])
         for b, kind, G, a_ in state['entry'].get(n, ()):
             if kind == 'in':
                 # down_proj columns G scaled by 1 + a, entry-wise in every slice's write.
@@ -945,7 +928,7 @@ ROT_ALL = list(ROT.values()) + [R[x] for R in ROTA.values() for x in ('q', 'k', 
 def rot_read_bits(R, Q):
     """Per q or k slice [ng, g]: its dense read's description and its angles' share, in bits."""
     s2 = (2 * R['ls']).exp(); d_ = R['di']
-    nr = torch.einsum('nki,nkm,nmi->ni', Q, R['G'], Q)
+    nr = qeinsum('nki,nkm,nmi->ni', Q, R['G'], Q)
     v = (nr.sum() + d_ * s2.sum()) / (d_ * nr.numel())
     return (0.5 * (d_ * torch.log(v / s2) + (nr + d_ * s2) / v - d_)) / math.log(2) + rot_angle_bits(R)
 
@@ -962,17 +945,17 @@ def rot_gate(Rb, R, Lj, hot, Lsm, calib_key):
     state['hard'].append((hard * Lj).sum((-1, -2)).reshape(-1))
     state['rot_on'].append(hard.sum((-1, -2)).reshape(-1))
     if state['mode'] == 'hard':
-        return torch.einsum('...nj,nij->...ni', hard, hot)
+        return qeinsum('...nj,nij->...ni', hard, hot)
     gb = rot_train_gate(hard, phi, z)
     state['soft'].append((gb * Lj).sum((-1, -2)).reshape(-1))
-    return torch.einsum('...nj,nij->...ni', gb, Lsm)
+    return qeinsum('...nj,nij->...ni', gb, Lsm)
 
 def rot_blocks(R, r, bits_i, calib_key):
     """The gates of R's slices from their reads r [B, T, ng, g] and their bits bits_i [ng, g]."""
     hot = F.one_hot(R['L'].argmax(-1), ROTG).float(); Lsm = torch.softmax(R['L'], -1)
     M_ = hot if state['mode'] == 'hard' else Lsm
-    Rb = (torch.einsum('btni,nij->btnj', r.pow(2), M_) + 1e-20).sqrt()
-    Lj = torch.einsum('ni,nij->nj', bits_i, M_) + rot_tau_bits(R) + rot_index_bits()
+    Rb = (qeinsum('btni,nij->btnj', r.pow(2), M_) + 1e-20).sqrt()
+    Lj = qeinsum('ni,nij->nj', bits_i, M_) + rot_tau_bits(R) + rot_index_bits()
     return rot_gate(Rb, R, Lj, hot, Lsm, calib_key)
 
 def rot_attention(i, h, causal):
@@ -983,12 +966,12 @@ def rot_attention(i, h, causal):
     grp = lambda t_: t_.view(B_, T_, -1, ROTG)
     q, k, v = site('q_proj')(h), site('k_proj')(h), site('v_proj')(h)
     Qq, Qk = rot_Q(Rq), rot_Q(Rk)
-    cq = torch.einsum('btnk,nki->btni', grp(q), Qq); ck = torch.einsum('btnk,nki->btni', grp(k), Qk)
+    cq = qeinsum('btnk,nki->btni', grp(q), Qq); ck = qeinsum('btnk,nki->btni', grp(k), Qk)
     if state.get('noise'):
         cq = cq + grp(h @ torch.randn(q.shape[-1], h.shape[-1], device=h.device).T) * Rq['ls'].exp()
         ck = ck + grp(h @ torch.randn(k.shape[-1], h.shape[-1], device=h.device).T) * Rk['ls'].exp()
     rope = lambda t_: T._rope(t_.view(B_, T_, NH, HD).transpose(1, 2), T_)
-    back = lambda c_, Q_: torch.einsum('btni,nki->btnk', c_, Q_).reshape(B_, T_, -1)
+    back = lambda c_, Q_: qeinsum('btni,nki->btnk', c_, Q_).reshape(B_, T_, -1)
     if state['mode'] != 'all':
         # The keys' per-coordinate variance over the attended keys, RoPE undone at the query: for plane c,
         # cov_rel = R_t^T cov_c(t) R_t; coordinate c (first of its plane) takes cov_rel[0, 0], c + HD/2 cov_rel[1, 1].
@@ -1003,14 +986,14 @@ def rot_attention(i, h, causal):
         d0 = co ** 2 * cv[..., 0, 0] + 2 * co * si * cv[..., 0, 1] + si ** 2 * cv[..., 1, 1]
         d1 = si ** 2 * cv[..., 0, 0] - 2 * co * si * cv[..., 0, 1] + co ** 2 * cv[..., 1, 1]
         D = torch.cat((d0, d1), -1).clamp_min(0).transpose(1, 2).reshape(B_, T_, -1, ROTG)     # [B, T, ng, g] by coordinate
-        rq = (cq.pow(2) * torch.einsum('btnk,nki->btni', D, Qq.pow(2)) / HD + 1e-20).sqrt()
+        rq = (cq.pow(2) * qeinsum('btnk,nki->btni', D, Qq.pow(2)) / HD + 1e-20).sqrt()
         cq = cq * rot_blocks(Rq, rq, rot_read_bits(Rq, Qq), f'h.{i}.attn.q_proj')
         ck = ck * rot_blocks(Rk, ck.abs(), rot_read_bits(Rk, Qk), f'h.{i}.attn.k_proj')
     qh, kh = rope(back(cq, Qq)), rope(back(ck, Qk))
     pattern = ((qh @ kh.transpose(-1, -2)) / math.sqrt(HD)).masked_fill(~causal, float('-inf')).softmax(-1)
     a = grp((pattern @ v.view(B_, T_, NH, HD).transpose(1, 2)).transpose(1, 2).reshape(B_, T_, -1))
     Q = rot_Q(Ro)
-    c = torch.einsum('btnk,nki->btni', a, Q)
+    c = qeinsum('btnk,nki->btni', a, Q)
     if state.get('noise'):
         # Each OV slice's read noise at each key, mixed by the pattern like the values.
         vn = (h @ torch.randn(NH * HD, h.shape[-1], device=h.device).T).view(B_, T_, NH, HD).transpose(1, 2)
@@ -1582,9 +1565,9 @@ if FMODE:
         if any(cont is R for R in ROT_ALL) and key in ('A', 'tau'):
             cont[key + '_leaf'] = (mu, ls)
 class OneAdam(torch.optim.Adam):
-    """DESCENT_ONE_ADAM=1 (speed): torch's multi-tensor Adam (its default on CUDA) in one pass over every group
-    instead of one per group (each tensor here is its own group: the per-group passes held the host 24 ms of a
-    whole-model step on an A40). The same element-wise operations, each tensor at its group's step size."""
+    """torch's multi-tensor Adam (its default on CUDA) in one pass over every group instead of one per group
+    (each tensor here is its own group: the per-group passes held the host 24 ms of a whole-model step on an
+    A40). The same element-wise operations, each tensor at its group's step size."""
     @torch.no_grad()
     def step(self):
         ps, gs, ms, vs, ss, lrs = [], [], [], [], [], []
@@ -1611,7 +1594,7 @@ class OneAdam(torch.optim.Adam):
         torch._foreach_div_(den, [bc ** 0.5 for bc in bc2])
         torch._foreach_add_(den, eps)
         torch._foreach_addcdiv_(ps, ms, den, [(lr_ / bc) * -1 for lr_, bc in zip(lrs, bc1)])
-opt = OneAdam(groups) if os.environ.get('DESCENT_ONE_ADAM') == '1' else torch.optim.Adam(groups)
+opt = OneAdam(groups)
 trainable = [q for g in groups for q in g['params']]
 
 def draw(mean):
@@ -1648,14 +1631,14 @@ def description_bits():
             # A q or k slice's dense read.
             s2 = (2 * R['ls']).exp(); d_ = R['di']
             Q = rot_Q({'A': R['A_leaf'][0]}) if 'A_leaf' in R else rot_Q(R)
-            nr = torch.einsum('nki,nkm,nmi->ni', Q, R['G'], Q)
+            nr = qeinsum('nki,nkm,nmi->ni', Q, R['G'], Q)
             v = (nr.sum() + d_ * s2.sum()) / (d_ * nr.numel())
             total = total + 0.5 * (d_ * torch.log(v / s2) + (nr + d_ * s2) / v - d_).sum()
             continue
         # rot: every slice's dense read and write (the angles and thresholds are leaves below).
         sf, sd = (2 * R['ls_fc']).exp(), (2 * R['ls_dn']).exp()
         Q = rot_Q({'A': R['A_leaf'][0]}) if 'A_leaf' in R else rot_Q(R)
-        nf = torch.einsum('nki,nkm,nmi->ni', Q, R['Gfc'], Q); nd = torch.einsum('nki,nkm,nmi->ni', Q, R['Gdn'], Q)
+        nf = qeinsum('nki,nkm,nmi->ni', Q, R['Gfc'], Q); nd = qeinsum('nki,nkm,nmi->ni', Q, R['Gdn'], Q)
         for nn_, s2, d_ in ((nf, sf, R['di']), (nd, sd, R['do'])):
             v = (nn_.sum() + d_ * s2.sum()) / (d_ * nn_.numel())
             total = total + 0.5 * (d_ * torch.log(v / s2) + (nn_ + d_ * s2) / v - d_).sum()
