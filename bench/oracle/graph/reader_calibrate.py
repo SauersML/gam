@@ -16,7 +16,9 @@ disjoint prompts), and the same code with false English (wrong).
 
   reader_calibrate.py measure --out ITEMS.jsonl [--prompts 8] [--targets 4] [--heads all|L.H,...]
   reader_calibrate.py programs --out PROGRAMS.jsonl
-then reader_score.py score --target vpd4l --programs PROGRAMS.jsonl --items ITEMS.jsonl ...
+then reader_score.py score --target vpd4l --programs PROGRAMS.jsonl --items ITEMS.jsonl --out OUT.json, and
+  reader_calibrate.py report --out OUT.json
+  reader_calibrate.py throughput [--model Qwen/Qwen3-8B] [--programs 8 --items 64 --text-tokens 64]
 """
 
 from __future__ import annotations
@@ -172,17 +174,99 @@ def programs(args):
     print(f"{len(rows)} programs -> {args.out}")
 
 
+def report(args):
+    """The calibration table from reader_score.py's output: per program its mean bits per item and per
+    family, the empty program and the code alone, and paired differences over the same items (mean and
+    standard error): every program against true_measured, and each X_paraphrase against X."""
+    d = json.loads(Path(args.out).read_text())
+    rows = {r["id"]: r for r in d["results"]}
+    bits = {k: np.array(r["per_item"]) for k, r in rows.items()}
+    n = d["items"]
+    lines = [f"reader {d['reader']}, {n} items, {d['seconds']:.0f} s, {d['item_reads_per_second']:.2f} item reads/s"]
+    for k, r in rows.items():
+        lines.append(f"{k:28s} {r['mean_bits_per_item']:.4f} bits/item  code alone {r.get('code_only_mean_bits_per_item', float('nan')):.4f}  "
+                     f"empty {r.get('empty_mean_bits_per_item', float('nan')):.4f}  per family " + json.dumps({f: round(v, 3) for f, v in r["per_family"].items()}))
+
+    def paired(a, b):
+        x = bits[a] - bits[b]
+        se = x.std(ddof=1) / np.sqrt(len(x))
+        return f"{a} - {b}: {x.mean():+.4f} bits/item (SE {se:.4f}, {x.mean() / se:+.1f} SE)"
+
+    ref = "true_measured"
+    for k in rows:
+        if k != ref and ref in rows and not k.endswith("_paraphrase"):
+            lines.append(paired(k, ref))
+        if k.endswith("_paraphrase") and k[: -len("_paraphrase")] in rows:
+            lines.append(paired(k, k[: -len("_paraphrase")]))
+    for k, r in rows.items():
+        if "english_saved_bits" in r:
+            lines.append(f"{k:28s} English saves {(r['code_only_mean_bits_per_item'] - r['mean_bits_per_item']):+.4f} bits/item, program saves "
+                         f"{(r['empty_mean_bits_per_item'] - r['mean_bits_per_item']):+.4f} bits/item over the empty program")
+    print("\n".join(lines))
+
+
+def throughput(args):
+    """Reader throughput at RL shape: --programs programs (g-mech's examples, cycled, each made distinct)
+    x --items items of a Qwen3 target (texts of --text-tokens tokens, 8 candidates), no baselines; prints
+    items per second with the prefix and suffix lengths."""
+    import time
+
+    import reader_score as S
+
+    tok_reader = S.CachedReader(args.model, args.batch_tokens, args.max_batch, device=args.device)
+    sc = S.Scorer(tok_reader, "qwen3-0.6b")
+    tok = tok_reader.tokenizer
+    rng = np.random.default_rng(0)
+    rows = np.load(Path.home() / "mpd-data/vpd/pile_val_4096x513.npy", mmap_mode="r")
+    import tokenizers
+
+    sys.path.insert(0, str(HERE.parent.parent / "vpd_2951"))
+    import vpd_model as VM
+
+    vtok = tokenizers.Tokenizer.from_file(str(VM.TARGET_DIR / "tokenizer.json"))
+    items = []
+    for i in range(args.items):
+        text = vtok.decode(rows[rng.integers(len(rows))][1:200].tolist())
+        ids = tok.encode(text, add_special_tokens=False)[: args.text_tokens]
+        cands = rng.choice(len(tok), 8, replace=False).tolist()
+        p = rng.dirichlet(np.ones(9))
+        items.append({"id": str(i), "family": "bench", "experiment": {"kind": "scale", "factor": 0, "pieces": [{"view": "native", "layer": 3, "kind": "head", "index": 5}]},
+                      "text": tok.decode(ids), "token_ids": ids, "candidates": [{"token_id": c, "text": tok.decode([c]), "clean": float(q), "p": float(q)} for c, q in zip(cands, p[:8])],
+                      "clean_other": float(p[8]), "other": float(p[8])})
+    examples = sorted((HERE / "examples").glob("*.py"))
+    programs = [{"id": str(j), "source": f"# variant {j}\n" + examples[j % len(examples)].read_text()} for j in range(args.programs)]
+    prefix = np.mean([len(sc.prompter.prefix(p["source"])) for p in programs])
+    suffix = np.mean([len(sc.prompter.item(it)) for it in items])
+    start = time.time()
+    sc.score(programs[:1], items[:2], baselines=False)  # warm up
+    warm = time.time() - start
+    start = time.time()
+    sc.score(programs, items, baselines=False)
+    seconds = time.time() - start
+    reads = len(programs) * len(items)
+    print(json.dumps({"reader": tok_reader.describe(), "programs": len(programs), "items_per_program": len(items), "mean_prefix_tokens": float(prefix),
+                      "mean_item_tokens": float(suffix), "seconds": seconds, "warmup_seconds": warm, "items_per_second": reads / seconds,
+                      "max_batch": args.max_batch, "batch_tokens": args.batch_tokens}))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("command", choices=["measure", "programs"])
-    ap.add_argument("--out", required=True)
+    ap.add_argument("command", choices=["measure", "programs", "report", "throughput"])
+    ap.add_argument("--out", help="measure/programs: the file written; report: reader_score.py's output JSON")
     ap.add_argument("--prompts", type=int, default=8)
     ap.add_argument("--targets", type=int, default=4)
     ap.add_argument("--heads", default="all")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--facts", help="programs: measure's printed JSON, for the true program's measured facts")
+    ap.add_argument("--model", default="Qwen/Qwen3-8B", help="throughput: the reader")
+    ap.add_argument("--device")
+    ap.add_argument("--programs", type=int, default=8, help="throughput: programs")
+    ap.add_argument("--items", type=int, default=64, help="throughput: items per program")
+    ap.add_argument("--text-tokens", type=int, default=64, help="throughput: tokens of each item's text")
+    ap.add_argument("--batch-tokens", type=int, default=65536)
+    ap.add_argument("--max-batch", type=int, default=32)
     args = ap.parse_args()
-    measure(args) if args.command == "measure" else programs(args)
+    {"measure": measure, "programs": programs, "report": report, "throughput": throughput}[args.command](args)
 
 
 if __name__ == "__main__":
