@@ -2261,9 +2261,12 @@ struct GatedStage {
     direction: Option<usize>,
     slices: Vec<Vec<usize>>,
     /// Per component its own prior groups (its slices' read and write groups and its direction
-    /// row), and the stage's groups its components share (thresholds and widths).
+    /// row), and the stage's groups its components share (thresholds and widths)
+    /// ([`GatedStage::account`]).
     groups: Vec<Vec<usize>>,
     shared: Vec<usize>,
+    /// The stage's operators' prefix (`library.l{l}.attn`, `.o`, `.mlp.fc`, `.mlp.dn`).
+    prefix: String,
     /// The node holding each component's gate pre-activation: the gate node, or in a shared
     /// stage the gates' pre-activations through the assignment (`library_vpd`).
     component_gate: usize,
@@ -2280,8 +2283,6 @@ impl GatedStage {
     fn of(flat: &OperatorProgram, explanation: &Explanation, l: usize) -> Result<Vec<Self>, String> {
         let program = &explanation.artifact.program;
         let name = format!("library.l{l}");
-        // Every group of the layer by its name.
-        let named_group: BTreeMap<String, usize> = explanation.groups.iter().enumerate().filter(|(_, g)| g.name.starts_with(&format!("{name}."))).map(|(i, g)| (g.name.clone(), i)).collect();
         // Each single-row read group by its operator and row.
         let mut read_group: BTreeMap<(usize, usize), usize> = BTreeMap::new();
         for (g, group) in explanation.groups.iter().enumerate() {
@@ -2335,27 +2336,16 @@ impl GatedStage {
                 None => gate,
             };
             let width = index_of(flat, &format!("{prefix}.width"))?;
-            let groups = slices
-                .iter()
-                .enumerate()
-                .map(|(b, reads)| {
-                    let mut own = Vec::with_capacity(2 * reads.len() + 1);
-                    for &g in reads {
-                        own.push(g);
-                        let write = explanation.groups[g].name.strip_suffix(".read").map(|stem| format!("{stem}.write"));
-                        own.extend(write.and_then(|w| named_group.get(&w).copied()));
-                    }
-                    own.extend(named_group.get(&format!("{prefix}.g{b}")).copied());
-                    own
-                })
-                .collect();
-            let shared = ["thresholds", "widths"].iter().filter_map(|s| named_group.get(&format!("{prefix}.{s}")).copied()).collect();
-            stages.push(Self { input, threshold, direction, slices, groups, shared, component_gate, assign, width });
+            stages.push(Self { input, threshold, direction, slices, groups: Vec::new(), shared: Vec::new(), prefix: prefix.to_string(), component_gate, assign, width });
             Ok(())
         };
-        let mut attention = blocks(index_of(program, &format!("{name}.attn.read"))?)?;
+        // A stage's read holds the components carried in from other blocks first
+        // (`library_vpd`'s blocks across blocks, [`GatedStage::carry_across`]): its own stage's
+        // rows follow them.
+        let carried_in = |consumer: &str| -> usize { program.operators.iter().filter(|o| o.name.starts_with(&format!("{consumer}.from."))).map(|o| o.rows.width()).sum() };
+        let mut attention = blocks(index_of(program, &format!("{name}.attn.read"))?)?.split_off(carried_in(&format!("{name}.attn")));
         let o = match operator_named(program, &format!("{name}.o.read")) {
-            Some(op) => blocks(op)?,
+            Some(op) => blocks(op)?.split_off(carried_in(&format!("{name}.o"))),
             None => Vec::new(),
         };
         let carried = carry(&mut attention, &format!("{name}.o.select_gate"), &o)?;
@@ -2365,8 +2355,8 @@ impl GatedStage {
         }
         // An MLP with no component (`{name}.mlp.zero`) has no stage.
         if let Some(fc_read) = operator_named(program, &format!("{name}.mlp.fc_read")) {
-            let mut up = blocks(fc_read)?;
-            let down = blocks(index_of(program, &format!("{name}.mlp.dn_read"))?)?;
+            let mut up = blocks(fc_read)?.split_off(carried_in(&format!("{name}.mlp.fc")));
+            let down = blocks(index_of(program, &format!("{name}.mlp.dn_read"))?)?.split_off(carried_in(&format!("{name}.mlp.dn")));
             let carried = carry(&mut up, &format!("{name}.mlp.dn_select_gate"), &down)?;
             stage(&format!("{name}.mlp.fc"), up)?;
             if down.len() > carried {
@@ -2374,6 +2364,79 @@ impl GatedStage {
             }
         }
         Ok(stages)
+    }
+
+    /// The slices carried across blocks (`library_vpd`): each selection `{consumer}.from.{home}`
+    /// picks, for the consumer stage's leading read rows (by home in home order), the home stage's
+    /// component whose gate runs them, and those rows' slices join that component's.
+    fn carry_across(stages: &mut [Vec<Self>], flat: &OperatorProgram, explanation: &Explanation) -> Result<(), String> {
+        let program = &explanation.artifact.program;
+        let mut read_group: BTreeMap<(usize, usize), usize> = BTreeMap::new();
+        for (g, group) in explanation.groups.iter().enumerate() {
+            if group.name.ends_with(".read") && group.cells.len() == 1 && group.cells[0].rows.len() == 1 {
+                read_group.insert((group.cells[0].operator, group.cells[0].rows[0]), g);
+            }
+        }
+        // Per consumer its selections, by home `(layer, stage)`.
+        let mut by_consumer: BTreeMap<String, Vec<((usize, usize), String, usize)>> = BTreeMap::new();
+        for (op, operator) in program.operators.iter().enumerate() {
+            let Some((consumer, home)) = operator.name.split_once(".from.") else { continue };
+            let order = home
+                .strip_prefix("library.l")
+                .and_then(|rest| rest.split_once('.'))
+                .and_then(|(layer, stage)| Some((layer.parse::<usize>().ok()?, if stage == "attn" { 0 } else { 2 })))
+                .ok_or_else(|| format!("{}: no home stage", operator.name))?;
+            by_consumer.entry(consumer.to_string()).or_default().push((order, home.to_string(), op));
+        }
+        for (consumer, mut selections) in by_consumer {
+            selections.sort();
+            let read = match consumer.rsplit_once('.') {
+                Some((stem, "fc")) => format!("{stem}.fc_read"),
+                Some((stem, "dn")) => format!("{stem}.dn_read"),
+                _ => format!("{consumer}.read"),
+            };
+            let op = index_of(program, &read)?;
+            let mut rows = Vec::new();
+            let mut row = 0;
+            for group in program.operators[op].rows.groups() {
+                rows.push((row..row + group.width).map(|r| read_group.get(&(op, r)).copied().ok_or_else(|| format!("{read}: no read group of row {r}"))).collect::<Result<Vec<_>, _>>()?);
+                row += group.width;
+            }
+            let mut offset = 0;
+            for ((layer, _), home, select) in selections {
+                let threshold = index_of(flat, &format!("{home}.threshold"))?;
+                let stage = stages.get_mut(layer).and_then(|s| s.iter_mut().find(|s| s.threshold == threshold)).ok_or_else(|| format!("{consumer}: no home stage {home}"))?;
+                let m = program.operators[select].matrix();
+                for (r, picks) in m.rows().into_iter().enumerate() {
+                    let c = picks.iter().position(|v| *v != 0.0).ok_or("an empty gate selection")?;
+                    stage.slices[c].extend(&rows[offset + r]);
+                }
+                offset += m.nrows();
+            }
+        }
+        Ok(())
+    }
+
+    /// Each component's own groups and the stage's shared ones (`GatedStage::groups`, `shared`), from
+    /// its slices' read groups (with their writes) and the stage's named groups.
+    fn account(&mut self, named: &BTreeMap<&str, usize>, explanation: &Explanation) {
+        let prefix = self.prefix.clone();
+        self.groups = self
+            .slices
+            .iter()
+            .enumerate()
+            .map(|(b, reads)| {
+                let mut own = Vec::with_capacity(2 * reads.len() + 1);
+                for &g in reads {
+                    own.push(g);
+                    let write = explanation.groups[g].name.strip_suffix(".read").map(|stem| format!("{stem}.write"));
+                    own.extend(write.and_then(|w| named.get(w.as_str()).copied()));
+                }
+                own.extend(named.get(format!("{prefix}.g{b}").as_str()).copied());
+                own
+            })
+            .collect();
+        self.shared = ["thresholds", "widths"].iter().filter_map(|s| named.get(format!("{prefix}.{s}").as_str()).copied()).collect();
     }
 
     /// Per component its active slices, its rank in rank-one equivalents.
@@ -2483,7 +2546,12 @@ impl Scorer {
         experiments.keep_targets(gam_runtime::resource::MemoryGovernor::global());
         let (flat, _, _) = interchange::sites(&explanation.artifact, &sites)?;
         let mlps: Vec<Option<Mlp>> = (0..sites.len()).map(|l| Mlp::of(&flat, l)).collect::<Result<_, _>>()?;
-        let stages: Vec<Vec<GatedStage>> = mlps.iter().enumerate().map(|(l, mlp)| if mlp.is_some() { Ok(Vec::new()) } else { GatedStage::of(&flat, explanation, l) }).collect::<Result<_, String>>()?;
+        let mut stages: Vec<Vec<GatedStage>> = mlps.iter().enumerate().map(|(l, mlp)| if mlp.is_some() { Ok(Vec::new()) } else { GatedStage::of(&flat, explanation, l) }).collect::<Result<_, String>>()?;
+        GatedStage::carry_across(&mut stages, &flat, explanation)?;
+        let named: BTreeMap<&str, usize> = explanation.groups.iter().enumerate().map(|(i, g)| (g.name.as_str(), i)).collect();
+        for stage in stages.iter_mut().flatten() {
+            stage.account(&named, explanation);
+        }
         let position: BTreeMap<usize, usize> = explanation.trainable.iter().enumerate().map(|(i, op)| (*op, i)).collect();
         let scope = Some(scope(explanation)).filter(|blocks| !blocks.iter().all(|b| *b));
         let program = &explanation.artifact.program;
@@ -6331,6 +6399,19 @@ mod tests {
     /// 0–2, the c_fc slices in threes and the down slices in fours mixed orthogonally, every slice's
     /// mean pinned.
     fn learned_tiny_mixed(tag: &str, mixing: bool) -> (OperatorProgram, Explanation, Vec<Vec<u32>>) {
+        learned_tiny_with(tag, mixing, None)
+    }
+
+    /// [`learned_tiny`] with the first layer's MLP components on direction gates (`g = e_i`,
+    /// threshold 0.5, so component `i` runs where input coordinate `i` exceeds 0.5) and its
+    /// component 0 a block across blocks: with `cross` true it also runs the second layer's q slice
+    /// 1, o slice 1 and down slice 0 (taken from their components); with `cross` false component 0
+    /// and all those slices are absent.
+    fn cross_tiny(tag: &str, cross: bool) -> (OperatorProgram, Explanation, Vec<Vec<u32>>) {
+        learned_tiny_with(tag, false, Some(cross))
+    }
+
+    fn learned_tiny_with(tag: &str, mixing: bool, cross: Option<bool>) -> (OperatorProgram, Explanation, Vec<Vec<u32>>) {
         let dir = crate::test_support::tiny_export(tag, 2);
         let record: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("export.json")).unwrap()).unwrap();
         let factors = std::env::temp_dir().join(format!("gam_mpd_{tag}_factors_{}", std::process::id()));
@@ -6359,8 +6440,27 @@ mod tests {
                     _ => always.extend((0..c).map(|i| [6 * l + k, i])),
                 }
             }
+            let carried = [[6, 1], [9, 1], [11, 0]];
+            if cross.is_some() && l == 1 {
+                always.retain(|s| !carried.contains(s));
+                mlp.iter_mut().for_each(|c| c.retain(|s| !carried.contains(s)));
+            }
             components.push(serde_json::json!({"read": {"own": [6 * l, 0]}, "tau": -1.0, "width": 1e-3, "slices": always}));
-            components.extend(mlp.into_iter().map(|slices| serde_json::json!({"read": {"own": slices[0]}, "tau": 0.5, "width": 0.5, "slices": slices})));
+            if cross.is_some() && l == 0 {
+                let d = record["files"]["blocks.0.mlp.c_fc"]["shape"][1].as_u64().unwrap() as usize;
+                for (i, mut slices) in mlp.into_iter().enumerate() {
+                    if i == 0 && cross == Some(false) {
+                        continue;
+                    }
+                    if i == 0 {
+                        slices.extend(carried);
+                    }
+                    let coefficients: Vec<f64> = (0..=d).map(|j| if j == i { 1.0 } else { 0.0 }).collect();
+                    components.push(serde_json::json!({"read": {"direction": {"site": 4, "coefficients": coefficients}}, "tau": 0.5, "width": 0.5, "slices": slices}));
+                }
+            } else {
+                components.extend(mlp.into_iter().map(|slices| serde_json::json!({"read": {"own": slices[0]}, "tau": 0.5, "width": 0.5, "slices": slices})));
+            }
         }
         std::fs::write(factors.join("export.json"), serde_json::json!({"config": {"sites": sites}, "files": files}).to_string()).unwrap();
         let start = factors.join("start.json");
@@ -6609,6 +6709,46 @@ mod tests {
         assert!((by_read - by_write).abs() <= 1e-12, "the read's {by_read} and the write's {by_write}");
         let both: Vec<f64> = (0..groups).map(|i| if i == read || i == write { 1.0 } else { 0.0 }).collect();
         assert!((count(both) - zero - by_read - by_write).abs() <= 1e-12, "the count is linear in the bits");
+    }
+
+    /// A block across blocks (`library_vpd`: a component gated at the first MLP's input that also
+    /// runs a q, an o and a down slice of the second layer, its gate recomputed in each of their
+    /// rules): with every part on its slices still sum to `M` (the all-on experiment under 1e-9
+    /// bits); with its gate shut it removes exactly its slices, the explanation scoring as one
+    /// without the component and those slices (1e-10); and the fit counts its rank across the
+    /// blocks it runs in.
+    #[test]
+    fn a_block_across_blocks_runs_its_slices_under_its_one_gate() {
+        let (native, explanation, sequences) = cross_tiny("library_cross_block", true);
+        let (device, settings) = (Device::host(), settings());
+        let mut posterior = Posterior::new(&explanation, 72).unwrap();
+        let mut scorer = Scorer::new(&device, &native, &explanation, &settings).unwrap();
+        let draws = draws(sequences.len(), settings.batch_sequences, settings.seed).unwrap();
+        let batch = draws[0].batch(&sequences).unwrap();
+        let experiments = scorer.experiments(&draws[0], &sequences).unwrap();
+        let targets = scorer.experiments.targets(&batch, &experiments).unwrap();
+        // The component's rank, counted at its home: its c_fc slice, its first layer's down slices
+        // and the three it runs in the second layer.
+        let program = &explanation.artifact.program;
+        let threshold = index_of(program, "library.l0.mlp.fc.threshold").unwrap();
+        let home = scorer.stages[0].iter().find(|s| s.threshold == threshold).unwrap();
+        let downs = program.operators[index_of(program, "library.l0.mlp.dn_read").unwrap()].rows.width() / program.operators[threshold].rows.width();
+        assert_eq!(home.ranks(&posterior.active)[0], (1 + downs + 3) as f64, "the block's rank across its blocks");
+        let device_posterior = DevicePosterior::new(&device, &explanation, &posterior, 72.0, None, 0).unwrap();
+        let on = scorer.all_on_pass(&device_posterior, (&batch, &experiments), (Values::Mean, Gates::Hard), (false, None)).unwrap().unwrap().bits;
+        assert!(on.iter().flatten().all(|b| b.abs() <= 1e-9), "every part on is M");
+        // Its gate shut: z = g·x + c with c far below zero.
+        let t = explanation.trainable.iter().position(|op| *op == threshold).unwrap();
+        posterior.mean[t][[0, 0]] = -1e6;
+        let device_posterior = DevicePosterior::new(&device, &explanation, &posterior, 72.0, None, 0).unwrap();
+        let shut = scorer.pass(&device_posterior, (&batch, &experiments, &targets), (Values::Mean, Gates::Hard, false), (false, None)).unwrap().bits;
+        let (native_b, without, _) = cross_tiny("library_cross_block_without", false);
+        let posterior_b = Posterior::new(&without, 72).unwrap();
+        let device_b = DevicePosterior::new(&device, &without, &posterior_b, 72.0, None, 0).unwrap();
+        let mut scorer_b = Scorer::new(&device, &native_b, &without, &settings).unwrap();
+        let reference = scorer_b.pass(&device_b, (&batch, &experiments, &targets), (Values::Mean, Gates::Hard, false), (false, None)).unwrap().bits;
+        let gap = shut.iter().flatten().zip(reference.iter().flatten()).fold(0.0f64, |m, (a, b)| m.max((a - b).abs()));
+        assert!(gap <= 1e-10, "the shut block against no block: {gap}");
     }
 
     /// A budget that never binds (`K = ∞`, or `K` far above any count, where `λ` stays 0) leaves

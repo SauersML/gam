@@ -203,15 +203,95 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
     };
     let mut artifact = Artifact::native(native)?;
     let mut shares = Vec::new();
-    // Per layer and stage, the components gated there.
+    // Per layer and stage, the components gated there (each component's home, its gate's stage).
+    // A component's slices sit at its home, at the stage its home's block carries (the o slices
+    // after the attention's input, the down slices after the MLP's input), or at any later stage of
+    // any later layer: a block of any rank across maps and layers under its one gate. A slice in
+    // another block is carried there (`cross`): that block's rule recomputes the gate from the home's
+    // input, which it takes as an argument, so a carried component's gate is an unshared direction
+    // gate at the attention's or the MLP's input, whose input `M`'s program holds.
+    let home_of = |site: usize| (site / KINDS.len(), stage(site));
     let mut at: BTreeMap<(usize, usize), Vec<usize>> = BTreeMap::new();
+    let mut cross: BTreeMap<(usize, usize), Vec<usize>> = BTreeMap::new();
     for (b, c) in components.iter().enumerate() {
-        let site = read_site(c);
-        if c.slices.iter().any(|[s, _]| s / KINDS.len() != site / KINDS.len()) {
-            return Err(error(format!("component {b}: slices outside its gate's layer")));
+        let home = home_of(read_site(c));
+        let mut into = std::collections::BTreeSet::new();
+        for &[s, _] in &c.slices {
+            let place = home_of(s);
+            if place < home {
+                return Err(error(format!("component {b}: a slice before its gate's stage")));
+            }
+            if place != home && !(place.0 == home.0 && matches!((home.1, place.1), (0, 1) | (2, 3))) {
+                into.insert(place);
+            }
         }
-        at.entry((site / KINDS.len(), stage(site))).or_default().push(b);
+        if !into.is_empty() && (!matches!(c.read, Read::Direction { .. }) || !c.candidates.is_empty() || !matches!(home.1, 0 | 2)) {
+            return Err(error(format!("component {b}: slices carried into another block need an unshared direction gate at the attention's or the MLP's input")));
+        }
+        for place in into {
+            cross.entry(place).or_default().push(b);
+        }
+        at.entry(home).or_default().push(b);
     }
+    // The components carried into the stage `place` (`cross`), by home in home order, each home's
+    // in its order there: per home its components and their positions among the home's.
+    let carried_into = |place: (usize, usize)| -> Vec<((usize, usize), Vec<usize>, Vec<usize>)> {
+        let mut by_home: BTreeMap<(usize, usize), Vec<(usize, usize)>> = BTreeMap::new();
+        for &b in cross.get(&place).into_iter().flatten() {
+            let home = home_of(read_site(&components[b]));
+            let position = at.get(&home).and_then(|comps| comps.iter().position(|c| *c == b)).unwrap_or(0);
+            by_home.entry(home).or_default().push((position, b));
+        }
+        by_home
+            .into_iter()
+            .map(|(home, mut list)| {
+                list.sort_unstable();
+                (home, list.iter().map(|p| p.1).collect(), list.iter().map(|p| p.0).collect())
+            })
+            .collect()
+    };
+    let home_prefix = |(l, s): (usize, usize)| if s == 0 { format!("library.l{l}.attn") } else { format!("library.l{l}.mlp.fc") };
+    let home_input = |(l, s): (usize, usize)| if s == 0 { layers[l].normed_stream } else { layers[l].normed };
+    // The distinct inputs of `carried`'s homes not among `inputs`, in order.
+    let extra_inputs = |carried: &[((usize, usize), Vec<usize>, Vec<usize>)], inputs: &[usize]| -> Vec<usize> {
+        let mut out: Vec<usize> = Vec::new();
+        for (home, _, _) in carried {
+            let node = home_input(*home);
+            if !inputs.contains(&node) && !out.contains(&node) {
+                out.push(node);
+            }
+        }
+        out
+    };
+    // In a rule whose inputs are the native nodes `inputs` (parameter `i` the `i`-th), the carried
+    // components' gate pre-activations and widths: per home its direction, threshold and width on
+    // its input, selected by `{consumer}.from.{home}` (pushed to `operators`, base `base`, unless a
+    // rule built before holds it).
+    let cross_parts = |artifact: &Artifact, nodes: &mut Vec<Node>, (operators, base): (&mut Vec<Operator>, usize), consumer: &str, carried: &[((usize, usize), Vec<usize>, Vec<usize>)], inputs: &[usize]| -> Result<(Vec<usize>, Vec<usize>), String> {
+        let (mut zs, mut ss) = (Vec::new(), Vec::new());
+        for (home, comps, positions) in carried {
+            let prefix = home_prefix(*home);
+            let op = |part: &str| index_of(&artifact.program, &format!("{prefix}.{part}"));
+            let name = format!("{consumer}.from.{prefix}");
+            let select = match (index_of(&artifact.program, &name), operators.iter().position(|o| o.name == name)) {
+                (Ok(i), _) => i,
+                (Err(_), Some(i)) => base + i,
+                (Err(_), None) => {
+                    let count = at.get(home).map_or(0, Vec::len);
+                    operators.push(dense(&name, units(comps.len())?, units(count)?, selection(positions, count))?);
+                    base + operators.len() - 1
+                }
+            };
+            let param = inputs.iter().position(|n| *n == home_input(*home)).ok_or_else(|| error(format!("{consumer}: no input of its carried gates' home {prefix}")))?;
+            nodes.push(Node::Affine { terms: vec![(param, op("direction")?)], bias: Some(op("threshold")?) });
+            nodes.push(Node::Affine { terms: vec![(nodes.len() - 1, select)], bias: None });
+            zs.push(nodes.len() - 1);
+            nodes.push(Node::Constant { operator: op("width")? });
+            nodes.push(Node::Affine { terms: vec![(nodes.len() - 1, select)], bias: None });
+            ss.push(nodes.len() - 1);
+        }
+        Ok((zs, ss))
+    };
     // Per stage its gate reads' kind: direction (true) or own (false), refused where mixed.
     let direction_of = |comps: &[usize]| -> Result<bool, String> {
         let directions = comps.iter().filter(|&&b| matches!(components[b].read, Read::Direction { .. })).count();
@@ -270,10 +350,16 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
             shares.push(share_of(&format!("{name}.attn"), &a_comps)?);
         }
         let (q, k, v) = (site(Kind::Query), site(Kind::Key), site(Kind::Value));
-        // The stacked read: per component its q, k, v slices in that order; each slice's row.
+        let a_cross = carried_into((l, 0));
+        if !a_cross.is_empty() && attn_shared {
+            return Err(error(format!("layer {l}: components carried into a shared attention input stage")));
+        }
+        // The stacked read: per component (the carried ones first) its q, k, v slices in that
+        // order; each slice's row.
         let mut read_rows: Vec<(usize, usize)> = Vec::new();
         let mut widths = Vec::new();
-        for &b in &a_comps {
+        let a_carried: usize = a_cross.iter().map(|(_, comps, _)| comps.len()).sum();
+        for &b in a_cross.iter().flat_map(|(_, comps, _)| comps).chain(&a_comps) {
             let mut w = 0;
             for s in [q, k, v] {
                 for i in slices_on(b, s) {
@@ -355,7 +441,10 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
         // The attention input stage's nodes from `input` (node 0 of a rule's nodes so far): the
         // stacked read, the gate, the gate's width, the gated activations; returns (gated node,
         // gate node, width node).
-        let stage_nodes = |nodes: &mut Vec<Node>, input: usize, (read, gate_a, gate_b, soft): (usize, usize, usize, usize), assign: Option<usize>, direction: bool| -> (usize, usize, usize) {
+        // With `extra` (the carried components' gate parts), the gated reads, gated by the carried
+        // gates then the stage's own; without, its own gates alone. `own` selects the own
+        // components' read norms where carried rows come first in the read.
+        let stage_nodes = |nodes: &mut Vec<Node>, input: usize, (read, gate_a, gate_b, soft): (usize, usize, usize, usize), assign: Option<usize>, direction: bool, own: Option<usize>, extra: Option<(Vec<usize>, Vec<usize>)>| -> (Option<usize>, usize, usize) {
             // A shared stage (`assign`, gates × components): the gates' pre-activations and widths,
             // then each component's own, z_b = Σ_m A_mb z_m and w_b = Σ_m A_mb w_m (a 0/1
             // assignment gives each component its gate's), before the reads.
@@ -380,8 +469,11 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
                     nodes.push(Node::Affine { terms: vec![(input, read)], bias: None });
                     nodes.len() - 1
                 });
-                nodes.push(Node::Gated { value: a, gate: zb, scale: Some(wb) });
-                return (nodes.len() - 1, zb, wb);
+                let gated = extra.map(|_| {
+                    nodes.push(Node::Gated { value: a, gate: zb, scale: Some(wb) });
+                    nodes.len() - 1
+                });
+                return (gated, zb, wb);
             }
             // A direction gate and its width come before the reads they gate, so each row reads
             // only its components on (`DeviceProgram`'s gated reads); an own gate reads them.
@@ -394,13 +486,24 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
                 nodes.push(Node::Affine { terms: vec![(input, read)], bias: None });
                 let a = nodes.len() - 1;
                 nodes.push(Node::GroupNorm { input: a });
+                if let Some(select) = own {
+                    nodes.push(Node::Affine { terms: vec![(nodes.len() - 1, select)], bias: None });
+                }
                 nodes.push(Node::Affine { terms: vec![(nodes.len() - 1, gate_a)], bias: Some(gate_b) });
                 nodes.push(Node::Constant { operator: soft });
                 (a, nodes.len() - 2, nodes.len() - 1)
             };
-            nodes.push(Node::Gated { value: a, gate: z, scale: Some(s) });
-            (nodes.len() - 1, z, s)
+            let gated = extra.map(|(mut zs, mut ss)| {
+                zs.push(z);
+                ss.push(s);
+                let (zj, sj) = joined(nodes, zs, ss);
+                nodes.push(Node::Gated { value: a, gate: zj, scale: Some(sj) });
+                nodes.len() - 1
+            });
+            (gated, z, s)
         };
+        // The attention input stage's own read norms where carried rows come first.
+        let a_own = a_carried > 0 && !a_direction;
         let selections: Vec<(usize, Vec<usize>)> = [q, k, v].iter().map(|&s| (s, (0..r_a).filter(|&r| read_rows[r].0 == s).collect())).collect();
         for (h, &read) in layer.reads.iter().enumerate() {
             let Node::Attend { query, key, value, scale, rotary, causal } = native.nodes[read].clone() else {
@@ -423,6 +526,10 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
                         operators.push(dense(&format!("{name}.attn.select{}", s % KINDS.len()), units(picked.len())?, stacked.clone(), selection(picked, r_a))?);
                     }
                 }
+                if a_own {
+                    let groups = a_carried + a_comps.len();
+                    operators.push(dense(&format!("{name}.attn.select_own"), units(a_comps.len())?, units(groups)?, selection(&(a_carried..groups).collect::<Vec<_>>(), groups))?);
+                }
                 (base, base + 1, base + 2, base + 3)
             } else {
                 let gate_names = match (a_direction, attn_shared) {
@@ -437,8 +544,17 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
                 (true, 0) => Some(if a_direction { base + 4 } else { base + 1 }),
                 (true, _) => Some(shared(&artifact, "assign")?),
             };
-            let mut nodes = vec![Node::Param { index: 0 }];
-            let (gated, _, _) = stage_nodes(&mut nodes, 0, (read_op, gate_a, gate_b, soft), assign, a_direction);
+            let mut inputs = vec![x];
+            inputs.extend(extra_inputs(&a_cross, &inputs));
+            let mut nodes: Vec<Node> = (0..inputs.len()).map(|index| Node::Param { index }).collect();
+            let parts = cross_parts(&artifact, &mut nodes, (&mut operators, base), &format!("{name}.attn"), &a_cross, &inputs)?;
+            let own = match (a_own, h) {
+                (false, _) => None,
+                (true, 0) => Some(base + operators.iter().position(|o| o.name == format!("{name}.attn.select_own")).ok_or("the own selection")?),
+                (true, _) => Some(shared(&artifact, "select_own")?),
+            };
+            let (gated, _, _) = stage_nodes(&mut nodes, 0, (read_op, gate_a, gate_b, soft), assign, a_direction, own, Some(parts));
+            let gated = gated.ok_or("the gated reads")?;
             let mut projections = Vec::new();
             for (j, (s, picked)) in selections.iter().enumerate() {
                 let rows = head_rows([query, key, value][j])?;
@@ -462,8 +578,8 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
                 projections.push(nodes.len() - 1);
             }
             nodes.push(Node::Attend { query: projections[0], key: projections[1], value: projections[2], scale, rotary, causal });
-            let rule = Rule { name: format!("{name}.h{h}"), inputs: vec![x_interface.clone()], output: nodes.len() - 1, nodes };
-            artifact = artifact.replace_block(&format!("{name}.h{h}"), Callee::New(rule), vec![Argument::Native(x)], read, operators)?;
+            let rule = Rule { name: format!("{name}.h{h}"), inputs: inputs.iter().map(|&n| node_interface(n)).collect::<Result<_, _>>()?, output: nodes.len() - 1, nodes };
+            artifact = artifact.replace_block(&format!("{name}.h{h}"), Callee::New(rule), inputs.iter().map(|&n| Argument::Native(n)).collect(), read, operators)?;
         }
         // ---------------------------------------------------------------- the attention's output
         let o = site(Kind::Output);
@@ -471,7 +587,9 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
         let o_direction = direction_of(&o_own)?;
         // The o slices: those of components gated at the attention's input, then of components
         // gated on their own o read; per o-carrying component its slices.
-        let o_carriers: Vec<usize> = a_comps.iter().copied().filter(|&b| !slices_on(b, o).is_empty()).chain(o_own.iter().copied()).collect();
+        let o_cross = carried_into((l, 1));
+        let o_carried: usize = o_cross.iter().map(|(_, comps, _)| comps.len()).sum();
+        let o_carriers: Vec<usize> = o_cross.iter().flat_map(|(_, comps, _)| comps.iter().copied()).chain(a_comps.iter().copied().filter(|&b| !slices_on(b, o).is_empty())).chain(o_own.iter().copied()).collect();
         if !o_carriers.is_empty() {
             let o_rows: Vec<usize> = o_carriers.iter().flat_map(|&b| slices_on(b, o)).collect();
             let o_widths: Vec<usize> = o_carriers.iter().map(|&b| slices_on(b, o).len()).collect();
@@ -489,8 +607,9 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
                 dense(&format!("{name}.o.write"), out_rows.clone(), o_stacked.clone(), Array2::from_shape_fn((out_rows.width(), o_rows.len()), |(r, c)| factors[o].u[[o_rows[c], r]]))?,
             ];
             let heads = layer.reads.len();
-            let mut nodes: Vec<Node> = (0..heads).map(|index| Node::Param { index }).collect();
-            nodes.push(Node::Param { index: heads });
+            let mut inputs: Vec<usize> = layer.reads.iter().copied().chain([x]).collect();
+            inputs.extend(extra_inputs(&o_cross, &inputs));
+            let mut nodes: Vec<Node> = (0..inputs.len()).map(|index| Node::Param { index }).collect();
             nodes.push(Node::Concat { parts: (0..heads).collect() });
             let c = nodes.len() - 1;
             // The o reads after their gate when the gate does not read them (no own norm gates), so
@@ -501,8 +620,8 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
             });
             // The gate columns of the o carriers: from the attention input stage's gate (recomputed
             // here from x), then the own o gates.
-            let (mut gate_parts, mut soft_parts) = (Vec::new(), Vec::new());
-            let carried: Vec<usize> = o_carriers.iter().filter(|b| a_comps.contains(b)).map(|b| a_comps.iter().position(|a| a == b).unwrap_or(0)).collect();
+            let (mut gate_parts, mut soft_parts) = cross_parts(&artifact, &mut nodes, (&mut operators, base), &format!("{name}.o"), &o_cross, &inputs)?;
+            let carried: Vec<usize> = o_carriers[o_carried..].iter().filter(|b| a_comps.contains(b)).map(|b| a_comps.iter().position(|a| a == b).unwrap_or(0)).collect();
             if !carried.is_empty() {
                 let gate_names = match (a_direction, attn_shared) {
                     (true, _) => ("direction", "threshold"),
@@ -516,7 +635,8 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
                     index_of(&artifact.program, &format!("{name}.attn.width"))?,
                 );
                 let assign = if attn_shared { Some(index_of(&artifact.program, &format!("{name}.attn.assign"))?) } else { None };
-                let (_, z, s) = stage_nodes(&mut nodes, heads, stage_ops, assign, a_direction);
+                let own = if a_own { Some(index_of(&artifact.program, &format!("{name}.attn.select_own"))?) } else { None };
+                let (_, z, s) = stage_nodes(&mut nodes, heads, stage_ops, assign, a_direction, own, None);
                 operators.push(dense(&format!("{name}.o.select_gate"), units(carried.len())?, units(a_comps.len())?, selection(&carried, a_comps.len()))?);
                 nodes.push(Node::Affine { terms: vec![(z, base + operators.len() - 1)], bias: None });
                 gate_parts.push(nodes.len() - 1);
@@ -525,7 +645,7 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
             }
             if !o_own.is_empty() {
                 // Own o gates read the o carriers' own rows: the group norms of the read's own groups.
-                let own_first = carried.len();
+                let own_first = o_carried + carried.len();
                 operators.push(dense(&format!("{name}.o.select_own"), units(o_own.len())?, units(o_carriers.len())?, selection(&(own_first..o_carriers.len()).collect::<Vec<_>>(), o_carriers.len()))?);
                 let select = base + operators.len() - 1;
                 if is_shared(&o_own) {
@@ -552,9 +672,8 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
             });
             nodes.push(Node::Gated { value: a_o, gate: z, scale: Some(s) });
             nodes.push(Node::Affine { terms: vec![(nodes.len() - 1, base + 1)], bias: None });
-            let mut inputs = reads_cols.clone();
-            inputs.push(x_interface.clone());
-            let arguments = layer.reads.iter().map(|&r| Argument::Native(r)).chain([Argument::Native(x)]).collect();
+            let arguments = inputs.iter().map(|&n| Argument::Native(n)).collect();
+            let inputs = inputs.iter().map(|&n| node_interface(n)).collect::<Result<_, _>>()?;
             let rule = Rule { name: format!("{name}.o"), inputs, output: nodes.len() - 1, nodes };
             artifact = artifact.replace_block(&format!("{name}.o"), Callee::New(rule), arguments, layer.attention, operators)?;
         }
@@ -569,7 +688,12 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
         let up_rows = node_interface(pre)?;
         let h2 = layer.normed;
         let h2_interface = node_interface(h2)?;
-        if f_comps.is_empty() && d_own.is_empty() {
+        let (f_cross, d_cross) = (carried_into((l, 2)), carried_into((l, 3)));
+        let (f_carried, d_carried): (usize, usize) = (f_cross.iter().map(|(_, c, _)| c.len()).sum(), d_cross.iter().map(|(_, c, _)| c.len()).sum());
+        if f_carried > 0 && (f_comps.is_empty() || f_active || is_shared(&f_comps)) {
+            return Err(error(format!("layer {l}: components carried into an MLP input stage with no own, all-on or shared gates")));
+        }
+        if f_comps.is_empty() && d_own.is_empty() && f_carried + d_carried == 0 {
             // No component in the MLP (an attention-only model's zero MLP): the block adds zero.
             let out_rows = node_interface(layer.mlp)?;
             let zero = dense(&format!("{name}.mlp.zero"), out_rows.clone(), Interface::constant(), Array2::zeros((out_rows.width(), 1)))?;
@@ -578,12 +702,13 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
             artifact = artifact.replace_block(&format!("{name}.mlp"), Callee::New(rule), vec![Argument::Native(h2)], layer.mlp, vec![zero])?;
             continue;
         }
-        let fc_rows: Vec<usize> = f_comps.iter().flat_map(|&b| slices_on(b, fc)).collect();
-        let fc_widths: Vec<usize> = f_comps.iter().map(|&b| slices_on(b, fc).len()).collect();
+        let fc_stack: Vec<usize> = f_cross.iter().flat_map(|(_, comps, _)| comps.iter().copied()).chain(f_comps.iter().copied()).collect();
+        let fc_rows: Vec<usize> = fc_stack.iter().flat_map(|&b| slices_on(b, fc)).collect();
+        let fc_widths: Vec<usize> = fc_stack.iter().map(|&b| slices_on(b, fc).len()).collect();
         if fc_widths.iter().any(|w| *w == 0) || f_comps.is_empty() {
             return Err(error(format!("layer {l}: an MLP component gated at the MLP's input without a c_fc slice")));
         }
-        let dn_carriers: Vec<usize> = f_comps.iter().copied().filter(|&b| !slices_on(b, dn).is_empty()).chain(d_own.iter().copied()).collect();
+        let dn_carriers: Vec<usize> = d_cross.iter().flat_map(|(_, comps, _)| comps.iter().copied()).chain(f_comps.iter().copied().filter(|&b| !slices_on(b, dn).is_empty())).chain(d_own.iter().copied()).collect();
         let dn_rows: Vec<usize> = dn_carriers.iter().flat_map(|&b| slices_on(b, dn)).collect();
         let dn_widths: Vec<usize> = dn_carriers.iter().map(|&b| slices_on(b, dn).len()).collect();
         let out_rows = node_interface(layer.mlp)?;
@@ -605,7 +730,17 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
         ];
         let mut gates = gate_ops(&format!("{name}.mlp.fc"), &f_comps, &h2_interface, is_shared(&f_comps))?;
         operators.append(&mut gates);
-        let mut nodes = vec![Node::Param { index: 0 }];
+        let mut inputs = vec![h2];
+        inputs.extend(extra_inputs(&f_cross, &inputs));
+        let d_inputs = extra_inputs(&d_cross, &inputs);
+        inputs.extend(d_inputs);
+        let mut nodes: Vec<Node> = (0..inputs.len()).map(|index| Node::Param { index }).collect();
+        let fc_parts = cross_parts(&artifact, &mut nodes, (&mut operators, base), &format!("{name}.mlp.fc"), &f_cross, &inputs)?;
+        let fc_own = (f_carried > 0 && !f_direction).then(|| {
+            let groups = f_carried + f_comps.len();
+            operators.push(dense(&format!("{name}.mlp.fc.select_own"), units(f_comps.len())?, units(groups)?, selection(&(f_carried..groups).collect::<Vec<_>>(), groups))?);
+            Ok::<usize, String>(base + operators.len() - 1)
+        }).transpose()?;
         let fc_assign = is_shared(&f_comps).then(|| if f_direction { base + 7 } else { base + 4 });
         if fc_assign.is_some() {
             shares.push(share_of(&format!("{name}.mlp.fc"), &f_comps)?);
@@ -635,7 +770,8 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
             nodes.push(Node::Gated { value: a, gate: z, scale: Some(s) });
             (nodes.len() - 1, z, s)
         } else {
-            stage_nodes(&mut nodes, 0, (base, base + 4, base + 5, base + 6), fc_assign, f_direction)
+            let (gated, z, s) = stage_nodes(&mut nodes, 0, (base, base + 4, base + 5, base + 6), fc_assign, f_direction, fc_own, Some(fc_parts));
+            (gated.ok_or("the gated reads")?, z, s)
         };
         nodes.push(Node::Affine { terms: vec![(gated, base + 1)], bias: None });
         nodes.push(Node::Pointwise { input: nodes.len() - 1, laws: laws.clone() });
@@ -645,8 +781,8 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
             nodes.push(Node::Affine { terms: vec![(act, base + 2)], bias: None });
             nodes.len() - 1
         });
-        let (mut gate_parts, mut soft_parts) = (Vec::new(), Vec::new());
-        let carried: Vec<usize> = dn_carriers.iter().filter(|b| f_comps.contains(b)).map(|b| f_comps.iter().position(|a| a == b).unwrap_or(0)).collect();
+        let (mut gate_parts, mut soft_parts) = cross_parts(&artifact, &mut nodes, (&mut operators, base), &format!("{name}.mlp.dn"), &d_cross, &inputs)?;
+        let carried: Vec<usize> = dn_carriers[d_carried..].iter().filter(|b| f_comps.contains(b)).map(|b| f_comps.iter().position(|a| a == b).unwrap_or(0)).collect();
         if !carried.is_empty() {
             operators.push(dense(&format!("{name}.mlp.dn_select_gate"), units(carried.len())?, units(f_comps.len())?, selection(&carried, f_comps.len()))?);
             nodes.push(Node::Affine { terms: vec![(z_f, base + operators.len() - 1)], bias: None });
@@ -655,7 +791,7 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
             soft_parts.push(nodes.len() - 1);
         }
         if !d_own.is_empty() {
-            let own_first = carried.len();
+            let own_first = d_carried + carried.len();
             operators.push(dense(&format!("{name}.mlp.dn_select_own"), units(d_own.len())?, units(dn_carriers.len())?, selection(&(own_first..dn_carriers.len()).collect::<Vec<_>>(), dn_carriers.len()))?);
             let select = base + operators.len() - 1;
             // Down components with candidates follow a c_fc component's gate or keep their own
@@ -721,8 +857,8 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
         });
         nodes.push(Node::Gated { value: a_dn, gate: z, scale: Some(s) });
         nodes.push(Node::Affine { terms: vec![(nodes.len() - 1, base + 3)], bias: None });
-        let rule = Rule { name: format!("{name}.mlp"), inputs: vec![h2_interface.clone()], output: nodes.len() - 1, nodes };
-        artifact = artifact.replace_block(&format!("{name}.mlp"), Callee::New(rule), vec![Argument::Native(h2)], layer.mlp, operators)?;
+        let rule = Rule { name: format!("{name}.mlp"), inputs: inputs.iter().map(|&n| node_interface(n)).collect::<Result<_, _>>()?, output: nodes.len() - 1, nodes };
+        artifact = artifact.replace_block(&format!("{name}.mlp"), Callee::New(rule), inputs.iter().map(|&n| Argument::Native(n)).collect(), layer.mlp, operators)?;
     }
     // Each shared component's gate is a choice among its candidates: ln K nats to send.
     let choices: f64 = shares.iter().flat_map(|s| s.candidates.iter()).map(|c| (c.len() as f64).ln()).sum();
@@ -1170,6 +1306,13 @@ pub fn dump_parts(native: &OperatorProgram, layers: &[LayerNodes], artifact: &Ar
     let mut at: BTreeMap<(usize, usize), Vec<usize>> = BTreeMap::new();
     for (b, c) in components.iter().enumerate() {
         let site = read_site(c);
+        let home = (site / KINDS.len(), stage(site));
+        if c.slices.iter().any(|&[s, _]| {
+            let place = (s / KINDS.len(), stage(s));
+            place != home && !(place.0 == home.0 && matches!((home.1, place.1), (0, 1) | (2, 3)))
+        }) {
+            return Err(error(format!("component {b}: dump_parts does not dump a block across blocks")));
+        }
         at.entry((site / KINDS.len(), stage(site))).or_default().push(b);
     }
     let trace = artifact.execute(inputs)?;
