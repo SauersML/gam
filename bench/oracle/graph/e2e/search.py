@@ -162,7 +162,8 @@ def objective_of(kind: str):
     if kind == "total":
         return lambda r: r["total_bits"]
     import table
-    return lambda r: table.shared(r)[1] * r["N"]
+    families = {"shared": table.SHARED, "fit": table.FIT}[kind]
+    return lambda r: table.shared(r, families)[1] * r["N"]
 
 
 def greedy(pool: Pool, model: str, mode: str, experiments: int, seed: int, min_neurons: int, log, start=None,
@@ -283,8 +284,9 @@ def main() -> None:
     ap.add_argument("--start", help="comma-separated units to start from (h<l>_<h>, m<l>_<start>_<stop>)")
     ap.add_argument("--tag", default="", help="suffix of the output names")
     ap.add_argument("--stand-in", choices=["counterfactual", "global"], help="the programs' stand-in form (checker default: counterfactual)")
-    ap.add_argument("--objective", default="total", choices=["total", "shared"],
-                    help="minimize the score's total, or the total over the experiment families every program shares")
+    ap.add_argument("--objective", default="total", choices=["total", "shared", "fit"],
+                    help="minimize the score's total, the total over the families every program shares, or over the fit "
+                         "families (table.FIT; the held-out ones, table.HELDOUT, stay for reporting)")
     ap.add_argument("--mlp-view", default="native", choices=["native", "vpd"], help="MLP units: native neuron blocks or VPD subcomponents")
     ap.add_argument("--ranking", type=Path, help="with --mlp-view vpd: measured removal effects of VPD subcomponents (sites -> kl_bits)")
     ap.add_argument("--vpd", type=Path, default=Path.home() / "mpd-data/engine/vpd4l_decomposition",

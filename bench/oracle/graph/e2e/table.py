@@ -19,18 +19,22 @@ TERMS = ["total_bits", "exec_error_bits", "opaque_bits", "code_bits", "reader_er
 # total over them compares programs on the same experiments (the aimed, swap and cut families depend on
 # what the program declares).
 SHARED = ("clean", "counterfactual", "edit_uniform", "rank_one")
+# Fit and held-out families for anti-Goodhart reporting (night plan): search selects on removals,
+# scalings and prompt edits; rank-one perturbations, node swaps and edge cuts are held out.
+FIT = ("clean", "counterfactual", "edit_uniform", "edit_aimed")
+HELDOUT = ("rank_one", "swap", "cut_declared", "cut_undeclared")
 COLUMNS = ["behavior", "program", "stand_in", "total", "exec_error", "opaque", "code", "reader_error", "opaque_numbers",
            "shared_exec_error", "shared_total", "checker_calls", "source_file"]
 
 
-def shared(s: dict) -> tuple[float, float] | None:
-    """Mean KL per token over the shared families and the total with it in place of the execution error
-    (bits per scored token), or None without per-family terms."""
+def shared(s: dict, families=SHARED) -> tuple[float, float] | None:
+    """Mean KL per token over `families` (default: the shared ones) and the total with it in place of the
+    execution error (bits per scored token), or None without per-family terms for them."""
     pf = s.get("per_family") or {}
-    tokens = sum(pf[f]["tokens"] for f in SHARED if f in pf)
+    tokens = sum(pf[f]["tokens"] for f in families if f in pf)
     if not tokens:
         return None
-    mean = sum(pf[f]["mean_kl_bits"] * pf[f]["tokens"] for f in SHARED if f in pf) / tokens
+    mean = sum(pf[f]["mean_kl_bits"] * pf[f]["tokens"] for f in families if f in pf) / tokens
     n = s.get("N", 2**24)
     return mean, mean + (s.get("opaque_bits", 0.0) + s.get("code_bits", 0.0) + (s.get("reader_error_bits") or 0.0)) / n
 
