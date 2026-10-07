@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The reader term of e2e/run.py's programs on MATS (#2951): one reader_score.py server (Qwen3-8B on vLLM,
+# The reader term of e2e/run.py's programs on MATS (#2951): one reader_score.py server (Qwen3-8B, prefix-cached transformers,
 # g-rl's ~/rl-venv, built here as rl/mats_rl.sh builds it when missing) scores every DIR/<stem>.program.jsonl written by
 # `run.py --items DIR` on its own DIR/<stem>.items.jsonl and writes OUT/<stem>.reader.json (the reader
 # term with the empty-program and code-alone baselines).
@@ -21,7 +21,7 @@ py=$HOME/rl-venv/bin/python
 export TOKENIZERS_PARALLELISM=false
 mkdir -p "$OUT"
 PORT=$((40000 + ${SLURM_JOB_ID:-1} % 20000))
-"$py" "$here/../reader_score.py" serve --backend vllm --model Qwen/Qwen3-8B --target "$TARGET" --listen "127.0.0.1:$PORT" > "$OUT/server.log" 2>&1 &
+"$py" "$here/../reader_score.py" serve --model Qwen/Qwen3-8B --target "$TARGET" --listen "127.0.0.1:$PORT" > "$OUT/server.log" 2>&1 &
 server=$!
 trap 'kill $server 2> /dev/null' EXIT
 "$py" - "$DIR" "$OUT" "$PORT" <<'EOF'

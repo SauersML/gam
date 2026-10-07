@@ -221,14 +221,15 @@ def kl_bits(p: np.ndarray, p_other: float, q: np.ndarray) -> float:
 class CachedReader:
     """A frozen Hugging Face causal LM read under a shared prefix: the prefix (a program's text) runs once
     and its key/value cache is repeated across a batch of suffixes (the items), right padded, so a
-    program's items pay only for their own tokens. bfloat16 on CUDA, float32 elsewhere (Mac tests).
+    program's items pay only for their own tokens. bfloat16 on CUDA and on the Mac's GPU (--device mps),
+    float32 on the CPU (tests).
     vLLM is not used: its prompt log-probabilities bypass its prefix cache (sampling_params.py sets
     skip_reading_prefix_cache whenever prompt_logprobs is requested), so every extension prompt was a
     full prefill with output logits at every position."""
 
     name = "cached"
 
-    def __init__(self, model: str, batch_tokens: int, max_batch: int, seed: int = 0):
+    def __init__(self, model: str, batch_tokens: int, max_batch: int, seed: int = 0, device: str | None = None):
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -236,8 +237,8 @@ class CachedReader:
         self.torch, self.model_id, self.seed = torch, model, seed
         self.batch_tokens, self.max_batch = batch_tokens, max_batch
         self.tokenizer = AutoTokenizer.from_pretrained(model)
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        dtype = torch.bfloat16 if self.device.type == "cuda" else torch.float32
+        self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+        dtype = torch.float32 if self.device.type == "cpu" else torch.bfloat16
         self.model = AutoModelForCausalLM.from_pretrained(model, dtype=dtype).to(self.device).eval()
         self.pad = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id
 
@@ -433,8 +434,9 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--batch-tokens", type=int, default=65536, help="tokens per forward pass, the shared prefix counted per sequence (memory)")
     ap.add_argument("--max-batch", type=int, default=32, help="sequences per forward pass")
+    ap.add_argument("--device", help="cuda, mps or cpu (default: cuda when present, else cpu)")
     args = ap.parse_args()
-    scorer = Scorer(CachedReader(args.model, args.batch_tokens, args.max_batch, args.seed), args.target)
+    scorer = Scorer(CachedReader(args.model, args.batch_tokens, args.max_batch, args.seed, args.device), args.target)
     if args.command == "serve":
         host, sep, port = args.listen.rpartition(":")
         server = socketserver.TCPServer((host, int(port)), _Handler) if sep and port.isdigit() else socketserver.UnixStreamServer(args.listen, _Handler)
