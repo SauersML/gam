@@ -163,3 +163,30 @@ def test_search_programs_trace_and_names_round_trip():
     assert len(ir["nodes"]) == len(units) and len(ir["edges"]) == edges
     blocks = search.pieces_of(("mlp", 0, 0, 3072), 384)
     assert len(blocks) == 15 and all(sum(r[3] - r[2] for r in rest) + b[3] - b[2] == 3072 for b, rest in blocks)
+
+
+def test_reader_subsample_is_stratified_and_complete():
+    import full_score
+    items = [{"family": f, "id": i} for i, f in enumerate(["clean"] * 3 + ["swap"] * 50 + ["cut"] * 10)]
+    sample = full_score.subsample(items, 12)
+    families = [it["family"] for it in sample]
+    assert len(sample) == 12 and families.count("clean") == 3 and families.count("cut") >= 4
+    assert len({it["id"] for it in sample}) == 12
+    assert full_score.subsample(items[:5], 12) == items[:5]
+
+
+def test_table_reads_sweep_search_and_oracle(tmp_path):
+    import table
+    n = 2**24
+    terms = lambda t: {"total_bits": t * n, "exec_error_bits": t * n, "opaque_bits": 0.0, "code_bits": 0.0, "N": n, "opaque_numbers": 0}
+    (tmp_path / "sweep").mkdir()
+    (tmp_path / "sweep" / "a.b.json").write_text(json.dumps({"behavior": "a.b", "programs": {"empty": terms(3.0), "hand": terms(2.0)}}))
+    (tmp_path / "search").mkdir()
+    (tmp_path / "search" / "a.b.addition_cf.json").write_text(json.dumps({"heldout": terms(1.5), "score": terms(1.4), "calls": 99,
+                                                                          "stand_in": "counterfactual"}))
+    (tmp_path / "oracle").mkdir()
+    for run, t in (("r1", 1.2), ("r2", 1.1)):
+        (tmp_path / "oracle" / f"a.b.{run}.json").write_text(json.dumps({"behavior": "a.b", "score": terms(t)}))
+    rows = table.collect(tmp_path / "sweep", [tmp_path / "search"], tmp_path / "oracle")
+    got = {r[1]: (r[3], r[9]) for r in rows}
+    assert got == {"empty": ("3.0000", ""), "hand": ("2.0000", ""), "search addition_cf": ("1.5000", "99"), "oracle": ("1.1000", "")}
