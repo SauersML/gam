@@ -4490,8 +4490,11 @@ pub fn fit_from(
                 let lambda = progress.multiplier;
                 let predicted = device_posterior.pending_predicted().unwrap_or(0.0);
                 let (accepted, change, standard_error) = step_accepted(&mut scorer, &device_posterior, explanation, &posterior.active, (&batch, &experiments, key), new, all_on.as_ref(), (scale, tokens, lambda))?;
-                // The trust region's ratio test, on a change resolved beyond its standard error.
-                if predicted > 0.0 && change.abs() > standard_error {
+                // The trust region's ratio test, where the batch can test the model: the predicted
+                // decrease beyond the measurement's standard error. Below it a single batch's ratio is
+                // its noise over the prediction: tested on every resolved change, the factor fell to
+                // 7e-9 within 276 steps (decomp-vpd4l-i, 4b76a52dcc), quartered on each chance rise.
+                if predicted > standard_error {
                     device_posterior.trust_update(-change / predicted);
                 }
                 if accepted {
