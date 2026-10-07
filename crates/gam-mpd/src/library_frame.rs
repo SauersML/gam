@@ -322,7 +322,9 @@ fn pursuit(x: ndarray::ArrayView1<f64>, atoms: &Array2<f64>, bits_per_atom: f64)
         let chosen = atoms.select(Axis(0), &support);
         let gram = chosen.dot(&chosen.t());
         let rhs = chosen.dot(&x).insert_axis(Axis(1));
-        let Ok(solved) = gam_linalg::decompose::solve(gram.view(), rhs.view()) else { break };
+        // The least squares coefficients on the support; a pseudo-inverse, since a duplicated atom
+        // (atoms drawn from equal-direction rows) makes the support's Gram singular.
+        let solved = gam_linalg::decompose::pseudo_inverse_solve(gram.view(), rhs.view()).map_err(|e| error(format!("{e:?}")))?;
         let coefficients = solved.column(0).to_vec();
         residual = &x - &chosen.t().dot(&solved.column(0));
         let left = residual.dot(&residual);
