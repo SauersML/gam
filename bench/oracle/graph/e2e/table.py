@@ -45,7 +45,22 @@ def row(behavior: str, program: str, s: dict, stand_in, calls, source: str) -> l
     return cells
 
 
-def collect(sweep: Path | None, searches: list[Path], oracle: Path | None) -> list[list[str]]:
+def oracle_eval_rows(path: Path) -> list[list[str]]:
+    """g-rl's train.py evaluation log (eval.jsonl): per behavior, the latest step's best-of-N and mean
+    single-sample totals (bits, N = 2^24 assumed: the score's default size)."""
+    latest: dict[str, dict] = {}
+    for line in path.read_text().splitlines():
+        r = json.loads(line)
+        if "behavior" in r and (r["behavior"] not in latest or r["step"] >= latest[r["behavior"]]["step"]):
+            latest[r["behavior"]] = r
+    rows = []
+    for b, r in latest.items():
+        for label, key in (("oracle best of n", "best_bits"), ("oracle mean", "mean_bits")):
+            rows.append(row(b, f"{label} (step {r['step']})", {"total_bits": r[key]}, None, None, str(path)))
+    return rows
+
+
+def collect(sweep: Path | None, searches: list[Path], oracle: Path | None, oracle_evals: list[Path] = ()) -> list[list[str]]:
     rows = []
     behaviors = set()
     if sweep is not None:
@@ -70,6 +85,8 @@ def collect(sweep: Path | None, searches: list[Path], oracle: Path | None) -> li
             if "total_bits" in s and (r["behavior"] not in best or s["total_bits"] < best[r["behavior"]][0]):
                 best[r["behavior"]] = (s["total_bits"], row(r["behavior"], "oracle", s, r.get("stand_in"), None, str(path)))
         rows += [v[1] for v in best.values()]
+    for path in oracle_evals:
+        rows += oracle_eval_rows(path)
     return sorted(rows, key=lambda c: (c[0], c[1]))
 
 
@@ -78,9 +95,11 @@ def main() -> None:
     ap.add_argument("--sweep", type=Path, default=RUNS / "sweep")
     ap.add_argument("--search", type=Path, nargs="*", default=[RUNS / "search"])
     ap.add_argument("--oracle", type=Path, default=RUNS / "oracle")
+    ap.add_argument("--oracle-eval", type=Path, nargs="*", default=[], help="g-rl's eval.jsonl files")
     ap.add_argument("--out", type=Path, default=RUNS / "oracle_vs_search.tsv")
     a = ap.parse_args()
-    rows = collect(a.sweep if a.sweep.exists() else None, [d for d in a.search if d.exists()], a.oracle if a.oracle.exists() else None)
+    rows = collect(a.sweep if a.sweep.exists() else None, [d for d in a.search if d.exists()], a.oracle if a.oracle.exists() else None,
+                   [p for p in a.oracle_eval if p.exists()])
     text = "\t".join(COLUMNS) + "\n" + "".join("\t".join(r) + "\n" for r in rows)
     a.out.parent.mkdir(parents=True, exist_ok=True)
     a.out.write_text(text)

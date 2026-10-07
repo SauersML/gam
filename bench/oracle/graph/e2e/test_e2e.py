@@ -187,9 +187,14 @@ def test_table_reads_sweep_search_and_oracle(tmp_path):
     (tmp_path / "oracle").mkdir()
     for run, t in (("r1", 1.2), ("r2", 1.1)):
         (tmp_path / "oracle" / f"a.b.{run}.json").write_text(json.dumps({"behavior": "a.b", "score": terms(t)}))
-    rows = table.collect(tmp_path / "sweep", [tmp_path / "search"], tmp_path / "oracle")
+    (tmp_path / "eval.jsonl").write_text("\n".join(json.dumps(r) for r in [
+        {"set": "heldout", "step": 0, "behavior": "a.b", "mean_bits": 3.5 * n, "best_bits": 2.5 * n},
+        {"set": "heldout", "step": 4, "behavior": "a.b", "mean_bits": 2.2 * n, "best_bits": 1.3 * n},
+        {"summary": {}, "step": 4}]))
+    rows = table.collect(tmp_path / "sweep", [tmp_path / "search"], tmp_path / "oracle", [tmp_path / "eval.jsonl"])
     got = {r[1]: (r[3], r[11]) for r in rows}
-    assert got == {"empty": ("3.0000", ""), "hand": ("2.0000", ""), "search addition_cf": ("1.5000", "99"), "oracle": ("1.1000", "")}
+    assert got == {"empty": ("3.0000", ""), "hand": ("2.0000", ""), "search addition_cf": ("1.5000", "99"), "oracle": ("1.1000", ""),
+                   "oracle best of n (step 4)": ("1.3000", ""), "oracle mean (step 4)": ("2.2000", "")}
 
 
 def test_vpd_units_take_the_strongest_subcomponents():
