@@ -396,6 +396,26 @@ impl RowLists {
     }
 }
 
+/// What [`Device::row_norm`] makes of each row: the norm `N(y)`, its tangent along a direction, or
+/// its pullback of a cotangent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowNorm {
+    Apply,
+    Tangent,
+    Pullback,
+}
+
+impl RowNorm {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn code(self) -> u32 {
+        match self {
+            Self::Apply => 0,
+            Self::Tangent => 1,
+            Self::Pullback => 2,
+        }
+    }
+}
+
 /// Which of an operator's coordinates its prior-group ids index ([`GroupMap`]).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GroupAxis {
@@ -1773,6 +1793,48 @@ impl Device {
             Backend::Cuda(engine) => engine.listed_product_t(v, lists, group_of, y),
             #[cfg(target_os = "macos")]
             Backend::Metal(engine) => engine.listed_product_t(v, lists, group_of, y),
+        }
+    }
+
+    /// A block's input norm per row of `y` (rows × d), an affine gain of an RMS norm
+    /// `N(y) = γ ⊙ y r + β`, `r = (Σ_k y_k² / d + ε)^{−1/2}`, or its tangent along `along` or its
+    /// pullback of `along` ([`RowNorm`]), with the gain `γ` and bias `β` as rows (1 × d). Every sum
+    /// runs in index order, each product and sum rounded on its own, so in float64 the values are
+    /// the host's iterator expressions' bit for bit (`interchange`'s cuts).
+    pub fn row_norm(&self, mode: RowNorm, y: &Tensor, along: Option<&Tensor>, (gain, bias): (&Tensor, Option<&Tensor>), epsilon: f64) -> Result<Tensor, GpuError> {
+        let (rows, d) = y.dim();
+        let wanted = mode != RowNorm::Apply;
+        if gain.dim() != (1, d) || bias.is_some_and(|b| b.dim() != (1, d)) || along.is_some() != wanted || along.is_some_and(|t| t.dim() != (rows, d)) {
+            return Err(shape(format!("a row norm of {:?} with a {:?} gain", y.dim(), gain.dim())));
+        }
+        match &*self.backend {
+            Backend::Host => {
+                let (yv, gv) = (host(y)?, host(gain)?);
+                let (tv, bv) = (along.map(host).transpose()?, bias.map(host).transpose()?);
+                let mut out = vec![0.0; rows * d];
+                for (r, o) in out.chunks_mut(d.max(1)).take(rows).enumerate() {
+                    let s = &yv[r * d..(r + 1) * d];
+                    let scale = 1.0 / (s.iter().map(|v| v * v).sum::<f64>() / d as f64 + epsilon).sqrt();
+                    match mode {
+                        RowNorm::Apply => o.iter_mut().enumerate().for_each(|(k, o)| *o = gv[k] * s[k] * scale + bv.map_or(0.0, |b| b[k])),
+                        RowNorm::Tangent => {
+                            let t = &tv.ok_or_else(|| shape("a tangent without its direction".to_string()))?[r * d..(r + 1) * d];
+                            let dr = -scale * scale * scale * s.iter().zip(t).map(|(a, b)| a * b).sum::<f64>() / d as f64;
+                            o.iter_mut().enumerate().for_each(|(k, o)| *o = gv[k] * (scale * t[k] + s[k] * dr));
+                        }
+                        RowNorm::Pullback => {
+                            let w = &tv.ok_or_else(|| shape("a pullback without its cotangent".to_string()))?[r * d..(r + 1) * d];
+                            let along: f64 = s.iter().zip(w).zip(gv).map(|((v, w), g)| g * w * v).sum::<f64>() * scale * scale * scale / d as f64;
+                            o.iter_mut().enumerate().for_each(|(k, o)| *o = scale * gv[k] * w[k] - along * s[k]);
+                        }
+                    }
+                }
+                Ok(Tensor { rows, cols: d, data: Data::Host(out) })
+            }
+            #[cfg(target_os = "linux")]
+            Backend::Cuda(engine) => engine.row_norm(mode, y, along, (gain, bias), epsilon),
+            #[cfg(target_os = "macos")]
+            Backend::Metal(engine) => engine.row_norm(mode, y, along, (gain, bias), epsilon),
         }
     }
 
@@ -4099,6 +4161,34 @@ extern "C" __global__ void listed_product_t(u64 total, unsigned int m, unsigned 
             s += v[r * n + c] * y[r * m + j];
         }
         out[i] = s;
+    }
+}
+
+// A block's input norm per row of y (rows × d, one thread a row, every sum in index order from
+// −0, as the host's iterator sums): r = 1 / √(Σ y² / d + ε); mode 0 N(y) = γ y r + β (β zero
+// without a bias); mode 1 its tangent along t, γ (r t + y dr) with dr = −r r r (Σ y t) / d; mode 2
+// its pullback of t, (r γ) t − a y with a = (Σ γ t y) r r r / d. No product is fused into an add.
+extern "C" __global__ void row_norm(unsigned int rows, unsigned int d, unsigned int mode, double epsilon, const double* y, const double* t, const double* g, const double* b, int has_bias, double* out) {
+    GRID_STRIDE(r, rows) {
+        const double* yr = y + r * d;
+        const double* tr = t + r * d;
+        double* o = out + r * d;
+        double sq = -0.0;
+        for (unsigned int k = 0; k < d; ++k) sq = sq + yr[k] * yr[k];
+        double scale = 1.0 / sqrt(sq / (double)d + (double)epsilon);
+        if (mode == 0) {
+            for (unsigned int k = 0; k < d; ++k) o[k] = g[k] * yr[k] * scale + (has_bias ? b[k] : 0.0);
+        } else if (mode == 1) {
+            double dot = -0.0;
+            for (unsigned int k = 0; k < d; ++k) dot = dot + yr[k] * tr[k];
+            double dr = -scale * scale * scale * dot / (double)d;
+            for (unsigned int k = 0; k < d; ++k) o[k] = g[k] * (scale * tr[k] + yr[k] * dr);
+        } else {
+            double dot = -0.0;
+            for (unsigned int k = 0; k < d; ++k) dot = dot + g[k] * tr[k] * yr[k];
+            double along = dot * scale * scale * scale / (double)d;
+            for (unsigned int k = 0; k < d; ++k) o[k] = scale * g[k] * tr[k] - along * yr[k];
+        }
     }
 }
 
@@ -7021,6 +7111,35 @@ extern "C" __global__ void group_divergence(u64 n, int scaled, const double* ref
             Ok(out)
         }
 
+        pub(super) fn row_norm(&self, mode: super::RowNorm, y: &Tensor, along: Option<&Tensor>, (gain, bias): (&Tensor, Option<&Tensor>), epsilon: f64) -> Result<Tensor, GpuError> {
+            let storage = y.storage();
+            if storage == Storage::Bf16 {
+                return Err(shape("row_norm of a bfloat16 tensor".to_string()));
+            }
+            let mut out = self.output(storage, y.rows, y.cols)?;
+            let (rows, d, code, has_bias) = (u32_of(y.rows)?, u32_of(y.cols)?, mode.code(), i32::from(bias.is_some()));
+            let f = self.kernel("row_norm", storage)?;
+            // SAFETY: y, along and out hold rows × d values, gain and bias d (checked by the caller);
+            // `along` and `bias` stand in for themselves as `y` and `gain` when absent (not read).
+            unsafe {
+                self.stream
+                    .launch_builder(&f)
+                    .arg(&rows)
+                    .arg(&d)
+                    .arg(&code)
+                    .arg(&epsilon)
+                    .input(y, storage)?
+                    .input(along.unwrap_or(y), storage)?
+                    .input(gain, storage)?
+                    .input(bias.unwrap_or(gain), storage)?
+                    .arg(&has_bias)
+                    .output(&mut out, storage)?
+                    .launch(cfg_elements(u64::from(rows)))
+            }
+            .gpu_ctx("tensor row_norm")?;
+            Ok(out)
+        }
+
         pub(super) fn transpose(&self, t: &Tensor) -> Result<Tensor, GpuError> {
             let storage = t.storage();
             if storage == Storage::Bf16 {
@@ -8225,6 +8344,36 @@ kernel void t_listed_product_t(device const float* v [[buffer(0)]], device const
     }
 }
 
+// A block's input norm per row (p.n rows of p.cols, one thread a row, sums in index order from −0):
+// p.a the mode (0 N(y), 1 its tangent along t, 2 its pullback of t), p.b whether β is read,
+// p.alpha ε.
+kernel void t_row_norm(device const float* y [[buffer(0)]], device const float* t [[buffer(1)]], device const float* g [[buffer(2)]],
+                       device const float* b [[buffer(3)]], device float* out [[buffer(4)]], constant P& p [[buffer(5)]],
+                       uint gid [[thread_position_in_grid]], uint grid [[threads_per_grid]]) {
+    ELEMENTS {
+        uint d = p.cols;
+        device const float* yr = y + i * d;
+        device const float* tr = t + i * d;
+        device float* o = out + i * d;
+        float sq = -0.0f;
+        for (uint k = 0; k < d; ++k) sq = sq + yr[k] * yr[k];
+        float scale = 1.0f / sqrt(sq / float(d) + p.alpha);
+        if (p.a == 0) {
+            for (uint k = 0; k < d; ++k) o[k] = g[k] * yr[k] * scale + (p.b ? b[k] : 0.0f);
+        } else if (p.a == 1) {
+            float dot = -0.0f;
+            for (uint k = 0; k < d; ++k) dot = dot + yr[k] * tr[k];
+            float dr = -scale * scale * scale * dot / float(d);
+            for (uint k = 0; k < d; ++k) o[k] = g[k] * (scale * tr[k] + yr[k] * dr);
+        } else {
+            float dot = -0.0f;
+            for (uint k = 0; k < d; ++k) dot = dot + g[k] * tr[k] * yr[k];
+            float along = dot * scale * scale * scale / float(d);
+            for (uint k = 0; k < d; ++k) o[k] = scale * g[k] * tr[k] - along * yr[k];
+        }
+    }
+}
+
 // out = tᵀ over its p.n entries (t p.rows × p.cols).
 kernel void t_transpose(device const float* t [[buffer(0)]], device float* out [[buffer(1)]], constant P& p [[buffer(2)]],
                         uint gid [[thread_position_in_grid]], uint grid [[threads_per_grid]]) {
@@ -9013,6 +9162,7 @@ kernel void t_group_divergence(device float* sums [[buffer(0)]], device const fl
         "t_listed_product",
         "t_transpose",
         "t_listed_product_t",
+        "t_row_norm",
         "t_softmax_quadratic",
         "t_argmax_rows",
         "t_fill_entries",
@@ -9257,6 +9407,14 @@ kernel void t_group_divergence(device float* sums [[buffer(0)]], device const fl
             u32_of(v.len().max(y.len()).max(out.len()))?;
             let p = P { cols: u32_of(y.cols)?, extra: u32_of(v.cols)?, ..P::default() };
             self.elements("t_listed_product_t", &[whole(buffer(v)?), whole(buffer(y)?), whole(index_buffer(&lists.offsets)?), whole(index_buffer(&lists.columns)?), whole(index_buffer(group_of)?), whole(buffer(&out)?)], out.len(), p)?;
+            Ok(out)
+        }
+
+        pub(super) fn row_norm(&self, mode: super::RowNorm, y: &Tensor, along: Option<&Tensor>, (gain, bias): (&Tensor, Option<&Tensor>), epsilon: f64) -> Result<Tensor, GpuError> {
+            let out = self.tensor(y.rows, y.cols)?;
+            u32_of(y.len())?;
+            let p = P { cols: u32_of(y.cols)?, a: mode.code(), b: u32::from(bias.is_some()), alpha: epsilon as f32, ..P::default() };
+            self.elements("t_row_norm", &[whole(buffer(y)?), whole(buffer(along.unwrap_or(y))?), whole(buffer(gain)?), whole(buffer(bias.unwrap_or(gain))?), whole(buffer(&out)?)], y.rows, p)?;
             Ok(out)
         }
 

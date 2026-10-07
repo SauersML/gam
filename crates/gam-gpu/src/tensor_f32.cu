@@ -675,6 +675,34 @@ extern "C" __global__ void listed_product_t(u64 total, unsigned int m, unsigned 
     }
 }
 
+// A block's input norm per row of y (rows × d, one thread a row, every sum in index order from
+// −0, as the host's iterator sums): r = 1 / √(Σ y² / d + ε); mode 0 N(y) = γ y r + β (β zero
+// without a bias); mode 1 its tangent along t, γ (r t + y dr) with dr = −r r r (Σ y t) / d; mode 2
+// its pullback of t, (r γ) t − a y with a = (Σ γ t y) r r r / d. No product is fused into an add.
+extern "C" __global__ void row_norm(unsigned int rows, unsigned int d, unsigned int mode, double epsilon, const float* y, const float* t, const float* g, const float* b, int has_bias, float* out) {
+    GRID_STRIDE(r, rows) {
+        const float* yr = y + r * d;
+        const float* tr = t + r * d;
+        float* o = out + r * d;
+        float sq = -0.0f;
+        for (unsigned int k = 0; k < d; ++k) sq = sq + yr[k] * yr[k];
+        float scale = 1.0f / sqrtf(sq / (float)d + (float)epsilon);
+        if (mode == 0) {
+            for (unsigned int k = 0; k < d; ++k) o[k] = g[k] * yr[k] * scale + (has_bias ? b[k] : 0.0f);
+        } else if (mode == 1) {
+            float dot = -0.0f;
+            for (unsigned int k = 0; k < d; ++k) dot = dot + yr[k] * tr[k];
+            float dr = -scale * scale * scale * dot / (float)d;
+            for (unsigned int k = 0; k < d; ++k) o[k] = g[k] * (scale * tr[k] + yr[k] * dr);
+        } else {
+            float dot = -0.0f;
+            for (unsigned int k = 0; k < d; ++k) dot = dot + g[k] * tr[k] * yr[k];
+            float along = dot * scale * scale * scale / (float)d;
+            for (unsigned int k = 0; k < d; ++k) o[k] = scale * g[k] * tr[k] - along * yr[k];
+        }
+    }
+}
+
 // out = tᵀ over its n = rows × cols entries (t rows × cols).
 extern "C" __global__ void transpose(u64 n, unsigned int rows, unsigned int cols, const float* t, float* out) {
     GRID_STRIDE(i, n) out[i] = t[(i % rows) * cols + i / rows];

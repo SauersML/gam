@@ -72,7 +72,7 @@ use crate::{
     resident_causal_fit::fixed_head_target::{Head, ResidentHead, Target},
     run_check::LayerNodes,
 };
-use gam_gpu::tensor::{Arithmetic, ColumnBlocks, Device, Op, Storage, Tensor};
+use gam_gpu::tensor::{Arithmetic, ColumnBlocks, Device, Op, RowNorm, Storage, Tensor};
 use gam_runtime::resource::{Governed, MemoryGovernor};
 use rand::RngExt;
 use std::{
@@ -607,27 +607,12 @@ impl Norm {
         Some(Self { entry, epsilon: *epsilon, gain: g.diag().to_vec(), bias })
     }
 
-    fn scale(&self, s: &[f64]) -> f64 {
-        1.0 / (s.iter().map(|v| v * v).sum::<f64>() / s.len() as f64 + self.epsilon).sqrt()
-    }
-
-    fn apply(&self, s: &[f64]) -> Vec<f64> {
-        let r = self.scale(s);
-        s.iter().enumerate().map(|(k, v)| self.gain[k] * v * r + self.bias.as_ref().map_or(0.0, |b| b[k])).collect()
-    }
-
-    /// The tangent of `N(s)` along `ds`: `γ ⊙ (r ds + s dr)`, `dr = −r³ (s·ds)/d`.
-    fn tangent(&self, s: &[f64], ds: &[f64]) -> Vec<f64> {
-        let r = self.scale(s);
-        let dr = -r * r * r * s.iter().zip(ds).map(|(a, b)| a * b).sum::<f64>() / s.len() as f64;
-        s.iter().zip(ds).zip(&self.gain).map(|((v, dv), g)| g * (r * dv + v * dr)).collect()
-    }
-
-    /// The cotangent of `s` from the cotangent `w` of `N(s)`: `r γ ⊙ w − (r³/d) s Σ_k γ_k w_k s_k`.
-    fn pullback(&self, s: &[f64], w: &[f64]) -> Vec<f64> {
-        let r = self.scale(s);
-        let along: f64 = s.iter().zip(w).zip(&self.gain).map(|((v, w), g)| g * w * v).sum::<f64>() * r * r * r / s.len() as f64;
-        s.iter().zip(w).zip(&self.gain).map(|((v, w), g)| r * g * w - along * v).collect()
+    /// `N(y)` per row of `y`, its tangent along `along` or its pullback of `along` ([`RowNorm`]),
+    /// on `d` (`interchange`'s cuts run it in float64, as the host's arithmetic was).
+    fn rows(&self, d: &Device, mode: RowNorm, y: &Tensor, along: Option<&Tensor>) -> Result<Tensor, String> {
+        let gain = d.upload_vec(1, self.gain.len(), self.gain.clone()).map_err(error)?;
+        let bias = self.bias.as_ref().map(|b| d.upload_vec(1, b.len(), b.clone())).transpose().map_err(error)?;
+        d.row_norm(mode, y, along, (&gain, bias.as_ref()), self.epsilon).map_err(error)
     }
 }
 
@@ -637,31 +622,59 @@ impl Norm {
 /// (first in, first out: every pass reverses the calls in the same order).
 #[derive(Default)]
 pub(crate) struct Record {
-    values: [Vec<f64>; 2],
-    tangents: [Vec<f64>; 2],
-    carried: std::collections::VecDeque<Vec<f64>>,
+    values: [Option<Tensor>; 2],
+    tangents: [Option<Tensor>; 2],
+    carried: std::collections::VecDeque<Tensor>,
 }
 
 pub(crate) type Records = std::rc::Rc<RefCell<BTreeMap<usize, Record>>>;
 
 /// The cuts replacing one read node's rows ([`Edits`]): the block's input norm, per cut its row
-/// and cut, the forward's `s` and `y = s + δ` per cut, and the reverse's cotangent of the stream
+/// and cut, the forward's `y = s + δ` (one row per cut), and the reverse's cotangent of the stream
 /// entering the block at the cuts' rows, which the block's reverse adds to the entering stream's.
+/// Both stay on the device in float64 (`wide`).
 struct CutReads {
     norm: Norm,
     rows: Vec<(usize, usize)>,
-    kept: RefCell<Vec<(Vec<f64>, Vec<f64>)>>,
-    entering: RefCell<Option<ndarray::Array2<f64>>>,
+    kept: RefCell<Option<Tensor>>,
+    entering: RefCell<Option<Tensor>>,
+}
+
+/// The device a cut computes on: float64 where the backend holds it, so `y = s + b − a` and the
+/// norm round as the host's float64 arithmetic did, each sum and product once.
+fn wide(d: &Device) -> Device {
+    d.with_storage(Storage::F64).unwrap_or_else(|_| d.clone())
+}
+
+/// Per cut of `cuts` (in order) its record's base (`role` 0) or donor (1) value, or with `tangent`
+/// their tangents (zero where none was recorded), as rows of a float64 tensor on `wide`.
+fn stacked(wide: &Device, recorded: &Records, cuts: &[(usize, usize)], (role, tangent): (usize, bool), width: usize) -> Result<Tensor, String> {
+    let mut out = wide.zeros(cuts.len(), width).map_err(error)?;
+    let records = recorded.borrow();
+    for (k, (_, cut)) in cuts.iter().enumerate() {
+        let record = records.get(cut).ok_or_else(|| error("a cut whose site was not recorded"))?;
+        let row = if tangent { record.tangents[role].as_ref() } else { record.values[role].as_ref() };
+        match row {
+            Some(row) => wide.set_rows(&mut out, k, &wide.convert(row).map_err(error)?).map_err(error)?,
+            None if tangent => {}
+            None => return Err(error("a cut whose site was not recorded")),
+        }
+    }
+    Ok(out)
 }
 
 /// Add `rows` (one per entry of `at`) to the rows `at` of `t`, each round of distinct rows at once.
 fn add_rows(d: &Device, t: &mut Tensor, at: &[usize], rows: &ndarray::Array2<f64>) -> Result<(), String> {
-    let added = d.upload(rows.view()).map_err(error)?;
+    add_row_tensor(d, t, at, &d.upload(rows.view()).map_err(error)?)
+}
+
+/// [`add_rows`] from rows already on the device.
+fn add_row_tensor(d: &Device, t: &mut Tensor, at: &[usize], added: &Tensor) -> Result<(), String> {
     for round in rounds(at) {
         let ranges = single(round.iter().map(|i| at[*i]));
         let mut h = d.gather_ranges(t, &ranges).map_err(error)?;
-        let part = picked(d, &added, &round)?;
-        d.axpy(&mut h, 1.0, part.as_ref().unwrap_or(&added)).map_err(error)?;
+        let part = picked(d, added, &round)?;
+        d.axpy(&mut h, 1.0, part.as_ref().unwrap_or(added)).map_err(error)?;
         d.scatter_ranges(t, &ranges, &h).map_err(error)?;
     }
     Ok(())
@@ -1188,7 +1201,7 @@ impl Edits {
                 Edit::CutRead { cut, block, .. } => {
                     let (read, norm) = sites.reads.get(*block).ok_or_else(|| error(format!("block {block}: no read")))?;
                     let norm = norm.clone().ok_or_else(|| error(format!("block {block}: an input norm a cut cannot recompute")))?;
-                    cuts.entry(*read).or_insert_with(|| CutReads { norm, rows: Vec::new(), kept: RefCell::new(Vec::new()), entering: RefCell::new(None) }).rows.push((*row, *cut));
+                    cuts.entry(*read).or_insert_with(|| CutReads { norm, rows: Vec::new(), kept: RefCell::new(None), entering: RefCell::new(None) }).rows.push((*row, *cut));
                 }
             }
         }
@@ -1243,7 +1256,7 @@ impl Edits {
     pub fn add_entering(&self, d: &Device, entering: &mut Tensor) -> Result<(), String> {
         for c in self.cuts.values() {
             if let Some(rows) = c.entering.borrow_mut().take() {
-                add_rows(d, entering, &c.rows.iter().map(|r| r.0).collect::<Vec<_>>(), &rows)?;
+                add_row_tensor(d, entering, &c.rows.iter().map(|r| r.0).collect::<Vec<_>>(), &d.convert(&rows).map_err(error)?)?;
             }
         }
         Ok(())
@@ -1261,34 +1274,34 @@ impl Edits {
         if let Some((rows, vectors)) = self.adds.get(&node) {
             add_rows(d, value, rows, vectors)?;
         }
-        let rows_of = |t: &Tensor, at: &[usize]| -> Result<ndarray::Array2<f64>, String> { d.download(&d.gather_ranges(t, &single(at.iter().copied())).map_err(error)?).map_err(error) };
+        // The probes and cuts stay on the device: a read-back here held the device idle while the
+        // host computed the replaced rows (about 110 ms of a 686 ms vpd4l step, decomp's grouped
+        // direction fit on an A40).
+        let rows_of = |t: &Tensor, at: &[usize]| -> Result<Tensor, String> { d.gather_ranges(t, &single(at.iter().copied())).map_err(error) };
         if let Some(probes) = self.probes.get(&node) {
             let recorded = self.recorded.as_ref().ok_or_else(|| error("a cut outside a plan"))?;
             let x = rows_of(value, &probes.iter().map(|p| p.0).collect::<Vec<_>>())?;
             for (k, (_, cut, role)) in probes.iter().enumerate() {
-                recorded.borrow_mut().entry(*cut).or_default().values[*role] = x.row(k).to_vec();
+                recorded.borrow_mut().entry(*cut).or_default().values[*role] = Some(d.rows_of(&x, k, 1).map_err(error)?);
             }
         }
         if let Some(c) = self.cuts.get(&node) {
             let recorded = self.recorded.as_ref().ok_or_else(|| error("a cut outside a plan"))?;
             let at: Vec<usize> = c.rows.iter().map(|r| r.0).collect();
-            let streams = rows_of(value_of(c.norm.entry)?, &at)?;
-            let mut replaced = ndarray::Array2::zeros((at.len(), value.cols()));
-            let mut kept = Vec::with_capacity(at.len());
-            for (k, (_, cut)) in c.rows.iter().enumerate() {
-                let records = recorded.borrow();
-                let record = records.get(cut).ok_or_else(|| error("a cut whose site was not recorded"))?;
-                let s = streams.row(k).to_vec();
-                let y: Vec<f64> = s.iter().zip(record.values[1].iter().zip(&record.values[0])).map(|(v, (b, a))| v + b - a).collect();
-                replaced.row_mut(k).assign(&ndarray::Array1::from(c.norm.apply(&y)));
-                kept.push((s, y));
-            }
-            *c.kept.borrow_mut() = kept;
-            let rounds_of = rounds(&at);
-            if rounds_of.len() > 1 {
+            if rounds(&at).len() > 1 {
                 return Err(error("two cuts replacing one read's row"));
             }
-            d.scatter_ranges(value, &single(at.iter().copied()), &d.upload(replaced.view()).map_err(error)?).map_err(error)?;
+            // y = s + b − a per cut (`s` the stream entering the block, `b` and `a` the site's donor
+            // and base values) and N(y), in float64: each sum and product rounded once, in the
+            // host's order, so the rows are its values bit for bit.
+            let wide = wide(d);
+            let width = value_of(c.norm.entry)?.cols();
+            let mut y = wide.convert(&rows_of(value_of(c.norm.entry)?, &at)?).map_err(error)?;
+            wide.axpy(&mut y, 1.0, &stacked(&wide, recorded, &c.rows, (1, false), width)?).map_err(error)?;
+            wide.axpy(&mut y, -1.0, &stacked(&wide, recorded, &c.rows, (0, false), width)?).map_err(error)?;
+            let replaced = d.convert(&c.norm.rows(&wide, RowNorm::Apply, &y, None)?).map_err(error)?;
+            *c.kept.borrow_mut() = Some(y);
+            d.scatter_ranges(value, &single(at.iter().copied()), &replaced).map_err(error)?;
         }
         Ok(())
     }
@@ -1319,37 +1332,34 @@ impl Edits {
         if let Some(value) = t.as_mut() {
             self.apply(d, node, value)?;
         }
-        let rows_of = |t: Option<&Tensor>, at: &[usize]| -> Result<ndarray::Array2<f64>, String> {
-            match t {
-                Some(t) => d.download(&d.gather_ranges(t, &single(at.iter().copied())).map_err(error)?).map_err(error),
-                None => Ok(ndarray::Array2::zeros((at.len(), width))),
-            }
-        };
+        let rows_of = |t: &Tensor, at: &[usize]| -> Result<Tensor, String> { d.gather_ranges(t, &single(at.iter().copied())).map_err(error) };
         if let Some(probes) = self.probes.get(&node) {
             let recorded = self.recorded.as_ref().ok_or_else(|| error("a cut outside a plan"))?;
-            let dx = rows_of(t.as_ref(), &probes.iter().map(|p| p.0).collect::<Vec<_>>())?;
+            let dx = t.as_ref().map(|t| rows_of(t, &probes.iter().map(|p| p.0).collect::<Vec<_>>())).transpose()?;
             for (k, (_, cut, role)) in probes.iter().enumerate() {
-                recorded.borrow_mut().entry(*cut).or_default().tangents[*role] = dx.row(k).to_vec();
+                recorded.borrow_mut().entry(*cut).or_default().tangents[*role] = dx.as_ref().map(|dx| d.rows_of(dx, k, 1)).transpose().map_err(error)?;
             }
         }
         if let Some(c) = self.cuts.get(&node) {
             let recorded = self.recorded.as_ref().ok_or_else(|| error("a cut outside a plan"))?;
             let at: Vec<usize> = c.rows.iter().map(|r| r.0).collect();
-            let ds = rows_of(dv.get(c.norm.entry).and_then(Option::as_ref), &at)?;
+            // dy = ds + t₁ − t₀ (zero where no tangent reached the entering stream or a site) and
+            // N's tangent at y, in float64 on the device as the forward's.
+            let wide = wide(d);
+            let mut dy = match dv.get(c.norm.entry).and_then(Option::as_ref) {
+                Some(ds) => wide.convert(&rows_of(ds, &at)?).map_err(error)?,
+                None => wide.zeros(at.len(), width).map_err(error)?,
+            };
+            wide.axpy(&mut dy, 1.0, &stacked(&wide, recorded, &c.rows, (1, true), width)?).map_err(error)?;
+            wide.axpy(&mut dy, -1.0, &stacked(&wide, recorded, &c.rows, (0, true), width)?).map_err(error)?;
             let kept = c.kept.borrow();
-            let mut replaced = ndarray::Array2::zeros((at.len(), width));
-            for (k, (_, cut)) in c.rows.iter().enumerate() {
-                let records = recorded.borrow();
-                let record = records.get(cut).ok_or_else(|| error("a cut whose site was not recorded"))?;
-                let (_, y) = kept.get(k).ok_or_else(|| error("a cut's tangent before its forward"))?;
-                let dy: Vec<f64> = (0..y.len()).map(|j| ds[[k, j]] + record.tangents[1].get(j).copied().unwrap_or(0.0) - record.tangents[0].get(j).copied().unwrap_or(0.0)).collect();
-                replaced.row_mut(k).assign(&ndarray::Array1::from(c.norm.tangent(y, &dy)));
-            }
+            let y = kept.as_ref().ok_or_else(|| error("a cut's tangent before its forward"))?;
+            let replaced = d.convert(&c.norm.rows(&wide, RowNorm::Tangent, y, Some(&dy))?).map_err(error)?;
             let value = match t {
                 Some(value) => value,
                 None => t.insert(d.zeros(rows, width).map_err(error)?),
             };
-            d.scatter_ranges(value, &single(at.iter().copied()), &d.upload(replaced.view()).map_err(error)?).map_err(error)?;
+            d.scatter_ranges(value, &single(at.iter().copied()), &replaced).map_err(error)?;
         }
         Ok(())
     }
@@ -1364,35 +1374,42 @@ impl Edits {
         if let Some(c) = self.cuts.get(&node) {
             let recorded = self.recorded.as_ref().ok_or_else(|| error("a cut outside a plan"))?;
             let at: Vec<usize> = c.rows.iter().map(|r| r.0).collect();
-            let w = d.download(&d.gather_ranges(g, &single(at.iter().copied())).map_err(error)?).map_err(error)?;
+            // N's pullback of the read rows' cotangent at y, in float64 on the device.
+            let wide = wide(d);
+            let w = wide.convert(&d.gather_ranges(g, &single(at.iter().copied())).map_err(error)?).map_err(error)?;
             let kept = c.kept.borrow();
-            let mut entering = ndarray::Array2::zeros((at.len(), g.cols()));
+            let y = kept.as_ref().ok_or_else(|| error("a cut's reverse before its forward"))?;
+            let back = c.norm.rows(&wide, RowNorm::Pullback, y, Some(&w))?;
             for (k, (_, cut)) in c.rows.iter().enumerate() {
-                let (_, y) = kept.get(k).ok_or_else(|| error("a cut's reverse before its forward"))?;
-                let back = c.norm.pullback(y, w.row(k).as_slice().ok_or_else(|| error("a row"))?);
-                entering.row_mut(k).assign(&ndarray::Array1::from(back.clone()));
-                recorded.borrow_mut().get_mut(cut).ok_or_else(|| error("a cut whose site was not recorded"))?.carried.push_back(back);
+                let row = wide.rows_of(&back, k, 1).map_err(error)?;
+                recorded.borrow_mut().get_mut(cut).ok_or_else(|| error("a cut whose site was not recorded"))?.carried.push_back(row);
             }
-            *c.entering.borrow_mut() = Some(entering);
+            *c.entering.borrow_mut() = Some(back);
             d.scatter_ranges(g, &single(at.iter().copied()), &d.zeros(at.len(), g.cols()).map_err(error)?).map_err(error)?;
         }
         if let Some(probes) = self.probes.get(&node) {
             let recorded = self.recorded.as_ref().ok_or_else(|| error("a cut outside a plan"))?;
-            let mut taken: BTreeMap<usize, Vec<f64>> = BTreeMap::new();
-            let mut added = ndarray::Array2::zeros((probes.len(), g.cols()));
+            // The donor's value takes the carried cotangent and the base's its negation (a product
+            // by −1, exact), in float64, rounded once into the cotangent's storage.
+            let wide = wide(d);
+            let mut taken: BTreeMap<usize, Tensor> = BTreeMap::new();
+            let mut added = wide.zeros(probes.len(), g.cols()).map_err(error)?;
+            let negated = wide.upload_vec(1, g.cols(), vec![-1.0; g.cols()]).map_err(error)?;
             for (k, (_, cut, role)) in probes.iter().enumerate() {
-                let carried = match taken.get(cut) {
-                    Some(v) => v.clone(),
-                    None => {
-                        let v = recorded.borrow_mut().get_mut(cut).and_then(|r| r.carried.pop_front()).ok_or_else(|| error("a cut's site reversed before its read"))?;
-                        taken.insert(*cut, v.clone());
-                        v
-                    }
-                };
-                let sign = if *role == 1 { 1.0 } else { -1.0 };
-                added.row_mut(k).iter_mut().zip(&carried).for_each(|(a, v)| *a = sign * v);
+                if !taken.contains_key(cut) {
+                    let v = recorded.borrow_mut().get_mut(cut).and_then(|r| r.carried.pop_front()).ok_or_else(|| error("a cut's site reversed before its read"))?;
+                    taken.insert(*cut, v);
+                }
+                let carried = taken.get(cut).ok_or_else(|| error("a cut's carried cotangent"))?;
+                if *role == 1 {
+                    wide.set_rows(&mut added, k, carried).map_err(error)?;
+                } else {
+                    let mut row = wide.empty(1, g.cols()).map_err(error)?;
+                    wide.scale_columns(&mut row, carried, &negated, false).map_err(error)?;
+                    wide.set_rows(&mut added, k, &row).map_err(error)?;
+                }
             }
-            add_rows(d, g, &probes.iter().map(|p| p.0).collect::<Vec<_>>(), &added)?;
+            add_row_tensor(d, g, &probes.iter().map(|p| p.0).collect::<Vec<_>>(), &d.convert(&added).map_err(error)?)?;
         }
         let Some(p) = self.nodes.get(&node) else { return Ok(()) };
         let read = d.gather_ranges(g, &single(p.rows.iter().copied())).map_err(error)?;
@@ -3741,7 +3758,7 @@ mod tests {
         let (paths, _) = paths(&batch, std::slice::from_ref(&cut), p.values(), engine_heads(&p), None, 4).expect("the paths");
         let plan = Plan::new(paths, 12);
         run([&p, &m], &plan, false).expect("the forward pass");
-        let recorded = plan.recorded.borrow().get(&0).map(|r| r.values[1].clone()).expect("the donor's record");
+        let recorded = plan.recorded.borrow().get(&0).and_then(|r| r.values[1].as_ref().map(|v| device.download(v).expect("download").row(0).to_vec())).expect("the donor's record");
         let own = |model: &Model| -> Vec<f64> {
             let mut stream = device.zeros(12, BlockEngine::width(model)).expect("zeros");
             let tok = vec![batch.source[1].as_slice()];

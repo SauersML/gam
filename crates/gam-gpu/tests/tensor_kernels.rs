@@ -801,6 +801,40 @@ fn row_lists_and_their_products_agree_with_the_host() {
     }
 }
 
+/// `row_norm` on every device against the host: the norm, its tangent and its pullback, with and
+/// without a bias; a float64 device gives the host's values bit for bit (every sum in index order,
+/// no fused product), the single-precision device within its rounding.
+#[test]
+fn row_norms_agree_with_the_host() {
+    use gam_gpu::tensor::RowNorm;
+    let (rows, d) = (5, 37);
+    let y = matrix(rows, d, 3, 1.0);
+    let t = matrix(rows, d, 5, 0.7);
+    let gain = matrix(1, d, 7, 1.3);
+    let bias = matrix(1, d, 11, 0.2);
+    let host = Device::host();
+    for bias in [None, Some(&bias)] {
+        for (mode, along) in [(RowNorm::Apply, None), (RowNorm::Tangent, Some(&t)), (RowNorm::Pullback, Some(&t))] {
+            let run = |device: &Device| {
+                let along = along.map(|a| up(device, a));
+                let bias = bias.map(|b| up(device, b));
+                down(device, &device.row_norm(mode, &up(device, &y), along.as_ref(), (&up(device, &gain), bias.as_ref()), 1e-5).expect("row norm"))
+            };
+            let want = run(&host);
+            for device in every_device() {
+                let got = run(&device);
+                if device.float64() {
+                    assert_eq!(got, want, "{} {mode:?}: bit for bit", device.name());
+                } else {
+                    let scale = want.iter().fold(1.0_f64, |m, v| m.max(v.abs()));
+                    let err = (&got - &want).iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+                    assert!(err <= 1e-5 * scale, "{} {mode:?}: differs by {err}", device.name());
+                }
+            }
+        }
+    }
+}
+
 /// `upload_f32_overlapped` (CUDA: a second stream and a landing buffer) gives the values
 /// `upload_f32` does, for uploads of several sizes in turn: one longer than a staging buffer, and
 /// more than the landing buffers, a later one landing where an earlier one did.
