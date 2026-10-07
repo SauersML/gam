@@ -531,6 +531,34 @@ def examples(table: Table, layers: set[int], count: int, seed: int, stratified: 
     return out
 
 
+def stated_direct(table: Table, ex: dict) -> list[float] | None:
+    """The direct-effect line's value per option, as the *_lens conditions state it (prompt): the change of
+    the subcomponent's activity times its write's lens value, or a group edit's sum (Table.group_direct);
+    None for other questions or without a write (q_proj, k_proj)."""
+    if ex["kind_q"] not in ("direction", "top") or ex["c"] < 0:
+        return None
+    if ex.get("direct") is not None:
+        return ex["direct"]
+    if ex.get("change") is None:
+        return None
+    values = [table.lens_value(ex["layer"], ex["kind"], ex["c"], t) for t in ex["option_ids"]]
+    return None if not values or values[0] is None else [ex["change"] * v for v in values]
+
+
+def rule_hit(table: Table, ex: dict) -> float | None:
+    """The zero-parameter reader of the direct-effect line, the bar for the weights readers: a direction
+    question is answered up when the stated effect on its token is positive, a top question by the option
+    with the largest stated effect. 1 or 0; a question with no stated line counts as a uniform guess
+    (1 / options); None for other kinds."""
+    if ex["kind_q"] not in ("direction", "top"):
+        return None
+    vals = stated_direct(table, ex)
+    if vals is None:
+        return 1.0 / len(ex["options"])
+    guess = (0 if vals[0] > 0 else 1) if ex["kind_q"] == "direction" else int(np.argmax(vals))
+    return float(guess == ex["answer"])
+
+
 def exemplars(table: Table, ex: dict, n: int = 3) -> str:
     """The subcomponent's n most active measured contexts other than the example's, as marked text, each
     the 24 tokens before its peak (whole contexts made a weights + texts arm's prompts two to three times
@@ -767,10 +795,18 @@ def train(args):
         optimizer.step()
         log.write(json.dumps({"step": step, "loss_nats": float(loss.detach()), "seconds": time.time() - started}) + "\n")
         log.flush()
+        if args.save_every and (step + 1) % args.save_every == 0 and step + 1 < args.steps:
+            save(oracle, out / f"step_{step + 1}", {**vars(args), "checkpoint": step + 1})
+    save(oracle, out, vars(args))
+    print(json.dumps({"condition": args.condition, "steps": args.steps, "seconds": time.time() - started, "last_loss": float(loss.detach())}))
+
+
+def save(oracle: "Oracle", out: Path, config: dict) -> None:
+    """A run (or a checkpoint of one) that evaluate reads: adapter, maps and config, the config last."""
+    out.mkdir(parents=True, exist_ok=True)
     torch.save({"maps": oracle.maps.state_dict(), "magnitude": oracle.magnitude.state_dict()}, out / "maps.pt")
     oracle.model.save_pretrained(str(out / "adapter"))
-    (out / "config.json").write_text(json.dumps(vars(args)))
-    print(json.dumps({"condition": args.condition, "steps": args.steps, "seconds": time.time() - started, "last_loss": float(loss.detach())}))
+    (out / "config.json").write_text(json.dumps(config))
 
 
 def check(args):
@@ -831,7 +867,7 @@ def evaluate(args):
                 for ex, score, guess in zip(batch, log_scores(lq, valid, batch).tolist(), best):
                     rows.append({"split": split, "distribution": distribution, "question": ex["kind_q"], "stratum": ex["stratum"], "layer": ex["layer"], "kind": ex["kind"],
                                  "c": ex["c"], "context": ex["context"], "log_score": score, "options": len(ex["options"]), "correct": int(guess == ex["answer"]),
-                                 "effect": ex.get("effect"), "edit": ex.get("edit"), "variant": ex.get("variant")})
+                                 "effect": ex.get("effect"), "edit": ex.get("edit"), "variant": ex.get("variant"), "rule": rule_hit(table, ex)})
     (Path(args.run) / f"eval_{Path(args.labels).name}.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
     summary = {}
     for split in [s_ for s_, _, _ in splits]:
@@ -843,6 +879,12 @@ def evaluate(args):
     print(json.dumps({"condition": config["condition"], **summary}))
 
 
+def rule_accuracy(rows: list[dict]) -> dict:
+    """The direct-effect rule's accuracy on these rows (rule_hit, recorded by evaluate), when it answers them."""
+    hits = [r.get("rule") for r in rows]
+    return {"rule_accuracy": float(np.mean(hits))} if hits and all(h is not None for h in hits) else {}
+
+
 def compare(args):
     """Per split and question: each condition's mean log score and its paired gain over `nothing`
     (the same examples in every run: evaluate draws them from the same seed), with standard errors;
@@ -852,7 +894,8 @@ def compare(args):
     runs = {}
     for d in args.runs:
         config = json.loads((Path(d) / "config.json").read_text())
-        runs[config["condition"]] = [json.loads(line) for line in open(Path(d) / args.eval)]
+        name = config["condition"] + (f"@{config['checkpoint']}" if config.get("checkpoint") else "")  # a checkpoint (train --save-every)
+        runs[name] = [json.loads(line) for line in open(Path(d) / args.eval)]
     base = runs["nothing"]
     table = {}
     groups = [("natural", None), ("stratified", None)] + [("stratified", k) for k in range(len(STRATA) - 1)]
@@ -868,7 +911,8 @@ def compare(args):
                     edges = (0.0, *EFFECT_BINS, float("inf"))
                     table[f"{condition}/{split}/{q}/effect_bits_{edges[b]:g}-{edges[b + 1]:g}"] = {
                         "examples": len(d), "log_score_nats": float(np.mean([r["log_score"] for r, _ in sel])), "gain_over_nothing_nats": float(d.mean()),
-                        "standard_error_nats": float(d.std(ddof=1) / math.sqrt(len(d))) if len(d) > 1 else None, "accuracy": float(np.mean([r["correct"] for r, _ in sel]))}
+                        "standard_error_nats": float(d.std(ddof=1) / math.sqrt(len(d))) if len(d) > 1 else None, "accuracy": float(np.mean([r["correct"] for r, _ in sel])),
+                        **rule_accuracy([r for r, _ in sel])}
                 for distribution, k in groups:
                     pairs = [(r["log_score"], b["log_score"]) for r, b in zip(rows, base)
                              if r["split"] == split and r["question"] == q and r["distribution"] == distribution and (k is None or r["stratum"] == k)]
@@ -881,6 +925,7 @@ def compare(args):
                     hits = [r["correct"] for r in rows if "correct" in r and r["split"] == split and r["question"] == q and r["distribution"] == distribution and (k is None or r["stratum"] == k)]
                     if hits:
                         table[f"{condition}/{split}/{q}{suffix}"]["accuracy"] = float(np.mean(hits))
+                    table[f"{condition}/{split}/{q}{suffix}"].update(rule_accuracy([r for r in rows if r["split"] == split and r["question"] == q and r["distribution"] == distribution and (k is None or r["stratum"] == k)]))
     Path(args.out).write_text(json.dumps(table, indent=1))
     print(json.dumps(table, indent=1))
 
@@ -906,6 +951,7 @@ def main():
     t.add_argument("--heldout-layers", default="2")
     t.add_argument("--heldout-every", type=int, default=0, help="hold out the subcomponents whose table index is a multiple of N (every layer) instead of layers")
     t.add_argument("--examples", type=int, default=65536)
+    t.add_argument("--save-every", type=int, default=0, help="also save the run every N steps as OUT/step_N (evaluate reads it)")
     t.add_argument("--init", help="an earlier run to start from (its adapter and maps)")
     t.add_argument("--per-component", type=int, default=1, help="effect questions per drawn subcomponent, at its strongest contexts")
     t.add_argument("--questions", default="", help="only these question kinds, comma-separated (default: all the relations support)")
