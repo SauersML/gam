@@ -69,7 +69,12 @@ def main():
     base = kl(log_probs(counterfactual))
     result = {"behavior": beh["id"], "base_bits": base, "layers": {}}
     for layer in layers:
-        tc = load_file(str(TRANSCODERS / f"layer_{layer}.safetensors"))
+        path = TRANSCODERS / f"layer_{layer}.safetensors"
+        if not path.exists():  # a pod: fetch just this layer from the Hugging Face repo
+            from huggingface_hub import hf_hub_download
+
+            path = Path(hf_hub_download("mwhanna/qwen3-0.6b-transcoders-lowl0", f"layer_{layer}.safetensors"))
+        tc = load_file(str(path))
         enc, b_enc, dec = (tc[k].to(dev, torch.float32) for k in ("W_enc", "b_enc", "W_dec"))
         state.update(layer=layer, add=None)
         for key, ids in (("clean", clean), ("cf", counterfactual)):
