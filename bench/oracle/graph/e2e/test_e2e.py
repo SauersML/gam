@@ -190,3 +190,15 @@ def test_table_reads_sweep_search_and_oracle(tmp_path):
     rows = table.collect(tmp_path / "sweep", [tmp_path / "search"], tmp_path / "oracle")
     got = {r[1]: (r[3], r[9]) for r in rows}
     assert got == {"empty": ("3.0000", ""), "hand": ("2.0000", ""), "search addition_cf": ("1.5000", "99"), "oracle": ("1.1000", "")}
+
+
+def test_vpd_units_take_the_strongest_subcomponents():
+    import search
+    search.RANKING.update({"0.c_fc": [53, 726, 1131, 5], "0.down_proj": [3257, 1149, 607, 9]})
+    u = ("vpd", 0, 2, 3)
+    assert search.unit_of(search.name(u)) == u and search.site(u) == 1
+    ir = mech.trace_inline(search.source([("head", 2, 4), u]), "vpd4l")
+    assert ir["valid"], ir["error"]
+    (vpd,) = [n for n in ir["nodes"] if n["pieces"][0]["view"] == "vpd"]
+    got = {p["kind"]: p["index"] for p in vpd["pieces"]}
+    assert got == {"c_fc": [53, 726], "down_proj": [607, 1149, 3257]}

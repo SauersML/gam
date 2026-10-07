@@ -42,28 +42,53 @@ OUT = Path.home() / "mpd-data/graph_oracle/runs/search"
 # A unit: ("head", layer, head) or ("mlp", layer, start, stop) for neurons start..stop-1.
 
 
+# A VPD unit: ("vpd", layer, kc, kd) = the kc c_fc and kd down_proj subcomponents of layer l's MLP with
+# the largest measured removal effect (RANKING: per site, subcomponent indices from largest effect down).
+RANKING: dict[str, list[int]] = {}
+
+
+def load_ranking(path: Path) -> None:
+    """Removal effects of VPD subcomponents (g-mech's measure/vpd_induction_removal.py output:
+    sites -> {"kl_bits": [per subcomponent]}), as per-site index orders, largest effect first."""
+    sites = json.loads(Path(path).read_text())["sites"]
+    for key, v in sites.items():
+        layer, site_name = int(key.split(".")[1]), key.split(".")[-1]
+        kl = v["kl_bits"]
+        RANKING[f"{layer}.{site_name}"] = sorted(range(len(kl)), key=lambda i: -kl[i])
+
+
 def site(unit) -> int:
     """The residual stream a unit reads (design.txt section 5): attention at 2l, MLP at 2l+1."""
-    return 2 * unit[1] + (unit[0] == "mlp")
+    return 2 * unit[1] + (unit[0] in ("mlp", "vpd"))
 
 
 def name(unit) -> str:
-    return f"h{unit[1]}_{unit[2]}" if unit[0] == "head" else f"m{unit[1]}_{unit[2]}_{unit[3]}"
+    return {"head": "h", "mlp": "m", "vpd": "v"}[unit[0]] + "_".join(str(x) for x in unit[1:]) if unit[0] != "head" else f"h{unit[1]}_{unit[2]}"
 
 
 def unit_of(text: str):
-    """The unit a name() denotes: h<l>_<h> or m<l>_<start>_<stop>."""
+    """The unit a name() denotes: h<l>_<h>, m<l>_<start>_<stop> or v<l>_<kc>_<kd>."""
     parts = [int(x) for x in text[1:].split("_")]
-    return ("head", *parts) if text[0] == "h" else ("mlp", *parts)
+    return ({"h": "head", "m": "mlp", "v": "vpd"}[text[0]], *parts)
+
+
+def piece(unit) -> str:
+    if unit[0] == "head":
+        return f"L[{unit[1]}].head[{unit[2]}]"
+    if unit[0] == "mlp":
+        return f"L[{unit[1]}].mlp[{unit[2]}:{unit[3]}]"
+    l, kc, kd = unit[1:]
+    c = ", ".join(map(str, sorted(RANKING[f"{l}.c_fc"][:kc])))
+    d = ", ".join(map(str, sorted(RANKING[f"{l}.down_proj"][:kd])))
+    return f"PD.vpd[{l}].c_fc[{c}], PD.vpd[{l}].down_proj[{d}]"
 
 
 def source(units) -> str:
     """The program declaring `units` as nodes with every causal edge among them listed."""
     units = sorted(units, key=lambda u: (site(u), u))
-    lines = ['"""Found by greedy search on the score (e2e/search.py)."""', "from mech import node, edges, L, embed, logits"]
+    lines = ['"""Found by greedy search on the score (e2e/search.py)."""', "from mech import node, edges, L, PD, embed, logits"]
     for u in units:
-        piece = f"L[{u[1]}].head[{u[2]}]" if u[0] == "head" else f"L[{u[1]}].mlp[{u[2]}:{u[3]}]"
-        lines.append(f"{name(u)} = node({piece})")
+        lines.append(f"{name(u)} = node({piece(u)})")
     wires = []
     for i, u in enumerate(units):
         wires += [f"    {w} >> {name(u)}," for w in ["embed"] + [name(v) for v in units[:i] if site(v) < site(u)]]
@@ -115,19 +140,23 @@ class Pool:
             c.close()
 
 
-def all_units(model: str):
+def all_units(model: str, mlp_view: str = "native"):
+    """Every unit: the heads, and per layer its MLP as one native block or (mlp_view "vpd") a VPD unit placeholder."""
     s = mech.shapes(model)
-    return [("head", l, h) for l in range(s["layers"]) for h in range(s["heads"])] + [("mlp", l, 0, s["d_mlp"]) for l in range(s["layers"])]
+    mlps = [("mlp", l, 0, s["d_mlp"]) for l in range(s["layers"])] if mlp_view == "native" else [("vpd", l, 0, 0) for l in range(s["layers"])]
+    return [("head", l, h) for l in range(s["layers"]) for h in range(s["heads"])] + mlps
 
 
-def greedy(pool: Pool, model: str, mode: str, experiments: int, seed: int, min_neurons: int, log, start=None) -> dict:
-    """`start`: the units to start from (default: none for addition, every unit for removal)."""
-    full = all_units(model)
+def greedy(pool: Pool, model: str, mode: str, experiments: int, seed: int, min_neurons: int, log, start=None,
+           mlp_view: str = "native") -> dict:
+    """`start`: the units to start from (default: none for addition, every unit for removal). With mlp_view
+    "vpd" (addition only), MLPs enter as VPD units grown by doubling along the removal ranking."""
+    full = all_units(model, mlp_view)
     current = list(start) if start is not None else [] if mode == "addition" else list(full)
     # Addition draws from `outside`: the pieces not declared yet, as dyadic blocks (whole units the
     # start does not touch; a start's partial MLP blocks leave nothing outside in that layer).
-    touched = {(u[0], u[1]) if u[0] == "mlp" else u for u in current}
-    outside = [u for u in full if ((u[0], u[1]) if u[0] == "mlp" else u) not in touched] if mode == "addition" else []
+    touched = {(u[0], u[1]) if u[0] in ("mlp", "vpd") else u for u in current}
+    outside = [u for u in full if ((u[0], u[1]) if u[0] in ("mlp", "vpd") else u) not in touched] if mode == "addition" else []
     best = pool.score([source(current)], experiments, seed)[0]
     trajectory = [{"step": 0, "units": [name(u) for u in current], "total_bits": best["total_bits"],
                    "exec_error_bits": best["exec_error_bits"], "opaque_bits": best["opaque_bits"], "calls": pool.calls}]
@@ -138,8 +167,16 @@ def greedy(pool: Pool, model: str, mode: str, experiments: int, seed: int, min_n
         moves = []  # (units, outside, (verb, block))
         if mode == "addition":
             for u in outside:
+                if u[0] == "vpd":  # a layer's VPD MLP enters with its strongest subcomponent of each matrix
+                    moves.append((current + [("vpd", u[1], 1, 1)], [v for v in outside if v != u], ("add", ("vpd", u[1], 1, 1))))
+                    continue
                 for b, rest in pieces_of(u, min_neurons):
                     moves.append((current + [b], [v for v in outside if v != u] + rest, ("add", b)))
+            for u in [u for u in current if u[0] == "vpd"]:  # grow a VPD MLP: twice the c_fc or the down_proj subcomponents
+                for grown in (("vpd", u[1], min(2 * u[2], len(RANKING[f"{u[1]}.c_fc"])), u[3]),
+                              ("vpd", u[1], u[2], min(2 * u[3], len(RANKING[f"{u[1]}.down_proj"])))):
+                    if grown != u:
+                        moves.append(([v for v in current if v != u] + [grown], outside, ("grow", grown)))
         else:
             for u in current:
                 for b, rest in pieces_of(u, min_neurons):
@@ -177,12 +214,16 @@ def main() -> None:
     ap.add_argument("--start", help="comma-separated units to start from (h<l>_<h>, m<l>_<start>_<stop>)")
     ap.add_argument("--tag", default="", help="suffix of the output names")
     ap.add_argument("--stand-in", choices=["counterfactual", "global"], help="the programs' stand-in form (checker default: counterfactual)")
+    ap.add_argument("--mlp-view", default="native", choices=["native", "vpd"], help="MLP units: native neuron blocks or VPD subcomponents")
+    ap.add_argument("--ranking", type=Path, help="with --mlp-view vpd: measured removal effects of VPD subcomponents (sites -> kl_bits)")
     a = ap.parse_args()
     path = a.behavior.expanduser()
     behavior = json.loads(path.read_text())
     model = behavior["model"]
     out = a.out.expanduser()
     out.mkdir(parents=True, exist_ok=True)
+    if a.mlp_view == "vpd":
+        load_ranking(a.ranking)
     pool = Pool(model, path, a.workers, a.export, a.stand_in)
     try:
         for mode in (["addition", "removal"] if a.mode == "both" else [a.mode]):
@@ -195,7 +236,7 @@ def main() -> None:
                     logf.write(msg + "\n")
                     logf.flush()
                 start = [unit_of(t) for t in a.start.split(",")] if a.start else None
-                found = greedy(pool, model, mode, a.experiments, a.seed, a.min_neurons, log, start)
+                found = greedy(pool, model, mode, a.experiments, a.seed, a.min_neurons, log, start, a.mlp_view)
                 heldout = pool.score([found["source"]], a.experiments, a.heldout_seed)[0]
                 found.update(units=[name(u) for u in found["units"]], heldout=heldout, calls=pool.calls - start, stand_in=a.stand_in, checker=Path(str(score.BINARY)).name,
                              experiments=a.experiments, seed=a.seed, heldout_seed=a.heldout_seed)
