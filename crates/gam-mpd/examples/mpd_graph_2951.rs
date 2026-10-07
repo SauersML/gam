@@ -28,8 +28,9 @@
 //! * `{"op": "quit"}`.
 //!
 //! Command line: `--cache-gib G` sets each checker's budget of `M`'s cached outcomes
-//! (`Checker::cache_bytes`, 4 GiB by default) and `--disk-cache DIR` its disk cache, shared by
-//! every checker process given the same directory (`Checker::disk_cache`, none by default).
+//! (`Checker::cache_bytes`, 4 GiB by default), `--disk-cache DIR` its disk cache, shared by
+//! every checker process given the same directory (`Checker::disk_cache`, none by default), and
+//! `--memo-dir DIR` its small per-behavior memos of targets and bit widths (`Checker::memo_dir`).
 use gam_gpu::tensor::Device;
 use gam_mpd::{
     engine::log_to_stderr,
@@ -50,6 +51,7 @@ fn error(e: impl std::fmt::Display) -> String {
 struct Caches {
     bytes: Option<usize>,
     disk: Option<std::path::PathBuf>,
+    memo: Option<std::path::PathBuf>,
 }
 
 impl Caches {
@@ -60,7 +62,8 @@ impl Caches {
             match flag.as_str() {
                 "--cache-gib" => caches.bytes = Some((value.parse::<f64>().map_err(error)? * f64::from(1u32 << 30)) as usize),
                 "--disk-cache" => caches.disk = Some(value.into()),
-                _ => return Err(format!("unknown flag {flag} (--cache-gib G, --disk-cache DIR)")),
+                "--memo-dir" => caches.memo = Some(value.into()),
+                _ => return Err(format!("unknown flag {flag} (--cache-gib G, --disk-cache DIR, --memo-dir DIR)")),
             }
         }
         Ok(caches)
@@ -243,6 +246,7 @@ fn handle(request: &Value, weights: &mut Option<Weights>, checker: &mut Option<C
                 c.cache_bytes = bytes;
             }
             c.disk_cache = caches.disk.clone();
+            c.memo_dir = caches.memo.clone();
             if let Some(u) = units {
                 c.sites = u;
             }

@@ -56,12 +56,14 @@ def reader_request(address, message):
 
 
 class Checker:
-    def __init__(self, model, export=None, memory_gib=None, threads=None, views=None, device=None):
+    def __init__(self, model, export=None, memory_gib=None, threads=None, views=None, device=None, memo_dir=None):
         """memory_gib: the server's mem-lease (vpd4l: a batch of 8 programs at 8 threads ran under 12 GiB and
         was killed under 8 GiB); threads: its rayon threads (RAYON_NUM_THREADS when unset, 6 by default: runs
         in parallel each hold their own streams and log-probabilities); views: decomposition views to attach,
         {"vpd": DIR, "transcoders": DIR} (the server's load keys); device: "gpu" runs the large products on
-        the single-precision device (the server's load key; float32, so compare scores within one device)."""
+        the single-precision device (the server's load key; float32, so compare scores within one device);
+        memo_dir: the server's --memo-dir (GRAPH_MEMO_DIR when unset), small per-behavior memos of the targets
+        and native bit widths that later runs on the same behavior reuse (builds from a6a063a9c4 on)."""
         # Qwen3-0.6B's load in float64 passed 16.3 GiB and was killed under a 16 GiB lease.
         memory_gib = memory_gib or (28 if model.startswith("qwen3") else 12)
         env = dict(os.environ)
@@ -69,6 +71,9 @@ class Checker:
         self.model = model
         export = Path(export or EXPORTS[model]).expanduser()
         command = [str(BINARY)]
+        memo_dir = memo_dir or os.environ.get("GRAPH_MEMO_DIR")
+        if memo_dir:
+            command += ["--memo-dir", str(Path(memo_dir).expanduser())]
         if not os.environ.get("MEM_LEASE_GIB"):
             command = ["mem-lease", str(memory_gib)] + command
         self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1, env=env)

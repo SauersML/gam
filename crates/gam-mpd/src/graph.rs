@@ -610,7 +610,7 @@ impl Weights {
 /// The pieces of one site: some heads of a layer's attention, some neurons of its MLP, or some
 /// transcoder features of its MLP (`rest`: the MLP minus those features, i.e. every other feature
 /// and the transcoder's exact error piece).
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Block {
     Heads { layer: usize, heads: Vec<usize> },
     Neurons { layer: usize, neurons: Vec<usize> },
@@ -2194,7 +2194,7 @@ impl Experiment {
 /// subcomponents) with the mean `KL(M ‖ M_e)` at the targets when it is removed, and each
 /// connection (an attention's or an MLP's output into a later block's read, a site cut from the
 /// counterfactual) with that of its cut, strongest first.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Targets {
     pub pieces: Vec<(Block, f64)>,
     pub cuts: Vec<(SiteOp, f64)>,
@@ -3465,6 +3465,10 @@ pub struct Checker {
     /// The directory of the disk cache of `M`'s outcomes, which every checker process given the
     /// same directory shares; `None` (the default) keeps them in memory only.
     pub disk_cache: Option<std::path::PathBuf>,
+    /// A directory of small per-behavior memos shared across checker processes and runs: the
+    /// targets (`Checker::targets`, hundreds of runs of `M`) and native blocks' bit widths
+    /// (`Checker::width`), named like the disk cache's files (behavior, prompts, weights, semantics).
+    pub memo_dir: Option<std::path::PathBuf>,
     /// Heads by their measured removal effect on `M` (mean `KL(M ‖ M without the head)` at the
     /// targets), strongest first; measured on first use.
     targets: Option<Targets>,
@@ -3586,6 +3590,7 @@ impl Checker {
             cached: Default::default(),
             cache_bytes: CACHE_BYTES,
             disk_cache: None,
+            memo_dir: None,
             targets: None,
             sites: SiteUnits::default(),
             uniform_seeds: None,
@@ -3720,6 +3725,35 @@ impl Checker {
     /// the cache is off.
     fn disk_path(&self, key: &str) -> Option<std::path::PathBuf> {
         let dir = self.disk_cache.as_ref()?;
+        let (sub, h) = self.fingerprint(key);
+        Some(dir.join(sub).join(format!("{h:016x}.f64")))
+    }
+
+    /// The memo file of `name` (`Checker::memo_dir`), named like the disk cache's files.
+    fn memo_path(&self, name: &str) -> Option<std::path::PathBuf> {
+        let dir = self.memo_dir.as_ref()?;
+        let (sub, h) = self.fingerprint(name);
+        Some(dir.join(sub).join(format!("{h:016x}.json")))
+    }
+
+    /// A memo of `name` written by an earlier run, when there is one.
+    fn memo_get<T: serde::de::DeserializeOwned>(&self, name: &str) -> Option<T> {
+        serde_json::from_slice(&std::fs::read(self.memo_path(name)?).ok()?).ok()
+    }
+
+    /// Writes the memo of `name` (whole, then renamed into place).
+    fn memo_put<T: Serialize>(&self, name: &str, value: &T) {
+        let Some(path) = self.memo_path(name) else { return };
+        let (Some(dir), Ok(bytes)) = (path.parent(), serde_json::to_vec(value)) else { return };
+        let tmp = path.with_extension(format!("{}.partial", std::process::id()));
+        if std::fs::create_dir_all(dir).is_ok() && std::fs::write(&tmp, bytes).is_ok() && std::fs::rename(&tmp, &path).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+
+    /// The behavior's directory name and a hash of its prompts, attention blocks, `M`'s weights, the
+    /// semantics version and `key`.
+    fn fingerprint(&self, key: &str) -> (String, u64) {
         // FNV-1a over little-endian words.
         let fnv = |mut h: u64, words: &mut dyn Iterator<Item = u64>| -> u64 {
             for w in words {
@@ -3756,7 +3790,7 @@ impl Checker {
         }
         let blocks = self.behavior.prompts.iter().flat_map(|p| p.attention_block.iter().flatten().map(|&b| b as u64).chain([u64::MAX - 1]));
         let h = fnv(prompts, &mut sample.iter().map(|v| v.to_bits()).chain(blocks).chain(std::iter::once(DISK_SEMANTICS)).chain(key.bytes().map(u64::from)));
-        Some(std::path::Path::new(&dir).join(format!("{}_{prompts:016x}", self.behavior.id)).join(format!("{h:016x}.f64")))
+        (format!("{}_{prompts:016x}", self.behavior.id), h)
     }
 
     /// `M`'s outcome under `key` from the disk cache, when it holds it.
@@ -4067,6 +4101,10 @@ impl Checker {
         if let Some(t) = &self.targets {
             return Ok(t.clone());
         }
+        if let Some(t) = self.memo_get::<Targets>("targets") {
+            self.targets = Some(t.clone());
+            return Ok(t);
+        }
         let graph = Graph::empty();
         let clean = self.model_outcome(&graph, &Experiment::Clean)?;
         let effect = |m: &Array2<f64>| {
@@ -4155,6 +4193,7 @@ impl Checker {
         }
         targets.pieces.sort_by(|a, b| b.1.total_cmp(&a.1));
         targets.cuts.sort_by(|a, b| b.1.total_cmp(&a.1));
+        self.memo_put("targets", &targets);
         self.targets = Some(targets.clone());
         Ok(targets)
     }
@@ -4238,6 +4277,13 @@ impl Checker {
         if let Some(b) = self.widths.get(&key) {
             return Ok(*b);
         }
+        // A native block's width depends on M and the behavior alone, so it is memoized across runs; a
+        // view's (VPD, library, transcoder) also on the view's weights, which the memo's name omits.
+        let native = matches!(block, Block::Heads { .. } | Block::Neurons { .. });
+        if let Some(b) = native.then(|| self.memo_get::<Option<u32>>(&format!("width {key}"))).flatten() {
+            self.widths.insert(key, b);
+            return Ok(b);
+        }
         let numbers = Graph { ids: vec![String::new()], blocks: vec![block.clone()], rules: vec![None], edges: Vec::new(), internal: Vec::new() }.opaque_numbers(&self.weights);
         let scales = quantized_rows(&self.weights, block);
         let mut best = (None, width_cost(numbers, scales, None, n));
@@ -4271,6 +4317,9 @@ impl Checker {
                     best = (Some(bits), total);
                 }
             }
+        }
+        if native {
+            self.memo_put(&format!("width {key}"), &best.0);
         }
         self.widths.insert(key, best.0);
         Ok(best.0)

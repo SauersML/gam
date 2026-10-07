@@ -616,3 +616,28 @@ fn vpd_attention_pieces_quantize() {
     assert_eq!(weights.vpd_attention[&0].q.0, before.vpd_attention[&0].q.0);
     assert_eq!(weights.vpd_attention[&0].o.0, before.vpd_attention[&0].o.0);
 }
+
+/// A second checker given the same memo directory reads the first one's targets and native bit widths
+/// instead of measuring them again, and scores a program exactly as the first did.
+#[test]
+fn memos_serve_a_later_checker() {
+    let (weights, sequences) = model("graph_sites_memo");
+    let dir = std::env::temp_dir().join(format!("graph_memo_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut program = Program { model: "tiny".into(), valid: true, ..Program::default() };
+    program.nodes = vec![NodeIr { id: "h".into(), pieces: vec![PieceIr { view: "native".into(), layer: 0, kind: "head".into(), index: Some(crate::graph::Index::One(0)) }], rule: None }];
+    program.edges = vec![EdgeIr { from: "embed".into(), to: "h".into(), route: "input".into() }, EdgeIr { from: "h".into(), to: "logits".into(), route: "input".into() }];
+    let mut first = Checker::new(weights.clone(), behavior(&sequences)).expect("checker");
+    first.memo_dir = Some(dir.clone());
+    let targets = first.targets().expect("targets");
+    let (a, _) = first.score(&program, 12, 2, true, None).expect("first score");
+    let mut second = Checker::new(weights, behavior(&sequences)).expect("checker");
+    second.memo_dir = Some(dir.clone());
+    let memo = second.targets().expect("memoized targets");
+    assert_eq!(serde_json::to_string(&memo.pieces).expect("json"), serde_json::to_string(&targets.pieces).expect("json"));
+    assert_eq!(serde_json::to_string(&memo.cuts).expect("json"), serde_json::to_string(&targets.cuts).expect("json"));
+    let (b, _) = second.score(&program, 12, 2, true, None).expect("second score");
+    assert_eq!(a.total_bits, b.total_bits);
+    assert_eq!(a.exec_error_bits, b.exec_error_bits);
+    let _ = std::fs::remove_dir_all(&dir);
+}
