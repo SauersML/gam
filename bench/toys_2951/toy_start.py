@@ -5,7 +5,11 @@ library_vpd reads (explanation_battery::load_factors: config.sites h.{l}.{kind} 
 k, v and columns of o by their exact SVD (rank at most head_dim), each MLP neuron's c_fc row and
 down_proj column. A zero map (a real-valued toy's attention, the induction toy's MLP) is one zero
 slice owned by the first head or neuron, since library_vpd wants every stage to hold a component.
-All slices sum to M's weights, so every arm starts at M, every gate on:
+All slices sum to M's weights, so every arm starts at M. An own gate starts at tau = 0: on wherever
+its component reads anything, which is everywhere its output is not zero, so the start is exact,
+and its expected gate is not saturated where the read is small (a start at tau < 0 holds every
+gate at slope zero, and the budget's multiplier then never moves: on the induction toy it stayed
+at 0.3 over 9 epochs with 515 rank-one slices per token against K = 211):
   per_slice_own      every slice its own component, gated by its own read |v^T x| - tau
   grouped_own        per head one component of its q, k, v and o slices, per neuron one of its c_fc
                      row and down_proj column, gated by ||V_b^T x|| - tau over its input-side reads
@@ -97,12 +101,12 @@ def main():
                 if not slices:
                     continue
                 first = slices[0]
-                grouped.append({"read": {"own": first}, "tau": -1.0, "slices": slices})
+                grouped.append({"read": {"own": first}, "tau": 0.0, "slices": slices})
                 # a direction gate g^T x + c - tau at the group's input-side read, started on
                 # everywhere (g = 0, c = 1, tau = 0)
                 width = W[f"blocks.{l}.{KINDS[first[0] % len(KINDS)]}"].shape[1]
                 direction.append({"read": {"direction": {"site": first[0], "coefficients": [0.0] * width + [1.0]}}, "tau": 0.0, "slices": slices})
-                per_slice += [{"read": {"own": sl}, "tau": -1.0, "slices": [sl]} for sl in slices]
+                per_slice += [{"read": {"own": sl}, "tau": 0.0, "slices": [sl]} for sl in slices]
     (dec / "export.json").write_text(json.dumps({"config": {"sites": sites, "source": str(toy)}, "files": files}))
     arms = [{"arm": "per_slice_own", "components": per_slice}, {"arm": "grouped_own", "components": grouped}, {"arm": "grouped_direction", "components": direction}]
     (out / "start.json").write_text(json.dumps(arms))
