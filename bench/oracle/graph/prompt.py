@@ -94,6 +94,9 @@ def behavior_text(behavior: dict, prompts: int) -> str:
     return "\n".join(lines)
 
 
+SHOT_CHARS = 6000  # few-shot programs longer than this (long neuron lists) are left out of prompts
+
+
 def examples(behavior: dict, shots: int) -> list[tuple[str, dict, str]]:
     """Up to `shots` example programs (name, index entry, source) for `behavior`: train-split examples
     of other families only (examples/index.json; families sharing their first word count as one), so a
@@ -102,7 +105,8 @@ def examples(behavior: dict, shots: int) -> list[tuple[str, dict, str]]:
     index = json.loads((HERE / "examples/index.json").read_text())
     text = {n: (HERE / "examples" / f"{n}.py").read_text() for n in index}
     kin = (behavior.get("family") or "").split("_")[0]  # induction_random and induction_phrase are kin
-    names = sorted((n for n, e in index.items() if e["split"] == "train" and e["family"].split("_")[0] != kin),
+    names = sorted((n for n, e in index.items() if e["split"] == "train" and e["family"].split("_")[0] != kin
+                    and len(text[n]) <= SHOT_CHARS),
                    key=lambda n: (index[n]["model"] != behavior["model"], index[n].get("priority", 9), len(text[n])))
     return [(n, index[n], text[n]) for n in names[:shots]]
 
