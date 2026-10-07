@@ -385,6 +385,18 @@ def role(f: dict) -> str:
     return line
 
 
+def rule_source(rule: dict, alias: dict[str, str]) -> str:
+    """An attention rule as mech source: attend(offset=k), attend(first=True), attend(query=..., key=...)."""
+    def expr(e: dict) -> str:
+        return alias["tokens"] if e["op"] == "tokens" else f"{alias['shift']}({expr(e['arg'])}, {e['by']})"
+
+    if "offset" in rule:
+        return f"{alias['attend']}(offset={rule['offset']})"
+    if rule.get("first"):
+        return f"{alias['attend']}(first=True)"
+    return f"{alias['attend']}(query={expr(rule['query'])}, key={expr(rule['key'])})"
+
+
 def source_of(ir: dict, behavior: dict, facts_of: dict[str, dict], score: dict | None = None) -> str:
     """Clean mech source for `ir` with measured-fact comments and docstring."""
     head = (f"Behavior {behavior['id']} ({ir['model']}): {behavior['description']}")
@@ -403,14 +415,22 @@ def source_of(ir: dict, behavior: dict, facts_of: dict[str, dict], score: dict |
     used |= ({"L"} if "native" in views else set()) | ({"PD"} if views & {"vpd", "library", "transcoder"} else set())
     used |= {e["from"] for e in ir["edges"] if e["from"] == "embed"} | {e["to"] for e in ir["edges"] if e["to"] == "logits"}
     order = [x for x in ("node", "edges", "L", "PD", "embed", "logits") if x in used]
-    out = ['"""' + "\n".join(lines) + '\n"""', f"from mech import {', '.join(order)}", ""]
+    ids = {n["id"] for n in ir["nodes"]}
+    alias = {k: (f"{k}_" if k in ids else k) for k in ("attend", "tokens", "shift")}  # a node may be named tokens
+    rules = [n["rule"] for n in ir["nodes"] if n.get("rule")]
+    out = ['"""' + "\n".join(lines) + '\n"""', f"from mech import {', '.join(order)}"]
+    if rules:
+        names = {"attend"} | ({"tokens", "shift"} if any("query" in r for r in rules) else set())
+        out.append("from mech import " + ", ".join(k if alias[k] == k else f"{k} as {alias[k]}" for k in ("attend", "tokens", "shift") if k in names))
+    out.append("")
     for n in ir["nodes"]:
         f = facts_of.get(n["id"])
         if f:
             out += [f"# {row}" for row in textwrap.wrap(role(f), 98)]
-        call = f"{n['id']} = node({', '.join(address(p) for p in n['pieces'])})"
+        args = [address(p) for p in n["pieces"]] + ([f"rule={rule_source(n['rule'], alias)}"] if n.get("rule") else [])
+        call = f"{n['id']} = node({', '.join(args)})"
         if len(call) > 100:
-            body = textwrap.wrap(", ".join(address(p) for p in n["pieces"]), 96, break_long_words=False)
+            body = textwrap.wrap(", ".join(args), 96, break_long_words=False)
             call = f"{n['id']} = node(\n" + "\n".join(f"    {row}" for row in body) + "\n)"
         out.append(call)
     if ir["edges"]:
