@@ -261,20 +261,29 @@ class Policy:
 class HfSampler:
     """Samples with the policy itself (transformers' generate): the CPU / Mac path and the smoke test."""
 
-    def __init__(self, policy: Policy, max_tokens: int):
-        self.policy, self.max_tokens = policy, max_tokens
+    def __init__(self, policy: Policy, max_tokens: int, batch: int = 16):
+        self.policy, self.max_tokens, self.batch = policy, max_tokens, batch
         self.logprob_sums = None
 
     @torch.no_grad()
     def __call__(self, prompts: list[list[int]], n: int, adapter: Path, version: int) -> list[list[list[int]]]:
+        """n samples of every prompt, up to `batch` sequences per generate call (left-padded)."""
         pol = self.policy
         pol.train_mode(False)
-        out = []
-        for p in prompts:
-            ids = torch.tensor([p] * n, device=pol.dev)
-            gen = pol.model.generate(input_ids=ids, attention_mask=torch.ones_like(ids), max_new_tokens=self.max_tokens, do_sample=True, temperature=1.0, top_p=1.0, top_k=0,
-                                     eos_token_id=pol.end, pad_token_id=pol.end)[:, len(p) :].tolist()
-            out.append([g[: g.index(pol.end) + 1] if pol.end in g else g for g in gen])
+        flat = [p for p in prompts for _ in range(n)]
+        gens = []
+        for s in range(0, len(flat), self.batch):
+            chunk = flat[s : s + self.batch]
+            width = max(len(p) for p in chunk)
+            ids = torch.full((len(chunk), width), pol.end, dtype=torch.long)
+            att = torch.zeros(len(chunk), width, dtype=torch.long)
+            for r, p in enumerate(chunk):
+                ids[r, width - len(p) :] = torch.tensor(p)
+                att[r, width - len(p) :] = 1
+            gen = pol.model.generate(input_ids=ids.to(pol.dev), attention_mask=att.to(pol.dev), max_new_tokens=self.max_tokens, do_sample=True, temperature=1.0, top_p=1.0,
+                                     top_k=0, eos_token_id=pol.end, pad_token_id=pol.end)[:, width:].tolist()
+            gens += [g[: g.index(pol.end) + 1] if pol.end in g else g for g in gen]
+        out = [gens[k * n : (k + 1) * n] for k in range(len(prompts))]
         if pol.dev.type == "mps":
             torch.mps.empty_cache()  # the generation's cached blocks, before the checker servers start beside this process
         return out
@@ -481,6 +490,7 @@ def main():
     ap.add_argument("--micro", type=int, default=2)
     ap.add_argument("--pack", action="store_true", help="GRPO / DPO: one sequence per group (the shared prompt once; see Policy.token_logprobs); sets GRPO's micro-batch to the group")
     ap.add_argument("--sampler", choices=["auto", "vllm", "hf"], default="auto")
+    ap.add_argument("--hf-batch", type=int, default=16, help="sequences per transformers generate call (the Mac / CPU sampler)")
     ap.add_argument("--gpu-memory", type=float, default=0.85, help="vLLM's share of its GPU (lower it when the trainer shares the GPU)")
     ap.add_argument("--prompt-holdout", type=int, default=4, help="every K-th prompt of each training behavior is held out for evaluation (0: none)")
     ap.add_argument("--eval-every", type=int, default=0, help="evaluate every E training steps and at the end (0: only --mode eval)")
@@ -512,7 +522,7 @@ def main():
     dev = torch.device(f"cuda:{torch.cuda.device_count() - 1}" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
     pol = Policy(args, dev)
     if sampler is None:
-        sampler = HfSampler(pol, args.max_tokens)
+        sampler = HfSampler(pol, args.max_tokens, args.hf_batch)
     if args.checker:
         os.environ["GRAPH_CHECKER"] = str(Path(args.checker).resolve())
     score = SCORERS[args.scorer]

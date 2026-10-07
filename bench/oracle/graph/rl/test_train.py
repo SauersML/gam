@@ -76,10 +76,11 @@ def main():
         for a, b in zip(got, (p.grad for p in pol.params)):
             assert torch.allclose(a, b, atol=1e-6)
         check_pack(pol)
+        check_left_padding(pol)
         check_init_adapter(Path(d))
     check_split_prompts()
     print("ok: token log-probabilities, KL 0 and DPO ln 2 at the reference, GRPO gradient = summed log-probability policy gradient, "
-          "packed groups = separate sequences, g-predict's adapters = their PEFT conversion, prompt split")
+          "packed groups = separate sequences, left-padded batched generation, g-predict's adapters = their PEFT conversion, prompt split")
 
 
 def check_pack(pol):
@@ -105,6 +106,28 @@ def check_pack(pol):
     for a, p in zip(grads, pol.params):
         assert torch.allclose(a, p.grad, atol=1e-5), float((a - p.grad).abs().max())
     pol.pack = False
+
+
+def check_left_padding(pol):
+    """HfSampler batches prompts of different lengths left-padded: greedy generation of a padded batch
+    equals each prompt's own, and the sampler returns n completions per prompt within max_tokens."""
+    g = torch.Generator().manual_seed(4)
+    prompts = [torch.randint(0, 1000, (n,), generator=g).tolist() for n in (3, 8)]
+    pol.train_mode(False)
+    width = 8
+    ids = torch.full((2, width), pol.end)
+    att = torch.zeros(2, width, dtype=torch.long)
+    for r, p in enumerate(prompts):
+        ids[r, width - len(p) :] = torch.tensor(p)
+        att[r, width - len(p) :] = 1
+    with torch.no_grad():
+        both = pol.model.generate(input_ids=ids, attention_mask=att, max_new_tokens=6, do_sample=False, eos_token_id=-1, pad_token_id=pol.end)[:, width:]
+        for r, p in enumerate(prompts):
+            one = pol.model.generate(input_ids=torch.tensor([p]), attention_mask=torch.ones(1, len(p), dtype=torch.long), max_new_tokens=6, do_sample=False, eos_token_id=-1,
+                                     pad_token_id=pol.end)[0, len(p) :]
+            assert both[r].tolist() == one.tolist(), (r, both[r], one)
+    out = train.HfSampler(pol, 5, batch=3)(prompts, 2, Path("."), 0)
+    assert len(out) == 2 and all(len(x) == 2 and all(len(c) <= 5 for c in x) for x in out)
 
 
 def check_init_adapter(base: Path):
