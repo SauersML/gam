@@ -281,6 +281,10 @@ pub struct DeviceProgram {
     /// Every product that can run on per-row lists runs on them, unmeasured
     /// ([`DeviceProgram::read_listed`]).
     always_listed: bool,
+    /// Per gated node and pass arithmetic, the entries per row its lists held at its last count,
+    /// the passes since that count, and the passes to go before the next
+    /// ([`DeviceProgram::gate_entries`]).
+    list_counts: Mutex<std::collections::HashMap<(usize, std::mem::Discriminant<Arithmetic>), (f64, usize, usize)>>,
     /// Per node, an earlier node of the same value: the same node over the same arguments (each
     /// argument taken as the earliest node of its value) and the same operators, a common
     /// subexpression. library_vpd's head rules each recompute their layer's attention-input reads
@@ -996,7 +1000,7 @@ impl DeviceProgram {
                 _ => None,
             })
             .collect();
-        Ok(Self { device: device.clone(), steps, widths, head, edited_head_nodes, operators, batch: Mutex::new(None), rotary_tables: Mutex::new(Vec::new()), bf16: false, arithmetic: Arithmetic::F64, fused, grouped, revisions: BTreeMap::new(), rounded: Mutex::new(BTreeMap::new()), exact_zeros, dead, sole, listed, gated_reads, list_costs: Mutex::new(std::collections::HashMap::new()), always_listed: false, aliases })
+        Ok(Self { device: device.clone(), steps, widths, head, edited_head_nodes, operators, batch: Mutex::new(None), rotary_tables: Mutex::new(Vec::new()), bf16: false, arithmetic: Arithmetic::F64, fused, grouped, revisions: BTreeMap::new(), rounded: Mutex::new(BTreeMap::new()), exact_zeros, dead, sole, listed, gated_reads, list_costs: Mutex::new(std::collections::HashMap::new()), always_listed: false, list_counts: Mutex::new(std::collections::HashMap::new()), aliases })
     }
 
     /// Operator `op`'s device copy changed: every group reading it runs node by node until
@@ -1580,9 +1584,10 @@ impl DeviceProgram {
     }
 
     /// The entries gated node `gated`'s per-row lists hold in the pass that made `trace`, counted
-    /// once a pass without listing them (`Device::listed_entries`), so a product the lists do not
-    /// pay for never makes them; `None` when the node is not listed or its gate is held in
-    /// bfloat16.
+    /// without listing them (`Device::listed_entries`), or between counts the last count's entries
+    /// per row times the pass's rows, so a product the lists do not pay for never makes them (a
+    /// product that takes them lists them exactly); `None` when the node is not listed or its gate
+    /// is held in bfloat16.
     fn gate_entries(&self, trace: &mut DeviceTrace, gated: usize) -> Result<Option<usize>, String> {
         let Some(starts) = &self.listed[gated] else { return Ok(None) };
         if let Some(lists) = trace.lists.get(&gated) {
@@ -1591,9 +1596,34 @@ impl DeviceProgram {
         if let Some(&entries) = trace.entries.get(&gated) {
             return Ok(Some(entries));
         }
+        // A count reads one value a row back, a wait on the device; between counts a pass takes
+        // the last count's entries per row. The passes between counts double while the entries
+        // per row stay within a factor 2 of the last count, and fall back to one when they leave
+        // it (the share of entries on moves with training), so the counts are few while it is
+        // steady and follow it when it moves.
+        let key = (gated, std::mem::discriminant(&self.arithmetic));
+        let rows = trace.rows;
+        {
+            let mut counts = self.list_counts.lock().map_err(|_| "device: poisoned list counts".to_string())?;
+            if let Some((per_row, since, wait)) = counts.get_mut(&key)
+                && *since < *wait
+            {
+                *since += 1;
+                let entries = (*per_row * rows as f64).round() as usize;
+                trace.entries.insert(gated, entries);
+                return Ok(Some(entries));
+            }
+        }
         let Some(mask) = self.gate_mask(trace, gated)? else { return Ok(None) };
         let entries = self.device.listed_entries(&mask, starts).map_err(error)?;
         trace.entries.insert(gated, entries);
+        let per_row = entries as f64 / rows.max(1) as f64;
+        let mut counts = self.list_counts.lock().map_err(|_| "device: poisoned list counts".to_string())?;
+        let wait = match counts.get(&key) {
+            Some(&(last, _, wait)) if per_row <= 2.0 * last && last <= 2.0 * per_row => 2 * wait,
+            _ => 1,
+        };
+        counts.insert(key, (per_row, 0, wait));
         Ok(Some(entries))
     }
 
