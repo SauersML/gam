@@ -188,19 +188,18 @@ pub fn compile(native: &OperatorProgram, explanation: &Artifact, edits: &[Weight
         let mut uses = 0;
         let rules = out.program.rules.iter_mut().flat_map(|r| r.nodes.iter_mut());
         for node in out.program.nodes.iter_mut().chain(rules) {
-            match node {
-                Node::Affine { terms, bias } => {
-                    if *bias == Some(op) {
-                        return Err(error(format!("{}: an edit of a bias is not compiled", target.name)));
-                    }
-                    let inputs: Vec<usize> = terms.iter().filter(|t| t.1 == op).map(|t| t.0).collect();
-                    uses += inputs.len();
-                    terms.extend(inputs.into_iter().map(|input| (input, added)));
+            if let Node::Transposed { operator, .. } | Node::Constant { operator } = node
+                && *operator == op
+            {
+                return Err(error(format!("{}: an owned block read transposed or as a constant is not compiled", target.name)));
+            }
+            if let Node::Affine { terms, bias } = node {
+                if *bias == Some(op) {
+                    return Err(error(format!("{}: an edit of a bias is not compiled", target.name)));
                 }
-                Node::Transposed { operator, .. } | Node::Constant { operator } if *operator == op => {
-                    return Err(error(format!("{}: an owned block read transposed or as a constant is not compiled", target.name)));
-                }
-                _ => {}
+                let inputs: Vec<usize> = terms.iter().filter(|t| t.1 == op).map(|t| t.0).collect();
+                uses += inputs.len();
+                terms.extend(inputs.into_iter().map(|input| (input, added)));
             }
         }
         if uses == 0 {
