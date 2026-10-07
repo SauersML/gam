@@ -24,7 +24,7 @@ SHARED = ("clean", "counterfactual", "edit_uniform", "rank_one")
 FIT = ("clean", "counterfactual", "edit_uniform", "edit_aimed")
 HELDOUT = ("rank_one", "swap", "cut_declared", "cut_undeclared")
 COLUMNS = ["behavior", "program", "stand_in", "total", "exec_error", "opaque", "code", "reader_error", "opaque_numbers",
-           "shared_exec_error", "shared_total", "checker_calls", "source_file"]
+           "shared_exec_error", "shared_total", "checker_calls", "source_file", "heldout_exec_error", "signal_recovered"]
 
 
 def shared(s: dict, families=SHARED) -> tuple[float, float] | None:
@@ -46,6 +46,8 @@ def row(behavior: str, program: str, s: dict, stand_in, calls, source: str) -> l
     sh = shared(s)
     cells += [str(s.get("opaque_numbers", ""))] + (["", ""] if sh is None else [f"{sh[0]:.4f}", f"{sh[1]:.4f}"])
     cells += ["" if calls is None else str(calls), source]
+    held = shared(s, HELDOUT)
+    cells += ["" if held is None else f"{held[0]:.4f}", ""]  # signal_recovered: filled per behavior in collect
     return cells
 
 
@@ -92,6 +94,14 @@ def collect(sweep, searches: list[Path], oracle: Path | None, oracle_evals: list
         rows += [v[1] for v in best.values()]
     for path in oracle_evals:
         rows += oracle_eval_rows(path)
+    # signal recovered = 1 - shared execution error / the empty program's (same behavior, same families)
+    empty = {}
+    for r in rows:
+        if r[1] == "empty" and r[9]:
+            empty.setdefault(r[0], float(r[9]))
+    for r in rows:
+        if r[9] and empty.get(r[0]):
+            r[14] = f"{1 - float(r[9]) / empty[r[0]]:.3f}"
     return sorted(rows, key=lambda c: (c[0], c[1]))
 
 
