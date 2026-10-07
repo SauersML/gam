@@ -39,7 +39,10 @@
 //! response to the edit, zero where `P` responds as `M` does whatever its clean error; `p` = `M`,
 //! `q` = `P`, `0` clean, `e` edited), and the gaps again in bins of the
 //! effect at the edited token (`by_effect`: below 0.01, 0.01–0.1, 0.1–1 and above 1 bits), so a
-//! comparison can rest on the edits that change `M`.
+//! comparison can rest on the edits that change `M`. The experiments are an immutable manifest
+//! (`Manifest`, `EditSettings::manifest`): drawn and written once, then scored as written by any
+//! binary, so explanations compare on the manifest file's SHA-256 (`manifest.sha256` in the
+//! report).
 //!
 //! With `blocks` (block `2l` layer `l`'s attention, `2l + 1` its MLP), the explanation is of those
 //! blocks alone and `M` everywhere else (`library_mdl::scoped`): the fast loop for comparing method
@@ -231,6 +234,45 @@ struct EditSettings {
     /// operators, its transcoder feature through the kept file), in float32.
     #[serde(default)]
     functions: Option<String>,
+    /// The experiment manifest (`Manifest`), a path in `OUT` or absolute: scored as it stands when
+    /// it exists (never rewritten), else drawn and written there. None draws and writes
+    /// `OUT/MANIFEST_{name}.json`, which must not exist yet.
+    #[serde(default)]
+    manifest: Option<String>,
+}
+
+/// An immutable experiment manifest: what an edits score is a score of, so two explanations are
+/// compared on the same experiments by the manifest file's SHA-256 alone. It names the export, the
+/// held-out rows (their range and their token ids' digest), the seed, families, experiments per
+/// sequence and batch size it was drawn with, the binary that drew it (its source revision), the
+/// pushed directions' digest and the sites' typical norms (the units of a push), and every
+/// experiment, batch by batch. A driver given it scores exactly those experiments, whatever its own
+/// sampler would draw, and refuses it when the export, the rows or the directions differ.
+#[derive(serde::Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct Manifest {
+    export: String,
+    sequences: [usize; 2],
+    rows: String,
+    seed: u64,
+    families: Vec<interchange::Family>,
+    edits_per_sequence: usize,
+    batch_sequences: usize,
+    binary: Option<String>,
+    directions: String,
+    typical: Vec<(interchange::SharedSite, f64)>,
+    experiments: Vec<Vec<interchange::Experiment>>,
+}
+
+/// The 64-bit FNV-1a digest of `words`, in hexadecimal.
+fn digest(words: impl IntoIterator<Item = u64>) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for w in words {
+        for byte in w.to_le_bytes() {
+            h = (h ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3);
+        }
+    }
+    format!("{h:016x}")
 }
 
 /// The parts in the oracle's names (`EditSettings::functions`), a safetensors file.
@@ -302,7 +344,32 @@ fn edit_faithfulness(
     let typical_batch: Vec<Vec<u32>> = held_out[first..end].iter().take(settings.batch_sequences).cloned().collect();
     let typical_batch = interchange::Batch::new(typical_batch.clone(), typical_batch)?;
     experiments.set_directions(interchange::DIRECTIONS, settings.seed);
-    experiments.measure_typical(&typical_batch)?;
+    let manifest_path = out.join(settings.manifest.clone().unwrap_or_else(|| format!("MANIFEST_{}.json", settings.name)));
+    let rows = digest(held_out[first..end].iter().flat_map(|s| s.iter().map(|t| u64::from(*t)).chain([u64::MAX])));
+    let directions = digest(experiments.push_directions().iter().flatten().map(|v| v.to_bits()));
+    let loaded: Option<Manifest> = if manifest_path.exists() {
+        if settings.manifest.is_none() {
+            return Err(format!("edits: {} exists and is immutable: name it in `manifest` to score on it", manifest_path.display()));
+        }
+        let m: Manifest = serde_json::from_slice(&std::fs::read(&manifest_path).map_err(|e| e.to_string())?).map_err(|e| format!("{}: {e}", manifest_path.display()))?;
+        let differs = [
+            ("export", m.export != identity.export),
+            ("held-out rows", m.sequences != settings.sequences || m.rows != rows),
+            ("seed", m.seed != settings.seed),
+            ("families", m.families != settings.families),
+            ("experiments per sequence", m.edits_per_sequence != settings.edits_per_sequence),
+            ("batch size", m.batch_sequences != settings.batch_sequences),
+            ("pushed directions", m.directions != directions),
+        ];
+        if let Some((what, _)) = differs.iter().find(|d| d.1) {
+            return Err(format!("edits: the manifest {} differs in its {what}", manifest_path.display()));
+        }
+        experiments.set_typical(m.typical.iter().copied().collect());
+        Some(m)
+    } else {
+        experiments.measure_typical(&typical_batch)?;
+        None
+    };
     let family = |e: &interchange::Experiment| match &e.patch {
         None => "clean",
         Some(interchange::Patch::Ops { family: interchange::Family::Swap, .. }) => "swap",
@@ -319,7 +386,10 @@ fn edit_faithfulness(
         let batch = interchange::Batch::new(chunk.to_vec(), chunk.to_vec())?;
         // Each base's donor is the next held-out sequence of its batch.
         let donors: Vec<usize> = (0..chunk.len()).map(|n| (n + 1) % chunk.len()).collect();
-        let drawn = experiments.sample_ops(&mut rng, &batch, &settings.families, settings.edits_per_sequence, &donors, false)?;
+        let drawn = match &loaded {
+            Some(m) => m.experiments.get(b).cloned().ok_or_else(|| format!("edits: the manifest has no batch {b}"))?,
+            None => experiments.sample_ops(&mut rng, &batch, &settings.families, settings.edits_per_sequence, &donors, false)?,
+        };
         let scored = experiments.evaluate(&batch, &drawn, false)?;
         for (e, bits) in drawn.iter().zip(&scored.bits) {
             let entry = scores.entry(family(e)).or_default();
@@ -339,6 +409,23 @@ fn edit_faithfulness(
             w.whole_rows
         );
     }
+    if loaded.is_none() {
+        let m = Manifest {
+            export: identity.export.clone(),
+            sequences: settings.sequences,
+            rows: rows.clone(),
+            seed: settings.seed,
+            families: settings.families.clone(),
+            edits_per_sequence: settings.edits_per_sequence,
+            batch_sequences: settings.batch_sequences,
+            binary: option_env!("GAM_BUILD_GIT_SHA").map(String::from),
+            directions: directions.clone(),
+            typical: experiments.typical_norms().into_iter().collect(),
+            experiments: batches.iter().map(|(_, _, drawn, _)| drawn.clone()).collect(),
+        };
+        std::fs::write(&manifest_path, serde_json::to_vec(&m).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    }
+    let manifest = json!({"file": manifest_path.display().to_string(), "sha256": sha256(&manifest_path)?});
     // The response diagnostic KL(p_e ‖ p̃_e), p̃_e ∝ p_0 q_e / q_0 (p = M, q = P, 0 clean, e edited;
     // Interchange::response): whether P predicts M's change under the edit, apart from P's clean
     // error, over the same tokens.
@@ -359,10 +446,11 @@ fn edit_faithfulness(
             entry.1.extend(bits.first());
         }
     }
+    let typical = experiments.typical_norms();
     drop(experiments);
     let mut reference = interchange::Interchange::new(device, native, layers, &gam_mpd::artifact::Artifact::native(native)?, &[], explanation.reads.clone(), settings.numeric_bytes, 256)?;
     reference.set_directions(interchange::DIRECTIONS, settings.seed);
-    reference.measure_typical(&typical_batch)?;
+    reference.set_typical(typical);
     reference.unedited_explanation();
     // An edit's evidence grows with how much it moves M: per family, the gaps of the edits whose
     // effect at the edited token KL(M_e ‖ M) falls in each bin (bits).
@@ -442,6 +530,7 @@ fn edit_faithfulness(
         "sequences": settings.sequences,
         "edits_per_sequence": settings.edits_per_sequence,
         "seed": settings.seed,
+        "manifest": manifest,
         "device": device.name(),
         "source_revision": option_env!("GAM_BUILD_GIT_SHA"),
         "families": families,

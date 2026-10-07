@@ -329,7 +329,8 @@ fn library_reads(program: &OperatorProgram, layers: usize) -> Result<Vec<ReadVar
 /// A patch: one read variable (an index into the variables), or the distinct read variables
 /// `variables` (ascending, all at one block) jointly. A joint read patch shows what single ones
 /// miss: many reads that matter little one at a time and much together.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Patch {
     Read { variable: usize },
     Reads { variables: Vec<usize> },
@@ -374,7 +375,8 @@ impl SharedSite {
 /// at the same row (`Swap`), the value scaled by `SCALES[i]` (`Scale`, 0 zeroing it), or unit
 /// direction `direction` ([`Interchange::set_directions`]) times `SIZES[size]` times the site's
 /// typical norm ([`Interchange::measure_typical`]) added (`Push`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Operation {
     Swap,
     Scale(usize),
@@ -397,7 +399,7 @@ pub const SIZES: [f64; 3] = [0.5, 1.0, 2.0];
 
 /// One operation of an experiment: its site, what it does, and its rows (the experiment's
 /// position alone, or with `onward` every row from it on).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct SiteOp {
     pub site: SharedSite,
     pub operation: Operation,
@@ -598,7 +600,7 @@ impl PartSites {
 /// One experiment: base and source sequences (indices into the batch's), the hybrid (per block
 /// whether `P_e` runs `P`'s version of it), at most one patch, and its position: the row the patch
 /// replaces and the first scored token (0 for an unpatched experiment, scored everywhere).
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Experiment {
     pub base: usize,
     pub source: usize,
@@ -2921,6 +2923,17 @@ impl Interchange {
         for sites in [&mut self.m_sites, &mut self.p_sites] {
             let mut next = (**sites).clone();
             next.parts.directions = Arc::clone(&directions);
+            *sites = Arc::new(next);
+        }
+    }
+
+    /// Set each shared site's typical norm to `typical`'s (an experiment manifest's, measured once by
+    /// [`Interchange::measure_typical`]), for both models.
+    pub fn set_typical(&mut self, typical: BTreeMap<SharedSite, f64>) {
+        let typical = Arc::new(typical);
+        for sites in [&mut self.m_sites, &mut self.p_sites] {
+            let mut next = (**sites).clone();
+            next.parts.typical = Arc::clone(&typical);
             *sites = Arc::new(next);
         }
     }

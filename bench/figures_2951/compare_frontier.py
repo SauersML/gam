@@ -13,8 +13,9 @@ Labels: description bits under the one convention of compare_f_edits.py, and, fo
 M's attention unchanged, that attention's own description at the Laplace start with its means held at M
 (compare-vpd4l-attn-price, ~/mpd-data/compare/attention_price.json), labelled separately.
 
-A point is drawn only from an EDITS file whose manifest (held-out sequences, seed, family names, edits
-per sequence) equals the reference arm's, scored by the same binary or by one whose experiments are
+A point is drawn only from an EDITS file scored on the reference arm's manifest: the same immutable
+manifest file (its SHA-256) where the edits driver wrote one, else the same held-out sequences, seed,
+family names and edits per sequence, scored by the same binary or by one whose experiments are
 checked to be the same draws (same families and positions, every edited token's effect KL(M_e || M)
 within 1e-3 bits); any other is refused with its difference.
 Points that other workstreams score (VPD as published, VPD fair, the decompositions at K = 213, 107,
@@ -38,7 +39,12 @@ MANIFEST = ('sequences', 'seed', 'families', 'edits_per_sequence')
 
 
 def manifest(r):
-    """The manifest an EDITS file was scored on: rows, seed, experiments per sequence, family names."""
+    """The manifest an EDITS file was scored on: the immutable manifest file's SHA-256 where the edits
+    driver wrote one (mpd_library_mdl_2951 EditSettings::manifest), which fixes every experiment;
+    else rows, seed, experiments per sequence, family names."""
+    sha = (r.get('manifest') or {}).get('sha256')
+    if sha:
+        return {'sha256': sha}
     return {'sequences': r.get('sequences'), 'seed': r.get('seed'), 'edits_per_sequence': r.get('edits_per_sequence'), 'families': sorted(k for k in r['families'] if k != 'clean')}
 
 
@@ -92,6 +98,13 @@ for p in L(EXTRA) or []:
     if not r:
         continue
     m = manifest(r)
+    if ref and ('sha256' in m or 'sha256' in ref):
+        # The manifest file fixes every experiment: any binary scoring it scores the same draws.
+        if m.get('sha256') != ref.get('sha256'):
+            print('refused (another manifest):', p['label'], {'sha256': (m.get('sha256'), ref.get('sha256'))})
+            continue
+        points.append(dict(p, gap=gap(r)))
+        continue
     diff = {k: (m.get(k), ref.get(k)) for k in MANIFEST if ref and m.get(k) != ref.get(k)}
     # Another binary may score the same manifest only if its experiments are shown to be the same
     # draws: the same families and positions, and the same effect KL(M_e || M) at every edited token.
