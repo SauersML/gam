@@ -8,6 +8,10 @@ program: S = total bits (lower is better). One update follows, by --mode:
 
   bestofn  SFT on each behavior's best valid program (lowest S):
              loss = -(1/B) sum_e sum_t log pi(y_et | x_e, y_e<t).
+           With --repair R, R rounds first show each behavior's best program and what the checker
+           measured of it (terms, error, worst experiment families) to the policy and sample N
+           revisions; a revision with lower S becomes the best. The kept program is trained as the
+           answer to the original input, so experiments only make training data.
   dpo      the pair (best, worst) of each behavior whose S differ, log pi(y) = sum_t log pi(y_t):
              loss = -(1/P) sum log sigmoid(beta [(log pi(y_w) - log pi_ref(y_w)) - (log pi(y_l) - log pi_ref(y_l))]).
   grpo     reward r = -S, advantage A_e = (r_e - mean_g r) / std_g r within the behavior's group
@@ -349,6 +353,40 @@ def grpo_update(pol: Policy, prompts, completions, advantage, beta: float, micro
     return {"loss": total, "kl_sum_per_episode": kl, "logprob_sums": sums}
 
 
+def repair_prompt(behavior: dict, source: str, result: dict) -> str:
+    """The oracle's input for a revision: the behavior's input, a program and what the checker measured
+    of it (its terms, its error, its worst experiment families)."""
+    lines = [render(behavior), "", "A program for this behavior:", "```python", source.rstrip(), "```",
+             f"Its score: {result['total_bits']:.6g} bits (execution error {result.get('exec_error_bits')}, reader error {result.get('reader_error_bits')}, code {result.get('code_bits')})."]
+    if not result.get("valid", True):
+        lines.append(f"It is invalid: {result.get('error')}")
+    families = result.get("per_family") or {}
+    if families:
+        worst = sorted(families.items(), key=lambda kv: -(kv[1] if isinstance(kv[1], (int, float)) else kv[1].get("bits", 0)))[:5]
+        lines.append("Its largest errors by experiment family: " + "; ".join(f"{k}: {v}" for k, v in worst) + ".")
+    lines.append("Write an improved program.")
+    return "\n".join(lines)
+
+
+def repair(chosen: list[dict], best: list[dict], pol, sampler, score, args, adapter: Path, step: int) -> set[int]:
+    """--repair rounds of revisions (training data only): each behavior's best program and its measured
+    failures go back to the policy, N revisions are sampled and scored under the step's seed, and a
+    revision that lowers S replaces the best (in place). Returns the behaviors whose best was replaced."""
+    replaced = set()
+    for _ in range(args.repair):
+        prompts = [pol.prompt_ids(repair_prompt(b, program_of(x["text"]), x["score"])) for b, x in zip(chosen, best)]
+        groups = sampler(prompts, args.samples, adapter, step)
+        texts = [[pol.tok.decode(c, skip_special_tokens=True) for c in g] for g in groups]
+        scores = score([{"source": program_of(t), "behavior": b, "seed": step} for b, ts in zip(chosen, texts) for t in ts])
+        for g in range(len(chosen)):
+            for j in range(args.samples):
+                r = scores[g * args.samples + j]
+                if (r["valid"], -r["total_bits"]) > (best[g]["score"]["valid"], -best[g]["score"]["total_bits"]):
+                    best[g] = {"completion": groups[g][j], "text": texts[g][j], "score": r}
+                    replaced.add(g)
+    return replaced
+
+
 def evaluate(sets: dict[str, list[dict]], pol, sampler, score, args, adapter: Path, version: int, log, step: int) -> dict:
     """Programs of the current policy on each evaluation set (N samples per behavior at temperature 1)
     and the baselines, all under one experiment seed (--eval-seed, never a training step's). Per set: the
@@ -401,6 +439,7 @@ def main():
     ap.add_argument("--lr", type=float)
     ap.add_argument("--beta", type=float, help="grpo: KL weight (default 0.04); dpo: inverse temperature (default 0.1)")
     ap.add_argument("--sft-epochs", type=int, default=1)
+    ap.add_argument("--repair", type=int, default=0, help="bestofn: rounds of revisions of each behavior's best program, shown its measured failures (training data only)")
     ap.add_argument("--lora-rank", type=int, default=32)
     ap.add_argument("--micro", type=int, default=2)
     ap.add_argument("--pack", action="store_true", help="GRPO / DPO: one sequence per group (the shared prompt once; see Policy.token_logprobs); sets GRPO's micro-batch to the group")
@@ -486,17 +525,20 @@ def main():
             stats = dpo_update(pol, [prompts[g] for g, _, _ in pairs], [groups[g][w] for g, w, _ in pairs], [groups[g][l] for g, _, l in pairs], beta, 1 if args.pack else args.micro) if pairs else {}
             stats["pairs"] = len(pairs)
         else:
-            keep = [(g, int(np.where(valid[g], S[g], np.inf).argmin())) for g in range(len(chosen)) if valid[g].any()]
-            for g, j in keep:
-                best_log.write(json.dumps({"behavior": chosen[g]["id"], "prompt": render(chosen[g]), "completion": texts[g][j], "score": scores[g * args.samples + j]}) + "\n")
+            best = [(int(np.where(valid[g], S[g], np.inf).argmin()) if valid[g].any() else int(S[g].argmin())) for g in range(len(chosen))]
+            best = [{"completion": groups[g][j], "text": texts[g][j], "score": scores[g * args.samples + j]} for g, j in enumerate(best)]
+            repaired = repair(chosen, best, pol, sampler, score, args, adapter, step)
+            keep = [g for g in range(len(chosen)) if best[g]["score"]["valid"]]
+            for g in keep:
+                best_log.write(json.dumps({"behavior": chosen[g]["id"], "prompt": render(chosen[g]), "completion": best[g]["text"], "score": best[g]["score"], "repaired": g in repaired}) + "\n")
             best_log.flush()
             stats = {}
-            for _ in range(args.sft_epochs if keep else 0):
-                stats = sft_update(pol, [prompts[g] for g, _ in keep], [groups[g][j] for g, j in keep], args.micro)
+            for _ in range(args.sft_epochs if keep else 0):  # the kept program answers the ORIGINAL input: experiments never reach the oracle's input
+                stats = sft_update(pol, [prompts[g] for g in keep], [best[g]["completion"] for g in keep], args.micro)
                 torch.nn.utils.clip_grad_norm_(pol.params, 1.0)
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
-            stats["kept"] = len(keep)
+            stats.update({"kept": len(keep), "repaired": len(repaired), "kept_mean_bits": float(np.mean([best[g]["score"]["total_bits"] for g in keep])) if keep else None})
         sums = stats.pop("logprob_sums", None)
         if sums is not None and sampler.logprob_sums is not None:  # on-policy check: the sampler's log pi(y) against the trainer's, per token
             stats["sampler_trainer_logprob_gap_per_token"] = float(np.sum(np.abs(np.array(sums) - np.array(sampler.logprob_sums))) / max(1, sum(len(c) for c in flat_c)))
