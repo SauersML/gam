@@ -21,8 +21,8 @@ TERMS = ["total_bits", "exec_error_bits", "opaque_bits", "code_bits", "reader_er
 SHARED = ("clean", "counterfactual", "edit_uniform", "rank_one")
 # Fit and held-out families for anti-Goodhart reporting (night plan): search selects on removals,
 # scalings and prompt edits; rank-one perturbations, node swaps and edge cuts are held out.
-FIT = ("clean", "counterfactual", "edit_uniform", "edit_aimed")
-HELDOUT = ("rank_one", "swap", "cut_declared", "cut_undeclared")
+FIT = ("clean", "counterfactual", "edit_uniform", "edit_aimed", "edit_targeted")
+HELDOUT = ("rank_one", "swap", "cut_declared", "cut_undeclared", "site_cut", "site_swap")
 COLUMNS = ["behavior", "program", "stand_in", "total", "exec_error", "opaque", "code", "reader_error", "opaque_numbers",
            "shared_exec_error", "shared_total", "checker_calls", "source_file", "heldout_exec_error", "signal_recovered"]
 
