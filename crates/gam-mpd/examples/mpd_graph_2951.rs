@@ -176,18 +176,22 @@ fn handle(request: &Value, weights: &mut Option<Weights>, checker: &mut Option<C
                 Some(path) => serde_json::from_slice(&std::fs::read(path).map_err(error)?).map_err(error)?,
                 None => serde_json::from_value(request["behavior"].clone()).map_err(error)?,
             };
+            // Everything that can fail runs before the model's weights move into the new checker,
+            // so a failed request keeps the loaded model.
+            let width = weights.as_ref().map(|w| w.embedding.ncols()).or_else(|| checker.as_ref().map(|c| c.weights.embedding.ncols())).ok_or("load a model first")?;
+            let dir = export.as_deref().ok_or("load a model first")?;
+            let named = manifest(request, dir);
+            // A manifest stating its own context (draw_manifest's) needs none from the export (0).
+            let units = named.as_ref().map(|path| SiteUnits::manifest(path, context(dir).unwrap_or(0), width)).transpose()?;
             let w = match (weights.take(), checker.take()) {
                 (Some(w), _) => w,
                 (None, Some(c)) => c.weights,
                 (None, None) => return Err("load a model first".into()),
             };
             let (id, prompts) = (behavior.id.clone(), behavior.prompts.len());
-            let width = w.embedding.ncols();
             let mut c = Checker::new(w, behavior)?;
-            let dir = export.as_deref().ok_or("load a model first")?;
-            let named = manifest(request, dir);
-            if let Some(path) = &named {
-                c.sites = SiteUnits::manifest(path, context(dir)?, width)?;
+            if let Some(u) = units {
+                c.sites = u;
             }
             let pool = c.sites.pool.len();
             *checker = Some(c);

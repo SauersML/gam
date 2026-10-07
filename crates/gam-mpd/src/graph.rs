@@ -2018,6 +2018,9 @@ impl SiteUnits {
         let directions = if stored.is_empty() { interchange::seeded_directions(interchange::DIRECTIONS, width, seed) } else { stored };
         let batches: Vec<Vec<interchange::Experiment>> = serde_json::from_value(value["experiments"].clone()).map_err(|e| format!("manifest experiments: {e}"))?;
         let length = value.get("context").and_then(serde_json::Value::as_u64).map_or(length, |c| c as usize);
+        if length == 0 {
+            return Err(format!("{}: the manifest states no context and none was given", path.display()));
+        }
         let pool = batches
             .into_iter()
             .flatten()
