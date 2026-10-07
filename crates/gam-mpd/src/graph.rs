@@ -961,7 +961,6 @@ impl Experiment {
 /// `strongest`, heads by measured removal effect), rank-one perturbations, node swaps, edge cuts
 /// (declared edges and undeclared pairs).
 pub fn sample(weights: &Weights, graph: &Graph, counterfactual: bool, count: usize, seed: u64, strongest: &[(usize, usize)]) -> Vec<Experiment> {
-    let mut rng = StdRng::seed_from_u64(seed);
     let mut out = vec![Experiment::Clean];
     if counterfactual {
         out.push(Experiment::Counterfactual);
@@ -998,17 +997,22 @@ pub fn sample(weights: &Weights, graph: &Graph, counterfactual: bool, count: usi
         }
     };
     let declared_edges: Vec<(Writer, Option<usize>, Route)> = graph.edges.clone();
-    let mut kinds = vec!["edit_uniform", "edit_aimed", "rank_one", "cut_undeclared"];
+    // Half the draws are the behavior's (uniform edits and rank-one perturbations drawn from `seed`
+    // alone, the same for every program, so `M`'s outcomes are shared across programs), half are
+    // aimed at the program (its pieces and the strongest it omits, its nodes, its edges).
+    let (mut fixed, mut aimed) = (StdRng::seed_from_u64(seed), StdRng::seed_from_u64(seed ^ 0x9E37_79B9_7F4A_7C15));
+    let mut kinds = vec!["edit_aimed", "cut_undeclared"];
     if !graph.blocks.is_empty() {
         kinds.push("swap");
     }
     if !declared_edges.is_empty() {
         kinds.push("cut_declared");
     }
-    for _ in 0..count {
-        let kind = kinds[rng.random_range(0..kinds.len())];
+    for k in 0..count {
+        let rng = if k % 2 == 0 { &mut fixed } else { &mut aimed };
+        let kind = if k % 2 == 0 { ["edit_uniform", "rank_one"][rng.random_range(0..2)] } else { kinds[rng.random_range(0..kinds.len())] };
         out.push(match kind {
-            "edit_uniform" => Experiment::Edit { edit: random_edit(&mut rng, None), aimed: false },
+            "edit_uniform" => Experiment::Edit { edit: random_edit(rng, None), aimed: false },
             "edit_aimed" => {
                 let own = !graph.blocks.is_empty() && (omitted.is_empty() || rng.random_bool(0.5));
                 let pool = if own {
@@ -1019,7 +1023,7 @@ pub fn sample(weights: &Weights, graph: &Graph, counterfactual: bool, count: usi
                     &omitted
                 };
                 let block = pool[rng.random_range(0..pool.len())].clone();
-                Experiment::Edit { edit: random_edit(&mut rng, Some(&block)), aimed: true }
+                Experiment::Edit { edit: random_edit(rng, Some(&block)), aimed: true }
             }
             "rank_one" => {
                 let layer = rng.random_range(0..layers);
