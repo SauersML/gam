@@ -4505,12 +4505,33 @@ pub fn fit_from(
                 parts.1 += 1;
                 // The multiplier: from the first step whose count exceeds the budget, λ starts at
                 // the robust balance of F's push on the gates against the count's, the median over
-                // the gates of |∂F/∂z_b| / |∂Ê/∂z_b| (read off each gate's row of its parameters: a
+                // the gates of F's push against the count, max(0, −∂F/∂z_b ∂Ê/∂z_b) / (∂Ê/∂z_b)², each
+                // gate weighted by (∂Ê/∂z_b)² (a gate whose count does not move says nothing of the
+                // balance, and one F already pushes off needs no pull: the median of the unsigned,
+                // unweighted |∂F/∂z_b| / |∂Ê/∂z_b| started λ near 400 on the tiny decoder at B = 128,
+                // the slope-weighted one near 300, where the count holds `K` near 4; read off each
+                // gate's row of its parameters: a
                 // threshold's or bias's entry, whose derivative is its pre-activation's, or the norms
                 // of a gate's weight row, whose derivative is its pre-activation's times its input),
-                // and then integrates the violation in
-                // log space, log λ ← log λ + (Ê − K) / (K B) per step (`B` the steps of one pass):
-                // symmetric, unable to wind up, and still only where Ê = K. The global ratio
+                // and then integrates the violation in log space, log λ ← log λ + (Ê − K) / (K H) per
+                // step: symmetric, and still only where Ê = K. `H` is the slower of the step's two
+                // averages, one pass of `B` batches (the curvature's, β₂ = 1 − 1/B) and the
+                // momentum's `1 / (1 − β₁)` steps: the pull reaches the means through the momentum,
+                // so the count answers a change of λ only over that many steps, and a multiplier
+                // moving faster sees no answer and swings (with `H = B` on the tiny decoder, B = 2
+                // against the momentum's 100 steps, λ rose from 24 to 68 before the count fell, the
+                // count then sat at 8.4–9.4 against K 11.8 while λ fell to 0.02, and rose to 14.6
+                // after; the budget test at 48eaf0af20). A step's relative violation counts at most
+                // one: λ moves by at most a factor e per horizon, however far the count is from `K`
+                // (toys' TMS at its true K, the count 63 against 7.96, took λ to 3e25 at one
+                // relative violation of 7 per pass). A cap at the λ whose step would move the count
+                // to `K` under the measured response (a Newton step on the constraint) does not hold:
+                // on the tiny decoder the predicted response of the budget's pull alone,
+                // `η λ Σ σ² (∂Ê/∂μ)²` (`σ²` the posterior's variances), capped λ near 2 with the count
+                // at 17.4 against K 11.8, where F's push needs about 20, and with the data's push
+                // `B ln 2 ⟨g_F, ∂Ê/∂μ⟩_σ²` of one batch included it turned negative. The
+                // budget's terms reach the thresholds and gate rows alone, never a learned width:
+                // the count reads the widths (`gated_expected`) but takes no pull from them. The global ratio
                 // −⟨g_F, g_k⟩ / |g_k|² (560f12d2d3's λ̄ Ê / K) explodes where most gates are
                 // saturated and |g_k| is tiny: a toy fit (resid_mlp_1l, K = 55) took λ to 8,000 and
                 // diverged with the count flat.
@@ -4523,20 +4544,28 @@ pub fn fit_from(
                             continue;
                         }
                         for (f, k) in data.rows().into_iter().zip(count.rows()) {
-                            let (f, k) = (f.dot(&f).sqrt() * scale * LN_2, k.dot(&k).sqrt());
-                            if k > 0.0 && f.is_finite() {
-                                ratios.push(f / k);
+                            // F's push against the count along the row, `max(0, −⟨f, k⟩) / |k|²`.
+                            let (along, square) = (f.dot(&k) * scale * LN_2, k.dot(&k));
+                            if square > 0.0 && along.is_finite() {
+                                ratios.push(((-along).max(0.0) / square, square));
                             }
                         }
                     }
-                    ratios.sort_by(f64::total_cmp);
-                    if let Some(balance) = ratios.get(ratios.len() / 2).copied().filter(|v| *v > 0.0) {
+                    ratios.sort_by(|a, b| a.0.total_cmp(&b.0));
+                    let half = 0.5 * ratios.iter().map(|r| r.1).sum::<f64>();
+                    let mut below = 0.0;
+                    let median = ratios.iter().find(|r| {
+                        below += r.1;
+                        below >= half
+                    });
+                    if let Some(&(balance, _)) = median.filter(|r| r.0 > 0.0) {
                         progress.engaged = true;
                         progress.multiplier = balance;
-                        log::info!("library budget bound at {expected:.4} parts per token (K {limit}): λ starts at {balance:.4e}, the median of {} gates' balances", ratios.len());
+                        log::info!("library budget bound at {expected:.4} parts per token (K {limit}): λ starts at {balance:.4e}, the median of {} gates' balances weighted by their count's slope", ratios.len());
                     }
                 } else if progress.engaged && limit > 0.0 {
-                    progress.multiplier *= ((expected - limit) / (limit * draws.len() as f64)).exp();
+                    let horizon = (draws.len() as f64).max(1.0 / (1.0 - ivon.beta1));
+                    progress.multiplier *= (((expected - limit) / limit).clamp(-1.0, 1.0) / horizon).exp();
                 }
                 let lambda = if progress.engaged { progress.multiplier } else { 0.0 };
                 for (i, mean, variance) in &terms {
@@ -5804,6 +5833,84 @@ mod tests {
         assert!((numeric - gradient[[r, c]]).abs() <= 1e-5 * (1.0 + numeric.abs()), "∂Ê/∂μ {} against the count's tangent {numeric}", gradient[[r, c]]);
     }
 
+    /// The budget's count on VPD-style gated slices with learned widths (`library_vpd`,
+    /// `Gate::Learned`), each MLP input column of the tiny decoder its own component with an own gate
+    /// at a threshold its reads cross (`τ` 0.5, width 0.5), the rest always on: the count's
+    /// derivative in a threshold is nonzero and matches central differences of the count itself
+    /// (`s² = w² + σ²` in both), and none of the budget's terms is a width's.
+    #[test]
+    fn a_learned_gates_count_answers_its_thresholds() {
+        let tag = "library_budget_learned";
+        let dir = crate::test_support::tiny_export(tag, 2);
+        let record: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("export.json")).unwrap()).unwrap();
+        let factors = std::env::temp_dir().join(format!("gam_mpd_{tag}_factors_{}", std::process::id()));
+        std::fs::create_dir_all(&factors).unwrap();
+        let (mut files, mut sites, mut components) = (serde_json::Map::new(), Vec::new(), Vec::new());
+        for l in 0..2 {
+            let (mut always, mut mlp): (Vec<[usize; 2]>, Vec<Vec<[usize; 2]>>) = (Vec::new(), Vec::new());
+            for (k, name) in ["attn.q_proj", "attn.k_proj", "attn.v_proj", "attn.o_proj", "mlp.c_fc", "mlp.down_proj"].into_iter().enumerate() {
+                let shape = &record["files"][format!("blocks.{l}.{name}")]["shape"];
+                let (r, c) = (shape[0].as_u64().unwrap() as usize, shape[1].as_u64().unwrap() as usize);
+                let w = crate::import::read_f64_shaped(&dir.join(format!("blocks.{l}.{name}.f64")), r, c).unwrap();
+                let site = format!("h.{l}.{name}");
+                for (suffix, values) in [("U", w.t().to_owned()), ("V", Array2::eye(c))] {
+                    let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+                    std::fs::write(factors.join(format!("{site}.{suffix}.f64")), bytes).unwrap();
+                    files.insert(format!("{site}.{suffix}"), serde_json::json!({"shape": [values.nrows(), values.ncols()]}));
+                }
+                sites.push(site);
+                match k {
+                    // Component i: the MLP's input column i and its hidden units j ≡ i.
+                    4 => mlp = (0..c).map(|i| vec![[6 * l + k, i]]).collect(),
+                    5 => {
+                        let n = mlp.len();
+                        (0..c).for_each(|j| mlp[j % n].push([6 * l + k, j]));
+                    }
+                    _ => always.extend((0..c).map(|i| [6 * l + k, i])),
+                }
+            }
+            components.push(serde_json::json!({"read": {"own": [6 * l, 0]}, "tau": -1.0, "width": 1e-3, "slices": always}));
+            components.extend(mlp.into_iter().map(|slices| serde_json::json!({"read": {"own": slices[0]}, "tau": 0.5, "width": 0.5, "slices": slices})));
+        }
+        std::fs::write(factors.join("export.json"), serde_json::json!({"config": {"sites": sites}, "files": files}).to_string()).unwrap();
+        let start = factors.join("start.json");
+        std::fs::write(&start, serde_json::json!([{"arm": "learned", "components": components}]).to_string()).unwrap();
+        let imported = crate::import::import_language_model(&dir, 6, 12).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+        let native = crate::run_check::split_sites(&imported.program).unwrap();
+        let layers = crate::run_check::layer_nodes(&native, 2).unwrap();
+        let explanation = crate::library_vpd::explanation_with_gate(&native, &layers, &factors, &start, "learned", crate::library_vpd::Gate::Learned).unwrap();
+        std::fs::remove_dir_all(&factors).unwrap();
+        let SlotValues::Tokens(tokens) = &imported.family.slots[0] else { panic!("a token slot") };
+        let sequences: Vec<Vec<u32>> = tokens.chunks(12).map(<[u32]>::to_vec).collect();
+        let settings = settings();
+        let device = Device::host();
+        let posterior = Posterior::new(&explanation, 72).unwrap();
+        let mut scorer = Scorer::new(&device, &native, &explanation, &settings).unwrap();
+        let draws = draws(sequences.len(), settings.batch_sequences, settings.seed).unwrap();
+        let batch = draws[0].batch(&sequences).unwrap();
+        let key = training_key(settings.seed, 0, 0);
+        let mut terms_at = |posterior: &Posterior| {
+            let device_posterior = DevicePosterior::new(&device, &explanation, posterior, 72.0, None, 0).unwrap();
+            complexity_terms(&mut scorer, &device_posterior, &explanation, &posterior.active, &batch, (key, false)).unwrap()
+        };
+        let (count, terms) = terms_at(&posterior);
+        let name = |i: usize| explanation.artifact.program.operators[explanation.trainable[i]].name.clone();
+        assert!(terms.iter().all(|(i, _, _)| !name(*i).ends_with(".width")), "a width takes the budget's pull");
+        // The second layer's MLP thresholds (whose count no later layer's input carries).
+        let (i, gradient) = terms.iter().map(|(i, m, _)| (*i, device.download(m).unwrap())).filter(|(i, _)| name(*i) == "library.l1.mlp.fc.threshold" || name(*i).starts_with("library.l1.mlp") && name(*i).ends_with("threshold")).last().expect("the last MLP's thresholds");
+        let (r, c) = gradient.indexed_iter().max_by(|a, b| a.1.abs().total_cmp(&b.1.abs())).unwrap().0;
+        assert!(count > 0.0 && gradient[[r, c]].abs() > 1e-3, "∂Ê/∂τ {} at a count of {count}", gradient[[r, c]]);
+        let h = 1e-6;
+        let moved = |delta: f64| {
+            let mut p = posterior.clone();
+            p.mean[i][[r, c]] += delta;
+            p
+        };
+        let numeric = (terms_at(&moved(h)).0 - terms_at(&moved(-h)).0) / (2.0 * h);
+        assert!((numeric - gradient[[r, c]]).abs() <= 1e-5 * (1.0 + numeric.abs()), "∂Ê/∂τ {} against the count's central difference {numeric}", gradient[[r, c]]);
+    }
+
     /// A budget that never binds (`K = ∞`, or `K` far above any count, where `λ` stays 0) leaves
     /// the fit bit for bit; a finite one records `K`, `Ê[k]` and `λ` in every epoch.
     #[test]
@@ -5833,37 +5940,45 @@ mod tests {
         }
     }
 
-    /// A tiny gated library meets its budget: on the tiny decoder with ReLU functions (gated
-    /// parts), with `K` at the heads plus half the gated share of the free fit's count, dual ascent
-    /// raises `λ` from zero and the expected parts per token settle at `K`: over the last 20 of 120
-    /// epochs their mean is within three standard errors (from the epochs' own spread) of `K` and
-    /// far below the free fit's (measured: free 19.7, `K` 11.86, last 20 epochs 11.80 ± 0.27, `λ`
-    /// settled near 18.9 nats per part per token).
+    /// A tiny gated library meets its budget once its passes outlast the momentum (`B` batches above
+    /// `1 / (1 − β₁)`, as in a production fit, so the multiplier's horizon is one pass): on the tiny
+    /// decoder with ReLU functions (gated parts), trained on 256 sequences of its tokens drawn
+    /// uniformly (B = 128 batches of 2), with `K` at the heads plus half the gated share of the free
+    /// fit's count, the expected parts per token over the last 6 of 30 epochs (each epoch's mean
+    /// over its 128 steps) are within three standard errors (from the epochs' own spread) of `K`
+    /// and far below the free fit's. With the fixture's 4 training sequences (B = 2 against the
+    /// momentum's 100 steps) the count at a fixed λ of 20 wandered between 5 and 16 parts over 120
+    /// epochs: no multiplier holds a mean of it at `K`.
     #[test]
     fn a_tiny_gated_library_meets_its_budget() {
         let (native, layers, _, sequences) = tiny("library_budget_binds", "relu");
         let explanation = explanation(&native, &layers).unwrap();
-        let (train, held) = sequences.split_at(4);
+        let held = &sequences[4..];
+        let mut symbols: Vec<u32> = sequences.iter().flatten().copied().collect();
+        symbols.sort_unstable();
+        symbols.dedup();
+        let mut rng = StdRng::seed_from_u64(17);
+        let train: Vec<Vec<u32>> = (0..256).map(|_| (0..sequences[0].len()).map(|_| symbols[rng.random_range(0..symbols.len())]).collect()).collect();
         let run = |budget: f64, epochs: usize| {
             let mut settings = settings();
             settings.epochs = Some(epochs);
             settings.budget = Some(budget);
-            fit(&Device::host(), &native, &explanation, train, held, &settings, "tiny", None, None).unwrap()
+            fit(&Device::host(), &native, &explanation, &train, held, &settings, "tiny", None, None).unwrap()
         };
-        let free = run(1e9, 6);
+        let free = run(1e9, 3);
         let free_parts = free.report.epochs.last().and_then(|e| e.expected_parts).unwrap();
         // The heads count whole; the budget asks for half of the rest.
         let heads: usize = explanation.layers.iter().map(|l| l.heads.len()).sum();
         let limit = heads as f64 + 0.5 * (free_parts - heads as f64);
-        let bound = run(limit, 120);
-        let tail: Vec<f64> = bound.report.epochs.iter().rev().take(20).map(|e| e.expected_parts.unwrap()).collect();
+        let bound = run(limit, 30);
+        let tail: Vec<f64> = bound.report.epochs.iter().rev().take(6).map(|e| e.expected_parts.unwrap()).collect();
         let mean = tail.iter().sum::<f64>() / tail.len() as f64;
         let spread = (tail.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (tail.len() - 1) as f64 / tail.len() as f64).sqrt();
         let last = bound.report.epochs.last().unwrap();
         // Every tenth epoch's count and multiplier, for a failure's message.
-        let trace: Vec<String> = bound.report.epochs.iter().step_by(10).map(|e| format!("{:.2} at λ {:.3e}", e.expected_parts.unwrap_or(f64::NAN), e.multiplier.unwrap_or(f64::NAN))).collect();
+        let trace: Vec<String> = bound.report.epochs.iter().map(|e| format!("{:.2} at λ {:.3e}", e.expected_parts.unwrap_or(f64::NAN), e.multiplier.unwrap_or(f64::NAN))).collect();
         assert!(last.multiplier.is_some_and(|l| l > 0.0), "the multiplier stayed at zero over the budget: {trace:?}");
-        assert!((mean - limit).abs() <= 3.0 * spread, "the last 20 epochs' mean {mean} ± {spread} parts per token against the budget {limit} (free {free_parts}): {trace:?}");
+        assert!((mean - limit).abs() <= 3.0 * spread, "the last 6 epochs' mean {mean} ± {spread} parts per token against the budget {limit} (free {free_parts}): {trace:?}");
         assert!(mean < limit + 0.5 * (free_parts - limit), "{mean} parts per token is not below the free fit's {free_parts}");
     }
 
