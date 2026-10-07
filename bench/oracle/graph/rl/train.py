@@ -13,7 +13,7 @@ program: S = total bits (lower is better). One update follows, by --mode:
   grpo     reward r = -S, advantage A_e = (r_e - mean_g r) / std_g r within the behavior's group
            (0 when the group's scores are equal):
              loss = -(1/E) sum_e A_e sum_t log pi(y_et) + beta (1/E) sum_e sum_t k3_et,
-           k3 = exp(d) - d - 1 with d = log pi_ref(y_t) - log pi(y_t), the per-token estimate of
+           k3 = exp(d) - d - 1 >= 0 with d = log pi_ref(y_t) - log pi(y_t), the per-token estimate of
            KL(pi || pi_ref), summed over the episode's tokens like the log-probabilities.
 
 Sums, not per-episode means: a per-episode mean of token log-probabilities (vpd_describe.py) gives each
@@ -260,7 +260,7 @@ def grpo_update(pol: Policy, prompts, completions, advantage, beta: float, micro
         if beta > 0:
             ref, _ = pol.token_logprobs(ps, cs, ref=True)
             d = ref - cur
-            k3 = ((d.exp() - d - 1) * mask).sum(1)
+            k3 = ((torch.expm1(d) - d) * mask).sum(1)  # exp(d) - d - 1 without the rounding of 1 + O(d)
             loss = loss + beta * k3.sum() / len(prompts)
             kl += float(k3.detach().sum()) / len(prompts)
         loss.backward()
