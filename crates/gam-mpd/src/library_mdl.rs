@@ -4843,6 +4843,21 @@ fn laplace_start(
     let variance = posterior.variances();
     let n = tokens as f64;
     let gate: Vec<bool> = explanation.groups.iter().map(|g| g.name.ends_with(".thresholds") || g.name.ends_with(".widths")).collect();
+    // A gated component's slice (`library_vpd`'s `.read` and `.write` groups) starts its deviation
+    // at a hundredth of the slice's own scale (the root mean square of its group at the start,
+    // `Explanation::reference`), and the step's curvature at the value that holds it there,
+    // `h = (1/σ² − 1/v_G) / N`; the running average then moves `h` toward the measured curvature
+    // over about one pass, so a slice's deviation grows only where the data allow it. From the
+    // Laplace curvature a slice the gated runs seldom reach starts near its prior, and with every
+    // part on (the all-on experiment) the sample's noise summed over every slice: the all-on KL at
+    // the first step's sample was 11.3 bits per token where the mean's is 1.32 (vpd4l tiny fit,
+    // grouped own gates, 14985361f0). descent's prototype starts its slices this way.
+    let slice: Vec<Option<f64>> = explanation
+        .groups
+        .iter()
+        .zip(&explanation.reference)
+        .map(|(g, r)| (g.name.ends_with(".read") || g.name.ends_with(".write")).then(|| 0.01 * r.sqrt()))
+        .collect();
     for i in 0..posterior.mean.len() {
         let mut h = match at.remove(&i) {
             Some(sum) => wide.download(&sum).map_err(error)?,
@@ -4857,11 +4872,20 @@ fn laplace_start(
         // (9b53f32bda) IVON's direction `G / (h + δ)` put most of its length on the gates, and the
         // line step's joint-to-diagonal curvature ratio ρ̄ started near 1e9 and held η near 1e-8
         // for the first epoch (decomp-vpd4l-f, -g at 5c54cd5f20).
-        ndarray::Zip::from(&mut *posterior.log_sd[i]).and(&h).and(&posterior.membership[i]).for_each(|s, h, group| {
+        ndarray::Zip::from(&mut *posterior.log_sd[i]).and(&mut h).and(&posterior.membership[i]).for_each(|s, h, group| {
             let v = variance[*group as usize];
-            let h = if gate[*group as usize] { 0.0 } else { *h };
-            if *s != f64::NEG_INFINITY && v > 0.0 {
-                *s = -0.5 * (n * h + 1.0 / v).ln();
+            if *s == f64::NEG_INFINITY || !(v > 0.0) {
+                return;
+            }
+            match slice[*group as usize] {
+                Some(sd) if sd > 0.0 && sd * sd < v => {
+                    *s = sd.ln();
+                    *h = (1.0 / (sd * sd) - 1.0 / v) / n;
+                }
+                _ => {
+                    let h = if gate[*group as usize] { 0.0 } else { *h };
+                    *s = -0.5 * (n * h + 1.0 / v).ln();
+                }
             }
         });
         set(i, &posterior.log_sd[i], &h)?;
