@@ -223,10 +223,56 @@ def greedy(pool: Pool, model: str, mode: str, experiments: int, seed: int, min_n
     return {"units": current, "source": source(current), "score": best, "trajectory": trajectory}
 
 
+def prefix_search(pool: Pool, model: str, experiments: int, seed: int, block: int, log, rank_experiments: int = 2,
+                  checkpoint=None, objective=None, units=None) -> dict:
+    """Measured ranking, then prefixes, then pruning, all exact through the checker:
+    1. every unit alone (heads, MLP neuron blocks of `block`) as a one-node program, scored on
+       `rank_experiments` experiments: under counterfactual stand-ins this is the unit's activation patch
+       from x into x', and the drop in execution error from the empty program is its measured effect;
+    2. the programs of the k most effective units for k = 1, 2, 3, 4, 6, 8, 12, ... (pieces that pay only
+       together enter together, which one-piece-at-a-time addition misses), the best kept;
+    3. greedy removal from it until no removal lowers the objective."""
+    objective = objective or (lambda r: r["total_bits"])
+    s_ = mech.shapes(model)
+    units = units or ([("head", l, h) for l in range(s_["layers"]) for h in range(s_["heads"])]
+                      + [("mlp", l, i, min(i + block, s_["d_mlp"])) for l in range(s_["layers"]) for i in range(0, s_["d_mlp"], block)])
+    empty, *alone = pool.score([source([])] + [source([u]) for u in units], rank_experiments, seed)
+    effect = {u: empty["exec_error_bits"] - r["exec_error_bits"] for u, r in zip(units, alone)}
+    ranked = sorted(units, key=lambda u: -effect[u])
+    log(f"ranked {len(units)} units by their patch on {rank_experiments} experiments; top: " +
+        ", ".join(f"{name(u)} {effect[u] / empty['N']:.3f}" for u in ranked[:8]))
+    ks, k = [], 1
+    while k < len(ranked):
+        ks.append(k)
+        k = max(k + 1, int(k * 1.5))
+    ks.append(len(ranked))
+    results = pool.score([source(ranked[:k]) for k in ks], experiments, seed)
+    j = min(range(len(ks)), key=lambda i: objective(results[i]))
+    log("prefixes: " + ", ".join(f"{k}:{objective(r) / r['N']:.3f}" for k, r in zip(ks, results)) + f"; best k = {ks[j]}")
+    current, best = ranked[:ks[j]], results[j]
+    trajectory = [{"ranking": [[name(u), effect[u]] for u in ranked], "empty": empty, "prefixes": [[k, r] for k, r in zip(ks, results)]}]
+    if checkpoint:
+        checkpoint({"units": [name(u) for u in current], "source": source(current), "score": best, "trajectory": trajectory, "partial": True})
+    while len(current) > 1:
+        moves = [[v for v in current if v != u] for u in current]
+        rs = pool.score([source(m) for m in moves], experiments, seed)
+        i = min(range(len(moves)), key=lambda i: objective(rs[i]))
+        log(f"prune: {len(moves)} candidates; best removes {name(current[i])} {objective(rs[i]):.6g} vs {objective(best):.6g}")
+        if objective(rs[i]) >= objective(best):
+            break
+        trajectory.append({"remove": name(current[i]), "score": rs[i]})
+        current, best = moves[i], rs[i]
+        if checkpoint:
+            checkpoint({"units": [name(u) for u in current], "source": source(current), "score": best, "trajectory": trajectory, "partial": True})
+    return {"units": current, "source": source(current), "score": best, "trajectory": trajectory}
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("behavior", type=Path)
-    ap.add_argument("--mode", default="both", choices=["addition", "removal", "both"])
+    ap.add_argument("--mode", default="both", choices=["addition", "removal", "both", "prefix"])
+    ap.add_argument("--block", type=int, default=96, help="prefix mode: MLP neurons per unit")
+    ap.add_argument("--rank-experiments", type=int, default=2, help="prefix mode: experiments per one-unit ranking program")
     ap.add_argument("--experiments", type=int, default=16)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--heldout-seed", type=int, default=1)
@@ -274,8 +320,12 @@ def main() -> None:
                     logf.flush()
                 start_units = [unit_of(t) for t in a.start.split(",")] if a.start else None
                 partial = out / f"{stem}.partial.json"
-                found = greedy(pool, model, mode, a.experiments, a.seed, a.min_neurons, log, start_units, a.mlp_view,
-                               lambda state: partial.write_text(json.dumps(state, indent=1)), objective_of(a.objective))
+                save = lambda state: partial.write_text(json.dumps(state, indent=1))
+                if mode == "prefix":
+                    found = prefix_search(pool, model, a.experiments, a.seed, a.block, log, a.rank_experiments, save, objective_of(a.objective))
+                else:
+                    found = greedy(pool, model, mode, a.experiments, a.seed, a.min_neurons, log, start_units, a.mlp_view,
+                                   save, objective_of(a.objective))
                 heldout = pool.score([found["source"]], a.experiments, a.heldout_seed)[0]
                 found.update(units=[name(u) for u in found["units"]], heldout=heldout, calls=pool.calls - start, stand_in=a.stand_in, checker=Path(str(score.BINARY)).name,
                              experiments=a.experiments, seed=a.seed, heldout_seed=a.heldout_seed)

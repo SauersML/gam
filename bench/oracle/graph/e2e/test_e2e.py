@@ -231,3 +231,27 @@ def test_search_main_writes_its_result(tmp_path, monkeypatch):
     r = json.loads((tmp_path / "out" / "x.y.addition.json").read_text())
     assert "h1_1" in r["units"] and "h2_4" in r["units"] and r["calls"] > 0
     assert r["heldout"]["total_bits"] == r["score"]["total_bits"]
+
+
+def test_prefix_search_takes_pieces_that_pay_only_together():
+    """Two planted units that save nothing alone but 50 together: one-at-a-time addition stops at empty,
+    the prefix of the units ranked by their single patch finds both."""
+    import search
+
+    class Pool(FakePool):
+        def score(self, sources, experiments, seed):
+            out = []
+            for src in sources:
+                ir = mech.trace_inline(src, "vpd4l")
+                heads = {(n["pieces"][0]["layer"], n["pieces"][0]["index"]) for n in ir["nodes"] if n["pieces"][0]["kind"] == "head"}
+                exec_ = 100.0 - 50.0 * ({(1, 1), (2, 4)} <= heads) - 0.5 * len(heads & {(1, 1), (2, 4)})
+                total = exec_ + 2.0 * len(ir["nodes"])
+                out.append({"total_bits": total, "exec_error_bits": exec_, "opaque_bits": total - exec_, "N": 1})
+            self.calls += len(sources)
+            return out
+
+    units = [("head", l, h) for l in range(4) for h in range(6)]
+    found = search.prefix_search(Pool(), "vpd4l", 1, 0, 3072, lambda m: None, units=units)
+    assert set(found["units"]) == {("head", 1, 1), ("head", 2, 4)}, found["units"]
+    addition = search.greedy(Pool(), "vpd4l", "addition", 1, 0, 3072, lambda m: None, start=[])
+    assert addition["units"] == [] or len(addition["units"]) < 2
