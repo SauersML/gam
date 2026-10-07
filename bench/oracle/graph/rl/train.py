@@ -388,32 +388,68 @@ def repair(chosen: list[dict], best: list[dict], pol, sampler, score, args, adap
     return replaced
 
 
+ORACLE_RUNS = Path.home() / "mpd-data/graph_oracle/runs/oracle"
+
+
+def recovered(x: dict, empty: dict | None) -> float | None:
+    """The share of the behavior's signal a program recovers: 1 - its execution error / the empty
+    program's, on the same experiments."""
+    if not empty or not empty.get("exec_error_bits"):
+        return None
+    return 1.0 - x["exec_error_bits"] / empty["exec_error_bits"]
+
+
 def evaluate(sets: dict[str, list[dict]], pol, sampler, score, args, adapter: Path, version: int, log, step: int) -> dict:
     """Programs of the current policy on each evaluation set (N samples per behavior at temperature 1)
-    and the baselines, all under one experiment seed (--eval-seed, never a training step's). Per set: the
-    mean S of a single sample (the oracle's expected score), the best of N, the validity, and each
-    baseline's S, averaged over the behaviors that have it."""
+    and the baselines, all under one experiment seed (--eval-seed, never a training step's). Every program
+    and its full score go to eval_samples.jsonl; each behavior's best program to
+    runs/oracle/<behavior>.<run>.json (g-int's oracle-vs-search table). Per set: the mean S of a single
+    sample (the oracle's expected score), the best of N, validity, the share of programs below the empty
+    program's S, the signal the best recovers, and each baseline's S."""
     summary = {}
-    for name, pool in sets.items():
-        if not pool:
-            continue
-        prompts = [pol.prompt_ids(render(b)) for b in pool]
-        groups = sampler(prompts, args.samples, adapter, version)
-        items = [{"source": program_of(pol.tok.decode(c, skip_special_tokens=True)), "behavior": b, "seed": args.eval_seed, "experiments": args.eval_experiments} for b, g in zip(pool, groups) for c in g]
-        base = [(b, n, src) for b in pool for n, src in (baselines(b).items() if args.baselines else [])]
-        scores = score(items + [{"source": src, "behavior": b, "seed": args.eval_seed, "experiments": args.eval_experiments} for b, _, src in base])
-        S = np.array([x["total_bits"] for x in scores[: len(items)]], dtype=float).reshape(len(pool), args.samples)
-        valid = np.array([bool(x["valid"]) for x in scores[: len(items)]]).reshape(len(pool), args.samples)
-        per_base = {}
-        for (b, n, _), x in zip(base, scores[len(items) :]):
-            per_base.setdefault(b["id"], {})[n] = x["total_bits"]
-        for g, b in enumerate(pool):
-            log.write(json.dumps({"set": name, "step": step, "behavior": b["id"], "mean_bits": float(S[g].mean()), "best_bits": float(S[g].min()), "valid_fraction": float(valid[g].mean()),
-                                  "baselines": per_base.get(b["id"], {}), "best_source": items[g * args.samples + int(S[g].argmin())]["source"]}) + "\n")
-        names = sorted({n for d in per_base.values() for n in d})
-        summary[name] = {"behaviors": len(pool), "mean_bits": float(S.mean()), "best_of_n_bits": float(S.min(1).mean()), "valid_fraction": float(valid.mean()),
-                         "baselines": {n: float(np.mean([d[n] for d in per_base.values() if n in d])) for n in names},
-                         "oracle_mean_bits_on_baseline_behaviors": {n: float(np.mean([S[g].mean() for g, b in enumerate(pool) if n in per_base.get(b["id"], {})])) for n in names}}
+    run = args.run_name or Path(args.out).name
+    ORACLE_RUNS.mkdir(parents=True, exist_ok=True)
+    with open(Path(args.out) / "eval_samples.jsonl", "a") as samples:
+        for name, pool in sets.items():
+            if not pool:
+                continue
+            prompts = [pol.prompt_ids(render(b)) for b in pool]
+            groups = sampler(prompts, args.samples, adapter, version)
+            items = [{"source": program_of(pol.tok.decode(c, skip_special_tokens=True)), "behavior": b, "seed": args.eval_seed, "experiments": args.eval_experiments} for b, g in zip(pool, groups) for c in g]
+            base = [(b, n, src) for b in pool for n, src in (baselines(b).items() if args.baselines else [])]
+            scores = score(items + [{"source": src, "behavior": b, "seed": args.eval_seed, "experiments": args.eval_experiments} for b, _, src in base])
+            S = np.array([x["total_bits"] for x in scores[: len(items)]], dtype=float).reshape(len(pool), args.samples)
+            valid = np.array([bool(x["valid"]) for x in scores[: len(items)]]).reshape(len(pool), args.samples)
+            per_base = {}
+            for (b, n, src), x in zip(base, scores[len(items) :]):
+                per_base.setdefault(b["id"], {})[n] = x
+                samples.write(json.dumps({"set": name, "step": step, "run": run, "behavior": b["id"], "program": n, "source": src, "score": x}) + "\n")
+            rows = []
+            for g, b in enumerate(pool):
+                mine = scores[g * args.samples : (g + 1) * args.samples]
+                for it, x in zip(items[g * args.samples : (g + 1) * args.samples], mine):
+                    samples.write(json.dumps({"set": name, "step": step, "run": run, "behavior": b["id"], "program": "oracle", "source": it["source"], "score": x}) + "\n")
+                j = int(S[g].argmin())
+                empty = per_base.get(b["id"], {}).get("empty")
+                (ORACLE_RUNS / f"{b['id']}.{run}.json").write_text(json.dumps({"behavior": b["id"], "model": b.get("model"), "source": items[g * args.samples + j]["source"], "score": mine[j],
+                                                                               "stand_in": "counterfactual", "experiments": args.eval_experiments, "seed": args.eval_seed, "set": name, "step": step}))
+                row = {"set": name, "step": step, "behavior": b["id"], "mean_bits": float(S[g].mean()), "best_bits": float(S[g].min()), "valid_fraction": float(valid[g].mean()),
+                       "below_empty_fraction": float(np.mean([x["total_bits"] < empty["total_bits"] for x in mine])) if empty else None,
+                       "best_recovered": recovered(mine[j], empty), "baselines": {n: x["total_bits"] for n, x in per_base.get(b["id"], {}).items()},
+                       "baselines_recovered": {n: recovered(x, empty) for n, x in per_base.get(b["id"], {}).items()}, "best_source": items[g * args.samples + j]["source"]}
+                rows.append(row)
+                log.write(json.dumps(row) + "\n")
+            names = sorted({n for d in per_base.values() for n in d})
+
+            def mean(xs):
+                xs = [x for x in xs if x is not None]
+                return float(np.mean(xs)) if xs else None
+
+            summary[name] = {"behaviors": len(pool), "mean_bits": float(S.mean()), "best_of_n_bits": float(S.min(1).mean()), "valid_fraction": float(valid.mean()),
+                             "below_empty_fraction": mean([r["below_empty_fraction"] for r in rows]), "best_recovered": mean([r["best_recovered"] for r in rows]),
+                             "baselines": {n: mean([r["baselines"].get(n) for r in rows]) for n in names},
+                             "baselines_recovered": {n: mean([r["baselines_recovered"].get(n) for r in rows]) for n in names},
+                             "oracle_mean_bits_on_baseline_behaviors": {n: mean([r["mean_bits"] for r in rows if n in r["baselines"]]) for n in names}}
     log.write(json.dumps({"summary": summary, "step": step}) + "\n")
     log.flush()
     return summary
@@ -454,6 +490,7 @@ def main():
     ap.add_argument("--eval-behaviors", type=int, default=0, help="evaluate a fixed random subset of this many behaviors per set (0: all)")
     ap.add_argument("--uniform-seeds", type=int, default=0, help="training draws experiments from step mod M (the checker's uniform_seeds: M's outcomes cached after M steps); the evaluation never")
     ap.add_argument("--no-baselines", dest="baselines", action="store_false", help="skip scoring the empty, full and search programs in evaluation")
+    ap.add_argument("--run-name", help="the run's name in runs/oracle/<behavior>.<run>.json (default: the --out directory's name)")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
     lr = args.lr if args.lr is not None else {"bestofn": 1e-4}.get(args.mode, 1e-5)

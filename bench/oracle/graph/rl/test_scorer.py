@@ -77,13 +77,20 @@ def check_evaluate():
 
     def score(items):
         seen.extend((it["seed"], it.get("experiments")) for it in items)
-        return [{"valid": True, "total_bits": float(it["source"].split("=")[1])} for it in items]
+        return [{"valid": True, "total_bits": float(it["source"].split("=")[1]), "exec_error_bits": float(it["source"].split("=")[1])} for it in items]
 
-    args = types.SimpleNamespace(samples=2, eval_seed=7, eval_experiments=16, baselines=True)
+    import tempfile
+
+    train.ORACLE_RUNS = Path(tempfile.mkdtemp())
+    args = types.SimpleNamespace(samples=2, eval_seed=7, eval_experiments=16, baselines=True, run_name="t", out=tempfile.mkdtemp())
     log = io.StringIO()
     out = train.evaluate({"heldout_behaviors": [{"id": "a"}, {"id": "b"}], "heldout_prompts": []}, pol, sampler, score, args, Path("."), 0, log, 3)
     s = out["heldout_behaviors"]
     assert s["mean_bits"] == 20.0 and s["best_of_n_bits"] == 10.0 and s["baselines"] == {"empty": 100.0}, s
+    assert s["below_empty_fraction"] == 1.0 and abs(s["best_recovered"] - 0.9) < 1e-12, s  # behavior a: 1 - 10/100
+    best = json.loads((train.ORACLE_RUNS / "a.t.json").read_text())
+    assert best["score"]["total_bits"] == 10.0 and best["experiments"] == 16 and best["seed"] == 7
+    assert sum(1 for _ in open(Path(args.out) / "eval_samples.jsonl")) == 5  # 4 oracle programs + 1 baseline
     assert s["oracle_mean_bits_on_baseline_behaviors"] == {"empty": 20.0} and "heldout_prompts" not in out
     assert set(seen) == {(7, 16)}, seen
     rows = [json.loads(line) for line in log.getvalue().splitlines()]
