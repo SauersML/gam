@@ -831,7 +831,7 @@ def evaluate(args):
                 for ex, score, guess in zip(batch, log_scores(lq, valid, batch).tolist(), best):
                     rows.append({"split": split, "distribution": distribution, "question": ex["kind_q"], "stratum": ex["stratum"], "layer": ex["layer"], "kind": ex["kind"],
                                  "c": ex["c"], "context": ex["context"], "log_score": score, "options": len(ex["options"]), "correct": int(guess == ex["answer"]),
-                                 "effect": ex.get("effect")})
+                                 "effect": ex.get("effect"), "edit": ex.get("edit"), "variant": ex.get("variant")})
     (Path(args.run) / f"eval_{Path(args.labels).name}.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
     summary = {}
     for split in [s_ for s_, _, _ in splits]:
