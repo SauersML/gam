@@ -951,12 +951,13 @@ def bracket_type(tok, rng):
 @family
 def clock_add(tok, rng):
     """Hours on a 12-hour clock."""
-    v = Variant("hours_later", "Clock arithmetic: the hour on a 12-hour clock a few hours after a given hour (wrapping past 12).")
-    for _ in range(300):
+    v = Variant("hours_later", "Clock arithmetic: the hour on a 12-hour clock a few hours after a given hour (wrapping past 12), in two phrasings.")
+    for _ in range(600):
         h, d = rng.randrange(1, 13), rng.randrange(1, 6)
         h2 = rng.choice([x for x in range(1, 13) if x != h])
         r, r2 = (h + d - 1) % 12 + 1, (h2 + d - 1) % 12 + 1
-        t = "If it is {h} o'clock now, then {d} hours later it will be"
+        t = rng.choice(["If it is {h} o'clock now, then {d} hours later it will be",
+                        "The meeting starts at {h} o'clock and lasts {d} hours, so it ends at"])
         v.items.append(Item(t.format(h=h, d=d), f" {r}", t.format(h=h2, d=d), f" {r2}"))
     return [v]
 
