@@ -592,7 +592,8 @@ pub struct PartSites {
 /// holding the map's input and the node its output adds into (an affine node), the native block's
 /// rows and columns, the columns of the output and of the input they sit at, the nodes' widths,
 /// whether the model holds the block transposed (its output then indexed by the native columns),
-/// and the factor the edit is divided by (the product of an owner's scalar factors). The edit's
+/// and the factor the edit is divided by (the product of an owner's scalar factors; an owner with
+/// a matrix factor cannot take an edit, and an edit of its block fails when applied). The edit's
 /// block `ΔB` joins the output as the term `ΔB·x` on the input, at every row the edit covers.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MatrixUse {
@@ -604,7 +605,7 @@ pub struct MatrixUse {
     pub in_at: usize,
     pub widths: (usize, usize),
     pub transposed: bool,
-    pub factor: f64,
+    pub factor: Result<f64, String>,
 }
 
 /// Per native matrix (by name) the uses of its blocks in `artifact`, whose flat program is `flat`
@@ -627,13 +628,13 @@ pub fn matrix_uses(native: &OperatorProgram, artifact: &Artifact, flat: &Operato
             if owned.contains(o.name.as_str()) || shapes.get(o.name.as_str()) != Some(&shape) {
                 continue;
             }
-            out.entry(o.name.clone()).or_default().push(MatrixUse { input: *input, output: n, native_rows: 0..shape.0, native_cols: 0..shape.1, out_at: 0, in_at: 0, widths: (width(n)?, width(*input)?), transposed: false, factor: 1.0 });
+            out.entry(o.name.clone()).or_default().push(MatrixUse { input: *input, output: n, native_rows: 0..shape.0, native_cols: 0..shape.1, out_at: 0, in_at: 0, widths: (width(n)?, width(*input)?), transposed: false, factor: Ok(1.0) });
         }
     }
     let program = &artifact.program;
     let named: BTreeMap<&str, usize> = program.operators.iter().enumerate().map(|(i, op)| (op.name.as_str(), i)).collect();
     // Per owner's use: the observation paths of its input and output nodes.
-    let mut found: Vec<(&crate::artifact::Owner, f64)> = Vec::new();
+    let mut found: Vec<(&crate::artifact::Owner, Result<f64, String>)> = Vec::new();
     let mut paths: Vec<Vec<usize>> = Vec::new();
     for owner in &artifact.owners {
         if !shapes.contains_key(owner.native.as_str()) {
@@ -641,11 +642,11 @@ pub fn matrix_uses(native: &OperatorProgram, artifact: &Artifact, flat: &Operato
         }
         let call = invocation(program, &owner.body, &owner.site)?;
         let body = call.last().and_then(|n| call_rule(program, &call[..call.len() - 1], *n)).ok_or_else(|| error(format!("{}: no rule {}", owner.site, owner.body)))?;
-        let factor = crate::weight_edit::scalar_factor(artifact, owner)?;
+        let factor = crate::weight_edit::scalar_factor(artifact, owner);
         let at = |node: usize| -> Vec<usize> { call.iter().copied().chain([node]).collect() };
         match owner.uses {
             Some((input, output)) => {
-                found.push((owner, factor));
+                found.push((owner, factor.clone()));
                 paths.extend([at(input), at(output)]);
             }
             None => {
@@ -653,7 +654,7 @@ pub fn matrix_uses(native: &OperatorProgram, artifact: &Artifact, flat: &Operato
                 for (n, node) in program.rules[body].nodes.iter().enumerate() {
                     let Node::Affine { terms, .. } = node else { continue };
                     for (input, _) in terms.iter().filter(|t| t.1 == op) {
-                        found.push((owner, factor));
+                        found.push((owner, factor.clone()));
                         paths.extend([at(*input), at(n)]);
                     }
                 }
@@ -1404,7 +1405,8 @@ impl Edits {
                         let mut read = ndarray::Array2::zeros((in_width, rank));
                         read.slice_mut(ndarray::s![u.in_at..u.in_at + in_native.len(), ..]).assign(&inward.slice(ndarray::s![in_native.clone(), ..]));
                         let mut write = ndarray::Array2::zeros((out_width, rank));
-                        write.slice_mut(ndarray::s![u.out_at..u.out_at + out_native.len(), ..]).assign(&(&outward.slice(ndarray::s![out_native.clone(), ..]) / u.factor));
+                        let factor = u.factor.as_ref().map_err(|e| error(format!("{}: {e}", f.native)))?;
+                        write.slice_mut(ndarray::s![u.out_at..u.out_at + out_native.len(), ..]).assign(&(&outward.slice(ndarray::s![out_native.clone(), ..]) / *factor));
                         out.weights.entry(u.output).or_default().push(WeightTerm { input: u.input, rows: rows.clone(), read: d.upload(read.view()).map_err(error)?, write: d.upload(write.view()).map_err(error)? });
                     }
                 }
