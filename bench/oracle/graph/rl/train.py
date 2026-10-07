@@ -417,7 +417,8 @@ def sft_examples(args, pol, pool: list[dict]) -> tuple[list, list]:
     by_id = {b["id"]: b for b in pool}
     best = {}
     for pattern in args.programs or []:
-        for path in sorted(glob.glob(os.path.expanduser(pattern))):
+        pattern = os.path.expanduser(pattern)
+        for path in sorted(glob.glob(os.path.join(pattern, "*.json") if os.path.isdir(pattern) else pattern)):
             r = json.loads(Path(path).read_text())
             if r.get("behavior") not in by_id or not r.get("source"):
                 continue
@@ -604,7 +605,7 @@ def main():
     ap.add_argument("--eval-behaviors", type=int, default=0, help="evaluate a fixed random subset of this many behaviors per set (0: all)")
     ap.add_argument("--uniform-seeds", type=int, default=0, help="training draws experiments from step mod M (the checker's uniform_seeds: M's outcomes cached after M steps); the evaluation never")
     ap.add_argument("--no-baselines", dest="baselines", action="store_false", help="skip scoring the empty, full and search programs in evaluation")
-    ap.add_argument("--programs", nargs="*", help="sft: program files (globs) in g-int's layout; each training behavior's best is one example")
+    ap.add_argument("--programs", nargs="*", help="sft: program files (globs or directories of .json) in g-int's layout")
     ap.add_argument("--data", nargs="*", help="sft: JSONL question files ({'messages': [user, assistant]})")
     ap.add_argument("--program-share", type=float, default=0.3, help="sft: probability that a batch example is a program example")
     ap.add_argument("--sft-steps", type=int, default=200)
