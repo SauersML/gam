@@ -38,7 +38,7 @@ import builtins
 import inspect
 import io
 import json
-import os
+import signal
 import subprocess
 import sys
 import tokenize
@@ -435,6 +435,8 @@ def check(tree: ast.AST) -> list[str]:
             if isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant) and isinstance(n.value.value, str)}
     for n in ast.walk(tree):
         line = getattr(n, "lineno", "?")
+        if isinstance(n, ast.Import):
+            raise MechError(f"line {line}: only `from mech import ...` is allowed")
         if not isinstance(n, ALLOWED_NODES):
             raise MechError(f"line {line}: {type(n).__name__} is not allowed in a mech program")
         if isinstance(n, ast.ImportFrom):
@@ -553,9 +555,11 @@ def trace(source: str, model: str, timeout: float = 10.0) -> dict:
                               input=source, capture_output=True, text=True, timeout=timeout + 5)
         if done.returncode == 0:
             return json.loads(done.stdout)
+        if done.returncode in (-signal.SIGXCPU, -signal.SIGKILL):
+            raise subprocess.TimeoutExpired(done.args, timeout)
         error = f"the program crashed the tracer (exit {done.returncode}): {done.stderr.strip()[-300:]}"
     except subprocess.TimeoutExpired:
-        error = f"time limit of {timeout} s exceeded"
+        error = f"time limit of {timeout} s CPU exceeded"
     ir = trace_inline("", model) if model in MODELS else {"model": model, "nodes": [], "edges": []}
     try:
         tokens, types = code_length(source)
