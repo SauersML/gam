@@ -128,7 +128,9 @@ fn parse_rejects_bad_programs() {
     program.edges = vec![EdgeIr { from: "a".into(), to: "b".into(), route: "input".into() }];
     assert!(Graph::parse(&program, &weights).is_err(), "an edge backwards in depth");
     program.edges = vec![EdgeIr { from: "b".into(), to: "a".into(), route: "input".into() }];
-    assert!(Graph::parse(&program, &weights).is_err(), "a head has no input route");
+    assert_eq!(Graph::parse(&program, &weights).expect("all of a head's inputs").edges.len(), 3);
+    program.edges = vec![EdgeIr { from: "b".into(), to: "a".into(), route: "gate".into() }];
+    assert!(Graph::parse(&program, &weights).is_err(), "no such route");
     program.edges = vec![EdgeIr { from: "b".into(), to: "a".into(), route: "key".into() }];
     assert!(Graph::parse(&program, &weights).is_ok());
 }

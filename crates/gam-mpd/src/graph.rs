@@ -414,11 +414,15 @@ impl Graph {
                 return Err(format!("edge {} >> {}: the writer does not write before the reader reads", e.from, e.to));
             }
             let routes = reader.map_or(&[Route::Input][..], |r| blocks[r].routes());
-            if !routes.contains(&route) {
-                return Err(format!("edge {} >> {}: the reader has no {} route", e.from, e.to, e.route));
-            }
-            if !edges.contains(&(writer, reader, route)) {
-                edges.push((writer, reader, route));
+            // `a >> head` (route input) feeds all of a head's inputs.
+            let expanded: Vec<Route> = if route == Route::Input && !routes.contains(&Route::Input) { routes.to_vec() } else { vec![route] };
+            for route in expanded {
+                if !routes.contains(&route) {
+                    return Err(format!("edge {} >> {}: the reader has no {} route", e.from, e.to, e.route));
+                }
+                if !edges.contains(&(writer, reader, route)) {
+                    edges.push((writer, reader, route));
+                }
             }
         }
         Ok(Self { ids, blocks, edges })
