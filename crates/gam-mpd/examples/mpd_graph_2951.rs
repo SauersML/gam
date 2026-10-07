@@ -5,14 +5,24 @@
 //!   its weights taken from the start library (`library_mdl::explanation`, equal to `M`).
 //! * `{"op": "behavior", "path": FILE}` or `{"op": "behavior", "behavior": {...}}`: a behavior file
 //!   (design.txt section 5); measures its stand-in averages on `M`. With `"manifest": FILE` (an
-//!   immutable experiment manifest, `mpd_library_mdl_2951`'s; for vpd4l the default is
-//!   `~/mpd-data/compare/manifest/MANIFEST_vpd4l_s1.json` when the export is VPD-4L's, `null` for
-//!   none), a third of the behavior's half of the experiments are its site operations
-//!   (`graph::SiteUnits::manifest`, positions drawn on the export's `context` tokens).
-//! * `{"op": "score", "program": IR, "experiments": 32, "seed": 0, "routing": "edges" | "nodes",
-//!   "N": null, "reader_top": 0}`: every score term (`graph::Score`); with `reader_top` k > 0, per
-//!   experiment its words and per target token `M_e`'s and the program's probabilities of `M`'s k
-//!   most probable clean tokens and of everything else (the reader's items).
+//!   immutable experiment manifest, `mpd_library_mdl_2951`'s or `draw_manifest`'s; by default
+//!   `~/mpd-data/compare/manifest/MANIFEST_vpd4l_s1.json` for the vpd4l export and
+//!   `~/mpd-data/graph_oracle/experiments/MANIFEST_{export directory}_s1.json` for others when it
+//!   exists, `null` for none), a third of the behavior's half of the experiments are its site
+//!   operations (`graph::SiteUnits::manifest`, positions drawn on the manifest's or the export's
+//!   context). A failed request keeps the loaded model.
+//! * `{"op": "score", "program": IR}` or `{"op": "score", "programs": [IR, ...]}` (the answer
+//!   `{"ok", "scores": [...], "seconds"}`), with `"experiments": 32, "seed": 0, "routing": "edges" |
+//!   "nodes", "N": null, "reader_top": 0, "uniform_seeds": null`: every score term (`graph::Score`)
+//!   per program, all programs under one seed (`Checker::score_batch`: the behavior's half of the
+//!   experiments shared, `M` once per experiment, runs on parallel threads); with `reader_top` k > 0,
+//!   per experiment its words and per target token `M_e`'s and the program's probabilities of `M`'s
+//!   k most probable clean tokens and of everything else (the reader's items); with
+//!   `uniform_seeds` m, experiments from seed mod m (`M`'s cache serves recurring seeds).
+//!   `GRAPH_CACHE_GIB` bounds `M`'s cached outcomes (2), `GRAPH_DISK_CACHE` shares them on disk.
+//! * `{"op": "draw_manifest", "out": FILE, "seed": 1, "count": 1024, "length": 512, "sequences": 8,
+//!   "families": [...]}`: an immutable manifest of site operations for a model without one
+//!   (`graph::SiteUnits::write_manifest` on the export's first token rows), made the pool.
 //! * `{"op": "quit"}`.
 use gam_gpu::tensor::Device;
 use gam_mpd::{
