@@ -203,6 +203,57 @@ def curve_figure(run: Path, path: str, sets=None):
     fig.savefig(path, dpi=150, facecolor="white")
 
 
+def compare_figure(runs, path, metric="measured_minus_no_change_bits"):
+    """Several runs on the same held-out sets: rows = held-out sets, columns = question types, one line per run
+    of the oracle's measured-minus-no-change answer bits over training steps (sft.py's curve), and, as squares,
+    eval_kl's oracle-minus-no-change KL at saved adapters."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    curves = {n: [json.loads(l) for l in open(r["dir"] / "train.jsonl") if '"heldout"' in l] for n, r in runs.items() if (r["dir"] / "train.jsonl").exists()}
+    sets = sorted({s for c in curves.values() for e in c for s in e["heldout"]})
+    types = sorted({k for c in curves.values() for e in c for s in sets for k, v in e["heldout"].get(s, {}).items() if v.get(metric) is not None})
+    plt.rcParams.update({"font.size": 13, "axes.spines.top": False, "axes.spines.right": False})
+    fig, axes = plt.subplots(2 * len(sets), len(types), figsize=(5 * len(types), 3.6 * 2 * len(sets)), facecolor="white", squeeze=False, sharex=True)
+    color = {n: f"C{i}" for i, n in enumerate(curves)}
+    for i, s in enumerate(sets):
+        for j, k in enumerate(types):
+            top, bottom = axes[2 * i][j], axes[2 * i + 1][j]
+            for n, c in curves.items():
+                pts = [(e["step"], e["heldout"][s][k]) for e in c if e["heldout"].get(s, {}).get(k, {}).get(metric) is not None]
+                if pts:
+                    top.plot([p[0] for p in pts], [p[1][metric] for p in pts], color=color[n], marker="o", ms=2, label=n)
+                kp = []
+                d = runs[n]["dir"]
+                for f in d.glob("eval_kl_step*.json"):
+                    v = json.loads(f.read_text())["sets"].get(s, {}).get(k)
+                    if v and v.get("difference_bits") is not None:
+                        kp.append((int(f.stem.split("step")[1]), v["difference_bits"], v["difference_se"]))
+                if (d / "eval_kl_base.json").exists():
+                    v = json.loads((d / "eval_kl_base.json").read_text())["sets"].get(s, {}).get(k)
+                    if v and v.get("difference_bits") is not None:
+                        kp.append((0, v["difference_bits"], v["difference_se"]))
+                kp.sort()
+                if kp:
+                    bottom.errorbar([p[0] for p in kp], [p[1] for p in kp], yerr=[p[2] for p in kp], color=color[n], marker="s", ms=4, capsize=2)
+            top.set_title(f"{s}: {k}")
+            for ax in (top, bottom):
+                ax.axhline(0, color="black", lw=0.8)
+                ax.set_yscale("symlog", linthresh=0.1)
+            if j == 0:
+                top.set_ylabel("answer bits:\nmeasured - no change")
+                bottom.set_ylabel("KL to M:\noracle - no change")
+    for ax in axes[-1]:
+        ax.set_xlabel("training step")
+    from matplotlib.lines import Line2D
+
+    fig.legend([Line2D([], [], color=color[n]) for n in curves], list(curves), frameon=False, ncol=len(curves), loc="upper center")
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    fig.savefig(path, dpi=130, facecolor="white")
+
+
 def kl_figure(name, r, path):
     """Per held-out set (panels) and question type: KL(M_e || answer) in bits for the base oracle, the trained
     oracle and the no-change answer on the same questions (log scale)."""
@@ -239,6 +290,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--run", action="append", required=True)
     ap.add_argument("--figure", default="")
+    ap.add_argument("--compare-figure", default="", help="every --run on one grid: held-out sets x question types, over steps")
     ap.add_argument("--curve-figure", default="", help="measured-minus-no-change bits over training steps for the first run")
     ap.add_argument("--strata-figure", default="", help="eval_kl by size of the measured change for the first run")
     ap.add_argument("--kl-figure", default="", help="eval_kl bars of the first run (base, trained, no change)")
@@ -252,6 +304,9 @@ def main():
         st = strata(r["dir"])
         if st:
             print(st)
+    if args.compare_figure:
+        compare_figure(runs, args.compare_figure)
+        print("figure", args.compare_figure)
     if args.curve_figure:
         curve_figure(next(iter(runs.values()))["dir"], args.curve_figure)
         print("figure", args.curve_figure)
