@@ -1358,10 +1358,11 @@ impl Posterior {
         (0..self.active.len()).map(|g| if self.active[g] { curvature.rise[g] } else { 0.0 }).collect()
     }
 
-    /// Over the active groups' entries, the mean `ln σ` and the mean `|μ|`, and over the active
-    /// groups, the sum of the prior variances `v_G`: what moves
+    /// Over the active groups' entries, the mean `ln σ` and the mean `|μ|` (absent when no entry
+    /// is active: a removal round may remove every group), and over the active groups, the sum of
+    /// the prior variances `v_G`: what moves
     /// `Σ_G KL(q_G ‖ p_G) = ½ Σ_G (S_G / v_G + |G| ln v_G − |G| − Σ_{j∈G} ln σ_j²)` between epochs.
-    pub fn spread(&self) -> (f64, f64, f64) {
+    pub fn spread(&self) -> (Option<f64>, Option<f64>, f64) {
         let (mut entries, mut log_sd, mut magnitude) = (0.0, 0.0, 0.0);
         for i in 0..self.mean.len() {
             for ((mu, s), group) in self.mean[i].iter().zip(self.log_sd[i].iter()).zip(self.membership[i].iter()) {
@@ -1373,7 +1374,8 @@ impl Posterior {
             }
         }
         let variances = self.priors().iter().zip(&self.active).filter(|(_, a)| **a).map(|(p, _)| p.variance).sum();
-        (log_sd / entries, magnitude / entries, variances)
+        let average = |sum: f64| (entries > 0.0).then(|| sum / entries);
+        (average(log_sd), average(magnitude), variances)
     }
 
     /// Per group, `KL(q_G ‖ p_G)` in nats at its prior variance (zero for a removed group).
@@ -4344,15 +4346,19 @@ pub fn fit_from(
         };
         log::info!("library fit epoch {epoch}: {record:?}");
         let (log_sd, magnitude, variances) = posterior.spread();
-        log::info!("library posterior after epoch {epoch}: mean ln σ {log_sd:.5}, mean |μ| {magnitude:.6e}, Σ v_G {variances:.6e}");
-        // Nothing nonfinite is checkpointed: the epoch fails at its record instead. With every
-        // group removed (a removal round may remove them all, and the descent goes on) the spread's
-        // means average no entry (0 / 0) and are left out.
+        let absent = || "none (no active entry)".to_string();
+        log::info!(
+            "library posterior after epoch {epoch}: mean ln σ {}, mean |μ| {}, Σ v_G {variances:.6e}",
+            log_sd.map_or_else(absent, |v| format!("{v:.5}")),
+            magnitude.map_or_else(absent, |v| format!("{v:.6e}"))
+        );
+        // Nothing nonfinite is checkpointed: the epoch fails at its record instead. The check
+        // applies to the values that exist: with every group removed (a removal round may remove
+        // them all, and the descent goes on) the spread's averages are absent, not nonfinite.
         let held = &record.held_out;
         let values = [record.data_bits, record.snapshot_bits, held.objective_bits_per_token, held.data_bits_per_token, held.mean_bits_per_token, held.rounded_bits_per_token, held.divergence_bits, variances];
-        let means = if posterior.active.iter().any(|a| *a) { vec![log_sd, magnitude] } else { Vec::new() };
-        if values.iter().chain(&means).any(|v| !v.is_finite()) {
-            return Err(format!("epoch {epoch}: nonfinite record (data, snapshot, held-out F, data, mean, rounded, divergence, Σ v_G: {values:?}; mean ln σ, mean |μ|: {means:?})"));
+        if values.iter().chain(log_sd.iter()).chain(magnitude.iter()).any(|v| !v.is_finite()) {
+            return Err(format!("epoch {epoch}: nonfinite record (data, snapshot, held-out F, data, mean, rounded, divergence, Σ v_G: {values:?}; mean ln σ {log_sd:?}, mean |μ| {magnitude:?})"));
         }
         progress.epochs.push(record);
         progress.previous = Some(snapshot);
