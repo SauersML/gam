@@ -81,6 +81,25 @@ def strong_weights(path):
             'bins': {f'[{a}, {b})': summary([x for x in records if a <= x['effect_mean_bits_per_token'] < b]) for a, b in bins}}
 
 
+def adversarial(path, form=None):
+    """An arm's fixed-budget adversarial push (edits' adv5 settings: 8 searches of 32 steps of 8 probes
+    on held-out sequences [0, 4)): the clean error over the searched rows, the found push's gap and
+    its excess over the clean error, and its effect on M, in bits per token; `form` picks one of VPD's
+    forms (mpd_battery_2951 adversarial). None without the file."""
+    r = L(path)
+    a = (r or {}).get('adversarial')
+    if a and form:
+        a = a.get(form)
+    if not a:
+        return None
+    return {'file': path, 'clean': a['clean_bits_per_token'], 'found': a['adversarial_bits_per_token'], 'excess': a['adversarial_excess_bits_per_token'], 'effect': a.get('effect_bits_per_token')}
+
+
+# The arms edits pushed adversarially (adv5): the transcoders as built and the fit on the shared
+# operations (thr-edits); VPD's forms (compare-vpd-adversarial5).
+EDITS_ADV = {'as_is': '/Users/user/mpd-data/scratch/edits/run/adv5_asis/out/EDITS_adv5_asis.json', 'thr_edits': '/Users/user/mpd-data/scratch/edits/run/adv5_thr/out/EDITS_adv5_thr.json'}
+
+
 def fixed_bits(out):
     """32 bits per real of each transcoder layer's fixed output bias (not M's tensor)."""
     reals = 0
@@ -118,6 +137,9 @@ for model, label, d, f, rec, out in arms:
     strong = strong_weights(f"{d}/{f.rsplit('_', 1)[0]}_s3.json")
     if strong:
         row['strong_weights'] = strong
+    pushed = adversarial(EDITS_ADV.get(f[len('EDITS_'):].rsplit('_', 1)[0])) if model == 'vpd4l' else None
+    if pushed:
+        row['adversarial'] = pushed
     if r:
         row['gap'], row['gap_by_effect'], row['families'] = manifest_gap(r)
         if r.get('weights'):
@@ -140,7 +162,8 @@ for form, label in (('published', 'VPD as published (CI reads the edited M, both
     path = next((f for f in (f'{MANIFEST_DIR}/vpd_s2/EDITS_vpd_{form}.json', f'{MANIFEST_DIR}/vpd/EDITS_vpd_{form}.json') if os.path.exists(f)), f'{MANIFEST_DIR}/vpd/EDITS_vpd_{form}.json')
     r = L(path)
     strong = strong_weights(f'{MANIFEST_DIR}/vpd_s3/EDITS_vpd_{form}.json')
-    row = {'model': 'vpd4l', 'method': label, 'edits': path if r else None, 'manifest': experiments_of(r), **({'strong_weights': strong} if strong else {}),
+    pushed = adversarial(f'{MANIFEST_DIR}/vpd/vpd_adversarial5.json', form)
+    row = {'model': 'vpd4l', 'method': label, 'edits': path if r else None, 'manifest': experiments_of(r), **({'strong_weights': strong} if strong else {}), **({'adversarial': pushed} if pushed else {}),
            'description_bits': 11.4e6 + 77.2e6, 'description_note': '11.4M subcomponents + 77.2M CI network', 'active': '213 subcomponents unmasked per token'}
     if r:
         row['gap'], row['gap_by_effect'], row['families'] = manifest_gap(r)
@@ -155,7 +178,8 @@ for p in L('/Users/user/mpd-data/compare/frontier_points.json') or []:
         continue
     r = L(p.get('edits'))
     strong = strong_weights(p.get('weights_edits'))
-    row = {'model': 'vpd4l', 'method': p['label'], 'edits': p.get('edits') if r else None, 'manifest': experiments_of(r), **({'strong_weights': strong} if strong else {}),
+    pushed = adversarial(p.get('adversarial_edits'))
+    row = {'model': 'vpd4l', 'method': p['label'], 'edits': p.get('edits') if r else None, 'manifest': experiments_of(r), **({'strong_weights': strong} if strong else {}), **({'adversarial': pushed} if pushed else {}),
            'description_bits': p.get('description_bits'), 'description_note': p.get('description_note'), 'attention_bits': p.get('attention_bits')}
     if r:
         row['gap'], row['gap_by_effect'], row['families'] = manifest_gap(r)
@@ -180,6 +204,7 @@ for r in rows:
           '| weight edits: gap', (r.get('weights') or {}).get('mean_bits_per_token') and round(r['weights']['mean_bits_per_token'], 4),
           'ignoring', (r.get('weights') or {}).get('ignoring_mean_bits_per_token') and round(r['weights']['ignoring_mean_bits_per_token'], 4),
           'not applicable', (r.get('weights') or {}).get('not_applicable'),
+          '| adversarial push: excess', (r.get('adversarial') or {}).get('excess') and round(r['adversarial']['excess'], 4),
           '| strong weight edits', (lambda w: w and {'all': {k: (round(v, 4) if isinstance(v, float) else v) for k, v in w['all'].items()}, 'not applicable': w['not_applicable'],
                                                      'families': {f: (v['edits'], v['gap'] and round(v['gap'], 3), v['ignoring'] and round(v['ignoring'], 3), v['effect'] and round(v['effect'], 3)) for f, v in w['families'].items()},
                                                      'bins': {b: (v['edits'], v['gap'] and round(v['gap'], 3), v['ignoring'] and round(v['ignoring'], 3)) for b, v in w['bins'].items()}})(r.get('strong_weights')), '| bins', {k: (n, round(g, 3)) for k, (n, g) in (r.get('gap_by_effect') or {}).items()}, r.get('refused', ''))
