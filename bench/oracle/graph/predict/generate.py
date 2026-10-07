@@ -389,7 +389,9 @@ class Draw:
 # ---------------------------------------------------------------- one batch of texts
 
 
-def batch_questions(m: Qwen3, w: Writer, draw: Draw, tokens: torch.Tensor, source: str, split: str, steps: int, ids: list):
+def batch_questions(m: Qwen3, w: Writer, draw: Draw, tokens: torch.Tensor, source: str, split: str, steps: int, ids: list, counterfactuals=None):
+    """Every question type on a batch of texts of one length; `counterfactuals` (optional, per text a
+    token list of the same length or None) are the behaviors' own prompt edits, used by the prompt type."""
     rng = draw.rng
     B, T = tokens.shape
     out = []
@@ -510,6 +512,14 @@ def batch_questions(m: Qwen3, w: Writer, draw: Draw, tokens: torch.Tensor, sourc
     toks2 = tokens.clone()
     desc, extra = [], []
     for r in rows:
+        cf = counterfactuals[r] if counterfactuals else None
+        if cf is not None:
+            toks2[r] = torch.tensor(cf, device=tokens.device)
+            changed = [i for i in range(T) if int(tokens[r, i]) != cf[i]]
+            edits = ", ".join(f"position {i}: {w.token(int(tokens[r, i]))} -> {w.token(cf[i])}" for i in changed)
+            desc.append(f"<text> {texts[r]}\n<edit> {edits}\n<edited_text> {w.text(cf)}\n")
+            extra.append({"positions": changed, "counterfactual": cf})
+            continue
         p = int(rng.integers(1, T))
         new = int(tokens[(r + 1 + int(rng.integers(B - 1))) % B, int(rng.integers(T))].item()) if B > 1 else int(rng.integers(1000))
         old = int(tokens[r, p].item())
@@ -545,15 +555,25 @@ def batch_questions(m: Qwen3, w: Writer, draw: Draw, tokens: torch.Tensor, sourc
     return out
 
 
-def load_behaviors(root: Path, tok):
-    """Behavior prompts (g-behaviors' files for this model), as token id lists."""
+def load_behaviors(root: Path, tok, per_behavior: int, rng):
+    """Behavior prompts (g-behaviors' files for this model): per prompt and target position t, the prefix
+    ending at t (the question is about the token after it) and the counterfactual's prefix when it has the
+    same length; at most `per_behavior` prefixes per behavior (drawn uniformly)."""
     seqs = []
     for f in sorted(root.glob("*.json")):
         b = json.loads(f.read_text())
+        mine = []
         for p in b.get("prompts", []):
-            ids = p.get("token_ids") or tok(p["text"])["input_ids"]
-            if len(ids) >= 4:
-                seqs.append((f"{b['id']}", [int(t) for t in ids], b.get("split", "train")))
+            ids = [int(t) for t in (p.get("token_ids") or tok(p["text"])["input_ids"])]
+            cf = p.get("counterfactual") or {}
+            cf_ids = [int(t) for t in cf.get("token_ids", [])]
+            for t in p.get("target_positions") or [len(ids) - 1]:
+                if t >= 3:
+                    prefix = ids[: t + 1]
+                    cfp = cf_ids[: t + 1] if len(cf_ids) > t and cf_ids[: t + 1] != prefix else None
+                    mine.append((b["id"], prefix, b.get("split", "train"), cfp))
+        for i in rng.permutation(len(mine))[:per_behavior]:
+            seqs.append(mine[i])
     return seqs
 
 
@@ -570,6 +590,7 @@ def main():
     ap.add_argument("--steps", type=int, default=8)
     ap.add_argument("--split", default="train")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--per-behavior", type=int, default=64, help="prefixes per behavior (--behaviors)")
     ap.add_argument("--transcoders", default="", help="circuit-tracer transcoder directory (layer_{l}.safetensors)")
     ap.add_argument("--tc-layers", default="", help="layers whose transcoder features are asked about, e.g. 3,9,14,20,25")
     args = ap.parse_args()
@@ -604,19 +625,23 @@ def main():
                 rate = texts / (time.time() - started)
                 print(json.dumps({"texts": texts, "questions": written, "T": Tn, "texts_per_s": round(rate, 2), "questions_per_s": round(rate * 8, 1)}), flush=True)
         if args.behaviors:
-            seqs = load_behaviors(Path(args.behaviors), m.tok)
+            seqs = load_behaviors(Path(args.behaviors), m.tok, args.per_behavior, np.random.default_rng(args.seed + 2))
             by_len = {}
-            for bid, ids, split in seqs:
-                by_len.setdefault((len(ids), split), []).append((bid, ids, split))
+            for item in seqs:
+                by_len.setdefault((len(item[1]), item[2]), []).append(item)
             for n, group in sorted(by_len.items()):
                 for s in range(0, len(group), args.batch):
                     chunk = group[s : s + args.batch]
                     if len(chunk) < 2:
                         continue
-                    toks = torch.tensor([ids for _, ids, _ in chunk], device=dev)
-                    qs = batch_questions(m, w, draw, toks, "behavior", chunk[0][2], args.steps, [bid for bid, _, _ in chunk])
+                    toks = torch.tensor([ids for _, ids, _, _ in chunk], device=dev)
+                    qs = batch_questions(m, w, draw, toks, "behavior", chunk[0][2], args.steps, [bid for bid, _, _, _ in chunk],
+                                         [cf for _, _, _, cf in chunk])
                     for q in qs:
                         f.write(json.dumps(q, ensure_ascii=False) + "\n")
+                    f.flush()
+                    if dev.type == "mps":
+                        torch.mps.empty_cache()
                     written += len(qs)
                     texts += len(chunk)
     print(json.dumps({"done": True, "texts": texts, "questions": written, "seconds": round(time.time() - started, 1)}), flush=True)
