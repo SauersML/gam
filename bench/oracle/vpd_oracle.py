@@ -815,6 +815,8 @@ def evaluate(args):
     held = {int(x) for x in config["heldout_layers"].split(",") if x} if not every else set()
     splits = (("heldout_layers", held, "trained"), ("trained_layers", set(table.layers) - held, "trained")) if not every else \
         (("heldout_subcomponents", set(table.layers), "heldout"), ("trained_subcomponents", set(table.layers), "trained"))
+    if args.split:
+        splits = tuple(x for x in splits if x[0] == args.split)
     rows = []
     for split, layers, side in splits:
         for distribution in ("natural", "stratified"):
@@ -915,6 +917,7 @@ def main():
     e = sub.choices["evaluate"]
     e.add_argument("--run", required=True)
     e.add_argument("--examples", type=int, default=4096)
+    e.add_argument("--split", default="", help="only this split (e.g. heldout_subcomponents)")
     k = sub.add_parser("check")
     for a in ("--base", "--labels", "--uv"):
         k.add_argument(a, required=True)
