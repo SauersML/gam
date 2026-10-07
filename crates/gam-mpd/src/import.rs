@@ -461,8 +461,10 @@ fn language_model(tensors: &Tensors<'_>, record: &Value, blocks: std::ops::Range
         None
     };
     let norm = |b: &mut Builder, x: usize, name: &str| -> Result<usize, String> {
+        // Without a norm the block reads the stream through the identity: a node of its own, so
+        // a block's read follows the stream entering it (interchange's site order).
         if no_norm {
-            return Ok(x);
+            return Ok(b.node(Node::Affine { terms: vec![(x, identity)], bias: None }));
         }
         let input = match centring {
             Some(centre) => b.node(Node::Affine { terms: vec![(x, identity), (x, centre)], bias: None }),
