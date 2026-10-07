@@ -87,6 +87,21 @@ class Interventions:
         self.parts_scale = {}  # row -> (layer, site, subcomponent indices [k], alpha)   (vpd4l's VPD view)
         self.parts_swap = {}  # row -> (layer, site, subcomponent indices [k], source activities [k])
 
+    @staticmethod
+    def concat(ivs: list["Interventions"]) -> "Interventions":
+        """One batch holding several batches' interventions in order (rows of the k-th offset by k B):
+        several forwards' work in one pass. Weight edits only (scales); swaps and cuts are not combined."""
+        B = ivs[0].head.shape[0]
+        out = Interventions.__new__(Interventions)
+        out.head = torch.cat([iv.head for iv in ivs])
+        out.neuron = torch.cat([iv.neuron for iv in ivs])
+        out.head_swap = out.neuron_swap = None
+        out.cuts, out.tc_swap, out.parts_swap = {}, {}, {}
+        out.tc_scale = {r + k * B: e for k, iv in enumerate(ivs) for r, e in iv.tc_scale.items()}
+        out.parts_scale = {r + k * B: e for k, iv in enumerate(ivs) for r, e in iv.parts_scale.items()}
+        assert not any(iv.cuts or iv.tc_swap or iv.parts_swap or iv.head_swap or iv.neuron_swap for iv in ivs)
+        return out
+
 
 class Qwen3:
     name = MODEL_NAME
@@ -167,17 +182,21 @@ class Qwen3:
             q, k, v = self.qkv(layer, x, cos, sin)
             z = self.attend(q, k, v)
             if iv is not None:
-                for r, (ak, al, ah, bk, bl, bh, route) in iv.cuts.items():
-                    if bk == "head" and bl == l and r in cut_delta:
-                        xr = layer.input_layernorm(h[r : r + 1] + cut_delta[r])
-                        q2, k2, v2 = self.qkv(layer, xr, cos, sin)
-                        g = bh // (self.H // self.KV)
-                        qh = (q2 if route == "query" else q[r : r + 1])[:, bh : bh + 1]
-                        kh = (k2 if route == "key" else k[r : r + 1])[:, g : g + 1]
-                        vh = (v2 if route == "value" else v[r : r + 1])[:, g : g + 1]
-                        zr = F.scaled_dot_product_attention(qh, kh, vh, is_causal=True).transpose(1, 2)
-                        z = z.clone()
-                        z[r, :, bh] = zr[0, :, 0]
+                # Cut readers among this layer's heads, all texts at once: the head's query, key or value
+                # from the stream with the writer's average write in place of its actual one.
+                R = [r for r, c in iv.cuts.items() if c[3] == "head" and c[4] == l and r in cut_delta]
+                if R:
+                    q2, k2, v2 = self.qkv(layer, layer.input_layernorm(h[R] + torch.stack([cut_delta[r] for r in R])), cos, sin)
+                    rt, ar = torch.tensor(R, device=self.dev), torch.arange(len(R), device=self.dev)
+                    bh = torch.tensor([iv.cuts[r][5] for r in R], device=self.dev)
+                    g = bh // (self.H // self.KV)
+                    which = [iv.cuts[r][6] for r in R]
+                    sel = lambda name: torch.tensor([w == name for w in which], device=self.dev)[:, None, None]  # noqa: E731
+                    qh = torch.where(sel("query"), q2[ar, bh], q[rt, bh])
+                    kh = torch.where(sel("key"), k2[ar, g], k[rt, g])
+                    vh = torch.where(sel("value"), v2[ar, g], v[rt, g])
+                    z = z.clone()
+                    z[rt, :, bh] = F.scaled_dot_product_attention(qh[:, None], kh[:, None], vh[:, None], is_causal=True)[:, 0]
                 if iv.head_swap is not None:
                     mask, values = iv.head_swap
                     m = mask[:, l]
@@ -194,21 +213,27 @@ class Qwen3:
                         record["probe_values"][r] = torch.linalg.vector_norm(z[r, :, ph] @ self.Wo[l][:, ph].T, dim=-1)
             attn_out = layer.self_attn.o_proj(z.reshape(B, T, self.H * self.hd))
             if iv is not None:
-                for r, (ak, al, ah, bk, bl, bh, route) in iv.cuts.items():
-                    if al == l and ak == "head":
-                        write = z[r, :, ah] @ self.Wo[l][:, ah].T
-                        cut_delta[r] = (means["mean_z"][l, ah] @ self.Wo[l][:, ah].T)[None] - write
-                    elif al == l and ak == "attn":
+                Ra = [r for r, c in iv.cuts.items() if c[1] == l and c[0] == "head"]
+                if Ra:
+                    rt = torch.tensor(Ra, device=self.dev)
+                    ah = torch.tensor([iv.cuts[r][2] for r in Ra], device=self.dev)
+                    Wsel = self.Wo[l][:, ah]  # [d, n, hd]
+                    write = torch.einsum("ntk,dnk->ntd", z[rt, :, ah], Wsel)
+                    mean = torch.einsum("nk,dnk->nd", means["mean_z"][l, ah], Wsel)
+                    for i, r in enumerate(Ra):
+                        cut_delta[r] = mean[i][None] - write[i]
+                for r, c in iv.cuts.items():
+                    if c[1] == l and c[0] == "attn":
                         cut_delta[r] = means["mean_attn"][l][None] - attn_out[r]
             if record is not None:
                 record["mean_attn"][l] = attn_out[:, 1:].mean(dim=(0, 1))
             mid = h + attn_out
             y = layer.post_attention_layernorm(mid)
             if iv is not None:
-                for r, (ak, al, ah, bk, bl, bh, route) in iv.cuts.items():
-                    if bk == "mlp" and bl == l and r in cut_delta:
-                        y = y.clone()
-                        y[r] = layer.post_attention_layernorm(mid[r] + cut_delta[r])
+                Rm = [r for r, c in iv.cuts.items() if c[3] == "mlp" and c[4] == l and r in cut_delta]
+                if Rm:
+                    y = y.clone()
+                    y[Rm] = layer.post_attention_layernorm(mid[Rm] + torch.stack([cut_delta[r] for r in Rm]))
             mlp = layer.mlp
             act = mlp.act_fn(mlp.gate_proj(y)) * mlp.up_proj(y)
             if iv is not None:
@@ -513,12 +538,15 @@ def batch_questions(m: Qwen3, w: Writer, draw: Draw, tokens: torch.Tensor, sourc
 
     # rank: 4 candidates, one removal per forward
     cands = [[draw.piece(rec, r, small=True) for _ in range(4)] for r in rows]
-    kls = torch.empty(B, 4, dtype=m.wide)
+    ivs = []
     for c in range(4):
         iv = m.new(B)
         for r in rows:
             apply_scale(iv, r, cands[r][c], 0.0)
-        kls[:, c] = kl_bits(lp_clean, m.log_probs(m.forward(tokens, iv))).cpu()
+        ivs.append(iv)
+    # The 4 removals of every text in one forward of 4 B rows.
+    lp4 = m.log_probs(m.forward(tokens.repeat(4, 1), Interventions.concat(ivs))).view(4, B, -1)
+    kls = torch.stack([kl_bits(lp_clean, lp4[c]) for c in range(4)], dim=1).cpu()
     for r in rows:
         names = "abcd"
         listing = " ".join(f"({names[c]}) {piece_text(cands[r][c])}" for c in range(4))
@@ -544,8 +572,8 @@ def batch_questions(m: Qwen3, w: Writer, draw: Draw, tokens: torch.Tensor, sourc
         p, a = draw.piece(rec, r), float(rng.choice([2.0, 4.0]))
         apply_scale(iv, r, p, a)
         desc.append((piece_text(p), a))
-    clean_cont = m.greedy(tokens, steps)
-    edit_cont = m.greedy(tokens, steps, iv)
+    both = m.greedy(tokens.repeat(2, 1), steps, Interventions.concat([m.new(B), iv]))  # clean and edited rows in one pass
+    clean_cont, edit_cont = both[:B], both[B:]
     for r in rows:
         cc, ec = clean_cont[r].tolist(), edit_cont[r].tolist()
         same = sum(1 for x, y in zip(cc, ec) if x == y)
