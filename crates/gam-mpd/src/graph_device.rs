@@ -11,7 +11,7 @@
 use crate::{
     device_attention::{Segment, forward_segments},
     device_program::{gelu_tanh_constant, law_of},
-    graph::{Block, Circuit, Execution, Incoming, Reference, Weights, Writer},
+    graph::{After, Block, Circuit, Execution, Incoming, Interventions, OnInput, Reference, Weights, Writer},
     operator_program::Rotary,
 };
 use gam_gpu::{
@@ -140,6 +140,8 @@ pub(crate) struct Run<'a> {
     pub swaps: &'a BTreeMap<usize, Array2<f64>>,
     pub capture: bool,
     pub reference: Option<&'a Reference>,
+    /// Row interventions (site operations), applied as `graph::run` applies them.
+    pub ops: &'a Interventions,
 }
 
 /// The stand-ins (`embed`'s and each unit's write in the counterfactual run `r`, rows × width),
@@ -202,6 +204,167 @@ pub(crate) fn run(weights: &Weights, circuit: &Circuit, job: &Run) -> Option<Res
     on_device(|s| run_on(s, weights, circuit, job))
 }
 
+/// A run's state on the device: `embed`'s actual and stand-in writes, every unit's stand-in and
+/// actual write (`None` while it writes its stand-in), and the actual and stand-in streams entering
+/// the current site.
+struct Streams {
+    embed: Tensor,
+    embed_standin: Tensor,
+    standins: Vec<Tensor>,
+    writes: Vec<Option<Tensor>>,
+    stream: Tensor,
+    standin_stream: Tensor,
+}
+
+impl Streams {
+    /// Writer `w`'s actual write and stand-in write (rows × width).
+    fn of(&self, w: Writer) -> (Option<&Tensor>, &Tensor) {
+        match w {
+            Writer::Embed => (Some(&self.embed), &self.embed_standin),
+            Writer::Unit(u) => (self.writes[u].as_ref(), &self.standins[u]),
+        }
+    }
+
+    fn of_mut(&mut self, w: Writer) -> (Option<&mut Tensor>, &mut Tensor) {
+        match w {
+            Writer::Embed => (Some(&mut self.embed), &mut self.embed_standin),
+            Writer::Unit(u) => (self.writes[u].as_mut(), &mut self.standins[u]),
+        }
+    }
+
+    /// A route's input: the actual stream less the cut writers' (actual − stand-in), or the
+    /// stand-in stream plus the kept writers'.
+    fn input(&self, d: &Device, incoming: &Incoming) -> Result<Tensor, GpuError> {
+        let (mut x, sign, writers) = match incoming {
+            Incoming::AllBut(cut) => (d.copy(&self.stream)?, -1.0, cut),
+            Incoming::Only(kept) => (d.copy(&self.standin_stream)?, 1.0, kept),
+        };
+        for &w in writers {
+            let (actual, standin) = self.of(w);
+            if let Some(a) = actual {
+                d.axpy(&mut x, sign, a)?;
+                d.axpy(&mut x, -sign, standin)?;
+            }
+        }
+        Ok(x)
+    }
+}
+
+/// `t[rows] ← f · t[rows]`.
+fn scale_rows(d: &Device, t: &mut Tensor, rows: &gam_gpu::tensor::Indices, f: f64) -> Result<Tensor, GpuError> {
+    let old = d.gather_rows(t, rows)?;
+    d.scatter_rows(t, rows, &d.scaled(f, &old)?, false)?;
+    Ok(old)
+}
+
+/// `v` as `count` rows.
+fn repeated(d: &Device, v: &Array1<f64>, count: usize) -> Result<Tensor, GpuError> {
+    d.upload(v.view().insert_axis(ndarray::Axis(0)).broadcast((count, v.len())).ok_or_else(|| GpuError::DriverCallFailed { reason: "a pushed vector".into() })?)
+}
+
+/// The site operations of `ops` after `point` (a site, `None` before every site), as
+/// `Interventions::after` applies them on the host: a scale multiplies writers' actual and
+/// stand-in writes at the rows (and the streams by the change), a swap puts the donor's writes in
+/// place of the actual ones, a push adds a vector to both streams.
+fn after(d: &Device, ops: &Interventions, point: Option<usize>, st: &mut Streams) -> Result<(), GpuError> {
+    for (_, op) in ops.after.iter().filter(|(p, _)| *p == point) {
+        match op {
+            After::Scale(writers, rows, f) => {
+                let idx = d.upload_indices(&rows.iter().map(|&r| r as u32).collect::<Vec<_>>())?;
+                for &w in writers {
+                    let (actual, standin) = st.of_mut(w);
+                    let old_standin = scale_rows(d, standin, &idx, *f)?;
+                    let contribution = match actual {
+                        Some(a) => scale_rows(d, a, &idx, *f)?,
+                        None => d.copy(&old_standin)?,
+                    };
+                    d.scatter_rows(&mut st.stream, &idx, &d.scaled(f - 1.0, &contribution)?, true)?;
+                    d.scatter_rows(&mut st.standin_stream, &idx, &d.scaled(f - 1.0, &old_standin)?, true)?;
+                }
+            }
+            After::Swap(writers, rows) => {
+                let donor = ops.donor.as_ref().ok_or_else(|| GpuError::DriverCallFailed { reason: "a swap without a donor run".into() })?;
+                let idx = d.upload_indices(&rows.iter().map(|&r| r as u32).collect::<Vec<_>>())?;
+                for &w in writers {
+                    let value = match w {
+                        Writer::Embed => Some(&donor.embed),
+                        Writer::Unit(u) => donor.writes.get(u).and_then(Option::as_ref),
+                    };
+                    let (Some(value), (Some(actual), _)) = (value, st.of_mut(w)) else { continue };
+                    let new = d.gather_rows(&d.upload(value.view())?, &idx)?;
+                    let old = d.gather_rows(actual, &idx)?;
+                    d.scatter_rows(actual, &idx, &new, false)?;
+                    let mut change = new;
+                    d.axpy(&mut change, -1.0, &old)?;
+                    d.scatter_rows(&mut st.stream, &idx, &change, true)?;
+                }
+            }
+            After::Push(rows, v) => {
+                let idx = d.upload_indices(&rows.iter().map(|&r| r as u32).collect::<Vec<_>>())?;
+                let values = repeated(d, v, rows.len())?;
+                d.scatter_rows(&mut st.stream, &idx, &values, true)?;
+                d.scatter_rows(&mut st.standin_stream, &idx, &values, true)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Unit `unit`'s route inputs under the cuts into its site (`Interventions::cut_inputs`): a writer
+/// the route reads actually is read on the donor at the cut rows.
+fn cut_inputs(d: &Device, ops: &Interventions, site: usize, unit: &crate::graph::Unit, inputs: &mut [(usize, Tensor)], st: &Streams) -> Result<(), GpuError> {
+    for (_, writers, rows) in ops.cuts.iter().filter(|(to, _, _)| *to == site) {
+        let donor = ops.donor.as_ref().ok_or_else(|| GpuError::DriverCallFailed { reason: "a cut without a donor run".into() })?;
+        let idx = d.upload_indices(&rows.iter().map(|&r| r as u32).collect::<Vec<_>>())?;
+        for &w in writers {
+            let value = match w {
+                Writer::Embed => Some(&donor.embed),
+                Writer::Unit(u) => donor.writes.get(u).and_then(Option::as_ref),
+            };
+            let (Some(value), (Some(actual), _)) = (value, st.of(w)) else { continue };
+            let mut change = d.gather_rows(&d.upload(value.view())?, &idx)?;
+            d.axpy(&mut change, -1.0, &d.gather_rows(actual, &idx)?)?;
+            for (slot, x) in inputs.iter_mut() {
+                let reads = match &unit.routes[*slot] {
+                    Incoming::AllBut(cut) => !cut.contains(&w),
+                    Incoming::Only(kept) => kept.contains(&w),
+                };
+                if reads {
+                    d.scatter_rows(x, &idx, &change, true)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Unit `u`'s normed input of route slot `slot` under the operations on its site's input
+/// (`Interventions::normed`), kept in `kept` when the site is recorded.
+fn normed(d: &Device, ops: &Interventions, (site, u, slot): (usize, usize, usize), x: &mut Tensor, kept: &mut BTreeMap<(usize, usize), Array2<f64>>) -> Result<(), GpuError> {
+    for (_, op) in ops.inputs.iter().filter(|(s, _)| *s == site) {
+        let rows = match op {
+            OnInput::Scale(rows, _) | OnInput::Push(rows, _) | OnInput::Swap(rows) => rows,
+        };
+        let idx = d.upload_indices(&rows.iter().map(|&r| r as u32).collect::<Vec<_>>())?;
+        match op {
+            OnInput::Scale(_, f) => {
+                scale_rows(d, x, &idx, *f)?;
+            }
+            OnInput::Push(_, v) => d.scatter_rows(x, &idx, &repeated(d, v, rows.len())?, true)?,
+            OnInput::Swap(_) => {
+                if let Some(value) = ops.donor.as_ref().and_then(|dn| dn.normed.get(&(u, slot))) {
+                    let new = d.gather_rows(&d.upload(value.view())?, &idx)?;
+                    d.scatter_rows(x, &idx, &new, false)?;
+                }
+            }
+        }
+    }
+    if ops.record.contains(&site) {
+        kept.insert((u, slot), d.download(x)?);
+    }
+    Ok(())
+}
+
 /// [`run`] on a given device state (the tests run it on the host backend).
 pub(crate) fn run_on(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, job: &Run) -> Result<Execution, String> {
     let e = |e: GpuError| e.to_string();
@@ -224,11 +387,6 @@ pub(crate) fn run_on(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, 
         None if circuit.units.iter().all(|u| u.computes) => (s.device.zeros(rows, width).map_err(e)?, (0..units).map(|_| s.device.zeros(rows, width)).collect::<Result<_, _>>().map_err(e)?),
         None => return Err("a program's undeclared pieces take their values from the counterfactual run, which this batch lacks".into()),
     };
-    let mut order: Vec<usize> = (0..units).collect();
-    order.sort_by_key(|&u| circuit.units[u].block.site());
-    let mut stream = s.device.copy(&embed).map_err(e)?;
-    let mut standin_stream = s.device.copy(&embed_standin).map_err(e)?;
-    let mut writes: Vec<Option<Tensor>> = (0..units).map(|_| None).collect();
     let mut captured = job.capture.then(|| Reference {
         embed: Array2::zeros((0, 0)),
         reads: weights.layers.iter().map(|l| vec![Array2::zeros((0, 0)); l.heads.len()]).collect(),
@@ -237,28 +395,22 @@ pub(crate) fn run_on(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, 
         inputs: vec![Array2::zeros((0, 0)); weights.layers.len()],
         attention_inputs: vec![Array2::zeros((0, 0)); weights.layers.len()],
     });
-    if let Some(c) = captured.as_mut() {
-        c.embed = s.device.download(&embed).map_err(e)?;
-    }
-    // A route's input: the actual stream less the cut writers' (actual − stand-in), or the
-    // stand-in stream plus the kept writers'.
-    let input = |s: &DeviceState, incoming: &Incoming, stream: &Tensor, standin_stream: &Tensor, writes: &[Option<Tensor>]| -> Result<Tensor, GpuError> {
-        let (mut x, sign, writers) = match incoming {
-            Incoming::AllBut(cut) => (s.device.copy(stream)?, -1.0, cut),
-            Incoming::Only(kept) => (s.device.copy(standin_stream)?, 1.0, kept),
-        };
-        for &w in writers {
-            let (actual, standin) = match w {
-                Writer::Embed => (Some(&embed), &embed_standin),
-                Writer::Unit(u) => (writes[u].as_ref(), &standins[u]),
-            };
-            if let Some(a) = actual {
-                s.device.axpy(&mut x, sign, a)?;
-                s.device.axpy(&mut x, -sign, standin)?;
-            }
-        }
-        Ok(x)
+    let mut order: Vec<usize> = (0..units).collect();
+    order.sort_by_key(|&u| circuit.units[u].block.site());
+    let mut st = Streams {
+        stream: s.device.copy(&embed).map_err(e)?,
+        standin_stream: s.device.copy(&embed_standin).map_err(e)?,
+        embed,
+        embed_standin,
+        standins,
+        writes: (0..units).map(|_| None).collect(),
     };
+    let ops = job.ops;
+    let mut kept = BTreeMap::new();
+    if let Some(c) = captured.as_mut() {
+        c.embed = s.device.download(&st.embed).map_err(e)?;
+    }
+    after(&s.device, ops, None, &mut st).map_err(e)?;
     let mut rotations: BTreeMap<(u32, u32, bool), (Tensor, Tensor)> = BTreeMap::new();
     let mut at = 0;
     while at < order.len() {
@@ -270,23 +422,26 @@ pub(crate) fn run_on(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, 
                 continue;
             }
             if let Some(value) = job.swaps.get(&u) {
-                writes[u] = Some(s.device.upload(value.view()).map_err(e)?);
+                st.writes[u] = Some(s.device.upload(value.view()).map_err(e)?);
                 continue;
             }
+            let slots: Vec<usize> = unit.block.routes().iter().map(|r| r.slot()).collect();
+            let mut inputs: Vec<(usize, Tensor)> = slots.iter().map(|&slot| st.input(&s.device, &unit.routes[slot]).map(|x| (slot, x))).collect::<Result<_, _>>().map_err(e)?;
+            cut_inputs(&s.device, ops, site, unit, &mut inputs, &st).map_err(e)?;
             let write = match &unit.block {
                 Block::Heads { layer, heads } => {
                     let lw = &weights.layers[*layer];
                     let gain = s.ensure(row(&lw.attention.gain)).map_err(e)?;
-                    let mut normed = Vec::with_capacity(3);
-                    for slot in 0..3 {
-                        let x = input(s, &unit.routes[slot], &stream, &standin_stream, &writes).map_err(e)?;
-                        let unit_x = s.device.rms_norm(&x, lw.attention.epsilon).map_err(e)?;
+                    let mut normed_inputs = Vec::with_capacity(3);
+                    for (slot, x) in &inputs {
+                        let unit_x = s.device.rms_norm(x, lw.attention.epsilon).map_err(e)?;
                         let mut out = s.device.zeros(rows, width).map_err(e)?;
                         s.device.scale_columns(&mut out, &unit_x, s.get(gain).map_err(e)?, false).map_err(e)?;
-                        normed.push(out);
+                        normed(&s.device, ops, (site, u, *slot), &mut out, &mut kept).map_err(e)?;
+                        normed_inputs.push(out);
                     }
                     if let Some(c) = captured.as_mut() {
-                        c.attention_inputs[*layer] = s.device.download(&normed[0]).map_err(e)?;
+                        c.attention_inputs[*layer] = s.device.download(&normed_inputs[0]).map_err(e)?;
                     }
                     let mut out = s.device.zeros(rows, width).map_err(e)?;
                     for &h in heads {
@@ -302,9 +457,9 @@ pub(crate) fn run_on(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, 
                             }
                             Ok(p)
                         };
-                        let mut q = project(s, &normed[0], &hw.query, hw.query_norm.as_ref()).map_err(e)?;
-                        let mut k = project(s, &normed[1], &hw.key, hw.key_norm.as_ref()).map_err(e)?;
-                        let v = project(s, &normed[2], &hw.value, None).map_err(e)?;
+                        let mut q = project(s, &normed_inputs[0], &hw.query, hw.query_norm.as_ref()).map_err(e)?;
+                        let mut k = project(s, &normed_inputs[1], &hw.key, hw.key_norm.as_ref()).map_err(e)?;
+                        let v = project(s, &normed_inputs[2], &hw.value, None).map_err(e)?;
                         if let Some(r) = hw.rotary {
                             let tables = (r.base, r.dims, r.half_split);
                             if !rotations.contains_key(&tables) {
@@ -330,11 +485,12 @@ pub(crate) fn run_on(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, 
                 Block::Neurons { layer, neurons } => {
                     let lw = &weights.layers[*layer];
                     let mlp = lw.mlp.as_ref().ok_or("a neuron block without an MLP")?;
-                    let x = input(s, &unit.routes[0], &stream, &standin_stream, &writes).map_err(e)?;
-                    let unit_x = s.device.rms_norm(&x, lw.mlp_norm.epsilon).map_err(e)?;
+                    let x = &inputs[0].1;
+                    let unit_x = s.device.rms_norm(x, lw.mlp_norm.epsilon).map_err(e)?;
                     let gain = s.ensure(row(&lw.mlp_norm.gain)).map_err(e)?;
                     let mut x_hat = s.device.zeros(rows, width).map_err(e)?;
                     s.device.scale_columns(&mut x_hat, &unit_x, s.get(gain).map_err(e)?, false).map_err(e)?;
+                    normed(&s.device, ops, (site, u, 0), &mut x_hat, &mut kept).map_err(e)?;
                     let n = mlp.gate.nrows();
                     // The whole MLP, less the few neurons outside a large block.
                     let whole = 2 * neurons.len() > n;
@@ -363,31 +519,32 @@ pub(crate) fn run_on(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, 
                 }
                 _ => return Err("a block the device path does not cover".into()),
             };
-            writes[u] = Some(write);
+            st.writes[u] = Some(write);
         }
         for &u in &order[at..end] {
-            match &writes[u] {
-                Some(w) => s.device.axpy(&mut stream, 1.0, w).map_err(e)?,
-                None => s.device.axpy(&mut stream, 1.0, &standins[u]).map_err(e)?,
+            match &st.writes[u] {
+                Some(w) => s.device.axpy(&mut st.stream, 1.0, w).map_err(e)?,
+                None => s.device.axpy(&mut st.stream, 1.0, &st.standins[u]).map_err(e)?,
             }
-            s.device.axpy(&mut standin_stream, 1.0, &standins[u]).map_err(e)?;
+            s.device.axpy(&mut st.standin_stream, 1.0, &st.standins[u]).map_err(e)?;
         }
+        after(&s.device, ops, Some(site), &mut st).map_err(e)?;
         at = end;
     }
-    let last = input(s, &circuit.logits, &stream, &standin_stream, &writes).map_err(e)?;
+    let last = st.input(&s.device, &circuit.logits).map_err(e)?;
     let picked = s.device.upload_indices(&job.scored.iter().map(|&r| r as u32).collect::<Vec<_>>()).map_err(e)?;
     let last = s.device.gather_rows(&last, &picked).map_err(e)?;
-    let normed = s.device.rms_norm(&last, weights.final_norm.epsilon).map_err(e)?;
+    let normed_last = s.device.rms_norm(&last, weights.final_norm.epsilon).map_err(e)?;
     let u = s.ensure(weights.unembedding.view()).map_err(e)?;
     let mut logits = s.device.zeros(job.scored.len(), weights.unembedding.nrows()).map_err(e)?;
-    s.device.gemm(&mut logits, 1.0, &normed, Op::N, s.get(u).map_err(e)?, Op::T, 0.0, arithmetic).map_err(e)?;
+    s.device.gemm(&mut logits, 1.0, &normed_last, Op::N, s.get(u).map_err(e)?, Op::T, 0.0, arithmetic).map_err(e)?;
     let mut log_probabilities = s.device.download(&logits).map_err(e)?;
     for mut row in log_probabilities.outer_iter_mut() {
         let values = gam_math::categorical::log_softmax(row.as_slice().ok_or("a contiguous row")?).map_err(|e| e.to_string())?;
         row.assign(&Array1::from(values));
     }
-    let writes = writes.iter().map(|w| w.as_ref().map(|t| s.device.download(t)).transpose()).collect::<Result<Vec<_>, _>>().map_err(e)?;
-    Ok(Execution::of(log_probabilities, writes, captured))
+    let writes = st.writes.iter().map(|w| w.as_ref().map(|t| s.device.download(t)).transpose()).collect::<Result<Vec<_>, _>>().map_err(e)?;
+    Ok(Execution::of(log_probabilities, writes, captured, kept))
 }
 
 /// Neurons `picked` (all when `None`) of an MLP on normed inputs `x_hat`: their write (rows ×

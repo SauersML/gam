@@ -129,7 +129,7 @@ impl Route {
     }
 
     /// The slot of the route in a unit's inputs: heads read 0, 1, 2; an MLP and the logits read 0.
-    fn slot(self) -> usize {
+    pub(crate) fn slot(self) -> usize {
         match self {
             Self::Query | Self::Input => 0,
             Self::Key => 1,
@@ -490,7 +490,7 @@ impl Block {
         }
     }
 
-    fn routes(&self) -> &'static [Route] {
+    pub(crate) fn routes(&self) -> &'static [Route] {
         match self {
             Self::Heads { .. } | Self::AttnSlices { .. } => &[Route::Query, Route::Key, Route::Value],
             Self::Neurons { .. } | Self::Features { .. } | Self::Slices { .. } => &[Route::Input],
@@ -1130,8 +1130,8 @@ pub struct Execution {
 
 impl Execution {
     /// A run's outcome from the device path (`graph_device`).
-    pub(crate) fn of(log_probabilities: Array2<f64>, writes: Vec<Option<Array2<f64>>>, captured: Option<Reference>) -> Self {
-        Self { log_probabilities, writes, normed: BTreeMap::new(), captured }
+    pub(crate) fn of(log_probabilities: Array2<f64>, writes: Vec<Option<Array2<f64>>>, captured: Option<Reference>, normed: BTreeMap<(usize, usize), Array2<f64>>) -> Self {
+        Self { log_probabilities, writes, normed, captured }
     }
 
     /// The run's capture ([`Reference`]), when it made one.
@@ -1284,8 +1284,8 @@ fn run(weights: &Weights, circuit: &Circuit, batch: &Batch, scored: &[usize], sw
     let units = circuit.units.len();
     // The device runs what it covers (`graph_device`, stand-ins assembled there); everything else
     // runs here.
-    if ops.is_empty() && batch.blocks.iter().all(Vec::is_empty) {
-        let job = crate::graph_device::Run { tokens: &batch.tokens, spans: &batch.spans, scored, swaps, capture, reference: batch.reference.as_deref() };
+    if batch.blocks.iter().all(Vec::is_empty) {
+        let job = crate::graph_device::Run { tokens: &batch.tokens, spans: &batch.spans, scored, swaps, capture, reference: batch.reference.as_deref(), ops };
         if let Some(out) = crate::graph_device::run(weights, circuit, &job) {
             return out;
         }
@@ -2270,7 +2270,7 @@ impl Streams {
 
 /// What happens after a site ([`Interventions`]).
 #[derive(Clone, Debug)]
-enum After {
+pub(crate) enum After {
     /// The writers' writes, actual and stand-in, times the factor at the rows.
     Scale(Vec<Writer>, Vec<usize>, f64),
     /// The writers' actual writes at the rows replaced by their writes on the donor (stand-ins do
@@ -2283,7 +2283,7 @@ enum After {
 
 /// What happens to every normed input of a site's units ([`Interventions`]).
 #[derive(Clone, Debug)]
-enum OnInput {
+pub(crate) enum OnInput {
     Scale(Vec<usize>, f64),
     Push(Vec<usize>, Array1<f64>),
     /// The normed input at the rows replaced by the same unit's on the donor.
@@ -2294,9 +2294,9 @@ enum OnInput {
 /// normed inputs at the sites an input swap names.
 #[derive(Clone, Debug)]
 pub struct Donor {
-    embed: Array2<f64>,
-    writes: Vec<Option<Array2<f64>>>,
-    normed: BTreeMap<(usize, usize), Array2<f64>>,
+    pub(crate) embed: Array2<f64>,
+    pub(crate) writes: Vec<Option<Array2<f64>>>,
+    pub(crate) normed: BTreeMap<(usize, usize), Array2<f64>>,
 }
 
 /// Row interventions of one run: site operations (`interchange::SiteOp`) resolved against a
@@ -2308,22 +2308,17 @@ pub struct Donor {
 /// gives the readers of block `to` the writers' values on the donor.
 #[derive(Clone, Debug, Default)]
 pub struct Interventions {
-    after: Vec<(Option<usize>, After)>,
-    inputs: Vec<(usize, OnInput)>,
+    pub(crate) after: Vec<(Option<usize>, After)>,
+    pub(crate) inputs: Vec<(usize, OnInput)>,
     /// Readers at a site: the writers' writes on the donor in place of their actual writes at the
     /// rows, through the routes that read the writers' actual writes.
-    cuts: Vec<(usize, Vec<Writer>, Vec<usize>)>,
-    donor: Option<Donor>,
+    pub(crate) cuts: Vec<(usize, Vec<Writer>, Vec<usize>)>,
+    pub(crate) donor: Option<Donor>,
     /// Sites whose units' normed inputs a run keeps (`Execution::normed`).
-    record: BTreeSet<usize>,
+    pub(crate) record: BTreeSet<usize>,
 }
 
 impl Interventions {
-    /// Whether the run has no row interventions at all.
-    fn is_empty(&self) -> bool {
-        self.after.is_empty() && self.inputs.is_empty() && self.cuts.is_empty() && self.record.is_empty()
-    }
-
     /// The operations after `point` (a site, `None` before every site, on `embed`).
     fn after(&self, point: Option<usize>, st: &mut Streams, embed_standin: &Array2<f64>, standins: &[Array2<f64>]) -> Result<(), String> {
         for (_, op) in self.after.iter().filter(|(p, _)| *p == point) {

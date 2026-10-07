@@ -523,7 +523,7 @@ fn device_path_on_the_host_backend_is_the_host_run() {
     ];
     for (name, circuit, batch) in cases {
         let host = execute(&weights, &circuit, batch, &rows, &BTreeMap::new()).expect("host");
-        let job = crate::graph_device::Run { tokens: &batch.tokens, spans: &batch.spans, scored: &rows, swaps: &BTreeMap::new(), capture: false, reference: batch.reference.as_deref() };
+        let job = crate::graph_device::Run { tokens: &batch.tokens, spans: &batch.spans, scored: &rows, swaps: &BTreeMap::new(), capture: false, reference: batch.reference.as_deref(), ops: &crate::graph::Interventions::default() };
         let device = crate::graph_device::run_on(&mut state, &weights, &circuit, &job).expect("device");
         let kl = max(&kl_bits(&host.log_probabilities, &device.log_probabilities));
         assert!(kl < 1e-9, "{name}: KL(host ‖ device) = {kl:e} bits");
@@ -531,8 +531,55 @@ fn device_path_on_the_host_backend_is_the_host_run() {
     // A capture is the host's Reference.
     let circuit = Graph::empty().model(&weights);
     let cf_batch = Batch::new(&cf).expect("cf batch");
-    let job = crate::graph_device::Run { tokens: &cf_batch.tokens, spans: &cf_batch.spans, scored: &[], swaps: &BTreeMap::new(), capture: true, reference: None };
+    let job = crate::graph_device::Run { tokens: &cf_batch.tokens, spans: &cf_batch.spans, scored: &[], swaps: &BTreeMap::new(), capture: true, reference: None, ops: &crate::graph::Interventions::default() };
     let captured = crate::graph_device::run_on(&mut state, &weights, &circuit, &job).expect("capture").captured().expect("captured");
     let gap = |a: &ndarray::Array2<f64>, b: &ndarray::Array2<f64>| (a - b).iter().fold(0.0f64, |m, v| m.max(v.abs()));
     assert!(gap(&captured.active[1], &counterfactual.active[1]) < 1e-9 && gap(&captured.reads[1][0], &counterfactual.reads[1][0]) < 1e-9 && gap(&captured.attention_inputs[0], &counterfactual.attention_inputs[0]) < 1e-9);
+}
+
+#[test]
+fn device_site_operations_on_the_host_backend_are_the_host_run() {
+    use crate::graph::{After, Donor, Interventions, OnInput, Writer, execute_with};
+    let f = fixture("graph_device_sites");
+    let library = Library::new(&f.device, &f.device, &f.native, &f.layers, &f.artifact, 1 << 28, 64).expect("library");
+    let weights = Weights::of(&library);
+    let cf = counterfactuals(&f.sequences);
+    let cf_batch = Batch::new(&cf).expect("cf batch");
+    let counterfactual = std::sync::Arc::new(reference(&weights, &cf_batch).expect("reference"));
+    let mut batch = Batch::new(&f.sequences).expect("batch");
+    batch.reference = Some(counterfactual);
+    let rows: Vec<usize> = (0..batch.tokens.len()).collect();
+    let node = |id: &str, layer: usize, kind: &str, index: Option<Index>| NodeIr { id: id.into(), pieces: vec![PieceIr { view: "native".into(), layer, kind: kind.into(), index }], rule: None };
+    let program = Program { model: "tiny".into(), valid: true, nodes: vec![node("h", 1, "head", Some(Index::One(0))), node("n", 0, "mlp", Some(Index::Many(vec![1, 4, 9])))], ..Program::default() };
+    let graph = Graph::parse(&program, &weights).expect("parse");
+    let mut state = crate::graph_device::DeviceState::new(Device::host());
+    for (name, circuit) in [("model", graph.model(&weights)), ("program", graph.program(&weights, true))] {
+        // The donor run: the same circuit on the counterfactuals, normed inputs kept at every site.
+        let mut donor_batch = cf_batch.clone();
+        donor_batch.reference = batch.reference.clone().filter(|_| !circuit.is_model());
+        let recording = Interventions { record: (0..4).collect(), ..Interventions::default() };
+        let donor_run = execute_with(&weights, &circuit, &donor_batch, &[], &BTreeMap::new(), &recording).expect("donor run");
+        let embed = weights.embedding.select(ndarray::Axis(0), &cf_batch.tokens.iter().map(|t| *t as usize).collect::<Vec<_>>());
+        let donor = Donor { embed, writes: donor_run.writes.clone(), normed: donor_run.normed.clone() };
+        let push = ndarray::Array1::from_shape_fn(weights.width(), |c| 0.3 * (c as f64 + 1.0).sin());
+        let ops = Interventions {
+            after: vec![
+                (None, After::Scale(vec![Writer::Embed], vec![0, 13, 30], 0.5)),
+                (Some(0), After::Swap(vec![Writer::Unit(0)], vec![5, 6, 40])),
+                (Some(1), After::Push(vec![2, 17], push.clone())),
+                (Some(2), After::Scale(vec![Writer::Unit(1)], vec![3, 25], 2.0)),
+            ],
+            inputs: vec![(1, OnInput::Scale(vec![1, 4], 2.0)), (2, OnInput::Push(vec![8], push.clone())), (3, OnInput::Swap(vec![9, 33]))],
+            cuts: vec![(3, vec![Writer::Embed, Writer::Unit(0)], vec![7, 50])],
+            donor: Some(donor),
+            record: [2].into_iter().collect(),
+        };
+        let host = execute_with(&weights, &circuit, &batch, &rows, &BTreeMap::new(), &ops).expect("host");
+        let reference = if circuit.is_model() { None } else { batch.reference.as_deref() };
+        let job = crate::graph_device::Run { tokens: &batch.tokens, spans: &batch.spans, scored: &rows, swaps: &BTreeMap::new(), capture: false, reference, ops: &ops };
+        let device = crate::graph_device::run_on(&mut state, &weights, &circuit, &job).expect("device");
+        let kl = max(&kl_bits(&host.log_probabilities, &device.log_probabilities));
+        assert!(kl < 1e-9, "{name}: KL(host ‖ device) under site operations = {kl:e} bits");
+        assert_eq!(host.normed.keys().collect::<Vec<_>>(), device.normed.keys().collect::<Vec<_>>(), "{name}: recorded inputs");
+    }
 }
