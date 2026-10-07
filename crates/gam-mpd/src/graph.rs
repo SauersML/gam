@@ -65,6 +65,11 @@ pub struct Program {
     pub valid: bool,
     #[serde(default)]
     pub error: Option<String>,
+    /// What undeclared pieces and edges carry: "counterfactual" (the default: the same model's
+    /// values on the prompt's counterfactual), or the diagnostic "global" (each piece applied to
+    /// its average input over the behavior's prompts).
+    #[serde(default)]
+    pub standin: Option<String>,
 }
 
 fn yes() -> bool {
@@ -300,6 +305,16 @@ pub struct Circuit {
     pub units: Vec<Unit>,
     pub logits: Incoming,
     pub nodes: usize,
+    /// Stand-ins from the counterfactual run (else from average inputs).
+    pub counterfactual: bool,
+}
+
+impl Circuit {
+    /// Whether this is `M` itself: every unit computing, every edge kept (no stand-in is read).
+    pub fn is_model(&self) -> bool {
+        let all = |i: &Incoming| matches!(i, Incoming::AllBut(cut) if cut.is_empty());
+        all(&self.logits) && self.units.iter().all(|u| u.computes && u.routes.iter().all(all))
+    }
 }
 
 /// A parsed program: its nodes' blocks by id and its edges as (writer, reader, route), the reader
@@ -309,6 +324,8 @@ pub struct Graph {
     pub ids: Vec<String>,
     pub blocks: Vec<Block>,
     pub edges: Vec<(Writer, Option<usize>, Route)>,
+    /// The program's stand-ins: counterfactual (the default) or global averages (diagnostic).
+    pub counterfactual: bool,
 }
 
 fn indices(index: &Option<Index>, count: usize, what: &str) -> Result<Vec<usize>, String> {
@@ -428,12 +445,17 @@ impl Graph {
                 }
             }
         }
-        Ok(Self { ids, blocks, edges })
+        let counterfactual = match program.standin.as_deref() {
+            None | Some("counterfactual") => true,
+            Some("global") => false,
+            Some(other) => return Err(format!("unknown stand-in {other} (counterfactual or global)")),
+        };
+        Ok(Self { ids, blocks, edges, counterfactual })
     }
 
     /// The empty program: every piece a stand-in.
     pub fn empty() -> Self {
-        Self { ids: Vec::new(), blocks: Vec::new(), edges: Vec::new() }
+        Self { ids: Vec::new(), blocks: Vec::new(), edges: Vec::new(), counterfactual: true }
     }
 
     /// Every piece of `weights` not in a node, per site: the heads of each layer, then its neurons.
@@ -485,7 +507,7 @@ impl Graph {
             })
             .collect();
         units.extend(self.complement(weights).into_iter().map(|block| Unit { block, computes: false, routes: [Incoming::all(), Incoming::all(), Incoming::all()] }));
-        Circuit { units, logits: routed(None, Route::Input), nodes: self.blocks.len() }
+        Circuit { units, logits: routed(None, Route::Input), nodes: self.blocks.len(), counterfactual: self.counterfactual }
     }
 
     /// `M` as a circuit with the program's nodes as its first units: every piece computing, every
@@ -577,10 +599,13 @@ impl Stats {
 
 // ------------------------------------------------------------------------------ execution
 
-/// Sequences end to end, each its own causal span (start, length).
+/// Sequences end to end, each its own causal span (start, length), and, for counterfactual
+/// stand-ins, the same model's run on each sequence's counterfactual ([`Reference`]).
+#[derive(Clone)]
 pub struct Batch {
     pub tokens: Vec<u32>,
     pub spans: Vec<(usize, usize)>,
+    pub reference: Option<std::sync::Arc<Reference>>,
 }
 
 impl Batch {
@@ -597,7 +622,12 @@ impl Batch {
         if tokens.is_empty() {
             return Err("no sequences".into());
         }
-        Ok(Self { tokens, spans })
+        Ok(Self { tokens, spans, reference: None })
+    }
+
+    /// The batch's sequences.
+    pub fn sequences(&self) -> Vec<Vec<u32>> {
+        self.spans.iter().map(|&(start, length)| self.tokens[start..start + length].to_vec()).collect()
     }
 
     /// The batch row of (sequence, position).
@@ -610,6 +640,57 @@ impl Batch {
     }
 }
 
+/// `M`'s run on the counterfactual sequences (the stand-ins' source), per piece so that any unit
+/// partition reads it: the embeddings, per layer each head's attention read `z_h` (rows × head
+/// width), its MLP's activations (rows × neurons) and its MLP's write (rows × width). A unit's
+/// stand-in write is assembled with the current weights, the same (possibly edited) weights the
+/// run used.
+#[derive(Clone, Debug)]
+pub struct Reference {
+    pub embed: Array2<f64>,
+    pub reads: Vec<Vec<Array2<f64>>>,
+    pub active: Vec<Array2<f64>>,
+    pub mlp: Vec<Array2<f64>>,
+}
+
+impl Reference {
+    /// Block `block`'s write in the run (rows × width).
+    fn write(&self, weights: &Weights, block: &Block) -> Result<Array2<f64>, String> {
+        let rows = self.embed.nrows();
+        match block {
+            Block::Heads { layer, heads } => {
+                let mut out = Array2::<f64>::zeros((rows, weights.width()));
+                for &h in heads {
+                    let z = self.reads.get(*layer).and_then(|r| r.get(h)).ok_or("a head the reference did not record")?;
+                    out += &z.dot(&weights.layers[*layer].heads[h].output.t());
+                }
+                Ok(out)
+            }
+            Block::Neurons { layer, neurons } => {
+                let mlp = weights.layers[*layer].mlp.as_ref().ok_or("a neuron block without an MLP")?;
+                let active = self.active.get(*layer).ok_or("an MLP the reference did not record")?;
+                let n = mlp.gate.nrows();
+                // The few neurons outside a large block are subtracted from the MLP's whole write.
+                if 2 * neurons.len() > n {
+                    let inside: BTreeSet<usize> = neurons.iter().copied().collect();
+                    let rest: Vec<usize> = (0..n).filter(|i| !inside.contains(i)).collect();
+                    Ok(&self.mlp[*layer] - &active.select(Axis(1), &rest).dot(&mlp.out.select(Axis(1), &rest).t()))
+                } else {
+                    Ok(active.select(Axis(1), neurons).dot(&mlp.out.select(Axis(1), neurons).t()))
+                }
+            }
+        }
+    }
+}
+
+/// `M`'s run on `batch` with `weights` recorded per piece ([`Reference`]).
+pub fn reference(weights: &Weights, stats: &Stats, batch: &Batch) -> Result<Reference, String> {
+    let circuit = Graph::empty().model(weights);
+    let mut plain = batch.clone();
+    plain.reference = None;
+    run(weights, stats, &circuit, &plain, &[], &BTreeMap::new(), false, &Interventions::default(), true)?.captured.ok_or_else(|| "no captured run".to_string())
+}
+
 /// One run: the logits' log-probabilities at the scored rows (rows × vocabulary) and every
 /// computing unit's actual write (rows × width).
 pub struct Execution {
@@ -618,6 +699,7 @@ pub struct Execution {
     recorded: Option<(Vec<Vec<Array1<f64>>>, Vec<Array1<f64>>, Vec<Array1<f64>>)>,
     /// Per (unit, route slot) its normed input, at the sites `Interventions::record` lists.
     pub normed: BTreeMap<(usize, usize), Array2<f64>>,
+    captured: Option<Reference>,
 }
 
 fn project(x: &Array2<f64>, map: &Array2<f64>, norm: Option<&(Array1<f64>, f64)>) -> Array2<f64> {
@@ -634,7 +716,8 @@ fn project(x: &Array2<f64>, map: &Array2<f64>, norm: Option<&(Array1<f64>, f64)>
 /// Heads `heads` of `layer` on their query, key and value inputs (residual streams), `normed`
 /// applied to each normed input (route slot, value). With `record`, each head's mean
 /// attention-weighted normalized value input as well.
-fn heads_write(layer: &LayerWeights, heads: &[usize], inputs: [&Array2<f64>; 3], spans: &[(usize, usize)], record: bool, normed: &mut dyn FnMut(usize, &mut Array2<f64>)) -> (Array2<f64>, Vec<Array1<f64>>) {
+#[allow(clippy::type_complexity)]
+fn heads_write(layer: &LayerWeights, heads: &[usize], inputs: [&Array2<f64>; 3], spans: &[(usize, usize)], record: bool, capture: bool, normed: &mut dyn FnMut(usize, &mut Array2<f64>)) -> (Array2<f64>, Vec<Array1<f64>>, Vec<Array2<f64>>) {
     let norm = &layer.attention;
     let (mut q_hat, mut k_hat) = (norm.apply(inputs[0]), norm.apply(inputs[1]));
     let v_unit = norm.unit(inputs[2]);
@@ -644,7 +727,7 @@ fn heads_write(layer: &LayerWeights, heads: &[usize], inputs: [&Array2<f64>; 3],
     normed(2, &mut v_hat);
     let (rows, d) = v_hat.dim();
     let mut out = Array2::<f64>::zeros((rows, d));
-    let mut recorded = Vec::new();
+    let (mut recorded, mut reads) = (Vec::new(), Vec::new());
     for &h in heads {
         let w = &layer.heads[h];
         let (q, k, v) = (project(&q_hat, &w.query, w.query_norm.as_ref()), project(&k_hat, &w.key, w.key_norm.as_ref()), v_hat.dot(&w.value.t()));
@@ -665,8 +748,11 @@ fn heads_write(layer: &LayerWeights, heads: &[usize], inputs: [&Array2<f64>; 3],
             recorded.push(mixed / rows as f64);
         }
         out += &z.dot(&w.output.t());
+        if capture {
+            reads.push(z);
+        }
     }
-    (out, recorded)
+    (out, recorded, reads)
 }
 
 /// Neurons `neurons` of an MLP on the normed stream `x_hat` (rows × width).
@@ -728,6 +814,15 @@ pub fn execute(weights: &Weights, stats: &Stats, circuit: &Circuit, batch: &Batc
 /// units' normed inputs scaled, pushed or swapped and cut writers read on the donor.
 #[allow(clippy::too_many_arguments)]
 pub fn execute_with(weights: &Weights, stats: &Stats, circuit: &Circuit, batch: &Batch, scored: &[usize], swaps: &BTreeMap<usize, Array2<f64>>, record: bool, ops: &Interventions) -> Result<Execution, String> {
+    run(weights, stats, circuit, batch, scored, swaps, record, ops, false)
+}
+
+/// [`execute_with`], with `capture` recording every head's read and every MLP's activations and
+/// write ([`Reference`]; every unit must compute, each layer's heads and MLP one unit each).
+/// Stand-ins: with `batch.reference`, each unit's write in that run (counterfactual stand-ins),
+/// else each piece applied to its average input ([`Stats`]).
+#[allow(clippy::too_many_arguments)]
+fn run(weights: &Weights, stats: &Stats, circuit: &Circuit, batch: &Batch, scored: &[usize], swaps: &BTreeMap<usize, Array2<f64>>, record: bool, ops: &Interventions, capture: bool) -> Result<Execution, String> {
     let (rows, d) = (batch.tokens.len(), weights.width());
     let vocabulary = weights.embedding.nrows();
     if let Some(t) = batch.tokens.iter().find(|t| **t as usize >= vocabulary) {
@@ -735,18 +830,36 @@ pub fn execute_with(weights: &Weights, stats: &Stats, circuit: &Circuit, batch: 
     }
     let embed = weights.embedding.select(Axis(0), &batch.tokens.iter().map(|t| *t as usize).collect::<Vec<_>>());
     let units = circuit.units.len();
-    let mut embed_standin = Array1::<f64>::zeros(d);
-    for (&t, &f) in &stats.tokens {
-        embed_standin.scaled_add(f, &weights.embedding.row(t as usize));
-    }
-    let standins: Vec<Array1<f64>> = if record { vec![Array1::zeros(d); circuit.units.len()] } else { circuit.units.iter().map(|u| stand_in(weights, stats, &u.block)).collect() };
+    let broadcast = |v: &Array1<f64>| Array2::from_shape_fn((rows, d), |(_, c)| v[c]);
+    let (embed_standin, standins): (Array2<f64>, Vec<Array2<f64>>) = match &batch.reference {
+        _ if record => (Array2::zeros((rows, d)), vec![Array2::zeros((rows, d)); units]),
+        Some(r) => {
+            if r.embed.nrows() != rows {
+                return Err(format!("a counterfactual run of {} tokens for a batch of {rows}", r.embed.nrows()));
+            }
+            (r.embed.clone(), circuit.units.iter().map(|u| r.write(weights, &u.block)).collect::<Result<_, _>>()?)
+        }
+        None => {
+            let mut e = Array1::<f64>::zeros(d);
+            for (&t, &f) in &stats.tokens {
+                e.scaled_add(f, &weights.embedding.row(t as usize));
+            }
+            (broadcast(&e), circuit.units.iter().map(|u| broadcast(&stand_in(weights, stats, &u.block))).collect())
+        }
+    };
+    let mut captured = capture.then(|| Reference {
+        embed: embed.clone(),
+        reads: weights.layers.iter().map(|l| vec![Array2::zeros((0, 0)); l.heads.len()]).collect(),
+        active: vec![Array2::zeros((0, 0)); weights.layers.len()],
+        mlp: vec![Array2::zeros((0, 0)); weights.layers.len()],
+    });
     let mut order: Vec<usize> = (0..circuit.units.len()).collect();
     order.sort_by_key(|&u| circuit.units[u].block.site());
     // The actual stream and the stand-in stream entering the current site, every unit's write and
     // the per-row factors of the stand-ins interventions scaled (`embed`'s last).
     let mut st = Streams {
         stream: embed.clone(),
-        standin_stream: Array2::from_shape_fn((rows, d), |(_, c)| embed_standin[c]),
+        standin_stream: embed_standin.clone(),
         embed,
         writes: vec![None; units],
         factors: vec![None; units + 1],
@@ -801,9 +914,14 @@ pub fn execute_with(weights: &Weights, stats: &Stats, circuit: &Circuit, batch: 
             let mut normed = |slot: usize, x: &mut Array2<f64>| ops.normed(site, u, slot, x, &mut normed_kept);
             let write = match &unit.block {
                 Block::Heads { layer, heads } => {
-                    let (w, recorded) = heads_write(&weights.layers[*layer], heads, [&inputs[0], &inputs[1], &inputs[2]], &batch.spans, record, &mut normed);
+                    let (w, recorded, reads) = heads_write(&weights.layers[*layer], heads, [&inputs[0], &inputs[1], &inputs[2]], &batch.spans, record, capture, &mut normed);
                     for (h, r) in heads.iter().zip(recorded) {
                         head_stats[*layer][*h] = r;
+                    }
+                    if let Some(c) = captured.as_mut() {
+                        for (h, z) in heads.iter().zip(reads) {
+                            c.reads[*layer][*h] = z;
+                        }
                     }
                     w
                 }
@@ -820,7 +938,15 @@ pub fn execute_with(weights: &Weights, stats: &Stats, circuit: &Circuit, batch: 
                             active_stats[*layer][i] = mean[k];
                         }
                     }
-                    active.dot(&mlp.out.select(Axis(1), neurons).t())
+                    let write = active.dot(&mlp.out.select(Axis(1), neurons).t());
+                    if let Some(c) = captured.as_mut() {
+                        if neurons.len() != mlp.gate.nrows() {
+                            return Err("a capture needs each MLP whole in one unit".into());
+                        }
+                        c.mlp[*layer] = write.clone();
+                        c.active[*layer] = active;
+                    }
+                    write
                 }
             };
             st.writes[u] = Some(write);
@@ -828,7 +954,7 @@ pub fn execute_with(weights: &Weights, stats: &Stats, circuit: &Circuit, batch: 
         for &u in &order[at..end] {
             match &st.writes[u] {
                 Some(w) => st.stream += w,
-                None => st.stream += &standins[u].view().insert_axis(Axis(0)),
+                None => st.stream += &standins[u],
             }
             st.standin_stream += &standins[u];
         }
@@ -837,7 +963,7 @@ pub fn execute_with(weights: &Weights, stats: &Stats, circuit: &Circuit, batch: 
     }
     let last = input(&circuit.logits, &st).select(Axis(0), scored);
     let log_probabilities = log_probabilities(weights, &last)?;
-    Ok(Execution { log_probabilities, writes: st.writes, recorded: record.then_some((head_stats, mlp_stats, active_stats)), normed: normed_kept })
+    Ok(Execution { log_probabilities, writes: st.writes, recorded: record.then_some((head_stats, mlp_stats, active_stats)), normed: normed_kept, captured })
 }
 
 /// Next-token log-probabilities of final streams (rows × width) through the final norm (its own
@@ -1170,13 +1296,12 @@ impl Streams {
     }
 
     /// Writer `w`'s stand-in write at every row (rows × width).
-    fn standin(&self, w: Writer, embed_standin: &Array1<f64>, standins: &[Array1<f64>]) -> Array2<f64> {
+    fn standin(&self, w: Writer, embed_standin: &Array2<f64>, standins: &[Array2<f64>]) -> Array2<f64> {
         let s = match w {
             Writer::Embed => embed_standin,
             Writer::Unit(u) => &standins[u],
         };
-        let rows = self.stream.nrows();
-        let mut out = Array2::from_shape_fn((rows, s.len()), |(_, c)| s[c]);
+        let mut out = s.clone();
         if let Some(f) = &self.factors[self.slot(w)] {
             out *= &f.view().insert_axis(Axis(1));
         }
@@ -1184,7 +1309,7 @@ impl Streams {
     }
 
     /// Writer `w`'s actual write minus its stand-in write, `None` for a unit writing its stand-in.
-    fn delta(&self, w: Writer, embed_standin: &Array1<f64>, standins: &[Array1<f64>]) -> Option<Array2<f64>> {
+    fn delta(&self, w: Writer, embed_standin: &Array2<f64>, standins: &[Array2<f64>]) -> Option<Array2<f64>> {
         let actual = match w {
             Writer::Embed => &self.embed,
             Writer::Unit(u) => self.writes[u].as_ref()?,
@@ -1253,7 +1378,7 @@ pub struct Interventions {
 
 impl Interventions {
     /// The operations after `point` (a site, `None` before every site, on `embed`).
-    fn after(&self, point: Option<usize>, st: &mut Streams, embed_standin: &Array1<f64>, standins: &[Array1<f64>]) -> Result<(), String> {
+    fn after(&self, point: Option<usize>, st: &mut Streams, embed_standin: &Array2<f64>, standins: &[Array2<f64>]) -> Result<(), String> {
         for (_, op) in self.after.iter().filter(|(p, _)| *p == point) {
             match op {
                 After::Scale(writers, rows, f) => {
@@ -1741,6 +1866,13 @@ pub struct Checker {
     strongest: Option<Vec<(usize, usize)>>,
     /// The units and pool of site operations (`SiteUnits::manifest`); empty draws none.
     pub sites: SiteUnits,
+    /// Each prompt's tokens with its counterfactual's and back: a sequence's stand-in source.
+    partners: std::collections::HashMap<Vec<u32>, Vec<u32>>,
+    /// The weight edit applied now, if any (its JSON): part of a counterfactual run's cache key.
+    edit: Option<String>,
+    /// Counterfactual runs by (edit, sequences), each computed once by whichever run asks first.
+    #[allow(clippy::type_complexity)]
+    references: std::sync::Mutex<Vec<(String, Arc<std::sync::OnceLock<Result<Arc<Reference>, String>>>)>>,
 }
 
 /// Every score term (bits) and the counts behind them.
@@ -1812,7 +1944,75 @@ impl Checker {
             donors.extend(group.iter().enumerate().map(|(k, &i)| (i, group[(k + 1) % group.len()])));
         }
         donors.sort_unstable();
-        Ok(Self { weights, behavior, stats, clean: (batch, rows), counterfactual, donors, cache: BTreeMap::new(), cached: Default::default(), cache_bytes: cache_budget(), strongest: None, sites: SiteUnits::default() })
+        let mut partners = std::collections::HashMap::new();
+        for p in &behavior.prompts {
+            if let Some(c) = p.counterfactual.as_ref().filter(|c| c.token_ids.len() == p.token_ids.len()) {
+                partners.insert(p.token_ids.clone(), c.token_ids.clone());
+                partners.entry(c.token_ids.clone()).or_insert_with(|| p.token_ids.clone());
+            }
+        }
+        Ok(Self {
+            weights,
+            behavior,
+            stats,
+            clean: (batch, rows),
+            counterfactual,
+            donors,
+            cache: BTreeMap::new(),
+            cached: Default::default(),
+            cache_bytes: cache_budget(),
+            strongest: None,
+            sites: SiteUnits::default(),
+            partners,
+            edit: None,
+            references: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    /// `batch` with its stand-in source attached: under counterfactual stand-ins, `M`'s run (with
+    /// the current weights) on each sequence's partner (a prompt's counterfactual, a
+    /// counterfactual's prompt). `M` itself (every unit computing, every edge kept) reads no
+    /// stand-in and gets none.
+    pub fn referenced(&self, circuit: &Circuit, batch: &Batch) -> Result<Batch, String> {
+        let mut out = batch.clone();
+        out.reference = None;
+        if !circuit.counterfactual || circuit.is_model() {
+            return Ok(out);
+        }
+        let partner: Vec<Vec<u32>> = batch.sequences().iter().map(|s| self.partners.get(s).cloned().ok_or("counterfactual stand-ins need each prompt's counterfactual of the same length")).collect::<Result<_, _>>()?;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(&partner, &mut hasher);
+        let key = format!("{} {}", self.edit.as_deref().unwrap_or(""), std::hash::Hasher::finish(&hasher));
+        let cell = {
+            let mut cache = self.references.lock().map_err(|e| e.to_string())?;
+            match cache.iter().find(|(k, _)| *k == key) {
+                Some((_, c)) => c.clone(),
+                None => {
+                    // A few batches recur per edit (the prompts, their counterfactuals, a swap's subset).
+                    if cache.len() >= 6 {
+                        cache.remove(0);
+                    }
+                    let c = Arc::new(std::sync::OnceLock::new());
+                    cache.push((key, c.clone()));
+                    c
+                }
+            }
+        };
+        let r = cell.get_or_init(|| Batch::new(&partner).and_then(|b| reference(&self.weights, &self.stats, &b)).map(Arc::new)).clone()?;
+        out.reference = Some(r);
+        Ok(out)
+    }
+
+    /// Sets the weight edit applied now (`None` after restoring) and drops the counterfactual runs
+    /// of any other edit.
+    fn set_edit(&mut self, e: &Experiment) {
+        self.edit = match e {
+            Experiment::Edit { edit, .. } => serde_json::to_string(edit).ok(),
+            _ => None,
+        };
+        if let Ok(mut cache) = self.references.lock() {
+            cache.retain(|(k, _)| k.starts_with(' '));
+        }
     }
 
     /// The experiment's key for `M`'s cache: what it does to which pieces.
@@ -1839,7 +2039,9 @@ impl Checker {
             Experiment::Edit { edit, .. } => Some(edit.apply(&mut self.weights)?),
             _ => None,
         };
+        self.set_edit(e);
         let result = self.run(circuit, e);
+        self.set_edit(&Experiment::Clean);
         if let Some(r) = restore {
             r.restore(&mut self.weights)?;
         }
@@ -1860,7 +2062,7 @@ impl Checker {
                         Some(r) => circuit.units[*r].routes[route.slot()].cut(*from),
                         None => circuit.logits.cut(*from),
                     }
-                    Ok(execute(&self.weights, &self.stats, &circuit, batch, rows, &BTreeMap::new(), false)?.log_probabilities)
+                    Ok(execute(&self.weights, &self.stats, &circuit, &self.referenced(&circuit, batch)?, rows, &BTreeMap::new(), false)?.log_probabilities)
                 }
                 Experiment::Swap { node } => {
                     if self.donors.is_empty() {
@@ -1869,14 +2071,14 @@ impl Checker {
                     let prompts: Vec<Vec<u32>> = self.donors.iter().map(|(i, _)| self.behavior.prompts[*i].token_ids.clone()).collect();
                     let donors: Vec<Vec<u32>> = self.donors.iter().map(|(_, j)| self.behavior.prompts[*j].token_ids.clone()).collect();
                     let (base, donor) = (Batch::new(&prompts)?, Batch::new(&donors)?);
-                    let donor_run = execute(&self.weights, &self.stats, &circuit, &donor, &[], &BTreeMap::new(), false)?;
+                    let donor_run = execute(&self.weights, &self.stats, &circuit, &self.referenced(&circuit, &donor)?, &[], &BTreeMap::new(), false)?;
                     let value = donor_run.writes[*node].clone().ok_or("the swapped node does not compute")?;
                     let targets: Vec<(usize, &[usize])> = self.donors.iter().enumerate().map(|(k, (i, _))| (k, self.behavior.prompts[*i].target_positions.as_slice())).collect();
                     let rows = scored_rows(&base, &targets)?;
-                    Ok(execute(&self.weights, &self.stats, &circuit, &base, &rows, &[(*node, value)].into(), false)?.log_probabilities)
+                    Ok(execute(&self.weights, &self.stats, &circuit, &self.referenced(&circuit, &base)?, &rows, &[(*node, value)].into(), false)?.log_probabilities)
                 }
                 Experiment::Sites { draw } => self.sites_outcome(&circuit, draw),
-                _ => Ok(execute(&self.weights, &self.stats, &circuit, batch, rows, &BTreeMap::new(), false)?.log_probabilities),
+                _ => Ok(execute(&self.weights, &self.stats, &circuit, &self.referenced(&circuit, batch)?, rows, &BTreeMap::new(), false)?.log_probabilities),
             }
         }
     }
@@ -1884,7 +2086,12 @@ impl Checker {
     /// `M`'s cache key of `e` on `graph`'s units.
     fn model_key(&self, graph: &Graph, e: &Experiment) -> String {
         // A cut hands the reader the writer's stand-in, so the stand-in form is part of the key.
-        format!("{}{}", if self.stats.mean_output { "mean output; " } else { "" }, Self::key(graph, e))
+        let form = match (graph.counterfactual, self.stats.mean_output) {
+            (true, _) => "counterfactual; ",
+            (false, true) => "mean output; ",
+            (false, false) => "",
+        };
+        format!("{form}{}", Self::key(graph, e))
     }
 
     /// Stores `M`'s outcome under `key`, dropping the oldest past the byte budget.
@@ -1967,6 +2174,7 @@ impl Checker {
                 Experiment::Edit { edit, .. } => Some(edit.apply(&mut self.weights)?),
                 _ => None,
             };
+            self.set_edit(&runs[members[0]].1.clone());
             let result = (|| -> Result<(), String> {
                 // M once per key not yet cached, in parallel.
                 let mut missing: Vec<usize> = Vec::new();
@@ -2001,6 +2209,7 @@ impl Checker {
                 }
                 Ok(())
             })();
+            self.set_edit(&Experiment::Clean);
             if let Some(r) = restore {
                 r.restore(&mut self.weights)?;
             }
@@ -2109,6 +2318,7 @@ impl Checker {
     /// scored rows.
     fn sites_outcome(&self, circuit: &Circuit, draw: &SiteDraw) -> Result<Array2<f64>, String> {
         let (base, rows, donor) = self.site_batches(Interventions::needs_donor(draw))?;
+        let (base, donor) = (self.referenced(circuit, &base)?, donor.map(|d| self.referenced(circuit, &d)).transpose()?);
         run_sites(&self.weights, &self.stats, circuit, (&base, &rows), donor.as_ref(), draw, &self.sites)
     }
 
