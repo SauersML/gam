@@ -110,17 +110,22 @@ def score(model, runs: Runs, ids, think, s2, block: bool, device) -> tuple[np.nd
     dtype = next(model.parameters()).dtype
     m, pos = mask_for(len(ids), cand, think, s2, block, dtype)
     x = torch.tensor([ids + [t for c in cand for t in c]], device=device)
-    logits = model(input_ids=x, attention_mask=m.to(device), position_ids=torch.tensor([pos], device=device)).logits[0].float()
-    lp = torch.log_softmax(logits, -1)
-    first = lp[len(ids) - 1]
+    h = model.model(input_ids=x, attention_mask=m.to(device), position_ids=torch.tensor([pos], device=device)).last_hidden_state[0]
+    # the head only where a log-probability is read: after "Animal:" and before each later candidate token
+    rows, q = [len(ids) - 1], len(ids)
+    for toks in cand:
+        rows += [q + t - 1 for t in range(1, len(toks))]
+        q += len(toks)
+    lp = torch.log_softmax(model.lm_head(h[rows]).float(), -1).cpu()
+    first = lp[0]
     best = np.full(len(ANIMALS), -np.inf)
-    q = len(ids)
+    r = 1
     for (c, toks) in runs.forms:
-        s = float(first[toks[0]]) + sum(float(lp[q + t - 1, toks[t]]) for t in range(1, len(toks)))
+        s = float(first[toks[0]]) + sum(float(lp[r + t - 1, toks[t]]) for t in range(1, len(toks)))
+        r += len(toks) - 1
         k = ANIMALS.index(c)
         best[k] = np.logaddexp(best[k], s)
-        q += len(toks)
-    return best, first.cpu()
+    return best, first
 
 
 def main():
