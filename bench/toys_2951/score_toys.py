@@ -52,9 +52,11 @@ class Toy:
         self.dir = dir_
         self.record = json.loads((dir_ / "export.json").read_text())
         self.truth = json.loads((dir_ / "truth.json").read_text())
-        # the decomposed maps: every block operator (the embedding, norms and head stay M's)
+        # the decomposed maps: every nonzero block operator (the embedding, norms and head stay
+        # M's; a real-valued toy's zero attention and the induction toy's zero MLP compute nothing)
         self.shapes = {name: e["shape"] for name, e in self.record["files"].items()}
-        self.operators = [n for n in self.shapes if n.startswith("blocks.") and not n.endswith("gain") and not n.endswith("bias")]
+        blocks = [n for n in self.shapes if n.startswith("blocks.") and not n.endswith("gain") and not n.endswith("bias")]
+        self.operators = [n for n in blocks if np.any(self.weight(n))]
         self.mechanisms = [{**m, "deltas": {op: load(dir_, e) for op, e in m["operators"].items()}} for m in self.truth["mechanisms"]]
         self.active = load(dir_, self.truth["active"]).astype(bool)
         self.m_params = sum(int(np.prod(self.shapes[op])) for op in self.operators)
@@ -181,10 +183,12 @@ def references(toy: Toy, root: Path):
     where the truth says)."""
     rows = toy.active.shape[0]
     native = [{"name": op, "slices": {op: low_rank(toy.weight(op))}, "gate": {"kind": "always", "read": op}} for op in toy.operators]
-    write_parts(root / "native", native, np.ones((rows, len(native))), {"fitter": "native start: each operator one always-on part"})
+    # the embedding and readout are M's in every explanation the fitter makes (its dump's `kept`)
+    kept = ["wte", "lm_head"]
+    write_parts(root / "native", native, np.ones((rows, len(native))), {"fitter": "native start: each operator one always-on part", "kept": kept})
     truth = [{"name": m["name"], "slices": {op: low_rank(d) for op, d in m["deltas"].items()}, "gate": {"kind": "always", "read": next(iter(m["deltas"]))}}
              for m in toy.mechanisms]
-    write_parts(root / "truth", truth, toy.active.astype(float), {"fitter": "truth: the known mechanisms, active where the truth says"})
+    write_parts(root / "truth", truth, toy.active.astype(float), {"fitter": "truth: the known mechanisms, active where the truth says", "kept": kept})
 
 
 if __name__ == "__main__":
