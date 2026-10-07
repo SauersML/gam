@@ -2427,28 +2427,32 @@ impl Checker {
     /// and the key; `None` when the cache is off.
     fn disk_path(&self, key: &str) -> Option<std::path::PathBuf> {
         let dir = std::env::var_os("GRAPH_DISK_CACHE")?;
-        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-        let mut absorb = |bytes: &[u8]| {
-            for &b in bytes {
-                h = (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3);
+        // FNV-1a over little-endian words.
+        let fnv = |mut h: u64, words: &mut dyn Iterator<Item = u64>| -> u64 {
+            for w in words {
+                for b in w.to_le_bytes() {
+                    h = (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3);
+                }
             }
+            h
         };
+        let mut words: Vec<u64> = Vec::new();
         for p in &self.behavior.prompts {
-            p.token_ids.iter().for_each(|t| absorb(&t.to_le_bytes()));
-            p.target_positions.iter().for_each(|t| absorb(&t.to_le_bytes()));
+            words.extend(p.token_ids.iter().map(|&t| u64::from(t)));
+            words.extend(p.target_positions.iter().map(|&t| t as u64));
             if let Some(c) = &p.counterfactual {
-                c.token_ids.iter().for_each(|t| absorb(&t.to_le_bytes()));
+                words.extend(c.token_ids.iter().map(|&t| u64::from(t)));
             }
+            words.push(u64::MAX);
         }
-        let prompts = h;
+        let prompts = fnv(0xcbf2_9ce4_8422_2325, &mut words.into_iter());
         let w = &self.weights;
         let mut sample: Vec<f64> = w.embedding.row(0).to_vec();
         sample.extend(w.unembedding.row(w.unembedding.nrows() - 1).iter());
         for l in &w.layers {
             sample.extend(l.mlp.iter().flat_map(|m| m.out.row(0).to_vec()));
         }
-        sample.iter().for_each(|v| absorb(&v.to_le_bytes()));
-        absorb(key.as_bytes());
+        let h = fnv(prompts, &mut sample.iter().map(|v| v.to_bits()).chain(key.bytes().map(u64::from)));
         Some(std::path::Path::new(&dir).join(format!("{}_{prompts:016x}", self.behavior.id)).join(format!("{h:016x}.f64")))
     }
 
