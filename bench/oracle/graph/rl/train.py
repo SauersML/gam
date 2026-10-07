@@ -487,10 +487,13 @@ def summarize(name: str, step: int, groups: list[tuple[dict, list, dict]], log) 
     rows = []
     for b, mine, base in groups:
         S = np.array([x["total_bits"] for _, x in mine], dtype=float)
-        j = int(S.argmin())
+        valid = np.array([bool(x["valid"]) for _, x in mine])
+        # the best VALID program (an invalid one is scored as the empty program without its code, so it would
+        # "beat" the empty program by the empty program's code bits); none valid: the first program
+        j = int(np.where(valid, S, np.inf).argmin()) if valid.any() else 0
         empty = base.get("empty")
-        row = {"set": name, "step": step, "behavior": b["id"], "mean_bits": float(S.mean()), "best_bits": float(S[j]), "valid_fraction": float(np.mean([bool(x["valid"]) for _, x in mine])),
-               "below_empty_fraction": float(np.mean(S < empty["total_bits"])) if empty else None, "best_recovered": recovered(mine[j][1], empty),
+        row = {"set": name, "step": step, "behavior": b["id"], "mean_bits": float(S.mean()), "best_bits": float(S[j]), "valid_fraction": float(valid.mean()),
+               "below_empty_fraction": float(np.mean(valid & (S < empty["total_bits"]))) if empty else None, "best_recovered": recovered(mine[j][1], empty),
                "baselines": {n: x["total_bits"] for n, x in base.items()}, "baselines_recovered": {n: recovered(x, empty) for n, x in base.items()}, "best_source": mine[j][0]}
         rows.append(row)
         log.write(json.dumps(row) + "\n")
@@ -561,6 +564,8 @@ def rescore(args, score) -> dict:
     done_path = out / f"rescore_{args.rescore_tag}.jsonl"
     key = lambda r: (r["run"], r["step"], r["set"], r["behavior"], r["program"], r["source"])  # noqa: E731
     done = {key(r): r for r in map(json.loads, open(done_path))} if done_path.exists() else {}
+    if args.summary_only:  # summarize what is scored so far, score nothing
+        rows = [r for r in rows if key(r) in done]
     for bpath in sorted(behaviors_by_path, key=str):
         todo = list({key(r): r for r in rows if r["behavior_path"] == bpath and key(r) not in done}.values())  # each distinct program once
         if not todo:
@@ -639,6 +644,7 @@ def main():
     ap.add_argument("--batch", type=int, default=8, help="sft: examples per optimizer step")
     ap.add_argument("--samples-from", nargs="*", help="rescore: eval_samples.jsonl files of earlier evaluations")
     ap.add_argument("--score-options", help="rescore: JSON object of extra checker request keys")
+    ap.add_argument("--summary-only", action="store_true", help="rescore: summarize the rows already scored, score nothing")
     ap.add_argument("--rescore-tag", default="rescore", help="rescore: output name RUN/rescore_<tag>.jsonl")
     ap.add_argument("--oracle-runs", help="directory of the per-behavior best-program files (default ~/mpd-data/graph_oracle/runs/oracle; a pod writes under its outputs)")
     ap.add_argument("--run-name", help="the run's name in runs/oracle/<behavior>.<run>.json (default: the --out directory's name)")

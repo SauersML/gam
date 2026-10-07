@@ -146,7 +146,7 @@ def check_rescore():
         return [{"valid": True, "total_bits": 2 * float(it["source"].split("=")[1]), "exec_error_bits": 2 * float(it["source"].split("=")[1])} for it in items]
 
     args = types.SimpleNamespace(samples_from=[str(d / "eval_samples.jsonl")], score_options='{"families": ["swap"]}', eval_seed=5, eval_experiments=16, out=str(d), rescore_tag="t",
-                                 behaviors=str(d), model="vpd4l")
+                                 behaviors=str(d), model="vpd4l", summary_only=False)
     s = train.rescore(args, score)["heldout_behaviors/r"]
     assert s["best_of_n_bits"] == 20.0 and s["baselines"] == {"empty": 100.0} and abs(s["best_recovered"] - 0.8) < 1e-12, s
     assert set(seen) == {(5, 16, '{"families": ["swap"]}')}, seen

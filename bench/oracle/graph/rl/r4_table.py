@@ -51,15 +51,19 @@ def main():
         for r in rs:
             table.append(f"{name}\t{r['behavior']}\t{r['valid_fraction']:.3f}\t{r['below_empty_fraction']}\t{r['best_recovered']}\t{r['best_bits']:.6g}\tsamples")
             recovered.setdefault(name, {})[r["behavior"]] = r["best_recovered"]
+            groups = {}  # g-mech's examples and search's programs: the best of each kind per behavior
             for base, bits in r["baselines"].items():
+                kind = "example" if base.startswith("example_") else "search" if base.startswith("search_") else base
+                if kind not in groups or bits < groups[kind][1]:
+                    groups[kind] = (base, bits)
+            for kind, (base, bits) in groups.items():
                 calls = None
                 if base.startswith("search_"):
                     f = SEARCH / f"{r['behavior']}.{base[len('search_'):]}.json"
                     calls = json.loads(f.read_text()).get("checker_calls") if f.exists() else None
-                key = f"{base}"
-                if r["behavior"] not in recovered.get(key, {}):
-                    table.append(f"{base}\t{r['behavior']}\t\t\t{r['baselines_recovered'].get(base)}\t{bits:.6g}\t{calls if calls is not None else ''}")
-                    recovered.setdefault(key, {})[r["behavior"]] = r["baselines_recovered"].get(base)
+                if r["behavior"] not in recovered.get(kind, {}):
+                    table.append(f"{kind}\t{r['behavior']}\t\t\t{r['baselines_recovered'].get(base)}\t{bits:.6g}\t{calls if calls is not None else ''}")
+                    recovered.setdefault(kind, {})[r["behavior"]] = r["baselines_recovered"].get(base)
     Path(a.tsv).parent.mkdir(parents=True, exist_ok=True)
     Path(a.tsv).write_text("\n".join(table) + "\n")
     methods = [m for m in recovered if m != "empty"]
