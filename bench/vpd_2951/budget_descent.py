@@ -391,7 +391,7 @@ if RESID:
                       'ls': torch.full((W.shape[1], W.shape[0]), math.log(1e-3 * W.abs().mean().item()), device=dev).requires_grad_()}
 del X
 
-state = {'mode': 'M', 'soft': [], 'hard': [], 'gates': {}, 'route': {}, 'share': {}, 'r': {}, 'writers': {}, 'on': {}, 'gate': {}, 'edges_soft': [], 'edges_hard': [], 'share_a': {}, 'resid_on': {}, 'wedits': {}}
+state = {'mode': 'M', 'soft': [], 'hard': [], 'gates': {}, 'route': {}, 'share': {}, 'r': {}, 'writers': {}, 'on': {}, 'gate': {}, 'edges_soft': [], 'edges_hard': [], 'share_a': {}, 'resid_on': {}, 'wedits_M': {}, 'wedits_P': {}, 'entry': {}, 'force_on': [], 'drop_R': []}
 SQ2 = math.sqrt(2)
 def make(n):
     st = T.site(n); p = P[n]; grp = GROUP.get(n); mult = MULT.get(n)
@@ -404,12 +404,26 @@ def make(n):
         if n.endswith('down_proj'):
             state['writers'][layer] = coef
         y = coef @ p['U']
+        for b, kind, G, a in state['entry'].get(n, ()):
+            if kind == 'out':
+                # Output coordinates G of every part's write scaled by 1 + a.
+                y = y.index_add(0, torch.tensor([b], device=y.device), (a * (coef[b] @ p['U'][:, G]) @ torch.eye(y.shape[-1], device=y.device)[G])[None])
         return y + residual(n, cur['x']) if RESID else y
     def fwd(x):
         cur['x'] = x
         if state['mode'] == 'M':
             return x @ st.W.T
         c = x @ p['V']
+        un = p['U'].norm(dim=1)
+        for b, kind, G, a in state['entry'].get(n, ()):
+            if kind == 'in':
+                # Input coordinates G of every part's read scaled by 1 + a.
+                c = c.index_add(0, torch.tensor([b], device=c.device), (a * (x[b][..., G] @ p['V'][G]))[None])
+            else:
+                # Every part's write norm with output coordinates G scaled (its own read is |c| ||u||).
+                un_b = (un.pow(2) + ((1 + a) ** 2 - 1) * p['U'][:, G].pow(2).sum(1)).clamp_min(0).sqrt()
+                un = un.expand(c.shape[0], 1, -1).clone() if un.dim() == 1 else un
+                un[b] = un_b
         if state['mode'] == 'all':
             return emit(c)
         keep = None
@@ -452,7 +466,7 @@ def make(n):
                 return emit(c * hard)
             state['soft'].append(soft.sum(-1).reshape(-1))
             return emit(c * soft)
-        read = x @ p['G'] if ARM == 'dir' else c if start == 'neuron' else c.abs() * p['U'].norm(dim=1)
+        read = x @ p['G'] if ARM == 'dir' else c if start == 'neuron' else c.abs() * un
         if router is not None:
             if n.endswith('c_fc'):
                 state['route'][layer] = torch.relu(x @ router['G1'])
@@ -460,6 +474,9 @@ def make(n):
         z = (read - p['tau']) / p['s']
         hard = (z > 0).float()
         phi = 0.5 * (1 + torch.erf(z / SQ2))
+        if state['force_on']:
+            on = torch.tensor(state['force_on'], device=z.device)
+            hard = hard.index_fill(0, on, 1.0); phi = phi.index_fill(0, on, 1.0)
         w = 1.0
         if grp is not None:
             fh, fp = state['gates'][grp[0]]
@@ -555,11 +572,11 @@ for n in attn: T.site(n)._forward = make_attn(n)
 # Weight edits (DESCENT_WEDITS = edited sequences per training batch): an edit is an additive
 # Delta W = A B^T on one or more of M's maps, defined in M's terms and applied verbatim to both models
 # at every use of the map: M's output W x and P's (its parts plus leftover, which together own W) both
-# gain Delta W x on the edited sequence. state['wedits'][map] lists (sequence, A [d_out, r], B [d_in, r]).
+# gain Delta W x on the edited sequence (install(): M every edit additively, P neuron-group edits entry-wise).
 def with_edits(n, f):
     def g(x):
         y = f(x)
-        for b, A_, B_ in state['wedits'].get(n, ()):
+        for b, A_, B_ in state['wedits_M' if state['mode'] == 'M' else 'wedits_P'].get(n, ()):
             y = y.index_add(0, torch.tensor([b], device=x.device), ((x[b] @ B_) @ A_.T)[None])
         return y
     return g
@@ -587,9 +604,10 @@ def draw_edit(g, family):
         size = max(1, int(round(math.exp(g.uniform(0, math.log(width))))))
         G = sorted(int(j) for j in g.choice(width, size, replace=False))
         a = -1.0 if family.endswith('remove') else float(g.choice([0.5, 2.0, 3.0])) - 1
+        Gt = torch.tensor(G, device=dev)
         if family.startswith('neurons_in'):
-            return {site_of(l, 'c_fc'): (eye(width, G), a * W('c_fc')[G].T)}
-        return {site_of(l, 'down_proj'): (a * W('down_proj')[:, G], eye(width, G))}
+            return {site_of(l, 'c_fc'): (eye(width, G), a * W('c_fc')[G].T), '_entry': {site_of(l, 'c_fc'): ('out', Gt, a)}}
+        return {site_of(l, 'down_proj'): (a * W('down_proj')[:, G], eye(width, G)), '_entry': {site_of(l, 'down_proj'): ('in', Gt, a)}}
     nh, hd = T.n_head, T.hd
     cols = lambda h: list(range(h * hd, (h + 1) * hd))
     if family in ('head_remove', 'head_scale'):
@@ -609,13 +627,36 @@ def draw_edit(g, family):
                 torch.tensor(g.standard_normal((d_in, r)), dtype=torch.float32, device=dev) * math.sqrt(c))}
 
 def install(edits):
-    """edits: per sequence of the batch, None or {map: (A, B)}."""
-    state['wedits'] = {}
+    """edits: per sequence of the batch, None, 'allon' (every part's gate on, the leftover off, against M),
+    'lrm' (the leftover removed from both: M becomes its parts all on, P runs without the leftover), or
+    {map: (A, B), '_entry': {map: (kind, G, a)}}: a weight edit, additive Delta W = A B^T on M, and on P
+    entry-wise where '_entry' gives it (kind 'in': input coordinates G of the map scaled by 1 + a, in
+    every part's read and the leftover; 'out': output coordinates G, in every part's write and the
+    leftover), additive otherwise."""
+    state['wedits_M'], state['wedits_P'], state['entry'] = {}, {}, {}
+    state['force_on'], state['drop_R'] = [], []
     for b, e in enumerate(edits):
-        for n, (A_, B_) in (e or {}).items():
-            state['wedits'].setdefault(n, []).append((b, A_, B_))
+        if e == 'allon':
+            state['force_on'].append(b); state['drop_R'].append(b); continue
+        if e == 'lrm':
+            state['drop_R'].append(b); continue
+        entry = (e or {}).get('_entry', {})
+        for n, v in (e or {}).items():
+            if n == '_entry':
+                continue
+            state['wedits_M'].setdefault(n, []).append((b, *v))
+            if n in entry:
+                state['entry'].setdefault(n, []).append((b, *entry[n]))
+            else:
+                state['wedits_P'].setdefault(n, []).append((b, *v))
 
 N_EDITS = int(os.environ.get('DESCENT_WEDITS', '0'))
+# DESCENT_ALLON=1: one sequence of every batch runs with every part's gate on and the leftover off,
+# against M (ties the parts' sum to M). DESCENT_LRM=1 (with DESCENT_RESID): one sequence runs the
+# leftover-removal experiment, Delta W = -R on both models (M becomes its parts all on; P runs without
+# its leftover), tying P's sparse run to its own dense run.
+ALLON = int(os.environ.get('DESCENT_ALLON', '0') == '1')
+LRM = int(os.environ.get('DESCENT_LRM', '0') == '1' and RESID)
 # Held-out weight edits: a fixed set, 4 per held-out sequence (32 in all), families in turn, seed 7.
 _g = np.random.default_rng(7)
 EVAL_EDITS = [(i, FAMILIES[(4 * i + k) % len(FAMILIES)]) for i in range(ev.shape[0]) for k in range(4)]
@@ -692,7 +733,7 @@ def attn_v(l, h, pattern):
         # v_proj's leftover, gated on its own read at the key position, mixed by the pattern like any value.
         dv = residual(n, h).view(B_, T_, NH, HD).transpose(1, 2)                 # [B, H, T, HD]
         y = y + pattern @ dv
-    for b, A_, B_ in state['wedits'].get(n, ()):
+    for b, A_, B_ in state['wedits_P'].get(n, ()):
         # A weight edit of v_proj adds Delta W x to the values, which the pattern mixes like any value.
         dv = ((h[b] @ B_) @ A_.T).view(T_, NH, HD).transpose(0, 1)               # [H, T, HD]
         y = y.index_add(0, torch.tensor([b], device=y.device), (pattern[b] @ dv)[None])
@@ -755,6 +796,14 @@ def residual(n, x):
     """Map n's residual part on its input x: R = W^T - V U (or its posterior sample), gated on ||x R||."""
     R = RES[n]['sample'] if RES[n].get('sample') is not None else T.site(n).W.T - assembled(n)
     out = x @ R
+    for b, kind, G, a in state['entry'].get(n, ()):
+        idx = torch.tensor([b], device=out.device)
+        if kind == 'in':
+            out = out.index_add(0, idx, (a * (x[b][..., G] @ R[G]))[None])
+        else:
+            out = out.index_add(0, idx, (a * (x[b] @ R[:, G]) @ torch.eye(out.shape[-1], device=out.device)[G])[None])
+    if state['drop_R']:
+        out = out.index_fill(0, torch.tensor(state['drop_R'], device=out.device), 0.0)
     if state['mode'] == 'all':
         return out * 0.0 if state.get('drop_leftover') else out
     z = (out.norm(dim=-1) - RES[n]['tau']) / RES[n]['s']
@@ -1026,10 +1075,24 @@ for step in range(steps):
     rows = rng.integers(0, train_rows, batch); rows = np.where(rows >= 1024, rows + 8, rows); offs = rng.integers(0, 513 - seq, batch)
     ids = torch.tensor(np.stack([tok[r, o:o + seq] for r, o in zip(rows, offs)]).astype(np.int64), device=dev)
     t_step = time.time()
-    install([draw_edit(g_edits, FAMILIES[(step * N_EDITS + b) % len(FAMILIES)]) if b < N_EDITS else None for b in range(batch)])
+    kinds = [draw_edit(g_edits, FAMILIES[(step * N_EDITS + b) % len(FAMILIES)]) if b < N_EDITS else None for b in range(batch)]
+    if ALLON:
+        kinds[N_EDITS] = 'allon'
+    if LRM:
+        kinds[N_EDITS + ALLON] = 'lrm'
+    install(kinds)
     with torch.no_grad():
         lm = run(ids, 'M')
     draw(False)
+    if LRM:
+        # The leftover-removal experiment: M with Delta W = -R is the parts all on; its target is computed
+        # at this step's parts (no gradient), and P runs the same sequence without its leftover.
+        b_ = N_EDITS + ALLON
+        with torch.no_grad():
+            install([None]); state['drop_leftover'] = True
+            lm = lm.index_copy(0, torch.tensor([b_], device=dev), run(ids[b_:b_ + 1], 'all'))
+            state['drop_leftover'] = False
+        install(kinds)
     lp = run(ids, 'soft')
     kl_seq = kl_bits(lm, lp).mean(-1)
     kl = kl_seq.mean()
@@ -1038,8 +1101,13 @@ for step in range(steps):
     # Each kept edge's index bits, at the expected gates.
     edge_bits = sum(E['bits'] * (0.5 * (1 + torch.erf(E['eta'] / SQ2))).sum() for E in EDGE.values()) if EDGES else torch.zeros((), device=dev)
     objective = kl + (desc + edge_bits) / N
-    ek = torch.stack(state['soft']).sum(0).mean()
-    hk = torch.stack(state['hard']).sum(0).mean().item()
+    # The per-token count over the sequences that run as the explanation runs (not the all-on ones).
+    counted = torch.ones(batch, seq, device=dev)
+    if state['force_on']:
+        counted[state['force_on']] = 0.0
+    counted = counted.reshape(-1)
+    ek = (torch.stack(state['soft']).sum(0) * counted).sum() / counted.sum()
+    hk = ((torch.stack(state['hard']).sum(0) * counted).sum() / counted.sum()).item()
     if EDGES:
         # The per-token budget counts the edges on beside the parts on.
         ek = ek + torch.stack(state['edges_soft']).sum(0).mean()
