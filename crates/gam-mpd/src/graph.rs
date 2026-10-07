@@ -40,8 +40,10 @@ use crate::{
 };
 use ndarray::{Array1, Array2, Axis, s};
 use rand::{RngExt, SeedableRng, rngs::StdRng};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 // ------------------------------------------------------------------------------ the IR
 
@@ -1575,6 +1577,75 @@ impl SiteUnits {
     }
 }
 
+/// One scored experiment: the experiment, per scored token `KL(M_e ‖ P_e)` in bits, and the
+/// reader's candidates when asked for.
+#[derive(Clone, Debug)]
+pub struct Measured(pub Experiment, pub Vec<f64>, pub Option<Candidates>);
+
+/// Per scored token of an experiment (in [`Checker::rows_of`] order): `M`'s `k` most probable
+/// clean tokens at that (prompt, position), their clean probabilities, `M_e`'s and `P_e`'s
+/// probabilities of them, and each distribution's rest (what reader_score.py reads).
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct Candidates {
+    pub tokens: Vec<Vec<usize>>,
+    pub clean: Vec<Vec<f64>>,
+    pub model: Vec<Vec<f64>>,
+    pub program: Vec<Vec<f64>>,
+    pub clean_other: Vec<f64>,
+    pub model_other: Vec<f64>,
+    pub program_other: Vec<f64>,
+}
+
+impl Candidates {
+    /// From `M`'s clean log-probabilities `clean` (rows `clean_rows`), `M_e`'s `m` and `P_e`'s `p`
+    /// (rows `rows`).
+    fn of(clean: &Array2<f64>, m: &Array2<f32>, p: &Array2<f64>, rows: &[(usize, usize)], clean_rows: &[(usize, usize)], k: usize) -> Self {
+        let mut out = Self::default();
+        let rest = |values: &[f64]| (1.0 - values.iter().sum::<f64>()).max(0.0);
+        for (r, at) in rows.iter().enumerate().take(m.nrows().min(p.nrows())) {
+            let c = clean_rows.iter().position(|t| t == at).unwrap_or(r).min(clean.nrows().saturating_sub(1));
+            let row = clean.row(c);
+            let mut order: Vec<usize> = (0..row.len()).collect();
+            order.sort_by(|a, b| row[*b].total_cmp(&row[*a]));
+            order.truncate(k);
+            let clean_p: Vec<f64> = order.iter().map(|&t| row[t].exp()).collect();
+            let model_p: Vec<f64> = order.iter().map(|&t| f64::from(m[[r, t]]).exp()).collect();
+            let program_p: Vec<f64> = order.iter().map(|&t| p[[r, t]].exp()).collect();
+            out.clean_other.push(rest(&clean_p));
+            out.model_other.push(rest(&model_p));
+            out.program_other.push(rest(&program_p));
+            out.tokens.push(order);
+            out.clean.push(clean_p);
+            out.model.push(model_p);
+            out.program.push(program_p);
+        }
+        out
+    }
+}
+
+/// `KL(p ‖ q)` in bits per row, `p` stored in float32.
+pub fn kl_bits_f32(p: &Array2<f32>, q: &Array2<f64>) -> Vec<f64> {
+    p.outer_iter()
+        .zip(q.outer_iter())
+        .map(|(p, q)| {
+            p.iter()
+                .zip(q.iter())
+                .map(|(&a, b)| {
+                    let a = f64::from(a);
+                    if a.is_finite() { a.exp() * (a - b) } else { 0.0 }
+                })
+                .sum::<f64>()
+                / std::f64::consts::LN_2
+        })
+        .collect()
+}
+
+/// The byte budget of `M`'s cached outcomes: `GRAPH_CACHE_GIB` GiB (4 when unset).
+fn cache_budget() -> usize {
+    let gib: f64 = std::env::var("GRAPH_CACHE_GIB").ok().and_then(|v| v.parse().ok()).unwrap_or(4.0);
+    (gib * f64::from(1u32 << 30)) as usize
+}
+
 /// Site operations in words (the reader's description; the same for `M` and every program).
 fn describe_sites(draw: &SiteDraw) -> String {
     let block = |b: usize| format!("layer {}'s {}", b / 2, if b % 2 == 0 { "attention" } else { "MLP" });
@@ -1660,7 +1731,11 @@ pub struct Checker {
     counterfactual: Option<(Batch, Vec<usize>)>,
     /// Per prompt with a same-length donor: (prompt, donor).
     donors: Vec<(usize, usize)>,
-    cache: BTreeMap<String, Array2<f64>>,
+    /// `M`'s outcome per experiment key (log-probabilities in float32) and the keys in the order
+    /// they were stored: the oldest are dropped past `cache_bytes`.
+    cache: BTreeMap<String, Arc<Array2<f32>>>,
+    cached: std::collections::VecDeque<String>,
+    pub cache_bytes: usize,
     /// Heads by their measured removal effect on `M` (mean `KL(M ‖ M without the head)` at the
     /// targets), strongest first; measured on first use.
     strongest: Option<Vec<(usize, usize)>>,
@@ -1737,7 +1812,7 @@ impl Checker {
             donors.extend(group.iter().enumerate().map(|(k, &i)| (i, group[(k + 1) % group.len()])));
         }
         donors.sort_unstable();
-        Ok(Self { weights, behavior, stats, clean: (batch, rows), counterfactual, donors, cache: BTreeMap::new(), strongest: None, sites: SiteUnits::default() })
+        Ok(Self { weights, behavior, stats, clean: (batch, rows), counterfactual, donors, cache: BTreeMap::new(), cached: Default::default(), cache_bytes: cache_budget(), strongest: None, sites: SiteUnits::default() })
     }
 
     /// The experiment's key for `M`'s cache: what it does to which pieces.
@@ -1760,16 +1835,25 @@ impl Checker {
     /// One circuit under one experiment: its log-probabilities at the scored rows (the swap's
     /// prompts only, for a swap).
     fn outcome(&mut self, circuit: &Circuit, e: &Experiment) -> Result<Array2<f64>, String> {
+        let restore = match e {
+            Experiment::Edit { edit, .. } => Some(edit.apply(&mut self.weights)?),
+            _ => None,
+        };
+        let result = self.run(circuit, e);
+        if let Some(r) = restore {
+            r.restore(&mut self.weights)?;
+        }
+        result
+    }
+
+    /// [`Checker::outcome`] on the current weights (an edit's already applied).
+    fn run(&self, circuit: &Circuit, e: &Experiment) -> Result<Array2<f64>, String> {
         let mut circuit = circuit.clone();
         let (batch, rows) = match e {
             Experiment::Counterfactual => self.counterfactual.as_ref().ok_or("the behavior has no counterfactuals")?,
             _ => &self.clean,
         };
-        let restore = match e {
-            Experiment::Edit { edit, .. } => Some(edit.apply(&mut self.weights)?),
-            _ => None,
-        };
-        let result = (|| -> Result<Array2<f64>, String> {
+        {
             match e {
                 Experiment::Cut { from, to, route, .. } => {
                     match to {
@@ -1794,79 +1878,176 @@ impl Checker {
                 Experiment::Sites { draw } => self.sites_outcome(&circuit, draw),
                 _ => Ok(execute(&self.weights, &self.stats, &circuit, batch, rows, &BTreeMap::new(), false)?.log_probabilities),
             }
-        })();
-        if let Some(r) = restore {
-            r.restore(&mut self.weights)?;
         }
-        result
+    }
+
+    /// `M`'s cache key of `e` on `graph`'s units.
+    fn model_key(&self, graph: &Graph, e: &Experiment) -> String {
+        // A cut hands the reader the writer's stand-in, so the stand-in form is part of the key.
+        format!("{}{}", if self.stats.mean_output { "mean output; " } else { "" }, Self::key(graph, e))
+    }
+
+    /// Stores `M`'s outcome under `key`, dropping the oldest past the byte budget.
+    fn keep(&mut self, key: String, outcome: Arc<Array2<f32>>) {
+        if self.cache.insert(key.clone(), outcome).is_none() {
+            self.cached.push_back(key);
+        }
+        let mut bytes: usize = self.cache.values().map(|a| a.len() * 4).sum();
+        while bytes > self.cache_bytes && self.cached.len() > 1 {
+            let Some(old) = self.cached.pop_front() else { break };
+            if let Some(a) = self.cache.remove(&old) {
+                bytes -= a.len() * 4;
+            }
+        }
     }
 
     /// `M`'s outcome under `e`, cached.
     pub fn model_outcome(&mut self, graph: &Graph, e: &Experiment) -> Result<Array2<f64>, String> {
-        // A cut hands the reader the writer's stand-in, so the stand-in form is part of the key.
-        let key = format!("{}{}", if self.stats.mean_output { "mean output; " } else { "" }, Self::key(graph, e));
+        let key = self.model_key(graph, e);
         if let Some(hit) = self.cache.get(&key) {
-            return Ok(hit.clone());
+            return Ok(hit.mapv(f64::from));
         }
         let circuit = graph.model(&self.weights);
         let out = self.outcome(&circuit, e)?;
-        self.cache.insert(key, out.clone());
+        self.keep(key, Arc::new(out.mapv(|v| v as f32)));
         Ok(out)
     }
 
     /// The program's score under `count` sampled experiments (seed `seed`); `edges` routes by the
     /// declared edges, else every edge among the nodes is kept. `n` overrides the behavior's size.
-    /// An invalid program is scored as the empty program, flagged.
-    pub fn score(&mut self, program: &Program, count: usize, seed: u64, edges: bool, n: Option<f64>) -> Result<(Score, Vec<(Experiment, Array2<f64>, Array2<f64>)>), String> {
+    /// An invalid program is scored as the empty program, flagged. [`Checker::score_batch`] of one.
+    pub fn score(&mut self, program: &Program, count: usize, seed: u64, edges: bool, n: Option<f64>) -> Result<(Score, Vec<Measured>), String> {
+        let mut out = self.score_batch(std::slice::from_ref(program), count, seed, edges, n, 0)?;
+        out.pop().ok_or_else(|| "no score".into())
+    }
+
+    /// Every program's score under its `count` sampled experiments (seed `seed`; the behavior's
+    /// half is the same for all of them), with per experiment its tokens' `KL(M_e ‖ P_e)` and, for
+    /// `top` > 0, the reader's candidates ([`Candidates`]). `M`'s outcomes are computed once per
+    /// experiment and cached; runs go in parallel threads, experiments that edit weights grouped
+    /// by their edit (the edit applied once, then every run that needs it).
+    pub fn score_batch(&mut self, programs: &[Program], count: usize, seed: u64, edges: bool, n: Option<f64>, top: usize) -> Result<Vec<(Score, Vec<Measured>)>, String> {
         let n = n.unwrap_or_else(|| self.behavior.size());
-        let (graph, valid, error) = match Graph::parse(program, &self.weights) {
-            Ok(g) => (g, true, None),
-            Err(e) => (Graph::empty(), false, Some(e)),
-        };
         let strongest = self.strongest()?;
-        let experiments = sample(&self.weights, &graph, self.counterfactual.is_some(), count, seed, &strongest, &self.sites.pool);
-        let circuit = graph.program(&self.weights, edges);
-        let mut per_family: BTreeMap<String, Family> = BTreeMap::new();
-        let mut total = (0.0, 0usize);
-        let mut outcomes = Vec::new();
-        for e in &experiments {
-            if matches!(e, Experiment::Swap { .. }) && self.donors.is_empty() {
-                continue;
+        let parsed: Vec<(Graph, bool, Option<String>)> = programs
+            .iter()
+            .map(|program| match Graph::parse(program, &self.weights) {
+                Ok(g) => (g, true, None),
+                Err(e) => (Graph::empty(), false, Some(e)),
+            })
+            .collect();
+        let circuits: Vec<Circuit> = parsed.iter().map(|(g, _, _)| g.program(&self.weights, edges)).collect();
+        let models: Vec<Circuit> = parsed.iter().map(|(g, _, _)| g.model(&self.weights)).collect();
+        // Per program its experiments; per run (program, experiment) the cache key of M's outcome.
+        let mut runs: Vec<(usize, Experiment, String)> = Vec::new();
+        let mut drawn = vec![0usize; programs.len()];
+        for (i, (graph, _, _)) in parsed.iter().enumerate() {
+            for e in sample(&self.weights, graph, self.counterfactual.is_some(), count, seed, &strongest, &self.sites.pool) {
+                if matches!(e, Experiment::Swap { .. }) && self.donors.is_empty() {
+                    continue;
+                }
+                let key = self.model_key(graph, &e);
+                runs.push((i, e, key));
+                drawn[i] += 1;
             }
-            let m = self.model_outcome(&graph, e)?;
-            let p = self.outcome(&circuit, e)?;
-            let kl = kl_bits(&m, &p);
-            let sum: f64 = kl.iter().sum();
-            let entry = per_family.entry(e.family().to_string()).or_default();
-            entry.experiments += 1;
-            entry.tokens += kl.len();
-            entry.mean_kl_bits += sum;
-            total.0 += sum;
-            total.1 += kl.len();
-            outcomes.push((e.clone(), m, p));
         }
-        for v in per_family.values_mut() {
-            v.mean_kl_bits /= v.tokens.max(1) as f64;
+        // Runs grouped by the weight edit they apply (none first).
+        let mut groups: BTreeMap<Option<String>, Vec<usize>> = BTreeMap::new();
+        for (r, (_, e, _)) in runs.iter().enumerate() {
+            let edit = match e {
+                Experiment::Edit { edit, .. } => Some(serde_json::to_string(edit).map_err(|e| e.to_string())?),
+                _ => None,
+            };
+            groups.entry(edit).or_default().push(r);
         }
-        let exec_error_bits = n * total.0 / total.1.max(1) as f64;
-        let code_bits = if valid && program.token_types > 1 { program.python_tokens as f64 * (program.token_types as f64).log2() } else { 0.0 };
-        let opaque_numbers = graph.opaque_numbers(&self.weights);
-        let opaque_bits = 0.5 * n.log2() * opaque_numbers as f64;
-        let score = Score {
-            total_bits: exec_error_bits + code_bits + opaque_bits,
-            exec_error_bits,
-            reader_error_bits: 0.0,
-            code_bits,
-            python_tokens: if valid { program.python_tokens } else { 0 },
-            opaque_numbers,
-            opaque_bits,
-            n,
-            experiments: outcomes.len(),
-            valid,
-            error,
-            per_family,
-        };
-        Ok((score, outcomes))
+        let mut measured: Vec<Option<(Vec<f64>, Option<Candidates>)>> = vec![None; runs.len()];
+        let clean = if top > 0 { Some(self.model_outcome(&Graph::empty(), &Experiment::Clean)?) } else { None };
+        for members in groups.values() {
+            let restore = match &runs[members[0]].1 {
+                Experiment::Edit { edit, .. } => Some(edit.apply(&mut self.weights)?),
+                _ => None,
+            };
+            let result = (|| -> Result<(), String> {
+                // M once per key not yet cached, in parallel.
+                let mut missing: Vec<usize> = Vec::new();
+                for &r in members {
+                    if !self.cache.contains_key(&runs[r].2) && !missing.iter().any(|&m| runs[m].2 == runs[r].2) {
+                        missing.push(r);
+                    }
+                }
+                let this = &*self;
+                let made: Vec<(String, Arc<Array2<f32>>)> = missing
+                    .par_iter()
+                    .map(|&r| this.run(&models[runs[r].0], &runs[r].1).map(|m| (runs[r].2.clone(), Arc::new(m.mapv(|v| v as f32)))))
+                    .collect::<Result<_, String>>()?;
+                let fresh: BTreeMap<String, Arc<Array2<f32>>> = made.iter().cloned().collect();
+                let this = &*self;
+                let scored: Vec<(usize, Vec<f64>, Option<Candidates>)> = members
+                    .par_iter()
+                    .map(|&r| {
+                        let (i, e, key) = &runs[r];
+                        let m = fresh.get(key).or_else(|| this.cache.get(key)).ok_or("M's outcome went missing")?;
+                        let p = this.run(&circuits[*i], e)?;
+                        let kl = kl_bits_f32(m, &p);
+                        let candidates = clean.as_ref().map(|c| Candidates::of(c, m, &p, &this.rows_of(e), &this.rows_of(&Experiment::Clean), top));
+                        Ok((r, kl, candidates))
+                    })
+                    .collect::<Result<_, String>>()?;
+                for (key, m) in made {
+                    self.keep(key, m);
+                }
+                for (r, kl, candidates) in scored {
+                    measured[r] = Some((kl, candidates));
+                }
+                Ok(())
+            })();
+            if let Some(r) = restore {
+                r.restore(&mut self.weights)?;
+            }
+            result?;
+        }
+        let mut out = Vec::with_capacity(programs.len());
+        let mut runs_and_measures = runs.into_iter().zip(measured);
+        for (i, program) in programs.iter().enumerate() {
+            let (graph, valid, error) = &parsed[i];
+            let mut per_family: BTreeMap<String, Family> = BTreeMap::new();
+            let mut total = (0.0, 0usize);
+            let mut outcomes = Vec::new();
+            for ((_, e, _), m) in runs_and_measures.by_ref().take(drawn[i]) {
+                let (kl, candidates) = m.ok_or("an unmeasured run")?;
+                let sum: f64 = kl.iter().sum();
+                let entry = per_family.entry(e.family().to_string()).or_default();
+                entry.experiments += 1;
+                entry.tokens += kl.len();
+                entry.mean_kl_bits += sum;
+                total.0 += sum;
+                total.1 += kl.len();
+                outcomes.push(Measured(e, kl, candidates));
+            }
+            for v in per_family.values_mut() {
+                v.mean_kl_bits /= v.tokens.max(1) as f64;
+            }
+            let exec_error_bits = n * total.0 / total.1.max(1) as f64;
+            let code_bits = if *valid && program.token_types > 1 { program.python_tokens as f64 * (program.token_types as f64).log2() } else { 0.0 };
+            let opaque_numbers = graph.opaque_numbers(&self.weights);
+            let opaque_bits = 0.5 * n.log2() * opaque_numbers as f64;
+            let score = Score {
+                total_bits: exec_error_bits + code_bits + opaque_bits,
+                exec_error_bits,
+                reader_error_bits: 0.0,
+                code_bits,
+                python_tokens: if *valid { program.python_tokens } else { 0 },
+                opaque_numbers,
+                opaque_bits,
+                n,
+                experiments: outcomes.len(),
+                valid: *valid,
+                error: error.clone(),
+                per_family,
+            };
+            out.push((score, outcomes));
+        }
+        Ok(out)
     }
 
     /// Heads by measured removal effect, strongest first (cached).
@@ -1876,14 +2057,21 @@ impl Checker {
         }
         let graph = Graph::empty();
         let clean = self.model_outcome(&graph, &Experiment::Clean)?;
-        let mut effects = Vec::new();
-        for l in 0..self.weights.layers.len() {
-            for h in 0..self.weights.layers[l].heads.len() {
-                let removed = self.model_outcome(&graph, &Experiment::Edit { edit: WeightEdit::Head { layer: l, head: h, factor: 0.0 }, aimed: true })?;
+        // A head's output zeroed at every token is the head removed (graph_sites_tests), and site
+        // operations leave the weights alone, so every head runs in parallel.
+        let heads: Vec<(usize, usize)> = self.weights.layers.iter().enumerate().flat_map(|(l, layer)| (0..layer.heads.len()).map(move |h| (l, h))).collect();
+        let model = graph.model(&self.weights);
+        let this = &*self;
+        let mut effects: Vec<((usize, usize), f64)> = heads
+            .par_iter()
+            .enumerate()
+            .map(|(k, &lh)| {
+                let draw = SiteDraw { family: interchange::Family::Zero, ops: vec![SiteOp { site: SharedSite::Head(k), operation: Operation::Scale(0), onward: true }], position: 0, length: 1 };
+                let removed = this.run(&model, &Experiment::Sites { draw })?;
                 let kl = kl_bits(&clean, &removed);
-                effects.push(((l, h), kl.iter().sum::<f64>() / kl.len().max(1) as f64));
-            }
-        }
+                Ok((lh, kl.iter().sum::<f64>() / kl.len().max(1) as f64))
+            })
+            .collect::<Result<_, String>>()?;
         effects.sort_by(|a, b| b.1.total_cmp(&a.1));
         let order: Vec<(usize, usize)> = effects.into_iter().map(|(k, _)| k).collect();
         self.strongest = Some(order.clone());

@@ -17,13 +17,12 @@
 use gam_gpu::tensor::Device;
 use gam_mpd::{
     engine::log_to_stderr,
-    graph::{Behavior, Checker, Experiment, Graph, Program, SiteUnits, WeightEdit, Weights, Writer},
+    graph::{Behavior, Checker, Experiment, Graph, Measured, Program, SiteUnits, WeightEdit, Weights, Writer},
     import::import_language_model,
     library_mdl,
     library_readout::Library,
     run_check::{layer_nodes, split_sites},
 };
-use ndarray::Array2;
 use serde_json::{Value, json};
 use std::io::{BufRead, Write};
 use std::path::Path;
@@ -87,39 +86,24 @@ fn reader_experiment(e: &Experiment, program: &Program, graph: &Graph, behavior:
 /// The reader's items (reader_score.py's format, without the texts, which score.py decodes): per
 /// experiment and target token, `M`'s clean top `k` tokens with their clean probabilities, `M_e`'s
 /// probabilities of them and of everything else, and the program's.
-fn items(checker: &Checker, outcomes: &[(Experiment, Array2<f64>, Array2<f64>)], program: &Program, k: usize) -> Value {
+fn items(checker: &Checker, outcomes: &[Measured], program: &Program) -> Value {
     let graph = checker.graph(program);
-    let Some((_, clean, _)) = outcomes.iter().find(|o| o.0 == Experiment::Clean) else { return Value::Null };
-    let top: Vec<Vec<usize>> = clean
-        .outer_iter()
-        .map(|row| {
-            let mut order: Vec<usize> = (0..row.len()).collect();
-            order.sort_by(|a, b| row[*b].total_cmp(&row[*a]));
-            order.truncate(k);
-            order
-        })
-        .collect();
     let behavior = &checker.behavior;
-    // Rows are the behavior's target tokens in prompt order (a swap's: its prompts' only).
-    let targets: Vec<(usize, usize)> = behavior.prompts.iter().enumerate().flat_map(|(i, p)| p.target_positions.iter().map(move |&t| (i, t))).collect();
     let donors = checker.donors();
     let mut list = Vec::new();
-    for (x, (e, m, p)) in outcomes.iter().enumerate() {
-        let rows = checker.rows_of(e);
-        for (r, &(prompt, position)) in rows.iter().enumerate().filter(|(r, _)| *r < m.nrows()) {
-            let clean_row = targets.iter().position(|t| *t == (prompt, position)).unwrap_or(r);
-            let tokens = &top[clean_row];
+    for (x, Measured(e, _, candidates)) in outcomes.iter().enumerate() {
+        let Some(c) = candidates else { continue };
+        for (r, &(prompt, position)) in checker.rows_of(e).iter().enumerate().take(c.tokens.len()) {
             let donor = donors.iter().find(|(i, _)| *i == prompt).map(|(_, j)| *j);
             let (ids, cut) = match e {
                 Experiment::Counterfactual => {
-                    let c = behavior.prompts[prompt].counterfactual.as_ref().map_or(&behavior.prompts[prompt].token_ids, |c| &c.token_ids);
-                    let shift = c.len() as isize - behavior.prompts[prompt].token_ids.len() as isize;
-                    (c, (position as isize + shift) as usize)
+                    let cf = behavior.prompts[prompt].counterfactual.as_ref().map_or(&behavior.prompts[prompt].token_ids, |c| &c.token_ids);
+                    let shift = cf.len() as isize - behavior.prompts[prompt].token_ids.len() as isize;
+                    (cf, (position as isize + shift) as usize)
                 }
                 _ => (&behavior.prompts[prompt].token_ids, position),
             };
-            let candidates: Vec<Value> = tokens.iter().map(|&t| json!({"token_id": t, "clean": clean[[clean_row, t]].exp(), "p": m[[r, t]].exp(), "q_program": p[[r, t]].exp()})).collect();
-            let rest = |row: ndarray::ArrayView1<f64>| (1.0 - tokens.iter().map(|&t| row[t].exp()).sum::<f64>()).max(0.0);
+            let candidates: Vec<Value> = c.tokens[r].iter().enumerate().map(|(j, &t)| json!({"token_id": t, "clean": c.clean[r][j], "p": c.model[r][j], "q_program": c.program[r][j]})).collect();
             list.push(json!({
                 "id": format!("{x}:{prompt}:{position}"),
                 "family": e.family(),
@@ -129,9 +113,9 @@ fn items(checker: &Checker, outcomes: &[(Experiment, Array2<f64>, Array2<f64>)],
                 "position": cut,
                 "token_ids": ids[..=cut.min(ids.len() - 1)],
                 "candidates": candidates,
-                "clean_other": rest(clean.row(clean_row)),
-                "other": rest(m.row(r)),
-                "other_program": rest(p.row(r)),
+                "clean_other": c.clean_other[r],
+                "other": c.model_other[r],
+                "other_program": c.program_other[r],
             }));
         }
     }
@@ -190,9 +174,13 @@ fn handle(request: &Value, weights: &mut Option<Weights>, checker: &mut Option<C
             *checker = Some(c);
             Ok(json!({"ok": true, "id": id, "prompts": prompts, "manifest": named.map(|p| p.display().to_string()), "site_experiments": pool}))
         }
-        "score" => {
+        // One program ("program") or many ("programs", the batch answer {"ok", "scores": [...]}),
+        // every program under the same seed: the behavior's half of the experiments is shared and
+        // M runs once per experiment; runs go in parallel threads (RAYON_NUM_THREADS).
+        "score" | "score_batch" => {
             let c = checker.as_mut().ok_or("load a behavior first")?;
-            let program: Program = serde_json::from_value(request["program"].clone()).map_err(error)?;
+            let batch = request.get("programs").is_some();
+            let programs: Vec<Program> = if batch { serde_json::from_value(request["programs"].clone()).map_err(error)? } else { vec![serde_json::from_value(request["program"].clone()).map_err(error)?] };
             let count = request["experiments"].as_u64().unwrap_or(32) as usize;
             let seed = request["seed"].as_u64().unwrap_or(0);
             let edges = request["routing"].as_str().unwrap_or("edges") == "edges";
@@ -200,13 +188,25 @@ fn handle(request: &Value, weights: &mut Option<Weights>, checker: &mut Option<C
             // "stand_in": "input" (design: each neuron applied to its layer's mean input) or
             // "output" (each neuron's mean activation through its down column).
             c.stats.mean_output = request["stand_in"].as_str() == Some("output");
-            let (score, outcomes) = c.score(&program, count, seed, edges, n)?;
-            let mut answer = serde_json::to_value(&score).map_err(error)?;
             let k = request["reader_top"].as_u64().unwrap_or(0) as usize;
-            if k > 0 {
-                answer["items"] = items(c, &outcomes, &program, k);
+            let started = std::time::Instant::now();
+            let scored = c.score_batch(&programs, count, seed, edges, n, k)?;
+            let seconds = started.elapsed().as_secs_f64();
+            let mut answers = Vec::with_capacity(scored.len());
+            for (program, (score, outcomes)) in programs.iter().zip(&scored) {
+                let mut answer = serde_json::to_value(score).map_err(error)?;
+                if k > 0 {
+                    answer["items"] = items(c, outcomes, program);
+                }
+                answers.push(answer);
             }
-            Ok(answer)
+            if batch {
+                Ok(json!({"ok": true, "scores": answers, "seconds": seconds}))
+            } else {
+                let mut answer = answers.pop().ok_or("no score")?;
+                answer["seconds"] = json!(seconds);
+                Ok(answer)
+            }
         }
         other => Err(format!("unknown op {other}")),
     }
