@@ -19,16 +19,17 @@ class Checker:
     def __init__(self, model):
         self.model, self.path = model, None
 
-    def behavior(self, path):
-        self.path = path
+    def request(self, message):
+        self.path = message["path"]
 
-    def score_batch(self, sources, seed=0):
+    def score_batch(self, sources, seed=0, uniform_seeds=None):
         calls.append((self.path, seed, len(sources)))
         return [{"total_bits": len(x) + seed, "valid": True, "behavior": self.path} for x in sources]
 
 
 def main():
     sys.modules["score"] = types.SimpleNamespace(Checker=Checker)
+    sys.modules["run"] = types.SimpleNamespace(load_behavior=lambda c, path: c.request({"op": "behavior", "path": path, "manifest": None}))
     scorer.WORKERS = 3
     items = [{"source": "x" * i, "behavior": {"model": "vpd4l", "path": f"b{i % 4}"}, "seed": 1 + i % 2} for i in range(16)]
     out = scorer.checker(items)

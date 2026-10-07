@@ -54,6 +54,9 @@ def checker(items: list[dict]) -> list[dict]:
 
     import score
 
+    sys.path.insert(0, str(GRAPH / "e2e"))
+    from run import load_behavior  # g-int's: the behavior without the site manifest, which the vpd4l export cannot serve
+
     groups = {}
     for k, it in enumerate(items):
         groups.setdefault((it["behavior"]["model"], it["behavior"]["path"]), []).append(k)
@@ -65,12 +68,12 @@ def checker(items: list[dict]) -> list[dict]:
             c = _CHECKERS[(model, w)] = score.Checker(model, EXPORT) if EXPORT else score.Checker(model)
             c.loaded = None
         if c.loaded != path:
-            c.behavior(path)
+            load_behavior(c, path)
             c.loaded = path
-        seeds = sorted({items[k].get("seed", 0) for k in ks})
-        for seed in seeds:  # one batch request per seed: the server runs M once per experiment and the programs in parallel
-            batch = [k for k in ks if items[k].get("seed", 0) == seed]
-            for k, r in zip(batch, c.score_batch([items[k]["source"] for k in batch], seed=seed)):
+        keys = sorted({(items[k].get("seed", 0), items[k].get("uniform_seeds") or 0) for k in ks})
+        for seed, uniform in keys:  # one batch request per seed: the server runs M once per experiment and the programs in parallel
+            batch = [k for k in ks if (items[k].get("seed", 0), items[k].get("uniform_seeds") or 0) == (seed, uniform)]
+            for k, r in zip(batch, c.score_batch([items[k]["source"] for k in batch], seed=seed, uniform_seeds=uniform or None)):
                 out[k] = r
 
     per_worker = [[] for _ in range(WORKERS)]

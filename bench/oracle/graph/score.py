@@ -89,13 +89,16 @@ class Checker:
         are returned for a later reader pass."""
         return self.score_batch([program], experiments, seed, routing, N, reader, reader_top, stand_in)[0]
 
-    def score_batch(self, programs, experiments=32, seed=0, routing="edges", N=None, reader=True, reader_top=8, stand_in="input"):
+    def score_batch(self, programs, experiments=32, seed=0, routing="edges", N=None, reader=True, reader_top=8, stand_in="input", uniform_seeds=None):
         """score() for many programs of the current behavior under one seed, in one checker request (the server
-        runs M once per experiment it has not cached and the programs in parallel)."""
+        runs M once per experiment it has not cached and the programs in parallel). uniform_seeds m: the
+        experiments are drawn from seed mod m, so m collections recur across a caller's seeds (58119de9b3)."""
         irs = [self.ir(p) for p in programs]
-        answer = self.request({"op": "score", "programs": irs, "experiments": experiments, "seed": seed,
-                               "routing": routing, "N": N, "reader_top": reader_top if reader else 0,
-                               "stand_in": stand_in})
+        request = {"op": "score", "programs": irs, "experiments": experiments, "seed": seed,
+                   "routing": routing, "N": N, "reader_top": reader_top if reader else 0, "stand_in": stand_in}
+        if uniform_seeds:
+            request["uniform_seeds"] = uniform_seeds
+        answer = self.request(request)
         return [self.finish(ir, a, reader) for ir, a in zip(irs, answer["scores"])]
 
     def ir(self, program):

@@ -377,7 +377,7 @@ def repair(chosen: list[dict], best: list[dict], pol, sampler, score, args, adap
         prompts = [pol.prompt_ids(repair_prompt(b, program_of(x["text"]), x["score"])) for b, x in zip(chosen, best)]
         groups = sampler(prompts, args.samples, adapter, step)
         texts = [[pol.tok.decode(c, skip_special_tokens=True) for c in g] for g in groups]
-        scores = score([{"source": program_of(t), "behavior": b, "seed": step} for b, ts in zip(chosen, texts) for t in ts])
+        scores = score([{"source": program_of(t), "behavior": b, "seed": step, "uniform_seeds": args.uniform_seeds} for b, ts in zip(chosen, texts) for t in ts])
         for g in range(len(chosen)):
             for j in range(args.samples):
                 r = scores[g * args.samples + j]
@@ -448,6 +448,7 @@ def main():
     ap.add_argument("--prompt-holdout", type=int, default=4, help="every K-th prompt of each training behavior is held out for evaluation (0: none)")
     ap.add_argument("--eval-every", type=int, default=0, help="evaluate every E training steps and at the end (0: only --mode eval)")
     ap.add_argument("--eval-seed", type=int, default=1_000_003, help="the evaluation's experiment seed (training steps use their index)")
+    ap.add_argument("--uniform-seeds", type=int, default=0, help="training draws experiments from step mod M (the checker's uniform_seeds: M's outcomes cached after M steps); the evaluation never")
     ap.add_argument("--no-baselines", dest="baselines", action="store_false", help="skip scoring the empty, full and search programs in evaluation")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
@@ -503,7 +504,7 @@ def main():
         groups = sampler(prompts, args.samples, adapter, step)
         t1 = time.time()
         texts = [[pol.tok.decode(c, skip_special_tokens=True) for c in g] for g in groups]
-        items = [{"source": program_of(t), "behavior": b, "seed": step} for b, ts in zip(chosen, texts) for t in ts]
+        items = [{"source": program_of(t), "behavior": b, "seed": step, "uniform_seeds": args.uniform_seeds} for b, ts in zip(chosen, texts) for t in ts]
         scores = score(items)
         t2 = time.time()
         S = np.array([s["total_bits"] for s in scores], dtype=float).reshape(len(chosen), args.samples)
