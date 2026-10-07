@@ -95,11 +95,11 @@ VPD_COUNTS = {'h.0.mlp.c_fc': 18.62, 'h.0.mlp.down_proj': 20.20, 'h.1.mlp.c_fc':
 
 @torch.no_grad()
 def site_inputs(ids):
-    xs = {n: [] for n in mlp + attn}
+    xs = {n: [] for n in site_names()}
     for i in range(0, ids.shape[0], 4):
-        for n in mlp + attn: T.site(n).cache_input = True
+        for n in site_names(): T.site(n).cache_input = True
         T(ids[i:i + 4])
-        for n in mlp + attn:
+        for n in site_names():
             st = T.site(n); xs[n].append(st.last_input.reshape(-1, st.last_input.shape[-1])); st.cache_input = False
     return {n: torch.cat(v) for n, v in xs.items()}
 
@@ -356,21 +356,45 @@ for n in attn:
     A[n] = {'F': F0.clone().requires_grad_(), 'V': V, 'U': U, 'tau': tau.clone().requires_grad_(), 's': s_, 'o': o}
     print(n, 'slices', NH * V.shape[-1], 'all-on error', err, 'worst head frame cond', round(cond, 1), flush=True)
 SHARE_A = {}
+# DESCENT_RESID=1 (MLP maps): a priced residual part per map. R = W^T - V U, recomputed from the current
+# slices, is one more part, so every part on is M exactly by construction whatever the slices become.
+# It is gated on its own read ||x R|| (the norm of its output on the map's own input): Phi((||x R|| -
+# tau_R)/s_R) in training, hard at evaluation, with s_R = 0.1 x the root mean square of ||x W^T|| on
+# M's fit tokens (the map's output scale; R starts at 0 for an exact start) and tau_R started at 3 s_R
+# (off). On, it counts its rank-one equivalent, min(d_in, d_out) (a full-rank residual is that many
+# rank-one units). Under DESCENT_F its entries are described like any part's (below), so a large
+# residual costs bits and budget and a small one is cheap: F decides how far the slices drift.
+RESID = os.environ.get('DESCENT_RESID') == '1'
+# Typical input and output norms of every map on M's fit tokens (random weight edits are sized by them).
+with torch.no_grad():
+    TYPICAL = {n: (X[n].norm(dim=-1).pow(2).mean().sqrt().item(), (X[n] @ T.site(n).W.T).norm(dim=-1).pow(2).mean().sqrt().item())
+               for n in X}
+RES = {}
+if RESID:
+    with torch.no_grad():
+        for n in mlp:
+            W = T.site(n).W
+            s_R = 0.1 * (X[n] @ W.T).norm(dim=-1).pow(2).mean().sqrt()
+            RES[n] = {'tau': (3 * s_R).clone().requires_grad_(), 's': s_R, 'rank': float(min(W.shape)),
+                      'ls': torch.full((W.shape[1], W.shape[0]), math.log(1e-3 * W.abs().mean().item()), device=dev).requires_grad_()}
 del X
 
-state = {'mode': 'M', 'soft': [], 'hard': [], 'gates': {}, 'route': {}, 'share': {}, 'r': {}, 'writers': {}, 'on': {}, 'gate': {}, 'edges_soft': [], 'edges_hard': [], 'share_a': {}}
+state = {'mode': 'M', 'soft': [], 'hard': [], 'gates': {}, 'route': {}, 'share': {}, 'r': {}, 'writers': {}, 'on': {}, 'gate': {}, 'edges_soft': [], 'edges_hard': [], 'share_a': {}, 'resid_on': {}, 'wedits': {}}
 SQ2 = math.sqrt(2)
 def make(n):
     st = T.site(n); p = P[n]; grp = GROUP.get(n); mult = MULT.get(n)
     layer = int(n.split('.')[1]); router = ROUTER.get(layer)
     if grp is not None:
         tied, own = grp[1] >= 0, grp[1].clamp_min(0)
+    cur = {}
     def emit(coef):
         # A down_proj slice's coefficient on each token (its read times its gate): what it writes.
         if n.endswith('down_proj'):
             state['writers'][layer] = coef
-        return coef @ p['U']
+        y = coef @ p['U']
+        return y + residual(n, cur['x']) if RESID else y
     def fwd(x):
+        cur['x'] = x
         if state['mode'] == 'M':
             return x @ st.W.T
         c = x @ p['V']
@@ -514,6 +538,91 @@ def make_attn(n):
     return fwd
 for n in attn: T.site(n)._forward = make_attn(n)
 
+# Weight edits (DESCENT_WEDITS = edited sequences per training batch): an edit is an additive
+# Delta W = A B^T on one or more of M's maps, defined in M's terms and applied verbatim to both models
+# at every use of the map: M's output W x and P's (its parts plus leftover, which together own W) both
+# gain Delta W x on the edited sequence. state['wedits'][map] lists (sequence, A [d_out, r], B [d_in, r]).
+def with_edits(n, f):
+    def g(x):
+        y = f(x)
+        for b, A_, B_ in state['wedits'].get(n, ()):
+            y = y.index_add(0, torch.tensor([b], device=x.device), ((x[b] @ B_) @ A_.T)[None])
+        return y
+    return g
+plain_forward = {n: T.site(n)._forward for n in site_names()}
+for n in site_names():
+    T.site(n)._forward = with_edits(n, plain_forward[n])
+
+KINDS_ = ('q_proj', 'k_proj', 'v_proj', 'o_proj', 'c_fc', 'down_proj')
+FAMILIES = ('neuron_remove', 'neuron_scale', 'head_remove', 'head_scale', 'head_swap', 'random')
+def site_of(l, k):
+    return f"h.{l}.{'mlp' if k in ('c_fc', 'down_proj') else 'attn'}.{k}"
+
+def draw_edit(g, family):
+    """One weight edit of M, as {map: (A, B)}, from the generator g. Neuron edits act on the neuron's
+    down_proj column (remove: zero it; scale: times 0.5, 2 or 3), head edits on the head's o_proj
+    columns, a head swap puts head h2's q, k, v rows and o columns in head h1's place, and a random edit
+    is A B^T on one map with rank log-uniform from 1 to full and size log-uniform from 5% to 100% of
+    the map's typical output norm."""
+    l = int(g.integers(4)); W = lambda k: T.site(site_of(l, k)).W
+    eye = lambda d, idx: torch.eye(d, device=dev)[:, idx]
+    if family in ('neuron_remove', 'neuron_scale'):
+        j = int(g.integers(W('down_proj').shape[1])); a = -1.0 if family == 'neuron_remove' else float(g.choice([0.5, 2.0, 3.0])) - 1
+        return {site_of(l, 'down_proj'): (a * W('down_proj')[:, j:j + 1], eye(W('down_proj').shape[1], [j]))}
+    nh, hd = T.n_head, T.hd
+    cols = lambda h: list(range(h * hd, (h + 1) * hd))
+    if family in ('head_remove', 'head_scale'):
+        h = int(g.integers(nh)); a = -1.0 if family == 'head_remove' else float(g.choice([0.5, 2.0, 3.0])) - 1
+        return {site_of(l, 'o_proj'): (a * W('o_proj')[:, cols(h)], eye(W('o_proj').shape[1], cols(h)))}
+    if family == 'head_swap':
+        h1, h2 = (int(x) for x in g.choice(nh, 2, replace=False))
+        out = {site_of(l, k): (eye(W(k).shape[0], cols(h1)), (W(k)[cols(h2)] - W(k)[cols(h1)]).T) for k in ('q_proj', 'k_proj', 'v_proj')}
+        out[site_of(l, 'o_proj')] = (W('o_proj')[:, cols(h2)] - W('o_proj')[:, cols(h1)], eye(W('o_proj').shape[1], cols(h1)))
+        return out
+    k = KINDS_[int(g.integers(6))]; n = site_of(l, k); d_out, d_in = W(k).shape
+    r = max(1, int(round(math.exp(g.uniform(0, math.log(min(d_out, d_in)))))))
+    f = math.exp(g.uniform(math.log(0.05), 0.0))
+    xs, ys = TYPICAL[n]
+    c = f * ys / math.sqrt(d_out * r) / xs
+    return {n: (torch.tensor(g.standard_normal((d_out, r)), dtype=torch.float32, device=dev) * math.sqrt(c),
+                torch.tensor(g.standard_normal((d_in, r)), dtype=torch.float32, device=dev) * math.sqrt(c))}
+
+def install(edits):
+    """edits: per sequence of the batch, None or {map: (A, B)}."""
+    state['wedits'] = {}
+    for b, e in enumerate(edits):
+        for n, (A_, B_) in (e or {}).items():
+            state['wedits'].setdefault(n, []).append((b, A_, B_))
+
+N_EDITS = int(os.environ.get('DESCENT_WEDITS', '0'))
+# Held-out weight edits: a fixed set, 4 per held-out sequence (32 in all), families in turn, seed 7.
+_g = np.random.default_rng(7)
+EVAL_EDITS = [(i, FAMILIES[(4 * i + k) % len(FAMILIES)]) for i in range(ev.shape[0]) for k in range(4)]
+EVAL_EDITS = [(i, fam, draw_edit(_g, fam)) for i, fam in EVAL_EDITS]
+
+@torch.no_grad()
+def evaluate_edits():
+    """Held-out weight-edit gaps, KL(M_e || P_e) in bits per token (P hard), per family and per bin of
+    the edit's effect on M, KL(M_e || M): below 0.01, 0.01-0.1, 0.1-1, above 1 bits."""
+    rows = {}
+    for i in range(ev.shape[0]):
+        install([None]); rows[i] = run(ev[i:i + 1], 'M')
+    by_fam, by_bin = {}, {}
+    for j in range(0, len(EVAL_EDITS), 4):
+        chunk = EVAL_EDITS[j:j + 4]
+        ids = torch.cat([ev[i:i + 1] for i, _, _ in chunk])
+        install([e for _, _, e in chunk])
+        lm_e = run(ids, 'M'); lp_e = run(ids, 'hard')
+        gap = kl_bits(lm_e, lp_e).mean(-1); eff = kl_bits(lm_e, torch.cat([rows[i] for i, _, _ in chunk])).mean(-1)
+        for (_, fam, _), g_, f_ in zip(chunk, gap.tolist(), eff.tolist()):
+            by_fam.setdefault(fam, []).append((g_, f_))
+            b_ = '<0.01' if f_ < 0.01 else '0.01-0.1' if f_ < 0.1 else '0.1-1' if f_ < 1 else '>1'
+            by_bin.setdefault(b_, []).append(g_)
+    install([None])
+    return {'gap_mean': float(np.mean([g_ for v in by_fam.values() for g_, _ in v])),
+            'by_family': {k: {'gap': round(float(np.mean([g_ for g_, _ in v])), 4), 'effect': round(float(np.mean([f_ for _, f_ in v])), 4), 'n': len(v)} for k, v in by_fam.items()},
+            'by_effect': {k: {'gap': round(float(np.mean(v)), 4), 'n': len(v)} for k, v in by_bin.items()}}
+
 # Attention gates after attention: a v slice's coefficient c_i(s) on each key position s is mixed by
 # the head's attention pattern into m_i(t) = sum_s a(t, s) c_i(s) at the query position t, and the
 # slice is gated there, on its own post-attention read r_i(t) = |m_i(t)| ||f_i|| (what it delivers to
@@ -558,6 +667,10 @@ def attn_v(l, h, pattern):
             state['soft'].append(soft.sum((1, 3)).reshape(-1))
             g = soft if gate == 'mf' or SHARE_A else hard + soft - soft.detach()
     y = (m * g) @ p['U'][None]                                                 # [B, H, T, HD]
+    for b, A_, B_ in state['wedits'].get(n, ()):
+        # A weight edit of v_proj adds Delta W x to the values, which the pattern mixes like any value.
+        dv = ((h[b] @ B_) @ A_.T).view(T_, NH, HD).transpose(0, 1)               # [H, T, HD]
+        y = y.index_add(0, torch.tensor([b], device=y.device), (pattern[b] @ dv)[None])
     return y.transpose(1, 2).reshape(B_, T_, -1)
 
 plain_hidden = T.hidden
@@ -612,6 +725,22 @@ if attn:
                 SHARE_A[l] = {'cand_v': cand_v, 'cand_o': cand_o, 'L_v': L_v.requires_grad_(), 'L_o': L_o.requires_grad_(),
                               't': A[v]['tau'].detach().clone().requires_grad_(), 's': A[v]['s'].clone()}
         del cap
+
+def residual(n, x):
+    """Map n's residual part on its input x: R = W^T - V U (or its posterior sample), gated on ||x R||."""
+    R = RES[n]['sample'] if RES[n].get('sample') is not None else T.site(n).W.T - P[n]['V'] @ P[n]['U']
+    out = x @ R
+    if state['mode'] == 'all':
+        return out
+    z = (out.norm(dim=-1) - RES[n]['tau']) / RES[n]['s']
+    hard = (z > 0).float()
+    state['hard'].append(hard.reshape(-1) * RES[n]['rank'])
+    state['resid_on'].setdefault(n, []).append(hard.mean().item())
+    if state['mode'] == 'hard':
+        return out * hard[..., None]
+    phi = 0.5 * (1 + torch.erf(z / SQ2))
+    state['soft'].append(phi.reshape(-1) * RES[n]['rank'])
+    return out * phi[..., None]
 
 def kl_bits(lm, lp):
     pm = F.log_softmax(lm.float(), -1); pp = F.log_softmax(lp.float(), -1)
@@ -694,6 +823,8 @@ def evaluate(final=False):
     for n in attn:
         A[n]['V'], A[n]['U'] = head_frame(A[n]['F'], T.site(n).W, A[n]['o'])
     state['collect'] = {} if SHARE else None
+    state['resid_on'] = {}
+    install([None])
     r = {'kl': [], 'kl_soft': [], 'kl_all_on': [], 'active': [], 'active_soft': [], 'per_map': [], 'edges_on': [], 'edges_on_soft': []}
     graph = None
     for i in range(0, ev.shape[0], 4):
@@ -713,6 +844,12 @@ def evaluate(final=False):
         lp = run(ids, 'all'); r['kl_all_on'].append(kl_bits(lm, lp).mean().item())
     out = {k: float(np.mean(v)) for k, v in r.items() if k != 'per_map' and v}
     out['per_map'] = [round(float(x), 2) for x in np.mean(r['per_map'], 0)]
+    if RES:
+        out['residual'] = {n: {'norm_rel_W': round(((T.site(n).W.T - P[n]['V'] @ P[n]['U']).norm() / T.site(n).W.norm()).item(), 4),
+                               'fires': round(float(np.mean(state['resid_on'].get(n, [0.0]))), 4)} for n in mlp}
+        if FMODE:
+            out['residual_bits'] = residual_bits()
+    state['resid_on'] = {}
     if EDGES:
         # Kept edges per layer, and the distribution of each reader part's inputs (its kept edges).
         out['edges'] = {}
@@ -790,6 +927,9 @@ else:
     groups = [{'params': [cont[key]], 'lr': LR * 3e-3 * scale} for cont, key, scale in slots]
 # Edge gates by 0.01 per step (from the start's 3, 300 steps to drop an edge the data never defends).
 groups += [{'params': [E['eta']], 'lr': LR * 1e-2} for E in EDGE.values()]
+groups += [{'params': [Rn['tau']], 'lr': LR * 0.1 * Rn['s'].item()} for Rn in RES.values()]
+if FMODE:
+    groups += [{'params': [Rn['ls']], 'lr': LR * 1e-2} for Rn in RES.values()]
 opt = torch.optim.Adam(groups)
 trainable = [q for g in groups for q in g['params']]
 
@@ -798,6 +938,10 @@ def draw(mean):
     map's reads and writes from its frame."""
     for cont, key, mu, ls in leaves:
         cont[key] = mu if mean else mu + ls.exp() * torch.randn_like(mu)
+    for n, Rn in RES.items():
+        mu_R = T.site(n).W.T - P[n]['V'] @ P[n]['U']
+        Rn['mean'] = mu_R
+        Rn['sample'] = mu_R if mean or not FMODE else mu_R + Rn['ls'].exp() * torch.randn_like(mu_R)
     if EXACT:
         for n in mlp:
             if not (NEURON_DOWN and n.endswith('down_proj')):
@@ -811,6 +955,18 @@ def description_bits():
     for _, _, mu, ls in leaves:
         v = (mu.pow(2) + (2 * ls).exp()).mean()
         total = total + 0.5 * (mu.numel() * torch.log(v) - 2 * ls.sum())
+    for Rn in RES.values():
+        # The residual's entries under their own prior group N(0, v_R), posterior N(R, sigma_R^2).
+        v = (Rn['mean'].pow(2) + (2 * Rn['ls']).exp()).mean()
+        total = total + 0.5 * (Rn['mean'].numel() * torch.log(v) - 2 * Rn['ls'].sum())
+    return total / math.log(2)
+
+def residual_bits():
+    """The residual parts' share of the description, in bits (F only)."""
+    total = 0.0
+    for Rn in RES.values():
+        v = (Rn['mean'].pow(2) + (2 * Rn['ls']).exp()).mean()
+        total += 0.5 * (Rn['mean'].numel() * torch.log(v) - 2 * Rn['ls'].sum()).item()
     return total / math.log(2)
 # The budget's multiplier (library_mdl's rule, Settings::budget): the step descends KL + lam (E[k] - K),
 # then lam <- max(0, lam + eta (E[k] - K)) with eta = lam_hat / (K B), lam_hat = |<g_F, g_k>| / |g_k|^2
@@ -832,16 +988,21 @@ def save(step):
                     'tied': {dn: (fc, own.cpu()) for dn, (fc, own) in GROUP.items()}}, os.environ['DESCENT_SAVE'])
 
 draw(True)
-e = evaluate(); print('start', e, flush=True); log['trace'].append({'step': 0, **e}); save(0)
+e = evaluate(); e['weight_edits'] = evaluate_edits(); print('start', e, flush=True); log['trace'].append({'step': 0, **e}); save(0)
+g_edits = np.random.default_rng(11)
+step_seconds = []
 t0 = time.time()
 for step in range(steps):
     rows = rng.integers(0, train_rows, batch); rows = np.where(rows >= 1024, rows + 8, rows); offs = rng.integers(0, 513 - seq, batch)
     ids = torch.tensor(np.stack([tok[r, o:o + seq] for r, o in zip(rows, offs)]).astype(np.int64), device=dev)
+    t_step = time.time()
+    install([draw_edit(g_edits, FAMILIES[(step * N_EDITS + b) % len(FAMILIES)]) if b < N_EDITS else None for b in range(batch)])
     with torch.no_grad():
         lm = run(ids, 'M')
     draw(False)
     lp = run(ids, 'soft')
-    kl = kl_bits(lm, lp).mean()
+    kl_seq = kl_bits(lm, lp).mean(-1)
+    kl = kl_seq.mean()
     # The objective's data and description terms (F; without DESCENT_F only the data term).
     desc = description_bits() if FMODE else torch.zeros((), device=dev)
     # Each kept edge's index bits, at the expected gates.
@@ -876,10 +1037,17 @@ for step in range(steps):
         opt.step()
         if square > 0:
             lam = max(0.0, lam + abs(along) / square / (Kt * B) * (ek.item() - Kt))
+    if dev == 'cuda':
+        torch.cuda.synchronize()
+    step_seconds.append(time.time() - t_step)
     last = step == steps - 1 or time.time() - t0 > LIMIT
     if (step + 1) % EVAL == 0 or last:
         draw(True)
         e = evaluate(final=last)
+        e['weight_edits'] = evaluate_edits()
+        e['step_seconds'] = float(np.mean(step_seconds)) if step_seconds else None
+        e['train_kl_edited'] = float(kl_seq[:N_EDITS].mean()) if N_EDITS else None
+        step_seconds = []
         rec = {'step': step + 1, 'lambda': lam, 'K_t': Kt, 'train_kl': kl.item(), 'description_bits': desc.item(), 'train_edge_bits': float(edge_bits),
                'train_F': objective.item(), 'train_k_soft': ek.item(), 'train_k_hard': hk, **e,
                'seconds': time.time() - t0}
