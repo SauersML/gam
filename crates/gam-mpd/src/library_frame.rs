@@ -163,6 +163,34 @@ impl Frame {
     }
 }
 
+/// The gates a component of the shared arm may move to, its own first (library_vpd's gate sharing;
+/// as descent's share arm, d6ad2537cb).
+const CANDIDATES: usize = 8;
+
+/// Per component of a stage (the columns of `magnitudes`, its read's magnitude on each fitting row),
+/// its candidate gates for the shared arm: the `CANDIDATES − 1` other components of the stage whose
+/// read magnitudes are most correlated with its own over the rows (the components likeliest to fire
+/// together), as indices from `first`, the stage's first component in the arm.
+fn candidates(magnitudes: &Array2<f64>, first: usize) -> Vec<Vec<usize>> {
+    let n = magnitudes.nrows().max(1) as f64;
+    let mut z = magnitudes.clone();
+    for mut column in z.columns_mut() {
+        let mean = column.sum() / n;
+        column.mapv_inplace(|v| v - mean);
+        let sd = (column.dot(&column) / n).sqrt();
+        column.mapv_inplace(|v| if sd > 0.0 { v / sd } else { 0.0 });
+    }
+    let correlation = fast_ata(&z);
+    (0..z.ncols())
+        .map(|b| {
+            let mut others: Vec<usize> = (0..z.ncols()).filter(|j| *j != b).collect();
+            others.sort_by(|i, j| correlation[[b, *j]].total_cmp(&correlation[[b, *i]]).then(i.cmp(j)));
+            others.truncate(CANDIDATES - 1);
+            others.into_iter().map(|j| first + j).collect()
+        })
+        .collect()
+}
+
 /// One component of a start file, as library_vpd reads it: its read, `τ = 0`, its gate's width
 /// and its slices.
 fn component(read: Value, width: f64, slices: &[[usize; 2]]) -> Value {
@@ -248,6 +276,9 @@ pub fn frame_start(native: &OperatorProgram, layers: &[LayerNodes], fitting: &Fa
         std::fs::create_dir_all(&out).map_err(error)?;
         let (mut sites, mut files) = (Vec::new(), serde_json::Map::new());
         let (mut own, mut direction) = (Vec::new(), Vec::new());
+        // The shared arm's candidates: per shareable stage (the attention's input, the MLP's
+        // input) its components' candidate gates, by their index in `own`.
+        let mut shared: Vec<(usize, Vec<usize>)> = Vec::new();
         for (l, layer) in layers.iter().enumerate() {
             let site = |k: usize| KINDS.len() * l + k;
             let heads = layer.reads.len();
@@ -333,6 +364,8 @@ pub fn frame_start(native: &OperatorProgram, layers: &[LayerNodes], fitting: &Fa
             // The components, per site group, own and direction; each gate's width is its read's
             // spread on the fitting rows (a direction is written in those units, width 1).
             if let (Some(frame), Some(dual)) = (&attention_frame, &attention_dual) {
+                let first = own.len();
+                shared.extend(candidates(&x.dot(&dual.t()).mapv(f64::abs), first).into_iter().enumerate().map(|(i, c)| (first + i, c)));
                 for i in 0..frame.atoms.nrows() {
                     let slices = [[site(0), i], [site(1), i], [site(2), i]];
                     own.push(component(json!({"own": [site(0), i]}), own_width(&x, dual.row(i), 3.0), &slices));
@@ -348,6 +381,8 @@ pub fn frame_start(native: &OperatorProgram, layers: &[LayerNodes], fitting: &Fa
             // A zero MLP has no component (library_vpd adds zero for it).
             if let Some((ups, downs, Some((up_dual, down_dual)))) = &mlp {
                 let hidden = value(layer.active)?;
+                let first = own.len();
+                shared.extend(candidates(&h2.dot(&up_dual.t()).mapv(f64::abs), first).into_iter().enumerate().map(|(i, c)| (first + i, c)));
                 for i in 0..*ups {
                     own.push(component(json!({"own": [site(4), i]}), own_width(&h2, up_dual.row(i), 1.0), &[[site(4), i]]));
                     direction.push(component(direction_read(&h2, up_dual.row(i), site(4)), 1.0, &[[site(4), i]]));
@@ -357,6 +392,8 @@ pub fn frame_start(native: &OperatorProgram, layers: &[LayerNodes], fitting: &Fa
                     direction.push(component(direction_read(&hidden, down_dual.row(i), site(5)), 1.0, &[[site(5), i]]));
                 }
             } else if let Some((m, _, None)) = &mlp {
+                let first = own.len();
+                shared.extend(candidates(&h2.dot(&up.t()).mapv(f64::abs), first).into_iter().enumerate().map(|(i, c)| (first + i, c)));
                 for n in 0..*m {
                     let slices = [[site(4), n], [site(5), n]];
                     own.push(component(json!({"own": [site(4), n]}), own_width(&h2, up.row(n), 1.0), &slices));
@@ -375,7 +412,13 @@ pub fn frame_start(native: &OperatorProgram, layers: &[LayerNodes], fitting: &Fa
         }
         let record = json!({"config": {"sites": sites, "frame": name, "redundancy": REDUNDANCY, "seed": seed}, "files": files});
         std::fs::write(out.join("export.json"), record.to_string()).map_err(error)?;
-        let arms = json!([{"arm": "frame_own", "components": own}, {"arm": "frame_direction", "components": direction}]);
+        // The shared arm: the own arm with candidates at the stages where components can share
+        // gates (library_vpd builds those stages shared; the o and down stages keep own gates).
+        let mut own_shared = own.clone();
+        for (b, c) in shared {
+            own_shared[b]["candidates"] = json!(c);
+        }
+        let arms = json!([{"arm": "frame_own", "components": own}, {"arm": "frame_direction", "components": direction}, {"arm": "frame_own_shared", "components": own_shared}]);
         std::fs::write(out.join("start.json"), arms.to_string()).map_err(error)?;
         summary.push(json!({"frame": name, "components": own.len(), "sites": sites.len(), "fitting_rows": fitting.rows}));
     }
