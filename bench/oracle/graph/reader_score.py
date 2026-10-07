@@ -359,6 +359,7 @@ class Scorer:
         shared = target.lower().startswith("qwen3") and "qwen3" in backend.model_id.lower()
         self.prompter = Prompter(backend.tokenizer, shared, answer)
         self.memo: dict[tuple[str, str], float] = {}
+        self.rest: dict[tuple[str, str], float] = {}  # the reader's q(other) per (text, item), for diagnosis
         self._vocab = None
 
     def vocabulary(self):
@@ -441,6 +442,7 @@ class Scorer:
                         q = disjoint(cands[b], list(np.exp(first[b])))
                     p = np.array([c["p"] for c in it["candidates"]], dtype=np.float64)
                     self.memo[self.key(texts[a], it)] = kl_bits(p, float(it["other"]), q)
+                    self.rest[self.key(texts[a], it)] = max(0.0, 1.0 - float(q.sum()))
         for a, text in enumerate(texts):
             for b, it in enumerate(items):
                 out[a, b] = self.memo[self.key(text, it)]
@@ -459,7 +461,8 @@ class Scorer:
             r = {"id": prog.get("id"), "valid": prog.get("valid", True), "N": N, "items": len(items), "reader_error_bits": N * float(b.mean()),
                  "mean_bits_per_item": float(b.mean()), "sum_bits": float(b.sum()),
                  "per_family": {f: float(np.mean([b[j] for j, it in enumerate(items) if it.get("family", "all") == f])) for f in fams},
-                 "per_item": [round(float(x), 6) for x in b]}
+                 "per_item": [round(float(x), 6) for x in b],
+                 "per_item_q_other": [round(self.rest.get(self.key(texts[i], it), float("nan")), 6) for it in items]}
             if baselines:
                 empty, code = bits[len(texts)], bits[len(texts) + 1 + i]
                 r["empty_mean_bits_per_item"] = float(empty.mean())
