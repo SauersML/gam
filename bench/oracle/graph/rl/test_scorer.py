@@ -16,7 +16,7 @@ calls = []
 
 
 class Checker:
-    def __init__(self, model):
+    def __init__(self, model, export=None, memory_gib=None):
         self.model, self.path = model, None
 
     def request(self, message):
@@ -36,6 +36,11 @@ def main():
     assert [r["total_bits"] for r in out] == [i + 1 + i % 2 for i in range(16)]
     assert [r["behavior"] for r in out] == [f"b{i % 4}" for i in range(16)]
     assert sorted(calls) == sorted({(f"b{i % 4}", 1 + i % 2, 4) for i in range(16)}), calls
+    calls.clear()
+    scorer.BATCH = 3  # a request holds at most BATCH programs
+    assert [r["total_bits"] for r in scorer.checker(items)] == [i + 1 + i % 2 for i in range(16)]
+    assert sorted(n for _, _, n in calls) == [1] * 4 + [3] * 4, calls
+    scorer.BATCH = 4
     check_repair()
     check_evaluate()
     check_sft_examples()

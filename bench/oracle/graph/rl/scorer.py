@@ -43,6 +43,8 @@ def mock(items: list[dict]) -> list[dict]:
 _CHECKERS = {}
 WORKERS = 1
 EXPORT = None
+BATCH = 4  # programs per score request (vpd4l: 11 programs of 16 experiments passed a 20 GiB lease on the Mac)
+MEMORY_GIB = None  # the checker server's lease (score.py's default when None)
 
 
 def checker(items: list[dict]) -> list[dict]:
@@ -66,7 +68,7 @@ def checker(items: list[dict]) -> list[dict]:
     def run(w: int, model: str, path: str, ks: list[int]):
         c = _CHECKERS.get((model, w))
         if c is None:
-            c = _CHECKERS[(model, w)] = score.Checker(model, EXPORT) if EXPORT else score.Checker(model)
+            c = _CHECKERS[(model, w)] = score.Checker(model, EXPORT, memory_gib=MEMORY_GIB)
             c.loaded = None
         if c.loaded != path:
             load_behavior(c, path)
@@ -77,8 +79,10 @@ def checker(items: list[dict]) -> list[dict]:
         for seed, uniform, experiments, options in sorted({key(k) for k in ks}):  # one batch request per seed: M once per experiment, the programs in parallel
             batch = [k for k in ks if key(k) == (seed, uniform, experiments, options)]
             extra = {"options": json.loads(options)} if json.loads(options) else {}
-            for k, r in zip(batch, c.score_batch([items[k]["source"] for k in batch], experiments=experiments, seed=seed, uniform_seeds=uniform or None, **extra)):
-                out[k] = r
+            for s in range(0, len(batch), BATCH):  # a server's memory grows with the programs of one request
+                chunk = batch[s : s + BATCH]
+                for k, r in zip(chunk, c.score_batch([items[k]["source"] for k in chunk], experiments=experiments, seed=seed, uniform_seeds=uniform or None, **extra)):
+                    out[k] = r
 
     per_worker = [[] for _ in range(WORKERS)]
     for g, (key, ks) in enumerate(groups.items()):

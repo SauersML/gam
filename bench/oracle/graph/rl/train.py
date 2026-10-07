@@ -546,7 +546,8 @@ def rescore(args, score) -> dict:
     """Every program of earlier evaluations (--samples-from eval_samples.jsonl files) scored again under
     --eval-seed / --eval-experiments and --score-options (extra checker request keys, e.g. held-out
     experiment families or resampled counterfactuals once the checker offers them), summarized as in
-    evaluate. Writes RUN/rescore_<tag>.jsonl (every program) and RUN/rescore_<tag>_summary.jsonl."""
+    evaluate. Writes RUN/rescore_<tag>.jsonl one behavior at a time, so a rerun resumes after the
+    behaviors already scored, and RUN/rescore_<tag>_summary.jsonl."""
     rows = [json.loads(line) for path in args.samples_from for line in open(os.path.expanduser(path))]
     options = json.loads(args.score_options) if args.score_options else None
     behaviors_by_path = {}
@@ -556,17 +557,27 @@ def rescore(args, score) -> dict:
             if not path.is_file():  # written on another machine (a pod): the same behavior file here
                 path = Path(args.behaviors) / args.model / f"{r['behavior']}.json"
             behaviors_by_path[r["behavior_path"]] = {**json.loads(path.read_text()), "path": str(path)}
-    scores = score([{"source": r["source"], "behavior": behaviors_by_path[r["behavior_path"]], "seed": args.eval_seed, "experiments": args.eval_experiments, "options": options} for r in rows])
     out = Path(args.out)
-    with open(out / f"rescore_{args.rescore_tag}.jsonl", "w") as f:
-        for r, x in zip(rows, scores):
-            f.write(json.dumps({**r, "score_before": r["score"], "score": x, "options": options, "seed": args.eval_seed, "experiments": args.eval_experiments}) + "\n")
+    done_path = out / f"rescore_{args.rescore_tag}.jsonl"
+    key = lambda r: (r["run"], r["step"], r["set"], r["behavior"], r["program"], r["source"])  # noqa: E731
+    done = {key(r): r for r in map(json.loads, open(done_path))} if done_path.exists() else {}
+    for bpath in sorted(behaviors_by_path, key=str):
+        todo = [r for r in rows if r["behavior_path"] == bpath and key(r) not in done]
+        if not todo:
+            continue
+        scores = score([{"source": r["source"], "behavior": behaviors_by_path[bpath], "seed": args.eval_seed, "experiments": args.eval_experiments, "options": options} for r in todo])
+        with open(done_path, "a") as f:
+            for r, x in zip(todo, scores):
+                rec = {**r, "score_before": r["score"], "score": x, "options": options, "seed": args.eval_seed, "experiments": args.eval_experiments}
+                f.write(json.dumps(rec) + "\n")
+                done[key(r)] = rec
     summary = {}
     log = open(out / f"rescore_{args.rescore_tag}_summary.jsonl", "w")
     for name in sorted({r["set"] for r in rows}):
         groups = {}
-        for r, x in zip(rows, scores):
+        for r in rows:
             if r["set"] == name:
+                x = done[key(r)]["score"]
                 g = groups.setdefault((r["run"], r["step"], r["behavior_path"]), (behaviors_by_path[r["behavior_path"]], [], {}))
                 (g[1].append((r["source"], x)) if r["program"] == "oracle" else g[2].__setitem__(r["program"], x))
         summary[name] = summarize(name, -1, [g for g in groups.values() if g[1]], log)
@@ -584,6 +595,7 @@ def main():
     ap.add_argument("--scorer", choices=sorted(SCORERS), default="checker")
     ap.add_argument("--score-workers", type=int, default=1, help="checker servers per target model, each scoring whole behaviors in parallel")
     ap.add_argument("--checker", help="the checker binary (mpd_graph_2951; score.py's GRAPH_CHECKER); on MATS name target/release/examples/mpd_graph_2951 so the job builds it")
+    ap.add_argument("--checker-gib", type=int, help="the checker server's memory lease on the Mac (score.py's default otherwise)")
     ap.add_argument("--export", help="the target model's export directory for the checker (score.py's EXPORTS entry otherwise)")
     ap.add_argument("--out", required=True)
     ap.add_argument("--steps", type=int, default=1)
@@ -634,7 +646,7 @@ def main():
     if args.mode == "rescore":  # no policy: scores saved programs again
         if args.checker:
             os.environ["GRAPH_CHECKER"] = str(Path(args.checker).resolve())
-        scorer.WORKERS, scorer.EXPORT = args.score_workers, args.export
+        scorer.WORKERS, scorer.EXPORT, scorer.MEMORY_GIB = args.score_workers, args.export, args.checker_gib
         print(json.dumps(rescore(args, SCORERS[args.scorer])))
         return
     use_vllm = args.sampler == "vllm" or (args.sampler == "auto" and torch.cuda.is_available() and __import__("importlib").util.find_spec("vllm") is not None)
@@ -651,7 +663,7 @@ def main():
     if args.checker:
         os.environ["GRAPH_CHECKER"] = str(Path(args.checker).resolve())
     score = SCORERS[args.scorer]
-    scorer.WORKERS, scorer.EXPORT = args.score_workers, args.export
+    scorer.WORKERS, scorer.EXPORT, scorer.MEMORY_GIB = args.score_workers, args.export, args.checker_gib
     root = Path(args.behaviors)
     pool, heldout_prompts = split_prompts(behaviors(root, args.model, "train"), args.prompt_holdout, out / "behaviors")
     sets = {"heldout_behaviors": behaviors(root, args.model, "heldout"), "heldout_prompts": heldout_prompts}
