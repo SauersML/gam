@@ -3773,6 +3773,12 @@ pub fn fit_from(
             let posterior_seconds = posterior_started.elapsed().as_secs_f64();
             let (eta, rho, draws_averaged, ratio) = device_posterior.step_state();
             log::info!("library line step {epoch}.{b}: η {eta:.4e}, ρ̄ {rho:.4e} over {draws_averaged} draws, r̄ {ratio:.4e}; posterior step {posterior_seconds:.3} s");
+            // A nonfinite step state is a failed step: it fails here, at the step that made it,
+            // never later as a null in a checkpoint record (toys' TMS-id fit ran on with ρ̄ NaN for
+            // epochs while its mean's KL went from 4e-4 to 2e182).
+            if !(eta.is_finite() && rho.is_finite() && ratio.is_finite() && progress.multiplier.is_finite()) {
+                return Err(format!("step {epoch}.{b}: nonfinite step state (η {eta}, ρ̄ {rho}, r̄ {ratio}, λ {})", progress.multiplier));
+            }
             let prior_note = if prior.is_some() { format!(" (prior: {prior_seconds:.3} s)") } else { String::new() };
             log::info!("library step {epoch}.{b}: data {:.6} bits per scored token at the iterate's samples, {:.2} s{prior_note}{parts_note}", bits.iter().flatten().sum::<f64>() / scored as f64, step_started.elapsed().as_secs_f64());
         }
@@ -3827,6 +3833,12 @@ pub fn fit_from(
         log::info!("library fit epoch {epoch}: {record:?}");
         let (log_sd, magnitude, variances) = posterior.spread();
         log::info!("library posterior after epoch {epoch}: mean ln σ {log_sd:.5}, mean |μ| {magnitude:.6e}, Σ v_G {variances:.6e}");
+        // Nothing nonfinite is checkpointed: the epoch fails at its record instead.
+        let held = &record.held_out;
+        let values = [record.data_bits, record.snapshot_bits, held.objective_bits_per_token, held.data_bits_per_token, held.mean_bits_per_token, held.rounded_bits_per_token, held.divergence_bits, log_sd, magnitude, variances];
+        if values.iter().any(|v| !v.is_finite()) {
+            return Err(format!("epoch {epoch}: nonfinite record (data, snapshot, held-out F, data, mean, rounded, divergence, mean ln σ, mean |μ|, Σ v_G: {values:?})"));
+        }
         progress.epochs.push(record);
         progress.previous = Some(snapshot);
         progress.epoch += 1;
