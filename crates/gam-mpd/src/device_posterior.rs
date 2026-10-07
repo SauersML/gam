@@ -131,6 +131,8 @@ pub struct DevicePosterior {
     slope: (f64, f64),
     slope_steps: u64,
     last_eta: f64,
+    /// The trust factor on the line step's length ([`DevicePosterior::trust_update`]), in `(0, 1]`.
+    trust: f64,
     hold: bool,
     /// Per group `(n, Σ μ² + σ², Σ 2s)` being summed, its variance, its divergence in nats with
     /// its variance's scale bits (groups × 2), and its reference variance when its code has a scale
@@ -184,6 +186,8 @@ struct Pending {
     means: Vec<Tensor>,
     averages: Vec<Tensor>,
     divergence_nats: f64,
+    /// The quadratic model's predicted decrease of `F` per token for the move, in nats.
+    predicted: f64,
 }
 
 /// Each trainable operator's entries' groups, row-major.
@@ -339,6 +343,7 @@ impl DevicePosterior {
             slope: (0.0, 0.0),
             slope_steps: 0,
             last_eta: 0.0,
+            trust: 1.0,
             hold: false,
             operators: parts.operators.to_vec(),
             fitting: fitting.clone(),
@@ -605,8 +610,10 @@ impl DevicePosterior {
             }
             let (slope, curvature) = (self.slope_ratio() * (diagonal + prior_curvature), self.rho * diagonal + prior_curvature);
             let held = self.hold || self.rho_steps < RATIO_DRAWS || self.slope_steps < RATIO_DRAWS;
-            let eta = if held || !(curvature > 0.0 && slope.is_finite()) { 0.0 } else { slope / curvature };
+            let eta = if held || !(curvature > 0.0 && slope.is_finite()) { 0.0 } else { self.trust * slope / curvature };
             self.last_eta = eta;
+            // The model's decrease of `F` per token for the move `−η d`: `η slope − ½ η² curvature`.
+            let predicted = eta * slope - 0.5 * eta * eta * curvature;
             // The move is kept until the next batch tests it (`pending`): the iterate and average
             // before it, and the prior's divergence at the iterate before and after it (per group
             // `Σ μ²` over `2 v_G`; the deviations are the move's own on both sides).
@@ -615,7 +622,7 @@ impl DevicePosterior {
                 let means = self.mean.iter().map(|m| self.fitting.copy(m)).collect::<Result<Vec<_>, _>>().map_err(error)?;
                 let averages = self.average.iter().map(|m| self.fitting.copy(m)).collect::<Result<Vec<_>, _>>().map_err(error)?;
                 let before = self.iterate_divergence()?;
-                self.pending = Some(Pending { means, averages, divergence_nats: -before });
+                self.pending = Some(Pending { means, averages, divergence_nats: -before, predicted });
             }
             // The mean moved by `η d`, its Polyak average (uniform over the steps since the posterior
             // was set, then over about one epoch; module note) moved toward it, and the groups'
@@ -648,6 +655,35 @@ impl DevicePosterior {
         let (sums, variances) = (self.wide.download(&sums).map_err(error)?, self.variances()?);
         // Column 1 is `Σ μ² + σ²`; the deviations are the same on both sides of a move.
         Ok(sums.column(1).iter().zip(&variances).map(|(s, v)| if *v > 0.0 { s / (2.0 * v) } else { 0.0 }).sum())
+    }
+
+    /// The pending move's predicted decrease of `F` per token (nats), from the line step's model.
+    #[must_use]
+    pub fn pending_predicted(&self) -> Option<f64> {
+        self.pending.as_ref().map(|p| p.predicted)
+    }
+
+    /// The trust region's ratio test on a tested move: `ratio` is the measured decrease of the
+    /// objective over the model's prediction. Where the model overstated the gain (`ratio < ¼`,
+    /// a rise included) the factor on the step's length falls to a quarter; where it held
+    /// (`ratio > ¾`) it doubles, up to one, the model's own length. A move whose measured change
+    /// is within its standard error says nothing and leaves it. The trust factor starts at one
+    /// and is not checkpointed. A line step from averaged ratios can overshoot when the curvature
+    /// jumps: on vpd4l grouped direction gates (decomp-vpd4l-h, 591bb575c2) η rose from about
+    /// 2e-4 to 3.7e-2 in the third epoch and the epoch diverged (clean KL 3.67 → 8.54) despite 511
+    /// rejected moves.
+    pub fn trust_update(&mut self, ratio: f64) {
+        if ratio < 0.25 {
+            self.trust *= 0.25;
+        } else if ratio > 0.75 {
+            self.trust = (2.0 * self.trust).min(1.0);
+        }
+    }
+
+    /// The trust factor on the line step's length.
+    #[must_use]
+    pub fn trust(&self) -> f64 {
+        self.trust
     }
 
     /// Whether the last step's move awaits its test, and that move's change of the prior's

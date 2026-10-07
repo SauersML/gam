@@ -4479,7 +4479,12 @@ pub fn fit_from(
             if device_posterior.pending_divergence().is_some() {
                 let new = (bits.as_slice(), budget.as_ref().map(|(_, (expected, _))| *expected));
                 let lambda = progress.multiplier;
+                let predicted = device_posterior.pending_predicted().unwrap_or(0.0);
                 let (accepted, change, standard_error) = step_accepted(&mut scorer, &device_posterior, explanation, &posterior.active, (&batch, &experiments, key), new, all_on.as_ref(), (scale, tokens, lambda))?;
+                // The trust region's ratio test, on a change resolved beyond its standard error.
+                if predicted > 0.0 && change.abs() > standard_error {
+                    device_posterior.trust_update(-change / predicted);
+                }
                 if accepted {
                     device_posterior.accept();
                     scorer.accept_assignments();
@@ -4595,7 +4600,7 @@ pub fn fit_from(
             scorer.step_assignments(weight * LN_2);
             let posterior_seconds = posterior_started.elapsed().as_secs_f64();
             let (eta, rho, draws_averaged, ratio) = device_posterior.step_state();
-            log::info!("library line step {epoch}.{b}: η {eta:.4e}, ρ̄ {rho:.4e} over {draws_averaged} draws, r̄ {ratio:.4e}; posterior step {posterior_seconds:.3} s");
+            log::info!("library line step {epoch}.{b}: η {eta:.4e}, ρ̄ {rho:.4e} over {draws_averaged} draws, r̄ {ratio:.4e}, trust {:.3e}; posterior step {posterior_seconds:.3} s", device_posterior.trust());
             // A nonfinite step state is a failed step: it fails here, at the step that made it,
             // never later as a null in a checkpoint record (toys' TMS-id fit ran on with ρ̄ NaN for
             // epochs while its mean's KL went from 4e-4 to 2e182).
