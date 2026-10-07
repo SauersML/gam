@@ -323,7 +323,7 @@ pub struct Artifact {
 /// At its site the native block is `L₁ ⋯ L_n · B · R₁ ⋯ R_m` ([`Artifact::native_block`]): `B` the
 /// block (transposed where `transposed`), `L` and `R` the site's own factors, each one of `P`'s
 /// operators by name. A 1 × 1 factor is a scalar; a transposed block's factors are scalars.
-#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Owner {
     /// `P`'s operator (by name) and the block of its entries.
     pub operator: String,
@@ -353,6 +353,30 @@ pub struct Owner {
     /// output node as a term on the input node (`weight_edit`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uses: Option<(usize, usize)>,
+}
+
+/// The derived debug form, with `uses` only where set: an explanation's identity hashes its owners'
+/// debug form (`library_mdl::explanation_identity`), which stays what it was for owners without one.
+impl std::fmt::Debug for Owner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut out = f.debug_struct("Owner");
+        out.field("operator", &self.operator)
+            .field("rows", &self.rows)
+            .field("cols", &self.cols)
+            .field("body", &self.body)
+            .field("site", &self.site)
+            .field("native", &self.native)
+            .field("native_rows", &self.native_rows)
+            .field("native_cols", &self.native_cols)
+            .field("role", &self.role)
+            .field("left", &self.left)
+            .field("right", &self.right)
+            .field("transposed", &self.transposed);
+        if let Some(uses) = &self.uses {
+            out.field("uses", uses);
+        }
+        out.finish()
+    }
 }
 
 impl Owner {
