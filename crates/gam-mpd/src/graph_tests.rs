@@ -442,3 +442,44 @@ fn vpd_attention_view_reads_queries_keys_values_through_its_edges() {
     mixed.nodes.push(NodeIr { id: "h".into(), pieces: vec![piece(1, "native", "head", Some(Index::One(0)))], rule: None });
     assert!(Graph::parse(&mixed, &weights).is_err(), "heads and VPD subcomponents of one attention");
 }
+
+#[test]
+fn library_parts_resolve_to_their_vpd_subcomponents() {
+    let f = fixture("graph_library");
+    let library = Library::new(&f.device, &f.device, &f.native, &f.layers, &f.artifact, 1 << 28, 64).expect("library");
+    let mut weights = Weights::of(&library);
+    let vpd = exact_vpd(&weights);
+    weights.vpd.insert(1, vpd);
+    let lw = &weights.layers[1];
+    let width: usize = lw.heads.iter().map(|h| h.query.nrows()).sum();
+    let wo = ndarray::concatenate(ndarray::Axis(1), &lw.heads.iter().map(|h| h.output.view()).collect::<Vec<_>>()).expect("hstack");
+    let eye_in = |rows: usize, w: ndarray::Array2<f64>| (ndarray::Array2::eye(rows), w);
+    let stack = |m: &dyn Fn(&crate::graph::HeadWeights) -> ndarray::Array2<f64>| ndarray::concatenate(ndarray::Axis(0), &lw.heads.iter().map(m).collect::<Vec<_>>().iter().map(|a| a.view()).collect::<Vec<_>>()).expect("stack").t().to_owned();
+    let attention = crate::graph::VpdAttention { q: eye_in(width, stack(&|h| h.query.clone())), k: eye_in(width, stack(&|h| h.key.clone())), v: eye_in(width, stack(&|h| h.value.clone())), o: (wo.t().to_owned(), ndarray::Array2::eye(width)) };
+    weights.vpd_attention.insert(1, attention);
+    // Layer 1: attention part 0 = every q, k, v subcomponent, part 1 = every o one; MLP part 0 = c_fc, part 1 = down_proj.
+    let slices = |site: usize, n: usize| (0..n).map(|i| serde_json::json!([site, i])).collect::<Vec<_>>();
+    let qkv: Vec<_> = [6, 7, 8].iter().flat_map(|&s| slices(s, width)).collect();
+    let start = serde_json::json!([{"arm": "test", "components": [{"slices": qkv}, {"slices": slices(9, width)}, {"slices": slices(10, 16)}, {"slices": slices(11, 16)}]}]);
+    let path = std::env::temp_dir().join(format!("gam_mpd_graph_library_{}.json", std::process::id()));
+    std::fs::write(&path, start.to_string()).expect("write");
+    assert_eq!(weights.attach_library(&path, "test").expect("attach"), 4);
+    let piece = |view: &str, kind: &str, index: Index| PieceIr { view: view.into(), layer: 1, kind: kind.into(), index: Some(index) };
+    let node = |id: &str, pieces: Vec<PieceIr>| NodeIr { id: id.into(), pieces, rule: None };
+    let all = |n: usize| Index::Many((0..n).collect());
+    let lib = Program { model: "tiny".into(), valid: true, nodes: vec![node("QKV", vec![piece("library", "attn", Index::One(0))]), node("O", vec![piece("library", "attn", Index::One(1))]), node("F", vec![piece("library", "mlp", Index::One(0))]), node("D", vec![piece("library", "mlp", Index::One(1))])], ..Program::default() };
+    let vpd = Program {
+        nodes: vec![
+            node("QKV", vec![piece("vpd", "q_proj", all(width)), piece("vpd", "k_proj", all(width)), piece("vpd", "v_proj", all(width))]),
+            node("O", vec![piece("vpd", "o_proj", all(width))]),
+            node("F", vec![piece("vpd", "c_fc", all(16))]),
+            node("D", vec![piece("vpd", "down_proj", all(16))]),
+        ],
+        ..lib.clone()
+    };
+    let (a, b) = (Graph::parse(&lib, &weights).expect("library"), Graph::parse(&vpd, &weights).expect("vpd"));
+    assert_eq!(a.blocks, b.blocks);
+    let mut mixed = lib.clone();
+    mixed.nodes[1] = node("O", vec![piece("vpd", "o_proj", Index::One(0))]);
+    assert!(Graph::parse(&mixed, &weights).is_err(), "library and VPD views of one attention");
+}

@@ -214,6 +214,10 @@ pub struct Weights {
     /// Per layer with a VPD view of its attention, VPD's subcomponents of `q_proj`, `k_proj`,
     /// `v_proj` and `o_proj` (`attach_vpd`).
     pub vpd_attention: BTreeMap<usize, VpdAttention>,
+    /// Our library's parts (decomp's exact start, `attach_library`): per (layer, attention?) its
+    /// parts in file order, each the VPD subcomponents it holds per matrix (attention: q, k, v, o;
+    /// MLP: c_fc, down_proj). Parts execute through VPD's factors.
+    pub library: BTreeMap<(usize, bool), Vec<[Vec<usize>; 4]>>,
 }
 
 /// VPD's subcomponents of one attention's four matrices, each `U` (subcomponents × out) and `V`
@@ -301,7 +305,7 @@ impl Features {
 impl Weights {
     /// `M`'s blocks with no decomposition views attached.
     pub fn new(layers: Vec<LayerWeights>, final_norm: Norm, unembedding: Array2<f64>, embedding: Array2<f64>) -> Self {
-        Self { layers, final_norm, unembedding, embedding, transcoders: BTreeMap::new(), vpd: BTreeMap::new(), vpd_attention: BTreeMap::new() }
+        Self { layers, final_norm, unembedding, embedding, transcoders: BTreeMap::new(), vpd: BTreeMap::new(), vpd_attention: BTreeMap::new(), library: BTreeMap::new() }
     }
 
     /// Attaches the transcoder view: `dir/layer_{l}.safetensors` per layer that has one.
@@ -355,6 +359,54 @@ impl Weights {
             attached += 1;
         }
         Ok(attached)
+    }
+
+    /// Attaches our library's parts from decomp's start (`start.components.json`, arm `arm`): each
+    /// component's slices `[site, index]` (site `6 l + k`, `k` in VPD's order q, k, v, o, c_fc,
+    /// down_proj) name VPD subcomponents, so the VPD view must be attached. Part `i` of layer `l`'s
+    /// attention or MLP is the `i`-th such component in file order (mech's `PD.lib[l].attn[i]`,
+    /// `.mlp[i]`).
+    pub fn attach_library(&mut self, start: &std::path::Path, arm: &str) -> Result<usize, String> {
+        #[derive(Deserialize)]
+        struct Component {
+            slices: Vec<[usize; 2]>,
+        }
+        #[derive(Deserialize)]
+        struct Arm {
+            arm: String,
+            components: Vec<Component>,
+        }
+        let arms: Vec<Arm> = serde_json::from_slice(&std::fs::read(start).map_err(|e| format!("{}: {e}", start.display()))?).map_err(|e| e.to_string())?;
+        let components = arms.into_iter().find(|a| a.arm == arm).ok_or_else(|| format!("{}: no arm {arm}", start.display()))?.components;
+        let mut library: BTreeMap<(usize, bool), Vec<[Vec<usize>; 4]>> = BTreeMap::new();
+        for c in &components {
+            let Some(&[first, _]) = c.slices.first() else { return Err("a library part of no slices".into()) };
+            let (layer, attention) = (first / 6, first % 6 < 4);
+            let mut lists: [Vec<usize>; 4] = Default::default();
+            for &[site, index] in &c.slices {
+                if site / 6 != layer || (site % 6 < 4) != attention {
+                    return Err(format!("a library part spans sites {first} and {site}"));
+                }
+                let (kind, count) = match site % 6 {
+                    k @ 0..4 => {
+                        let a = self.vpd_attention.get(&layer).ok_or_else(|| format!("layer {layer}: attach VPD's attention view first"))?;
+                        (k, [&a.q, &a.k, &a.v, &a.o][k].0.nrows())
+                    }
+                    k => {
+                        let m = self.vpd.get(&layer).ok_or_else(|| format!("layer {layer}: attach VPD's MLP view first"))?;
+                        (k - 4, if k == 4 { m.fc_u.nrows() } else { m.down_u.nrows() })
+                    }
+                };
+                if index >= count {
+                    return Err(format!("library slice [{site}, {index}] past {count} subcomponents"));
+                }
+                lists[kind].push(index);
+            }
+            library.entry((layer, attention)).or_default().push(lists);
+        }
+        let parts = components.len();
+        self.library = library;
+        Ok(parts)
     }
 
     /// Reads the rows of every transcoder feature `graph`'s nodes declare.
@@ -565,6 +617,7 @@ impl Graph {
         let mut owned: BTreeSet<(usize, bool, usize)> = BTreeSet::new();
         let mut featured: BTreeSet<(usize, usize)> = BTreeSet::new();
         let mut sliced: BTreeSet<(usize, usize, usize)> = BTreeSet::new();
+        let mut views: BTreeMap<(usize, bool), String> = BTreeMap::new();
         for node in &program.nodes {
             if node.id == "embed" || node.id == "logits" || ids.contains(&node.id) {
                 return Err(format!("node id {} is reserved or repeated", node.id));
@@ -587,6 +640,21 @@ impl Graph {
                             return Err(format!("{}: name the transcoder features of layer {l}", node.id));
                         }
                         Block::Features { layer: l, features: indices(&piece.index, t.count, "feature")?, rest: false }
+                    }
+                    ("library", kind @ ("attn" | "mlp")) => {
+                        let attention = kind == "attn";
+                        let parts = weights.library.get(&(l, attention)).ok_or_else(|| format!("{}: layer {l}'s {kind} has no library view", node.id))?;
+                        if piece.index.is_none() {
+                            return Err(format!("{}: name the library parts of layer {l}'s {kind}", node.id));
+                        }
+                        let mut lists: [Vec<usize>; 4] = Default::default();
+                        for p in indices(&piece.index, parts.len(), "library part")? {
+                            for (all, more) in lists.iter_mut().zip(&parts[p]) {
+                                all.extend(more.iter().copied());
+                            }
+                        }
+                        let [a, b, c, d] = lists;
+                        if attention { Block::AttnSlices { layer: l, q: a, k: b, v: c, o: d, rest: false } } else { Block::Slices { layer: l, fc: a, down: b, rest: false } }
                     }
                     ("vpd", kind @ ("q_proj" | "k_proj" | "v_proj" | "o_proj")) => {
                         let a = weights.vpd_attention.get(&l).ok_or_else(|| format!("{}: layer {l}'s attention has no VPD view", node.id))?;
@@ -647,6 +715,12 @@ impl Graph {
                 });
             }
             let Some(mut block) = block else { return Err(format!("{}: a node of no pieces", node.id)) };
+            for piece in &node.pieces {
+                let site = (piece.layer, matches!(piece.kind.as_str(), "head" | "attn" | "q_proj" | "k_proj" | "v_proj" | "o_proj"));
+                if let Some(other) = views.insert(site, piece.view.clone()).filter(|v| *v != piece.view) {
+                    return Err(format!("{}: layer {}'s {} appears in views {other} and {}", node.id, site.0, if site.1 { "attention" } else { "MLP" }, piece.view));
+                }
+            }
             match &mut block {
                 Block::Heads { layer, heads } => {
                     heads.sort_unstable();
