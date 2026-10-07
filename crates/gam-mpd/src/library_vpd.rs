@@ -953,16 +953,17 @@ fn set_gate(part: &mut Dumped, read: String, (on, tau, g): StageGate) {
     part.on = on;
 }
 
-/// One arm's components as parts, in the layout of the toy gate's harness
-/// (`bench/toys_2951/score_toys.py`), at `artifact`'s values (a checkpoint's posterior mean, or
-/// the start's): per component its slices' writes `U` and reads `V` on each of `M`'s operators it
+/// One arm's parts, in the layout of the toy gate's harness (`bench/toys_2951/score_toys.py`), at
+/// `artifact`'s values (a checkpoint's posterior mean, or the start's): a part per gate with its
+/// member components (each component of an unshared stage; components that share a gate, gate
+/// sharing, one part of their summed rank), per part its slices' writes `U` and reads `V` on each of `M`'s operators it
 /// spans (export names, `W = U Vᵀ`), its gate (own: `z = ‖V_bᵀx‖ − τ_b` over its reads at its
 /// stage; direction: `z = g_bᵀx − τ_b`, the threshold's constant folded into `τ_b`), and its hard
 /// gate `z > 0` on every row of `inputs` in `P`'s own run (`artifact` executed on the host; a down
 /// gate on its own read reads the MLP's activations recomputed from the gated `c_fc` reads, as the
 /// MLP's rule computes them). Written to `dir`: `parts.json`, each slice set's `U` (out × r) and
-/// `V` (in × r) and each direction's `g` as float64, and `active.f64` (rows × components). Heads are
-/// taken to own their k and v (no grouped-query sharing). Returns the number of components.
+/// `V` (in × r) and each direction's `g` as float64, and `active.f64` (rows × parts). Heads are
+/// taken to own their k and v (no grouped-query sharing). Returns the number of parts.
 pub fn dump_parts(native: &OperatorProgram, layers: &[LayerNodes], artifact: &Artifact, start: &Path, arm: &str, inputs: &FamilyInputs, dir: &Path) -> Result<usize, String> {
     let records: Vec<ArmRecord> = serde_json::from_slice(&std::fs::read(start).map_err(|e| error(format!("{}: {e}", start.display())))?).map_err(error)?;
     let components = records.into_iter().find(|r| r.arm == arm).ok_or_else(|| error(format!("{}: no arm {arm}", start.display())))?.components;
@@ -1206,8 +1207,36 @@ pub fn dump_parts(native: &OperatorProgram, layers: &[LayerNodes], artifact: &Ar
         let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
         std::fs::write(dir.join(file), bytes).map_err(error)
     };
-    let mut records = Vec::with_capacity(parts.len());
-    for (b, part) in parts.iter().enumerate() {
+    // The parts written: one per gate with its member components (`reported`), so a stage's
+    // components that came to share a gate (gate sharing) are one part of their summed rank, its
+    // slices every member's, its gate and activity the gate's (every member's alike); an unshared
+    // stage's parts are its components. A component no gate lists stays a part of its own.
+    let mut listed = vec![false; parts.len()];
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    for (_, members, _, _) in &reported {
+        if !members.is_empty() {
+            members.iter().for_each(|b| listed[*b] = true);
+            groups.push(members.clone());
+        }
+    }
+    groups.extend((0..parts.len()).filter(|b| !listed[*b]).map(|b| vec![b]));
+    let merged: Vec<Dumped> = groups
+        .iter()
+        .map(|members| {
+            let mut slices: BTreeMap<String, (Vec<Vec<f64>>, Vec<Vec<f64>>)> = BTreeMap::new();
+            for b in members {
+                for (op, (us, vs)) in &parts[*b].slices {
+                    let entry = slices.entry(op.clone()).or_default();
+                    entry.0.extend(us.iter().cloned());
+                    entry.1.extend(vs.iter().cloned());
+                }
+            }
+            let first = &parts[members[0]];
+            Dumped { slices, gate: first.gate.clone(), g: first.g.clone(), on: first.on.clone() }
+        })
+        .collect();
+    let mut records = Vec::with_capacity(merged.len());
+    for (b, (part, members)) in merged.iter().zip(&groups).enumerate() {
         let mut slices = serde_json::Map::new();
         for (op, (us, vs)) in &part.slices {
             // U as out × r and V as in × r, row-major.
@@ -1223,9 +1252,10 @@ pub fn dump_parts(native: &OperatorProgram, layers: &[LayerNodes], artifact: &Ar
             write(&format!("p{b}.g.f64"), g)?;
             gate["g"] = serde_json::json!(format!("p{b}.g.f64"));
         }
-        records.push(serde_json::json!({"name": format!("component {b}"), "slices": slices, "gate": gate}));
+        let name = if members.len() == 1 { format!("component {}", members[0]) } else { format!("part of components {members:?}") };
+        records.push(serde_json::json!({"name": name, "slices": slices, "gate": gate, "members": members}));
     }
-    let active: Vec<f64> = (0..rows).flat_map(|row| parts.iter().map(move |p| if p.on[row] { 1.0 } else { 0.0 })).collect();
+    let active: Vec<f64> = (0..rows).flat_map(|row| merged.iter().map(move |p| if p.on[row] { 1.0 } else { 0.0 })).collect();
     write("active.f64", &active)?;
     let record = serde_json::json!({"parts": records, "active": "active.f64", "kept": ["wte", "lm_head"], "fitter": format!("library_vpd, arm {arm}")});
     std::fs::write(dir.join("parts.json"), serde_json::to_vec_pretty(&record).map_err(error)?).map_err(error)?;
@@ -1243,5 +1273,6 @@ pub fn dump_parts(native: &OperatorProgram, layers: &[LayerNodes], artifact: &Ar
     }
     let summary = serde_json::json!({"parts": report, "rank_histogram": stages, "rows": rows});
     std::fs::write(dir.join("parts_report.json"), serde_json::to_vec_pretty(&summary).map_err(error)?).map_err(error)?;
+    let parts = merged;
     Ok(parts.len())
 }
