@@ -40,8 +40,8 @@ enum Field {
     Mlp,
 }
 
-/// The counterfactual runs whose arrays stay uploaded.
-const KEPT_REFERENCES: usize = 4;
+/// The bytes of counterfactual runs' arrays kept uploaded (the least recently used run's go first).
+const KEPT_REFERENCE_BYTES: usize = 2 << 30;
 
 static DEVICE: OnceLock<Mutex<DeviceState>> = OnceLock::new();
 
@@ -83,16 +83,13 @@ impl DeviceState {
 
     /// Uploads array `field` (at `layer`, `head`) of counterfactual run `r` unless it is kept.
     fn ensure_reference(&mut self, r: &Reference, (field, layer, head): (Field, usize, usize)) -> Result<(), String> {
-        let at = match self.references.iter().position(|(id, _)| *id == r.id) {
-            Some(at) => at,
-            None => {
-                if self.references.len() >= KEPT_REFERENCES {
-                    self.references.remove(0);
-                }
-                self.references.push((r.id, BTreeMap::new()));
-                self.references.len() - 1
-            }
+        // The run moves to the most recent place.
+        let kept = match self.references.iter().position(|(id, _)| *id == r.id) {
+            Some(at) => self.references.remove(at),
+            None => (r.id, BTreeMap::new()),
         };
+        self.references.push(kept);
+        let at = self.references.len() - 1;
         if !self.references[at].1.contains_key(&(field, layer, head)) {
             let host = match field {
                 Field::Embed => Some(&r.embed),
@@ -103,6 +100,10 @@ impl DeviceState {
             let host = host.ok_or("an array the counterfactual run did not record")?;
             let t = self.device.upload(host.view()).map_err(|e| e.to_string())?;
             self.references[at].1.insert((field, layer, head), t);
+            let bytes = |m: &BTreeMap<(Field, usize, usize), Tensor>| m.values().map(|t| 4 * t.rows() * t.cols()).sum::<usize>();
+            while self.references.len() > 1 && self.references.iter().map(|(_, m)| bytes(m)).sum::<usize>() > KEPT_REFERENCE_BYTES {
+                self.references.remove(0);
+            }
         }
         Ok(())
     }
