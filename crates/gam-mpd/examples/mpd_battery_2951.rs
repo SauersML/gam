@@ -9,6 +9,7 @@
 //! EXPORT SETTINGS.json OUT.json host|gpu lookahead DECOMPOSITION
 //! EXPORT SETTINGS.json OUT.json host|gpu site_edits DECOMPOSITION
 //! EXPORT SETTINGS.json OUT.json host|gpu adversarial DECOMPOSITION
+//! EXPORT SETTINGS.json OUT.json host|gpu weight_edits DECOMPOSITION
 //! EXPORT SETTINGS.json OUT.json host|gpu start DECOMPOSITION
 //!
 //! `price_charged` prices VPD's causal-importance network beside its subcomponents
@@ -22,7 +23,8 @@
 //! cuts), typical norms and pushed directions as they stand, applied to `M` and to VPD published,
 //! with causal masks, and autonomous and causal. `adversarial` searches pushes against each of the
 //! three forms as the edits driver searches them against an explanation (settings `adversarial`,
-//! `explanation_battery::vpd_adversarial`), at the manifest's typical norms.
+//! `explanation_battery::vpd_adversarial`), at the manifest's typical norms. `weight_edits` scores
+//! the three forms under the manifest's native weight edits (`explanation_battery::vpd_weight_edits`).
 //!
 //! `masks` measures where VPD's masks come from (`explanation_battery::vpd_mask_sources`): held-out
 //! KL with masks from `M`'s activations, from them through a causal network, with every mask 1,
@@ -104,6 +106,10 @@ struct Settings {
     /// For `adversarial`: the edits driver's adversarial pushes (its EditSettings::adversarial).
     #[serde(default)]
     adversarial: Option<Adversarial>,
+    /// For `weight_edits`: the manifest's first held-out sequences its weight edits are scored on
+    /// (the edits driver's EditSettings::weights.sequences).
+    #[serde(default)]
+    weight_sequences: Option<usize>,
 }
 
 /// Adversarial pushes as the edits driver searches them (`gam_mpd::adversary`): from `seed`,
@@ -300,7 +306,7 @@ fn circuits(device: &Device, export: &Path, layers: &[gam_mpd::run_check::LayerN
 fn main() -> Result<(), String> {
     log_to_stderr();
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let usage = "EXPORT SETTINGS.json OUT.json host|gpu library [ARTIFACT] | vpd DECOMPOSITION | circuits PAIRS.json [DECOMPOSITION] | price|price_charged DECOMPOSITION [START] | masks DECOMPOSITION | lookahead DECOMPOSITION | site_edits DECOMPOSITION | adversarial DECOMPOSITION | start DECOMPOSITION | fit DECOMPOSITION START";
+    let usage = "EXPORT SETTINGS.json OUT.json host|gpu library [ARTIFACT] | vpd DECOMPOSITION | circuits PAIRS.json [DECOMPOSITION] | price|price_charged DECOMPOSITION [START] | masks DECOMPOSITION | lookahead DECOMPOSITION | site_edits DECOMPOSITION | adversarial DECOMPOSITION | weight_edits DECOMPOSITION | start DECOMPOSITION | fit DECOMPOSITION START";
     let (export, settings_path, out, mode, kind, extra, more) = match &args[..] {
         [e, s, o, m, k] => (e, s, o, m, k.as_str(), None, None),
         [e, s, o, m, k, a] => (e, s, o, m, k.as_str(), Some(Path::new(a)), None),
@@ -395,7 +401,7 @@ fn main() -> Result<(), String> {
         log::info!("battery done in {:.0} s: {out}", started.elapsed().as_secs_f64());
         return Ok(());
     }
-    if kind == "site_edits" || kind == "adversarial" {
+    if kind == "site_edits" || kind == "adversarial" || kind == "weight_edits" {
         let decomposition = extra.ok_or(usage)?;
         let vpd = Vpd::new(&device, export, Decomposition::load(decomposition)?, settings.numeric_bytes)?;
         let m = Manifest::read(settings.manifest.as_deref().ok_or("site_edits, adversarial: the edits driver's manifest in the settings (`manifest`)")?, bases)?;
@@ -413,6 +419,15 @@ fn main() -> Result<(), String> {
             let batches: Vec<(Vec<Vec<u32>>, Vec<interchange::Experiment>)> = chunks.into_iter().map(<[Vec<u32>]>::to_vec).zip(experiments).collect();
             report["manifest"] = m.report(&directions)?;
             report["site_edits"] = battery::vpd_site_edits(&vpd, export, decomposition, &batches, (&m.typical, &directions), settings.numeric_bytes)?;
+        } else if kind == "weight_edits" {
+            // The manifest's native weight edits (the edits driver's `weights` draws), each scored on
+            // its first `weight_sequences` held-out sequences.
+            let sequences = settings.weight_sequences.ok_or("weight_edits: the sequences to score on in the settings (`weight_sequences`)")?;
+            let draws = m.record["weights"].as_array().filter(|w| !w.is_empty()).ok_or_else(|| format!("weight_edits: {} lists no weight edits", m.path))?;
+            let edits = draws.iter().map(|w| battery::native_weight_edit(export, w)).collect::<Result<Vec<_>, _>>()?;
+            let rows = m.held.get(..sequences).filter(|r| !r.is_empty()).ok_or("weight_edits: sequences outside the manifest's held-out rows")?;
+            report["manifest"] = json!({"file": m.path, "sha256": sha256(Path::new(&m.path))?});
+            report["weight_edits"] = battery::vpd_weight_edits(&vpd, export, decomposition, rows, &edits, settings.numeric_bytes)?;
         } else {
             // The edits driver's adversarial pushes (its `adversarial` settings), each search on one of
             // the manifest's held-out sequences [first, end), pushing one typical norm of the manifest.
