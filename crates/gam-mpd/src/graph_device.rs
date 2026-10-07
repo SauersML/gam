@@ -141,7 +141,11 @@ pub(crate) fn run_on(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, 
     let e = |e: GpuError| e.to_string();
     let (rows, width) = (job.tokens.len(), weights.width());
     let arithmetic = s.arithmetic();
-    let segments: Vec<Segment> = job.spans.iter().map(|&(start, length)| Segment { rows: start..start + length, first: 0, before: Vec::new() }).collect();
+    // The sequences grouped by length: each group's attention runs as whole sequences at once.
+    let mut by_length: BTreeMap<usize, Vec<Segment>> = BTreeMap::new();
+    for &(start, length) in job.spans {
+        by_length.entry(length).or_default().push(Segment { rows: start..start + length, first: 0, before: Vec::new() });
+    }
     let positions: Vec<u32> = job.spans.iter().flat_map(|&(_, length)| 0..length as u32).collect();
     let table = s.ensure(weights.embedding.view()).map_err(e)?;
     let ids = s.device.upload_indices(job.tokens).map_err(e)?;
@@ -242,7 +246,11 @@ pub(crate) fn run_on(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, 
                             q = s.device.rotate(&q, cos, sin, r.half_split, false).map_err(e)?;
                             k = s.device.rotate(&k, cos, sin, r.half_split, false).map_err(e)?;
                         }
-                        let z = forward_segments(&s.device, (&q, &k, &v), &segments, hw.scale, hw.causal, arithmetic).map_err(e)?;
+                        let mut z = s.device.zeros(rows, v.cols()).map_err(e)?;
+                        for group in by_length.values() {
+                            let part = forward_segments(&s.device, (&q, &k, &v), group, hw.scale, hw.causal, arithmetic).map_err(e)?;
+                            s.device.axpy(&mut z, 1.0, &part).map_err(e)?;
+                        }
                         if let Some(c) = captured.as_mut() {
                             c.reads[*layer][h] = s.device.download(&z).map_err(e)?;
                         }
