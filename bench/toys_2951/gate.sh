@@ -7,6 +7,8 @@
 #   ROOT    where the toys live (trained here when missing), e.g. ~/mpd-data/toys_gate
 #   BINARY  mpd_library_mdl_2951 built at the commit under test (fastcheck build --release)
 #   TOY     the toys to run (all seven when none), each also as seeds 1 and 2 (TOY_s1, TOY_s2)
+# GATE_DEVICE (host or gpu, default host) is the fits' device; GATE_FITS (default the four below,
+# ARM:BUDGET separated by spaces) runs only those fits, so lanes can split a toy's fits.
 #
 # Per toy and seed: train it if missing (train_toys.py); score the native and truth references
 # (score_toys.py --references); write the three start arms (toy_start.py); the engine's edits on
@@ -19,7 +21,8 @@ root=$1; binary=$2; epochs=${3:-20}; shift 3 2>/dev/null || shift $#
 toys=("$@"); (( ${#toys} )) || toys=(tms_40_10 tms_40_10_id resid_mlp_1l resid_mlp_2l resid_mlp_3l modadd_113 induction)
 here=${0:A:h}
 py=(env MPD_MEM_GIB=1 ~/mpd-data/venv/bin/python)
-fits=(per_slice_own:true grouped_own:true grouped_direction:true grouped_own:none)
+fits=(${=GATE_FITS:-per_slice_own:true grouped_own:true grouped_direction:true grouped_own:none})
+device=${GATE_DEVICE:-host}
 for toy in $toys; do
   for seed in 0 1 2; do
     name=$toy; (( seed )) && name=${toy}_s$seed
@@ -34,7 +37,7 @@ for toy in $toys; do
       out=$root/fit/$name.$arm.$budget
       mkdir -p $root/fit
       $py $here/gate_settings.py $t $root/start/$name $arm $budget $epochs $out.json
-      [[ -f $out/REPORT.json ]] || mem-lease 4 $binary $t $out.json $out host > $out.log 2>&1
+      [[ -f $out/REPORT.json ]] || mem-lease 4 $binary $t $out.json $out $device > $out.log 2>&1
       $binary $t $out.json $out host parts $out/parts >> $out.log 2>&1
       env MPD_MEM_GIB=3 ~/mpd-data/venv/bin/python $here/score_toys.py $t $out/parts > /dev/null
       $py $here/engine_edits.py $binary $t $out $out.json checkpoint.bin $native/MANIFEST_native.json > /dev/null
