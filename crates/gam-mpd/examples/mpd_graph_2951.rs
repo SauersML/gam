@@ -4,7 +4,11 @@
 //! * `{"op": "load", "export": DIR}`: the native model of an export (`import::import_language_model`),
 //!   its weights taken from the start library (`library_mdl::explanation`, equal to `M`).
 //! * `{"op": "behavior", "path": FILE}` or `{"op": "behavior", "behavior": {...}}`: a behavior file
-//!   (design.txt section 5); measures its stand-in averages on `M`.
+//!   (design.txt section 5); measures its stand-in averages on `M`. With `"manifest": FILE` (an
+//!   immutable experiment manifest, `mpd_library_mdl_2951`'s; for vpd4l the default is
+//!   `~/mpd-data/compare/manifest/MANIFEST_vpd4l_s1.json` when the export is VPD-4L's, `null` for
+//!   none), a third of the behavior's half of the experiments are its site operations
+//!   (`graph::SiteUnits::manifest`, positions drawn on the export's `context` tokens).
 //! * `{"op": "score", "program": IR, "experiments": 32, "seed": 0, "routing": "edges" | "nodes",
 //!   "N": null, "reader_top": 0}`: every score term (`graph::Score`); with `reader_top` k > 0, per
 //!   experiment its words and per target token `M_e`'s and the program's probabilities of `M`'s k
@@ -13,7 +17,7 @@
 use gam_gpu::tensor::Device;
 use gam_mpd::{
     engine::log_to_stderr,
-    graph::{Behavior, Checker, Experiment, Graph, Program, WeightEdit, Weights, Writer},
+    graph::{Behavior, Checker, Experiment, Graph, Program, SiteUnits, WeightEdit, Weights, Writer},
     import::import_language_model,
     library_mdl,
     library_readout::Library,
@@ -66,6 +70,10 @@ fn reader_experiment(e: &Experiment, program: &Program, graph: &Graph, behavior:
             }
         },
         Experiment::Swap { node } => json!({"kind": "swap", "pieces": pieces(program, graph, Some(*node), ""), "source_text": donor.map_or(String::new(), |d| behavior.prompts[d].text.clone())}),
+        Experiment::Sites { .. } => {
+            let source = behavior.prompts[prompt].counterfactual.as_ref().map_or_else(|| donor.map_or(String::new(), |d| behavior.prompts[d].text.clone()), |c| c.text.clone());
+            json!({"words": format!("{} (the counterfactual text: <<<{source}>>>)", e.describe(graph))})
+        }
         Experiment::Cut { from, to, route, .. } => {
             let from = match from {
                 Writer::Embed => json!("embed"),
@@ -94,11 +102,10 @@ fn items(checker: &Checker, outcomes: &[(Experiment, Array2<f64>, Array2<f64>)],
     let behavior = &checker.behavior;
     // Rows are the behavior's target tokens in prompt order (a swap's: its prompts' only).
     let targets: Vec<(usize, usize)> = behavior.prompts.iter().enumerate().flat_map(|(i, p)| p.target_positions.iter().map(move |&t| (i, t))).collect();
-    let swapped = checker.swap_targets();
     let donors = checker.donors();
     let mut list = Vec::new();
     for (x, (e, m, p)) in outcomes.iter().enumerate() {
-        let rows: &[(usize, usize)] = if matches!(e, Experiment::Swap { .. }) { &swapped } else { &targets };
+        let rows = checker.rows_of(e);
         for (r, &(prompt, position)) in rows.iter().enumerate().filter(|(r, _)| *r < m.nrows()) {
             let clean_row = targets.iter().position(|t| *t == (prompt, position)).unwrap_or(r);
             let tokens = &top[clean_row];
@@ -131,12 +138,32 @@ fn items(checker: &Checker, outcomes: &[(Experiment, Array2<f64>, Array2<f64>)],
     Value::Array(list)
 }
 
-fn handle(request: &Value, weights: &mut Option<Weights>, checker: &mut Option<Checker>) -> Result<Value, String> {
+/// The export's context in tokens (`export.json`'s `context`), what a manifest's positions were
+/// drawn on.
+fn context(export: &Path) -> Result<usize, String> {
+    let record: Value = serde_json::from_slice(&std::fs::read(export.join("export.json")).map_err(error)?).map_err(error)?;
+    record["context"].as_u64().map(|c| c as usize).ok_or_else(|| "export.json has no context".into())
+}
+
+/// The manifest a behavior request names, or by default VPD-4L's shared one for its export.
+fn manifest(request: &Value, export: &Path) -> Option<std::path::PathBuf> {
+    match request.get("manifest") {
+        Some(Value::Null) => None,
+        Some(Value::String(path)) => Some(path.into()),
+        _ => {
+            let default = Path::new(&std::env::var("HOME").ok()?).join("mpd-data/compare/manifest/MANIFEST_vpd4l_s1.json");
+            (export.file_name().is_some_and(|n| n == "vpd4l") && default.exists()).then_some(default)
+        }
+    }
+}
+
+fn handle(request: &Value, weights: &mut Option<Weights>, checker: &mut Option<Checker>, export: &mut Option<std::path::PathBuf>) -> Result<Value, String> {
     match request["op"].as_str().ok_or("an op")? {
         "load" => {
-            let export = request["export"].as_str().ok_or("export")?;
+            let path = request["export"].as_str().ok_or("export")?;
             *checker = None;
-            let w = load(Path::new(export))?;
+            *export = Some(path.into());
+            let w = load(Path::new(path))?;
             let answer = json!({"ok": true, "layers": w.layers.len(), "heads": w.layers.first().map_or(0, |l| l.heads.len()), "neurons": w.layers.first().and_then(|l| l.mlp.as_ref()).map_or(0, |m| m.gate.nrows()), "vocabulary": w.embedding.nrows(), "width": w.embedding.ncols()});
             *weights = Some(w);
             Ok(answer)
@@ -152,8 +179,16 @@ fn handle(request: &Value, weights: &mut Option<Weights>, checker: &mut Option<C
                 (None, None) => return Err("load a model first".into()),
             };
             let (id, prompts) = (behavior.id.clone(), behavior.prompts.len());
-            *checker = Some(Checker::new(w, behavior)?);
-            Ok(json!({"ok": true, "id": id, "prompts": prompts}))
+            let width = w.embedding.ncols();
+            let mut c = Checker::new(w, behavior)?;
+            let dir = export.as_deref().ok_or("load a model first")?;
+            let named = manifest(request, dir);
+            if let Some(path) = &named {
+                c.sites = SiteUnits::manifest(path, context(dir)?, width)?;
+            }
+            let pool = c.sites.pool.len();
+            *checker = Some(c);
+            Ok(json!({"ok": true, "id": id, "prompts": prompts, "manifest": named.map(|p| p.display().to_string()), "site_experiments": pool}))
         }
         "score" => {
             let c = checker.as_mut().ok_or("load a behavior first")?;
@@ -179,7 +214,7 @@ fn handle(request: &Value, weights: &mut Option<Weights>, checker: &mut Option<C
 
 fn main() -> Result<(), String> {
     log_to_stderr();
-    let (mut weights, mut checker) = (None, None);
+    let (mut weights, mut checker, mut export) = (None, None, None);
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
     for line in stdin.lock().lines() {
@@ -189,7 +224,7 @@ fn main() -> Result<(), String> {
         }
         let answer = match serde_json::from_str::<Value>(&line) {
             Ok(request) if request["op"] == "quit" => break,
-            Ok(request) => handle(&request, &mut weights, &mut checker).unwrap_or_else(|e| json!({"ok": false, "error": e})),
+            Ok(request) => handle(&request, &mut weights, &mut checker, &mut export).unwrap_or_else(|e| json!({"ok": false, "error": e})),
             Err(e) => json!({"ok": false, "error": e.to_string()}),
         };
         writeln!(stdout, "{answer}").map_err(error)?;
