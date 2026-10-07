@@ -42,7 +42,8 @@ included (cont_from_<alpha>). Effects of either size, zero included, are kept: p
 part of the task. The next-token fields also come for three larger edits (suffixes): _from, the edit at
 every row from the first token after the sink on (at p, every earlier row's edit reaches it too); _group,
 the subcomponent with the other GROUP - 1 subcomponents of its site most active at p (|v . x|), removed or
-doubled together at row p (their numbers in `group`); _groupfrom, the group from the first token on.
+doubled together at row p (their numbers in `group`, their activities at p in `group_act`); _groupfrom,
+the group from the first token on.
 
   vpd_labels.py --out DIR [--offset 0] [--pool 2048] [--top 16] [--random 16] [--sites h.0.mlp.c_fc,...]
                 [--limit N] [--rows 256] [--seed 0] [--edit all|row] [--stride 1] [--continue 1]
@@ -243,7 +244,7 @@ def row_labels(args, model: Model, ids: torch.Tensor, entering, final, peaks, na
         activity = torch.empty(C, K, T, device=dev)
         position = torch.empty(C, K, dtype=torch.int64, device=dev)
         fields = {a: {} for a, _ in ROW_ALPHAS}
-        groups = []
+        groups, group_acts = [], []
         pairs = torch.cartesian_prod(torch.arange(C, device=dev), torch.arange(K, device=dev))
         for s in range(0, len(pairs), args.rows):
             cs, ks = pairs[s : s + args.rows, 0], pairs[s : s + args.rows, 1]
@@ -258,10 +259,12 @@ def row_labels(args, model: Model, ids: torch.Tensor, entering, final, peaks, na
             activity[cs, ks], position[cs, ks] = act, pos
             lp_c = model.log_probs(final[rows_ctx, pos])
             # Its group: the GROUP subcomponents of the site most active at p, itself first.
-            every = (seen[at, pos] @ V).abs()  # [R, all of the site's subcomponents]
+            signed = seen[at, pos] @ V  # [R, all of the site's subcomponents]
+            every = signed.abs()
             every[at, sub] = float("inf")
             group = every.topk(GROUP, dim=-1).indices  # [R, GROUP]
             groups.append(group.to(torch.int32).cpu())
+            group_acts.append(signed.gather(-1, group).float().cpu())
             for (alpha_name, alpha), (suffix, span, grouped) in [(a, v_) for a in ROW_ALPHAS for v_ in VARIANTS]:
                 ev, eu = (V.T[group], U[group]) if grouped else (v, u)
                 rows_ = (pos, pos + 1) if span == "row" else (torch.ones_like(pos),)
@@ -283,6 +286,7 @@ def row_labels(args, model: Model, ids: torch.Tensor, entering, final, peaks, na
                 val = torch.cat(parts).reshape(C, K, *parts[0].shape[1:])
                 rec[f"{key}_{alpha_name}{suffix}"] = val.to(torch.int32) if key.endswith("_ids") else val.to(torch.float32)
         rec["group"] = torch.cat(groups).reshape(C, K, GROUP)
+        rec["group_act"] = torch.cat(group_acts).reshape(C, K, GROUP)  # their activities v . x at p
         # Continuations after p in each subcomponent's first `--continue` top contexts.
         J = args.cont
         conts = {"cont_clean": torch.empty(C, J, S, dtype=torch.int32)}
