@@ -1117,7 +1117,22 @@ def evaluate(final=False):
 # point). Thresholds set on M's inputs left maps dead whose reads shrink under upstream gating (the
 # whole model at K = 128: layer 0's v and o and layer 1's o at 0.0-0.1 on against 1.2-3.2 targeted, and a
 # gate far below its threshold gets no gradient back).
-if start in ('vpd', 'neuron') and not (SHARE or SHARE_A or ROUTER or EXACT or ARM == 'dir'):
+# DESCENT_RESUME=SAVE: the parts and gates start from a DESCENT_SAVE file (the posterior means; the optimizer,
+# posterior widths and multiplier start afresh), its thresholds kept. Under F the weight priors stay centred
+# on the start's tensors (M's own slices for the neuron and head starts), recorded before the load.
+RESUME = os.environ.get('DESCENT_RESUME')
+START_VAL = {}
+if RESUME:
+    S_ = torch.load(RESUME, map_location=dev, weights_only=False)
+    with torch.no_grad():
+        for cont, src in ([(P[n], S_['maps'][n]) for n in mlp] + [(A[n], S_['attn'][n]) for n in sliced]
+                          + [(HP[l], S_['heads'][l]) for l in HP] + [(HG[f'h.{l}.attn.o_proj'], S_['heads'][l]) for l in HP]):
+            for k in cont:
+                if k in src and torch.is_tensor(cont[k]) and k != 'F':
+                    START_VAL[(id(cont), k)] = cont[k].detach().clone()
+                    cont[k] = src[k].to(dev).clone().requires_grad_(k != 's')
+    print('resumed from', RESUME, 'step', S_['step'], flush=True)
+if start in ('vpd', 'neuron') and not (SHARE or SHARE_A or ROUTER or EXACT or ARM == 'dir' or RESUME):
     # A neuron part counts its two slices: its layer's neurons on match the mean of VPD's two counts.
     vc = lambda n: (VPD_COUNTS[n] if start == 'vpd' else
                     (VPD_COUNTS[n.rsplit('.', 1)[0] + '.c_fc'] + VPD_COUNTS[n.rsplit('.', 1)[0] + '.down_proj']) / 2)
@@ -1187,7 +1202,7 @@ if FMODE:
         mu = cont[key].detach().clone().requires_grad_()
         ls = torch.full_like(mu, math.log(0.01 * scale)).requires_grad_()
         leaves.append((cont, key, mu, ls))
-        MU0[id(mu)] = cont[key].detach().clone()
+        MU0[id(mu)] = START_VAL.get((id(cont), key), cont[key]).detach().clone()
         # log sigma by 1% per step
         groups += [{'params': [mu], 'lr': LR * 3e-3 * scale}, {'params': [ls], 'lr': LR * 1e-2}]
 else:
