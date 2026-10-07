@@ -771,11 +771,12 @@ fn operations_on_shared_sites_are_the_same_on_both_models() {
 }
 
 /// Native weight edits ([`Patch::Weights`], `weight_edit::candidates`) on the scoped starting
-/// library, which computes `M` exactly: every edit scores zero (each model adds the edit's term
-/// `ΔW·x` at its own uses of the edited maps, `M`'s attention maps by name and the MLPs' through
-/// their owners), nearly every edit moves `M`, and with `P`'s maps moved off `M`'s the gradient of
-/// the edits' bits matches central differences (the term's cotangent reaching the maps that make
-/// its input).
+/// library, which computes `M` exactly: every edit scores zero (each model applies the edit at its
+/// own uses of the edited maps, `M`'s attention maps by name and the MLPs' through their owners:
+/// coordinate edits entry-wise, other changes as the term `ΔW·x`), nearly every edit moves `M`
+/// (with a third of the scale factors 0.5 and the replacements of a head by another, a weak one may
+/// not), and with `P`'s maps moved off `M`'s the gradient of the edits' bits matches central
+/// differences (the masks' and the terms' cotangents reaching the maps that make their inputs).
 #[test]
 fn weight_edits_are_the_same_on_both_models() {
     use super::interchange::Family;
@@ -792,11 +793,10 @@ fn weight_edits_are_the_same_on_both_models() {
     let variables = reads(&native, &blocks).expect("the reads");
     let mut x = Interchange::new(&d, &native, &blocks, &explanation.artifact, &explanation.trainable, variables, 1 << 30, 64).expect("the experiments");
     let batch = Batch::new(sequences[..3].to_vec(), sequences[3..6].to_vec()).expect("the batch");
-    let inputs = x.matrix_inputs(&batch, 16).expect("the inputs");
-    let drawn = crate::weight_edit::candidates(&native, &inputs, 5, 24).expect("the edits");
+    let drawn = crate::weight_edit::candidates(&native, 5, 24).expect("the edits");
     let kinds: std::collections::BTreeSet<_> = drawn.iter().map(|e| e.kind).collect();
-    assert!(kinds.len() >= 5, "{kinds:?}");
-    let described: Vec<String> = drawn.iter().map(|e| format!("{:?} {}", e.kind, e.factors.iter().map(|f| f.native.as_str()).collect::<Vec<_>>().join("+"))).collect();
+    assert_eq!(kinds.len(), 4, "{kinds:?}");
+    let described: Vec<String> = drawn.iter().map(|e| format!("{:?} {}", e.kind, e.entries.iter().map(|x| x.native.as_str()).chain(e.factors.iter().map(|f| f.native.as_str())).collect::<Vec<_>>().join("+"))).collect();
     let count = drawn.len();
     x.set_weight_edits(drawn).expect("the table");
     let experiments = x.sample_ops(&mut rand::rngs::StdRng::seed_from_u64(3), &batch, &[Family::Weight], 8, &[1, 2, 0], false).expect("the draw");
@@ -806,7 +806,7 @@ fn weight_edits_are_the_same_on_both_models() {
         assert!(bits.iter().flatten().all(|b| b.abs() <= 1e-9), "{bits:?}");
     }
     let effects = x.weight_effects(&batch, &(0..count).collect::<Vec<_>>()).expect("the effects");
-    assert!(effects.iter().filter(|e| **e > 1e-6).count() * 10 >= count * 9, "{:?}", described.iter().zip(&effects).collect::<Vec<_>>());
+    assert!(effects.iter().filter(|e| **e > 1e-6).count() * 10 >= count * 8, "{:?}", described.iter().zip(&effects).collect::<Vec<_>>());
     // P's maps moved off M's: the analytic gradient against central differences.
     let start: Vec<Array2<f64>> = explanation.trainable.iter().map(|&op| explanation.artifact.program.operators[op].matrix()).collect();
     let moved: Vec<Array2<f64>> = start.iter().enumerate().map(|(k, v)| Array2::from_shape_fn(v.dim(), |(i, j)| v[[i, j]] * (1.0 + 0.2 * noise(7919 * k + 31 * i + j)))).collect();

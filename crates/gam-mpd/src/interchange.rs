@@ -393,6 +393,9 @@ pub enum Operation {
     Cut { to: usize },
 }
 
+/// The candidate weight edits measured per evaluation ([`Interchange::draw_weight_edits`]).
+const WEIGHT_SCREEN_CHUNK: usize = 32;
+
 /// The factors a scale operation multiplies its site's value by.
 pub const SCALES: [f64; 4] = [0.0, 0.5, 2.0, 3.0];
 
@@ -610,15 +613,16 @@ pub struct MatrixUse {
 
 /// Per native matrix (by name) the uses of its blocks in `artifact`, whose flat program is `flat`
 /// (`mapped_inlined`), for the edits of [`Patch::Weights`]: every node of `flat` applying an
-/// operator named as one of `M`'s (`native`'s) of the same shape, and every owner's block
-/// (`Artifact::owners`): an operator's, at each node of its rule body applying it, or a summed
-/// block's, at its use's input and output nodes (`Owner::uses`). A matrix the artifact holds no
-/// block of has no use: an edit of it changes `M` alone.
-pub fn matrix_uses(native: &OperatorProgram, artifact: &Artifact, flat: &OperatorProgram) -> Result<BTreeMap<String, Vec<MatrixUse>>, String> {
+/// operator named as one of `M`'s (`native`'s) of the same shape, and every owner's block of
+/// `owners` (the artifact's, `Artifact::owners`, or for an explanation `library_vpd` built, which
+/// records none, its maps' uses, `library_vpd::uses`): an operator's, at each node of its rule body
+/// applying it, or a summed block's, at its use's input and output nodes (`Owner::uses`). A matrix
+/// the artifact holds no block of has no use: an edit of it changes `M` alone.
+pub fn matrix_uses(native: &OperatorProgram, (artifact, owners): (&Artifact, &[crate::artifact::Owner]), flat: &OperatorProgram) -> Result<BTreeMap<String, Vec<MatrixUse>>, String> {
     let shapes: HashMap<&str, (usize, usize)> = native.operators.iter().map(|op| (op.name.as_str(), (op.rows.width(), op.cols.width()))).collect();
     let interfaces = flat.interfaces().map_err(error)?;
     let width = |n: usize| interfaces.get(n).map(|i| i.width()).ok_or_else(|| error("a matrix use outside the program"));
-    let owned: BTreeSet<&str> = artifact.owners.iter().map(|o| o.operator.as_str()).collect();
+    let owned: BTreeSet<&str> = owners.iter().map(|o| o.operator.as_str()).collect();
     let mut out: BTreeMap<String, Vec<MatrixUse>> = BTreeMap::new();
     for (n, node) in flat.nodes.iter().enumerate() {
         let Node::Affine { terms, .. } = node else { continue };
@@ -636,7 +640,7 @@ pub fn matrix_uses(native: &OperatorProgram, artifact: &Artifact, flat: &Operato
     // Per owner's use: the observation paths of its input and output nodes.
     let mut found: Vec<(&crate::artifact::Owner, Result<f64, String>)> = Vec::new();
     let mut paths: Vec<Vec<usize>> = Vec::new();
-    for owner in &artifact.owners {
+    for owner in owners {
         if !shapes.contains_key(owner.native.as_str()) {
             continue;
         }
@@ -1384,7 +1388,36 @@ impl Edits {
                 }
             }
         }
-        let mut out = Self::patches(d, patches, values, &zeroed)?;
+        // Each weight edit's coordinate edits, entry-wise: at every use of the edited map in the
+        // model, the edited rows' entries of the use's output (its columns indexing the map's rows)
+        // or the edited columns' entries of its input, scaled at the edit's rows, so each part and
+        // leftover computing the map computes it with those rows or columns scaled.
+        let mut scaled: BTreeMap<(usize, usize), Vec<f64>> = BTreeMap::new();
+        if let Some(sites) = sites.filter(|s| !weight_rows.is_empty() && !s.unedited) {
+            for (e, rows) in &weight_rows {
+                let drawn = sites.weights.get(*e).ok_or_else(|| error(format!("weight edit {e}: not in the table")))?;
+                for x in &drawn.entries {
+                    let mut done: BTreeSet<(usize, usize)> = BTreeSet::new();
+                    for u in sites.matrices.get(&x.native).into_iter().flatten() {
+                        // The output indexes the map's rows, the input its columns (the other way
+                        // round for a block held transposed).
+                        let output = x.rows != u.transposed;
+                        let native = if x.rows { &u.native_rows } else { &u.native_cols };
+                        let (node, at, width) = if output { (u.output, u.out_at, u.widths.0) } else { (u.input, u.in_at, u.widths.1) };
+                        let columns: Vec<usize> = x.units.iter().filter(|j| native.contains(j)).map(|j| at + j - native.start).filter(|c| done.insert((node, *c))).collect();
+                        if columns.iter().any(|c| *c >= width) {
+                            return Err(error(format!("{}: an edited unit outside its use", x.native)));
+                        }
+                        for &row in rows {
+                            let mask = scaled.entry((node, row)).or_insert_with(|| vec![1.0; width]);
+                            columns.iter().for_each(|c| mask[*c] *= x.alpha);
+                        }
+                    }
+                }
+            }
+        }
+        let scaled: Vec<(usize, usize, Vec<f64>)> = scaled.into_iter().map(|((node, row), mask)| (row, node, mask)).collect();
+        let mut out = Self::patches(d, patches, values, (&zeroed, &scaled))?;
         out.adds = adds.into_iter().map(|(node, (rows, vectors))| (node, (rows, ndarray::Array2::from_shape_fn((vectors.len(), vectors[0].len()), |(i, c)| vectors[i][c])))).collect();
         out.probes = probes;
         out.cuts = cuts;
@@ -1418,7 +1451,7 @@ impl Edits {
     /// The read patches `patches` and the rows `zeroed` (a row, a node and its width) of nodes
     /// whose value is zeroed there (a head's removal: the patch keeping none of the row and taking
     /// none of its source, the row itself).
-    fn patches(d: &Device, patches: &[(usize, usize, &[usize])], values: &[Value], zeroed: &[(usize, usize, usize, usize, f64, f64)]) -> Result<Self, String> {
+    fn patches(d: &Device, patches: &[(usize, usize, &[usize])], values: &[Value], (zeroed, scaled): (&[(usize, usize, usize, usize, f64, f64)], &[(usize, usize, Vec<f64>)])) -> Result<Self, String> {
         let mut masks: BTreeMap<(usize, usize, usize), (Vec<f64>, Vec<f64>)> = BTreeMap::new();
         for (row, source, variables) in patches {
             for v in *variables {
@@ -1431,6 +1464,13 @@ impl Edits {
         }
         for (row, source, node, width, keep, take) in zeroed {
             masks.insert((*node, *row, *source), (vec![*keep; *width], vec![*take; *width]));
+        }
+        // A row's entries scaled column by column (a weight edit's coordinate edits), on top of
+        // whatever the row already keeps.
+        for (row, node, factors) in scaled {
+            let mask = masks.entry((*node, *row, *row)).or_insert_with(|| (vec![1.0; factors.len()], vec![0.0; factors.len()]));
+            mask.0.iter_mut().zip(factors).for_each(|(k, f)| *k *= f);
+            mask.1.iter_mut().zip(factors).for_each(|(t, f)| *t *= f);
         }
         let mut grouped: BTreeMap<usize, (Vec<usize>, Vec<usize>, Vec<f64>, Vec<f64>)> = BTreeMap::new();
         for ((node, row, source), (keep, take)) in masks {
@@ -3214,8 +3254,9 @@ impl Interchange {
         let (m_norms, p_norms) = (norms(&m_flat, &m_reads, &m_streams), norms(&p_flat, &p_reads, &p_streams));
         let mut m_sites = Sites::new(&m, &m_flat, m_streams, m_reads, &[], m_values)?;
         let mut p_sites = Sites::new(&p, &p_flat, p_streams, p_reads, trainable, p_values)?;
-        m_sites.parts.matrices = Arc::new(matrix_uses(native, &Artifact::native(native)?, &m_flat)?);
-        p_sites.parts.matrices = Arc::new(matrix_uses(native, explanation, &p_flat)?);
+        m_sites.parts.matrices = Arc::new(matrix_uses(native, (&Artifact::native(native)?, &[]), &m_flat)?);
+        let p_owners = if explanation.owners.is_empty() { crate::library_vpd::uses(native, layers, explanation)? } else { explanation.owners.clone() };
+        p_sites.parts.matrices = Arc::new(matrix_uses(native, (explanation, &p_owners), &p_flat)?);
         m_sites.parts.reads = m_norms;
         p_sites.parts.reads = p_norms;
         let head_blocks: Vec<usize> = layers.iter().enumerate().flat_map(|(l, layer)| layer.reads.iter().map(move |_| 2 * l)).collect();
@@ -3358,6 +3399,15 @@ impl Interchange {
         let m = self.models().0;
         for (i, e) in edits.iter().enumerate() {
             let (start, end) = (m.entry(e.block), m.end(e.block));
+            for x in &e.entries {
+                let uses = self.m_sites.parts.matrices.get(&x.native).filter(|u| !u.is_empty()).ok_or_else(|| error(format!("weight edit {i}: {} is not one of M's matrices", x.native)))?;
+                for u in uses {
+                    let n = if x.rows { u.native_rows.end } else { u.native_cols.end };
+                    if x.units.iter().any(|j| *j >= n) || u.input <= start || u.output > end {
+                        return Err(error(format!("weight edit {i}: units of {} outside it, or it applied outside block {}", x.native, e.block)));
+                    }
+                }
+            }
             for f in &e.factors {
                 let uses = self.m_sites.parts.matrices.get(&f.native).filter(|u| !u.is_empty()).ok_or_else(|| error(format!("weight edit {i}: {} is not one of M's matrices", f.native)))?;
                 for u in uses {
@@ -3384,37 +3434,25 @@ impl Interchange {
         &self.m_sites.parts.weights
     }
 
-    /// Per matrix of `M` (by name) the inputs of its first use on `M`'s runs of `batch`'s base
-    /// sequences after their first token, at most `rows` of them (the first sequences' first): what
-    /// sizes a random weight edit against the matrix's own output (`weight_edit::candidates`).
-    pub fn matrix_inputs(&self, batch: &Batch, rows: usize) -> Result<BTreeMap<String, ndarray::Array2<f64>>, String> {
-        let (m, _) = self.models();
-        let (d, length) = (m.device(), batch.length());
-        let n = batch.base.len();
-        let ranges: Vec<Range<usize>> = (0..n).map(|i| i * length..(i + 1) * length).collect();
-        let mut later: Vec<Range<usize>> = Vec::new();
-        let mut taken = 0;
-        for i in 0..n {
-            let more = (length.saturating_sub(1)).min(rows - taken);
-            if more == 0 {
-                break;
-            }
-            later.push(i * length + 1..i * length + 1 + more);
-            taken += more;
-        }
-        let tokens: Vec<&[u32]> = batch.base.iter().map(Vec::as_slice).collect();
-        let mut stream = d.zeros(n * length, BlockEngine::width(&m)).map_err(error)?;
-        let mut out = BTreeMap::new();
-        for b in 0..m.blocks() {
-            let (start, end) = (m.entry(b), m.end(b));
-            let trace = m.forward(b, &mut stream, &ranges, &tokens, None, true)?.ok_or_else(|| error("a block kept no tape"))?;
-            for (name, uses) in self.m_sites.parts.matrices.iter() {
-                if let Some(u) = uses.first().filter(|u| u.input > start && u.output <= end) {
-                    out.insert(name.clone(), d.download(&d.gather_ranges(trace.value(u.input)?, &later).map_err(error)?).map_err(error)?);
-                }
+    /// Set the table of native weight edits ([`Interchange::set_weight_edits`]) to `kept` of
+    /// `candidates` edits of `M` (`native`) drawn from `seed` (`weight_edit::candidates`), each
+    /// measured on `M` alone on `screen` (`KL(M_e ‖ M)` per token, [`Interchange::weight_effects`]),
+    /// kept stratified by that effect (`weight_edit::stratified`, bins at
+    /// `weight_edit::EFFECT_EDGES`) so edits that move `M` much are as common as those that barely do;
+    /// returns the table. It depends on `M`, the seed and the screen's sequences alone: every
+    /// explanation faces the same edits.
+    pub fn draw_weight_edits(&mut self, native: &OperatorProgram, screen: &Batch, seed: u64, (candidates, kept): (usize, usize)) -> Result<Vec<crate::weight_edit::Drawn>, String> {
+        let mut drawn = crate::weight_edit::candidates(native, seed, candidates)?;
+        self.set_weight_edits(drawn.clone())?;
+        let all: Vec<usize> = (0..drawn.len()).collect();
+        for chunk in all.chunks(WEIGHT_SCREEN_CHUNK) {
+            for (i, effect) in chunk.iter().zip(self.weight_effects(screen, chunk)?) {
+                drawn[*i].effect = Some(effect);
             }
         }
-        Ok(out)
+        let table = crate::weight_edit::stratified(drawn, kept, &crate::weight_edit::EFFECT_EDGES)?;
+        self.set_weight_edits(table.clone())?;
+        Ok(table)
     }
 
     /// Per weight edit of the table, `edits` its indices, its effect on `M`: `KL(M_e ‖ M)` in bits

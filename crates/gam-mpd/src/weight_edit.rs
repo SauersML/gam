@@ -265,7 +265,7 @@ pub fn compile(native: &OperatorProgram, explanation: &Artifact, edits: &[Weight
 
 /// A native edit of coordinates: `units` of the rows (`rows`) or columns of `M`'s operator `native`
 /// scaled by `alpha` (0 removes them).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct EntryEdit {
     pub native: String,
     pub rows: bool,
@@ -373,25 +373,36 @@ pub fn component(native: &OperatorProgram, explanation: &Artifact, owners: &[Own
     Ok(out.into_iter().map(|(native, delta)| WeightEdit { native, delta }).collect())
 }
 
-/// A kind of native weight edit ([`candidates`]), each defined on `M`'s weights alone.
+/// A family of native weight edits ([`candidates`]), each defined on `M`'s weights alone, as the
+/// edits driver's strong draw makes them (`mpd_library_mdl_2951`'s `draw_weights`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Kind {
-    /// One MLP neuron removed: its `c_fc` row and its `down_proj` column zeroed.
-    NeuronRemove,
-    /// One MLP neuron's output scaled: its `down_proj` column times 0.5, 2 or 3.
-    NeuronScale,
-    /// One head removed: its query and output blocks zeroed, and its key and value blocks where the
-    /// head reads a key-value head of its own.
-    HeadRemove,
-    /// One head's output scaled: its output block times 0.5, 2 or 3.
-    HeadScale,
-    /// A random change of one matrix block of any rank ([`candidates`]).
+    /// One head scaled by a factor of `interchange::SCALES` (0 removes it): its query rows and its
+    /// output columns, and its key and value rows where it reads a key-value head of its own.
+    Head,
+    /// A group of 8, 16, 32 or 64 neurons of one layer's MLP scaled so: their `c_fc` (and
+    /// `gate_proj`) rows and their `down_proj` columns.
+    Neurons,
+    /// One head's maps replaced by another head's of the same layer (its query and output maps, and
+    /// key and value where each reads a key-value head of its own). An exchange of two heads' maps
+    /// is no edit: the attention output sums over its heads.
+    HeadReplaced,
+    /// A random change `ΔW = s A Bᵀ` of one map: rank `full^u`, `A` and `B` of random signs, `s` setting
+    /// `‖ΔW‖_F` to `0.3 · 10^u′` of the map's (`u`, `u′` uniform in `[0, 1)`).
     Random,
-    /// One head taking another head's query and output blocks in the same layer (and its key and
-    /// value blocks where each reads a key-value head of its own), the other head unchanged. An
-    /// exchange of two heads' blocks is no edit: the attention output sums over its heads.
-    HeadReplace,
+}
+
+impl Kind {
+    /// Its name in reports.
+    pub fn name(self) -> &'static str {
+        match self {
+            Kind::Head => "weight_head",
+            Kind::Neurons => "weight_neurons",
+            Kind::HeadReplaced => "weight_head_replaced",
+            Kind::Random => "weight_random",
+        }
+    }
 }
 
 /// A native weight edit of one of `M`'s matrices in factored form, `ΔW = U Vᵀ` (`left` `U`, rows
@@ -411,149 +422,120 @@ impl Factored {
 }
 
 /// A drawn native weight edit: its kind, the block whose maps it edits (`2l` a layer's attention,
-/// `2l + 1` its MLP), its factored changes, and its effect `KL(M_e ‖ M)` in bits per token once
-/// measured (`interchange::Interchange::weight_effects`).
+/// `2l + 1` its MLP), its coordinate edits (`entries`, applied entry-wise in each model: the edited
+/// rows or columns of every part and leftover computing the map scaled, `interchange`'s
+/// `Patch::Weights`), its other changes in factored form (`factors`, each an always-on term
+/// `ΔW·x`), and its effect `KL(M_e ‖ M)` in bits per token once measured
+/// (`interchange::Interchange::weight_effects`).
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Drawn {
     pub kind: Kind,
     pub block: usize,
+    #[serde(default)]
+    pub entries: Vec<EntryEdit>,
+    #[serde(default)]
     pub factors: Vec<Factored>,
     #[serde(default)]
     pub effect: Option<f64>,
 }
-
-/// The factors by which [`Kind::NeuronScale`] and [`Kind::HeadScale`] scale an output.
-pub const SCALES: [f64; 3] = [0.5, 2.0, 3.0];
 
 /// The edges of the effect bins edits are stratified in ([`stratified`]), `KL(M_e ‖ M)` in bits
 /// per token.
 pub const EFFECT_EDGES: [f64; 3] = [0.01, 0.1, 1.0];
 
 /// `count` native weight edits of `M` (`native`, a split sequential decoder: `blocks.{l}.c_fc`,
-/// `down_proj`, `q{h}`, `k{g}`, `v{g}`, `o{h}`), drawn from `seed`: per edit a kind uniform among
-/// those `M` has, then its place uniform (a layer, then a neuron, a head, or two heads; a random
-/// edit's tensor uniform among the six, then its layer and block). A random edit of a block `W`
-/// (`R × C`) is `ΔW = s U Vᵀ` of rank `r` log-uniform in `1..=min(R, C)`, `U` and `V` standard
-/// normal, `s` setting `‖X ΔWᵀ‖ = f ‖X Wᵀ‖` on the rows `X` of `inputs` (the block's inputs on `M`'s
-/// own runs, `interchange::Interchange::matrix_inputs`), `f` log-uniform in `[0.05, 1]`.
-pub fn candidates(native: &OperatorProgram, inputs: &BTreeMap<String, Array2<f64>>, seed: u64, count: usize) -> Result<Vec<Drawn>, String> {
+/// `gate_proj`, `down_proj`, `q{h}`, `k{g}`, `v{g}`, `o{h}`), drawn from `seed` as the edits
+/// driver's strong draw draws them ([`Kind`]): per edit a layer uniform, a scale factor uniform
+/// among `interchange::SCALES`, and a family uniform among the four (a replacement needs two
+/// heads; a random change takes a map uniformly among the tensors, then one of its blocks).
+pub fn candidates(native: &OperatorProgram, seed: u64, count: usize) -> Result<Vec<Drawn>, String> {
     use rand::{RngExt, SeedableRng};
-    let mut rng = rand::rngs::StdRng::seed_from_u64(seed ^ 0x5745_4947_4854_5331);
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed ^ 0x5745_4947_4854_5332);
     let by_name: BTreeMap<&str, &Operator> = native.operators.iter().map(|op| (op.name.as_str(), op.as_ref())).collect();
-    let matrix = |name: &str| -> Option<Array2<f64>> { by_name.get(name).map(|op| op.matrix()) };
-    let has = |name: String| by_name.contains_key(name.as_str());
-    let mut layers = 0;
-    while has(format!("blocks.{layers}.c_fc")) || has(format!("blocks.{layers}.q0")) {
-        layers += 1;
-    }
+    let has = |name: &str| by_name.contains_key(name);
+    let count_of = |l: usize, part: &str| (0..).take_while(|h| has(&format!("blocks.{l}.{part}{h}"))).count();
+    let layers = (0..).take_while(|l| has(&format!("blocks.{l}.q0"))).count();
     if layers == 0 {
-        return Err(error("no layer of M's to edit (blocks.0.c_fc, blocks.0.q0)"));
+        return Err(error("no attention maps of M to edit (blocks.0.q0)"));
     }
-    let count_of = |l: usize, part: &str| (0..).take_while(|h| has(format!("blocks.{l}.{part}{h}"))).count();
-    let heads: Vec<(usize, usize)> = (0..layers).map(|l| (count_of(l, "q"), count_of(l, "k"))).collect();
-    let neurons: Vec<usize> = (0..layers).map(|l| by_name.get(format!("blocks.{l}.c_fc").as_str()).map_or(0, |op| op.rows.width())).collect();
-    let mut kinds = Vec::new();
-    if neurons.iter().any(|n| *n > 0) {
-        kinds.extend([Kind::NeuronRemove, Kind::NeuronScale]);
-    }
-    if heads.iter().any(|h| h.0 > 0) {
-        kinds.extend([Kind::HeadRemove, Kind::HeadScale]);
-    }
-    if heads.iter().any(|h| h.0 > 1) {
-        kinds.push(Kind::HeadReplace);
-    }
-    if neurons.iter().any(|n| *n > 0) || heads.iter().any(|h| h.0 > 0) {
-        kinds.push(Kind::Random);
-    }
-    let normal = |rng: &mut rand::rngs::StdRng, rows: usize, cols: usize| -> Array2<f64> {
-        Array2::from_shape_fn((rows, cols), |_| {
-            let (a, b): (f64, f64) = (rng.random::<f64>().max(f64::MIN_POSITIVE), rng.random());
-            (-2.0 * a.ln()).sqrt() * (std::f64::consts::TAU * b).cos()
-        })
+    let shape = |name: &str| by_name.get(name).map(|op| (op.rows.width(), op.cols.width())).ok_or_else(|| error(format!("{name}: not an operator of M")));
+    let all = |name: String, rows: bool, alpha: f64| -> Result<EntryEdit, String> {
+        let (r, c) = shape(&name)?;
+        Ok(EntryEdit { native: name, rows, units: (0..if rows { r } else { c }).collect(), alpha })
     };
-    let unit = |n: usize, j: usize| Array2::from_shape_fn((n, 1), |(i, _)| if i == j { 1.0 } else { 0.0 });
-    let eye = |n: usize| Array2::<f64>::eye(n);
-    let get = |name: String| matrix(&name).ok_or_else(|| error(format!("{name}: not an operator of M")));
-    // A head's key-value head of its own, if it has one (as many key-value heads as heads).
-    let own_kv = |l: usize| heads[l].0 == heads[l].1;
+    // The maps a random change may take: tensors uniformly (a map stored per head is one tensor),
+    // then one of their blocks.
+    let mut tensors: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for op in native.operators.iter().filter(|op| op.name.starts_with("blocks.") && op.rows.width() > 1 && op.cols.width() > 1 && op.diagonal().is_none()) {
+        tensors.entry(op.name.trim_end_matches(|c: char| c.is_ascii_digit())).or_default().push(&op.name);
+    }
+    let tensors: Vec<Vec<&str>> = tensors.into_values().collect();
+    let block_of = |name: &str| -> usize {
+        let l: usize = name.split('.').nth(1).and_then(|l| l.parse().ok()).unwrap_or(0);
+        let part = name.split('.').nth(2).unwrap_or("");
+        if ["c_fc", "gate_proj", "up_proj", "down_proj"].contains(&part) { 2 * l + 1 } else { 2 * l }
+    };
     let mut out = Vec::with_capacity(count);
     while out.len() < count {
-        let kind = kinds[rng.random_range(0..kinds.len())];
-        let drawn = match kind {
-            Kind::NeuronRemove | Kind::NeuronScale => {
-                let with: Vec<usize> = (0..layers).filter(|l| neurons[*l] > 0).collect();
-                let l = with[rng.random_range(0..with.len())];
-                let j = rng.random_range(0..neurons[l]);
-                let (fc, down) = (get(format!("blocks.{l}.c_fc"))?, get(format!("blocks.{l}.down_proj"))?);
-                let down_column = down.column(j).to_owned().insert_axis(ndarray::Axis(1));
-                let mut factors = Vec::new();
-                let alpha = if kind == Kind::NeuronRemove {
-                    factors.push(Factored { native: format!("blocks.{l}.c_fc"), left: -unit(fc.nrows(), j), right: fc.row(j).to_owned().insert_axis(ndarray::Axis(1)) });
-                    0.0
-                } else {
-                    SCALES[rng.random_range(0..SCALES.len())]
-                };
-                factors.push(Factored { native: format!("blocks.{l}.down_proj"), left: down_column * (alpha - 1.0), right: unit(down.ncols(), j) });
-                Drawn { kind, block: 2 * l + 1, factors, effect: None }
+        let l = rng.random_range(0..layers);
+        let (heads, groups) = (count_of(l, "q"), count_of(l, "k"));
+        let alpha = crate::interchange::SCALES[rng.random_range(0..crate::interchange::SCALES.len())];
+        let drawn = match rng.random_range(0..4) {
+            0 => {
+                let h = rng.random_range(0..heads);
+                let mut entries = vec![all(format!("blocks.{l}.q{h}"), true, alpha)?, all(format!("blocks.{l}.o{h}"), false, alpha)?];
+                if groups == heads {
+                    entries.push(all(format!("blocks.{l}.k{h}"), true, alpha)?);
+                    entries.push(all(format!("blocks.{l}.v{h}"), true, alpha)?);
+                }
+                Drawn { kind: Kind::Head, block: 2 * l, entries, factors: Vec::new(), effect: None }
             }
-            Kind::HeadRemove | Kind::HeadScale | Kind::HeadReplace => {
-                let least = if kind == Kind::HeadReplace { 2 } else { 1 };
-                let with: Vec<usize> = (0..layers).filter(|l| heads[*l].0 >= least).collect();
-                let l = with[rng.random_range(0..with.len())];
-                let h = rng.random_range(0..heads[l].0);
-                let mut parts: Vec<&str> = vec!["q", "o"];
-                if own_kv(l) {
-                    parts.extend(["k", "v"]);
+            1 if has(&format!("blocks.{l}.c_fc")) => {
+                let fc = format!("blocks.{l}.c_fc");
+                let n = shape(&fc)?.0;
+                let k = (8usize << rng.random_range(0..4usize)).min(n);
+                let mut units: Vec<usize> = (0..n).collect();
+                for j in 0..k {
+                    let t = rng.random_range(j..n);
+                    units.swap(j, t);
                 }
-                let mut factors = Vec::new();
-                match kind {
-                    Kind::HeadRemove | Kind::HeadScale => {
-                        let alpha = if kind == Kind::HeadRemove { 0.0 } else { SCALES[rng.random_range(0..SCALES.len())] };
-                        for part in if kind == Kind::HeadRemove { parts.clone() } else { vec!["o"] } {
-                            let w = get(format!("blocks.{l}.{part}{h}"))?;
-                            // The output map `o` (stream × head) changes by columns, the others
-                            // (head × stream) by rows: `ΔW = (α − 1) W` either way.
-                            let (left, right) = if part == "o" { (&w * (alpha - 1.0), eye(w.ncols())) } else { (eye(w.nrows()) * (alpha - 1.0), w.t().to_owned()) };
-                            factors.push(Factored { native: format!("blocks.{l}.{part}{h}"), left, right });
-                        }
-                    }
-                    _ => {
-                        let other = (h + 1 + rng.random_range(0..heads[l].0 - 1)) % heads[l].0;
-                        for part in parts {
-                            let delta = get(format!("blocks.{l}.{part}{other}"))? - get(format!("blocks.{l}.{part}{h}"))?;
-                            let (left, right) = if part == "o" { (delta.clone(), eye(delta.ncols())) } else { (eye(delta.nrows()), delta.t().to_owned()) };
-                            factors.push(Factored { native: format!("blocks.{l}.{part}{h}"), left, right });
-                        }
-                    }
+                units.truncate(k);
+                units.sort_unstable();
+                let mut entries = vec![EntryEdit { native: fc, rows: true, units: units.clone(), alpha }];
+                if has(&format!("blocks.{l}.gate_proj")) {
+                    entries.push(EntryEdit { native: format!("blocks.{l}.gate_proj"), rows: true, units: units.clone(), alpha });
                 }
-                Drawn { kind, block: 2 * l, factors, effect: None }
+                entries.push(EntryEdit { native: format!("blocks.{l}.down_proj"), rows: false, units, alpha });
+                Drawn { kind: Kind::Neurons, block: 2 * l + 1, entries, factors: Vec::new(), effect: None }
             }
-            Kind::Random => {
-                let tensors = ["c_fc", "down_proj", "q", "k", "v", "o"];
-                let part = tensors[rng.random_range(0..tensors.len())];
-                let blocks: Vec<(String, usize)> = (0..layers)
-                    .flat_map(|l| {
-                        let n = if part == "c_fc" || part == "down_proj" { usize::from(neurons[l] > 0) } else { count_of(l, part) };
-                        let one = part == "c_fc" || part == "down_proj";
-                        (0..n).map(move |h| (if one { format!("blocks.{l}.{part}") } else { format!("blocks.{l}.{part}{h}") }, if one { 2 * l + 1 } else { 2 * l }))
-                    })
-                    .collect();
-                if blocks.is_empty() {
-                    continue;
+            2 if heads > 1 => {
+                let h = rng.random_range(0..heads);
+                let other = (h + 1 + rng.random_range(0..heads - 1)) % heads;
+                let maps: &[&str] = if groups == heads { &["q", "k", "v", "o"] } else { &["q", "o"] };
+                let mut factors = Vec::new();
+                for m in maps {
+                    let (from, to) = (by_name[format!("blocks.{l}.{m}{h}").as_str()].matrix(), by_name[format!("blocks.{l}.{m}{other}").as_str()].matrix());
+                    let delta = to - from;
+                    // An output map (stream × head) changes by its columns, the others (head × stream)
+                    // by their rows: the factors through the head's width.
+                    let (left, right) = if *m == "o" { (delta.clone(), Array2::eye(delta.ncols())) } else { (Array2::eye(delta.nrows()), delta.t().to_owned()) };
+                    factors.push(Factored { native: format!("blocks.{l}.{m}{h}"), left, right });
                 }
-                let (name, block) = blocks[rng.random_range(0..blocks.len())].clone();
-                let w = get(name.clone())?;
+                Drawn { kind: Kind::HeadReplaced, block: 2 * l, entries: Vec::new(), factors, effect: None }
+            }
+            _ => {
+                let blocks = &tensors[rng.random_range(0..tensors.len())];
+                let name = blocks[rng.random_range(0..blocks.len())].to_string();
+                let w = by_name[name.as_str()].matrix();
                 let full = w.nrows().min(w.ncols());
-                let rank = ((rng.random::<f64>() * (full as f64).ln()).exp().round() as usize).clamp(1, full);
-                let (u, v) = (normal(&mut rng, w.nrows(), rank), normal(&mut rng, w.ncols(), rank));
-                let x = inputs.get(&name).ok_or_else(|| error(format!("{name}: no measured inputs")))?;
-                let norm = |m: &Array2<f64>| m.iter().map(|v| v * v).sum::<f64>().sqrt();
-                let (own, moved) = (norm(&x.dot(&w.t())), norm(&x.dot(&v).dot(&u.t())));
-                if !(own > 0.0 && moved > 0.0) {
-                    return Err(error(format!("{name}: a zero output on the measured inputs")));
-                }
-                let fraction = (0.05_f64.ln() * (1.0 - rng.random::<f64>())).exp();
-                Drawn { kind, block, factors: vec![Factored { native: name, left: u * (fraction * own / moved), right: v }], effect: None }
+                let rank = ((full as f64).powf(rng.random::<f64>()).round() as usize).clamp(1, full);
+                let ratio = 0.3 * 10f64.powf(rng.random::<f64>());
+                let sign = |rng: &mut rand::rngs::StdRng, r: usize, c: usize| Array2::from_shape_fn((r, c), |_| if rng.random::<bool>() { 1.0 } else { -1.0 });
+                let (a, b) = (sign(&mut rng, w.nrows(), rank), sign(&mut rng, w.ncols(), rank));
+                let size = |m: &Array2<f64>| m.iter().map(|v| v * v).sum::<f64>().sqrt();
+                let delta_size = size(&a.dot(&b.t()));
+                let s = if delta_size > 0.0 { ratio * size(&w) / delta_size } else { 0.0 };
+                Drawn { kind: Kind::Random, block: block_of(&name), entries: Vec::new(), factors: vec![Factored { native: name, left: a * s, right: b }], effect: None }
             }
         };
         out.push(drawn);
@@ -837,6 +819,36 @@ mod tests {
             assert!(edited.abs() <= 1e-9, "{native}: the decomposition scores {edited} bits under the edit");
             let ignored = bits(&s, &compiled.model, &s.explanation.artifact);
             assert!(ignored > 1e-4, "{native}: the edit moves M ({ignored})");
+        }
+    }
+
+    /// Native weight edits as interchange experiments (`interchange::Patch::Weights`) on the exact
+    /// gated-slice decompositions, one component per stage and two per stage sharing their gates:
+    /// every family of edit scores zero (the coordinate edits scale the edited rows' or columns'
+    /// entries at each use of the map, the replacements and random changes add their terms there;
+    /// `Interchange::new` takes the maps' uses, `library_vpd::uses`, for an explanation recording
+    /// no owners), and most edits move `M`.
+    #[test]
+    fn native_weight_edits_score_zero_on_exact_gated_slice_decompositions() {
+        use crate::interchange::{Family, Interchange};
+        for split in [false, true] {
+            let (s, _) = exact_slices(if split { "weight_family_vpd_shared" } else { "weight_family_vpd" }, split);
+            let d = Device::host();
+            let mut x = Interchange::new(&d, &s.native, &s.blocks, &s.explanation.artifact, &s.explanation.trainable, s.explanation.reads.clone(), 1 << 30, 64).expect("the experiments");
+            let drawn = candidates(&s.native, 9, 30).expect("the edits");
+            let kinds: std::collections::BTreeSet<Kind> = drawn.iter().map(|e| e.kind).collect();
+            assert_eq!(kinds.len(), 4, "{kinds:?}");
+            let count = drawn.len();
+            x.set_weight_edits(drawn).expect("the table");
+            let experiments = x.sample_ops(&mut StdRng::seed_from_u64(4), &s.batch, &[Family::Weight], 10, &[1, 2, 0], false).expect("the draw");
+            let bits = x.evaluate(&s.batch, &experiments, false).expect("evaluate").bits;
+            let failing: Vec<String> = experiments.iter().zip(&bits).filter(|(_, b)| b.iter().any(|v| v.abs() > 1e-9)).map(|(e, b)| match &e.patch {
+                Some(crate::interchange::Patch::Weights { edit, .. }) => format!("{:?} {:?} {:.3}", x.weight_edits()[*edit].kind, x.weight_edits()[*edit].entries.iter().map(|e| (e.native.as_str(), e.rows, e.alpha)).collect::<Vec<_>>(), b.iter().sum::<f64>()),
+                _ => format!("clean {:.3}", b.iter().sum::<f64>()),
+            }).collect();
+            assert!(failing.is_empty(), "shared {split}: {failing:?}");
+            let effects = x.weight_effects(&s.batch, &(0..count).collect::<Vec<_>>()).expect("the effects");
+            assert!(effects.iter().filter(|e| **e > 1e-6).count() * 10 >= count * 8, "shared {split}: {effects:?}");
         }
     }
 
