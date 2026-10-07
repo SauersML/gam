@@ -28,7 +28,7 @@
 use super::device_attention::Segment;
 use super::device_heads::{self, Buffer, Heads, Stacked};
 use super::operator_program::{Basis, FamilyInputs, Law, Node, Operator, OperatorBody, OperatorProgram, Rotary, SlotValues};
-use gam_gpu::tensor::{Arithmetic, ColumnBlocks, Device, GateFunction, Indices, Op, PointwiseLaw, Storage, Tensor};
+use gam_gpu::tensor::{Arithmetic, ColumnBlocks, Device, GateFunction, Indices, Op, PointwiseLaw, RowLists, Storage, Tensor};
 use ndarray::{Array1, Array2};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -226,19 +226,25 @@ pub struct DeviceProgram {
     /// Emptied by every forward pass and every write of an operator.
     rounded: Mutex<BTreeMap<usize, Arc<Tensor>>>,
     /// Per node, whether its value is exactly zero wherever its law is off (a pointwise node of
-    /// ReLUs): a dense product reading it reads only its nonzero columns ([`Active`]).
+    /// ReLUs): a dense product reading it reads only its nonzero columns ([`Active`]). A gated
+    /// node's zeros are per row instead ([`DeviceProgram::listed`]).
     exact_zeros: Vec<bool>,
     /// Per node, the positions whose rows of it no reader uses: every reader is a select taking
     /// another node's rows there (a transcoder block's output at the attention sink).
     dead: Vec<Vec<u32>>,
     /// Per node, its reader when it has exactly one.
     sole: Vec<Option<usize>>,
-    /// Per affine node read only by a hard-gated node as its value (`Node::Gated`, no scale), with
-    /// one term and its gate computed before it: that gate's node and the affine's column range per
-    /// gated group. Its forward takes
-    /// only the columns of the groups its gate turns on in the batch: the others are multiplied by
-    /// `H = 0` and reach nothing (a component's reads downstream of its gate).
-    gated_reads: Vec<Option<(usize, Vec<std::ops::Range<usize>>)>>,
+    /// Per gated node (`Node::Gated`), the column where each of its value's groups starts and the
+    /// end: per row its components on ([`DeviceProgram::row_lists`]) span these columns, and its
+    /// value is exactly zero on every other (`H = 0`, or an expected gate `Φ` that is zero with its
+    /// slope). A product writing from it takes each row's own components only, and so does its
+    /// cotangent's pull ([`Device::listed_product`], [`Device::sampled_product`]).
+    listed: Vec<Option<Vec<u32>>>,
+    /// Per affine node read only by a gated node as its value, with one term and the gate (and
+    /// scale) computed before it: that gated node. Its forward reads each row's components on only,
+    /// zero on the others, which the gate multiplies by zero (a component's reads downstream of
+    /// its gate), and its cotangent's pull reads those entries alone.
+    gated_reads: Vec<Option<usize>>,
 }
 
 /// The columns of an exactly-zero node (`DeviceProgram::exact_zeros`) a product reads: those
@@ -409,6 +415,8 @@ pub struct DeviceTrace {
     segments: Option<Arc<Vec<Segment>>>,
     /// Per affine node and argument it read sparsely, the argument's columns it read ([`Active`]).
     active: BTreeMap<(usize, usize), Active>,
+    /// Per gated node read on per-row lists, its lists ([`DeviceProgram::row_lists`]).
+    lists: BTreeMap<usize, Arc<RowLists>>,
     /// Bfloat16 copies of node values a bfloat16 forward pass's and the reverse passes' products read
     /// ([`DeviceTrace::rounded_value`]), kept until [`DeviceTrace::release_rounded`].
     rounded: Mutex<BTreeMap<usize, Arc<Tensor>>>,
@@ -879,7 +887,7 @@ impl DeviceProgram {
         let exact_zeros = program
             .nodes
             .iter()
-            .map(|n| matches!(n, Node::Pointwise { laws, .. } if !laws.is_empty() && laws.iter().all(|l| matches!(l, Law::Relu))) || matches!(n, Node::Gated { scale: None, .. }))
+            .map(|n| matches!(n, Node::Pointwise { laws, .. } if !laws.is_empty() && laws.iter().all(|l| matches!(l, Law::Relu))))
             .collect();
         let dead = (0..program.nodes.len())
             .map(|n| {
@@ -896,15 +904,22 @@ impl DeviceProgram {
             })
             .collect();
         let sole: Vec<Option<usize>> = readers.iter().map(|r| if r.len() == 1 { Some(r[0]) } else { None }).collect();
-        let gated_reads = (0..program.nodes.len())
-            .map(|n| match (&program.nodes[n], sole[n].map(|r| &program.nodes[r])) {
-                (Node::Affine { terms, .. }, Some(Node::Gated { value, gate, scale: None })) if *value == n && *gate < n && terms.len() == 1 => {
-                    Some((*gate, (0..interfaces[n].group_count()).map(|g| interfaces[n].range(g)).collect()))
-                }
+        let listed = (0..program.nodes.len())
+            .map(|n| match &program.nodes[n] {
+                Node::Gated { value, .. } => Some(std::iter::once(0).chain((0..interfaces[*value].group_count()).map(|g| interfaces[*value].range(g).end as u32)).collect()),
                 _ => None,
             })
             .collect();
-        Ok(Self { device: device.clone(), steps, widths, head, edited_head_nodes, operators, batch: Mutex::new(None), rotary_tables: Mutex::new(Vec::new()), bf16: false, arithmetic: Arithmetic::F64, fused, grouped, revisions: BTreeMap::new(), rounded: Mutex::new(BTreeMap::new()), exact_zeros, dead, sole, gated_reads })
+        let gated_reads = (0..program.nodes.len())
+            .map(|n| match (&program.nodes[n], sole[n]) {
+                (Node::Affine { terms, .. }, Some(r)) if terms.len() == 1 => match &program.nodes[r] {
+                    Node::Gated { value, gate, scale } if *value == n && *gate < n && scale.is_none_or(|s| s < n) => Some(r),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        Ok(Self { device: device.clone(), steps, widths, head, edited_head_nodes, operators, batch: Mutex::new(None), rotary_tables: Mutex::new(Vec::new()), bf16: false, arithmetic: Arithmetic::F64, fused, grouped, revisions: BTreeMap::new(), rounded: Mutex::new(BTreeMap::new()), exact_zeros, dead, sole, listed, gated_reads })
     }
 
     /// Operator `op`'s device copy changed: every group reading it runs node by node until
@@ -1191,7 +1206,15 @@ impl DeviceProgram {
     /// reference the sparse reads are tested and timed against.
     pub fn read_densely(&mut self) {
         self.exact_zeros.iter_mut().for_each(|z| *z = false);
+        self.listed.iter_mut().for_each(|l| *l = None);
         self.gated_reads.iter_mut().for_each(|g| *g = None);
+    }
+
+    /// How many entries of gated node `gated`'s value the pass that made `trace` listed, its rows'
+    /// components on ([`DeviceProgram::row_lists`]); `None` when it listed none (a dense pass).
+    #[must_use]
+    pub fn entries_listed(&self, trace: &DeviceTrace, gated: usize) -> Option<usize> {
+        trace.lists.get(&gated).map(|lists| lists.len())
     }
 
     /// How many columns of `argument` affine node `node` read in the pass that made `trace`
@@ -1453,32 +1476,73 @@ impl DeviceProgram {
         Ok(Some((if columns.len() == x.cols() { None } else { Some(Arc::new(d.upload_indices(&columns).map_err(error)?)) }, dead)))
     }
 
-    /// Affine node `node`'s term `(argument, operator)` on the columns of the groups its gate turns
-    /// on in the batch, zero elsewhere ([`DeviceProgram::gated_reads`]): `x A_idsᵀ` from the rows
-    /// `ids` of `A` (held dense in f32 or f64). `None` for the whole product (no gated read, or every
-    /// group on).
-    fn gated_read(&self, trace: &DeviceTrace, node: usize, (argument, operator): (usize, usize), (rows, width): (usize, usize)) -> Result<Option<Tensor>, String> {
-        let Some((gate, ranges)) = &self.gated_reads[node] else { return Ok(None) };
-        let Held::Dense(a) = self.held(operator, Role::Product)? else { return Ok(None) };
-        let x = trace.value(argument)?;
-        if a.storage() == Storage::Bf16 || x.storage() == Storage::Bf16 {
-            return Ok(None);
+    /// Gated node `gated`'s per-row lists ([`DeviceProgram::listed`]): per row the columns of the
+    /// components its gate turns on (`H(gate) = 1`), or with a scale those whose expected gate
+    /// `Φ(gate / scale)` or its slope `φ(gate / scale) / scale` is not zero (their sum, of two
+    /// terms never negative, is zero only where both are). Made once a pass, from the gate's
+    /// values, and kept in the trace; `None` when the node is not listed (a dense pass) or its gate
+    /// is held in bfloat16.
+    fn row_lists(&self, trace: &mut DeviceTrace, gated: usize) -> Result<Option<Arc<RowLists>>, String> {
+        let Some(starts) = &self.listed[gated] else { return Ok(None) };
+        if let Some(lists) = trace.lists.get(&gated) {
+            return Ok(Some(Arc::clone(lists)));
         }
+        let Step::Gated { gate, scale, .. } = &self.steps[gated] else { return Err(format!("device: node {gated} is not gated")) };
         let d = &self.device;
-        let on = d.gate_function(GateFunction::Step, trace.value(*gate)?, None).map_err(error)?;
-        let groups = d.nonzero_columns(&on, &(0..trace.rows as u32).collect::<Vec<_>>()).map_err(error)?;
-        let columns: Vec<u32> = groups.iter().flat_map(|&g| ranges[g as usize].clone()).map(|c| c as u32).collect();
-        if columns.len() == width {
+        let z = trace.value(*gate)?;
+        if z.storage() == Storage::Bf16 {
             return Ok(None);
         }
-        let mut out = d.zeros(rows, width).map_err(error)?;
-        if !columns.is_empty() {
-            let ids = d.upload_indices(&columns).map_err(error)?;
-            let mut part = d.empty(rows, columns.len()).map_err(error)?;
-            d.gemm(&mut part, 1.0, x, Op::N, &d.gather_rows(a, &ids).map_err(error)?, Op::T, 0.0, self.arithmetic).map_err(error)?;
-            d.scatter_columns(&mut out, &ids, &part, false).map_err(error)?;
+        let mask = match scale {
+            None => d.gate_function(GateFunction::Step, z, None).map_err(error)?,
+            Some(s) => {
+                let s = trace.value(*s)?;
+                let mut mask = d.gate_function(GateFunction::Cdf, z, Some(s)).map_err(error)?;
+                d.axpy(&mut mask, 1.0, &d.gate_function(GateFunction::CdfSlope, z, Some(s)).map_err(error)?).map_err(error)?;
+                mask
+            }
+        };
+        let lists = Arc::new(d.row_lists(&mask, starts).map_err(error)?);
+        trace.lists.insert(gated, Arc::clone(&lists));
+        Ok(Some(lists))
+    }
+
+    /// `A` held dense in f32 or f64 in `x`'s storage, for a product on per-row lists; `None` for
+    /// the dense product.
+    fn listed_operand(&self, operator: usize, x: &Tensor) -> Result<Option<&Tensor>, String> {
+        Ok(match self.held(operator, Role::Product)? {
+            Held::Dense(a) if a.storage() != Storage::Bf16 && a.storage() == x.storage() => Some(a),
+            _ => None,
+        })
+    }
+
+    /// Affine node `node`'s term `(argument, operator)` at the entries its gated reader lists
+    /// ([`DeviceProgram::gated_reads`]), zero elsewhere: per row `x Aᵀ` on the columns of the
+    /// components on in that row only. `None` for the dense product.
+    fn gated_read(&self, trace: &mut DeviceTrace, node: usize, (argument, operator): (usize, usize)) -> Result<Option<Tensor>, String> {
+        let Some(gated) = self.gated_reads[node] else { return Ok(None) };
+        if self.listed_operand(operator, trace.value(argument)?)?.is_none() {
+            return Ok(None);
         }
-        Ok(Some(out))
+        let Some(lists) = self.row_lists(trace, gated)? else { return Ok(None) };
+        let x = trace.value(argument)?;
+        let a = self.listed_operand(operator, x)?.ok_or("device: a listed operand")?;
+        self.device.sampled_product(x, a, &lists).map(Some).map_err(error)
+    }
+
+    /// The product of affine node `node`'s term `(argument, operator)` when `argument` is a gated
+    /// node read on per-row lists ([`DeviceProgram::listed`]): row `r` sums `A`'s columns of the
+    /// components on in that row only (`v Aᵀ` from `v`'s listed entries). `None` for the dense
+    /// product.
+    fn listed_write(&self, trace: &mut DeviceTrace, (argument, operator): (usize, usize)) -> Result<Option<Tensor>, String> {
+        if self.listed[argument].is_none() || self.listed_operand(operator, trace.value(argument)?)?.is_none() {
+            return Ok(None);
+        }
+        let Some(lists) = self.row_lists(trace, argument)? else { return Ok(None) };
+        let d = &self.device;
+        let v = trace.value(argument)?;
+        let a = self.listed_operand(operator, v)?.ok_or("device: a listed operand")?;
+        d.listed_product(v, &lists, &d.transpose(a).map_err(error)?).map(Some).map_err(error)
     }
 
     /// `x Aᵀ` (`A` held dense) from the columns `ids` of `x` and of `A`, the dense product on every
@@ -1785,6 +1849,7 @@ impl DeviceProgram {
             positions: Arc::clone(&batch.positions),
             segments: span.segments.clone(),
             active: BTreeMap::new(),
+            lists: BTreeMap::new(),
             rounded: Mutex::new(BTreeMap::new()),
         };
         for (index, step) in self.steps.iter().enumerate() {
@@ -1849,9 +1914,14 @@ impl DeviceProgram {
                 Step::Affine { terms, bias } => {
                     // The first term's product is the output, written whole (`product`); an identity
                     // first term with a dense second is one product onto the identity's argument.
-                    // A gated read takes only the columns of the groups its gate turns on.
+                    // A gated read takes each row's components on only, and so does a write from a
+                    // gated node (unless an edit changed it).
                     let gated = match terms.first() {
-                        Some(&(argument, operator)) if !hook => self.gated_read(&trace, index, (argument, operator), (rows, width))?,
+                        Some(&(argument, operator)) if !hook => match self.gated_read(&mut trace, index, (argument, operator))? {
+                            Some(out) => Some(out),
+                            None if !hooks.before(argument) => self.listed_write(&mut trace, (argument, operator))?,
+                            None => None,
+                        },
                         _ => None,
                     };
                     let (mut out, rest) = match self.onto_identity(&trace, terms)? {
@@ -2481,6 +2551,10 @@ impl DeviceProgram {
                     for (argument, operator) in terms {
                         // A cotangent of the argument kept or edited is the dense one.
                         let observed = keep.contains(argument) || edited.contains(argument);
+                        if needed[*argument] && !matches!(self.steps[*argument], Step::Feature { .. }) && let Some(term) = self.listed_pull(trace, (index, *argument, *operator), &cot, (observed, edited, &seeded))? {
+                            add(&mut g, *argument, term)?;
+                            continue;
+                        }
                         match self.reverse_active(trace, (index, *argument), (edited, &seeded)) {
                             Some(ids) if needed[*argument] && !observed => {
                                 let part = self.columns_pull(trace.rows, (&cot, &mut half), *operator, &ids, arithmetic)?;
@@ -2616,21 +2690,12 @@ impl DeviceProgram {
         let d = &self.device;
         let rows = trace.rows;
         match &self.steps[index] {
-            Step::Pointwise { .. } | Step::Gated { .. } if self.exact_zeros[index] => {
-                // The input's cotangent on the same columns: through the ReLU's slope, or a gated
-                // value's read columns times their components' H.
-                let (input, term) = if let Step::Gated { value, gate, of, .. } = &self.steps[index] {
-                    let spread = d.gather_columns(&self.gate_weights(trace, *gate, None)?, of).map_err(error)?;
-                    let weights = d.gather_columns(&spread, ids).map_err(error)?;
-                    let mut term = d.empty(part.rows(), part.cols()).map_err(error)?;
-                    d.hadamard(&mut term, part, &weights, false).map_err(error)?;
-                    (*value, term)
-                } else {
-                    let input = step_arguments(&self.steps[index])[0];
-                    let z = d.gather_columns(trace.value(input)?, ids).map_err(error)?;
-                    let codes = d.upload_indices(&vec![law_of(Law::Relu).code(); ids.len()]).map_err(error)?;
-                    (input, d.law_slopes(part, &z, &codes, gelu_tanh_constant()).map_err(error)?)
-                };
+            Step::Pointwise { .. } if self.exact_zeros[index] => {
+                // The input's cotangent on the same columns, through the ReLU's slope.
+                let input = step_arguments(&self.steps[index])[0];
+                let z = d.gather_columns(trace.value(input)?, ids).map_err(error)?;
+                let codes = d.upload_indices(&vec![law_of(Law::Relu).code(); ids.len()]).map_err(error)?;
+                let term = d.law_slopes(part, &z, &codes, gelu_tanh_constant()).map_err(error)?;
                 if !needed[input] {
                     return Ok(());
                 }
@@ -2723,6 +2788,26 @@ impl DeviceProgram {
     /// The columns affine node `node` read of `argument` sparsely in the forward pass ([`Active`]),
     /// when its reverse may use them: its cotangent is zero on the rows the columns were not taken
     /// on (`node` neither seeded nor edited).
+    /// Affine node `node`'s pull of `cot` through its term `(argument, operator)` on per-row lists:
+    /// to a gated node it writes from, `cot A` at that node's listed entries only (the gate zeroes
+    /// the rest of its value's cotangent), and from a gated read's cotangent, zero off its lists,
+    /// `cot A` from the listed entries alone. `None` for the dense pull: the argument's cotangent
+    /// kept or edited (`observed`), or this node's cotangent seeded or edited.
+    fn listed_pull(&self, trace: &DeviceTrace, (node, argument, operator): (usize, usize, usize), cot: &Tensor, (observed, edited, seeded): (bool, &BTreeSet<usize>, &BTreeSet<usize>)) -> Result<Option<Tensor>, String> {
+        let d = &self.device;
+        if let Some(lists) = self.gated_reads[node].and_then(|r| trace.lists.get(&r)).filter(|_| !seeded.contains(&node) && !edited.contains(&node))
+            && let Some(a) = self.listed_operand(operator, cot)?
+        {
+            return d.listed_product(cot, lists, a).map(Some).map_err(error);
+        }
+        if let Some(lists) = trace.lists.get(&argument).filter(|_| !observed && self.listed[argument].is_some())
+            && let Some(a) = self.listed_operand(operator, cot)?
+        {
+            return d.sampled_product(cot, &d.transpose(a).map_err(error)?, lists).map(Some).map_err(error);
+        }
+        Ok(None)
+    }
+
     fn reverse_active(&self, trace: &DeviceTrace, (node, argument): (usize, usize), (edited, seeded): (&BTreeSet<usize>, &BTreeSet<usize>)) -> Option<Arc<Indices>> {
         if edited.contains(&node) || seeded.contains(&node) {
             return None;
@@ -3839,7 +3924,7 @@ mod gated_tests {
     /// A gated layer: reads `a = V x` in components of widths 1, 2, 1, 3, 1, its gate `z` either a
     /// component's own read norm `‖a_b‖ − τ_b` or a direction `g_bᵀx − τ_b`, the gated reads
     /// (`H(z)`, or `Φ(z / s)` with the scale `s` a raw slot), written back by `U`. Thresholds put
-    /// some components off on some rows.
+    /// some components off on some rows, and small scales some expected gates at zero.
     fn layer(direction: bool, soft: bool, seed: u64) -> (OperatorProgram, FamilyInputs) {
         let mut rng = StdRng::seed_from_u64(seed);
         let mut normal = |r: usize, c: usize| Array2::from_shape_fn((r, c), |_| rng.random::<f64>() - 0.5);
@@ -3876,7 +3961,9 @@ mod gated_tests {
         let rows = 24;
         let mut values = vec![SlotValues::Raw(normal(rows, D))];
         if soft {
-            values.push(SlotValues::Raw(Array2::from_shape_fn((rows, b), |(i, j)| 0.2 + 0.05 * ((i + j) % 4) as f64)));
+            // Some scales small enough that a component below its threshold has an expected gate
+            // and slope of exactly zero, in float32 and float64.
+            values.push(SlotValues::Raw(Array2::from_shape_fn((rows, b), |(i, j)| if (i + j) % 3 == 0 { 1e-3 } else { 0.2 + 0.05 * ((i + j) % 4) as f64 })));
         }
         let layout = SequenceLayout { sequence: vec![0; rows], position: (0..rows as u32).collect() };
         (program, FamilyInputs { rows, slots: values, layout: Some(layout) })
@@ -3886,7 +3973,7 @@ mod gated_tests {
     /// positive), and every device's forward, the input's cotangent, the tangent along every
     /// trainable operator and the gradients of V, U, the thresholds and the gate rows equal the
     /// host's derivatives and the device's own dense read;
-    /// with hard gates the write reads only the active components' columns. The program's code
+    /// the write reads each row's components on only. The program's code
     /// keeps the nodes.
     #[test]
     fn a_gated_layer_is_its_definition_on_every_device() {
@@ -3939,10 +4026,10 @@ mod gated_tests {
                 lowered.set_arithmetic(arithmetic);
                 let trace = lowered.forward(&family).unwrap();
                 close("the output", &device.download(trace.value(program.output).unwrap()).unwrap(), &host.values[program.output]);
-                if !soft {
-                    let read = lowered.columns_read(&trace, program.output, gate);
-                    assert!(read.is_some_and(|n| n < WIDTHS.iter().sum::<usize>()), "{}: the write reads the active components only ({read:?})", device.name());
-                }
+                // The write reads each row's components on only: with hard gates those whose gate is
+                // positive, with soft ones those whose expected gate or its slope is not zero.
+                let listed = lowered.entries_listed(&trace, gate);
+                assert!(listed.is_some_and(|n| n < family.rows * WIDTHS.iter().sum::<usize>()), "{} soft {soft}: the write reads the components on only ({listed:?})", device.name());
                 let seeds = || BTreeMap::from([(program.output, device.upload(seed.view()).unwrap())]);
                 let (nodes, gradients) = lowered.vjp_values_dense(&trace, seeds(), &[0], &trainable, arithmetic).unwrap();
                 close("the input's cotangent", &device.download(&nodes[&0]).unwrap(), host_cot[0].as_ref().unwrap());
@@ -3960,8 +4047,9 @@ mod gated_tests {
     }
 
     /// A component spanning two maps under one gate (an MLP's: reads at the input, gated, written,
-    /// a GELU, read again, gated by the same gate, written): the second map's reads are made on the
-    /// components their gate turns on only (zero on the others, which the gate zeroes), and the
+    /// a GELU, read again, gated by the same gate, written): the second map's reads are made per
+    /// row on the components their gate turns on there only (zero on the others, which the gate
+    /// zeroes), and the
     /// output, the input's cotangent and every gradient equal the host's and the device's own dense
     /// pass's.
     #[test]
@@ -3996,8 +4084,9 @@ mod gated_tests {
         let rows = 3;
         let family = FamilyInputs { rows, slots: vec![SlotValues::Raw(normal(rows, D))], layout: Some(SequenceLayout { sequence: vec![0; rows], position: (0..rows as u32).collect() }) };
         let host = program.execute(&family, false).unwrap();
-        let on: Vec<usize> = (0..b).filter(|&g| (0..rows).any(|row| host.values[3][[row, g]] > 0.0)).collect();
-        assert!(!on.is_empty() && on.len() < b, "some components are on in the batch and some never: {on:?}");
+        let on = |row: usize, g: usize| host.values[3][[row, g]] > 0.0;
+        let count = (0..rows).map(|row| (0..b).filter(|&g| on(row, g)).count()).sum::<usize>();
+        assert!(count > 0 && count < rows * b, "some components are on in some rows and off in others: {count}");
         let seed = Array2::from_shape_fn((rows, OUT), |(i, j)| ((i * 5 + j) % 7) as f64 / 7.0 - 0.5);
         let host_cot = crate::derivatives::vjp_seeded(&program, &family, &host, BTreeMap::from([(9, seed.clone())]), None).unwrap();
         let trainable = vec![0, 1, 2, 3, 4];
@@ -4015,10 +4104,10 @@ mod gated_tests {
             lowered.set_arithmetic(arithmetic);
             let trace = lowered.forward(&family).unwrap();
             close("the output", &device.download(trace.value(9).unwrap()).unwrap(), &host.values[9]);
-            // The second reads: the host's on the groups turned on, zero on the others.
+            // The second reads: the host's where the row's component is on, zero elsewhere.
             let mut expected = host.values[7].clone();
-            for g in (0..b).filter(|g| !on.contains(g)) {
-                expected.slice_mut(ndarray::s![.., interface.range(g)]).fill(0.0);
+            for (row, g) in (0..rows).flat_map(|row| (0..b).map(move |g| (row, g))).filter(|&(row, g)| !on(row, g)) {
+                expected.slice_mut(ndarray::s![row, interface.range(g)]).fill(0.0);
             }
             close("the downstream reads", &device.download(trace.value(7).unwrap()).unwrap(), &expected);
             let seeds = || BTreeMap::from([(9, device.upload(seed.view()).unwrap())]);
