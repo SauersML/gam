@@ -1027,6 +1027,11 @@ for l, R in ROUTER.items():
 # sigma^2) / 2 per tensor of n entries. Each step draws one sample of every tensor; evaluation is
 # at the posterior mean.
 FMODE = os.environ.get('DESCENT_F') == '1'
+# DESCENT_COUNT=mean (F only): the budget's E[k] at the posterior mean, the explanation evaluated, rather
+# than at the step's sample. At the sample, parts whose reads or thresholds are wide fire at random (the whole
+# model at K = 128 under F: 602 parts on per training token against 77 at the mean after 915 steps, then the
+# multiplier rose to 914 and closed every gate at the mean).
+COUNT_MEAN = FMODE and os.environ.get('DESCENT_COUNT') == 'mean'
 N = train_rows * 512
 leaves = []
 if FMODE:
@@ -1063,11 +1068,28 @@ def draw(mean):
     for n in attn if not ATTN_FREE else ():
         A[n]['V'], A[n]['U'] = head_frame(A[n]['F'], T.site(n).W, A[n]['o'])
 
+# DESCENT_PRIOR=part: each part's read and write get their own prior group N(0, v_j) (v_j at its optimum,
+# the mean of mu^2 + sigma^2 over the part's entries; each v_j described in (1/2) ln n_j nats, n_j its
+# entries) instead of one per tensor. Under a tensor's prior an unused part's entries revert to the
+# tensor's scale, the scale of the used parts, and such random reads fire at the sampled parameters (the
+# whole model at K = 128: sigma 2x RMS(mu) on reads and writes after 915 steps, 602 parts on per training
+# token against 77 at the posterior mean); under its own prior an unused part costs nothing at mu = 0
+# whatever its width, and its mean decays to zero.
+PART_PRIOR = os.environ.get('DESCENT_PRIOR') == 'part'
+
 def description_bits():
     """KL(q || p) in bits (F only)."""
     total = 0.0
-    for _, _, mu, ls in leaves:
-        v = (mu.pow(2) + (2 * ls).exp()).mean()
+    for _, key, mu, ls in leaves:
+        e = mu.pow(2) + (2 * ls).exp()
+        if PART_PRIOR and key in ('V', 'U') and mu.dim() >= 2:
+            # A read's part is its last axis (MLP [d_in, r], heads [H, d, C]), a write's its second last
+            # (MLP [r, d_out], heads [H, C, d_out]).
+            d_ = -2 if key == 'V' else -1
+            v = e.mean(d_)
+            total = total + 0.5 * (mu.shape[d_] * torch.log(v).sum() - 2 * ls.sum()) + 0.5 * math.log(mu.shape[d_]) * v.numel()
+            continue
+        v = e.mean()
         total = total + 0.5 * (mu.numel() * torch.log(v) - 2 * ls.sum())
     for Rn in RES.values():
         # The residual's entries under their own prior group N(0, v_R), posterior N(R, sigma_R^2).
@@ -1147,6 +1169,13 @@ for step in range(steps):
     # sequences only (an edited, all-on or leftover-removal sequence runs extra machinery, e.g. its
     # leftover where the parts cannot express the edit, which the clean budget does not cap).
     counted = torch.tensor([1.0 if k_ is None else 0.0 for k_ in kinds], device=dev)[:, None].expand(batch, seq).reshape(-1)
+    if COUNT_MEAN:
+        # Under F the budget counts the explanation evaluated, the posterior mean: the clean sequences run
+        # again at the mean (the data term stays at this step's sample).
+        clean = [b for b, k_ in enumerate(kinds) if k_ is None]
+        draw(True); install([None] * len(clean))
+        run(ids[clean], 'soft')
+        counted = torch.ones(len(clean) * seq, device=dev)
     ek = (torch.stack(state['soft']).sum(0) * counted).sum() / counted.sum()
     hk = ((torch.stack(state['hard']).sum(0) * counted).sum() / counted.sum()).item()
     if EDGES:
@@ -1194,6 +1223,13 @@ for step in range(steps):
     step_seconds.append(time.time() - t_step)
     last = step == steps - 1 or time.time() - t0 > LIMIT
     if (step + 1) % EVAL == 0 or last:
+        # This step's parts on per clean training token, per map (at the sample under F), and under F each
+        # kind of tensor's posterior width: the median over tensors of RMS(sigma) / RMS(mu).
+        train_per_map = [((h * counted).sum() / counted.sum()).item() for h in state['hard']]
+        sigma_rel = {}
+        for _, key, mu, ls in leaves:
+            sigma_rel.setdefault(key, []).append((ls.exp().pow(2).mean() / mu.pow(2).mean().clamp_min(1e-30)).sqrt().item())
+        sigma_rel = {key: float(np.median(v)) for key, v in sigma_rel.items()}
         draw(True)
         e = evaluate(final=last)
         e['weight_edits'] = evaluate_edits()
@@ -1201,7 +1237,8 @@ for step in range(steps):
         e['train_kl_edited'] = float(kl_seq[:N_EDITS].mean()) if N_EDITS else None
         step_seconds = []
         rec = {'step': step + 1, 'lambda': lam, 'K_t': Kt, 'train_kl': kl.item(), 'description_bits': desc.item(), 'train_edge_bits': float(edge_bits),
-               'train_F': objective.item(), 'train_k_soft': ek.item(), 'train_k_hard': hk, **e,
+               'train_F': objective.item(), 'train_k_soft': ek.item(), 'train_k_hard': hk, 'train_per_map': train_per_map,
+               'sigma_rel': sigma_rel, **e,
                'seconds': time.time() - t0}
         log['trace'].append(rec); print(rec, flush=True); save(step + 1)
         json.dump(log, open(out, 'w'), indent=1)
