@@ -279,10 +279,11 @@ class CachedReader:
                                           cache_position=positions.to(d), past_key_values=c, use_cache=True).last_hidden_state
                 for row, i in enumerate(chunk):
                     js = [j for j, _ in reads[i]]
-                    lp = torch.log_softmax(self.model.lm_head(hidden[row, js]).double(), -1)
+                    # Normalized in float64 on the host (the Mac's GPU has no float64).
+                    lp = torch.log_softmax(self.model.lm_head(hidden[row, js]).float().cpu().double(), -1)
                     res = []
                     for r, (_, want) in enumerate(reads[i]):
-                        res.append(lp[r].cpu().numpy() if want is None else lp[r, want].cpu().numpy())
+                        res.append(lp[r].numpy() if want is None else lp[r, want].numpy())
                     out[i] = res
             del c, hidden
             start = stop
