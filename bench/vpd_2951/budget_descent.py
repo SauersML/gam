@@ -1097,13 +1097,15 @@ DUAL = os.environ.get('DESCENT_DUAL', 'measured')
 B_H = max(1, EVAL // 10)
 lam, rng = 0.0, np.random.default_rng(0)
 log = {'start': start, 'K': K, 'steps': steps, 'gate': gate, 'arm': ARM, 'dual': DUAL, 'train_rows': train_rows, 'F': FMODE, 'edges': EDGES, 'trace': []}
-# DESCENT_SAVE=PATH: after every evaluation, the MLP maps' slices and gates at the posterior mean
+# DESCENT_SAVE=PATH: after every evaluation, the maps' slices and gates at the posterior mean
 # (reads V [d_in, C], writes U [C, d_out], thresholds tau [C] and noise scales s [C] per map, and the
 # neuron start's tied down slices), for export_to_rust.py (library_vpd's importer).
 def save(step):
     if os.environ.get('DESCENT_SAVE'):
         torch.save({'step': step, 'start': start, 'arm': ARM, 'gate': gate,
                     'maps': {n: {k: P[n][k].detach().float().cpu() for k in ('V', 'U', 'tau', 's')} for n in mlp},
+                    # The heads' slices (DESCENT_SITES=all): reads V [H, d_in_h, C], writes U [H, C, d_out_h].
+                    'attn': {n: {k: A[n][k].detach().float().cpu() for k in ('V', 'U', 'tau', 's')} for n in attn},
                     'tied': {dn: (fc, own.cpu()) for dn, (fc, own) in GROUP.items()}}, os.environ['DESCENT_SAVE'])
 
 draw(True)
