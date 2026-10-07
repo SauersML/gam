@@ -125,3 +125,18 @@ def test_greedy_addition_and_removal_find_the_planted_units():
         mlp = [u for u in units if u[0] == "mlp"]
         assert mlp and all(u[1] == 0 and u[3] <= 768 for u in mlp), (mode, mlp)
         assert sum(u[3] - u[2] for u in mlp) == 768, (mode, mlp)
+
+
+def test_search_programs_trace_and_names_round_trip():
+    import search
+    units = search.all_units("vpd4l")
+    for u in units + [b for b, _ in search.pieces_of(("mlp", 2, 0, 3072), 384)]:
+        assert search.unit_of(search.name(u)) == u
+    ir = mech.trace_inline(search.source(units), "vpd4l")
+    assert ir["valid"], ir["error"]
+    # every unit, and every causal edge among them, embed and the logits
+    sites = sorted(search.site(u) for u in units)
+    edges = sum(1 + sum(t < s for t in sites) for s in sites) + 1 + len(units)
+    assert len(ir["nodes"]) == len(units) and len(ir["edges"]) == edges
+    blocks = search.pieces_of(("mlp", 0, 0, 3072), 384)
+    assert len(blocks) == 15 and all(sum(r[3] - r[2] for r in rest) + b[3] - b[2] == 3072 for b, rest in blocks)
