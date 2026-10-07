@@ -30,7 +30,10 @@ def main():
     for path in args.shards + args.average_cuts:
         average = path in args.average_cuts
         for line in open(path):
-            q = json.loads(line)
+            try:
+                q = json.loads(line)
+            except json.JSONDecodeError:  # a shard still being written ends mid-line
+                continue
             if q.get("piece_split", "train") != "train" or q.get("split") != "train":
                 continue
             if average and q["type"] == "cut":
