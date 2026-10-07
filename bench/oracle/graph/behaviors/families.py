@@ -1577,3 +1577,71 @@ def boilerplate(tok, rng):
         for a, b in rows:
             v.items.append(Item(pre + a, " " + b, tmpl=i))
     return [v]
+
+
+CATEGORY_POOLS = {"fruit": ["apple", "banana", "cherry", "grape", "mango", "lemon", "peach", "plum"],
+                  "tool": ["hammer", "wrench", "saw", "drill", "shovel", "pliers", "chisel", "axe"],
+                  "animal": ["dog", "cat", "horse", "tiger", "rabbit", "wolf", "bear", "goat"],
+                  "color": ["red", "blue", "green", "yellow", "purple", "orange", "pink", "brown"],
+                  "vehicle": ["car", "bus", "truck", "train", "bicycle", "boat", "plane", "tram"]}
+
+
+@family
+def odd_one_out(tok, rng):
+    """The member of a list that belongs to another category."""
+    v = Variant("list", "Odd one out: three words of one category and one of another; the answer is the outsider; the counterfactual swaps which word is the outsider by using a different outsider at the same place.")
+    cats = list(CATEGORY_POOLS)
+    for _ in range(600):
+        c1, c2, c3 = rng.sample(cats, 3)
+        ins = rng.sample(CATEGORY_POOLS[c1], 3)
+        o1, o2 = rng.choice(CATEGORY_POOLS[c2]), rng.choice(CATEGORY_POOLS[c3])
+        k = rng.randrange(4)
+        a = ins[:k] + [o1] + ins[k:]
+        b = ins[:k] + [o2] + ins[k:]
+        t = "Words: {w}.\nThe word that does not belong is"
+        v.items.append(Item(t.format(w=", ".join(a)), " " + o1, t.format(w=", ".join(b)), " " + o2))
+    return [v]
+
+
+@family
+def pick_category(tok, rng):
+    """Pick the list member of a named category."""
+    v = Variant("which", "Category selection: among three words of different categories, the one of the named category; the counterfactual names another category.")
+    cats = list(CATEGORY_POOLS)
+    for _ in range(600):
+        cs = rng.sample(cats, 3)
+        ws = [rng.choice(CATEGORY_POOLS[c]) for c in cs]
+        i, j = rng.sample(range(3), 2)
+        t = "Which of these is a {c}: {w}? Answer:"
+        v.items.append(Item(t.format(c=cs[i], w=", ".join(ws)), " " + ws[i], t.format(c=cs[j], w=", ".join(ws)), " " + ws[j]))
+    return [v]
+
+
+@family
+def alphabetical_first(tok, rng):
+    """The word that comes first alphabetically."""
+    ws = words(tok, NOUNS)
+    v = Variant("pair", "Alphabetical order: of two words with different first letters, the one that comes first; the counterfactual replaces the earlier word with one that comes after the other.")
+    for _ in range(600):
+        a, b, c = rng.sample(ws, 3)
+        lo, hi = sorted([a, b])
+        if lo[0] == hi[0] or c[0] <= hi[0]:
+            continue
+        t = "Which word comes first in alphabetical order, {x} or {y}? Answer:"
+        if rng.random() < 0.5:
+            v.items.append(Item(t.format(x=lo, y=hi), " " + lo, t.format(x=c, y=hi), " " + hi))
+        else:
+            v.items.append(Item(t.format(x=hi, y=lo), " " + lo, t.format(x=hi, y=c), " " + hi))
+    return [v]
+
+
+@family
+def repeat_after_me(tok, rng):
+    """Repeat a two-word phrase on instruction."""
+    ws = words(tok, NOUNS)
+    v = Variant("phrase", "Instructed copying: 'Repeat after me: A B.' then the first word; the next word is the second word of the phrase; the counterfactual changes it.")
+    for _ in range(400):
+        a, b, c = rng.sample(ws, 3)
+        t = "Repeat after me: {a} {b}.\nSure: {a}"
+        v.items.append(Item(t.format(a=a, b=b), " " + b, t.format(a=a, b=c), " " + c))
+    return [v]
