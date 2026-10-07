@@ -19,5 +19,7 @@ fi
 mkdir -p "$OUT/data"
 [ -s "$OUT/data/heldout_000.jsonl" ] || $PY "$here/generate.py" --model "$SNAP" --windows "$HELD" --out "$OUT/data/heldout_000.jsonl" --texts 256 --batch 32 --split heldout --seed 1000
 [ -s "$OUT/data/train_000.jsonl" ] || $PY "$here/generate.py" --model "$SNAP" --windows "$TRAIN" --out "$OUT/data/train_000.jsonl" --texts "$TEXTS" --batch 64 --split train --seed 0
-HOURS=$($PY -c "print(round(1.95 - $SECONDS / 3600, 3))")
+HOURS=$($PY -c "print(round(1.6 - $SECONDS / 3600, 3))")  # leaves time for eval_kl.py
 $PY "$here/sft.py" --model "$ORACLE" --train "$OUT/data/train_*.jsonl" --heldout "$OUT/data/heldout_*.jsonl" --out "$OUT/sft" --steps "$STEPS" --hours "$HOURS"
+$PY "$here/eval_kl.py" --model "$ORACLE" --heldout "$OUT/data/heldout_*.jsonl" --out "$OUT/sft/eval_kl_base.json"
+$PY "$here/eval_kl.py" --model "$ORACLE" --adapters "$OUT/sft/adapters.safetensors" --heldout "$OUT/data/heldout_*.jsonl" --out "$OUT/sft/eval_kl_trained.json"
