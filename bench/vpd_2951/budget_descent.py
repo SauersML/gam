@@ -83,13 +83,8 @@ T = load_target(dev)
 mlp = [n for n in site_names() if '.mlp.' in n]
 # DESCENT_SITES=all: the attention maps are explained too (below; always exact by construction).
 attn = [n for n in site_names() if '.attn.' in n] if os.environ.get('DESCENT_SITES') == 'all' else []
-# DESCENT_HEADS=1 (with DESCENT_SITES=all): an attention part is a whole head, its q, k, v and o weights
-# together, gated on the norm of its own write at the query position, ||W_o,h a_h(t)|| (a_h(t) the head's
-# attention output), and counted 1 when on. q, k and v run ungated at every position, so the pattern is
-# always formed from the full q and k (a head off at t still serves later queries' keys and values) and
-# the gate multiplies only the head's write at t. With every head on, P's attention is M's.
-HEADS = bool(attn) and os.environ.get('DESCENT_HEADS') == '1'
-sliced = [] if HEADS else attn
+# The attention maps gated as slices (all of them, except under the rot arm, whose attention blocks are below).
+sliced = [] if os.environ.get('DESCENT_ARM') == 'rot' else attn
 tok = np.memmap(TOKENS, dtype=np.uint16 if TOKENS.endswith('.u16') else np.float64, mode='r').reshape(-1, 513)
 ev = torch.tensor(tok[1024:1032, :512].astype(np.int64), device=dev)
 # Training rows: DESCENT_TRAIN_ROWS rows of the file, skipping the held-out rows 1024..1031 (default 1024).
@@ -108,19 +103,6 @@ VPD_ATTN_COUNTS = {'h.0.attn.q_proj': 0.91, 'h.0.attn.k_proj': 1.25, 'h.0.attn.v
                    'h.2.attn.q_proj': 4.28, 'h.2.attn.k_proj': 4.22, 'h.2.attn.v_proj': 10.16, 'h.2.attn.o_proj': 15.76,
                    'h.3.attn.q_proj': 1.99, 'h.3.attn.k_proj': 2.04, 'h.3.attn.v_proj': 7.74, 'h.3.attn.o_proj': 12.9}
 START_SCALE = min(1.0, K / (sum(VPD_COUNTS.values()) + (sum(VPD_ATTN_COUNTS.values()) if attn else 0.0)))
-H_START = {}
-if HEADS:
-    # Water-filling: each layer's share of the heads' start count, capped at the layer's heads.
-    w_ = {l: sum(v for n, v in VPD_ATTN_COUNTS.items() if n.startswith(f'h.{l}.')) for l in range(T.n_layer)}
-    left, free = min(T.n_layer * T.n_head, K * sum(VPD_ATTN_COUNTS.values()) / (sum(VPD_COUNTS.values()) + sum(VPD_ATTN_COUNTS.values()))), set(w_)
-    while free:
-        tot = sum(w_[l] for l in free)
-        over = [l for l in free if left * w_[l] / tot > T.n_head]
-        if not over:
-            H_START.update({l: left * w_[l] / tot for l in free}); break
-        for l in over:
-            H_START[l] = float(T.n_head); left -= T.n_head; free.discard(l)
-    START_SCALE = min(1.0, (K - sum(H_START.values())) / sum(VPD_COUNTS.values()))
 
 @torch.no_grad()
 def site_inputs(ids):
@@ -610,9 +592,6 @@ def force_rows(hard, soft, T_):
     rows = torch.cat([torch.arange(b * T_, (b + 1) * T_, device=hard.device) for b in state['force_on']])
     return hard.index_fill(1, rows, 1.0), soft.index_fill(1, rows, 1.0)
 
-# DESCENT_UNGATED=q_proj,k_proj (a diagnostic, not an explanation): those attention maps run every slice on
-# and uncounted, to measure what gating them costs.
-UNGATED = set(filter(None, os.environ.get('DESCENT_UNGATED', '').split(',')))
 
 def make_attn(n):
     st = T.site(n); p = A[n]
@@ -648,13 +627,6 @@ def make_attn(n):
                 state['calib'].setdefault(n, []).append((c.abs() * p['U'].norm(dim=-1)[:, None, :]).reshape(-1))
             z = (c.abs() * p['U'].norm(dim=-1)[:, None, :] - p['tau'][:, None, :]) / p['s'][:, None, :]
             hard, phi = force_rows((z > 0).float(), 0.5 * (1 + torch.erf(z / SQ2)), x.shape[1])
-            if n.rsplit('.', 1)[1] in UNGATED:
-                hard, phi = torch.ones_like(hard), torch.ones_like(phi)
-                state['hard'].append(torch.zeros_like(hard[0, :, 0]))
-                if state['mode'] != 'hard':
-                    state['soft'].append(torch.zeros_like(hard[0, :, 0]))
-                y = head_output(c * hard, p['U'], p['o'], swaps_of(n, x.shape[1])).view(x.shape[0], x.shape[1], -1)
-                return y + residual(n, x) if n in RES else y
             state['hard'].append(hard.sum((0, 2)))
             if state['mode'] == 'hard':
                 g = hard
@@ -666,57 +638,6 @@ def make_attn(n):
     return fwd
 for n in sliced: T.site(n)._forward = make_attn(n)
 
-# Whole-head parts (HEADS): each layer's q, k, v, o weights trained (HP, started at M's), and each head's
-# gate threshold and noise scale (HG, keyed by the layer's o_proj).
-HP, HG = {}, {}
-def make_head_in(n, l, k):
-    def fwd(x):
-        return x @ (T.site(n).W if state['mode'] == 'M' else HP[l][k]).T
-    return fwd
-
-def make_head_o(n, l):
-    def fwd(a):
-        if state['mode'] == 'M':
-            return a @ T.site(n).W.T
-        B_, T_ = a.shape[0], a.shape[1]
-        y = torch.einsum('bthk,dhk->bthd', a.view(B_, T_, NH, HD), HP[l]['o_proj'].view(-1, NH, HD))  # [B, T, H, d]
-        if state['entry'].get(n):
-            # Head edits, entry-wise in the head's o columns: a scale multiplies the head's write on its
-            # sequence (its gate reads the scaled write); a swap puts head h2's write in head h1's place.
-            scale = torch.ones(B_, NH, device=a.device); perm = torch.arange(NH, device=a.device).repeat(B_, 1)
-            for b, kind, G, a_ in state['entry'][n]:
-                if kind == 'in':
-                    scale[b, int(G[0]) // HD] = 1 + a_
-                elif kind == 'swap':
-                    perm[b, G[0]] = G[1]
-            y = y.gather(2, perm[:, None, :, None].expand(-1, T_, -1, y.shape[-1])) * scale[:, None, :, None]
-        r = y.norm(dim=-1)                                                       # [B, T, H]
-        if state.get('calib') is not None:
-            state['calib'].setdefault(n, []).append(r.detach().reshape(-1))
-        if state['mode'] == 'all':
-            return y.sum(2)
-        z = (r - HG[n]['tau']) / HG[n]['s']
-        hard, phi = (z > 0).float(), 0.5 * (1 + torch.erf(z / SQ2))
-        if state['force_on']:
-            on = torch.tensor(state['force_on'], device=z.device)
-            hard, phi = hard.index_fill(0, on, 1.0), phi.index_fill(0, on, 1.0)
-        state['hard'].append(hard.sum(-1).reshape(-1))
-        if state['mode'] == 'hard':
-            g = hard
-        else:
-            state['soft'].append(phi.sum(-1).reshape(-1))
-            g = phi if gate == 'mf' else hard + phi - phi.detach()
-        return (y * g[..., None]).sum(2)
-    return fwd
-
-if HEADS:
-    for l in range(T.n_layer):
-        HP[l] = {k: T.site(f'h.{l}.attn.{k}').W.detach().clone().requires_grad_() for k in ('q_proj', 'k_proj', 'v_proj', 'o_proj')}
-        for k in ('q_proj', 'k_proj', 'v_proj'):
-            T.site(f'h.{l}.attn.{k}')._forward = make_head_in(f'h.{l}.attn.{k}', l, k)
-        n = f'h.{l}.attn.o_proj'
-        HG[n] = {'tau': torch.zeros(NH, device=dev, requires_grad=True), 's': torch.ones(NH, device=dev)}
-        T.site(n)._forward = make_head_o(n, l)
 
 # DESCENT_ARM=rot (neuron start, MLP maps, F): parts are learned blocks of each MLP layer's neuron space, exact
 # by construction. A layer's neurons fall into groups of DESCENT_ROT (default 32) co-firing neurons (greedy on the
@@ -737,8 +658,8 @@ if HEADS:
 # width of 1% of its tensor's root mean square, as ours start, plus its index).
 ROT, ROTG = {}, int(os.environ.get('DESCENT_ROT', '32'))
 if ARM == 'rot':
-    if start != 'neuron' or attn or os.environ.get('DESCENT_F') != '1':
-        raise SystemExit('DESCENT_ARM=rot: the neuron start, the MLP maps, F')
+    if start != 'neuron' or os.environ.get('DESCENT_F') != '1':
+        raise SystemExit('DESCENT_ARM=rot: the neuron start, F')
     with torch.no_grad():
         for l in range(T.n_layer):
             fc, dn = f'h.{l}.mlp.c_fc', f'h.{l}.mlp.down_proj'
@@ -804,8 +725,10 @@ def rot_tau_bits(R):
     return 0.5 * (torch.log(v) - 2 * ls + ((mu - mu.mean()).pow(2) + (2 * ls).exp()) / v - 1) / math.log(2)
 
 def rot_index_bits():
-    used = sum(int((torch.zeros(R['ng'], ROTG, device=dev).scatter_(1, R['L'].argmax(-1), 1.0) > 0).sum()) for R in ROT.values())
-    return math.log2(max(used, 2))
+    """log2 of the number of blocks (MLP, OV and QK blocks with a slice or plane)."""
+    used = lambda L: int((torch.zeros(L.shape[:2], device=dev).scatter_(1, L.argmax(-1), 1.0) > 0).sum())
+    return math.log2(max(2, sum(used(R['L']) for R in list(ROT.values()) + list(ROTA.values()))
+                         + sum(used(R['Lqk']) for R in ROTA.values())))
 
 def make_rot_fc(n, l):
     R = ROT[l]; W = T.site(n).W
@@ -880,6 +803,126 @@ if ARM == 'rot':
     for l in range(T.n_layer):
         T.site(f'h.{l}.mlp.c_fc')._forward = make_rot_fc(f'h.{l}.mlp.c_fc', l)
         T.site(f'h.{l}.mlp.down_proj')._forward = make_rot_dn(f'h.{l}.mlp.down_proj', l)
+
+# The rot arm's attention (DESCENT_SITES=all), exact by construction, q, k and v computed by M's maps:
+# - QK blocks: a head's RoPE planes (coordinates c and c + HD/2 of its q and k, which RoPE rotates together, so
+#   no rotation across planes keeps the logits) fall into blocks under a learned assignment; a block's gate at
+#   query t switches its planes of q at t, and reads its effect on the logits there, the root of the summed
+#   variances over the attended keys of its planes' logit terms q_c(t) . k_c(s) / sqrt(HD), under the pattern
+#   with every block on.
+# - OV blocks: a head's value coordinates fall into groups of DESCENT_ROT, each with a learned basis Q = exp(S) as
+#   in the MLP; slice i reads W_v,G^T Q_i (mixed by the pattern) and writes W_o,G Q_i, and a block's gate at
+#   query t switches its subspace of the head's attention output there (z_G = Q diag(g) Q^T a_G), reading its own
+#   write, sqrt(sum_i |a_G . Q_i|^2 ||W_o,G Q_i||^2).
+# With every block on, P's attention is M's. A QK plane's description is its two q rows and two k rows, an OV
+# slice's its read and write (dense, at their own widths, under zero-mean priors per layer and map), as in the MLP.
+ROTA = {}
+if ARM == 'rot' and attn:
+    NPL = HD // 2
+    with torch.no_grad():
+        for l in range(T.n_layer):
+            Wq, Wk, Wv, Wo = (T.site(f'h.{l}.attn.{k}').W for k in ('q_proj', 'k_proj', 'v_proj', 'o_proj'))
+            plane = lambda W: W.view(NH, 2, NPL, -1).pow(2).sum((1, 3))                              # [H, NPL]
+            ngo = NH * HD // ROTG
+            Gv = Wv.view(ngo, ROTG, -1); Go = Wo.T.reshape(ngo, ROTG, -1)
+            ROTA[l] = {'nq': plane(Wq), 'nk': plane(Wk), 'ngo': ngo, 'di': Wv.shape[1], 'do': Wo.shape[0],
+                       'Lqk': (6.0 * torch.eye(NPL, device=dev)).repeat(NH, 1, 1).requires_grad_(),
+                       'tau_qk': torch.zeros(NH, NPL, device=dev, requires_grad=True), 's_qk': torch.ones(NH, NPL, device=dev),
+                       'ls_q': torch.full((NH, NPL), math.log(0.01 * Wq.pow(2).mean().sqrt().item()), device=dev, requires_grad=True),
+                       'ls_k': torch.full((NH, NPL), math.log(0.01 * Wk.pow(2).mean().sqrt().item()), device=dev, requires_grad=True),
+                       'Gfc': Gv @ Gv.transpose(1, 2), 'Gdn': Go @ Go.transpose(1, 2), 'ng': ngo,
+                       'A': torch.zeros(ngo, ROTG, ROTG, device=dev, requires_grad=True),
+                       'L': (6.0 * torch.eye(ROTG, device=dev)).repeat(ngo, 1, 1).requires_grad_(),
+                       'tau': torch.zeros(ngo, ROTG, device=dev, requires_grad=True), 's': torch.ones(ngo, ROTG, device=dev),
+                       'ls_fc': torch.full((ngo, ROTG), math.log(0.01 * Wv.pow(2).mean().sqrt().item()), device=dev, requires_grad=True),
+                       'ls_dn': torch.full((ngo, ROTG), math.log(0.01 * Wo.pow(2).mean().sqrt().item()), device=dev, requires_grad=True)}
+
+def rot_plane_bits(R):
+    """Per QK plane [H, NPL]: its two q rows' and two k rows' description in bits."""
+    bits = 0.0
+    for nn_, ls in ((R['nq'], R['ls_q']), (R['nk'], R['ls_k'])):
+        s2 = (2 * ls).exp(); d_ = 2 * R['di']
+        v = (nn_.sum() + d_ * s2.sum()) / (d_ * nn_.numel())
+        bits = bits + 0.5 * (d_ * torch.log(v / s2) + (nn_ + d_ * s2) / v - d_)
+    return bits / math.log(2)
+
+def rot_qk_tau_bits(R):
+    if 'tau_qk_leaf' not in R:
+        return torch.zeros_like(R['s_qk'])
+    mu, ls = R['tau_qk_leaf']
+    v = ((mu - mu.mean()).pow(2) + (2 * ls).exp()).mean()
+    return 0.5 * (torch.log(v) - 2 * ls + ((mu - mu.mean()).pow(2) + (2 * ls).exp()) / v - 1) / math.log(2)
+
+def rot_gate(Rb, tau, s_, Lj, hot, Lsm, calib_key):
+    """From the blocks' reads Rb [B, T, groups, blocks]: appends the bits and blocks on per token, returns the
+    slices' gates [B, T, groups, slices]."""
+    if state.get('calib') is not None:
+        state['calib'].setdefault(calib_key, []).append(Rb.detach().reshape(-1))
+    z = (Rb - tau) / s_
+    hard, phi = (z > 0).float(), 0.5 * (1 + torch.erf(z / SQ2))
+    if state['force_on']:
+        on = torch.tensor(state['force_on'], device=z.device)
+        hard, phi = hard.index_fill(0, on, 1.0), phi.index_fill(0, on, 1.0)
+    state['hard'].append((hard * Lj).sum((-1, -2)).reshape(-1))
+    state['rot_on'].append(hard.sum((-1, -2)).reshape(-1))
+    if state['mode'] == 'hard':
+        return torch.einsum('...nj,nij->...ni', hard, hot)
+    gb = phi if gate == 'mf' else hard + phi - phi.detach()
+    state['soft'].append((gb * Lj).sum((-1, -2)).reshape(-1))
+    return torch.einsum('...nj,nij->...ni', gb, Lsm)
+
+def rot_attention(i, h, causal):
+    """Layer i's attention output under the rot arm: QK blocks gate q's planes at each query, OV blocks gate the
+    head's output in rotated bases, M's weights throughout."""
+    R = ROTA[i]; B_, T_ = h.shape[0], h.shape[1]
+    site = lambda k: T.site(f'h.{i}.attn.{k}')
+    q, k, v = site('q_proj')(h), site('k_proj')(h), site('v_proj')(h)
+    if state.get('noise'):
+        # Each plane's two q (k) rows at the plane's width; each OV slice's read (below) at its own.
+        rows = lambda ls: ls.exp().view(NH, 1, NPL).expand(NH, 2, NPL).reshape(-1)              # q's row order
+        q = q + (h @ torch.randn(q.shape[-1], h.shape[-1], device=h.device).T) * rows(R['ls_q'])
+        k = k + (h @ torch.randn(k.shape[-1], h.shape[-1], device=h.device).T) * rows(R['ls_k'])
+    qh = T._rope(q.view(B_, T_, NH, HD).transpose(1, 2), T_); kh = T._rope(k.view(B_, T_, NH, HD).transpose(1, 2), T_)
+    vh = v.view(B_, T_, NH, HD).transpose(1, 2)
+    if state['mode'] == 'all':
+        gq = None
+    else:
+        full = ((qh @ kh.transpose(-1, -2)) / math.sqrt(HD)).masked_fill(~causal, float('-inf')).softmax(-1)
+        q2 = torch.stack((qh[..., :NPL], qh[..., NPL:]), -1); k2 = torch.stack((kh[..., :NPL], kh[..., NPL:]), -1)  # [B, H, T, NPL, 2]
+        mk = (full @ k2.flatten(-2)).view(B_, NH, T_, NPL, 2)
+        kk = (full @ (k2[..., :, None] * k2[..., None, :]).flatten(-3)).view(B_, NH, T_, NPL, 2, 2)
+        cov = kk - mk[..., :, None] * mk[..., None, :]
+        r2 = torch.einsum('bhtcx,bhtcxy,bhtcy->bhtc', q2, cov, q2).clamp_min(0) / HD       # [B, H, T, NPL]
+        hot = F.one_hot(R['Lqk'].argmax(-1), NPL).float(); Lsm = torch.softmax(R['Lqk'], -1)
+        M_ = hot if state['mode'] == 'hard' else Lsm
+        Rb = (torch.einsum('bhtc,hcj->bhtj', r2, M_) + 1e-20).sqrt()
+        Lj = torch.einsum('hc,hcj->hj', rot_plane_bits(R), M_) + rot_qk_tau_bits(R) + rot_index_bits()
+        gq = rot_gate(Rb.permute(0, 2, 1, 3), R['tau_qk'], R['s_qk'], Lj, hot, Lsm, f'h.{i}.attn.q_proj')  # [B, T, H, NPL]
+        gq = gq.permute(0, 2, 1, 3)
+        qh = qh * torch.cat((gq, gq), -1)
+    pattern = ((qh @ kh.transpose(-1, -2)) / math.sqrt(HD)).masked_fill(~causal, float('-inf')).softmax(-1)
+    a = (pattern @ vh).transpose(1, 2).reshape(B_, T_, R['ngo'], ROTG)                    # [B, T, groups, g]
+    Q = rot_Q(R)
+    c = torch.einsum('btnk,nki->btni', a, Q)
+    if state.get('noise'):
+        # Each OV slice's read noise at each key, mixed by the pattern like the values.
+        vn = (h @ torch.randn(NH * HD, h.shape[-1], device=h.device).T).view(B_, T_, NH, HD).transpose(1, 2)
+        c = c + (pattern @ vn).transpose(1, 2).reshape(B_, T_, R['ngo'], ROTG) * R['ls_fc'].exp()
+    if state['mode'] == 'all':
+        gam = torch.ones_like(c)
+    else:
+        bits_i, wn = rot_slice_bits(R, Q)
+        hot = F.one_hot(R['L'].argmax(-1), ROTG).float(); Lsm = torch.softmax(R['L'], -1)
+        M_ = hot if state['mode'] == 'hard' else Lsm
+        Rb = (torch.einsum('btni,nij->btnj', (c.abs() * wn).pow(2), M_) + 1e-20).sqrt()
+        Lj = torch.einsum('ni,nij->nj', bits_i, M_) + rot_tau_bits(R) + rot_index_bits()
+        gam = rot_gate(Rb, R['tau'], R['s'], Lj, hot, Lsm, f'h.{i}.attn.o_proj')
+    zz = torch.einsum('btni,nki->btnk', c * gam, Q).reshape(B_, T_, -1)
+    y = site('o_proj')(zz)
+    if state.get('noise'):
+        eps = torch.randn(NH * HD, y.shape[-1], device=h.device)
+        y = y + (c * gam * R['ls_dn'].exp()).reshape(B_, T_, -1) @ eps
+    return y
 
 # Weight edits (DESCENT_WEDITS = edited sequences per training batch): an edit is an additive
 # Delta W = A B^T on one or more of M's maps, defined in M's terms and applied verbatim to both models
@@ -1075,30 +1118,18 @@ def hidden(ids):
     for i in range(T.n_layer):
         site = lambda k: T.site(f"h.{i}.{'mlp' if k in ('c_fc', 'down_proj') else 'attn'}.{k}")
         h = vpd_model.rms(x, T.norms[2 * i], T.eps)
-        q = T._rope(site('q_proj')(h).view(B_, T_, NH, HD).transpose(1, 2), T_)
-        k = T._rope(site('k_proj')(h).view(B_, T_, NH, HD).transpose(1, 2), T_)
-        pattern = ((q @ k.transpose(-1, -2)) / math.sqrt(HD)).masked_fill(~causal, float('-inf')).softmax(-1)
-        if HEADS:
-            a = (pattern @ site('v_proj')(h).view(B_, T_, NH, HD).transpose(1, 2)).transpose(1, 2).reshape(B_, T_, -1)
+        if ROTA:
+            x = x + rot_attention(i, h, causal)
         else:
-            a = attn_v(i, h, pattern)
-        x = x + site('o_proj')(a)
+            q = T._rope(site('q_proj')(h).view(B_, T_, NH, HD).transpose(1, 2), T_)
+            k = T._rope(site('k_proj')(h).view(B_, T_, NH, HD).transpose(1, 2), T_)
+            pattern = ((q @ k.transpose(-1, -2)) / math.sqrt(HD)).masked_fill(~causal, float('-inf')).softmax(-1)
+            x = x + site('o_proj')(attn_v(i, h, pattern))
         h = vpd_model.rms(x, T.norms[2 * i + 1], T.eps)
         x = x + site('down_proj')(vpd_model.gelu_tanh(site('c_fc')(h)))
     return vpd_model.rms(x, T.ln_f, T.eps)
 if attn:
     T.hidden = hidden
-if HEADS:
-    # Each head's noise scale: a tenth of the root mean square of its write's norm on P's run with every
-    # part on (= M).
-    with torch.no_grad():
-        state['calib'] = {}
-        for i in range(0, 4, 2):
-            state['mode'], state['soft'], state['hard'] = 'all', [], []
-            T(torch.tensor(tok[i:i + 2, :512].astype(np.int64), device=dev))
-        for n, v in state['calib'].items():
-            HG[n]['s'] = 0.1 * torch.stack(v).view(len(v), -1, NH).reshape(-1, NH).pow(2).mean(0).sqrt().clamp_min(1e-12)
-        state['calib'] = None
 if sliced:
     # Calibration on P's own run with every slice on (= M): each v slice's noise scale and the v map's
     # threshold from the post-attention reads (the quantile matching VPD's mean count at the map).
@@ -1264,6 +1295,12 @@ def evaluate(final=False):
         ranks = torch.cat([torch.bincount(R['L'].argmax(-1).reshape(-1) + ROTG * torch.arange(R['ng'], device=dev).repeat_interleave(ROTG),
                                           minlength=R['ng'] * ROTG) for R in ROT.values()])
         ranks = ranks[ranks > 0].float()
+        rk = lambda L: torch.cat([torch.bincount((L.argmax(-1) + L.shape[-1] * torch.arange(L.shape[0], device=dev)[:, None]).reshape(-1),
+                                                 minlength=L.shape[0] * L.shape[-1])]).float()
+        if ROTA:
+            for name, key in (('ov', 'L'), ('qk', 'Lqk')):
+                r_ = torch.cat([rk(R[key]) for R in ROTA.values()]); r_ = r_[r_ > 0]
+                out.setdefault('rot_attn', {})[name] = {'blocks': int(r_.numel()), 'rank_hist': {str(k): int((r_ == k).sum()) for k in range(1, 65) if (r_ == k).any()}}
         out['rot'] = {'blocks_on': round(torch.stack(state['rot_on']).sum(0).mean().item(), 2), 'blocks': int(ranks.numel()),
                       'rank_hist': {str(k): int((ranks == k).sum()) for k in range(1, ROTG + 1) if (ranks == k).any()},
                       'mean_slice_bits': round(float(np.mean([rot_slice_bits(R, rot_Q(R))[0].mean().item() for R in ROT.values()])), 1),
@@ -1302,7 +1339,7 @@ if RESUME:
     S_ = torch.load(RESUME, map_location=dev, weights_only=False)
     with torch.no_grad():
         for cont, src in ([(P[n], S_['maps'][n]) for n in mlp] + [(A[n], S_['attn'][n]) for n in sliced]
-                          + [(HP[l], S_['heads'][l]) for l in HP] + [(HG[f'h.{l}.attn.o_proj'], S_['heads'][l]) for l in HP]):
+                          ):
             for k in cont:
                 if k in src and torch.is_tensor(cont[k]) and k != 'F':
                     START_VAL[(id(cont), k)] = cont[k].detach().clone()
@@ -1314,8 +1351,6 @@ if start in ('vpd', 'neuron') and not (SHARE or SHARE_A or ROUTER or EXACT or AR
                     (VPD_COUNTS[n.rsplit('.', 1)[0] + '.c_fc'] + VPD_COUNTS[n.rsplit('.', 1)[0] + '.down_proj']) / 2)
     target = {n: 1 - START_SCALE * vc(n) / P[n]['V'].shape[1] for n in mlp}
     target.update({n: 1 - START_SCALE * VPD_ATTN_COUNTS.get(n, 1.0) / (NH * A[n]['V'].shape[-1]) for n in sliced})
-    # A layer's heads on at the start: H_START[l] of its NH.
-    target.update({n: max(0.0, 1 - H_START[int(n.split('.')[1])] / NH) for n in HG})
     ids_c = torch.tensor(tok[0:4, :512].astype(np.int64), device=dev)
     with torch.no_grad():
         install([None])
@@ -1324,7 +1359,7 @@ if start in ('vpd', 'neuron') and not (SHARE or SHARE_A or ROUTER or EXACT or AR
             run(ids_c, 'hard')
             for n, v in state['calib'].items():
                 flat = torch.cat(v); idx = torch.randperm(flat.numel(), device=dev)[:2_000_000]
-                (P[n] if n in P else A[n] if n in A else HG[n])['tau'].fill_(torch.quantile(flat[idx].float(), target[n]).item())
+                (P[n] if n in P else A[n])['tau'].fill_(torch.quantile(flat[idx].float(), target[n]).item())
         state['calib'] = None
         run(ids_c, 'hard')
         print('thresholds set in the gated run: parts on per token', round(torch.stack(state['hard']).sum(0).mean().item(), 1),
@@ -1335,35 +1370,47 @@ if ARM == 'rot':
     # zero-mean prior per tensor, plus its index among VPD's MLP subcomponents.
     with torch.no_grad():
         vb, total = {}, 0
-        for n in mlp:
+        for n in mlp + attn:
             per = 0.0
             for w, ax in (('V', 0), ('U', 1)):
                 t_ = load(f'{n}.{w}'); d_ = t_.shape[ax]
                 s2 = (0.01 * t_.pow(2).mean().sqrt()) ** 2; v_ = t_.pow(2).mean() + s2
                 per = per + 0.5 * (d_ * torch.log(v_ / s2) + (t_.pow(2).sum(ax) + d_ * s2) / v_ - d_) / math.log(2)
             vb[n] = per.mean().item(); total += per.numel()
-        K = K / 129 * sum(VPD_COUNTS[n] * (vb[n] + math.log2(total)) for n in mlp)
+        counts = {**VPD_COUNTS, **(VPD_ATTN_COUNTS if attn else {})}
+        K = K / sum(counts.values()) * sum(counts[n] * (vb[n] + math.log2(total)) for n in counts)
     print('rot budget B', round(K), 'bits per token; VPD subcomponent bits', {n: round(v) for n, v in vb.items()}, flush=True)
     # Each block's noise scale (a tenth of the root mean square of its read with all on), then the thresholds set
     # in the gated run, layer by layer, so the start's expected bits per token are B (the layers' shares as VPD's
     # MLP counts there).
     ids_c = torch.tensor(tok[0:4, :512].astype(np.int64), device=dev)
+    # Components in forward order: (blocks' container, threshold, noise scale, read key, start bits per block, share).
+    comps = []
+    for l in range(T.n_layer):
+        if ROTA:
+            R = ROTA[l]
+            comps.append((R, 'tau_qk', 's_qk', f'h.{l}.attn.q_proj', lambda R=R: rot_plane_bits(R).mean().item(),
+                          VPD_ATTN_COUNTS[f'h.{l}.attn.q_proj'] + VPD_ATTN_COUNTS[f'h.{l}.attn.k_proj']))
+            comps.append((R, 'tau', 's', f'h.{l}.attn.o_proj', lambda R=R: rot_slice_bits(R, rot_Q(R))[0].mean().item(),
+                          VPD_ATTN_COUNTS[f'h.{l}.attn.v_proj'] + VPD_ATTN_COUNTS[f'h.{l}.attn.o_proj']))
+        R = ROT[l]
+        comps.append((R, 'tau', 's', f'h.{l}.mlp.c_fc', lambda R=R: rot_slice_bits(R, rot_Q(R))[0].mean().item(),
+                      VPD_COUNTS[f'h.{l}.mlp.c_fc'] + VPD_COUNTS[f'h.{l}.mlp.down_proj']))
     with torch.no_grad():
         install([None])
         state['calib'] = {}
         run(ids_c, 'soft')
-        for l, R in ROT.items():
-            rb = torch.stack(state['calib'][f'h.{l}.mlp.c_fc']).view(-1, R['ng'], ROTG)
-            R['s'] = 0.1 * rb.pow(2).mean(0).sqrt().clamp_min(1e-12)
-        bits0 = {l: (rot_slice_bits(R, rot_Q(R))[0] + rot_index_bits()).mean().item() for l, R in ROT.items()}
-        share = {l: VPD_COUNTS[f'h.{l}.mlp.c_fc'] + VPD_COUNTS[f'h.{l}.mlp.down_proj'] for l in ROT}
-        for l in ROT:
+        for R, tk, sk, key, _, _ in comps:
+            rb = torch.stack(state['calib'][key]).view(-1, *R[sk].shape)
+            R[sk] = 0.1 * rb.pow(2).mean(0).sqrt().clamp_min(1e-12)
+        ib = rot_index_bits(); share_all = sum(c[5] for c in comps)
+        for R, tk, sk, key, bits0, share in comps:
             state['calib'] = {}
             run(ids_c, 'hard')
-            R = ROT[l]; flat = torch.cat(state['calib'][f'h.{l}.mlp.c_fc'])
-            on = K * share[l] / sum(share.values()) / bits0[l]
+            flat = torch.cat(state['calib'][key])
+            on = K * share / share_all / (bits0() + ib)
             idx = torch.randperm(flat.numel(), device=dev)[:2_000_000]
-            R['tau'].fill_(torch.quantile(flat[idx].float(), max(0.0, 1 - on / (R['ng'] * ROTG))).item())
+            R[tk].fill_(torch.quantile(flat[idx].float(), max(0.0, 1 - on / R[sk].numel())).item())
         state['calib'] = None
         run(ids_c, 'hard')
         print('rot start: bits per token', round(torch.stack(state['hard']).sum(0).mean().item()), 'blocks on per token',
@@ -1380,9 +1427,9 @@ FREEZE = os.environ.get('DESCENT_FREEZE') == '1'
 slots = [(P[n], w, rms(P[n][w])) for n in mlp for w in (('F',) if EXACT else ('V', 'U')) + (('G',) if ARM == 'dir' else ())
          if not (EXACT and NEURON_DOWN and n.endswith('down_proj') and w == 'F') and not (FREEZE and w in ('V', 'U', 'F')) and ARM != 'rot']
 # rot: rotation angles by 1e-3 per step, thresholds by a tenth of their noise scale, assignment logits by 0.02.
-slots += [x for R in ROT.values() for x in ((R, 'A', 1 / 3), (R, 'tau', 100 / 3 * R['s'].mean().item()), (R, 'L', 20 / 3))]
+slots += [x for R in list(ROT.values()) + list(ROTA.values()) for x in ((R, 'A', 1 / 3), (R, 'tau', 100 / 3 * R['s'].mean().item()), (R, 'L', 20 / 3))]
+slots += [x for R in ROTA.values() for x in ((R, 'tau_qk', 100 / 3 * R['s_qk'].mean().item()), (R, 'Lqk', 20 / 3))]
 slots += [(A[n], w, rms(A[n][w])) for n in sliced for w in (('V', 'U') if ATTN_FREE else ('F',))] + [(A[n], 'tau', 100 / 3 * A[n]['s'].mean().item()) for n in sliced]
-slots += [(HP[l], k, rms(HP[l][k])) for l in HP for k in HP[l]] + [(HG[n], 'tau', 100 / 3 * HG[n]['s'].mean().item()) for n in HG]
 for l, S in SHARE_A.items():
     slots += [(S, 't', 100 / 3 * S['s'].mean().item()), (S, 'L_v', 20 / 3), (S, 'L_o', 20 / 3)]
 slots += [(P[n], 'tau', 100 / 3 * P[n]['s'].mean().item()) for n in mlp if ARM != 'rot']
@@ -1427,9 +1474,10 @@ groups += [{'params': [Rn['tau']], 'lr': LR * 0.1 * Rn['s'].item()} for Rn in RE
 if FMODE:
     groups += [{'params': [Rn['ls']], 'lr': LR * 1e-2} for Rn in RES.values()]
     # rot: each slice's dense widths (log sigma by 1% per step), and the leaves its cost reads.
-    groups += [{'params': [R['ls_fc'], R['ls_dn']], 'lr': LR * 1e-2} for R in ROT.values()]
+    groups += [{'params': [R['ls_fc'], R['ls_dn']], 'lr': LR * 1e-2} for R in list(ROT.values()) + list(ROTA.values())]
+    groups += [{'params': [R['ls_q'], R['ls_k']], 'lr': LR * 1e-2} for R in ROTA.values()]
     for cont, key, mu, ls in leaves:
-        if any(cont is R for R in ROT.values()) and key in ('A', 'tau'):
+        if any(cont is R for R in list(ROT.values()) + list(ROTA.values())) and key in ('A', 'tau', 'tau_qk'):
             cont[key + '_leaf'] = (mu, ls)
 opt = torch.optim.Adam(groups)
 trainable = [q for g in groups for q in g['params']]
@@ -1463,7 +1511,9 @@ PART_PRIOR = os.environ.get('DESCENT_PRIOR') == 'part'
 def description_bits():
     """KL(q || p) in bits (F only)."""
     total = 0.0
-    for R in ROT.values():
+    for R in ROTA.values():
+        total = total + rot_plane_bits(R).sum() * math.log(2)
+    for R in list(ROT.values()) + list(ROTA.values()):
         # rot: every slice's dense read and write (the angles and thresholds are leaves below).
         sf, sd = (2 * R['ls_fc']).exp(), (2 * R['ls_dn']).exp()
         Q = rot_Q({'A': R['A_leaf'][0]}) if 'A_leaf' in R else rot_Q(R)
@@ -1533,16 +1583,16 @@ def save(step):
                     'maps': {n: {k: P[n][k].detach().float().cpu() for k in ('V', 'U', 'tau', 's')} for n in mlp},
                     # The heads' slices (DESCENT_SITES=all): reads V [H, d_in_h, C], writes U [H, C, d_out_h].
                     'attn': {n: {k: A[n][k].detach().float().cpu() for k in ('V', 'U', 'tau', 's')} for n in sliced},
-                    # Whole-head parts (HEADS): per layer the trained q, k, v, o weights [d_out, d_in] (M's
-                    # layout) and per head the gate's threshold and noise scale [H] on ||W_o,h a_h(t)||.
-                    'heads': {l: {**{k: HP[l][k].detach().float().cpu() for k in HP[l]},
-                                  'tau': HG[f'h.{l}.attn.o_proj']['tau'].detach().float().cpu(),
-                                  's': HG[f'h.{l}.attn.o_proj']['s'].float().cpu()} for l in HP},
                     'tied': {dn: (fc, own.cpu()) for dn, (fc, own) in GROUP.items()},
                     # rot: per layer the neuron order (groups of DESCENT_ROT consecutive), angles, assignments,
                     # thresholds, noise scales and the slices' log widths.
                     'rot': {l: {k: R[k].detach().float().cpu() if R[k].dtype.is_floating_point else R[k].cpu()
-                                for k in ('perm', 'A', 'L', 'tau', 's', 'ls_fc', 'ls_dn')} for l, R in ROT.items()}}, os.environ['DESCENT_SAVE'])
+                                for k in ('perm', 'A', 'L', 'tau', 's', 'ls_fc', 'ls_dn')} for l, R in ROT.items()},
+                    # rot attention: per layer the OV groups' (consecutive value coordinates of the heads) angles,
+                    # assignments, thresholds, noise scales and widths, and the QK planes' assignments, thresholds,
+                    # noise scales and widths.
+                    'rota': {l: {k: R[k].detach().float().cpu() for k in ('A', 'L', 'tau', 's', 'ls_fc', 'ls_dn', 'Lqk', 'tau_qk', 's_qk', 'ls_q', 'ls_k')}
+                             for l, R in ROTA.items()}}, os.environ['DESCENT_SAVE'])
 
 draw(True)
 e = evaluate(); e['weight_edits'] = evaluate_edits(); print('start', e, flush=True); log['trace'].append({'step': 0, **e}); save(0)
