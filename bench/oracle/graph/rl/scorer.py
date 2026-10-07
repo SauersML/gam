@@ -93,4 +93,10 @@ def checker(items: list[dict]) -> list[dict]:
     return out
 
 
-SCORERS = {"mock": mock, "checker": checker}
+def none(items: list[dict]) -> list[dict]:
+    """No score: the evaluation only samples and saves programs (a GPU pod without the checker); train.py
+    --mode rescore scores them later where the checker runs."""
+    return [{"total_bits": float("nan"), "valid": None, "scorer": "none"} for _ in items]
+
+
+SCORERS = {"mock": mock, "checker": checker, "none": none}
