@@ -1137,8 +1137,16 @@ pub struct Score {
     pub experiments: usize,
     pub valid: bool,
     pub error: Option<String>,
-    /// Per family: experiments, scored tokens, mean KL per token in bits.
-    pub per_family: BTreeMap<String, (usize, usize, f64)>,
+    pub per_family: BTreeMap<String, Family>,
+}
+
+/// One experiment family's share of the execution error.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct Family {
+    pub experiments: usize,
+    pub tokens: usize,
+    /// Mean `KL(M_e ‖ P_e)` per scored token, bits.
+    pub mean_kl_bits: f64,
 }
 
 fn scored_rows(batch: &Batch, prompts: &[(usize, &[usize])]) -> Result<Vec<usize>, String> {
@@ -1161,10 +1169,15 @@ impl Checker {
         let targets: Vec<(usize, &[usize])> = behavior.prompts.iter().enumerate().map(|(i, p)| (i, p.target_positions.as_slice())).collect();
         let rows = scored_rows(&batch, &targets)?;
         let stats = Stats::measure(&weights, &sequences)?;
-        let counterfactual = if behavior.prompts.iter().all(|p| p.counterfactual.as_ref().is_some_and(|c| c.token_ids.len() == p.token_ids.len())) {
+        // A counterfactual's targets: the prompt's, counted from the end of the sequence.
+        let counterfactual = if behavior.prompts.iter().all(|p| p.counterfactual.is_some()) {
             let cf: Vec<Vec<u32>> = behavior.prompts.iter().map(|p| p.counterfactual.as_ref().map(|c| c.token_ids.clone()).unwrap_or_default()).collect();
             let b = Batch::new(&cf)?;
-            let r = scored_rows(&b, &targets)?;
+            let shifted: Vec<Vec<usize>> = behavior.prompts.iter().zip(&cf).map(|(p, c)| p.target_positions.iter().filter_map(|&t| (t + c.len()).checked_sub(p.token_ids.len())).collect()).collect();
+            if shifted.iter().zip(&behavior.prompts).any(|(s, p)| s.len() != p.target_positions.len()) {
+                return Err("a counterfactual too short for its prompt's targets".into());
+            }
+            let r = scored_rows(&b, &shifted.iter().enumerate().map(|(i, s)| (i, s.as_slice())).collect::<Vec<_>>())?;
             Some((b, r))
         } else {
             None
@@ -1263,7 +1276,7 @@ impl Checker {
         };
         let experiments = sample(&self.weights, &graph, self.counterfactual.is_some(), count, seed);
         let circuit = graph.program(&self.weights, edges);
-        let mut per_family: BTreeMap<String, (usize, usize, f64)> = BTreeMap::new();
+        let mut per_family: BTreeMap<String, Family> = BTreeMap::new();
         let mut total = (0.0, 0usize);
         let mut outcomes = Vec::new();
         for e in &experiments {
@@ -1275,15 +1288,15 @@ impl Checker {
             let kl = kl_bits(&m, &p);
             let sum: f64 = kl.iter().sum();
             let entry = per_family.entry(e.family().to_string()).or_default();
-            entry.0 += 1;
-            entry.1 += kl.len();
-            entry.2 += sum;
+            entry.experiments += 1;
+            entry.tokens += kl.len();
+            entry.mean_kl_bits += sum;
             total.0 += sum;
             total.1 += kl.len();
             outcomes.push((e.clone(), m, p));
         }
         for v in per_family.values_mut() {
-            v.2 /= v.1.max(1) as f64;
+            v.mean_kl_bits /= v.tokens.max(1) as f64;
         }
         let exec_error_bits = n * total.0 / total.1.max(1) as f64;
         let code_bits = if valid && program.token_types > 1 { program.python_tokens as f64 * (program.token_types as f64).log2() } else { 0.0 };
@@ -1304,6 +1317,16 @@ impl Checker {
             per_family,
         };
         Ok((score, outcomes))
+    }
+
+    /// Each swapped prompt with its donor.
+    pub fn donors(&self) -> &[(usize, usize)] {
+        &self.donors
+    }
+
+    /// A swap's scored tokens as (prompt, position), in its rows' order.
+    pub fn swap_targets(&self) -> Vec<(usize, usize)> {
+        self.donors.iter().flat_map(|&(i, _)| self.behavior.prompts[i].target_positions.iter().map(move |&t| (i, t))).collect()
     }
 
     /// The graph a program parses to (for describing its experiments), or the empty graph.
