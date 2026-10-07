@@ -153,6 +153,56 @@ def strata_figure(run: Path, path: str):
     fig.savefig(path, dpi=150, facecolor="white")
 
 
+def curve_figure(run: Path, path: str, sets=None):
+    """Per held-out set (columns), over training steps and per question type: top, the oracle's bits of the
+    measured answer minus its bits of the no-change answer (sft.py's curve every --eval-every steps); bottom,
+    eval_kl's KL(M_e || oracle's answer) minus KL(M_e || no-change answer) at the base model (step 0) and the
+    saved adapters. Below 0 = the oracle beats "no change"."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    curve = [json.loads(l) for l in open(run / "train.jsonl") if '"heldout"' in l]
+    if not curve:
+        return
+    names = sets or sorted(curve[0]["heldout"])
+    kls = {}
+    for f in run.glob("eval_kl_step*.json"):
+        kls[int(f.stem.split("step")[1])] = json.loads(f.read_text())["sets"]
+    if (run / "eval_kl_base.json").exists():
+        kls[0] = json.loads((run / "eval_kl_base.json").read_text())["sets"]
+    if (run / "eval_kl_trained.json").exists() and (run / "eval.json").exists():
+        kls[json.loads((run / "eval.json").read_text())["steps"]] = json.loads((run / "eval_kl_trained.json").read_text())["sets"]
+    plt.rcParams.update({"font.size": 14, "axes.spines.top": False, "axes.spines.right": False})
+    fig, axes = plt.subplots(2, len(names), figsize=(5.5 * len(names), 9), facecolor="white", squeeze=False, sharex=True)
+    types = sorted({k for c in curve for s in names for k, v in c["heldout"].get(s, {}).items() if v.get("measured_minus_no_change_bits") is not None})
+    color = {k: f"C{i}" for i, k in enumerate(types)}
+    for col, s in enumerate(names):
+        top, bottom = axes[0][col], axes[1][col]
+        for k in types:
+            pts = [(c["step"], c["heldout"][s][k]) for c in curve if c["heldout"].get(s, {}).get(k, {}).get("measured_minus_no_change_bits") is not None]
+            if pts:
+                top.errorbar([p[0] for p in pts], [p[1]["measured_minus_no_change_bits"] for p in pts],
+                             yerr=[p[1]["measured_minus_no_change_se"] for p in pts], color=color[k], marker="o", ms=3, capsize=2)
+            kp = sorted((st, v[s][k]) for st, v in kls.items() if v.get(s, {}).get(k, {}).get("difference_bits") is not None)
+            if kp:
+                bottom.errorbar([p[0] for p in kp], [p[1]["difference_bits"] for p in kp], yerr=[p[1]["difference_se"] for p in kp],
+                                color=color[k], marker="s", ms=5, capsize=2)
+        for ax in (top, bottom):
+            ax.axhline(0, color="black", lw=0.8)
+            ax.set_yscale("symlog", linthresh=0.1)
+        top.set_title(s)
+        bottom.set_xlabel("training step")
+    axes[0][0].set_ylabel("answer bits: measured\nminus no-change")
+    axes[1][0].set_ylabel("KL to M: oracle\nminus no-change, bits")
+    from matplotlib.lines import Line2D
+
+    fig.legend([Line2D([], [], color=color[k], marker="o") for k in types], types, frameon=False, ncol=len(types), loc="upper center")
+    fig.tight_layout(rect=(0, 0, 1, 0.94))
+    fig.savefig(path, dpi=150, facecolor="white")
+
+
 def kl_figure(name, r, path):
     """Per held-out set (panels) and question type: KL(M_e || answer) in bits for the base oracle, the trained
     oracle and the no-change answer on the same questions (log scale)."""
@@ -189,6 +239,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--run", action="append", required=True)
     ap.add_argument("--figure", default="")
+    ap.add_argument("--curve-figure", default="", help="measured-minus-no-change bits over training steps for the first run")
     ap.add_argument("--strata-figure", default="", help="eval_kl by size of the measured change for the first run")
     ap.add_argument("--kl-figure", default="", help="eval_kl bars of the first run (base, trained, no change)")
     args = ap.parse_args()
@@ -201,6 +252,9 @@ def main():
         st = strata(r["dir"])
         if st:
             print(st)
+    if args.curve_figure:
+        curve_figure(next(iter(runs.values()))["dir"], args.curve_figure)
+        print("figure", args.curve_figure)
     if args.strata_figure:
         strata_figure(next(iter(runs.values()))["dir"], args.strata_figure)
         print("figure", args.strata_figure)
