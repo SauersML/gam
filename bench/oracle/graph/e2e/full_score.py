@@ -70,7 +70,9 @@ def main() -> None:
     ap.add_argument("--batch-tokens", type=int, help="reader_score.py's tokens per forward pass (memory)")
     ap.add_argument("--out", type=Path)
     a = ap.parse_args()
-    results = json.loads(a.results.read_text())
+    out = a.out or a.results.with_suffix(".joined.json")
+    # resumable: programs already joined in OUT keep their reader term
+    results = json.loads((out if out.exists() else a.results).read_text())
     command = [sys.executable, str(READER), "serve", "--model", a.model, "--target", a.target, "--listen", f"127.0.0.1:{a.port}"]
     if a.device:
         command += ["--device", a.device]
@@ -89,7 +91,7 @@ def main() -> None:
         lines = []
         for name, r in results.items():
             stem = a.items / f"{a.behavior}.{name}"
-            if name.startswith("_") or not Path(f"{stem}.items.jsonl").exists():
+            if name.startswith("_") or not Path(f"{stem}.items.jsonl").exists() or "reader" in r:
                 continue
             items = [json.loads(l) for l in Path(f"{stem}.items.jsonl").read_text().splitlines() if l.strip()]
             program = json.loads(Path(f"{stem}.program.jsonl").read_text())
@@ -113,8 +115,8 @@ def main() -> None:
             lines.append(e2e.status_line(a.target, a.behavior, f"{name}+reader:{a.model.split('/')[-1]}", r, r.get("stand_in")))
             print(name, {k: round(r[k] / r["N"], 4) for k in ("total_bits", "exec_error_bits", "opaque_bits", "code_bits", "reader_error_bits")},
                   "english saved/N", round(reader.get("english_saved_bits", float("nan")) / r["N"], 4), flush=True)
-        e2e.record(lines)
-        (a.out or a.results.with_suffix(".joined.json")).write_text(json.dumps(results, indent=1))
+            e2e.record(lines[-1:])
+            out.write_text(json.dumps(results, indent=1))
     finally:
         server.terminate()
 
