@@ -2396,6 +2396,9 @@ struct SiteStep {
 enum Action {
     Op(interchange::Operation),
     Weight { input: usize, delta: Tensor, arithmetic: Arithmetic },
+    /// The value's columns scaled by `diagonal` (`1 × width`): a native edit of a map's rows or
+    /// columns compiled entry-wise, every part and the leftover edited at those entries.
+    Scale { diagonal: Tensor },
 }
 
 /// A cut's replaced read: the later block's read is `N(s + o(x′) − o(x))` at the rows (`s` the
@@ -2478,6 +2481,11 @@ fn apply_steps(d: &Device, node: usize, steps: &[SiteStep], trace: &DeviceTrace,
         let operation = match &step.operation {
             Action::Weight { input, delta, arithmetic } => {
                 d.gemm(&mut v, 1.0, trace.value(*input)?, Op::N, delta, Op::T, 1.0, *arithmetic).map_err(error)?;
+                continue;
+            }
+            Action::Scale { diagonal } => {
+                let x = d.copy(&v).map_err(error)?;
+                d.scale_columns(&mut v, &x, diagonal, false).map_err(error)?;
                 continue;
             }
             Action::Op(operation) => *operation,
@@ -2785,20 +2793,61 @@ fn weight_site(layout: &Layout, native: &str) -> Option<(usize, usize)> {
     })
 }
 
-/// A native weight edit as the edits driver's manifest lists it (`{"units": {operator, rows, units,
-/// alpha}}`: those rows, else columns, of the operator scaled by `alpha`; `{"rank_one": {operator,
-/// scale, u, v}}`: `scale · u vᵀ` added) as `(operator, ΔW)`, the operator's matrix `W` read from
-/// the export (`blocks.{l}.q{h}`, `k{h}`, `v{h}`: head `h`'s rows of the attention map; `o{h}`: its
-/// columns of the output map; `c_fc`, `down_proj`: the MLP's maps).
-pub fn native_weight_edit(export: &Path, draw: &Value) -> Result<(String, Array2<f64>), String> {
+/// A node of a battery program that an entry-wise weight edit scales, by its place in the model.
+#[derive(Clone, Copy, Debug)]
+pub enum NodeRef {
+    /// Layer `layer`'s head `head`: its query (`map` 0), key (1) or value (2) vector, or its attention
+    /// read (the output map's input block).
+    HeadVariable { layer: usize, head: usize, map: usize },
+    HeadRead { layer: usize, head: usize },
+    /// Layer `layer`'s MLP pre-activations (`c_fc`'s output) and hidden vector (`down_proj`'s input).
+    PreActivation { layer: usize },
+    Hidden { layer: usize },
+}
+
+impl NodeRef {
+    fn node(self, layout: &Layout) -> Option<usize> {
+        match self {
+            Self::HeadVariable { layer, head, map } => layout.head_variables.get(layer)?.get(head).map(|v| v[map]),
+            Self::HeadRead { layer, head } => layout.head_reads.get(layer)?.get(head).copied(),
+            Self::PreActivation { layer } => layout.pre_activations.get(layer).copied(),
+            Self::Hidden { layer } => layout.inputs.get(KINDS.len() * layer + KINDS.iter().position(|k| *k == Kind::Down)?).copied(),
+        }
+    }
+}
+
+/// A native weight edit as a battery program takes it: entry-wise at a node (its columns `columns`,
+/// all where none, scaled by `alpha`), as a decomposition's parts and leftover take an edit of the
+/// rows or columns of the map they decompose, entry by entry; or the always-on term `ΔW·x` of an
+/// edit of no coordinates (a random ΔW), `weight_edit`'s rule for a map computed as a sum of slices.
+pub enum BatteryEdit {
+    Scale { node: NodeRef, columns: Option<Vec<usize>>, alpha: f64 },
+    Additive { native: String, delta: Array2<f64> },
+}
+
+/// A native weight edit as the edits driver's manifest lists it (mpd_library_mdl_2951 WeightDraw:
+/// `units` of an operator's rows or columns scaled by `alpha`; `rank_one` and `random`, a ΔW added;
+/// `replaced`, a map replaced by another's; `group`, several together) as battery edits, with its
+/// family. Entry-wise where the edit scales coordinates a node holds apart: a head's query, key or
+/// value rows (its vector's entries), a head's output-map columns (its attention read's entries), an
+/// MLP's c_fc rows (its pre-activations) and down_proj columns (its hidden vector). A head whose
+/// query, key, value and output blocks are all replaced by another head's of its layer takes the
+/// replacement entry-wise too: its attention read is then the other head's, read through the other's
+/// output block, so its read is zeroed and the other's doubled. Every other edit is additive, its ΔW
+/// from the export's maps (`blocks.{l}.q{h}`, `k{h}`, `v{h}`: head `h`'s rows of the attention map;
+/// `o{h}`: its columns of the output map; `c_fc`, `down_proj`).
+pub fn native_weight_edit(export: &Path, draw: &Value) -> Result<(String, Vec<BatteryEdit>), String> {
     let export = Export::open(export)?;
+    let hd = export.count("head_dim")?;
     let (kind, body) = draw.as_object().and_then(|o| o.iter().next()).ok_or_else(|| error("a weight edit without its kind"))?;
-    let operator = body["operator"].as_str().ok_or_else(|| error("a weight edit without its operator"))?.to_string();
-    let matrix = || -> Result<Array2<f64>, String> {
+    let place = |operator: &str| -> Result<(usize, String), String> {
         let (layer, map) = operator.strip_prefix("blocks.").and_then(|r| r.split_once('.')).ok_or_else(|| error(format!("{operator}: not a layer's map")))?;
-        let hd = export.count("head_dim")?;
+        Ok((layer.parse().map_err(|_| error(format!("{operator}: no layer")))?, map.to_string()))
+    };
+    let matrix = |operator: &str| -> Result<Array2<f64>, String> {
+        let (layer, map) = place(operator)?;
         let head = |p: &str| map.strip_prefix(p).and_then(|h| h.parse::<usize>().ok());
-        Ok(match map {
+        Ok(match map.as_str() {
             "c_fc" | "down_proj" => export.tensor(&format!("blocks.{layer}.mlp.{map}"))?,
             _ => match (head("q"), head("k"), head("v"), head("o")) {
                 (Some(h), ..) => export.tensor(&format!("blocks.{layer}.attn.q_proj"))?.slice(s![h * hd..(h + 1) * hd, ..]).to_owned(),
@@ -2809,43 +2858,97 @@ pub fn native_weight_edit(export: &Path, draw: &Value) -> Result<(String, Array2
             },
         })
     };
-    let floats = |key: &str| -> Result<Vec<f64>, String> { body[key].as_array().ok_or_else(|| error(format!("{operator}: no {key}")))?.iter().map(|v| v.as_f64().ok_or_else(|| error(format!("{operator}: {key}")))).collect() };
-    let delta = match kind.as_str() {
-        "units" => {
-            let w = matrix()?;
-            let alpha = body["alpha"].as_f64().ok_or_else(|| error(format!("{operator}: no alpha")))?;
-            let rows = body["rows"].as_bool().ok_or_else(|| error(format!("{operator}: rows or columns")))?;
-            let mut delta = Array2::zeros(w.dim());
-            for u in floats("units")? {
-                let u = u as usize;
-                if rows && u < w.nrows() {
-                    delta.row_mut(u).assign(&w.row(u).mapv(|v| v * (alpha - 1.0)));
-                } else if !rows && u < w.ncols() {
-                    delta.column_mut(u).assign(&w.column(u).mapv(|v| v * (alpha - 1.0)));
-                } else {
-                    return Err(error(format!("{operator}: unit {u} outside the map")));
-                }
+    let operator = |body: &Value| -> Result<String, String> { body["operator"].as_str().map(str::to_string).ok_or_else(|| error("a weight edit without its operator")) };
+    let floats = |body: &Value, key: &str| -> Result<Vec<f64>, String> { body[key].as_array().ok_or_else(|| error(format!("a weight edit without {key}")))?.iter().map(|v| v.as_f64().ok_or_else(|| error(key.to_string()))).collect() };
+    // One edit of the kinds the driver draws.
+    let one = |kind: &str, body: &Value| -> Result<Vec<BatteryEdit>, String> {
+        let name = operator(body)?;
+        let (layer, map) = place(&name)?;
+        let head = |p: &str| map.strip_prefix(p).and_then(|h| h.parse::<usize>().ok());
+        match kind {
+            "units" => {
+                let alpha = body["alpha"].as_f64().ok_or_else(|| error(format!("{name}: no alpha")))?;
+                let rows = body["rows"].as_bool().ok_or_else(|| error(format!("{name}: rows or columns")))?;
+                let units: Vec<usize> = floats(body, "units")?.into_iter().map(|u| u as usize).collect();
+                let vector = ["q", "k", "v"].iter().position(|p| head(p).is_some());
+                let node = match (rows, map.as_str(), vector, head("o")) {
+                    (true, "c_fc", ..) => Some(NodeRef::PreActivation { layer }),
+                    (false, "down_proj", ..) => Some(NodeRef::Hidden { layer }),
+                    (true, _, Some(j), _) => head(["q", "k", "v"][j]).map(|h| NodeRef::HeadVariable { layer, head: h, map: j }),
+                    (false, _, _, Some(h)) => Some(NodeRef::HeadRead { layer, head: h }),
+                    _ => None,
+                };
+                Ok(match node {
+                    Some(node) => vec![BatteryEdit::Scale { node, columns: Some(units), alpha }],
+                    None => {
+                        let w = matrix(&name)?;
+                        let mut delta = Array2::zeros(w.dim());
+                        for u in units {
+                            if rows && u < w.nrows() {
+                                delta.row_mut(u).assign(&w.row(u).mapv(|v| v * (alpha - 1.0)));
+                            } else if !rows && u < w.ncols() {
+                                delta.column_mut(u).assign(&w.column(u).mapv(|v| v * (alpha - 1.0)));
+                            } else {
+                                return Err(error(format!("{name}: unit {u} outside the map")));
+                            }
+                        }
+                        vec![BatteryEdit::Additive { native: name, delta }]
+                    }
+                })
             }
-            delta
+            "rank_one" => {
+                let (scale, u, v) = (body["scale"].as_f64().ok_or_else(|| error(format!("{name}: no scale")))?, floats(body, "u")?, floats(body, "v")?);
+                Ok(vec![BatteryEdit::Additive { native: name, delta: Array2::from_shape_fn((u.len(), v.len()), |(a, b)| scale * u[a] * v[b]) }])
+            }
+            "random" => {
+                // As the driver builds it: signs of A (rows × rank) then B (columns × rank) from the
+                // seed, A Bᵀ scaled to `ratio ‖W‖_F`.
+                let w = matrix(&name)?;
+                let rank = body["rank"].as_u64().ok_or_else(|| error(format!("{name}: no rank")))? as usize;
+                let ratio = body["ratio"].as_f64().ok_or_else(|| error(format!("{name}: no ratio")))?;
+                let mut rng = StdRng::seed_from_u64(body["seed"].as_u64().ok_or_else(|| error(format!("{name}: no seed")))?);
+                let signs = |rng: &mut StdRng, n: usize| Array2::from_shape_fn((n, rank), |_| if rng.random::<bool>() { 1.0 } else { -1.0 });
+                let (a, b) = (signs(&mut rng, w.nrows()), signs(&mut rng, w.ncols()));
+                let delta = a.dot(&b.t());
+                let size = delta.iter().map(|x| x * x).sum::<f64>().sqrt();
+                let target = ratio * w.iter().map(|x| x * x).sum::<f64>().sqrt();
+                Ok(vec![BatteryEdit::Additive { native: name, delta: delta.mapv(|x| x * target / size.max(f64::MIN_POSITIVE)) }])
+            }
+            "replaced" => {
+                let with = body["with"].as_str().ok_or_else(|| error(format!("{name}: replaced by nothing")))?;
+                Ok(vec![BatteryEdit::Additive { native: name.clone(), delta: &matrix(with)? - &matrix(&name)? }])
+            }
+            other => Err(error(format!("{name}: a weight edit of kind {other}"))),
         }
-        "rank_one" => {
-            let (scale, u, v) = (body["scale"].as_f64().ok_or_else(|| error(format!("{operator}: no scale")))?, floats("u")?, floats("v")?);
-            Array2::from_shape_fn((u.len(), v.len()), |(a, b)| scale * u[a] * v[b])
-        }
-        other => return Err(error(format!("{operator}: a weight edit of kind {other}"))),
     };
-    Ok((operator, delta))
+    if kind != "group" {
+        return Ok((kind.clone(), one(kind, body)?));
+    }
+    let family = body["family"].as_str().unwrap_or("group").to_string();
+    let children: Vec<(&String, &Value)> = body["edits"].as_array().ok_or_else(|| error("a group without its edits"))?.iter().filter_map(|c| c.as_object().and_then(|o| o.iter().next())).collect();
+    // A head replaced in all four of its maps by another head of its layer, entry-wise.
+    if children.len() == 4 && children.iter().all(|(k, _)| k.as_str() == "replaced") {
+        let (layer, map) = place(&operator(children[0].1)?)?;
+        let (_, with) = place(children[0].1["with"].as_str().unwrap_or(""))?;
+        let (h, other) = (map[1..].parse::<usize>().map_err(|_| error("a replaced head"))?, with[1..].parse::<usize>().map_err(|_| error("a replacing head"))?);
+        return Ok((family, vec![BatteryEdit::Scale { node: NodeRef::HeadRead { layer, head: h }, columns: None, alpha: 0.0 }, BatteryEdit::Scale { node: NodeRef::HeadRead { layer, head: other }, columns: None, alpha: 2.0 }]));
+    }
+    let mut edits = Vec::new();
+    for (k, b) in children {
+        edits.extend(one(k, b)?);
+    }
+    Ok((family, edits))
 }
 
 /// VPD's three forms (`FormRuns`) under native weight edits of `M`'s maps, as the edits driver
-/// scores an explanation (`mpd_library_mdl_2951` weight_faithfulness): each edit `(native, ΔW)`
-/// makes `M` compute with `W + ΔW` and VPD with its masked subcomponents plus the always-on term
-/// `ΔW·x` on the map's own input (`weight_edit`'s rule for a map computed as a sum of slices), its
-/// masks recomputed from each form's own run under the edit. On `rows`, every token scored: per form
+/// scores an explanation (`mpd_library_mdl_2951` weight_faithfulness): each edit (`BatteryEdit`s,
+/// `native_weight_edit`) makes `M` compute with its edited weights and VPD with its subcomponents
+/// edited entry-wise where the edit scales coordinates, plus the always-on term `ΔW·x` on the map's
+/// own input otherwise, its masks recomputed from each form's own run under the edit. On `rows`, every token scored: per form
 /// the gap `KL(M_e ‖ VPD_e)`, the edit-ignoring baseline `KL(M_e ‖ VPD)`, and the edit's effect
 /// `KL(M_e ‖ M)`, in bits per token, per edit and their means; an edit of an operator VPD does not
 /// hold is not applicable.
-pub fn vpd_weight_edits(vpd: &Vpd, export: &Path, decomposition: &Path, rows: &[Vec<u32>], edits: &[(String, Array2<f64>)], numeric_bytes: usize) -> Result<Value, String> {
+pub fn vpd_weight_edits(vpd: &Vpd, export: &Path, decomposition: &Path, rows: &[Vec<u32>], edits: &[(String, Vec<BatteryEdit>)], numeric_bytes: usize) -> Result<Value, String> {
     let d = vpd.e.program.device().clone();
     let parts = FormParts::new(vpd, export, decomposition, numeric_bytes)?;
     let runs = FormRuns::new(vpd, &parts, rows)?;
@@ -2860,22 +2963,45 @@ pub fn vpd_weight_edits(vpd: &Vpd, export: &Path, decomposition: &Path, rows: &[
     let m_clean = runs.m_run(None)?;
     let clean: Vec<DeviceTrace> = (0..FORMS.len()).map(|f| runs.form(f, &m_clean, None)).collect::<Result<_, _>>()?;
     let mut records = Vec::new();
-    for (i, (native, delta)) in edits.iter().enumerate() {
-        let (Some((m_node, m_input)), Some((e_node, e_input))) = (weight_site(&vpd.m_layout, native), weight_site(&vpd.layout, native)) else {
-            records.push(json!({"operator": native, "applicable": false}));
+    for (i, (native, edit)) in edits.iter().enumerate() {
+        // Per program its steps: an entry-wise scale of a node's columns, or the additive term at a
+        // map's use; none where the program holds no such node.
+        let plan = |layout: &Layout, program: &DeviceProgram| -> Result<Option<Plan>, String> {
+            let mut plan = Plan::new();
+            for e in edit {
+                let (node, operation) = match e {
+                    BatteryEdit::Scale { node, columns, alpha } => {
+                        let Some(at) = node.node(layout) else { return Ok(None) };
+                        let width = program.widths().get(at).copied().ok_or_else(|| error("a node outside the program"))?;
+                        let mut diagonal = vec![1.0; width];
+                        match columns {
+                            Some(columns) => {
+                                for &c in columns {
+                                    *diagonal.get_mut(c).ok_or_else(|| error(format!("{native}: entry {c} outside its node")))? = *alpha;
+                                }
+                            }
+                            None => diagonal.iter_mut().for_each(|v| *v = *alpha),
+                        }
+                        (at, Action::Scale { diagonal: d.upload_vec(1, width, diagonal).map_err(error)? })
+                    }
+                    BatteryEdit::Additive { native, delta } => {
+                        let Some((at, input)) = weight_site(layout, native) else { return Ok(None) };
+                        (at, Action::Weight { input, delta: d.upload(delta.view()).map_err(error)?, arithmetic: program.arithmetic() })
+                    }
+                };
+                plan.entry(node).or_default().push(SiteStep { base: None, operation, start: 0, rows: 0, donor: 0, push: None, cut: None });
+            }
+            Ok(Some(plan))
+        };
+        let (Some(m_plan), Some(e_plan)) = (plan(&vpd.m_layout, &vpd.m.program)?, plan(&vpd.layout, &vpd.e.program)?) else {
+            records.push(json!({"family": native, "applicable": false}));
             continue;
         };
-        let term = d.upload(delta.view()).map_err(error)?;
-        let plan = |node: usize, input: usize, arithmetic: Arithmetic| -> Result<Plan, String> {
-            let step = SiteStep { base: None, operation: Action::Weight { input, delta: d.copy(&term).map_err(error)?, arithmetic }, start: 0, rows: 0, donor: 0, push: None, cut: None };
-            Ok(Plan::from([(node, vec![step])]))
-        };
-        let m_edited = runs.m_run(Some((&plan(m_node, m_input, vpd.m.program.arithmetic())?, None)))?;
-        let e_plan = plan(e_node, e_input, vpd.e.program.arithmetic())?;
+        let m_edited = runs.m_run(Some((&m_plan, None)))?;
         let (m_hidden, e_hidden) = (vpd.m.hidden, vpd.e.hidden);
         let effect = mean_kl(&m_edited, &m_clean, (m_hidden, m_hidden))?;
         let mut record = serde_json::Map::new();
-        record.insert("operator".into(), json!(native));
+        record.insert("family".into(), json!(native));
         record.insert("applicable".into(), json!(true));
         record.insert("effect_mean_bits_per_token".into(), json!(effect));
         for (f, name) in FORMS.iter().enumerate() {
@@ -2883,7 +3009,7 @@ pub fn vpd_weight_edits(vpd: &Vpd, export: &Path, decomposition: &Path, rows: &[
             record.insert(format!("{name}_mean_bits_per_token"), json!(mean_kl(&m_edited, &run, (m_hidden, e_hidden))?));
             record.insert(format!("{name}_ignoring_mean_bits_per_token"), json!(mean_kl(&m_edited, &clean[f], (m_hidden, e_hidden))?));
         }
-        log::info!("vpd weight edit {i} ({native}): {:?}", record);
+        log::info!("vpd weight edit {i} ({native}): {}", Value::Object(record.clone()));
         records.push(Value::Object(record));
     }
     let applicable: Vec<&Value> = records.iter().filter(|r| r["applicable"] == json!(true)).collect();
