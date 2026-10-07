@@ -496,7 +496,8 @@ def evaluate(sets: dict[str, list[dict]], pol, sampler, score, args, adapter: Pa
     runs/oracle/<behavior>.<run>.json (g-int's oracle-vs-search table); summarize gives the numbers."""
     summary = {}
     run = args.run_name or Path(args.out).name
-    ORACLE_RUNS.mkdir(parents=True, exist_ok=True)
+    runs = Path(args.oracle_runs) if getattr(args, "oracle_runs", None) else ORACLE_RUNS
+    runs.mkdir(parents=True, exist_ok=True)
     with open(Path(args.out) / "eval_samples.jsonl", "a") as samples:
         for name, pool in sets.items():
             if not pool:
@@ -516,7 +517,7 @@ def evaluate(sets: dict[str, list[dict]], pol, sampler, score, args, adapter: Pa
                 for src, x in mine:
                     samples.write(json.dumps({"set": name, "step": step, "run": run, "behavior": b["id"], "behavior_path": b.get("path"), "program": "oracle", "source": src, "score": x}) + "\n")
                 src, x = min(mine, key=lambda m: m[1]["total_bits"])
-                (ORACLE_RUNS / f"{b['id']}.{run}.json").write_text(json.dumps({"behavior": b["id"], "model": b.get("model"), "source": src, "score": x, "stand_in": "counterfactual",
+                (runs / f"{b['id']}.{run}.json").write_text(json.dumps({"behavior": b["id"], "model": b.get("model"), "source": src, "score": x, "stand_in": "counterfactual",
                                                                                "experiments": args.eval_experiments, "seed": args.eval_seed, "set": name, "step": step}))
                 out.append((b, mine, per_base.get(b["id"], {})))
             summary[name] = summarize(name, step, out, log)
@@ -599,6 +600,7 @@ def main():
     ap.add_argument("--samples-from", nargs="*", help="rescore: eval_samples.jsonl files of earlier evaluations")
     ap.add_argument("--score-options", help="rescore: JSON object of extra checker request keys")
     ap.add_argument("--rescore-tag", default="rescore", help="rescore: output name RUN/rescore_<tag>.jsonl")
+    ap.add_argument("--oracle-runs", help="directory of the per-behavior best-program files (default ~/mpd-data/graph_oracle/runs/oracle; a pod writes under its outputs)")
     ap.add_argument("--run-name", help="the run's name in runs/oracle/<behavior>.<run>.json (default: the --out directory's name)")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
