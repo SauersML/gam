@@ -20,7 +20,7 @@ GRPO without its length and difficulty biases (Dr. GRPO). Per subcomponent, G ep
 temperature 1; advantage r - mean within its group (no division by the group's std, which weights
 groups by how alike their rewards are); loss = -sum over episodes of advantage x (summed log-probability
 of the policy's own tokens, every turn, thinking and tool calls included) / (episodes x the most tokens an
-episode may generate, turns x tokens), one constant, so no episode is reweighted by its own length (a
+episode may generate, (turns + 1) x tokens: the tool-call turns and the answer turn), one constant, so no episode is reweighted by its own length (a
 preference for short descriptions belongs in the reward, whose L(z) already charges them); one gradient
 step per batch,
 on the policy that sampled it, so the probability ratio is 1 and needs no clipping; no KL term. TRL's
@@ -355,7 +355,7 @@ def train(args):
         oracle.model.base_model.model.gradient_checkpointing_enable()
         oracle.model.base_model.model.config.use_cache = False
         optimizer.zero_grad(set_to_none=True)
-        loss = policy_step(oracle, table, episodes, convs, places, own, comps, advantage, args.micro, args.turns * args.tokens)
+        loss = policy_step(oracle, table, episodes, convs, places, own, comps, advantage, args.micro, (args.turns + 1) * args.tokens)
         torch.nn.utils.clip_grad_norm_(oracle.trainable(), 1.0)
         optimizer.step()
         log.write(json.dumps({"step": step, "mean_reward_bits": float(rewards.mean()), "best_reward_bits": float(rewards.max()), "loss": loss,
