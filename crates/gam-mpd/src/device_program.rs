@@ -284,6 +284,9 @@ pub struct DeviceProgram {
     /// Gated nodes with a scale take the ramp `clamp(gate / scale, 0, 1)` in place of the
     /// expected gate `Φ(gate / scale)` ([`DeviceProgram::set_ramp`]).
     ramp: bool,
+    /// Gated nodes with a scale take the hard gate `H(gate)`, the scale unread
+    /// ([`DeviceProgram::set_hard`]).
+    hard: bool,
     /// Per node, an earlier node of the same value: the same node over the same arguments (each
     /// argument taken as the earliest node of its value) and the same operators, a common
     /// subexpression. library_vpd's head rules each recompute their layer's attention-input reads
@@ -473,8 +476,9 @@ pub struct DeviceTrace {
     /// The nodes that took an earlier node's value (`DeviceProgram::aliases`), and that node.
     aliased: BTreeMap<usize, usize>,
     /// The gates' mode of the pass ([`DeviceProgram::set_ramp`]), which its reverse and tangent
-    /// differentiate.
+    /// differentiate, and whether it gated hard ([`DeviceProgram::set_hard`]).
     ramp: bool,
+    hard: bool,
     /// Bfloat16 copies of node values a bfloat16 forward pass's and the reverse passes' products read
     /// ([`DeviceTrace::rounded_value`]), kept until [`DeviceTrace::release_rounded`].
     rounded: Mutex<BTreeMap<usize, Arc<Tensor>>>,
@@ -1003,7 +1007,7 @@ impl DeviceProgram {
                 _ => None,
             })
             .collect();
-        Ok(Self { device: device.clone(), steps, widths, head, edited_head_nodes, operators, batch: Mutex::new(None), rotary_tables: Mutex::new(Vec::new()), bf16: false, arithmetic: Arithmetic::F64, fused, grouped, revisions: BTreeMap::new(), rounded: Mutex::new(BTreeMap::new()), exact_zeros, dead, sole, listed, gated_reads, list_choices: Mutex::new(std::collections::HashMap::new()), always_listed: false, ramp: false, aliases })
+        Ok(Self { device: device.clone(), steps, widths, head, edited_head_nodes, operators, batch: Mutex::new(None), rotary_tables: Mutex::new(Vec::new()), bf16: false, arithmetic: Arithmetic::F64, fused, grouped, revisions: BTreeMap::new(), rounded: Mutex::new(BTreeMap::new()), exact_zeros, dead, sole, listed, gated_reads, list_choices: Mutex::new(std::collections::HashMap::new()), always_listed: false, ramp: false, hard: false, aliases })
     }
 
     /// Operator `op`'s device copy changed: every group reading it runs node by node until
@@ -1316,6 +1320,20 @@ impl DeviceProgram {
         self.ramp
     }
 
+    /// From now on every gated node with a scale gates by the hard gate `H(gate)` (`hard` true),
+    /// its scale unread, or by its mode as before (false). A fit trained through a learned
+    /// width (`library_vpd::Gate::Learned`) scores its explanation this way; a hard pass is not
+    /// reversed.
+    pub fn set_hard(&mut self, hard: bool) {
+        self.hard = hard;
+    }
+
+    /// Whether gated nodes with a scale take the hard gate ([`DeviceProgram::set_hard`]).
+    #[must_use]
+    pub fn hard(&self) -> bool {
+        self.hard
+    }
+
     /// How many entries of gated node `gated`'s value the pass that made `trace` listed, its rows'
     /// components on (`DeviceProgram::row_lists`); `None` when it listed none (a dense pass).
     #[must_use]
@@ -1615,6 +1633,7 @@ impl DeviceProgram {
         }
         Ok(Some(match scale {
             None => d.gate_function(GateFunction::Step, z, None).map_err(error)?,
+            Some(_) if trace.hard => d.gate_function(GateFunction::Step, z, None).map_err(error)?,
             Some(s) if trace.ramp => d.gate_function(GateFunction::Ramp, z, Some(trace.value(*s)?)).map_err(error)?,
             Some(s) => {
                 let s = trace.value(*s)?;
@@ -1710,7 +1729,7 @@ impl DeviceProgram {
     }
 
     fn list_key(&self, node: usize) -> ListKey {
-        (node, std::mem::discriminant(&self.arithmetic), self.ramp)
+        (node, std::mem::discriminant(&self.arithmetic), self.ramp || self.hard)
     }
 
     /// Affine node `node`'s first term `(argument, operator)` from `listed` (its product on per-row
@@ -1806,6 +1825,7 @@ impl DeviceProgram {
     fn gate_weights(&self, trace: &DeviceTrace, gate: usize, scale: Option<usize>) -> Result<Tensor, String> {
         let d = &self.device;
         match scale {
+            Some(_) if trace.hard => d.gate_function(GateFunction::Step, trace.value(gate)?, None),
             Some(s) => d.gate_function(if trace.ramp { GateFunction::Ramp } else { GateFunction::Cdf }, trace.value(gate)?, Some(trace.value(s)?)),
             None => d.gate_function(GateFunction::Step, trace.value(gate)?, None),
         }
@@ -2085,6 +2105,7 @@ impl DeviceProgram {
             listed_nodes: BTreeSet::new(),
             aliased: BTreeMap::new(),
             ramp: self.ramp,
+            hard: self.hard,
             rounded: Mutex::new(BTreeMap::new()),
         };
         // The nodes an edit replaced: a later node of the same value computes its own.

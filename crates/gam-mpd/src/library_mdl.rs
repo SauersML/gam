@@ -411,6 +411,19 @@ pub struct Explanation {
     pub reads: Vec<interchange::ReadVariable>,
     /// The stages whose components share gates (`library_vpd`'s gate sharing; [`Share`]).
     pub shares: Vec<Share>,
+    /// How a fit scores the gated components ([`GateScoring`]).
+    pub scoring: GateScoring,
+}
+
+/// How a fit scores an explanation's gated components (`library_vpd::Gate`) in every pass that
+/// takes no gradient: as compiled, by the ramp `clamp(z / w, 0, 1)` (`DeviceProgram::set_ramp`), or
+/// by the hard gate `H(z)` (`DeviceProgram::set_hard`); a pass with a gradient gates as compiled.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GateScoring {
+    #[default]
+    Compiled,
+    Ramp,
+    Hard,
 }
 
 /// Per group of `groups`, the mean square of `program`'s values over its cells. A group whose
@@ -932,7 +945,7 @@ pub fn explanation_with(native: &OperatorProgram, layers: &[LayerNodes], transco
     artifact.owners = owners;
     let reference = mean_squares(&artifact.program, &groups);
     let reads = interchange::reads_of(native, &artifact, out.len())?;
-    Ok(Explanation { artifact, trainable, groups, layers: out, removed: Vec::new(), fixed_nats: 0.0, reference, reads, shares: Vec::new() })
+    Ok(Explanation { artifact, trainable, groups, layers: out, removed: Vec::new(), fixed_nats: 0.0, reference, reads, shares: Vec::new(), scoring: GateScoring::Compiled })
 }
 
 /// The prior groups of each of `explanation`'s `2L` blocks (block `2l` layer `l`'s attention,
@@ -2087,10 +2100,10 @@ struct Scorer {
     /// Per layer its stages of gated components (`library_vpd`), none for a layer of functions.
     stages: Vec<Vec<GatedStage>>,
     /// The hard gates' stages (`library_vpd::Gate::Hard`: a width that is no parameter), each its
-    /// width and threshold operators and its gates ([`Scorer::train_gates`]), and whether the
-    /// explanation's gates are ramps (`library_vpd::Gate::Ramp`).
+    /// width and threshold operators and its gates ([`Scorer::train_gates`]), and how the
+    /// explanation's gates are scored ([`GateScoring`]).
     hard_gates: Vec<(usize, usize, usize)>,
-    ramp: bool,
+    scoring: GateScoring,
     /// Each trainable operator's position in `Explanation::trainable`.
     position: BTreeMap<usize, usize>,
     /// The blocks the explanation explains ([`scope`]), when not all of them ([`scoped`]): every
@@ -2159,8 +2172,8 @@ impl Scorer {
         let scope = Some(scope(explanation)).filter(|blocks| !blocks.iter().all(|b| *b));
         let program = &explanation.artifact.program;
         let hard_gates = stages.iter().flatten().filter(|s| !position.contains_key(&s.width)).map(|s| (s.width, s.threshold, program.operators[s.width].rows.width())).collect();
-        let ramp = stages.iter().flatten().any(|s| position.contains_key(&s.width));
-        let mut scorer = Self { experiments, mlps, stages, hard_gates, ramp, position, scope, families: settings.families.clone(), edits: std::cell::RefCell::new(BTreeMap::new()), assignments, written: None, version: 0, assignment_step: None, assignment_budget: Vec::new() };
+        let scoring = explanation.scoring;
+        let mut scorer = Self { experiments, mlps, stages, hard_gates, scoring, position, scope, families: settings.families.clone(), edits: std::cell::RefCell::new(BTreeMap::new()), assignments, written: None, version: 0, assignment_step: None, assignment_budget: Vec::new() };
         scorer.train_gates(None)?;
         Ok(scorer)
     }
@@ -2170,12 +2183,14 @@ impl Scorer {
     /// thresholds their means about `center` (the iterate, the average or the iterate before the
     /// pending move, whatever the pass samples around), so its gate is `Φ(z_b / σ_b)`, the hard
     /// gate's expectation with the threshold integrated exactly and the reads and a direction by
-    /// the pass's weight sample; a ramp explanation gates by `Φ(z / w)`. With none, the evaluation
-    /// law: every hard stage at `library_vpd::HARD` (the hard gate `H(z_b)`), a ramp explanation by
-    /// its ramp (`DeviceProgram::set_ramp`).
+    /// the pass's weight sample; a learned width's gate is `Φ(z / w)`. With none, the evaluation
+    /// law: every hard stage at `library_vpd::HARD` (the hard gate `H(z_b)`), and a learned width's
+    /// gate by its scoring ([`GateScoring`]: the ramp or the hard gate).
     fn train_gates(&mut self, posterior: Option<(&DevicePosterior, Center)>) -> Result<(), String> {
-        if self.ramp {
-            self.experiments.explanation_mut().set_ramp(posterior.is_none());
+        match self.scoring {
+            GateScoring::Ramp => self.experiments.explanation_mut().set_ramp(posterior.is_none()),
+            GateScoring::Hard => self.experiments.explanation_mut().set_hard(posterior.is_none()),
+            GateScoring::Compiled => {}
         }
         if self.hard_gates.is_empty() {
             return Ok(());

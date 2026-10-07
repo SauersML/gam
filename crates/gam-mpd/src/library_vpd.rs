@@ -27,6 +27,7 @@
 //!   into the width and the threshold's mean into the threshold, so the gate is `Φ(z_b / σ_b)`, the
 //!   threshold integrated exactly and the reads and a direction by the pass's weight sample. The
 //!   width is no parameter; its operator holds no prior group.
+//! - `Gate::Learned`: as `Gate::Ramp` in training, evaluated with the hard gate `H(z_b)`.
 //! - `Gate::Ramp`, a labelled partial-strength arm: the width is a trainable parameter (its own
 //!   prior group, started at the standard deviation of the component's gate read over the start's
 //!   fitting tokens), a pass with a gradient gates by `Φ(z_b / w_b)` and every scoring by the ramp
@@ -139,6 +140,13 @@ pub enum Gate {
     Hard,
     /// A learned width, evaluated by the ramp `clamp(z / w, 0, 1)`.
     Ramp,
+    /// A learned width, trained through `Φ(z / w)` and evaluated by the hard gate `H(z)`
+    /// (`DeviceProgram::set_hard`). Trained as `Hard`, the expected gate `Φ(z / σ_τ)` steepens as
+    /// the posterior sharpens (IVON sets `σ_τ` from the measured curvature every step, about 10⁻³
+    /// after the first), the curvature grows like `1 / σ_τ` and the step stops (vpd4l tiny fit:
+    /// the curvature ratio 7e2 → 7e8 within 3 draws, with or without a budget); a width at the
+    /// data's scale does not.
+    Learned,
 }
 
 /// The width a hard gate's stage holds while it is evaluated: `Φ(z / s)` at `s = 10⁻³⁰` (a normal
@@ -279,11 +287,11 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
             }
             let widths = match gate {
                 Gate::Hard => vec![HARD; count],
-                Gate::Ramp => comps.iter().map(|&b| components[b].width.filter(|w| w.is_finite() && *w > 0.0).ok_or_else(|| error(format!("component {b}: no positive gate width in the start file (rerun mpd_battery_2951 start)")))).collect::<Result<Vec<f64>, String>>()?,
+                Gate::Ramp | Gate::Learned => comps.iter().map(|&b| components[b].width.filter(|w| w.is_finite() && *w > 0.0).ok_or_else(|| error(format!("component {b}: no positive gate width in the start file (rerun mpd_battery_2951 start)")))).collect::<Result<Vec<f64>, String>>()?,
             };
             // A shared own gate's width on the squared norm has the norm's slope at the threshold:
             // d‖·‖²/d‖·‖ = 2τ there (2w for a threshold below one width).
-            let width = |b: usize| if share && !direction && gate == Gate::Ramp { 2.0 * widths[b] * components[comps[b]].tau.max(widths[b]) } else { widths[b] };
+            let width = |b: usize| if share && !direction && gate != Gate::Hard { 2.0 * widths[b] * components[comps[b]].tau.max(widths[b]) } else { widths[b] };
             ops.push(dense(&format!("{prefix}.width"), units(count)?, Interface::constant(), Array2::from_shape_fn((count, 1), |(b, _)| width(b)))?);
             if share && direction {
                 ops.push(dense(&format!("{prefix}.assign"), units(count)?, units(count)?, Array2::eye(count))?);
@@ -622,7 +630,12 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
     // Each shared component's gate is a choice among its candidates: ln K nats to send.
     let choices: f64 = shares.iter().flat_map(|s| s.candidates.iter()).map(|c| (c.len() as f64).ln()).sum();
     let built = groups_of(artifact, layers, direction, gate)?;
-    Ok(Explanation { shares, fixed_nats: built.fixed_nats + choices, ..built })
+    let scoring = match gate {
+        Gate::Hard => crate::library_mdl::GateScoring::Compiled,
+        Gate::Ramp => crate::library_mdl::GateScoring::Ramp,
+        Gate::Learned => crate::library_mdl::GateScoring::Hard,
+    };
+    Ok(Explanation { shares, fixed_nats: built.fixed_nats + choices, scoring, ..built })
 }
 
 /// The prior groups, trainable operators and layers of the built artifact (module note).
@@ -711,7 +724,7 @@ fn groups_of(artifact: Artifact, layers: &[LayerNodes], direction: bool, gate: G
                 thresholds.push(groups.len() - 1);
             }
             if let Ok(w) = named(&format!("{name}.{prefix}.width"))
-                && gate == Gate::Ramp
+                && gate != Gate::Hard
             {
                 trainable.push(w);
                 groups.push(Group { name: format!("{name}.{prefix}.widths"), cells: vec![Cells { operator: w, rows: (0..rows_of(w)).collect(), cols: 0..1 }] });
@@ -766,7 +779,7 @@ fn groups_of(artifact: Artifact, layers: &[LayerNodes], direction: bool, gate: G
                 layer.thresholds.push(groups.len() - 1);
             }
             if let Ok(w) = named(&format!("{name}.mlp.{prefix}.width"))
-                && gate == Gate::Ramp
+                && gate != Gate::Hard
             {
                 trainable.push(w);
                 groups.push(Group { name: format!("{name}.mlp.{prefix}.widths"), cells: vec![Cells { operator: w, rows: (0..rows_of(w)).collect(), cols: 0..1 }] });
@@ -777,7 +790,7 @@ fn groups_of(artifact: Artifact, layers: &[LayerNodes], direction: bool, gate: G
     trainable.sort_unstable();
     trainable.dedup();
     let reference = mean_squares(&artifact.program, &groups);
-    Ok(Explanation { artifact, trainable, groups, layers: out, removed: Vec::new(), fixed_nats: 0.0, reference, reads: Vec::new(), shares: Vec::new() })
+    Ok(Explanation { artifact, trainable, groups, layers: out, removed: Vec::new(), fixed_nats: 0.0, reference, reads: Vec::new(), shares: Vec::new(), scoring: crate::library_mdl::GateScoring::Compiled })
 }
 
 /// The uses of `M`'s maps in an explanation [`explanation`] built (`artifact::Owner::uses`), where
