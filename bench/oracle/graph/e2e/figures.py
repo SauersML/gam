@@ -53,7 +53,7 @@ def terms(results: dict, behavior: str, labels: dict[str, str], out: Path, title
             ax.barh(row, min(v, max(limit - left, 0)), left=left, color=color, height=0.6, edgecolor="white", linewidth=2,
                     label=label if row == next(r for r, m in enumerate(names) if results[m][k] > 0) else None)
             left += v
-        text = f"{totals[row]:.2f}" + (" (beyond the axis)" if totals[row] > limit else "")
+        text = f"{totals[row]:.2f}" + (" →" if totals[row] > limit else "")  # an arrow: the bar runs past the axis
         ax.text(min(totals[row], limit) + 0.01 * limit, row, text, va="center", fontsize=18)
     ax.set_yticks(range(len(names)), [labels.get(n, n) for n in names])
     ax.invert_yaxis()
