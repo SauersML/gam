@@ -30,6 +30,8 @@
 //! components by `gᵀx − τ` with `g` the component's own read direction (its first read slice, the
 //! sign that makes its mean coefficient on the fitting rows positive), `c = 0` and `τ = 0`: on
 //! where the coefficient is positive, so it is exact only where the coefficients have one sign.
+//! Every gate's width is its read's spread on the fitting rows (library_vpd's learned width, as
+//! vpd_start sets it); a direction is written in those units, width 1.
 
 use crate::{
     artifact::Artifact,
@@ -154,9 +156,41 @@ impl Frame {
     }
 }
 
-/// One component of a start file, as library_vpd reads it.
-fn component(read: Value, slices: &[[usize; 2]]) -> Value {
-    json!({"read": read, "tau": 0.0, "slices": slices})
+/// One component of a start file, as library_vpd reads it: its read, `τ = 0`, its gate's width
+/// and its slices.
+fn component(read: Value, width: f64, slices: &[[usize; 2]]) -> Value {
+    json!({"read": read, "tau": 0.0, "width": width, "slices": slices})
+}
+
+/// The spread (standard deviation) of `values`; a read that is the same on every fitting row
+/// (a zero map's, or a completing atom's that the rows never take) has no scale to set, and its
+/// gate is given width 1.
+fn spread(values: impl Iterator<Item = f64>) -> f64 {
+    let (mut n, mut sum, mut squares) = (0.0, 0.0, 0.0);
+    for v in values {
+        n += 1.0;
+        sum += v;
+        squares += v * v;
+    }
+    let variance = if n > 0.0 { (squares / n - (sum / n).powi(2)).max(0.0) } else { 0.0 };
+    if variance > 0.0 { variance.sqrt() } else { 1.0 }
+}
+
+/// An own gate reading `copies` slices that each read `g` on `rows`: its width, the spread of
+/// `‖V_bᵀx‖ = √copies |gᵀx|`.
+fn own_width(rows: &Array2<f64>, g: ndarray::ArrayView1<f64>, copies: f64) -> f64 {
+    spread(rows.dot(&g).iter().map(|v| copies.sqrt() * v.abs()))
+}
+
+/// A direction gate reading `g` on `rows`, signed so that its mean on the rows is not negative and
+/// written in units of its spread there (`g` over the spread, width 1), with no constant.
+fn direction(rows: &Array2<f64>, g: ndarray::ArrayView1<f64>, site: usize) -> Value {
+    let values = rows.dot(&g);
+    let sign = if values.sum() >= 0.0 { 1.0 } else { -1.0 };
+    let scale = spread(values.iter().copied());
+    let mut coefficients: Vec<f64> = g.iter().map(|v| sign * v / scale).collect();
+    coefficients.push(0.0);
+    json!({"direction": {"site": site, "coefficients": coefficients}})
 }
 
 /// The matrix of the native operator named `name`.
@@ -223,8 +257,8 @@ pub fn frame_start(native: &OperatorProgram, layers: &[LayerNodes], fitting: &Fa
                 for w in [&wq, &wk, &wv] {
                     layer_sites.push(Site::zero(w.nrows(), w.ncols()));
                 }
-                own.push(component(json!({"own": [site(0), 0]}), &[[site(0), 0], [site(1), 0], [site(2), 0]]));
-                direction.push(component(json!({"direction": {"site": site(0), "coefficients": vec![0.0; x.ncols() + 1]}}), &[[site(0), 0], [site(1), 0], [site(2), 0]]));
+                own.push(component(json!({"own": [site(0), 0]}), 1.0, &[[site(0), 0], [site(1), 0], [site(2), 0]]));
+                direction.push(component(json!({"direction": {"site": site(0), "coefficients": vec![0.0; x.ncols() + 1]}}), 1.0, &[[site(0), 0], [site(1), 0], [site(2), 0]]));
                 (None, None)
             } else {
                 let frame = Frame::of(kind, &x, seed ^ (l as u64 * 6 + 1))?;
@@ -273,50 +307,38 @@ pub fn frame_start(native: &OperatorProgram, layers: &[LayerNodes], fitting: &Fa
                 layer_sites.push(Site { u: down.t().to_owned(), v: Array2::eye(m) });
                 Some((m, m, None))
             };
-            // The components, per site group, own and direction.
-            let mean_sign = |rows: &Array2<f64>, g: &Array2<f64>, i: usize| -> f64 { if rows.dot(&g.row(i)).sum() >= 0.0 { 1.0 } else { -1.0 } };
+            // The components, per site group, own and direction; each gate's width is its read's
+            // spread on the fitting rows (a direction is written in those units, width 1).
             if let (Some(frame), Some(dual)) = (&attention_frame, &attention_dual) {
                 for i in 0..frame.atoms.nrows() {
                     let slices = [[site(0), i], [site(1), i], [site(2), i]];
-                    own.push(component(json!({"own": [site(0), i]}), &slices));
-                    let mut g: Vec<f64> = dual.row(i).iter().map(|v| v * mean_sign(&x, dual, i)).collect();
-                    g.push(0.0);
-                    direction.push(component(json!({"direction": {"site": site(0), "coefficients": g}}), &slices));
+                    own.push(component(json!({"own": [site(0), i]}), own_width(&x, dual.row(i), 3.0), &slices));
+                    direction.push(component(direction(&x, dual.row(i), site(0)), 1.0, &slices));
                 }
             }
             if let Some((frame, dual)) = &o_frame {
                 for i in 0..frame.atoms.nrows() {
-                    own.push(component(json!({"own": [site(3), i]}), &[[site(3), i]]));
-                    let mut g: Vec<f64> = dual.row(i).iter().map(|v| v * mean_sign(&heads_out, dual, i)).collect();
-                    g.push(0.0);
-                    direction.push(component(json!({"direction": {"site": site(3), "coefficients": g}}), &[[site(3), i]]));
+                    own.push(component(json!({"own": [site(3), i]}), own_width(&heads_out, dual.row(i), 1.0), &[[site(3), i]]));
+                    direction.push(component(direction(&heads_out, dual.row(i), site(3)), 1.0, &[[site(3), i]]));
                 }
             }
             match &mlp {
                 Some((ups, downs, Some((up_dual, down_dual)))) => {
                     let hidden = value(layer.active)?;
                     for i in 0..*ups {
-                        own.push(component(json!({"own": [site(4), i]}), &[[site(4), i]]));
-                        let mut g: Vec<f64> = up_dual.row(i).iter().map(|v| v * mean_sign(&h2, up_dual, i)).collect();
-                        g.push(0.0);
-                        direction.push(component(json!({"direction": {"site": site(4), "coefficients": g}}), &[[site(4), i]]));
+                        own.push(component(json!({"own": [site(4), i]}), own_width(&h2, up_dual.row(i), 1.0), &[[site(4), i]]));
+                        direction.push(component(direction(&h2, up_dual.row(i), site(4)), 1.0, &[[site(4), i]]));
                     }
                     for i in 0..*downs {
-                        own.push(component(json!({"own": [site(5), i]}), &[[site(5), i]]));
-                        let mut g: Vec<f64> = down_dual.row(i).iter().map(|v| v * mean_sign(&hidden, down_dual, i)).collect();
-                        g.push(0.0);
-                        direction.push(component(json!({"direction": {"site": site(5), "coefficients": g}}), &[[site(5), i]]));
+                        own.push(component(json!({"own": [site(5), i]}), own_width(&hidden, down_dual.row(i), 1.0), &[[site(5), i]]));
+                        direction.push(component(direction(&hidden, down_dual.row(i), site(5)), 1.0, &[[site(5), i]]));
                     }
                 }
                 Some((m, _, None)) => {
                     for n in 0..*m {
                         let slices = [[site(4), n], [site(5), n]];
-                        own.push(component(json!({"own": [site(4), n]}), &slices));
-                        let mut g: Vec<f64> = up.row(n).to_vec();
-                        let sign = if h2.dot(&up.row(n)).sum() >= 0.0 { 1.0 } else { -1.0 };
-                        g.iter_mut().for_each(|v| *v *= sign);
-                        g.push(0.0);
-                        direction.push(component(json!({"direction": {"site": site(4), "coefficients": g}}), &slices));
+                        own.push(component(json!({"own": [site(4), n]}), own_width(&h2, up.row(n), 1.0), &slices));
+                        direction.push(component(direction(&h2, up.row(n), site(4)), 1.0, &slices));
                     }
                 }
                 _ => {}
