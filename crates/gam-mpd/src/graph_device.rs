@@ -593,7 +593,14 @@ pub(crate) fn run_on(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, 
         let values = gam_math::categorical::log_softmax(row.as_slice().ok_or("a contiguous row")?).map_err(|e| e.to_string())?;
         row.assign(&Array1::from(values));
     }
-    let writes = st.writes.iter().map(|w| w.as_ref().map(|t| s.device.download(t)).transpose()).collect::<Result<Vec<_>, _>>().map_err(e)?;
+    // The units' writes come back only from a run that scores no rows: a donor run, whose writes
+    // other runs read (swaps, site operations, `Checker::measure_typical`). On Qwen3-0.6B every
+    // run's writes are about a gigabyte of float64.
+    let writes = if job.scored.is_empty() && !job.capture {
+        st.writes.iter().map(|w| w.as_ref().map(|t| s.device.download(t)).transpose()).collect::<Result<Vec<_>, _>>().map_err(e)?
+    } else {
+        vec![None; units]
+    };
     Ok(Execution::of(log_probabilities, writes, captured, kept))
 }
 
