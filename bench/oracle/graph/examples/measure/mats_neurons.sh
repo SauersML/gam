@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Patch tables (vpd_neurons.py) for many Qwen3-0.6B behaviors on one MATS L40 (#2951):
-#   MATS_GPUS=1 mats-run neurons-vpd4l 8 32 2 -- bash /Users/user/gam/bench/oracle/graph/examples/measure/mats_patch.sh \
+# Neuron tables (vpd_neurons.py) for many vpd4l behavior:layer jobs on one MATS L40 (#2951):
+#   MATS_GPUS=1 mats-run neurons-vpd4l 8 32 2 -- bash /Users/user/gam/bench/oracle/graph/examples/measure/mats_neurons.sh \
 #       /Users/user/mpd-data/cluster/neurons-vpd4l BEHAVIOR.json:LAYER [...] [vpd4l weight files, named so mats-run uploads them]
 set -Eeuo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
