@@ -17,8 +17,11 @@ from pathlib import Path
 
 EXPORTS = {
     "vpd4l": Path.home() / "mpd-data/engine/vpd4l",
+    "qwen3-0.6b": Path.home() / "mpd-data/engine/qwen3_0p6b_heldout64",
 }
-BINARY = Path(os.environ.get("GRAPH_CHECKER", Path.home() / "mpd-data/scratch/g-exec/bin/mpd_graph_2951"))
+# The latest checker build (g-exec2 copies each release build there), else g-exec's first build.
+PUBLISHED = Path.home() / "mpd-data/graph_oracle/bin/mpd_graph_2951"
+BINARY = Path(os.environ.get("GRAPH_CHECKER") or (PUBLISHED if PUBLISHED.exists() else Path.home() / "mpd-data/scratch/g-exec/bin/mpd_graph_2951"))
 HERE = Path(__file__).resolve().parent
 
 

@@ -143,14 +143,19 @@ fn export_sequences(export: &Path, count: usize) -> Result<Vec<Vec<u32>>, String
     Ok((0..count.min(rows)).map(|r| (0..cols).map(|c| id(r * cols + c)).collect()).collect())
 }
 
-/// The manifest a behavior request names, or by default VPD-4L's shared one for its export.
+/// The manifest a behavior request names, or by default the export's shared one: VPD-4L's
+/// `~/mpd-data/compare/manifest/MANIFEST_vpd4l_s1.json`, any other export's
+/// `~/mpd-data/graph_oracle/experiments/MANIFEST_{export directory}_s1.json` (draw_manifest
+/// writes it) when it exists.
 fn manifest(request: &Value, export: &Path) -> Option<std::path::PathBuf> {
     match request.get("manifest") {
         Some(Value::Null) => None,
         Some(Value::String(path)) => Some(path.into()),
         _ => {
-            let default = Path::new(&std::env::var("HOME").ok()?).join("mpd-data/compare/manifest/MANIFEST_vpd4l_s1.json");
-            (export.file_name().is_some_and(|n| n == "vpd4l") && default.exists()).then_some(default)
+            let home = std::path::PathBuf::from(std::env::var("HOME").ok()?);
+            let name = export.file_name()?.to_string_lossy().into_owned();
+            let default = if name == "vpd4l" { home.join("mpd-data/compare/manifest/MANIFEST_vpd4l_s1.json") } else { home.join(format!("mpd-data/graph_oracle/experiments/MANIFEST_{name}_s1.json")) };
+            default.exists().then_some(default)
         }
     }
 }
