@@ -715,3 +715,25 @@ fn a_ruled_node_attends_by_its_rule_with_its_own_value_and_output() {
     let unruled = Graph::parse(&full_program(), &weights).expect("full");
     assert!(graph.opaque_numbers(&weights) < unruled.opaque_numbers(&weights));
 }
+
+#[test]
+fn device_path_runs_ruled_nodes_as_the_host() {
+    let f = fixture("graph_device_rule");
+    let library = Library::new(&f.device, &f.device, &f.native, &f.layers, &f.artifact, 1 << 28, 64).expect("library");
+    let weights = Weights::of(&library);
+    let mut program = full_program();
+    let a1 = program.nodes.iter().position(|n| n.id == "a1").expect("a1");
+    program.nodes[a1].rule = Some(serde_json::json!({"op": "attend", "query": {"op": "tokens"}, "key": {"op": "shift", "arg": {"op": "tokens"}, "by": 1}}));
+    program.edges.retain(|e| !(e.to == "a1" && e.route != "value"));
+    let graph = Graph::parse(&program, &weights).expect("parse");
+    let sequences: Vec<Vec<u32>> = f.sequences.iter().zip([12, 7, 9, 12, 5, 9]).map(|(s, n)| s[..n].to_vec()).collect();
+    let batch = Batch::new(&sequences).expect("batch");
+    let rows: Vec<usize> = (0..batch.tokens.len()).collect();
+    let circuit = graph.program(&weights, true);
+    let host = execute(&weights, &circuit, &batch, &rows, &BTreeMap::new()).expect("host");
+    let mut state = crate::graph_device::DeviceState::new(Device::host());
+    let job = crate::graph_device::Run { tokens: &batch.tokens, spans: &batch.spans, scored: &rows, swaps: &BTreeMap::new(), capture: false, reference: None, ops: &crate::graph::Interventions::default() };
+    let device = crate::graph_device::run_on(&mut state, &weights, &circuit, &job).expect("device");
+    let kl = max(&kl_bits(&host.log_probabilities, &device.log_probabilities));
+    assert!(kl < 1e-9, "KL(host ‖ device) with a ruled node = {kl:e} bits");
+}

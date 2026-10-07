@@ -271,9 +271,8 @@ fn standins(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, r: &Refer
 /// `circuit` run on the process's device ([`use_device`]), or `None` when there is none or the
 /// circuit holds a block the device path does not cover.
 pub(crate) fn run(weights: &Weights, circuit: &Circuit, job: &Run) -> Option<Result<Execution, String>> {
-    // Native blocks only; ruled heads and operations on the heads of a VPD-view attention run on the
-    // host.
-    if !circuit.units.iter().all(|u| matches!(u.block, Block::Heads { .. } | Block::Neurons { .. }) && u.rule.is_none()) || !job.ops.head_reads.is_empty() || !job.ops.record_reads.is_empty() {
+    // Native blocks only; operations on the heads of a VPD-view attention run on the host.
+    if !circuit.units.iter().all(|u| matches!(u.block, Block::Heads { .. } | Block::Neurons { .. })) || !job.ops.head_reads.is_empty() || !job.ops.record_reads.is_empty() {
         return None;
     }
     on_device(|s| run_on(s, weights, circuit, job))
@@ -529,6 +528,30 @@ pub(crate) fn run_on(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, 
                             c.attention_inputs[*layer] = s.device.download(&normed_inputs[0]).map_err(e)?;
                         }
                     }
+                    // A ruled node: its heads read the rule's pattern (block diagonal over the
+                    // sequences, built on the host) times their own value outputs.
+                    if let Some(rule) = &unit.rule {
+                        let mut pattern = Array2::<f64>::zeros((rows, rows));
+                        for &(start, length) in job.spans {
+                            pattern.slice_mut(ndarray::s![start..start + length, start..start + length]).assign(&rule.pattern(&job.tokens[start..start + length]));
+                        }
+                        let pattern = s.device.upload(pattern.view()).map_err(e)?;
+                        let mut out = s.device.zeros(rows, width).map_err(e)?;
+                        for &h in heads {
+                            let hw = &lw.heads[h];
+                            let wv = s.ensure(hw.value.view()).map_err(e)?;
+                            let mut v = s.device.zeros(rows, hw.value.nrows()).map_err(e)?;
+                            s.device.gemm(&mut v, 1.0, &normed_inputs[2], Op::N, s.get(wv).map_err(e)?, Op::T, 0.0, arithmetic).map_err(e)?;
+                            let mut z = s.device.zeros(rows, v.cols()).map_err(e)?;
+                            s.device.gemm(&mut z, 1.0, &pattern, Op::N, &v, Op::N, 0.0, arithmetic).map_err(e)?;
+                            if let Some(c) = captured.as_mut() {
+                                c.reads[*layer][h] = s.device.download(&z).map_err(e)?;
+                            }
+                            let wo = s.ensure(hw.output.view()).map_err(e)?;
+                            s.device.gemm(&mut out, 1.0, &z, Op::N, s.get(wo).map_err(e)?, Op::T, 1.0, arithmetic).map_err(e)?;
+                        }
+                        out
+                    } else {
                     // All the unit's heads at once where they share their shapes, head-norm gains and
                     // rotary (Qwen3, vpd4l): one product per map and one attention call per layer.
                     let pad_job = Padding { places: padded.as_ref(), sequences, longest };
@@ -587,6 +610,7 @@ pub(crate) fn run_on(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, 
                         s.device.gemm(&mut out, 1.0, &z, Op::N, s.get(wo).map_err(e)?, Op::T, 1.0, arithmetic).map_err(e)?;
                     }
                     out
+                    }
                     }
                 }
                 Block::Neurons { layer, neurons } => {
