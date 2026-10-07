@@ -61,7 +61,8 @@ class Checker:
         was killed under 8 GiB); threads: its rayon threads (RAYON_NUM_THREADS when unset, 6 by default: runs
         in parallel each hold their own streams and log-probabilities); views: decomposition views to attach,
         {"vpd": DIR, "transcoders": DIR} (the server's load keys)."""
-        memory_gib = memory_gib or (24 if model.startswith("qwen3") else 12)
+        # Qwen3-0.6B's load in float64 passed 16.3 GiB and was killed under a 16 GiB lease.
+        memory_gib = memory_gib or (28 if model.startswith("qwen3") else 12)
         env = dict(os.environ)
         env.setdefault("RAYON_NUM_THREADS", str(threads or 6))
         self.model = model
