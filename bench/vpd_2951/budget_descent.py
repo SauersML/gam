@@ -20,7 +20,7 @@ Starts:
   vpdgroup  as vpd, with each down_proj slice tied to the gate of the c_fc slice of its layer whose
        firing is nearest its own (below)
 Gate arms (DESCENT_ARM): own (above); dir, a separate signed gate direction per slice; router, a
-small causal router per layer added to the own read (below).
+small causal router per layer added to the own read; router_pure, the router alone (below).
 Dual step (DESCENT_DUAL): measured (default, library_mdl's rule, below) or fixed (lambda <- lambda +
 0.01 log(E[k] / K) on the loss KL + lambda log E[k], the first runs' rule).
 Training rows 0..1023 of tokens.f64, held-out evaluation rows 1024..1031 (4096 tokens), where VPD's
@@ -129,14 +129,24 @@ if start == 'vpdgroup':
 # input at that position only): z_i = (r_i + [G2 relu(G1 x)]_i - tau_i) / s_i for every slice of the
 # layer's two maps, G1 of shape d x 64 shared by the layer, G2 of shape 64 x C per map, started at
 # zero (so the start is the own-read gate's).
+# DESCENT_ARM=router_pure: the router alone, z_i = ([G2 relu(G1 x)]_i - tau_i) / s_i, with G2 started
+# at the least-squares fit of the own reads r on M's fit tokens from the 64 router features.
 ROUTER = {}
-if ARM == 'router':
+if ARM in ('router', 'router_pure'):
     for l in range(4):
         fc, dn = f'h.{l}.mlp.c_fc', f'h.{l}.mlp.down_proj'
         d = P[fc]['V'].shape[0]
-        ROUTER[l] = {'G1': (torch.randn(d, 64, device=dev) / math.sqrt(d)).requires_grad_(),
-                     fc: torch.zeros(64, P[fc]['V'].shape[1], device=dev, requires_grad=True),
-                     dn: torch.zeros(64, P[dn]['V'].shape[1], device=dev, requires_grad=True)}
+        G1 = torch.randn(d, 64, device=dev) / math.sqrt(d)
+        R = {'G1': G1.requires_grad_()}
+        for n in (fc, dn):
+            if ARM == 'router':
+                R[n] = torch.zeros(64, P[n]['V'].shape[1], device=dev, requires_grad=True)
+            else:
+                with torch.no_grad():
+                    H = torch.relu(X[fc] @ G1)
+                    r = (X[n] @ P[n]['V']).abs() * P[n]['U'].norm(dim=1)
+                    R[n] = torch.linalg.lstsq(H.cpu().double(), r.cpu().double()).solution.float().to(dev).requires_grad_()
+        ROUTER[l] = R
 del X
 
 state = {'mode': 'M', 'soft': [], 'hard': [], 'gates': {}, 'route': {}}
@@ -156,7 +166,7 @@ def make(n):
         if router is not None:
             if n.endswith('c_fc'):
                 state['route'][layer] = torch.relu(x @ router['G1'])
-            read = read + state['route'][layer] @ router[n]
+            read = state['route'][layer] @ router[n] if ARM == 'router_pure' else read + state['route'][layer] @ router[n]
         z = (read - p['tau']) / p['s']
         hard = (z > 0).float()
         phi = 0.5 * (1 + torch.erf(z / SQ2))
@@ -206,7 +216,7 @@ params = [P[n][w] for n in mlp for w in (('V', 'U', 'G') if ARM == 'dir' else ('
 LR = float(os.environ.get('DESCENT_LR', '1'))
 groups = [{'params': [q], 'lr': LR * 3e-3 * q.detach().pow(2).mean().sqrt().item()} for q in params]
 groups += [{'params': [P[n]['tau']], 'lr': LR * 0.1 * P[n]['s'].mean().item()} for n in mlp]
-# Router: G1 at 0.3% of its root mean square, G2 (started at zero) at 0.3% of its map's noise scale.
+# Router: G1 at 0.3% of its root mean square, G2 at 0.3% of its map's noise scale.
 for l, R in ROUTER.items():
     groups.append({'params': [R['G1']], 'lr': LR * 3e-3 * R['G1'].detach().pow(2).mean().sqrt().item()})
     groups += [{'params': [R[n]], 'lr': LR * 3e-3 * P[n]['s'].mean().item()} for n in R if n != 'G1']
