@@ -685,6 +685,7 @@ if ARM == 'rot':
                       'ls_fc': torch.full((ng, ROTG), math.log(0.01 * Wf.pow(2).mean().sqrt().item()), device=dev, requires_grad=True),
                       'ls_dn': torch.full((ng, ROTG), math.log(0.01 * Wd.pow(2).mean().sqrt().item()), device=dev, requires_grad=True)}
     MASK = torch.triu(torch.ones(ROTG, ROTG, device=dev), 1)
+ROT_ALL = list(ROT.values())
 
 def rot_train_gate(hard, phi):
     """A block's gate in training. mf: the expected gate Phi(z); st: the hard gate (as the scorer runs it) with
@@ -720,13 +721,17 @@ def rot_slice_bits(R, Q):
     di, do = R['di'], R['do']
     vf = (nf.sum() + di * sf.sum()) / (di * nf.numel()); vd = (nd.sum() + do * sd.sum()) / (do * nd.numel())
     bits = 0.5 * (di * torch.log(vf / sf) + (nf + di * sf) / vf - di) + 0.5 * (do * torch.log(vd / sd) + (nd + do * sd) / vd - do)
-    if 'A_leaf' in R:
-        mu, ls = R['A_leaf']
-        e = (mu.pow(2) + (2 * ls).exp()) * MASK
-        vA = e.sum() / (MASK.sum() * mu.shape[0])
-        kl = 0.5 * (torch.log(vA) - 2 * ls + e / vA - 1) * MASK
-        bits = bits + 0.5 * (kl.sum(-1) + kl.sum(-2))
-    return bits / math.log(2), nd.clamp_min(0).sqrt()
+    return bits / math.log(2) + rot_angle_bits(R), nd.clamp_min(0).sqrt()
+
+def rot_angle_bits(R):
+    """Per slice [ng, g]: half of each rotation angle it shares (F's posterior on the angles), in bits."""
+    if 'A_leaf' not in R:
+        return 0.0
+    mu, ls = R['A_leaf']
+    e = (mu.pow(2) + (2 * ls).exp()) * MASK
+    vA = e.sum() / (MASK.sum() * mu.shape[0])
+    kl = 0.5 * (torch.log(vA) - 2 * ls + e / vA - 1) * MASK
+    return 0.5 * (kl.sum(-1) + kl.sum(-2)) / math.log(2)
 
 def rot_tau_bits(R):
     """Per block [ng, g]: its threshold's description in bits (the fitted-mean prior)."""
@@ -739,8 +744,7 @@ def rot_tau_bits(R):
 def rot_index_bits():
     """log2 of the number of blocks (MLP, OV and QK blocks with a slice or plane)."""
     used = lambda L: int((torch.zeros(L.shape[:2], device=dev).scatter_(1, L.argmax(-1), 1.0) > 0).sum())
-    return math.log2(max(2, sum(used(R['L']) for R in list(ROT.values()) + list(ROTA.values()))
-                         + sum(used(R['Lqk']) for R in ROTA.values())))
+    return math.log2(max(2, sum(used(R['L']) for R in ROT_ALL)))
 
 def make_rot_fc(n, l):
     R = ROT[l]; W = T.site(n).W
@@ -815,64 +819,54 @@ if ARM == 'rot':
         T.site(f'h.{l}.mlp.c_fc')._forward = make_rot_fc(f'h.{l}.mlp.c_fc', l)
         T.site(f'h.{l}.mlp.down_proj')._forward = make_rot_dn(f'h.{l}.mlp.down_proj', l)
 
-# The rot arm's attention (DESCENT_SITES=all), exact by construction, q, k and v computed by M's maps:
-# - QK blocks: a head's RoPE planes (coordinates c and c + HD/2 of its q and k, which RoPE rotates together, so
-#   no rotation across planes keeps the logits) fall into blocks under a learned assignment; a block's gate at
-#   query t switches its planes of q at t, and reads its effect on the logits there, the root of the summed
-#   variances over the attended keys of its planes' logit terms q_c(t) . k_c(s) / sqrt(HD), under the pattern
-#   with every block on.
-# - OV blocks: a head's value coordinates fall into groups of DESCENT_ROT, each with a learned basis Q = exp(S) as
-#   in the MLP; slice i reads W_v,G^T Q_i (mixed by the pattern) and writes W_o,G Q_i, and a block's gate at
-#   query t switches its subspace of the head's attention output there (z_G = Q diag(g) Q^T a_G), reading its own
-#   write, sqrt(sum_i |a_G . Q_i|^2 ||W_o,G Q_i||^2).
-# With every block on, P's attention is M's. A QK plane's description is its two q rows and two k rows, an OV
-# slice's its read and write (dense, at their own widths, under zero-mean priors per layer and map), as in the MLP.
-# DESCENT_QKREAD=uniform: a QK block's read weighs every causal key alike instead of by the all-on pattern; a
-# pattern concentrated on one key (a sink) gives a plane that sets it apart no variance under the pattern itself.
-QK_READ = os.environ.get('DESCENT_QKREAD', 'pattern')
+# The rot arm's attention (DESCENT_SITES=all), exact by construction, from M's maps. q, k and the heads' value
+# coordinates each fall into groups of DESCENT_ROT coordinates of one head, each group with a learned basis
+# Q = exp(S) as in the MLP (pre-RoPE, so any basis sums to M's q and k), and a group's slices into blocks under a
+# learned assignment, one gate per block:
+# - q blocks, gated at the query t, switch their part of q(t); a block reads its effect on the logits there: the
+#   root of its slices' summed variances of their logit terms c_i(t) (R_t Q_i) . k(s) / sqrt(HD) over the keys
+#   under the all-on pattern (each slice's variance from the keys' per-coordinate variances, RoPE undone at t;
+#   covariances between coordinates left out);
+# - k blocks, gated at the key s, switch their part of k(s), reading their own write |c_i(s)|;
+# - OV blocks: slice i reads W_v,G^T Q_i (mixed by the pattern) and writes W_o,G Q_i; a block's gate at the query t
+#   switches its subspace of the head's output there (z_G = Q diag(g) Q^T a_G), reading its own write.
+# With every block on, P's attention is M's. A q or k slice's description is its dense read (d numbers), an OV
+# slice's its read and write, each at its own width under zero-mean priors per layer and map, plus its share of
+# the rotation's angles.
 ROTA = {}
 if ARM == 'rot' and attn:
     NPL = HD // 2
     with torch.no_grad():
         for l in range(T.n_layer):
             Wq, Wk, Wv, Wo = (T.site(f'h.{l}.attn.{k}').W for k in ('q_proj', 'k_proj', 'v_proj', 'o_proj'))
-            plane = lambda W: W.view(NH, 2, NPL, -1).pow(2).sum((1, 3))                              # [H, NPL]
-            ngo = NH * HD // ROTG
-            Gv = Wv.view(ngo, ROTG, -1); Go = Wo.T.reshape(ngo, ROTG, -1)
-            ROTA[l] = {'nq': plane(Wq), 'nk': plane(Wk), 'ngo': ngo, 'di': Wv.shape[1], 'do': Wo.shape[0],
-                       'Lqk': (6.0 * torch.eye(NPL, device=dev)).repeat(NH, 1, 1).requires_grad_(),
-                       'tau_qk': torch.zeros(NH, NPL, device=dev, requires_grad=True), 's_qk': torch.ones(NH, NPL, device=dev),
-                       'ls_q': torch.full((NH, NPL), math.log(0.01 * Wq.pow(2).mean().sqrt().item()), device=dev, requires_grad=True),
-                       'ls_k': torch.full((NH, NPL), math.log(0.01 * Wk.pow(2).mean().sqrt().item()), device=dev, requires_grad=True),
-                       'Gfc': Gv @ Gv.transpose(1, 2), 'Gdn': Go @ Go.transpose(1, 2), 'ng': ngo,
-                       'A': torch.zeros(ngo, ROTG, ROTG, device=dev, requires_grad=True),
-                       'L': (6.0 * torch.eye(ROTG, device=dev)).repeat(ngo, 1, 1).requires_grad_(),
-                       'tau': torch.zeros(ngo, ROTG, device=dev, requires_grad=True), 's': torch.ones(ngo, ROTG, device=dev),
-                       'ls_fc': torch.full((ngo, ROTG), math.log(0.01 * Wv.pow(2).mean().sqrt().item()), device=dev, requires_grad=True),
-                       'ls_dn': torch.full((ngo, ROTG), math.log(0.01 * Wo.pow(2).mean().sqrt().item()), device=dev, requires_grad=True)}
+            ng = NH * HD // ROTG
+            sub = lambda: {'ng': ng, 'A': torch.zeros(ng, ROTG, ROTG, device=dev, requires_grad=True),
+                           'L': (6.0 * torch.eye(ROTG, device=dev)).repeat(ng, 1, 1).requires_grad_(),
+                           'tau': torch.zeros(ng, ROTG, device=dev, requires_grad=True), 's': torch.ones(ng, ROTG, device=dev)}
+            ROTA[l] = {}
+            for name, W in (('q', Wq), ('k', Wk)):
+                G_ = W.view(ng, ROTG, -1)
+                ROTA[l][name] = {**sub(), 'G': G_ @ G_.transpose(1, 2), 'di': W.shape[1],
+                                 'ls': torch.full((ng, ROTG), math.log(0.01 * W.pow(2).mean().sqrt().item()), device=dev, requires_grad=True)}
+            Gv = Wv.view(ng, ROTG, -1); Go = Wo.T.reshape(ng, ROTG, -1)
+            ROTA[l]['ov'] = {**sub(), 'Gfc': Gv @ Gv.transpose(1, 2), 'Gdn': Go @ Go.transpose(1, 2), 'di': Wv.shape[1], 'do': Wo.shape[0],
+                             'ls_fc': torch.full((ng, ROTG), math.log(0.01 * Wv.pow(2).mean().sqrt().item()), device=dev, requires_grad=True),
+                             'ls_dn': torch.full((ng, ROTG), math.log(0.01 * Wo.pow(2).mean().sqrt().item()), device=dev, requires_grad=True)}
+ROT_ALL = list(ROT.values()) + [R[x] for R in ROTA.values() for x in ('q', 'k', 'ov')]
 
-def rot_plane_bits(R):
-    """Per QK plane [H, NPL]: its two q rows' and two k rows' description in bits."""
-    bits = 0.0
-    for nn_, ls in ((R['nq'], R['ls_q']), (R['nk'], R['ls_k'])):
-        s2 = (2 * ls).exp(); d_ = 2 * R['di']
-        v = (nn_.sum() + d_ * s2.sum()) / (d_ * nn_.numel())
-        bits = bits + 0.5 * (d_ * torch.log(v / s2) + (nn_ + d_ * s2) / v - d_)
-    return bits / math.log(2)
+def rot_read_bits(R, Q):
+    """Per q or k slice [ng, g]: its dense read's description and its angles' share, in bits."""
+    s2 = (2 * R['ls']).exp(); d_ = R['di']
+    nr = torch.einsum('nki,nkm,nmi->ni', Q, R['G'], Q)
+    v = (nr.sum() + d_ * s2.sum()) / (d_ * nr.numel())
+    return (0.5 * (d_ * torch.log(v / s2) + (nr + d_ * s2) / v - d_)) / math.log(2) + rot_angle_bits(R)
 
-def rot_qk_tau_bits(R):
-    if 'tau_qk_leaf' not in R:
-        return torch.zeros_like(R['s_qk'])
-    mu, ls = R['tau_qk_leaf']
-    v = ((mu - mu.mean()).pow(2) + (2 * ls).exp()).mean()
-    return 0.5 * (torch.log(v) - 2 * ls + ((mu - mu.mean()).pow(2) + (2 * ls).exp()) / v - 1) / math.log(2)
-
-def rot_gate(Rb, tau, s_, Lj, hot, Lsm, calib_key):
+def rot_gate(Rb, R, Lj, hot, Lsm, calib_key):
     """From the blocks' reads Rb [B, T, groups, blocks]: appends the bits and blocks on per token, returns the
     slices' gates [B, T, groups, slices]."""
     if state.get('calib') is not None:
         state['calib'].setdefault(calib_key, []).append(Rb.detach().reshape(-1))
-    z = (Rb - tau) / s_
+    z = (Rb - R['tau']) / R['s']
     hard, phi = (z > 0).float(), 0.5 * (1 + torch.erf(z / SQ2))
     if state['force_on']:
         on = torch.tensor(state['force_on'], device=z.device)
@@ -885,61 +879,60 @@ def rot_gate(Rb, tau, s_, Lj, hot, Lsm, calib_key):
     state['soft'].append((gb * Lj).sum((-1, -2)).reshape(-1))
     return torch.einsum('...nj,nij->...ni', gb, Lsm)
 
+def rot_blocks(R, r, bits_i, calib_key):
+    """The gates of R's slices from their reads r [B, T, ng, g] and their bits bits_i [ng, g]."""
+    hot = F.one_hot(R['L'].argmax(-1), ROTG).float(); Lsm = torch.softmax(R['L'], -1)
+    M_ = hot if state['mode'] == 'hard' else Lsm
+    Rb = (torch.einsum('btni,nij->btnj', r.pow(2), M_) + 1e-20).sqrt()
+    Lj = torch.einsum('ni,nij->nj', bits_i, M_) + rot_tau_bits(R) + rot_index_bits()
+    return rot_gate(Rb, R, Lj, hot, Lsm, calib_key)
+
 def rot_attention(i, h, causal):
-    """Layer i's attention output under the rot arm: QK blocks gate q's planes at each query, OV blocks gate the
-    head's output in rotated bases, M's weights throughout."""
-    R = ROTA[i]; B_, T_ = h.shape[0], h.shape[1]
+    """Layer i's attention output under the rot arm: q blocks gated at the query, k blocks at the key, OV blocks on
+    the heads' output at the query, M's weights throughout."""
+    Rq, Rk, Ro = ROTA[i]['q'], ROTA[i]['k'], ROTA[i]['ov']; B_, T_ = h.shape[0], h.shape[1]
     site = lambda k: T.site(f'h.{i}.attn.{k}')
+    grp = lambda t_: t_.view(B_, T_, -1, ROTG)
     q, k, v = site('q_proj')(h), site('k_proj')(h), site('v_proj')(h)
+    Qq, Qk = rot_Q(Rq), rot_Q(Rk)
+    cq = torch.einsum('btnk,nki->btni', grp(q), Qq); ck = torch.einsum('btnk,nki->btni', grp(k), Qk)
     if state.get('noise'):
-        # Each plane's two q (k) rows at the plane's width; each OV slice's read (below) at its own.
-        rows = lambda ls: ls.exp().view(NH, 1, NPL).expand(NH, 2, NPL).reshape(-1)              # q's row order
-        q = q + (h @ torch.randn(q.shape[-1], h.shape[-1], device=h.device).T) * rows(R['ls_q'])
-        k = k + (h @ torch.randn(k.shape[-1], h.shape[-1], device=h.device).T) * rows(R['ls_k'])
-    qh = T._rope(q.view(B_, T_, NH, HD).transpose(1, 2), T_); kh = T._rope(k.view(B_, T_, NH, HD).transpose(1, 2), T_)
-    vh = v.view(B_, T_, NH, HD).transpose(1, 2)
-    if state['mode'] == 'all':
-        gq = None
-    else:
-        if QK_READ == 'uniform':
-            # Every causal key alike.
-            full = causal.float() / causal.float().sum(-1, keepdim=True)
-        else:
+        cq = cq + grp(h @ torch.randn(q.shape[-1], h.shape[-1], device=h.device).T) * Rq['ls'].exp()
+        ck = ck + grp(h @ torch.randn(k.shape[-1], h.shape[-1], device=h.device).T) * Rk['ls'].exp()
+    rope = lambda t_: T._rope(t_.view(B_, T_, NH, HD).transpose(1, 2), T_)
+    back = lambda c_, Q_: torch.einsum('btni,nki->btnk', c_, Q_).reshape(B_, T_, -1)
+    if state['mode'] != 'all':
+        # The keys' per-coordinate variance over the attended keys, RoPE undone at the query: for plane c,
+        # cov_rel = R_t^T cov_c(t) R_t; coordinate c (first of its plane) takes cov_rel[0, 0], c + HD/2 cov_rel[1, 1].
+        with torch.no_grad():
+            qh, kh = rope(back(cq, Qq)), rope(back(ck, Qk))
             full = ((qh @ kh.transpose(-1, -2)) / math.sqrt(HD)).masked_fill(~causal, float('-inf')).softmax(-1)
-        q2 = torch.stack((qh[..., :NPL], qh[..., NPL:]), -1); k2 = torch.stack((kh[..., :NPL], kh[..., NPL:]), -1)  # [B, H, T, NPL, 2]
+        k2 = torch.stack((kh[..., :NPL], kh[..., NPL:]), -1)                                    # [B, H, T, NPL, 2]
         mk = (full @ k2.flatten(-2)).view(B_, NH, T_, NPL, 2)
         kk = (full @ (k2[..., :, None] * k2[..., None, :]).flatten(-3)).view(B_, NH, T_, NPL, 2, 2)
-        cov = kk - mk[..., :, None] * mk[..., None, :]
-        r2 = torch.einsum('bhtcx,bhtcxy,bhtcy->bhtc', q2, cov, q2).clamp_min(0) / HD       # [B, H, T, NPL]
-        hot = F.one_hot(R['Lqk'].argmax(-1), NPL).float(); Lsm = torch.softmax(R['Lqk'], -1)
-        M_ = hot if state['mode'] == 'hard' else Lsm
-        Rb = (torch.einsum('bhtc,hcj->bhtj', r2, M_) + 1e-20).sqrt()
-        Lj = torch.einsum('hc,hcj->hj', rot_plane_bits(R), M_) + rot_qk_tau_bits(R) + rot_index_bits()
-        gq = rot_gate(Rb.permute(0, 2, 1, 3), R['tau_qk'], R['s_qk'], Lj, hot, Lsm, f'h.{i}.attn.q_proj')  # [B, T, H, NPL]
-        gq = gq.permute(0, 2, 1, 3)
-        qh = qh * torch.cat((gq, gq), -1)
+        cv = kk - mk[..., :, None] * mk[..., None, :]
+        co, si = T.cos[:T_, :NPL], T.sin[:T_, :NPL]
+        d0 = co ** 2 * cv[..., 0, 0] + 2 * co * si * cv[..., 0, 1] + si ** 2 * cv[..., 1, 1]
+        d1 = si ** 2 * cv[..., 0, 0] - 2 * co * si * cv[..., 0, 1] + co ** 2 * cv[..., 1, 1]
+        D = torch.cat((d0, d1), -1).clamp_min(0).transpose(1, 2).reshape(B_, T_, -1, ROTG)     # [B, T, ng, g] by coordinate
+        rq = (cq.pow(2) * torch.einsum('btnk,nki->btni', D, Qq.pow(2)) / HD + 1e-20).sqrt()
+        cq = cq * rot_blocks(Rq, rq, rot_read_bits(Rq, Qq), f'h.{i}.attn.q_proj')
+        ck = ck * rot_blocks(Rk, ck.abs(), rot_read_bits(Rk, Qk), f'h.{i}.attn.k_proj')
+    qh, kh = rope(back(cq, Qq)), rope(back(ck, Qk))
     pattern = ((qh @ kh.transpose(-1, -2)) / math.sqrt(HD)).masked_fill(~causal, float('-inf')).softmax(-1)
-    a = (pattern @ vh).transpose(1, 2).reshape(B_, T_, R['ngo'], ROTG)                    # [B, T, groups, g]
-    Q = rot_Q(R)
+    a = grp((pattern @ v.view(B_, T_, NH, HD).transpose(1, 2)).transpose(1, 2).reshape(B_, T_, -1))
+    Q = rot_Q(Ro)
     c = torch.einsum('btnk,nki->btni', a, Q)
     if state.get('noise'):
         # Each OV slice's read noise at each key, mixed by the pattern like the values.
         vn = (h @ torch.randn(NH * HD, h.shape[-1], device=h.device).T).view(B_, T_, NH, HD).transpose(1, 2)
-        c = c + (pattern @ vn).transpose(1, 2).reshape(B_, T_, R['ngo'], ROTG) * R['ls_fc'].exp()
-    if state['mode'] == 'all':
-        gam = torch.ones_like(c)
-    else:
-        bits_i, wn = rot_slice_bits(R, Q)
-        hot = F.one_hot(R['L'].argmax(-1), ROTG).float(); Lsm = torch.softmax(R['L'], -1)
-        M_ = hot if state['mode'] == 'hard' else Lsm
-        Rb = (torch.einsum('btni,nij->btnj', (c.abs() * wn).pow(2), M_) + 1e-20).sqrt()
-        Lj = torch.einsum('ni,nij->nj', bits_i, M_) + rot_tau_bits(R) + rot_index_bits()
-        gam = rot_gate(Rb, R['tau'], R['s'], Lj, hot, Lsm, f'h.{i}.attn.o_proj')
-    zz = torch.einsum('btni,nki->btnk', c * gam, Q).reshape(B_, T_, -1)
-    y = site('o_proj')(zz)
+        c = c + grp((pattern @ vn).transpose(1, 2).reshape(B_, T_, -1)) * Ro['ls_fc'].exp()
+    if state['mode'] != 'all':
+        bits_i, wn = rot_slice_bits(Ro, Q)
+        c = c * rot_blocks(Ro, c.abs() * wn, bits_i, f'h.{i}.attn.o_proj')
+    y = site('o_proj')(back(c, Q))
     if state.get('noise'):
-        eps = torch.randn(NH * HD, y.shape[-1], device=h.device)
-        y = y + (c * gam * R['ls_dn'].exp()).reshape(B_, T_, -1) @ eps
+        y = y + (c * Ro['ls_dn'].exp()).reshape(B_, T_, -1) @ torch.randn(NH * HD, y.shape[-1], device=h.device)
     return y
 
 # Weight edits (DESCENT_WEDITS = edited sequences per training batch): an edit is an additive
@@ -1316,8 +1309,8 @@ def evaluate(final=False):
         rk = lambda L: torch.cat([torch.bincount((L.argmax(-1) + L.shape[-1] * torch.arange(L.shape[0], device=dev)[:, None]).reshape(-1),
                                                  minlength=L.shape[0] * L.shape[-1])]).float()
         if ROTA:
-            for name, key in (('ov', 'L'), ('qk', 'Lqk')):
-                r_ = torch.cat([rk(R[key]) for R in ROTA.values()]); r_ = r_[r_ > 0]
+            for name in ('q', 'k', 'ov'):
+                r_ = torch.cat([rk(R[name]['L']) for R in ROTA.values()]); r_ = r_[r_ > 0]
                 out.setdefault('rot_attn', {})[name] = {'blocks': int(r_.numel()), 'rank_hist': {str(k): int((r_ == k).sum()) for k in range(1, 65) if (r_ == k).any()}}
         out['rot'] = {'blocks_on': round(torch.stack(state['rot_on']).sum(0).mean().item(), 2), 'blocks': int(ranks.numel()),
                       'rank_hist': {str(k): int((ranks == k).sum()) for k in range(1, ROTG + 1) if (ranks == k).any()},
@@ -1406,11 +1399,13 @@ if ARM == 'rot':
     comps = []
     for l in range(T.n_layer):
         if ROTA:
-            R = ROTA[l]
-            comps.append((R, 'tau_qk', 's_qk', f'h.{l}.attn.q_proj', lambda R=R: rot_plane_bits(R).mean().item(),
-                          VPD_ATTN_COUNTS[f'h.{l}.attn.q_proj'] + VPD_ATTN_COUNTS[f'h.{l}.attn.k_proj']))
-            comps.append((R, 'tau', 's', f'h.{l}.attn.o_proj', lambda R=R: rot_slice_bits(R, rot_Q(R))[0].mean().item(),
-                          VPD_ATTN_COUNTS[f'h.{l}.attn.v_proj'] + VPD_ATTN_COUNTS[f'h.{l}.attn.o_proj']))
+            for name, key, bits0, share in (
+                    ('q', 'q_proj', lambda R: rot_read_bits(R, rot_Q(R)), VPD_ATTN_COUNTS[f'h.{l}.attn.q_proj']),
+                    ('k', 'k_proj', lambda R: rot_read_bits(R, rot_Q(R)), VPD_ATTN_COUNTS[f'h.{l}.attn.k_proj']),
+                    ('ov', 'o_proj', lambda R: rot_slice_bits(R, rot_Q(R))[0],
+                     VPD_ATTN_COUNTS[f'h.{l}.attn.v_proj'] + VPD_ATTN_COUNTS[f'h.{l}.attn.o_proj'])):
+                R = ROTA[l][name]
+                comps.append((R, 'tau', 's', f'h.{l}.attn.{key}', lambda R=R, f=bits0: f(R).mean().item(), share))
         R = ROT[l]
         comps.append((R, 'tau', 's', f'h.{l}.mlp.c_fc', lambda R=R: rot_slice_bits(R, rot_Q(R))[0].mean().item(),
                       VPD_COUNTS[f'h.{l}.mlp.c_fc'] + VPD_COUNTS[f'h.{l}.mlp.down_proj']))
@@ -1445,8 +1440,7 @@ FREEZE = os.environ.get('DESCENT_FREEZE') == '1'
 slots = [(P[n], w, rms(P[n][w])) for n in mlp for w in (('F',) if EXACT else ('V', 'U')) + (('G',) if ARM == 'dir' else ())
          if not (EXACT and NEURON_DOWN and n.endswith('down_proj') and w == 'F') and not (FREEZE and w in ('V', 'U', 'F')) and ARM != 'rot']
 # rot: rotation angles by 1e-3 per step, thresholds by a tenth of their noise scale, assignment logits by 0.02.
-slots += [x for R in list(ROT.values()) + list(ROTA.values()) for x in ((R, 'A', 1 / 3), (R, 'tau', 100 / 3 * R['s'].mean().item()), (R, 'L', 20 / 3))]
-slots += [x for R in ROTA.values() for x in ((R, 'tau_qk', 100 / 3 * R['s_qk'].mean().item()), (R, 'Lqk', 20 / 3))]
+slots += [x for R in ROT_ALL for x in ((R, 'A', 1 / 3), (R, 'tau', 100 / 3 * R['s'].mean().item()), (R, 'L', 20 / 3))]
 slots += [(A[n], w, rms(A[n][w])) for n in sliced for w in (('V', 'U') if ATTN_FREE else ('F',))] + [(A[n], 'tau', 100 / 3 * A[n]['s'].mean().item()) for n in sliced]
 for l, S in SHARE_A.items():
     slots += [(S, 't', 100 / 3 * S['s'].mean().item()), (S, 'L_v', 20 / 3), (S, 'L_o', 20 / 3)]
@@ -1492,10 +1486,9 @@ groups += [{'params': [Rn['tau']], 'lr': LR * 0.1 * Rn['s'].item()} for Rn in RE
 if FMODE:
     groups += [{'params': [Rn['ls']], 'lr': LR * 1e-2} for Rn in RES.values()]
     # rot: each slice's dense widths (log sigma by 1% per step), and the leaves its cost reads.
-    groups += [{'params': [R['ls_fc'], R['ls_dn']], 'lr': LR * 1e-2} for R in list(ROT.values()) + list(ROTA.values())]
-    groups += [{'params': [R['ls_q'], R['ls_k']], 'lr': LR * 1e-2} for R in ROTA.values()]
+    groups += [{'params': [R[w] for w in ('ls_fc', 'ls_dn', 'ls') if w in R], 'lr': LR * 1e-2} for R in ROT_ALL]
     for cont, key, mu, ls in leaves:
-        if any(cont is R for R in list(ROT.values()) + list(ROTA.values())) and key in ('A', 'tau', 'tau_qk'):
+        if any(cont is R for R in ROT_ALL) and key in ('A', 'tau'):
             cont[key + '_leaf'] = (mu, ls)
 opt = torch.optim.Adam(groups)
 trainable = [q for g in groups for q in g['params']]
@@ -1529,9 +1522,15 @@ PART_PRIOR = os.environ.get('DESCENT_PRIOR') == 'part'
 def description_bits():
     """KL(q || p) in bits (F only)."""
     total = 0.0
-    for R in ROTA.values():
-        total = total + rot_plane_bits(R).sum() * math.log(2)
-    for R in list(ROT.values()) + list(ROTA.values()):
+    for R in ROT_ALL:
+        if 'ls' in R:
+            # A q or k slice's dense read.
+            s2 = (2 * R['ls']).exp(); d_ = R['di']
+            Q = rot_Q({'A': R['A_leaf'][0]}) if 'A_leaf' in R else rot_Q(R)
+            nr = torch.einsum('nki,nkm,nmi->ni', Q, R['G'], Q)
+            v = (nr.sum() + d_ * s2.sum()) / (d_ * nr.numel())
+            total = total + 0.5 * (d_ * torch.log(v / s2) + (nr + d_ * s2) / v - d_).sum()
+            continue
         # rot: every slice's dense read and write (the angles and thresholds are leaves below).
         sf, sd = (2 * R['ls_fc']).exp(), (2 * R['ls_dn']).exp()
         Q = rot_Q({'A': R['A_leaf'][0]}) if 'A_leaf' in R else rot_Q(R)
@@ -1609,8 +1608,8 @@ def save(step):
                     # rot attention: per layer the OV groups' (consecutive value coordinates of the heads) angles,
                     # assignments, thresholds, noise scales and widths, and the QK planes' assignments, thresholds,
                     # noise scales and widths.
-                    'rota': {l: {k: R[k].detach().float().cpu() for k in ('A', 'L', 'tau', 's', 'ls_fc', 'ls_dn', 'Lqk', 'tau_qk', 's_qk', 'ls_q', 'ls_k')}
-                             for l, R in ROTA.items()}}, os.environ['DESCENT_SAVE'])
+                    'rota': {l: {x: {k: R[x][k].detach().float().cpu() for k in ('A', 'L', 'tau', 's', 'ls', 'ls_fc', 'ls_dn') if k in R[x]}
+                                 for x in ('q', 'k', 'ov')} for l, R in ROTA.items()}}, os.environ['DESCENT_SAVE'])
 
 draw(True)
 e = evaluate(); e['weight_edits'] = evaluate_edits(); print('start', e, flush=True); log['trace'].append({'step': 0, **e}); save(0)
