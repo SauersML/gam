@@ -45,6 +45,7 @@ OUT = Path.home() / "mpd-data/graph_oracle/runs/search"
 # A VPD unit: ("vpd", layer, kc, kd) = the kc c_fc and kd down_proj subcomponents of layer l's MLP with
 # the largest measured removal effect (RANKING: per site, subcomponent indices from largest effect down).
 RANKING: dict[str, list[int]] = {}
+GROW = 2  # a VPD unit's growth factor per move (--grow)
 
 
 def load_ranking(path: Path) -> None:
@@ -190,9 +191,10 @@ def greedy(pool: Pool, model: str, mode: str, experiments: int, seed: int, min_n
                     continue
                 for b, rest in pieces_of(u, min_neurons):
                     moves.append((current + [b], [v for v in outside if v != u] + rest, ("add", b)))
-            for u in [u for u in current if u[0] == "vpd"]:  # grow a VPD MLP: twice the c_fc or the down_proj subcomponents
-                for grown in (("vpd", u[1], min(2 * u[2], len(RANKING[f"{u[1]}.c_fc"])), u[3]),
-                              ("vpd", u[1], u[2], min(2 * u[3], len(RANKING[f"{u[1]}.down_proj"])))):
+            for u in [u for u in current if u[0] == "vpd"]:  # grow a VPD MLP: GROW times the c_fc or the down_proj subcomponents
+                for grown in (("vpd", u[1], min(GROW * u[2], len(RANKING[f"{u[1]}.c_fc"])), u[3]),
+                              ("vpd", u[1], u[2], min(GROW * u[3], len(RANKING[f"{u[1]}.down_proj"]))),
+                              ("vpd", u[1], min(GROW * u[2], len(RANKING[f"{u[1]}.c_fc"])), min(GROW * u[3], len(RANKING[f"{u[1]}.down_proj"])))):
                     if grown != u:
                         moves.append(([v for v in current if v != u] + [grown], outside, ("grow", grown)))
         else:
@@ -241,6 +243,7 @@ def main() -> None:
     ap.add_argument("--ranking", type=Path, help="with --mlp-view vpd: measured removal effects of VPD subcomponents (sites -> kl_bits)")
     ap.add_argument("--vpd", type=Path, default=Path.home() / "mpd-data/engine/vpd4l_decomposition",
                     help="with --mlp-view vpd: VPD's decomposition export (the checker's vpd view)")
+    ap.add_argument("--grow", type=int, default=2, help="with --mlp-view vpd: growth factor of a VPD unit per move")
     ap.add_argument("--prompt-holdout", type=int, default=0,
                     help="drop every K-th prompt (i %% K == 0) before searching: the prompts the oracle is evaluated on (g-rl)")
     a = ap.parse_args()
@@ -254,6 +257,8 @@ def main() -> None:
         path = out / f"{behavior['id']}.train_prompts.json"
         path.write_text(json.dumps(behavior))
     if a.mlp_view == "vpd":
+        global GROW
+        GROW = a.grow
         load_ranking(a.ranking)
     views = {"vpd": a.vpd} if a.mlp_view == "vpd" else None
     pool = Pool(model, path, a.workers, a.export, a.stand_in, views, out / f"{behavior['id']}{a.tag}.candidates.jsonl")
