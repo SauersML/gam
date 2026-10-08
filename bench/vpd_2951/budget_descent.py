@@ -68,8 +68,12 @@ ARM = os.environ.get('DESCENT_ARM', 'own')
 # 0. Bits-back (DESCENT_F) is off. Blocks never on in an evaluation's hard passes are pruned (off for good; all-on
 # keeps them, so P stays exact). (Levin's per-token KL + log2 concepts, tried first, traded faithfulness for
 # concepts at one bit per halving: hard KL rose from 3.1 to 6.2 as the count fell.)
-CONCEPTS = os.environ.get('DESCENT_CONCEPTS', '1') == '1' and ARM == 'rot'
+# On the slice arms (DESCENT_CONCEPTS=1 there) a slice is 4 concepts (gate, read, write, scale), its gate one of the
+# gates evaluated, and a map's or head's mean part one concept.
+CONCEPTS = os.environ.get('DESCENT_CONCEPTS', '1' if ARM == 'rot' else '0') == '1'
 KAPPA = float(os.environ.get('DESCENT_KAPPA', '0.553'))
+CPS = 1 if ARM == 'rot' else 4                                                  # concepts per unit on (rot counts concepts)
+start_q = lambda q: 0.01 if CONCEPTS else q                                      # the start's threshold quantile: all on
 dev = os.environ.get('DESCENT_DEV') or ('cuda' if torch.cuda.is_available() else 'mps')
 # DESCENT_EXACT=1: every map's slices sum to M's weight at every step by construction (below). The
 # frames' duals and writes are computed in full float32 (TF32's 10-bit mantissa would break the sum);
@@ -187,12 +191,12 @@ for n in mlp:
             tau = -3 * s
         elif start == 'neuron':
             l_ = n.split('.')[1]
-            q = 1 - START_SCALE * (VPD_COUNTS[f'h.{l_}.mlp.c_fc'] + VPD_COUNTS[f'h.{l_}.mlp.down_proj']) / 2 / V.shape[1]
+            q = start_q(1 - START_SCALE * (VPD_COUNTS[f'h.{l_}.mlp.c_fc'] + VPD_COUNTS[f'h.{l_}.mlp.down_proj']) / 2 / V.shape[1])
             flat = r.reshape(-1)
             idx = torch.randperm(flat.numel(), device=dev)[:2_000_000]
             tau = torch.full_like(s, torch.quantile(flat[idx], q).item())
         else:
-            q = 1 - START_SCALE * VPD_COUNTS[n] / V.shape[1]
+            q = start_q(1 - START_SCALE * VPD_COUNTS[n] / V.shape[1])
             flat = r.reshape(-1)
             idx = torch.randperm(flat.numel(), device=dev)[:2_000_000]
             tau = torch.full_like(s, torch.quantile(flat[idx], q).item())
@@ -356,7 +360,7 @@ for n in sliced:
         c = head_coefficients(x, V, o)
         r = c.abs() * U.norm(dim=-1)[:, None, :]
         s_ = 0.1 * r.pow(2).mean(1).sqrt().clamp_min(1e-12)                     # [H, C]
-        q = 1 - START_SCALE * VPD_ATTN_COUNTS.get(n, 1.0) / (NH * V.shape[-1])
+        q = start_q(1 - START_SCALE * VPD_ATTN_COUNTS.get(n, 1.0) / (NH * V.shape[-1]))
         flat = r.reshape(-1); idx = torch.randperm(flat.numel(), device=dev)[:2_000_000]
         tau = torch.full_like(s_, torch.quantile(flat[idx], q).item())
         err = (head_output(c, U, o) - x @ W.T).abs().max().item()
@@ -374,6 +378,8 @@ with torch.no_grad():
 
 # The rot arm's neuron grouping reads M's c_fc inputs.
 X_FC = {n: X[n] for n in mlp if n.endswith('c_fc')} if ARM == 'rot' else {}
+# Every map's mean input on M's fit tokens (the slice arms' mean parts: a slice's mean coefficient is its read of it).
+XBAR = {n: X[n].mean(0) for n in X}
 del X
 
 state = {'mode': 'M', 'soft': [], 'hard': [], 'gates': {}, 'share': {}, 'r': {}, 'writers': {}, 'on': {}, 'gate': {}, 'edges_soft': [], 'edges_hard': [], 'share_a': {}, 'wedits_M': {}, 'wedits_P': {}, 'entry': {}, 'force_on': [], 'gn_in': {}, 'score': {}, 'mlp_x': {}}
@@ -403,6 +409,12 @@ MEANQK = os.environ.get('DESCENT_MEANQK') == '1'
 # block mean-ablated, not zeroed (GELU's mean is not zero), and every part on is still M. A mean part is one
 # concept (its write) per map or head, as are MEANQK's (counted with the gates evaluated).
 MEANPARTS = os.environ.get('DESCENT_MEANPARTS') == '1'
+
+def slice_mean(n):
+    """Whether map n's slices (slice arms) split their coefficient's deviation from its mean, the mean always on:
+    q and k under MEANQK, every other map under MEANPARTS. A slice off is then mean-ablated, not zeroed."""
+    qk = n.endswith(('q_proj', 'k_proj'))
+    return (MEANQK and qk) or (MEANPARTS and not qk)
 # DESCENT_GATE_H=1 (rot): each gate's binary entropy H(Phi(z)) at each token is charged in bits per token: the bits
 # to specify a draw the gate does not determine. Training on sampled gates (bern) then drives the gates to 0 or 1,
 # so the delivered program (on where z > 0) is the trained one.
@@ -455,6 +467,8 @@ def make(n):
     cur = {}
     def emit(coef):
         # A down_proj slice's coefficient on each token (its read times its gate): what it writes.
+        if cur.get('cm') is not None:
+            coef = coef + cur['cm']                                             # the mean part
         if n.endswith('down_proj'):
             state['writers'][layer] = coef
         y = coef @ p['U']
@@ -464,7 +478,7 @@ def make(n):
                 y = y.index_add(0, torch.tensor([b], device=y.device), (a * (coef[b] @ p['U'][:, G]) @ torch.eye(y.shape[-1], device=y.device)[G])[None])
         return y
     def fwd(x):
-        cur['x'] = x
+        cur['x'], cur['cm'] = x, None
         if state.get('dense') is not None and n.endswith('c_fc'):
             state['dense'][(layer, 1)] = x
         if state['mode'] == 'M':
@@ -484,6 +498,9 @@ def make(n):
                 un[b] = un_b
         if state['mode'] == 'all':
             return emit(c)
+        if slice_mean(n):
+            cur['cm'] = XBAR[n] @ p['V']
+            c = c - cur['cm']
         keep = None
         if layer in EDGE and n.endswith('c_fc'):
             # The read of the listed inputs only: the full read less the edges that are off.
@@ -537,6 +554,8 @@ def make(n):
             ex = gate_net_s(n, state['gn_in'][('mlp', layer)])
         if grp is None and mult is None and not EDGES and not state['force_on']:
             coef, hb, sb, hard = slice_apply_run(read, c, un, p['tau'], p['s'], p.get('taun'), ex, (-1,), state['mode'])
+            if hard is not None:
+                state['on'][n] = hard
             state['hard'].append(hb.reshape(-1))
             if state['mode'] == 'hard':
                 state['on'][n] = hard
@@ -631,9 +650,13 @@ def make_attn(n):
                 state['soft'].append(soft.sum((0, 2)))
                 g = soft
             return head_output(c * g, p['U'], p['o'], swaps_of(n, x.shape[1])).view(x.shape[0], x.shape[1], -1)
+        cm = None
         if state['mode'] == 'all':
             g = 1.0
         else:
+            if slice_mean(n):
+                cm = head_coefficients(XBAR[n][None], p['V'], p['o'])                 # [H, 1, C], the mean part
+                c = c - cm
             if state.get('calib') is not None:
                 state['calib'].setdefault(n, []).append((c.abs() * p['U'].norm(dim=-1)[:, None, :]).reshape(-1))
             ex = None
@@ -649,11 +672,13 @@ def make_attn(n):
                 ex = sg if ex is None else ex + sg
             args = (None, c, p['U'].norm(dim=-1)[:, None, :], p['tau'][:, None, :], p['s'][:, None, :], p['taun'][:, None, :] if 'taun' in p else None, ex)
             if not state['force_on']:
-                cg, hb, sb, _ = slice_apply_run(*args, (0, 2), state['mode'])
+                cg, hb, sb, hd = slice_apply_run(*args, (0, 2), state['mode'])
                 state['hard'].append(hb)
                 if sb is not None:
                     state['soft'].append(sb)
-                return head_output(cg, p['U'], p['o'], swaps_of(n, x.shape[1])).view(x.shape[0], x.shape[1], -1)
+                if hd is not None:
+                    state['on'][n] = hd
+                return head_output(cg if cm is None else cg + cm, p['U'], p['o'], swaps_of(n, x.shape[1])).view(x.shape[0], x.shape[1], -1)
             hard, phi = force_rows(*slice_gates_run(*args), x.shape[1])
             state['hard'].append(hard.sum((0, 2)))
             if state['mode'] == 'hard':
@@ -661,7 +686,7 @@ def make_attn(n):
             else:
                 state['soft'].append(phi.sum((0, 2)))
                 g = phi if gate == 'mf' else hard + phi - phi.detach()
-        return head_output(c * g, p['U'], p['o'], swaps_of(n, x.shape[1])).view(x.shape[0], x.shape[1], -1)
+        return head_output(c * g if cm is None else c * g + cm, p['U'], p['o'], swaps_of(n, x.shape[1])).view(x.shape[0], x.shape[1], -1)
     return fwd
 for n in sliced: T.site(n)._forward = make_attn(n)
 
@@ -1163,6 +1188,10 @@ def nonempty(R, soft=False):
         return 1 - torch.log1p(-torch.softmax(R['L'], -1).clamp_max(1 - 1e-6)).sum(1).exp()
     return torch.zeros(R['L'].shape[:2], device=dev).scatter_(1, R['L'].argmax(-1), 1.0)
 
+def slices_live():
+    """The slice arms' slices not pruned (threshold below 1e29), every map's."""
+    return sum((P[n]['tau'] < 1e29).sum() for n in mlp) + sum((A[n]['tau'] < 1e29).sum() for n in sliced)
+
 def gates_evaluated(soft):
     """CONCEPTS: the gates a reader evaluates on every token: each non-empty unpruned block's (soft: expected under the
     assignment softmax), the head scores the score gates read, and the gate networks' parameters."""
@@ -1170,11 +1199,17 @@ def gates_evaluated(soft):
     extra += T.n_layer * NH if SCOREGATE and ROTA else 0
     extra += 2 * T.n_layer * NH if MEANQK and ROTA else 0
     extra += 2 * T.n_layer + (T.n_layer * NH if ROTA else 0) if MEANPARTS else 0
+    if ARM != 'rot':
+        # A slice arm's mean parts: one per MLP map and per head of every attention map that has one.
+        extra = sum(1 for n in mlp if slice_mean(n)) + NH * sum(1 for n in sliced if slice_mean(n))
+        return slices_live().float() + extra
     return sum((nonempty(R, soft) * R['keep']).sum() for R in ROT_ALL) + extra
 
 def concepts_total():
     """CONCEPTS: the whole decomposition's concepts: each non-empty unpruned block's 1 + 4 per MLP or OV slice (3 per q or
     k slice), plus the gates' extra concepts (head scores, gate network parameters)."""
+    if ARM != 'rot':
+        return float(gates_evaluated(False) + (CPS - 1) * slices_live())
     tot = gates_evaluated(False) - sum((nonempty(R) * R['keep']).sum() for R in ROT_ALL)
     for R in ROT_ALL:
         ranks = torch.zeros(R['L'].shape[:2], device=dev).scatter_add_(1, R['L'].argmax(-1), torch.ones(R['L'].shape[:2], device=dev))
@@ -1481,7 +1516,12 @@ def attn_v(l, h, pattern):
     B_, T_ = h.shape[0], h.shape[1]
     c = head_coefficients(h.reshape(-1, h.shape[-1]), p['V'], False)           # [H, B*T, C]
     m = pattern @ c.view(NH, B_, T_, -1).permute(1, 0, 2, 3)                   # [B, H, T, C]
-    mg = None
+    mg = cmv = None
+    if state['mode'] != 'all' and slice_mean(n):
+        # The mean part: the pattern's rows sum to 1, so the mixed coefficients less the mean coefficients are the
+        # mixed deviations.
+        cmv = head_coefficients(XBAR[n][None], p['V'], False).permute(1, 0, 2)[None]   # [1, H, 1, C]
+        m = m - cmv
     if state['mode'] == 'all':
         g = 1.0; mg = m * g
         if state.get('capture') is not None:
@@ -1513,7 +1553,9 @@ def attn_v(l, h, pattern):
             args = (r, m, p['U'].norm(dim=-1)[None, :, None, :], p['tau'][None, :, None, :], p['s'][None, :, None, :],
                     p['taun'][None, :, None, :] if 'taun' in p else None, ex)
             if not state['force_on']:
-                mg, hb, sb, _ = slice_apply_run(*args, (1, 3), state['mode'])
+                mg, hb, sb, hd = slice_apply_run(*args, (1, 3), state['mode'])
+                if hd is not None:
+                    state['on'][n] = hd
             else:
                 hard, soft = slice_gates_run(*args)
         if mg is not None:
@@ -1532,7 +1574,7 @@ def attn_v(l, h, pattern):
                 state['soft'].append(soft.sum((1, 3)).reshape(-1))
                 g = soft if gate == 'mf' or SHARE_A else hard + soft - soft.detach()
             mg = m * g
-    y = mg @ p['U'][None]                                                      # [B, H, T, HD]
+    y = (mg if cmv is None else mg + cmv) @ p['U'][None]                       # [B, H, T, HD]
     for b, Ae, Be in state['wedits_P'].get(n, ()):
         # A weight edit of v_proj adds Delta W x to the values, which the pattern mixes like any value.
         dv = ((h[b] @ Be) @ Ae.T).view(T_, NH, HD).transpose(0, 1)               # [H, T, HD]
@@ -1584,7 +1626,7 @@ if sliced:
         for l in range(T.n_layer):
             n = f'h.{l}.attn.v_proj'; r = cap[n]
             A[n]['s'] = 0.1 * r.pow(2).mean(1).sqrt().clamp_min(1e-12)
-            q = 1 - START_SCALE * VPD_ATTN_COUNTS.get(n, 1.0) / r.shape[0] / r.shape[2]
+            q = start_q(1 - START_SCALE * VPD_ATTN_COUNTS.get(n, 1.0) / r.shape[0] / r.shape[2])
             flat = r.reshape(-1); idx = torch.randperm(flat.numel(), device=dev)[:2_000_000]
             A[n]['tau'] = torch.full_like(A[n]['s'], torch.quantile(flat[idx], q).item()).requires_grad_()
         if ARM == 'share':
@@ -1734,7 +1776,8 @@ def evaluate(final=False, start_eval=False):
     r = {'kl': [], 'kl_soft': [], 'kl_all_on': [], 'active': [], 'active_soft': [], 'per_map': [], 'edges_on': [], 'edges_on_soft': []}
     graph = None
     if CONCEPTS:
-        G_ev, seen = gates_evaluated(False).item(), {}
+        G_ev, seen, seen_s = float(gates_evaluated(False)), {}, {}
+        state['on'] = {}
     for i in range(0, ev.shape[0], 4):
         ids = ev[i:i + 4]
         lm = run(ids, 'M')
@@ -1746,7 +1789,12 @@ def evaluate(final=False, start_eval=False):
             alone_rec = {l: acts_alone(l, *v) for l, v in state['alone'].items()}
             state['alone'] = None
         r['active'].append(torch.stack(state['hard']).sum(0).mean().item())
-        if CONCEPTS:
+        if CONCEPTS and ARM != 'rot':
+            # Each slice's on-anywhere (for the pruning): MLP [B, T, C], q/k/o [H, tokens, C], v [B, H, T, C].
+            for n_, hd_ in state['on'].items():
+                a_ = hd_.amax((0, 1)) if n_ in P else hd_.amax(1) if hd_.dim() == 3 else hd_.amax((0, 2))
+                seen_s[n_] = torch.maximum(seen_s[n_], a_) if n_ in seen_s else a_
+        if CONCEPTS and ARM == 'rot':
             # Each block's on-anywhere (for the pruning).
             for g_, R_ in state['probe'].values():
                 seen[id(R_)] = (R_, torch.maximum(seen[id(R_)][1], g_.amax((0, 1))) if id(R_) in seen else g_.amax((0, 1)))
@@ -1813,14 +1861,22 @@ def evaluate(final=False, start_eval=False):
         # The delivered program's concepts per token (on, plus the gates evaluated); then the non-empty blocks never on
         # in these hard passes (held-out text, the induction check) are pruned.
         out['gates_evaluated'] = G_ev
-        out['concepts_per_token'] = out['active'] + G_ev
+        out['concepts_on'] = CPS * out['active']
+        out['concepts_per_token'] = CPS * out['active'] + G_ev
         cut_n = 0
         for R_, anyon in (seen.values() if not start_eval else ()):
             # (none at the start's evaluation: the start's thresholds are a calibration, not a trained choice)
             cut = (anyon == 0) & (nonempty(R_) > 0) & (R_['keep'] > 0)
             R_['keep'][cut] = 0.0; cut_n += int(cut.sum())
+        with torch.no_grad():
+            for n_, anyon in (seen_s.items() if not start_eval else ()):
+                # A slice arm's slice never on is pruned: its threshold out of reach (it stays in every-part-on).
+                cont = P[n_] if n_ in P else A[n_]
+                cut = (anyon == 0) & (cont['tau'] < 1e29)
+                cont['tau'][cut] = 1e30; cut_n += int(cut.sum())
         out['pruned_now'] = cut_n
-        out['pruned_total'] = int(sum(((R_['keep'] == 0) & (nonempty(R_) > 0)).sum() for R_ in ROT_ALL))
+        out['pruned_total'] = (int(sum(((R_['keep'] == 0) & (nonempty(R_) > 0)).sum() for R_ in ROT_ALL)) if ARM == 'rot'
+                               else int(sum((P[n]['tau'] >= 1e29).sum() for n in mlp) + sum((A[n]['tau'] >= 1e29).sum() for n in sliced)))
         out['concepts_total'] = concepts_total()
     if ROT:
         run(ev[0:4], 'hard')
@@ -2292,7 +2348,7 @@ for step in range(steps):
         # bits (KL and the gates' entropy). The delivered KL on the step's clean sequences drives mu: the training
         # pass's own under st (one-hot assignments, hard gates: the delivered program), else a hard pass.
         G_t = gates_evaluated(True)
-        conc = ek + G_t
+        conc = CPS * ek + G_t
         clean = [b for b, k_ in enumerate(kinds) if k_ is None]
         kl_dl = kl_seq[clean].mean().item() if gate == 'st' else delivered_kl(ids, kinds, lm)
         if step == 0:
