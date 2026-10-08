@@ -1266,20 +1266,29 @@ if sliced:
 def kl_bits(lm, lp):
     return KLBits.apply(lm, lp)
 
+def kl_rows(m, p):
+    """KL(softmax(m) || softmax(p)) in bits per row of logits [n, V]."""
+    pm = F.log_softmax(m.float(), -1); pp = F.log_softmax(p.float(), -1)
+    return (pm.exp() * (pm - pp)).sum(-1) / math.log(2)
+
+def kl_rows_grad(m, p, g):
+    """kl_rows' gradient in p, times g [n]: (softmax(p) - softmax(m)) g / ln 2."""
+    return (F.softmax(p.float(), -1) - F.softmax(m.float(), -1)) * (g[:, None] / math.log(2))
+
 class KLBits(torch.autograd.Function):
     """KL(M || P) in bits per token from M's logits lm and P's lp [..., V], over chunks of tokens, its gradient in lp
     taken directly, (softmax(lp) - softmax(lm)) / ln 2: only the two logit tensors are kept for the backward
     (autograd through log_softmax kept five vocabulary-wide tensors; the whole model ran out of an A40's memory at
-    32 x 512 tokens)."""
+    32 x 512 tokens). On CUDA the row functions are compiled: a few passes over the logits in place of eleven."""
     CHUNK = 2048
+    rows, rows_grad = (torch.compile(kl_rows, dynamic=False), torch.compile(kl_rows_grad, dynamic=False)) if COMPILE else (kl_rows, kl_rows_grad)
     @staticmethod
     def forward(ctx, lm, lp):
         ctx.save_for_backward(lm, lp)
         V = lm.shape[-1]; fm, fp = lm.reshape(-1, V), lp.reshape(-1, V)
         out = torch.empty(fm.shape[0], device=lm.device)
         for i in range(0, fm.shape[0], KLBits.CHUNK):
-            pm = F.log_softmax(fm[i:i + KLBits.CHUNK].float(), -1); pp = F.log_softmax(fp[i:i + KLBits.CHUNK].float(), -1)
-            out[i:i + KLBits.CHUNK] = (pm.exp() * (pm - pp)).sum(-1) / math.log(2)
+            out[i:i + KLBits.CHUNK] = KLBits.rows(fm[i:i + KLBits.CHUNK], fp[i:i + KLBits.CHUNK])
         return out.view(lm.shape[:-1])
     @staticmethod
     def backward(ctx, g):
@@ -1288,7 +1297,7 @@ class KLBits(torch.autograd.Function):
         grad = torch.empty_like(fp)
         for i in range(0, fm.shape[0], KLBits.CHUNK):
             j = slice(i, i + KLBits.CHUNK)
-            grad[j] = (F.softmax(fp[j].float(), -1) - F.softmax(fm[j].float(), -1)) * (fg[j, None] / math.log(2))
+            grad[j] = KLBits.rows_grad(fm[j], fp[j], fg[j])
         return None, grad.view(lp.shape)
 
 def run(ids, mode):
