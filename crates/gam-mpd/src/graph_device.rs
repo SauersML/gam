@@ -51,7 +51,7 @@ pub(crate) struct DeviceState {
 
 /// The bytes of reference products kept ([`DeviceState::reference_product`]): past them every
 /// product goes and is made again on use.
-const KEPT_PRODUCT_BYTES: usize = 2 << 30;
+const KEPT_PRODUCT_BYTES: usize = 1 << 30;
 
 /// A rotary's base, dimensions and pairing, and the positions of its table's rows.
 type RotationKey = (u32, u32, bool, Vec<u32>);
