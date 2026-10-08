@@ -237,8 +237,20 @@ def answer(a, b: str) -> None:
             trajectory.flush()
             return results
 
+        extra = []  # kcurve mode: the larger k-curve sets' parts, candidates for the answer
         if a.mode == "nodes":
             ir = teacher.search_ir(json.loads(found.read_text()), behavior["model"])
+        elif a.mode == "kcurve":
+            record = json.loads((a.kcurve / f"{b}.prune.json").read_text())
+            sets = [[search.unit_of(n) for n in r["units"]] for r in record["curve"] if r["units"]]
+            algorithm = teacher.algorithm_of(behavior)
+            tried = edits.totals(scored([algorithm.rstrip() + "\n\n\n" + f"align(answer, {', '.join(map(token_of, x))})\n" for x in sets],
+                                        stage="kcurve"))
+            pick = min(range(len(sets)), key=lambda k: tried[k])
+            units = sets[pick]
+            extra = list(dict.fromkeys(token_of(u) for x in sets if len(x) > len(units) for u in x if u not in units))
+            print(f"{b}: k-curve sets " + ", ".join(f"{len(x)}:{t:.6g}" for x, t in zip(sets, tried)) + f"; start from {len(units)}", flush=True)
+            ir = teacher.search_ir({"source": search.source(units)}, behavior["model"])
         else:
             units = answer_search(teacher.algorithm_of(behavior), [search.unit_of(n) for n, _ in ranked["mixed"]], scored,
                                   a.budget, log=lambda m: print(f"{b}: {m}", flush=True), nonempty=a.nonempty)
@@ -257,6 +269,7 @@ def answer(a, b: str) -> None:
         start = edits.Answer.parse(candidates[best])
         named = {p for s in start.statements for p in s.parts}
         table = json.loads((a.carriers / f"{b}.json").read_text()) if (a.carriers / f"{b}.json").exists() else {}
+        table["answer"] = extra + [p for p in table.get("answer", []) if p not in extra]
         pool = {v: [p for p in order if p not in named] for v, order in table.items()}
         refined, total, accepted = edits.refine(start, scored, pool, a.rounds, a.adds, max_drops=a.drops,
                                                 log=lambda m: print(f"{b}: {m}", flush=True))
@@ -267,6 +280,10 @@ def answer(a, b: str) -> None:
     finally:
         checker.close()
         trajectory.close()
+    if a.winners and final[0]["total_bits"] >= final[2]["total_bits"]:
+        print(f"{b}: best answer {final[0]['total_bits']:.6g} bits does not beat the program without parts "
+              f"({final[2]['total_bits']:.6g}); no teacher answer", flush=True)
+        return
     (out / f"{b}.py").write_text(src)
     (out / f"{b}.answer.txt").write_text(printer.answer_of(src, graph["explanation"]))
     (out / f"{b}.graph.json").write_text(json.dumps(graph, indent=1))
@@ -301,8 +318,12 @@ def main():
     ap.add_argument("--keep", type=int, default=256, help="carriers: candidates kept per variable")
     ap.add_argument("--importance-bin", type=Path, help="carriers: mpd_vpd_importance_2951")
     ap.add_argument("--importance-device", default="gpu")
-    ap.add_argument("--mode", choices=["answer", "nodes"], default="answer",
-                    help="answer: the prefix search in the answer format (answer_search); nodes: vpd_min.py's node search")
+    ap.add_argument("--mode", choices=["answer", "nodes", "kcurve"], default="answer",
+                    help="answer: the prefix search in the answer format (answer_search); nodes: vpd_min.py's node search; "
+                         "kcurve: the best of contrast.py's pruned sets (KCURVE/<b>.prune.json), rescored here, with the "
+                         "larger sets' parts as the answer's candidates")
+    ap.add_argument("--kcurve", type=Path, default=DATA / "runs/kcurve")
+    ap.add_argument("--winners", action="store_true", help="write an answer only when it beats the program without parts")
     ap.add_argument("--budget", type=int, default=2048, help="answer mode: the most ranked subcomponents a prefix takes")
     ap.add_argument("--nonempty", action="store_true", help="answer mode: keep the best prefix that names parts even when "
                     "the program without parts scores lower (its manifest line carries both totals)")
@@ -321,7 +342,7 @@ def main():
                          "or zero")
     ap.add_argument("--checker-commit", help="the checker's commit (default: GRAPH_CHECKER's suffix)")
     a = ap.parse_args()
-    for k in ("behaviors_dir", "export", "vpd", "rankings", "carriers", "search", "out"):
+    for k in ("behaviors_dir", "export", "vpd", "rankings", "carriers", "search", "out", "kcurve"):
         setattr(a, k, getattr(a, k).expanduser())
     if a.command == "carriers":
         if not a.importance_bin:
