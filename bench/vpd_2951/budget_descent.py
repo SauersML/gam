@@ -1613,6 +1613,12 @@ def rope_rot(w):
     n_ = HD // 2
     return torch.cat([-w[..., n_:], w[..., :n_]], -1)
 
+# On CUDA the signal's masked max over u and the gated scores (forward and backward) run as fused Triton kernels
+# (dest_kernels.py: the keys rope_u(u_c) built in registers, one TF32 product per slice and tile, nothing of size
+# T x T per slice written); the einsum chunks wrote B H C T^2 values per layer, 34 s of a 36 s step on an A40 at 32 x 512.
+if DESTKV and dev == 'cuda':
+    import dest_kernels
+
 def dest_k_scores(l, h, q, causal):
     """DESTKV: layer l's attention scores [B, H, T, T] with each k slice gated at the query: s_tu = sum over slices c
     on at t of c(u) (q_t . rope_u(u_c)) / sqrt(hd), plus the mean key part's term (MEANQK), over each query's
@@ -1631,13 +1637,16 @@ def dest_k_scores(l, h, q, causal):
     cos, sin = T.cos[:T_].T.contiguous(), T.sin[:T_].T.contiguous()             # [HD, T]
     with torch.no_grad():
         # Each slice's signal at each query: max over u <= t of |c(u) (Qr_t . rope_u(u_c))|, TF32 (gate input only).
-        sig = torch.empty(B_, NH, T_, C_, device=h.device)
-        cc = max(1, int(2e8 // (B_ * NH * T_ * T_)))
-        Kr = lambda U_c: (U_c[:, :, None, :] * cos.T[None, None] + rope_rot(U_c)[:, :, None, :] * sin.T[None, None])   # [H, cc, T, HD]
-        for c0 in range(0, C_, cc):
-            Kc = Kr(U_[:, c0:c0 + cc])
-            sc_ = torch.einsum('bhtd,hcud->bhctu', Qr.detach(), Kc) * c[:, :, :, c0:c0 + cc].detach().permute(0, 1, 3, 2)[:, :, :, None, :]
-            sig[..., c0:c0 + cc] = sc_.abs_().masked_fill_(~causal, 0).amax(-1).permute(0, 1, 3, 2)
+        if dev == 'cuda':
+            sig = dest_kernels.dest_signal(Qr.detach(), c.detach(), U_.detach(), T.cos[:T_], T.sin[:T_])
+        else:
+            sig = torch.empty(B_, NH, T_, C_, device=h.device)
+            cc = max(1, int(2e8 // (B_ * NH * T_ * T_)))
+            Kr = lambda U_c: (U_c[:, :, None, :] * cos.T[None, None] + rope_rot(U_c)[:, :, None, :] * sin.T[None, None])   # [H, cc, T, HD]
+            for c0 in range(0, C_, cc):
+                Kc = Kr(U_[:, c0:c0 + cc])
+                sc_ = torch.einsum('bhtd,hcud->bhctu', Qr.detach(), Kc) * c[:, :, :, c0:c0 + cc].detach().permute(0, 1, 3, 2)[:, :, :, None, :]
+                sig[..., c0:c0 + cc] = sc_.abs_().masked_fill_(~causal, 0).amax(-1).permute(0, 1, 3, 2)
     if state.get('calib') is not None:
         state['calib'].setdefault(n, []).append(sig)
     z = (sig - p['tau'][None, :, None, :]) / p['s'][None, :, None, :]
@@ -1658,7 +1667,10 @@ def dest_k_scores(l, h, q, causal):
     cT = c.transpose(2, 3)                                                       # [B, H, C, T]
     ck = lambda f, *a: torch.utils.checkpoint.checkpoint(f, *a, use_reentrant=False) if torch.is_grad_enabled() else f(*a)
     parts = []
-    if K * 8 >= C_:
+    if K * 8 >= C_ and dev == 'cuda':
+        # Many on: every slice, in the fused kernels (forward and backward).
+        parts.append(dest_kernels.DestScores.apply(Qr, g, c, U_, T.cos[:T_], T.sin[:T_]))
+    elif K * 8 >= C_:
         # Many on: every slice, by RoPE's form, s_tu = sum_d cos_ud sum_c g_c(t) Qr_td u_cd c(u) + the sin term.
         Ut, Rt = U_.transpose(1, 2)[None, :, None], rope_rot(U_).transpose(1, 2)[None, :, None]   # [1, H, 1, HD, C]
         def dense(Qb, gb):
