@@ -2,13 +2,13 @@
   "workflow": "Python Contracts",
   "publish_job_status": "failure",
   "publish_job_status_note": "status of the job that PUBLISHED these results, not the conclusion of run_id -- this job is part of that run, so the run has not concluded here",
-  "publish_job_failed_steps": "step 13: Run bench-package Python tests (#1512 orphans) | step 16: Triage full Python suite on the fresh wheel (#1512)",
-  "run_id": "37665589401",
-  "run_number": "359",
+  "publish_job_failed_steps": "step 7: Build and install gam extension (maturin build + wheel install)",
+  "run_id": "37725393253",
+  "run_number": "360",
   "run_attempt": "1",
   "event": "schedule",
   "ref": "refs/heads/main",
-  "sha": "5b60514577cc1211404540021fbde71509637613",
-  "completed_utc": "2026-10-07T22:06:26Z",
-  "run_url": "https://github.com/SauersML/gam/actions/runs/37665589401"
+  "sha": "36bf1d901bdea2ae6d0478a67f17c858393ea31b",
+  "completed_utc": "2026-10-08T04:09:35Z",
+  "run_url": "https://github.com/SauersML/gam/actions/runs/37725393253"
 }
