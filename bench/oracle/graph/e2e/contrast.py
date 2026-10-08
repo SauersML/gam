@@ -24,6 +24,7 @@ OUT/rankings/<behavior>.json (teacher_run --rankings format).
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 import time
@@ -312,7 +313,7 @@ def main():
     ap.add_argument("--chunk", type=int, default=256, help="subcomponents per first chunk")
     ap.add_argument("--leaf", type=int, default=8, help="the chunk size splitting stops at")
     ap.add_argument("--keep", type=int, default=32, help="chunks split per level (largest effect first)")
-    ap.add_argument("--ks", type=int, nargs="+", default=[8, 16, 32, 64, 128])
+    ap.add_argument("--ks", type=int, nargs="+", default=[4, 8, 16, 32, 64, 128, 256])
     ap.add_argument("--batch", type=int, default=3, help="programs per checker request")
     ap.add_argument("--out", type=Path, default=DATA / "runs/kcurve")
     a = ap.parse_args()
@@ -346,7 +347,7 @@ def main():
             log(f"k={r['k']} ({r['parts']} parts): reproduced {r['reproduced']:.1%}, total {r['score']['total_bits']:.6g} vs empty "
                 f"{empty['total_bits']:.6g} (exec {r['score']['exec_error_bits']:.4g}, necessity {r['score']['necessity_error_bits']:.4g}, "
                 f"alignment {r['score'].get('alignment_error_bits') or 0:.4g}, complexity {r['score']['complexity_bits']:.4g})")
-        record = {"behavior": b, "method": a.method, "drop": a.drop, "semantics": "counterfactual", "experiments": a.experiments, "rank_experiments": a.rank_experiments,
+        record = {"behavior": b, "behavior_sha256": hashlib.sha256(path.read_bytes()).hexdigest(), "method": a.method, "drop": a.drop, "semantics": "counterfactual", "experiments": a.experiments, "rank_experiments": a.rank_experiments,
                   "chunk": a.chunk, "leaf": a.leaf,
                   "keep": a.keep, "checker": str(score_module.BINARY), "empty": empty, "curve": rows,
                   "ranking": [[search.name(u), e] for u, e in ranked[:2048]], "chunks": chunks, "seconds": round(time.time() - t0)}
