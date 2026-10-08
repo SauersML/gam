@@ -388,11 +388,23 @@ class HfSampler:
         return out
 
 
+def grammar_options(grammar: str) -> tuple[dict, dict]:
+    """(LLM keywords, SamplingParams keywords) for decoding under an xgrammar EBNF grammar: structured_outputs in
+    vLLM's newer API (0.19), guided_decoding in the older one (0.10)."""
+    from vllm import sampling_params as sp
+
+    if hasattr(sp, "StructuredOutputsParams"):
+        return {"structured_outputs_config": {"backend": "xgrammar"}}, {"structured_outputs": sp.StructuredOutputsParams(grammar=grammar)}
+    return {"guided_decoding_backend": "xgrammar"}, {"guided_decoding": sp.GuidedDecodingParams(grammar=grammar)}
+
+
 class VllmSampler:
     """vLLM serving the base with the policy's adapter (reloaded by path at every version). It takes the
-    first visible GPU; the trainer takes the second when there is one (--gpu-memory set accordingly)."""
+    first visible GPU; the trainer takes the second when there is one (--gpu-memory set accordingly). With a
+    grammar (--grammar, rl/grammar.py) every answer is decoded under it."""
 
-    def __init__(self, args, rank: int, end: int, model: str | None = None):
+    def __init__(self, args, rank: int, end: int, model: str | None = None, grammar: str | None = None):
+        self.engine_options, self.sample_options = grammar_options(grammar) if grammar else ({}, {})
         self.share, self.args, self.rank = args.share_gpu, args, rank
         self.max_tokens, self.end = args.max_tokens, end
         self.policy = None  # with --share-gpu: the trainer, moved to the host while vLLM samples
@@ -407,7 +419,7 @@ class VllmSampler:
 
         a = self.args
         self.llm = LLM(model=model, dtype="bfloat16", enable_lora=True, max_lora_rank=self.rank, max_loras=1, enable_prefix_caching=True,
-                       gpu_memory_utilization=a.gpu_memory, max_model_len=a.max_model_len, seed=a.seed, enable_sleep_mode=self.share)
+                       gpu_memory_utilization=a.gpu_memory, max_model_len=a.max_model_len, seed=a.seed, enable_sleep_mode=self.share, **self.engine_options)
         if self.share:
             self.llm.sleep(level=1)  # weights to host memory, KV cache freed: the trainer loads next
 
@@ -476,7 +488,7 @@ class VllmSampler:
 
         if not self.ready:
             self.acquire()
-        params = SamplingParams(n=n, temperature=1.0, top_p=1.0, top_k=-1, max_tokens=self.max_tokens, stop_token_ids=[self.end], logprobs=0)
+        params = SamplingParams(n=n, temperature=1.0, top_p=1.0, top_k=-1, max_tokens=self.max_tokens, stop_token_ids=[self.end], logprobs=0, **self.sample_options)
         try:
             outs = self.llm.generate([{"prompt_token_ids": p} for p in prompts], params, lora_request=LoRARequest(f"policy{version}", version + 1, str(adapter)), use_tqdm=False)
         finally:
@@ -1288,6 +1300,7 @@ def main():
     ap.add_argument("--pack", action="store_true", help="GRPO / DPO: one sequence per group (the shared prompt once; see Policy.token_logprobs); sets GRPO's micro-batch to the group")
     ap.add_argument("--sampler", choices=["auto", "vllm", "hf"], default="auto")
     ap.add_argument("--resample", type=int, default=0, help="redraw each invalid program (mech.trace) up to R times at sampling time")
+    ap.add_argument("--grammar", action="store_true", help="vLLM decodes every answer under rl/grammar.py's grammar (parts only inside align/claim statements, only the decomposition's); --resample stays the fallback")
     ap.add_argument("--part-tokens", help="part tokens: the registry file of g-predict's part_tokens.py build; the projections train with the LoRA and vLLM gets the rows in place")
     ap.add_argument("--materialize-every", type=int, default=0, help="with --part-tokens: also rewrite the checkpoint and restart vLLM every K steps (0: only at the start; the rows are copied in place before every sampling call)")
     ap.add_argument("--share-gpu", action="store_true", help="one GPU for vLLM and the trainer: vLLM sleeps (weights to host) while training and the trainer moves to the host while sampling, so --gpu-memory can be 0.8")
@@ -1353,7 +1366,12 @@ def main():
         from transformers import AutoTokenizer
 
         rank = json.loads((Path(args.init) / "adapter_config.json").read_text())["r"] if args.init else args.lora_rank
-        sampler = VllmSampler(args, rank, AutoTokenizer.from_pretrained(args.base).convert_tokens_to_ids("<|im_end|>"), None if args.part_tokens else args.base)
+        answers = None
+        if args.grammar:  # guided decoding: parts only in align/claim statements, only the attached decomposition's (rl/grammar.py)
+            import grammar
+
+            answers = grammar.model_grammar(args.model, args.part_tokens)
+        sampler = VllmSampler(args, rank, AutoTokenizer.from_pretrained(args.base).convert_tokens_to_ids("<|im_end|>"), None if args.part_tokens else args.base, answers)
     dev = torch.device(f"cuda:{torch.cuda.device_count() - 1}" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
     pol = Policy(args, dev)
     if isinstance(sampler, VllmSampler):
@@ -1362,6 +1380,8 @@ def main():
             sampler.reload(pol.materialize(vocab_dir(), args.base))
             sampler.rows = pol.part_rows
     if sampler is None:
+        if args.grammar:
+            print("--grammar needs vLLM: transformers' sampler decodes without it", file=sys.stderr)
         sampler = HfSampler(pol, args.max_tokens, args.hf_batch)
     if args.resample:
         sampler = ValidSampler(sampler, pol.tok, args.model, args.resample)
