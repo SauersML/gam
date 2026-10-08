@@ -306,6 +306,8 @@ def main():
     parts = library_parts() if a.library else None
     for path in a.behaviors:
         beh = json.loads(path.read_text())
+        if (a.out_dir / f"{'libpatch' if a.library else 'vpdpatch'}_{beh['id']}.json").exists():
+            continue  # measured already (a rerun after a stop goes on where it left off)
         if a.library:
             table = measure_library(run, beh, parts)
             (a.out_dir / f"libpatch_{beh['id']}.json").write_text(json.dumps(table))
