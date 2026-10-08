@@ -397,11 +397,11 @@ class VllmSampler:
         if self.share:
             self.llm.sleep(level=1)  # weights to host memory, KV cache freed: the trainer loads next
 
-    def push_rows(self):
+    def push_rows(self, rows=None):
         """Copies the part tokens' current rows into vLLM's embedding and output layer in place (an in-process
         engine, VLLM_ENABLE_V1_MULTIPROCESSING=0), so sampling uses this step's projections without
         rewriting the checkpoint; the prefix cache is reset since prompts may hold part tokens."""
-        first, rows_in, rows_out = self.rows()
+        first, rows_in, rows_out = rows if rows is not None else self.rows()
 
         def put(model):
             model.model.embed_tokens.weight.data[first : first + rows_in.shape[0]].copy_(rows_in)
@@ -430,12 +430,13 @@ class VllmSampler:
         from vllm import SamplingParams
         from vllm.lora.request import LoRARequest
 
+        rows = self.rows() if self.rows is not None else None  # computed where the trainer's projections live, before it moves
         if self.share:  # one GPU: the trainer's weights leave while vLLM wakes with its whole share
             self.policy.model.to("cpu")
             torch.cuda.empty_cache()
             self.llm.wake_up()
-        if self.rows is not None:
-            self.push_rows()
+        if rows is not None:
+            self.push_rows(rows)
         params = SamplingParams(n=n, temperature=1.0, top_p=1.0, top_k=-1, max_tokens=self.max_tokens, stop_token_ids=[self.end], logprobs=0)
         try:
             outs = self.llm.generate([{"prompt_token_ids": p} for p in prompts], params, lora_request=LoRARequest(f"policy{version}", version + 1, str(adapter)), use_tqdm=False)
