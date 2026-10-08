@@ -301,6 +301,36 @@ pub fn jvp_seeded(
                 }
                 out
             }
+            // The largest score moves with its own query and key: `scale (⟨dq̃_t, k̃_u⟩ + ⟨q̃_t, dk̃_u⟩)`
+            // at the key `u` it is taken at, the tangents turned as the rows are.
+            Node::MaxScore { query, key, scale, rotary, causal } => {
+                let (dq, dk) = (tangent_of(&dv, *query), tangent_of(&dv, *key));
+                if dq.is_none() && dk.is_none() {
+                    None
+                } else {
+                    let (_, at, _, (q, k)) = crate::operator_program::max_scores(inputs, (value(*query), value(*key)), None, (*scale, *rotary, *causal))?;
+                    let turned = |t: Option<Array2<f64>>| -> Result<Option<Array2<f64>>, ProgramError> {
+                        match (t, rotary) {
+                            (Some(t), Some(r)) => Ok(Some(crate::operator_program::rotated_rows(inputs, &t, None, *r, false)?.0)),
+                            (t, _) => Ok(t),
+                        }
+                    };
+                    let (dq, dk) = (turned(dq)?, turned(dk)?);
+                    let c = scale.value();
+                    let mut out = Array2::<f64>::zeros((rows, 1));
+                    for (t, &u) in at.iter().enumerate() {
+                        let mut total = 0.0;
+                        if let Some(dq) = &dq {
+                            total += dq.row(t).dot(&k.row(u));
+                        }
+                        if let Some(dk) = &dk {
+                            total += q.row(t).dot(&dk.row(u));
+                        }
+                        out[[t, 0]] = c * total;
+                    }
+                    Some(out)
+                }
+            }
             Node::Attend { query, key, value: v, scale, rotary, causal } => {
                 let (dq, dk, dvv) = (tangent_of(&dv, *query), tangent_of(&dv, *key), tangent_of(&dv, *v));
                 if dq.is_none() && dk.is_none() && dvv.is_none() {
@@ -576,6 +606,24 @@ pub(crate) fn vjp_seeded(
             }
             Node::Transposed { input, operator } => {
                 add(&mut g, *input, program.operators[*operator].apply(&cot));
+            }
+            // `g_t scale k̃_u` to the query and `g_t scale q̃_t` to the key it is taken at, turned back
+            // (a rotation's transpose is its inverse).
+            Node::MaxScore { query, key, scale, rotary, causal } => {
+                let (_, at, _, (q, k)) = crate::operator_program::max_scores(inputs, (value(*query), value(*key)), None, (*scale, *rotary, *causal))?;
+                let c = scale.value();
+                let (mut gq, mut gk) = (Array2::<f64>::zeros(q.dim()), Array2::<f64>::zeros(k.dim()));
+                for (t, &u) in at.iter().enumerate() {
+                    let w = c * cot[[t, 0]];
+                    gq.row_mut(t).scaled_add(w, &k.row(u));
+                    gk.row_mut(u).scaled_add(w, &q.row(t));
+                }
+                if let Some(r) = rotary {
+                    gq = crate::operator_program::rotated_rows(inputs, &gq, None, *r, true)?.0;
+                    gk = crate::operator_program::rotated_rows(inputs, &gk, None, *r, true)?.0;
+                }
+                add(&mut g, *query, gq);
+                add(&mut g, *key, gk);
             }
             Node::Attend { query, key, value: v, scale, rotary, causal } => {
                 let (gq, gk, gv) =

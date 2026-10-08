@@ -959,9 +959,84 @@ pub enum Node {
     /// it: a statistic of the rotated keys read in a query's own frame (`library_vpd`'s query
     /// block gates).
     Rotate { input: usize, rotary: Rotary, inverse: bool },
+    /// Per query row the head's largest pre-softmax score, `max_u scale ⟨q_t, k_u⟩` over the keys
+    /// `u` of its sequence (`u ≤ t` where `causal`), the query and the key turned by `rotary` as an
+    /// attend node turns them: one column. A gate's read of its head's attention scores
+    /// (`library_vpd`'s score gates; at an induction position the matching key's score).
+    MaxScore { query: usize, key: usize, scale: Scale, rotary: Option<Rotary>, causal: bool },
 }
 
-const NODE_KINDS: usize = 22;
+const NODE_KINDS: usize = 23;
+
+/// Per query row of `query` the largest scaled score over its keys in `key` ([`Node::MaxScore`]):
+/// the rows turned by `rotary`, the largest score and its key's row, and with `bands` its radius,
+/// the largest of the scores' radii (`|max a − max b| ≤ max |a − b|`).
+#[allow(clippy::type_complexity)]
+pub(crate) fn max_scores(
+    inputs: &FamilyInputs,
+    (query, key): (&Array2<f64>, &Array2<f64>),
+    bands: Option<(&Array2<f64>, &Array2<f64>)>,
+    (scale, rotary, causal): (Scale, Option<Rotary>, bool),
+) -> Result<(Array2<f64>, Vec<usize>, Option<Array2<f64>>, (Array2<f64>, Array2<f64>)), ProgramError> {
+    let layout = inputs.layout.as_ref().ok_or_else(|| ProgramError::Input("a max score node needs a sequence layout".to_string()))?;
+    let rows = query.nrows();
+    let (mut q, mut k) = (query.clone(), key.clone());
+    let (mut rq, mut rk) = match bands {
+        Some((bq, bk)) => (Some(bq.clone()), Some(bk.clone())),
+        None => (None, None),
+    };
+    if let Some(rotary) = rotary {
+        for row in 0..rows {
+            let position = layout.position[row];
+            for (m, b) in [(&mut q, &mut rq), (&mut k, &mut rk)] {
+                let mut v = m.row(row).to_vec();
+                let mut r = b.as_ref().map(|b| b.row(row).to_vec());
+                rotary.rotate(&mut v, r.as_deref_mut(), position);
+                m.row_mut(row).assign(&ndarray::ArrayView1::from(&v));
+                if let (Some(b), Some(r)) = (b.as_mut(), r) {
+                    b.row_mut(row).assign(&ndarray::ArrayView1::from(&r));
+                }
+            }
+        }
+    }
+    let c = scale.value();
+    let mut by_sequence: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
+    for row in 0..rows {
+        by_sequence.entry(layout.sequence[row]).or_default().push(row);
+    }
+    let mut out = Array2::<f64>::zeros((rows, 1));
+    let mut at = vec![0; rows];
+    let mut radius = bands.map(|_| Array2::<f64>::zeros((rows, 1)));
+    let growth = accumulation_growth(q.ncols() + 1);
+    for members in by_sequence.values() {
+        for &row in members {
+            let mut best = (f64::NEG_INFINITY, row);
+            let mut moved: f64 = 0.0;
+            for &other in members.iter().filter(|&&other| !causal || layout.position[other] <= layout.position[row]) {
+                let score = c * q.row(row).dot(&k.row(other));
+                if score > best.0 {
+                    best = (score, other);
+                }
+                if let (Some(rq), Some(rk)) = (rq.as_ref(), rk.as_ref()) {
+                    let r: f64 = (0..q.ncols())
+                        .map(|i| {
+                            let (a, b) = (q[[row, i]].abs(), k[[other, i]].abs());
+                            let (ra, rb) = (rq[[row, i]], rk[[other, i]]);
+                            growth * a * b + a * rb + ra * b + ra * rb
+                        })
+                        .sum();
+                    moved = moved.max(c.abs() * r);
+                }
+            }
+            out[[row, 0]] = best.0;
+            at[row] = best.1;
+            if let Some(radius) = radius.as_mut() {
+                radius[[row, 0]] = inflate(moved + UNIT_ROUNDOFF * best.0.abs(), 2);
+            }
+        }
+    }
+    Ok((out, at, radius, (q, k)))
+}
 
 /// `H(z) = 1{z > 0}`, a [`Node::Gated`] gate's weight.
 pub(crate) fn gated_step(z: f64) -> f64 {
@@ -1123,6 +1198,7 @@ impl Node {
             Self::GroupNorm { .. } => 19,
             Self::Gated { .. } => 20,
             Self::Rotate { .. } => 21,
+            Self::MaxScore { .. } => 22,
         }
     }
 
@@ -1145,6 +1221,7 @@ impl Node {
             Self::Pointwise { input, .. } | Self::Readout { input, .. } => vec![*input],
             Self::Select { inside, outside, .. } => vec![*inside, *outside],
             Self::GroupNorm { input } | Self::Rotate { input, .. } => vec![*input],
+            Self::MaxScore { query, key, .. } => vec![*query, *key],
             Self::Gated { value, gate, scale } => std::iter::once(*value).chain([*gate]).chain(*scale).collect(),
         }
     }
@@ -2125,6 +2202,14 @@ impl OperatorProgram {
                 Ok((pick(value(*inside), value(*outside)), radius))
             }
             Node::Rotate { input, rotary, inverse } => rotated_rows(inputs, value(*input), band(*input), *rotary, *inverse),
+            Node::MaxScore { query, key, scale, rotary, causal } => {
+                let bands = match (band(*query), band(*key)) {
+                    (Some(a), Some(b)) => Some((a, b)),
+                    _ => None,
+                };
+                let (out, _, radius, _) = max_scores(inputs, (value(*query), value(*key)), bands, (*scale, *rotary, *causal))?;
+                Ok((out, radius))
+            }
             Node::GroupNorm { input } => {
                 let (x, interface) = (value(*input), &interfaces[*input]);
                 let groups = interface.group_count();
@@ -2785,6 +2870,13 @@ fn interface_of(index: usize, node: &Node, out: &[Interface], scope: &Scope<'_>)
             out[*inside].clone()
         }
         Node::GroupNorm { input } => Interface::uniform(out[*input].group_count(), 1, LabelKind::Unit, 0)?,
+        Node::MaxScore { query, key, rotary, .. } => {
+            let width = out[*query].width();
+            if out[*key].width() != width || rotary.is_some_and(|r| r.dims as usize > width || r.dims % 2 == 1) {
+                return Err(ProgramError::Interface(format!("max score node {index}: query, key and rotary widths disagree")));
+            }
+            Interface::uniform(1, 1, LabelKind::Unit, 0)?
+        }
         Node::Rotate { input, rotary, .. } => {
             if out[*input].width() != rotary.dims as usize || rotary.dims % 2 == 1 {
                 return Err(ProgramError::Interface(format!("rotate node {index}: its input is not one rotary block")));
@@ -2873,6 +2965,10 @@ pub fn remap_node(node: &mut Node, nodes: &[usize], operators: &[usize], bases: 
             *outside = nodes[*outside];
         }
         Node::GroupNorm { input } | Node::Rotate { input, .. } => *input = nodes[*input],
+        Node::MaxScore { query, key, .. } => {
+            *query = nodes[*query];
+            *key = nodes[*key];
+        }
         Node::Gated { value, gate, scale } => {
             *value = nodes[*value];
             *gate = nodes[*gate];
@@ -3422,6 +3518,24 @@ fn encode_node(out: &mut BitString, node: &Node, index: usize, code: &NodeCode<'
             out.push_bit(rotary.half_split);
             out.push_bit(*inverse);
         }
+        Node::MaxScore { query, key, scale, rotary, causal } => {
+            encode_fixed_index(out, *query, refs)?;
+            encode_fixed_index(out, *key, refs)?;
+            match scale {
+                Scale::One => out.push_bit(false),
+                Scale::InverseSqrt(n) => {
+                    out.push_bit(true);
+                    encode_prefix_integer(out, u64::from(*n))?;
+                }
+            }
+            out.push_bit(rotary.is_some());
+            if let Some(rotary) = rotary {
+                encode_prefix_integer(out, u64::from(rotary.base))?;
+                encode_prefix_integer(out, u64::from(rotary.dims))?;
+                out.push_bit(rotary.half_split);
+            }
+            out.push_bit(*causal);
+        }
         Node::Gated { value, gate, scale } => {
             encode_fixed_index(out, *value, refs)?;
             encode_fixed_index(out, *gate, refs)?;
@@ -3545,6 +3659,22 @@ fn decode_node(reader: &mut BitReader<'_>, index: usize, code: &NodeCode<'_>, in
             let dims = u32::try_from(decode_prefix_integer(reader)?).map_err(|e| ProgramError::Code(e.to_string()))?;
             let rotary = Rotary { base, dims, half_split: reader.read_bit()? };
             Node::Rotate { input, rotary, inverse: reader.read_bit()? }
+        }
+        22 => {
+            let (query, key) = (decode_fixed_index(reader, refs)?, decode_fixed_index(reader, refs)?);
+            let scale = if reader.read_bit()? {
+                Scale::InverseSqrt(u32::try_from(decode_prefix_integer(reader)?).map_err(|error| ProgramError::Code(format!("scale argument: {error}")))?)
+            } else {
+                Scale::One
+            };
+            let rotary = if reader.read_bit()? {
+                let base = u32::try_from(decode_prefix_integer(reader)?).map_err(|e| ProgramError::Code(e.to_string()))?;
+                let dims = u32::try_from(decode_prefix_integer(reader)?).map_err(|e| ProgramError::Code(e.to_string()))?;
+                Some(Rotary { base, dims, half_split: reader.read_bit()? })
+            } else {
+                None
+            };
+            Node::MaxScore { query, key, scale, rotary, causal: reader.read_bit()? }
         }
         20 => {
             let (value, gate) = (decode_fixed_index(reader, refs)?, decode_fixed_index(reader, refs)?);

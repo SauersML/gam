@@ -157,6 +157,8 @@ enum Step {
     Gated { value: usize, gate: usize, scale: Option<usize>, blocks: ColumnBlocks, of: Arc<Indices> },
     /// Each row turned to its position, or back from it (`Node::Rotate`).
     Rotate { input: usize, rotary: Rotary, inverse: bool },
+    /// Per query row the largest scaled score over its block's keys (`Node::MaxScore`).
+    MaxScore { query: usize, key: usize, scale: f64, rotary: Option<Rotary>, causal: bool },
     /// `inside`'s rows at `positions`, `outside`'s elsewhere (`Node::Select`).
     Select {
         inside: usize,
@@ -224,6 +226,7 @@ fn step_arguments(step: &Step) -> Vec<usize> {
         Step::GroupNorm { input, .. } | Step::Rotate { input, .. } => vec![*input],
         Step::Gated { value, gate, scale, .. } => std::iter::once(*value).chain([*gate]).chain(*scale).collect(),
         Step::Attend { query, key, value, .. } => vec![*query, *key, *value],
+        Step::MaxScore { query, key, .. } => vec![*query, *key],
         Step::Concat { parts } => parts.clone(),
     }
 }
@@ -874,6 +877,14 @@ impl DeviceProgram {
                 }
                 Node::Select { inside, outside, positions } => Step::Select { inside: *inside, outside: *outside, positions: positions.clone() },
                 Node::Rotate { input, rotary, inverse } => Step::Rotate { input: *input, rotary: *rotary, inverse: *inverse },
+                Node::MaxScore { query, key, scale, rotary, causal } => {
+                    if let Some(r) = rotary
+                        && 2 * r.pairs().len() > widths[*query]
+                    {
+                        return refuse("a rotation wider than its head");
+                    }
+                    Step::MaxScore { query: *query, key: *key, scale: scale.value(), rotary: *rotary, causal: *causal }
+                }
                 Node::RmsNorm { input, epsilon } => Step::RmsNorm { input: *input, epsilon: *epsilon },
                 Node::Attend { query, key, value, scale, rotary, causal } => {
                     if let Some(r) = rotary
@@ -1497,7 +1508,7 @@ impl DeviceProgram {
         let rotaries: Vec<Rotary> = {
             let mut list: Vec<Rotary> = Vec::new();
             for step in &self.steps {
-                if let Step::Attend { rotary: Some(r), .. } | Step::Rotate { rotary: r, .. } = step
+                if let Step::Attend { rotary: Some(r), .. } | Step::MaxScore { rotary: Some(r), .. } | Step::Rotate { rotary: r, .. } = step
                     && !list.contains(r)
                 {
                     list.push(*r);
@@ -1505,7 +1516,7 @@ impl DeviceProgram {
             }
             list
         };
-        let attends = self.steps.iter().any(|s| matches!(s, Step::Attend { .. }));
+        let attends = self.steps.iter().any(|s| matches!(s, Step::Attend { .. } | Step::MaxScore { .. }));
         let Some(layout) = &family.layout else {
             if attends || !rotaries.is_empty() {
                 return Err("device: attention or a rotation needs a sequence layout".to_string());
@@ -2330,6 +2341,7 @@ impl DeviceProgram {
                     let (cos, sin) = rotations_of(&trace, *rotary)?;
                     value(d.rotate(trace.value(*input)?, cos, sin, rotary.half_split, *inverse).map_err(error)?)
                 }
+                Step::MaxScore { query, key, scale, rotary, causal } => value(self.max_score(&trace, (*query, *key), (*scale, *rotary, *causal))?.3),
                 Step::RmsNorm { input, epsilon } if !hook && trace.value(*input).is_ok_and(|x| self.rounds_on_write(index, x)) => {
                     let (values, half) = d.rms_norm_both(trace.value(*input)?, *epsilon).map_err(error)?;
                     trace.keep_rounded(index, half)?;
@@ -2545,6 +2557,39 @@ impl DeviceProgram {
                 Ok((d.rotate(q, cos, sin, r.half_split, false).map_err(error)?, d.rotate(k, cos, sin, r.half_split, false).map_err(error)?))
             }
         }
+    }
+
+    /// The largest scaled score of each query row over its block's keys (`Step::MaxScore`): the turned
+    /// queries, each row's best key turned (its row picked), the best keys' rows (on the device and
+    /// the host), and the scores.
+    /// The softmax keeps each row's order among its keys (with weight zero past the query where
+    /// `causal`), so its first largest entry is the best key's.
+    #[allow(clippy::type_complexity)]
+    fn max_score(&self, trace: &DeviceTrace, (query, key): (usize, usize), (scale, rotary, causal): (f64, Option<Rotary>, bool)) -> Result<(Tensor, Tensor, (Indices, Vec<u32>), Tensor), String> {
+        let d = &self.device;
+        if trace.segments.is_some() {
+            return Err("device: a max score node in a batch of unequal sequences".to_string());
+        }
+        let (q, k) = self.rotated(trace, query, key, rotary)?;
+        let length = trace.rows / trace.blocks;
+        let mut scores = d.empty(trace.rows, length).map_err(error)?;
+        d.gemm_batched(trace.blocks, &mut scores, scale, &q, Op::N, &k, Op::T, 0.0, self.arithmetic).map_err(error)?;
+        d.softmax_rows(&mut scores, causal).map_err(error)?;
+        let best = d
+            .argmax_rows(&scores)
+            .map_err(error)?
+            .into_iter()
+            .enumerate()
+            .map(|(t, j)| u32::try_from((t / length) * length + j).map_err(error))
+            .collect::<Result<Vec<u32>, String>>()?;
+        let at = d.upload_indices(&best).map_err(error)?;
+        let picked = d.gather_rows(&k, &at).map_err(error)?;
+        let mut product = d.empty(trace.rows, q.cols()).map_err(error)?;
+        d.hadamard(&mut product, &q, &picked, false).map_err(error)?;
+        let across = d.upload_vec(q.cols(), 1, vec![scale; q.cols()]).map_err(error)?;
+        let mut out = d.empty(trace.rows, 1).map_err(error)?;
+        d.gemm(&mut out, 1.0, &product, Op::N, &across, Op::N, 0.0, self.arithmetic).map_err(error)?;
+        Ok((q, picked, (at, best), out))
     }
 
     /// Whether the attention of `blocks` sequences in `rows` runs in query tiles
@@ -3030,6 +3075,37 @@ impl DeviceProgram {
                 Step::Rotate { input, rotary, inverse } => {
                     let (cos, sin) = rotations_of(trace, *rotary)?;
                     add(&mut g, *input, d.rotate(&cot, cos, sin, rotary.half_split, !*inverse).map_err(error)?)?;
+                }
+                // `g_t scale k̃_u` to the query and `g_t scale q̃_t` to the key `u` its score is taken at
+                // (summed over the queries taking it, through each block's one-hot selection), both
+                // turned back: a rotation's transpose is its inverse.
+                Step::MaxScore { query, key, scale, rotary, causal } => {
+                    let (q, picked, (_, best), _) = self.max_score(trace, (*query, *key), (*scale, *rotary, *causal))?;
+                    let (rows, hd) = (trace.rows, q.cols());
+                    let length = rows / trace.blocks;
+                    let weights = d.download(&cot).map_err(error)?.column(0).mapv(|w| w * scale);
+                    let column = d.upload_vec(rows, 1, weights.to_vec()).map_err(error)?;
+                    let across = d.upload_vec(1, hd, vec![1.0; hd]).map_err(error)?;
+                    let mut by_row = d.empty(rows, hd).map_err(error)?;
+                    d.gemm(&mut by_row, 1.0, &column, Op::N, &across, Op::N, 0.0, arithmetic).map_err(error)?;
+                    let mut gq = d.empty(rows, hd).map_err(error)?;
+                    d.hadamard(&mut gq, &picked, &by_row, false).map_err(error)?;
+                    let mut select = vec![0.0; rows * length];
+                    for (t, &u) in best.iter().enumerate() {
+                        select[t * length + u as usize % length] = weights[t];
+                    }
+                    let select = d.upload_vec(rows, length, select).map_err(error)?;
+                    let mut gk = d.empty(rows, hd).map_err(error)?;
+                    d.gemm_batched(trace.blocks, &mut gk, 1.0, &select, Op::T, &q, Op::N, 0.0, arithmetic).map_err(error)?;
+                    let (gq, gk) = match rotary {
+                        Some(r) => {
+                            let (cos, sin) = rotations_of(trace, *r)?;
+                            (d.rotate(&gq, cos, sin, r.half_split, true).map_err(error)?, d.rotate(&gk, cos, sin, r.half_split, true).map_err(error)?)
+                        }
+                        None => (gq, gk),
+                    };
+                    add(&mut g, *query, gq)?;
+                    add(&mut g, *key, gk)?;
                 }
                 Step::RmsNorm { input, epsilon } => {
                     let term = d
@@ -3749,6 +3825,35 @@ impl DeviceProgram {
                         Some(d.rotate(dx, cos, sin, rotary.half_split, *inverse).map_err(error)?)
                     }
                     None => None,
+                },
+                // `scale (⟨dq̃_t, k̃_u⟩ + ⟨q̃_t, dk̃_u⟩)` at the key `u` the score is taken at.
+                Step::MaxScore { query, key, scale, rotary, causal } => match (dv[*query].as_ref(), dv[*key].as_ref()) {
+                    (None, None) => None,
+                    (dq, dk) => {
+                        let (q, picked, (at, _), _) = self.max_score(trace, (*query, *key), (*scale, *rotary, *causal))?;
+                        let turned = |t: &Tensor| -> Result<Tensor, String> {
+                            match rotary {
+                                Some(r) => {
+                                    let (cos, sin) = rotations_of(trace, *r)?;
+                                    d.rotate(t, cos, sin, r.half_split, false).map_err(error)
+                                }
+                                None => d.copy(t).map_err(error),
+                            }
+                        };
+                        let (rows, hd) = (trace.rows, q.cols());
+                        let mut product = d.zeros(rows, hd).map_err(error)?;
+                        if let Some(dq) = dq {
+                            d.hadamard(&mut product, &turned(dq)?, &picked, true).map_err(error)?;
+                        }
+                        if let Some(dk) = dk {
+                            let moved = d.gather_rows(&turned(dk)?, &at).map_err(error)?;
+                            d.hadamard(&mut product, &q, &moved, true).map_err(error)?;
+                        }
+                        let across = d.upload_vec(hd, 1, vec![*scale; hd]).map_err(error)?;
+                        let mut out = d.empty(rows, 1).map_err(error)?;
+                        d.gemm(&mut out, 1.0, &product, Op::N, &across, Op::N, 0.0, self.arithmetic).map_err(error)?;
+                        Some(out)
+                    }
                 },
                 Step::GroupNorm { input, blocks, .. } => match dv[*input].as_ref() {
                     Some(dx) => {
@@ -4839,6 +4944,97 @@ mod rotate_tests {
                     let scale = want.iter().fold(1.0_f64, |m, v| m.max(v.abs()));
                     let err = (got - want).iter().fold(0.0_f64, |m, v| m.max(v.abs()));
                     assert!(err <= tolerance * scale, "{} half split {half_split}: {what} differs by {err}", device.name());
+                };
+                let arithmetic = if device.float64() { Arithmetic::F64 } else { Arithmetic::F32 };
+                let mut lowered = DeviceProgram::compile_values(device, &program).unwrap();
+                lowered.set_arithmetic(arithmetic);
+                let trace = lowered.forward(&family).unwrap();
+                close("the output", &device.download(trace.value(program.output).unwrap()).unwrap(), &host.values[program.output]);
+                let seeds = BTreeMap::from([(program.output, device.upload(seed.view()).unwrap())]);
+                let (nodes, _) = lowered.vjp_values_dense(&trace, seeds, &[0], &[0], arithmetic).unwrap();
+                close("the input's cotangent", &device.download(&nodes[&0]).unwrap(), host_cot[0].as_ref().unwrap());
+                let tangent = lowered.jvp_span(&trace, None, program.output, &tangents, arithmetic, |_, _, _| Ok(())).unwrap().unwrap();
+                close("the tangent", &device.download(&tangent).unwrap(), &host_tangent);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod max_score_tests {
+    use super::*;
+    use crate::operator_program::{Declarations, FamilyInputs, Interface, Scale, SequenceLayout, Slot, SlotValues, exact_precision};
+    use ndarray::Array2;
+    use rand::{RngExt, SeedableRng, rngs::StdRng};
+
+    /// A max score node is each query's largest scaled score over its sequence's keys up to its
+    /// position, query and key turned by the rotary (two sequences of 7): its host value is that
+    /// definition, the code keeps it, its cotangent is its tangent's adjoint, its tangent is the
+    /// value's central difference along a weight, and on every device the forward, the input's
+    /// cotangent and the tangent equal the host's.
+    #[test]
+    fn a_max_score_is_its_definition_on_every_device() {
+        let mut devices = crate::device_program_tests::devices();
+        devices.extend(Device::single_precision(gam_gpu::GpuPolicy::Auto).unwrap());
+        let mut rng = StdRng::seed_from_u64(9);
+        let mut normal = |r: usize, c: usize| Array2::from_shape_fn((r, c), |_| rng.random::<f64>() - 0.5);
+        let (d, dims, length, sequences) = (5, 8, 7, 2);
+        let rows = length * sequences;
+        let (wq, wk) = (normal(dims, d), normal(dims, d));
+        let dense = |name: &str, w: &Array2<f64>| Arc::new(Operator::dense(name, Interface::native(dims).unwrap(), Interface::native(d).unwrap(), w.clone(), exact_precision(w.iter().copied()).unwrap(), Default::default()).unwrap());
+        let x = normal(rows, d);
+        let layout = SequenceLayout { sequence: (0..rows as u32).map(|r| r / length as u32).collect(), position: (0..rows as u32).map(|r| r % length as u32).collect() };
+        let family = FamilyInputs { rows, slots: vec![SlotValues::Raw(x)], layout: Some(layout.clone()) };
+        for rotary in [None, Some(Rotary { base: 10_000, dims: dims as u32, half_split: true })] {
+            let nodes = vec![
+                Node::Raw { slot: 0 },
+                Node::Affine { terms: vec![(0, 0)], bias: None },
+                Node::Affine { terms: vec![(0, 1)], bias: None },
+                Node::MaxScore { query: 1, key: 2, scale: Scale::InverseSqrt(dims as u32), rotary, causal: true },
+            ];
+            let program = OperatorProgram { declarations: Declarations { domains: vec![], slots: vec![Slot::Raw { width: d }], parameters: 0 }, operators: vec![dense("Q", &wq), dense("K", &wk)], bases: vec![], rules: vec![], nodes, output: 3 };
+            let host = program.execute(&family, false).unwrap();
+            let turned = |m: &Array2<f64>, row: usize| -> Vec<f64> {
+                let mut v = m.row(row).to_vec();
+                if let Some(r) = rotary {
+                    r.rotate(&mut v, None, layout.position[row]);
+                }
+                v
+            };
+            let c = 1.0 / (dims as f64).sqrt();
+            for t in 0..rows {
+                let q = turned(&host.values[1], t);
+                let start = t - t % length;
+                let best = (start..=t).map(|u| c * q.iter().zip(turned(&host.values[2], u)).map(|(a, b)| a * b).sum::<f64>()).fold(f64::NEG_INFINITY, f64::max);
+                assert!((host.values[3][[t, 0]] - best).abs() < 1e-14, "row {t}: {} against {best}", host.values[3][[t, 0]]);
+            }
+            let artifact = crate::artifact::Artifact::native(&program).unwrap();
+            let decoded = crate::artifact::Artifact::from_bytes(&artifact.to_bytes().unwrap(), &program.declarations).unwrap();
+            assert_eq!(decoded.program.nodes, program.nodes, "the code keeps the max score node");
+            let seed = normal(rows, 1);
+            let host_cot = crate::derivatives::vjp_seeded(&program, &family, &host, BTreeMap::from([(program.output, seed.clone())]), None).unwrap();
+            let tangents = BTreeMap::from([(0, normal(dims, d)), (1, normal(dims, d))]);
+            let host_tangent = crate::derivatives::jvp(&program, &family, &host, &tangents).unwrap();
+            let input_tangent = BTreeMap::from([(0, normal(rows, d))]);
+            let along = crate::derivatives::jvp_seeded(&program, &family, &host, &BTreeMap::new(), &input_tangent).unwrap();
+            let forward = (&along * &seed).sum();
+            let backward = (host_cot[0].as_ref().unwrap() * &input_tangent[&0]).sum();
+            assert!((forward - backward).abs() < 1e-12 * forward.abs().max(1.0), "{forward} against {backward}");
+            let h = 1e-6;
+            let at = |sign: f64| {
+                let mut moved = program.clone();
+                moved.operators = vec![dense("Q", &(&wq + &(&tangents[&0] * (sign * h)))), dense("K", &(&wk + &(&tangents[&1] * (sign * h))))];
+                moved.execute(&family, false).unwrap().values[3].clone()
+            };
+            let central = (at(1.0) - at(-1.0)) / (2.0 * h);
+            let gap = (&central - &host_tangent).iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+            assert!(gap < 1e-7, "the tangent against the central difference: {gap}");
+            for device in &devices {
+                let tolerance = if device.float64() { 1e-12 } else { 1e-4 };
+                let close = |what: &str, got: &Array2<f64>, want: &Array2<f64>| {
+                    let scale = want.iter().fold(1.0_f64, |m, v| m.max(v.abs()));
+                    let err = (got - want).iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+                    assert!(err <= tolerance * scale, "{} rotary {}: {what} differs by {err}", device.name(), rotary.is_some());
                 };
                 let arithmetic = if device.float64() { Arithmetic::F64 } else { Arithmetic::F32 };
                 let mut lowered = DeviceProgram::compile_values(device, &program).unwrap();

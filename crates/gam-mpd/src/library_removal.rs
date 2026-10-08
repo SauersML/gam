@@ -348,6 +348,7 @@ impl Structure {
                 | Node::Select { .. }
                 | Node::GroupNorm { .. }
                 | Node::Rotate { .. }
+                | Node::MaxScore { .. }
                 | Node::Gated { .. } => {}
             }
         }
@@ -506,6 +507,8 @@ impl Structure {
                 Node::GroupNorm { .. } => vec![Kill::none(); w],
                 // A turn mixes each plane's two coordinates; claimed for none.
                 Node::Rotate { .. } => vec![Kill::none(); w],
+                // The largest score is zero only where every score is; claimed for none.
+                Node::MaxScore { .. } => vec![Kill::none(); w],
                 // Zero where its value is (the gate only multiplies).
                 Node::Gated { value, .. } => zero[*value].clone(),
                 Node::Param { .. } | Node::Call { .. } => return Err(error("a call in the flat program")),
@@ -674,6 +677,15 @@ impl Structure {
                     for (i, ui) in u.iter().enumerate() {
                         unread[*input][i].meet(ui, &Kill::none(), None);
                         unread[*input][i].meet(&k, &Kill::none(), None);
+                    }
+                }
+                Node::MaxScore { query, key, .. } => {
+                    // Every query and key coordinate reaches the largest score: read wherever it is.
+                    let k = every(&u, None);
+                    for node in [*query, *key] {
+                        for i in 0..self.widths[node] {
+                            unread[node][i].meet(&k, &Kill::none(), None);
+                        }
                     }
                 }
                 Node::Attend { query, key, value, rotary, .. } => {
