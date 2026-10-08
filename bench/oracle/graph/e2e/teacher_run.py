@@ -210,6 +210,7 @@ def answer(a, b: str) -> None:
             "assignment_score": {t: final[1].get(t) for t in TERMS}, "refine_bits": total, "parts": parts,
             "variables": [s.variable for s in refined.statements if s.kind != "claim"], "accepted": [str(e) for e in accepted],
             "search": str(found), "checker": a.checker_commit, "checker_binary": str(score_module.BINARY),
+            "base": os.environ.get("GRAPH_BASE"),
             "settings": {"experiments": a.experiments, "seed": 0, "rounds": a.rounds, "adds": a.adds, "drops": a.drops,
                          "final_experiments": a.final_experiments, "final_seed": 1}, "seconds": round(time.time() - t0)}
     with open(out / "manifest.jsonl", "a") as f:

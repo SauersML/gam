@@ -43,9 +43,13 @@ def sources(names: list[str], model: str, seed: int) -> dict[str, str]:
 def load_behavior(checker, path: Path) -> dict:
     """Loads a behavior into the checker without the site-operation manifest: the checker's vpd4l default
     needs the export's `context` tokens, which ~/mpd-data/engine/vpd4l's export.json does not have
-    (the request fails and the server loses its model; reported to g-exec2, 10-07 02:25)."""
+    (the request fails and the server loses its model; reported to g-exec2, 10-07 02:25). The checker's shared base
+    (score.Checker's base, GRAPH_BASE) is sent after it, as Checker.behavior does."""
     checker.behavior_record = json.loads(Path(path).read_text())
-    return checker.request({"op": "behavior", "path": str(Path(path).expanduser()), "manifest": None})
+    answer = checker.request({"op": "behavior", "path": str(Path(path).expanduser()), "manifest": None})
+    if getattr(checker, "base", None):
+        answer["base"] = checker.request({"op": "base", "path": checker.base})
+    return answer
 
 
 def ir_of(source: str, model: str, stand_in: str | None = None) -> dict:
