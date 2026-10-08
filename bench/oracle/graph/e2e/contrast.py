@@ -55,33 +55,79 @@ def ranges(indices: list[int]) -> str:
     return ", ".join(out)
 
 
-def without(sizes: dict, chunk: tuple) -> str:
-    """The node program naming every subcomponent but `chunk` (layer, site, start, stop), with every causal edge."""
-    layer, site, start, stop = chunk
+def nodes_program(kept: dict) -> str:
+    """The node program naming the subcomponents `kept` ({(layer, site): indices}): a node per (layer, block), and every
+    causal edge from embed and each earlier residual writer into each node that reads, and from every writer into the
+    logits."""
     nodes = []
-    for l in sorted({l for l, _ in sizes}):
+    for l in sorted({l for l, _ in kept}):
         for block, sites in BLOCKS.items():
-            pieces = []
-            for s in sites:
-                keep = [i for i in range(sizes[(l, s)]) if not (l == layer and s == site and start <= i < stop)]
-                if keep:
-                    pieces.append(f"PD[{l}].{s}[{ranges(keep)}]")
-            nodes.append((f"{'va' if block == 'attn' else 'vm'}{l}", ", ".join(pieces)))
-    lines = ["from mech import node, edges, L, PD, embed, logits"] + [f"{n} = node({p})" for n, p in nodes]
-    wires = [f"    {w} >> {n}," for k, (n, _) in enumerate(nodes) for w in ["embed"] + [m for m, _ in nodes[:k]]]
-    wires += [f"    {w} >> logits," for w in ["embed"] + [n for n, _ in nodes]]
-    return "\n".join(lines + ["edges("] + wires + [")"]) + "\n"
+            pieces = [f"PD[{l}].{s}[{ranges(sorted(kept[(l, s)]))}]" for s in sites if kept.get((l, s))]
+            if pieces:
+                present = {s for s in sites if kept.get((l, s))}
+                nodes.append((f"{'va' if block == 'attn' else 'vm'}{l}", ", ".join(pieces), bool(present - {"o_proj", "down_proj"}),
+                              bool(present & {"o_proj", "down_proj"})))
+    lines = ["from mech import node, edges, L, PD, embed, logits"] + [f"{n} = node({p})" for n, p, _, _ in nodes]
+    wires = [f"    {w} >> {n}," for k, (n, _, reads, _) in enumerate(nodes) if reads
+             for w in ["embed"] + [m for m, _, _, writes in nodes[:k] if writes]]
+    wires += [f"    {w} >> logits," for w in ["embed"] + [n for n, _, _, writes in nodes if writes]]
+    return "\n".join(lines + (["edges("] + wires + [")"] if nodes else [])) + "\n"
+
+
+def kept_of(chunks) -> dict:
+    out: dict = {}
+    for l, s, i, j in chunks:
+        out.setdefault((l, s), set()).update(range(i, j))
+    return out
+
+
+def without(sizes: dict, chunk: tuple) -> str:
+    """The node program naming every subcomponent but `chunk` (layer, site, start, stop)."""
+    return nodes_program(kept_of([c for c in ((l, s, 0, n) for (l, s), n in sizes.items())
+                                  for c in ([c] if (c[0], c[1]) != chunk[:2] else [(c[0], c[1], 0, chunk[2]), (c[0], c[1], chunk[3], c[3])])
+                                  if c[3] > c[2]]))
+
+
+def removals(checker, programs: list[str], a) -> list[float]:
+    """Each program's execution error on the clean and counterfactual prompts alone (--rank-experiments), necessity off."""
+    results = []
+    for k in range(0, len(programs), a.batch):
+        results += checker.score_batch(programs[k:k + a.batch], experiments=a.rank_experiments, seed=0, reader=False,
+                                       stand_in="counterfactual", options={"necessity": False})
+    return [r["exec_error_bits"] if r.get("valid", True) else float("inf") for r in results]
+
+
+def prune(b: str, checker, sizes: dict, a, log) -> tuple[dict, list]:
+    """Iterative pruning from every subcomponent: each round measures every chunk's removal from the current set (the
+    error of the set without it), drops the chunks of least effect until half the parts (or the next k) remain, and
+    splits the rest in half; the set at each k in --ks ({k: units}) and every round's log."""
+    chunks = [(l, s, i, min(i + a.chunk, n)) for (l, s), n in sorted(sizes.items()) for i in range(0, n, a.chunk)]
+    wanted, sets, rounds = sorted(a.ks, reverse=True), {}, []
+    while wanted:
+        parts = sum(j - i for _, _, i, j in chunks)
+        errors = removals(checker, [nodes_program(kept_of([d for d in chunks if d != c])) for c in chunks], a)
+        effect = dict(zip(chunks, errors))
+        target = max(parts // 2, wanted[0])
+        kept, total = [], parts
+        for c in sorted(chunks, key=lambda c: effect[c]):
+            if total - (c[3] - c[2]) >= target and total > wanted[-1]:
+                total -= c[3] - c[2]
+            else:
+                kept.append(c)
+        chunks = kept
+        current = removals(checker, [nodes_program(kept_of(chunks))], a)[0]
+        rounds.append({"parts": total, "chunks": len(chunks), "error_bits": current})
+        log(f"{total} parts in {len(chunks)} chunks, error {current:.5g} bits")
+        while wanted and total <= wanted[0]:
+            sets[wanted.pop(0)] = [("sub", l, s, i) for l, s, i0, j in chunks for i in range(i0, j)]
+        chunks = [h for (l, s, i, j) in chunks for h in (((l, s, i, (i + j) // 2), (l, s, (i + j) // 2, j)) if j - i > 1 else ((l, s, i, j),))]
+    return sets, rounds
 
 
 def rank(b: str, checker, sizes: dict, importance: dict, a, log) -> tuple[list, list]:
     """(the ranking as units ("sub", layer, site, index) with each one's chunk effect, every measured chunk)."""
     def measure(chunks):
-        sources = [without(sizes, c) for c in chunks]
-        results = []
-        for k in range(0, len(sources), a.batch):
-            results += checker.score_batch(sources[k:k + a.batch], experiments=a.rank_experiments, seed=0, reader=False,
-                                           stand_in="counterfactual", options={"necessity": False})
-        return [r["exec_error_bits"] if r.get("valid", True) else -1.0 for r in results]  # an invalid program ranks last
+        return [e if e != float("inf") else -1.0 for e in removals(checker, [without(sizes, c) for c in chunks], a)]  # invalid: last
 
     chunks = [(l, s, i, min(i + a.chunk, n)) for (l, s), n in sorted(sizes.items()) for i in range(0, n, a.chunk)]
     effect = dict(zip(chunks, measure(chunks)))
@@ -112,9 +158,8 @@ def rank(b: str, checker, sizes: dict, importance: dict, a, log) -> tuple[list, 
     return out, [{"chunk": list(c), "effect_bits": effect[c]} for c in sorted(effect, key=lambda c: -effect[c])]
 
 
-def curve(b: str, behavior: dict, checker, ranked: list, a) -> tuple[dict, list]:
-    """The program without parts' score and, per k, the first k ranked subcomponents' answer and score."""
-    units = [u for u, _ in ranked]
+def curve(b: str, behavior: dict, checker, chosen: dict, a) -> tuple[dict, list]:
+    """The program without parts' score and, per k, the answer aligning chosen[k] (units) and its score."""
     try:
         algorithm = teacher.algorithm_of(behavior)
     except ValueError:
@@ -125,7 +170,8 @@ def curve(b: str, behavior: dict, checker, ranked: list, a) -> tuple[dict, list]
             return search.source(chosen)
         return algorithm.rstrip() + "\n\n\n" + (f"align(answer, {', '.join(map(teacher_run.token_of, chosen))})\n" if chosen else "")
 
-    sets = [[]] + [teacher_run.closed(units[:k], units) for k in a.ks]
+    ks = sorted(chosen)
+    sets = [[]] + [chosen[k] for k in ks]
     results = []
     for k in range(0, len(sets), a.batch):
         results += checker.score_batch([program(s) for s in sets[k:k + a.batch]], experiments=a.experiments, seed=1,
@@ -134,7 +180,7 @@ def curve(b: str, behavior: dict, checker, ranked: list, a) -> tuple[dict, list]
              "code_bits", "N", "parts", "valid")
     empty = {t: results[0].get(t) for t in terms}
     rows = []
-    for k, s, r in zip(a.ks, sets[1:], results[1:]):
+    for k, s, r in zip(ks, sets[1:], results[1:]):
         rows.append({"k": k, "parts": len(s), "units": [search.name(u) for u in s], "source_format": "answer" if algorithm else "nodes",
                      "reproduced": 1 - r["exec_error_bits"] / empty["exec_error_bits"] if empty["exec_error_bits"] else None,
                      "beats_empty": r["total_bits"] < empty["total_bits"], "score": {t: r.get(t) for t in terms},
@@ -151,6 +197,9 @@ def main():
     ap.add_argument("--importance", type=Path, default=DATA / "experiments/importance", help="mpd_vpd_importance_2951's tables (site sizes, order within a chunk)")
     ap.add_argument("--device")
     ap.add_argument("--experiments", type=int, default=16)
+    ap.add_argument("--method", choices=["prune", "removal"], default="prune", help="prune: iterative pruning from every "
+                    "subcomponent, removals re-measured in the current set each round; removal: one ranking by removal "
+                    "from the full model, split down to --leaf, its prefixes")
     ap.add_argument("--rank-experiments", type=int, default=0, help="experiments drawn per chunk removal (0: the clean and "
                     "counterfactual prompts alone, the contrast itself)")
     ap.add_argument("--chunk", type=int, default=256, help="subcomponents per first chunk")
@@ -171,18 +220,27 @@ def main():
         log = lambda m: print(f"{b}: {m}", flush=True)  # noqa: E731
         with score_module.Checker(behavior["model"], export=a.export, views={"vpd": a.vpd}, device=a.device) as checker:
             checker.behavior(path)
-            ranked, chunks = rank(b, checker, sizes, importance, a, log)
-            empty, rows = curve(b, behavior, checker, ranked, a)
+            if a.method == "prune":
+                chosen, rounds = prune(b, checker, sizes, a, log)
+                ranked, chunks = [], rounds
+            else:
+                ranked, chunks = rank(b, checker, sizes, importance, a, log)
+                units = [u for u, _ in ranked]
+                chosen = {k: teacher_run.closed(units[:k], units) for k in a.ks}
+            if behavior.get("split") == "train":
+                chosen = {k: teacher_run.closed(v, v) for k, v in chosen.items()}  # an answer mech accepts
+            empty, rows = curve(b, behavior, checker, chosen, a)
         for r in rows:
             log(f"k={r['k']} ({r['parts']} parts): reproduced {r['reproduced']:.1%}, total {r['score']['total_bits']:.6g} vs empty "
                 f"{empty['total_bits']:.6g} (exec {r['score']['exec_error_bits']:.4g}, necessity {r['score']['necessity_error_bits']:.4g}, "
                 f"alignment {r['score'].get('alignment_error_bits') or 0:.4g}, complexity {r['score']['complexity_bits']:.4g})")
-        record = {"behavior": b, "semantics": "counterfactual", "experiments": a.experiments, "rank_experiments": a.rank_experiments,
+        record = {"behavior": b, "method": a.method, "semantics": "counterfactual", "experiments": a.experiments, "rank_experiments": a.rank_experiments,
                   "chunk": a.chunk, "leaf": a.leaf,
                   "keep": a.keep, "checker": str(score_module.BINARY), "empty": empty, "curve": rows,
                   "ranking": [[search.name(u), e] for u, e in ranked[:2048]], "chunks": chunks, "seconds": round(time.time() - t0)}
-        (a.out / f"{b}.json").write_text(json.dumps(record, indent=1))
-        (a.out / "rankings" / f"{b}.json").write_text(json.dumps({"behavior": b, "source": f"{a.out / b}.json (measured contrast by chunk removal)",
+        (a.out / f"{b}.{a.method}.json").write_text(json.dumps(record, indent=1))
+        if ranked:
+            (a.out / "rankings" / f"{b}.json").write_text(json.dumps({"behavior": b, "source": f"{a.out / b}.json (measured contrast by chunk removal)",
                                                                   "mixed": [[search.name(u), e] for u, e in ranked]}))
         log(f"done in {time.time() - t0:.0f} s")
 
