@@ -28,14 +28,19 @@ DATA = Path.home() / "mpd-data/graph_oracle"
 MODEL_NUMBERS = {"vpd4l": 28_324_608}
 
 
-def summary(behavior: str, result: dict, model: str = "vpd4l") -> dict:
+def summary(behavior: str, result: dict, model: str = "vpd4l", behavior_file: Path | None = None) -> dict:
     t = result["trajectory"][0]
     empty = next(s for k, s in t["prefixes"] if k == 0)
     found = result["score"]
     fams = tuple(f for f in table.FIT if f in found.get("per_family", {}) and f in empty.get("per_family", {}))
     e, f = table.shared(empty, fams), table.shared(found, fams)
     he, hf = table.shared(empty, table.HELDOUT), table.shared(found, table.HELDOUT)
+    # validity: the empty program's clean-prompt error must be the behavior's own signal KL(M(x) || M(x'))
+    # (g-behaviors' counterfactual_quality); c1870275cb's VPD view breaks it on some behaviors
+    signal = json.loads(behavior_file.read_text()).get("counterfactual_quality", {}).get("mean_kl_bits") if behavior_file else None
+    clean = empty.get("per_family", {}).get("clean", {}).get("mean_kl_bits")
     return {"behavior": behavior, "source": result["source"], "score": found, "empty": empty,
+            "empty_clean_kl": clean, "signal_kl": signal,
             "reproduced": 1 - f[0] / e[0] if e[0] else 0.0,
             "reproduced_heldout": 1 - hf[0] / he[0] if he and hf and he[0] else None,
             "weights_share": found.get("opaque_numbers", 0) / MODEL_NUMBERS[model], "parts": len(result["units"]),
@@ -76,7 +81,7 @@ def main() -> None:
         if not res.exists():
             print(f"{b}: no result ({work / f'{b}.stdout'})", flush=True)
             continue
-        s = summary(b, json.loads(res.read_text()), a.model)
+        s = summary(b, json.loads(res.read_text()), a.model, behaviors / f"{b}.json")
         (out / f"{b}.json").write_text(json.dumps(s, indent=1))
         print(f"{b}: {s['parts']} parts ({s['heads']} heads), reproduced {s['reproduced']:.0%} (held-out families "
               f"{s['reproduced_heldout'] if s['reproduced_heldout'] is None else round(s['reproduced_heldout'] * 100)}%), "
