@@ -22,6 +22,8 @@ block, then its plain-English explanation from the facts in words and the edges)
 from __future__ import annotations
 
 import argparse
+import ast
+import inspect
 import json
 import math
 import sys
@@ -426,25 +428,47 @@ SITE_WORDS = {"q_proj": "query", "k_proj": "key", "v_proj": "value", "o_proj": "
               "down_proj": "output"}
 
 
+def _listed(items: list[str]) -> str:
+    return items[0] if len(items) == 1 else ", ".join(items[:-1]) + " and " + items[-1]
+
+
 def part_words(n: dict) -> str:
-    """A node's pieces in words: "head L2.H4", "12 subcomponents of layer 0's MLP", ..."""
-    out = []
+    """A node's parts in words, per layer block: "layer 1's attention query subcomponent 316 and key
+    subcomponent 329", "60 input and 62 output subcomponents of layer 0's MLP", "heads L2.H3 and L2.H4"."""
+    groups: dict[tuple, list[dict]] = {}
     for p in n["pieces"]:
-        idx = p["index"]
-        count = None if idx in (None, "rest") else (len(idx) if isinstance(idx, list) else 1)
-        if p["view"] == "native" and p["kind"] == "head":
-            heads = idx if isinstance(idx, list) else [idx]
-            out.append(", ".join(f"L{p['layer']}.H{h}" for h in heads) if idx is not None else f"every head of layer {p['layer']}")
-        elif p["view"] == "native":
-            out.append(f"{count or 'all'} neurons of layer {p['layer']}'s MLP")
-        elif p["view"] == "vpd":
-            block = "MLP" if p["kind"] in ("c_fc", "down_proj") else "attention"
-            what = "the rest of" if idx == "rest" else f"{count} {SITE_WORDS[p['kind']]} subcomponent{'s' if count != 1 else ''} of"
-            out.append(f"{what} layer {p['layer']}'s {block} {p['kind'] if idx == 'rest' else ''}".rstrip())
-        elif p["view"] == "transcoder":
-            out.append(f"{count} transcoder feature{'s' if count != 1 else ''} of layer {p['layer']}'s MLP")
-        else:
-            out.append(f"{count} parts of layer {p['layer']}'s {p['kind']}")
+        groups.setdefault((p["layer"], "mlp" if p["kind"] in ("mlp", "c_fc", "down_proj", "feature") else "attn"), []).append(p)
+    out, heads = [], []
+    for (l, block), pieces in sorted(groups.items()):
+        where = f"layer {l}'s {'MLP' if block == 'mlp' else 'attention'}"
+        items, few = [], True
+        for p in pieces:
+            idx = p["index"]
+            units = None if idx in (None, "rest") else (idx if isinstance(idx, list) else [idx])
+            if p["view"] == "native" and p["kind"] == "head":
+                if units is None:
+                    out.append(f"every head of layer {l}")
+                else:
+                    heads += [f"L{l}.H{h}" for h in units]
+                continue
+            if p["view"] == "native":
+                out.append(f"{where}" if units is None else f"{len(units)} neurons of {where}")
+                continue
+            noun = {"vpd": "subcomponent", "transcoder": "transcoder feature", "library": "part"}[p["view"]]
+            word = SITE_WORDS.get(p["kind"], "")
+            if idx == "rest":
+                items.append(f"{word} remainder")
+            elif units is None:
+                items.append(f"every {word} {noun}".replace("  ", " "))
+            elif len(units) <= 3:
+                items.append(f"{word} {noun}{'s' if len(units) > 1 else ''} {_listed([str(u) for u in units])}".strip())
+            else:
+                few = False
+                items.append(f"{len(units)} {word} {noun}s".replace("  ", " "))
+        if items:
+            out.append(f"{where} {_listed(items)}" if few else f"{_listed(items)} of {where}")
+    if heads:
+        out.insert(0, ("head " if len(heads) == 1 else "heads ") + _listed(heads))
     return "; ".join(out)
 
 
@@ -498,6 +522,104 @@ def explanation_of(ir: dict, behavior: dict, facts_of: dict[str, dict]) -> str:
     return " ".join(lines)
 
 
+def variable_ir(ir: dict) -> dict:
+    """An algorithm program's IR as one node per bound or claimed variable (the pieces of all its nodes),
+    for facts(): a variable's parts are removed together."""
+    nodes = {n["id"]: n for n in ir["nodes"]}
+    return {"model": ir["model"], "nodes": [{"id": v["name"], "pieces": [p for i in v["nodes"] for p in nodes[i]["pieces"]]}
+                                           for v in ir["variables"] if v["nodes"]]}
+
+
+def described(source: str) -> dict[str, str]:
+    """Per top-level function of an algorithm: what its author says it is (its docstring, else the comments
+    that open its body), one line."""
+    import io
+    import tokenize
+
+    quoted = mech.quote_parts(source)
+    tree = ast.parse(quoted)
+    comments = {t.start[0]: t.string[1:].strip() for t in tokenize.generate_tokens(io.StringIO(quoted).readline)
+                if t.type == tokenize.COMMENT}
+    out = {}
+    for f in tree.body:
+        if not isinstance(f, ast.FunctionDef):
+            continue
+        doc = ast.get_docstring(f)
+        if doc:
+            out[f.name] = " ".join(doc.split())
+            continue
+        lines, k = [], f.body[0].lineno - 1
+        while k > f.lineno and k in comments:  # comments directly above the first statement
+            lines.insert(0, comments[k])
+            k -= 1
+        out[f.name] = " ".join(lines)
+    return out
+
+
+def algorithm_source(ir: dict, behavior: dict, facts_of: dict[str, dict], score: dict | None = None) -> str:
+    """An algorithm program as written, with a docstring stating the behavior and what the facts are, and
+    each variable's measured facts as comments above its bind or claim."""
+    source = ir["source"]
+    tree = ast.parse(mech.quote_parts(source))
+    lines = source.splitlines()
+    above: dict[int, list[str]] = {}
+    for st in tree.body:
+        call = st.value if isinstance(st, ast.Expr) and isinstance(st.value, ast.Call) else None
+        if call and isinstance(call.func, ast.Name) and call.func.id in ("bind", "claim") and call.args \
+                and isinstance(call.args[0], ast.Name) and call.args[0].id in facts_of and call.args[0].id not in {
+                    n for rows in above.values() for n in rows}:
+            above[st.lineno] = [call.args[0].id]
+    head = textwrap.wrap(f"Behavior {behavior['id']} ({ir['model']}): {behavior['description']}", 100)
+    head += ["", *textwrap.wrap(
+        f"Facts measured on the behavior's {next(iter(facts_of.values()))['targets'] if facts_of else 0} target tokens "
+        f"(clean prompts; the answer is the next token), per variable: what removing its parts does to the answer, "
+        f"and what their own write does to the logits through the direct path only (no later layers).", 100)]
+    if score:
+        head += ["", *textwrap.wrap(f"Score: {score['total_bits']:.4g} bits in total.", 100)]
+    doc = tree.body and isinstance(tree.body[0], ast.Expr) and isinstance(tree.body[0].value, ast.Constant) \
+        and isinstance(tree.body[0].value.value, str)
+    body = lines[tree.body[0].end_lineno:] if doc else lines
+    if doc:  # the author's notes follow the printer's
+        head += ["", *inspect.cleandoc(tree.body[0].value.value).splitlines()]
+    offset = len(lines) - len(body)
+    out = ['"""' + "\n".join(head) + '\n"""']
+    for k, line in enumerate(body, start=offset + 1):
+        for name in above.get(k, []):
+            out += [f"# {name}: {row}" if i == 0 else f"#   {row}" for i, row in enumerate(textwrap.wrap(role(facts_of[name]), 92))]
+        out.append(line)
+    return "\n".join(out).rstrip() + "\n"
+
+
+def algorithm_explanation(ir: dict, behavior: dict, facts_of: dict[str, dict]) -> str:
+    """An algorithm program's plain-English explanation: per variable, what it is (its author's words),
+    which parts hold it or produce its attention pattern, what removing them does, and what it reads."""
+    nodes = {n["id"]: n for n in ir["nodes"]}
+    says = described(ir["source"])
+    lines = [behavior["description"].rstrip(".") + "."]
+    for v in ir["variables"]:
+        name, what = v["name"], says.get(v["name"], "")
+        reads = [r if r != "tokens" else "the tokens" for r in v["reads"]]
+        sentence = f"{name}" + (f" ({what.rstrip('.')})" if what else "") + f" is computed from {' and '.join(reads)}"
+        if v["nodes"]:
+            pieces = [p for i in v["nodes"] for p in nodes[i]["pieces"]]
+            parts = part_words({"pieces": pieces})
+            many = sum(1 if not isinstance(p["index"], list) else len(p["index"]) for p in pieces) > 1
+            sentence += (f"; {parts} hold{'' if many else 's'} it" if v["role"] == "bound"
+                         else f"; it is the attention pattern of {parts}")
+            f = facts_of.get(name)
+            if f:
+                d = f["removal_answer_bits"]
+                sentence += (f", and removing {'them' if many else 'it'} {'lowers' if d < 0 else 'raises'} the "
+                             f"answer's log-probability by {abs(d):.2f} bits")
+        else:
+            sentence += ", a step no part holds on its own"
+        lines.append(sentence + ".")
+    lines.append(f"{ir['answer']} is the prediction.")
+    lines.append("Every other part of the model is deleted." if ir.get("decomposition")
+                 else "Everything else behaves as it does on the edited prompt.")
+    return " ".join(lines)
+
+
 def answer_of(source: str, explanation: str) -> str:
     """The full answer in the oracle's format: the program block, then the explanation."""
     return f"```python\n{source.rstrip()}\n```\n\n{explanation}\n"
@@ -534,8 +656,19 @@ def wrong(measured: dict[str, dict]) -> dict[str, dict]:
 
 def printed(ir: dict, behavior: dict, score: dict | None = None, measured: dict | None = None) -> tuple[str, dict]:
     """(source, graph description) of a traced program on a behavior (`measured`: facts already taken,
-    e.g. wrong(facts) for the reader's control)."""
+    e.g. wrong(facts) for the reader's control). An algorithm program (bindings) keeps its algorithm as
+    written; its facts are per variable."""
     SHAPE[0] = mech.shapes(ir["model"])
+    if ir.get("variables"):
+        measured = measured if measured is not None else facts(engine_for(ir["model"]), variable_ir(ir), behavior)
+        src = algorithm_source(ir, behavior, measured, score)
+        check = mech.trace_inline(src, ir["model"], behavior=behavior, decomposition=ir.get("decomposition") or "native")
+        if not check["valid"] or {k: check[k] for k in ("nodes", "edges", "bindings")} != {k: ir[k] for k in ("nodes", "edges", "bindings")}:
+            raise ValueError(f"the printed program does not trace back to the same IR: {check['error']}")
+        explanation = algorithm_explanation(ir, behavior, measured)
+        return src, {"behavior": behavior["id"], "model": ir["model"], "description": behavior["description"],
+                     "variables": [{**v, **measured.get(v["name"], {})} for v in ir["variables"]], "nodes": ir["nodes"],
+                     "edges": ir["edges"], "explanation": explanation, "score": score}
     measured = measured if measured is not None else facts(engine_for(ir["model"]), ir, behavior)
     src = source_of(ir, behavior, measured, score)
     check = mech.trace_inline(src, ir["model"], decomposition=ir.get("decomposition") or "native")
@@ -559,14 +692,14 @@ def main():
     text = a.program.read_text()
     if a.program.suffix == ".json":
         data = json.loads(text)
-        ir = data if "nodes" in data else mech.trace_inline(data["source"], behavior["model"], decomposition=a.decomposition)
+        ir = data if "nodes" in data else mech.trace_inline(data["source"], behavior["model"], behavior, a.decomposition)
     else:
-        ir = mech.trace_inline(text, behavior["model"], decomposition=a.decomposition)
+        ir = mech.trace_inline(text, behavior["model"], behavior, a.decomposition)
     if not ir["valid"]:
         sys.exit(f"invalid program: {ir['error']}")
     score = json.loads(a.score.read_text()) if a.score else None
     SHAPE[0] = mech.shapes(ir["model"])
-    measured = facts(engine_for(ir["model"]), ir, behavior)
+    measured = facts(engine_for(ir["model"]), variable_ir(ir) if ir.get("variables") else ir, behavior)
     src, graph = printed(ir, behavior, score, measured)
     a.out_dir.mkdir(parents=True, exist_ok=True)
     name = a.name or f"{behavior['id']}.{a.program.stem}"

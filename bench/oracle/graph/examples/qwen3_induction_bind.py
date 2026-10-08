@@ -11,22 +11,22 @@ from mech import bind, claim
 
 
 def back(tokens):
-    # the previous-token heads look one position back
+    # each position attends to the one before it
     return [[t - 1] if t else [0] for t in range(len(tokens))]
 
 
 def prev(tokens, back):
-    # and write the word before each position there
+    # the word before each position
     return [tokens[js[0]] if t else None for t, js in enumerate(back)]
 
 
 def match(tokens, prev):
-    # the induction heads attend where the previous word is the current word
+    # each position attends to the earlier positions whose previous word is its own word
     return [[j for j in range(t) if prev[j] == tokens[t]] for t in range(len(tokens))]
 
 
 def answer(tokens, match):
-    # and copy the word found there
+    # the word at the latest such position: the one that followed the current word before
     return [tokens[js[-1]] if js else None for js in match]
 
 

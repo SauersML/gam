@@ -38,7 +38,7 @@ query t attends to, uniformly (none: position 0), or maps positions to weights; 
 and k_proj parts (or native heads), in one layer or several (the pattern holds in each). A claim states
 what the parts compute; they still compute it with M's weights.
 The answer is the one bound variable that no variable reads: its value at t is the token M predicts
-after position t.
+after position t (a longer string: its first token).
 Edges follow the data flow: a variable reading `tokens` reads the token embedding; one reading another
 variable reads the writes of that variable's parts (through unbound steps); a variable spanning layers
 feeds its own later parts; the answer's parts and the embedding write the logits.
@@ -703,13 +703,14 @@ def _evaluate(program: _Program, algorithm: _Algorithm, answer: str, behavior: d
             cache[key].update(algorithm.values(prompts[i][: t + 1], [name], cache[key]))
         return cache[key][name]
 
-    right = total = 0
+    ir["clean"] = []  # per target: the answer on the clean prompt, and the prompt's next token
     for i, ts in enumerate(targets):
         for t in ts:
             a = at(i, t, answer)[t]
-            right += t + 1 < len(prompts[i]) and a == prompts[i][t + 1]
-            total += 1
-    ir["algorithm_accuracy"] = right / total if total else None
+            if a is not None and not isinstance(a, str):
+                raise MechError(f"the answer {answer} at position {t} of prompt {i} is {a!r}, not a token string")
+            ir["clean"].append([i, t, a, prompts[i][t + 1] if t + 1 < len(prompts[i]) else None])
+
     def swapped(i: int, j: int, v: str) -> list | None:  # the answers at i's targets with v from prompt j
         out = []
         for t in targets[i]:
@@ -875,7 +876,7 @@ ALLOWED_NODES = (
     ast.Constant, ast.Attribute, ast.Subscript, ast.Slice, ast.Tuple, ast.List, ast.Dict, ast.Set,
     ast.Call, ast.keyword, ast.Starred, ast.BinOp, ast.UnaryOp, ast.BoolOp, ast.Compare, ast.IfExp,
     ast.operator, ast.unaryop, ast.boolop, ast.cmpop, ast.expr_context, ast.FunctionDef, ast.Lambda,
-    ast.arguments, ast.arg, ast.Return, ast.Pass, ast.For, ast.If, ast.Break, ast.Continue,
+    ast.arguments, ast.arg, ast.Return, ast.Pass, ast.For, ast.While, ast.If, ast.Break, ast.Continue,
     ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp, ast.comprehension, ast.JoinedStr,
     ast.FormattedValue, ast.ImportFrom, ast.alias, ast.Assert, ast.NamedExpr,
 )
@@ -1067,8 +1068,9 @@ _VOCABULARIES: dict = {}
 
 
 def _token_id(model: str, text: str, known: dict) -> int | None:
-    """The id of the single token `text` decodes from: one of the behavior's own tokens, else the lowest
-    id of M's vocabulary that decodes to it."""
+    """The token an answer `text` starts with: the token it is (one of the behavior's own, else the lowest
+    id of M's vocabulary that decodes to it), else the first token M's tokenizer splits it into (an answer
+    may spell out a longer continuation)."""
     if text in known:
         return known[text]
     if model not in _VOCABULARIES:
@@ -1078,7 +1080,10 @@ def _token_id(model: str, text: str, known: dict) -> int | None:
         for i, s in enumerate(strings):
             vocabulary.setdefault(s, i)
         _VOCABULARIES[model] = vocabulary
-    return _VOCABULARIES[model].get(text)
+    if text in _VOCABULARIES[model]:
+        return _VOCABULARIES[model][text]
+    ids = tokenizer(model).encode(text, add_special_tokens=False).ids if text else []
+    return ids[0] if ids else None
 
 
 def behavior_tokens(behavior, model: str) -> tuple[dict, dict]:
@@ -1103,8 +1108,14 @@ def behavior_tokens(behavior, model: str) -> tuple[dict, dict]:
 
 
 def _answer_ids(ir: dict, model: str, known: dict | None) -> dict:
-    """Adds each interchange answer's token id (the checker's "answer"); a string that is not one token
-    makes the program invalid."""
+    """Adds each interchange answer's token id (the checker's "answer"; a string that starts with no token
+    makes the program invalid) and the algorithm's accuracy: the share of targets whose clean answer starts
+    with the prompt's next token."""
+    clean = ir.pop("clean", None)
+    if clean is not None:
+        hits = [a is not None and n is not None and _token_id(model, a, known or {}) == _token_id(model, n, known or {})
+                for _, _, a, n in clean]
+        ir["algorithm_accuracy"] = sum(hits) / len(hits) if hits else None
     for b in ir.get("bindings") or []:
         for pair in b["pairs"]:
             pair["answer"] = []
@@ -1113,7 +1124,7 @@ def _answer_ids(ir: dict, model: str, known: dict | None) -> dict:
                 if i is None:
                     ir.update(nodes=[], edges=[], bindings=[], variables=[], answer=None, claims={}, valid=False,
                               error=f"the answer {text!r} (variable {ir.get('answer')}, interchanging {b['variable']}, "
-                                    f"prompt {pair['base']}) is not one token of {model}")
+                                    f"prompt {pair['base']}) starts with no token of {model}")
                     return ir
                 pair["answer"].append(i)
     return ir

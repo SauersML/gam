@@ -11,23 +11,23 @@ from mech import bind, claim
 
 
 def back(tokens):
-    # layer 1's attention: each position looks one position back
+    # each position attends to the one before it
     return [[t - 1] if t else [0] for t in range(len(tokens))]
 
 
 def prev(tokens, back):
-    # what layer 1 writes at each position: the token before it
+    # the token before each position
     return [tokens[js[0]] if t else None for t, js in enumerate(back)]
 
 
 def match(tokens, prev):
-    # layer 2's attention: the earlier positions whose previous token is the current token,
-    # i.e. the positions right after the earlier copies of the current token
+    # each position attends to the earlier positions whose previous token is its own token:
+    # the positions right after the earlier copies of the current token
     return [[j for j in range(t) if prev[j] == tokens[t]] for t in range(len(tokens))]
 
 
 def answer(tokens, match):
-    # layer 2 copies the token found there; layer 3 writes the same token again
+    # the token at the latest such position: the one that followed the current token before
     return [tokens[js[-1]] if js else None for js in match]
 
 

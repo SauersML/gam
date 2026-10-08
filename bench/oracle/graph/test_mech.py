@@ -131,10 +131,15 @@ def test_algorithm_on_a_real_behavior():
             assert len(pair["answer"]) == len(record["prompts"][pair["base"]]["target_positions"])
 
 
-def test_answer_must_be_a_token():
+def test_answers_start_with_a_token():
     bad = INDUCTION.replace("return [tokens[js[-1]] if js else None for js in match]",
-                            "return [tokens[js[-1]] + '!' if js else None for js in match]")
-    assert "is not one token" in toy_trace(bad)["error"]
+                            "return ['' if js else None for js in match]")
+    assert "starts with no token" in toy_trace(bad)["error"]
+    longer = INDUCTION.replace("return [tokens[js[-1]] if js else None for js in match]",
+                               "return [tokens[js[-1]] + ' and more' if js else None for js in match]")
+    if BEHAVIOR.exists():  # a longer string's first token is the answer
+        ir = mech.trace_inline(longer, "vpd4l", behavior=BEHAVIOR)
+        assert ir["valid"] and ir["algorithm_accuracy"] == 1.0, ir["error"]
 
 
 def test_causal_answers():
@@ -381,7 +386,7 @@ def test_sandbox():
     assert "NameError" in invalid("getattr(1, 'real')\n")
     assert "NameError" in invalid("eval('1')\n")
     assert "NameError" in invalid("node(PD[1].q_proj[0])\n")  # used without importing
-    assert "not allowed" in invalid("while True:\n    pass\n")
+    assert "time limit" in invalid("while True:\n    pass\n", sandboxed=True)
     assert "time limit" in invalid("for i in range(10 ** 12):\n    pass\n", sandboxed=True)
     assert "time limit" in invalid("x = 10\ny = x ** x ** x ** x\n", sandboxed=True)
     for big in ("n = 10 ** 10\nx = [0] * n\n", "n = 10 ** 10\nx = 'ab' * n\n"):
