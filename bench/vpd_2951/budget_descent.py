@@ -1542,12 +1542,16 @@ if ARM == 'rot':
 # size scales with the square root of the tokens per step against 8 x 256 (the batch's gradient noise).
 LR = float(os.environ.get('DESCENT_LR', '1')) * math.sqrt(batch * seq / (8 * 256))
 rms = lambda q: q.detach().pow(2).mean().sqrt().item()
+# DESCENT_GATES_ONLY=1: the slices stay as they start (VPD's subcomponents, for the vpd start) and only the gates
+# train: whether the gap to VPD is the gates or the parts (VPD's own causal gates on these parts: 0.80 bits per
+# token at 190 active, whole model).
+GATES_ONLY = os.environ.get('DESCENT_GATES_ONLY') == '1'
 slots = [(P[n], w, rms(P[n][w])) for n in mlp for w in (('F',) if EXACT else ('V', 'U')) + (('G',) if ARM == 'dir' else ())
-         if not (EXACT and NEURON_DOWN and n.endswith('down_proj') and w == 'F') and ARM != 'rot']
+         if not (EXACT and NEURON_DOWN and n.endswith('down_proj') and w == 'F') and ARM != 'rot' and not GATES_ONLY]
 # rot: rotation angles by 1e-3 per step, thresholds by a tenth of their noise scale, assignment logits by 0.02.
 slots += [x for R in ROT_ALL for x in ((R, 'A', 1 / 3), (R, 'tau', 100 / 3 * R['s'].mean().item()), (R, 'L', 20 / 3))]
 slots += [x for P_ in GN.values() for x in ((P_, 'W1', rms(P_['W1'])), (P_, 'b1', 0.1), (P_, 'W2', 1 / math.sqrt(GATENET)))]
-slots += [(A[n], w, rms(A[n][w])) for n in sliced for w in (('V', 'U') if ATTN_FREE else ('F',))] + [(A[n], 'tau', 100 / 3 * A[n]['s'].mean().item()) for n in sliced]
+slots += [(A[n], w, rms(A[n][w])) for n in sliced for w in (('V', 'U') if ATTN_FREE else ('F',)) if not GATES_ONLY] + [(A[n], 'tau', 100 / 3 * A[n]['s'].mean().item()) for n in sliced]
 for l, S in SHARE_A.items():
     slots += [(S, 't', 100 / 3 * S['s'].mean().item()), (S, 'L_v', 20 / 3), (S, 'L_o', 20 / 3)]
 slots += [(P[n], 'tau', 100 / 3 * P[n]['s'].mean().item()) for n in mlp if ARM != 'rot']
