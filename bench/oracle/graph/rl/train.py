@@ -58,7 +58,6 @@ import contextlib
 import json
 import os
 import random
-import re
 import sys
 import time
 from pathlib import Path
@@ -80,23 +79,11 @@ BEHAVIORS = Path.home() / "mpd-data/graph_oracle/behaviors"
 SEARCH = Path.home() / "mpd-data/graph_oracle/runs/search"
 
 
-PART_TOKEN = re.compile(r"<p:[^>\s]+>")
-
-
-def to_mech(text: str) -> str:
-    """An answer with part tokens written as the mech addresses they name (part_tokens.address_of)."""
-    if "<p:" not in text:
-        return text
-    import part_tokens
-
-    return PART_TOKEN.sub(lambda m: part_tokens.address_of(m[0]), text)
-
-
 def item(answer: str, behavior: dict, seed: int, uniform_seeds: int, experiments: int) -> dict:
     """A scoring item from an oracle answer: prompt.split_answer's program (the last python block that
-    parses) and explanation (the plain English after it, which alone the reader reads); part tokens are
-    written as their mech addresses."""
-    source, explanation = split_answer(to_mech(answer))
+    parses) and explanation (the plain English after it, which alone the reader reads). Part tokens stay as
+    written: mech parses them, and each counts as one Python token of the program's size."""
+    source, explanation = split_answer(answer)
     return {"source": source, "explanation": explanation, "behavior": behavior, "seed": seed, "uniform_seeds": uniform_seeds, "experiments": experiments}
 
 
@@ -215,11 +202,12 @@ class Policy:
         self.end = self.tok.convert_tokens_to_ids("<|im_end|>")
 
     def param_groups(self, lr: float) -> list[dict]:
-        """AdamW groups: the LoRA at lr, each part-token projection at lr * rank / fan_in. Adam moves every entry
-        by about lr per step, so a linear map's output moves by about lr * fan_in per unit input; the scale gives the
-        projections (fan_in = a part kind's feature width, 1,538-3,842 for vpd4l) the per-step output change of the
-        LoRA's up-projections (fan_in = rank). With one lr for both, the first SFT step on Qwen3-8B (lr 1e-4) moved
-        every part's output row toward the same hidden state and the targets fell from 4.9 to 69.5 bits per token."""
+        """AdamW groups: the LoRA at lr, each linear map of the part tokens at lr * rank / fan_in. Adam moves every
+        entry by about lr per step, so a linear map's output moves by about lr * fan_in per unit input; the scale
+        gives the maps (fan_in = a part kind's feature width, 1,538-3,842 for vpd4l, or their inner rank) the
+        per-step output change of the LoRA's up-projections (fan_in = rank). With one lr for both, the first SFT
+        step on Qwen3-8B (lr 1e-4) moved every part's output row toward the same hidden state and the targets
+        went from 4.9 to 69.5 bits per token."""
         groups = [{"params": [p for n, p in self.model.named_parameters() if ".default." in n], "lr": lr}]
         if self.parts is not None:
             groups += [{"params": list(m.parameters()), "lr": lr * self.rank / m.in_features} for m in self.parts.modules() if isinstance(m, torch.nn.Linear)]
@@ -502,7 +490,7 @@ class ValidSampler:
         from concurrent.futures import ThreadPoolExecutor
 
         with ThreadPoolExecutor(8) as ex:  # each trace is a fork of a tracer server
-            return list(ex.map(lambda c: bool(mech.trace(program_of(to_mech(self.tok.decode(c, skip_special_tokens=True))), self.model)["valid"]), completions))
+            return list(ex.map(lambda c: bool(mech.trace(program_of(self.tok.decode(c, skip_special_tokens=True)), self.model)["valid"]), completions))
 
     def __call__(self, prompts: list[list[int]], n: int, adapter: Path, version: int) -> list[list[list[int]]]:
         with self.inner.hold() if hasattr(self.inner, "hold") else contextlib.nullcontext():
