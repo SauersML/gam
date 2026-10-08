@@ -980,6 +980,20 @@ GATENET = int(os.environ.get('DESCENT_GATENET', '0'))
 # first (every part on: P = M up to the parts' sum), VPD's own_causal_1 scheme (its causal CI network reads every
 # site's input from such a pass); without it each reads only its own layer's stream from the gated pass.
 GN_DENSE = os.environ.get('DESCENT_GATENET_DENSE') == '1'
+# DESCENT_GATECTX=D (with DESCENT_GATENET_DENSE): the dense streams first pass through a shared trunk, a projection to
+# D dimensions and one causal attention layer over the tokens (4 heads), so every gate also sees the context before
+# the token, as VPD's causal CI network does; the gate networks read the trunk's output.
+GATECTX = int(os.environ.get('DESCENT_GATECTX', '0'))
+TRUNK = {}
+
+def gate_trunk(f):
+    """The shared trunk on the dense streams f [B, T, d_f]: h = f W_in, then h + causal self-attention of h."""
+    h = f @ TRUNK['Win']
+    B_, T_, D_ = h.shape; nh = 4
+    sp = lambda t_: t_.view(B_, T_, nh, D_ // nh).transpose(1, 2)
+    q_, k_, v_ = sp(h @ TRUNK['Wq']), sp(h @ TRUNK['Wk']), sp(h @ TRUNK['Wv'])
+    o = F.scaled_dot_product_attention(q_, k_, v_, is_causal=True).transpose(1, 2).reshape(B_, T_, D_)
+    return h + o @ TRUNK['Wo']
 GN = {}
 if ARM == 'rot' and GATENET:
     for l in range(T.n_layer):
@@ -987,7 +1001,7 @@ if ARM == 'rot' and GATENET:
         if ROTA:
             outs['attn'] = sum(ROTA[l][x]['ng'] * ROTA[l][x]['g'] for x in ('q', 'k', 'ov'))
         for part, n_out in outs.items():
-            d_ = T.wte.shape[1] * ((2 if ROTA else 1) * T.n_layer if GN_DENSE else 1)
+            d_ = GATECTX or T.wte.shape[1] * ((2 if ROTA else 1) * T.n_layer if GN_DENSE else 1)
             GN[(l, part)] = {'W1': (torch.randn(d_, GATENET, device=dev) * math.sqrt(2 / d_)).requires_grad_(),
                              'b1': torch.zeros(GATENET, device=dev, requires_grad=True),
                              'W2': torch.zeros(GATENET, n_out, device=dev, requires_grad=True)}
@@ -997,10 +1011,15 @@ if ARM != 'rot' and GATENET:
     # output per slice.
     for n in mlp + sliced:
         n_out = P[n]['V'].shape[1] if n in P else NH * A[n]['V'].shape[-1]
-        d_ = T.wte.shape[1] * ((2 if sliced else 1) * T.n_layer if GN_DENSE else 1)
+        d_ = GATECTX or T.wte.shape[1] * ((2 if sliced else 1) * T.n_layer if GN_DENSE else 1)
         GN[n] = {'W1': (torch.randn(d_, GATENET, device=dev) * math.sqrt(2 / d_)).requires_grad_(),
                  'b1': torch.zeros(GATENET, device=dev, requires_grad=True),
                  'W2': torch.zeros(GATENET, n_out, device=dev, requires_grad=True)}
+
+if GATECTX and GN_DENSE and GN:
+    d_f = T.wte.shape[1] * (2 if (ROTA or sliced) else 1) * T.n_layer
+    TRUNK.update({'Win': (torch.randn(d_f, GATECTX, device=dev) / math.sqrt(d_f)).requires_grad_(),
+                  **{k: (torch.randn(GATECTX, GATECTX, device=dev) / math.sqrt(GATECTX)).requires_grad_() for k in ('Wq', 'Wk', 'Wv', 'Wo')}})
 
 def gate_net_s(n, x):
     """Map n's gate network's output for each of its slices at each token of x [B, T, d] (with GN_DENSE, of the
@@ -1379,6 +1398,8 @@ def run(ids, mode):
             T(ids)
             state['gn_feats'] = torch.cat([state['dense'][k] for k in sorted(state['dense'])], -1)
             state['dense'] = None
+        if TRUNK:
+            state['gn_feats'] = gate_trunk(state['gn_feats'])
     state['mode'], state['soft'], state['hard'], state['edges_soft'], state['edges_hard'] = mode, [], [], [], []
     state['rot'], state['rot_on'] = {}, []
     return T(ids)
@@ -1651,6 +1672,7 @@ slots = [(P[n], w, rms(P[n][w])) for n in mlp for w in (('F',) if EXACT else ('V
 # rot: rotation angles by 1e-3 per step, thresholds by a tenth of their noise scale, assignment logits by 0.02.
 slots += [x for R in ROT_ALL for x in ((R, 'A', 1 / 3), (R, 'tau', 100 / 3 * R['s'].mean().item()), (R, 'L', 20 / 3))]
 slots += [x for P_ in GN.values() for x in ((P_, 'W1', rms(P_['W1'])), (P_, 'b1', 0.1), (P_, 'W2', 1 / math.sqrt(GATENET)))]
+slots += [(TRUNK, k, rms(TRUNK[k])) for k in TRUNK]
 slots += [(A[n], w, rms(A[n][w])) for n in sliced for w in (('V', 'U') if ATTN_FREE else ('F',)) if not GATES_ONLY] + [(A[n], 'tau', 100 / 3 * A[n]['s'].mean().item()) for n in sliced]
 for l, S in SHARE_A.items():
     slots += [(S, 't', 100 / 3 * S['s'].mean().item()), (S, 'L_v', 20 / 3), (S, 'L_o', 20 / 3)]
