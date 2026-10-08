@@ -153,15 +153,21 @@ def credit(answer: Answer, score, k: int = 16, rng: random.Random | None = None)
 
 
 def refine(answer: Answer, score, candidates: dict[str, list[str]] | None = None, rounds: int = 8,
-           per_variable: int = 8, log=None) -> tuple[Answer, float, list[Edit]]:
-    """Greedy improvement: each round scores every part drop and the next `per_variable` candidates of each
-    variable in one batch, then makes the improving edits jointly in order of dS, trying all of them, half, a
-    quarter, ... and the best single one in a second batch, and keeps the lowest score. Stops when no edit improves
-    or after `rounds` rounds."""
+           per_variable: int = 8, log=None, max_drops: int | None = None,
+           rng: random.Random | None = None) -> tuple[Answer, float, list[Edit]]:
+    """Greedy improvement: each round scores every part drop (`max_drops` of them sampled uniformly when the answer
+    has more, for answers of hundreds of parts) and the next `per_variable` candidates of each variable in one
+    batch, then makes the improving edits jointly in order of dS, trying all of them, half, a quarter, ... and the
+    best single one in a second batch, and keeps the lowest score. Stops when no edit improves or after `rounds`
+    rounds."""
+    rng = rng or random.Random(0)
     current = totals(score([answer.source()]))[0]
     accepted: list[Edit] = []
     for r in range(rounds):
-        edits = drops(answer) + adds(answer, candidates or {}, per_variable)
+        part_drops = drops(answer)
+        if max_drops is not None and len(part_drops) > max_drops:
+            part_drops = rng.sample(part_drops, max_drops)
+        edits = part_drops + adds(answer, candidates or {}, per_variable)
         if not edits:
             break
         s = totals(score([apply(answer, e).source() for e in edits]))
