@@ -2246,12 +2246,15 @@ for step in range(steps):
         clean = [b for b, k_ in enumerate(kinds) if k_ is None]
         kl_dl = kl_seq[clean].mean().item() if gate == 'st' else delivered_kl(ids, kinds, lm)
         if step == 0:
-            # mu starts at the median over thresholds of the balance |d concepts / d tau| / |d bits / d tau|.
+            # mu starts at the balance ||d concepts / d tau|| / ||d bits / d tau|| over all thresholds (a per-threshold
+            # median overflowed: at the all-on start most thresholds move the KL by nearly nothing).
             taus = [cont[key] for cont, key, _ in slots if key == 'tau']
             gC = torch.autograd.grad(conc, taus, retain_graph=True, allow_unused=True)
             gB = torch.autograd.grad(objective, taus, retain_graph=True, allow_unused=True)
-            ratio = torch.cat([(a.abs() / b.abs()).reshape(-1)[b.abs().reshape(-1) > 0] for a, b in zip(gC, gB) if a is not None and b is not None])
-            lam = max(ratio.median().item(), 1e-12) if ratio.numel() else 1.0
+            nC = math.sqrt(sum(a.double().pow(2).sum().item() for a in gC if a is not None))
+            nB = math.sqrt(sum(b.double().pow(2).sum().item() for b in gB if b is not None))
+            lam = nC / nB if nB > 0 and math.isfinite(nC / nB) else 1.0
+            print('mu start', lam, flush=True)
     if step == 0 and not CONCEPTS:
         # lambda starts at the median over thresholds of the balance |dF/dtau| / |dE[k]/dtau|.
         taus = [mu for _, key, mu, _ in leaves if key == 'tau'] if FMODE else [cont[key] for cont, key, _ in slots if key == 'tau']
