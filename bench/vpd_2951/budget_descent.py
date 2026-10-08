@@ -383,6 +383,8 @@ def make(n):
         return y
     def fwd(x):
         cur['x'] = x
+        if state.get('dense') is not None and n.endswith('c_fc'):
+            state['dense'][(layer, 1)] = x
         if state['mode'] == 'M':
             return x @ st.W.T
         c = x @ p['V']
@@ -513,6 +515,8 @@ def make_attn(n):
     def fwd(x):
         if state['mode'] == 'M':
             return x @ st.W.T
+        if state.get('dense') is not None and n.endswith('q_proj'):
+            state['dense'][(int(n.split('.')[1]), 0)] = x
         xin = x.reshape(-1, x.shape[-1])
         c = head_coefficients(xin, p['V'], p['o'])
         if p['o'] and state['entry'].get(n):
@@ -966,19 +970,26 @@ if ARM == 'rot' and GATENET:
                              'b1': torch.zeros(GATENET, device=dev, requires_grad=True),
                              'W2': torch.zeros(GATENET, n_out, device=dev, requires_grad=True)}
 
+# DESCENT_GATENET_DENSE=1 (slice arms): the gate networks read, at each token, the streams of every layer from a dense
+# pass run first (every part on: P = M up to the parts' sum), VPD's own_causal_1 scheme (its causal CI network reads
+# every site's input from such a pass); without it each reads only its own layer's stream from the gated pass.
+GN_DENSE = os.environ.get('DESCENT_GATENET_DENSE') == '1'
 if ARM != 'rot' and GATENET:
     # Slice arms: one network per map, reading its layer's stream (the MLP's or the attention's normed input), one
     # output per slice.
     for n in mlp + sliced:
         n_out = P[n]['V'].shape[1] if n in P else NH * A[n]['V'].shape[-1]
-        d_ = T.wte.shape[1]
+        d_ = T.wte.shape[1] * ((2 if sliced else 1) * T.n_layer if GN_DENSE else 1)
         GN[n] = {'W1': (torch.randn(d_, GATENET, device=dev) * math.sqrt(2 / d_)).requires_grad_(),
                  'b1': torch.zeros(GATENET, device=dev, requires_grad=True),
                  'W2': torch.zeros(GATENET, n_out, device=dev, requires_grad=True)}
 
 def gate_net_s(n, x):
-    """Map n's gate network's output for each of its slices at each token of x [B, T, d]."""
+    """Map n's gate network's output for each of its slices at each token of x [B, T, d] (with GN_DENSE, of the
+    dense pass's streams at every layer instead)."""
     P_ = GN[n]
+    if GN_DENSE:
+        x = state['gn_feats']
     return F.gelu(x @ P_['W1'] + P_['b1']) @ P_['W2']
 
 def gate_net(l, part, x):
@@ -1337,6 +1348,15 @@ class KLBits(torch.autograd.Function):
         return None, grad.view(lp.shape)
 
 def run(ids, mode):
+    if GN_DENSE and mode in ('soft', 'hard'):
+        # The two-pass switching function: a dense pass first (every part on), whose streams at every layer
+        # (the attention's and the MLP's normed inputs) the gate networks read at each token.
+        with torch.no_grad():
+            state['mode'], state['soft'], state['hard'], state['edges_soft'], state['edges_hard'] = 'all', [], [], [], []
+            state['rot'], state['rot_on'], state['dense'] = {}, [], {}
+            T(ids)
+            state['gn_feats'] = torch.cat([state['dense'][k] for k in sorted(state['dense'])], -1)
+            state['dense'] = None
     state['mode'], state['soft'], state['hard'], state['edges_soft'], state['edges_hard'] = mode, [], [], [], []
     state['rot'], state['rot_on'] = {}, []
     return T(ids)
