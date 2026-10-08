@@ -4663,6 +4663,9 @@ impl Checker {
         // M's outcomes come from its native circuit, the same for every program whatever its views.
         let native = Graph::empty().model(&self.weights);
         let stacking: Vec<bool> = circuits.iter().map(|c| stacks(&self.weights, c)).collect();
+        // The program runs made in stacks (logged with the times).
+        let stacked_runs = std::sync::atomic::AtomicUsize::new(0);
+        let mut program_runs = 0usize;
         // M's outcomes of this score, held until it ends: the cache's byte budget may drop some
         // while later groups add theirs.
         let mut outcomes: BTreeMap<String, Arc<Array2<f64>>> = BTreeMap::new();
@@ -4782,6 +4785,7 @@ impl Checker {
                             let e = &runs[job[0]].1;
                             let group: Vec<&Circuit> = job.iter().map(|&r| &circuits[runs[r].0]).collect();
                             if let Some(out) = this.run_stacked(&group, e) {
+                                stacked_runs.fetch_add(job.len(), std::sync::atomic::Ordering::Relaxed);
                                 return out?
                                     .into_iter()
                                     .zip(job)
@@ -4796,6 +4800,7 @@ impl Checker {
                         }
                         job.iter().map(score_p).collect()
                     };
+                    program_runs += mine.len();
                     let scored: Vec<(usize, Vec<f64>, Option<Candidates>)> = if jobs.len() == 1 { jobs.iter().map(run_job).collect::<Result<Vec<_>, _>>()? } else { jobs.par_iter().map(run_job).collect::<Result<Vec<_>, _>>()? }.into_iter().flatten().collect();
                     for (r, kl, candidates) in scored {
                         measured[r] = Some((kl, candidates));
@@ -4813,7 +4818,7 @@ impl Checker {
             restored?;
         }
         seconds[2] = started.elapsed().as_secs_f64() - seconds[0] - seconds[1];
-        log::info!("graph score of {} programs: M's outcomes {:.1} s, counterfactual runs {:.1} s ({:.1} GB made), program runs {:.1} s", parsed.len(), seconds[0], seconds[1], made_bytes as f64 / 1e9, seconds[2]);
+        log::info!("graph score of {} programs: M's outcomes {:.1} s, counterfactual runs {:.1} s ({:.1} GB made), program runs {:.1} s ({} of {program_runs} stacked)", parsed.len(), seconds[0], seconds[1], made_bytes as f64 / 1e9, seconds[2], stacked_runs.load(std::sync::atomic::Ordering::Relaxed));
         Ok(())
     }
 
