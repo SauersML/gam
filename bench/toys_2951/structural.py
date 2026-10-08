@@ -501,12 +501,26 @@ def pattern(units, us, roles, reads):
 GROUP = 32   # the most units a rule's binding holds (local: canonical forms cost the group, never the model)
 
 
+COST = "bits"   # the per-token count: "bits" (description bits) or "concepts" (the 10-08 redesign)
+
+
 def body_bits(p, B, unit=None):
     """A rule's body: its numbers (a weight of exactly +-1 costs its sign; `unit` its quantized value) and its units'
-    and slots' structure."""
+    and slots' structure; under COST "concepts", its free numbers."""
     units, rd, n_slots = p
     ws = [w for u in units for w in u[1]] + [w for u in units for part in (u[2], u[3]) for _, w in part] + [w for _, _, w in rd]
+    if COST == "concepts":
+        return float(len(ws))
     return sum(1 if unit is not None and abs(w) == unit else B for w in ws) + len(units) + n_slots
+
+
+def index_bits(n):
+    """A block's index per token: log2 of the blocks under bits, none under concepts (a reader holds no names)."""
+    return 0.0 if COST == "concepts" else math.log2(max(n, 2))
+
+
+def library_bits(rep):
+    return 0.0 if COST == "concepts" else rep.D.bits()
 
 
 def number_bits(vals, B, tol=1e-12):
@@ -594,9 +608,36 @@ def raw_bits(rep, js, B, ms=()):
     return bits
 
 
+def block_concepts(rep, ms, rule_status):
+    """A block's concepts (the redesign's count): 1 for its gate, the directions it reads (nodes its items read and
+    none of them writes: atoms, or neurons whose input is outside it), the directions it writes (nodes its items
+    write and none of them reads: atoms, neurons, outputs), and the free numbers of its core: its items' weights
+    outside rule bindings (a rule's body is counted once per token by its rule), a neuron's write of its own atom
+    at weight 1 being no number (it defines the atom)."""
+    d = describe(rep, ms)
+    srcs, tgts = set(), set()
+    for j in ms:
+        l, i, k = int(rep.layer[j]), int(rep.recv[j]), int(rep.atom[j])
+        if rep.kind[j]:
+            srcs.add(("n", l, i))
+            tgts.add(("a", k))
+        else:
+            srcs.add(("a", k))
+            tgts.add(("n", l, i) if l < rep.toy.L else ("o", i))
+    raw = list(d["raw"]) + [j for (p, us, js), r in zip(d["bindings"], rule_status) if not r for j in js]
+    nums = sum(0 if rep.kind[j] and rep.own_atom.get((int(rep.layer[j]), int(rep.recv[j]))) == int(rep.atom[j]) and abs(rep.w[j] - 1.0) <= 1e-12 else 1
+               for j in raw)
+    return float(1 + len(srcs - tgts) + len(tgts - srcs) + nums), 0.0
+
+
 def block_cost(rep, ms, rule_status):
     """(per-token content bits without the block's index and its rules' binding indices, definition bits)
-    given which of its bindings are rules."""
+    given which of its bindings are rules; under COST "concepts", block_concepts."""
+    if COST == "concepts":
+        key = ("concepts", tuple(sorted(ms)), tuple(rule_status))
+        if key not in _RAW:
+            _RAW[key] = block_concepts(rep, ms, rule_status)
+        return _RAW[key]
     d = describe(rep, ms)
     key = (tuple(sorted(ms)), tuple(rule_status))
     if key not in _RAW:
@@ -650,17 +691,17 @@ class State:
     def pattern_terms(self, p, count, bind_on, users_on):
         if count < 2:
             return 0.0
-        return math.log2(count) * bind_on + body_bits(p, self.B, self.rep.unit) * (users_on > 0)
+        return (0.0 if COST == "concepts" else math.log2(count)) * bind_on + body_bits(p, self.B, self.rep.unit) * (users_on > 0)
 
     def total(self):
         """J counted from scratch (the check on the aggregates)."""
         nB = len(self.members)
-        tok = sum(self.on[b] * (self.cost[b][0] + math.log2(max(nB, 2))) for b in self.members)
-        defs = self.rep.D.bits() + sum(self.cost[b][1] for b in self.members)
+        tok = sum(self.on[b] * (self.cost[b][0] + index_bits(nB)) for b in self.members)
+        defs = library_bits(self.rep) + sum(self.cost[b][1] for b in self.members)
         for p, c in self.count.items():
             if c >= 2:
                 tok = tok + self.pattern_terms(p, c, self.bind_on[p], self.users_on[p])
-                defs += body_bits(p, self.B, self.rep.unit)
+                defs += 0.0 if COST == "concepts" else body_bits(p, self.B, self.rep.unit)
         return float(np.mean(tok)) + defs / self.N
 
     def delta(self, c, parts, ons):
@@ -682,7 +723,7 @@ class State:
         flips = {p for p in touched if (count.get(p, 0) >= 2) != (self.count.get(p, 0) >= 2)}
         affected = set().union(*[self.users.get(p, set()) for p in flips]) - set(c) if flips else set()
         nB, nB2 = len(self.members), len(self.members) - len(c) + len(parts)
-        lg, lg2 = math.log2(max(nB, 2)), math.log2(max(nB2, 2))
+        lg, lg2 = index_bits(nB), index_bits(nB2)
         n_on2 = self.n_on - sum(self.on[b] for b in c) + sum(ons)
         tok = lg2 * n_on2 - lg * self.n_on
         dfs = 0.0
@@ -703,7 +744,7 @@ class State:
             tok = tok + (new - old)
             flip = (count.get(p, 0) >= 2) - (self.count.get(p, 0) >= 2)
             if flip:
-                dfs += body_bits(p, self.B, self.rep.unit) * flip
+                dfs += (0.0 if COST == "concepts" else body_bits(p, self.B, self.rep.unit)) * flip
         return float(np.mean(tok)) + dfs / self.N
 
     def apply(self, c, parts, ons):
@@ -1048,8 +1089,8 @@ def summary(rep, run, name, assign, N, true_assign=None):
         members.setdefault(int(b), []).append(j)
     st = State(rep, run, members, N)
     rules = {p: c for p, c in st.count.items() if c >= 2}
-    tok = float(st.J - (rep.D.bits() + sum(st.cost[b][1] for b in st.members) + sum(body_bits(p, rep.B, rep.unit) for p in rules)) / N)
-    rec = {"explanation": name, "blocks": len(st.members), "rules": len(rules), "bindings_in_rules": int(sum(rules.values())),
+    tok = float(st.J - (library_bits(rep) + sum(st.cost[b][1] for b in st.members) + (0.0 if COST == "concepts" else sum(body_bits(p, rep.B, rep.unit) for p in rules))) / N)
+    rec = {"explanation": name, "cost": COST, "blocks": len(st.members), "rules": len(rules), "bindings_in_rules": int(sum(rules.values())),
            "bits_per_token": tok, "definitions_bits": float((st.J - tok) * N), "J": st.J,
            "blocks_on_per_token": float(st.n_on.mean()), "largest_blocks_items": sorted((len(ms) for ms in st.members.values()), reverse=True)[:5]}
     if true_assign is not None:
@@ -1211,7 +1252,10 @@ def main():
     ap.add_argument("--out")
     ap.add_argument("--tokens", type=int, default=2048)
     ap.add_argument("--gates", type=int, default=0, help="steps of gate training on the found blocks (0: none)")
+    ap.add_argument("--cost", choices=("bits", "concepts"), default="bits", help="the per-token count the search minimizes")
     a = ap.parse_args()
+    global COST
+    COST = a.cost
     toy = Toy(Path(a.toy))
     rep = Rep(toy, a.bits)
     D = rep.D
