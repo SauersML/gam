@@ -1196,10 +1196,17 @@ pub fn explanation_with(native: &OperatorProgram, layers: &[LayerNodes], transco
             library_copy(&format!("{name}.gate"), units.clone(), up.cols.clone(), &up)?,
             library_copy(&format!("{name}.out"), down.rows.clone(), units.clone(), &down)?,
         ];
-        // A gate bias only where `M` has one, so a bias-free MLP still maps 0 to 0.
-        let gate_bias = match up_bias {
-            Some(op) => {
-                operators.push(library_operator(&format!("{name}.gate_bias"), units.clone(), Interface::constant(), native.operators[op].matrix(), &up.name)?);
+        // A gate bias where `M` has one, and for ReLU functions at zero where it has none (`P = M`
+        // at the start): the bias the budget's projection lowers ([`project`]). Other laws keep a
+        // bias-free MLP's map of 0 to 0.
+        let gate_bias = match (up_bias, laws[0] == Law::Relu) {
+            (Some(op), _) => Some(native.operators[op].matrix()),
+            (None, true) => Some(Array2::zeros((units.width(), 1))),
+            (None, false) => None,
+        };
+        let gate_bias = match gate_bias {
+            Some(values) => {
+                operators.push(library_operator(&format!("{name}.gate_bias"), units.clone(), Interface::constant(), values, &up.name)?);
                 Some(base + 2)
             }
             None => None,
@@ -4232,10 +4239,6 @@ struct Progress {
     /// The budget's multiplier `λ` (`Settings::budget`), carried across a resume.
     #[serde(default)]
     multiplier: f64,
-    /// Whether the budget has bound (`Settings::budget`): from then on `multiplier` integrates its
-    /// violation.
-    #[serde(default)]
-    engaged: bool,
     /// The last epoch's snapshot, its per-batch estimates of `F` in nats, when convergence is being
     /// judged.
     previous: Option<Vec<f64>>,
@@ -4998,7 +5001,6 @@ pub fn fit_from(
         epochs: Vec::new(),
         removals: Vec::new(),
         multiplier: 0.0,
-        engaged: false,
         previous: None,
         collection: COLLECTION,
         active: posterior.active.clone(),
@@ -5177,10 +5179,6 @@ pub fn fit_from(
     // The best epoch's snapshot evaluation, the removal round's start (not checkpointed: a resumed
     // fit scores it again).
     let mut best_evaluation: Option<Evaluation> = None;
-    // A budget is held by projection after every step ([`project`]) on gated components' thresholds
-    // and ReLU functions' gate biases; an explanation with neither (functions whose gates have no
-    // bias, the tiny decoder's) keeps the multiplier's integral rule.
-    let projected = scorer.stages.iter().any(|s| !s.is_empty()) || scorer.mlps.iter().flatten().any(|m| m.law == Law::Relu && m.up.is_none() && m.gate.bias.is_some());
     // Whether the last projection bound (the count at its target), where λ steers, and the first
     // projected step's count and step, from which the target eases to `K`.
     let mut bound = false;
@@ -5321,80 +5319,29 @@ pub fn fit_from(
             if let Some((limit, (expected, terms))) = budget {
                 parts.0 += expected;
                 parts.1 += 1;
-                // The multiplier: from the first step whose count exceeds the budget, λ starts at
-                // the robust balance of F's push on the gates against the count's, the median over
-                // the gates of F's push against the count, max(0, −∂F/∂z_b ∂Ê/∂z_b) / (∂Ê/∂z_b)², each
-                // gate weighted by (∂Ê/∂z_b)² (a gate whose count does not move says nothing of the
-                // balance, and one F already pushes off needs no pull: the median of the unsigned,
-                // unweighted |∂F/∂z_b| / |∂Ê/∂z_b| started λ near 400 on the tiny decoder at B = 128,
-                // the slope-weighted one near 300, where the count holds `K` near 4; read off each
-                // gate's row of its parameters: a
-                // threshold's or bias's entry, whose derivative is its pre-activation's, or the norms
-                // of a gate's weight row, whose derivative is its pre-activation's times its input),
-                // and then integrates the violation in log space, log λ ← log λ + (Ê − K) / (K H) per
-                // step: symmetric, and still only where Ê = K. `H` is the slower of the step's two
-                // averages, one pass of `B` batches (the curvature's, β₂ = 1 − 1/B) and the
-                // momentum's `1 / (1 − β₁)` steps: the pull reaches the means through the momentum,
-                // so the count answers a change of λ only over that many steps, and a multiplier
-                // moving faster sees no answer and swings (with `H = B` on the tiny decoder, B = 2
-                // against the momentum's 100 steps, λ rose from 24 to 68 before the count fell, the
-                // count then sat at 8.4–9.4 against K 11.8 while λ fell to 0.02, and rose to 14.6
-                // after; the budget test at 48eaf0af20). A step's relative violation counts at most
-                // one: λ moves by at most a factor e per horizon, however far the count is from `K`
-                // (toys' TMS at its true K, the count 63 against 7.96, took λ to 3e25 at one
-                // relative violation of 7 per pass). A cap at the λ whose step would move the count
-                // to `K` under the measured response (a Newton step on the constraint) does not hold:
-                // on the tiny decoder the predicted response of the budget's pull alone,
-                // `η λ Σ σ² (∂Ê/∂μ)²` (`σ²` the posterior's variances), capped λ near 2 with the count
-                // at 17.4 against K 11.8, where F's push needs about 20, and with the data's push
-                // `B ln 2 ⟨g_F, ∂Ê/∂μ⟩_σ²` of one batch included it turned negative. The
-                // budget's terms reach the thresholds and gate rows alone, never a learned width:
-                // the count is the hard gate's under the posterior and reads no width. The global ratio
-                // −⟨g_F, g_k⟩ / |g_k|² (560f12d2d3's λ̄ Ê / K) explodes where most gates are
-                // saturated and |g_k| is tiny: a toy fit (resid_mlp_1l, K = 55) took λ to 8,000 and
-                // diverged with the count flat.
-                if projected {
-                    // The count is held at `K` by the projection after every step ([`project`]); λ
-                    // steers which gates trade: the slope-weighted median of the positive rates
-                    // max(0, −⟨∂F, ∂Ê⟩) / |∂Ê|², F's push against the count where the projection holds
-                    // it (269b6645c2's rule), measured at every step. An integral rule on λ with a
-                    // projection only at the start (8ed727551e) let every MLP gate close within
-                    // epochs and none reopen (the learned tiny library, GHA seeds 3–7), and on toys'
-                    // gated copy under a budget in bits λ reached 4e5 while no gate closed.
-                    // Where the constraint is slack (the last projection did not bind), λ is zero: the
-                    // pull kept on below `K` closed every MLP gate of the learned tiny library and then
-                    // the always-on parts (GHA, seeds 3–6).
-                    let mut ratios = balance_rates(&terms, &gradients, (device, explanation), scale)?;
-                    ratios.retain(|r| r.0 > 0.0);
-                    let half = 0.5 * ratios.iter().map(|r| r.1).sum::<f64>();
-                    let mut below = 0.0;
-                    progress.engaged = true;
-                    progress.multiplier = if bound {
-                        ratios.iter().find(|r| {
-                            below += r.1;
-                            below >= half
-                        }).map_or(0.0, |r| r.0)
-                    } else {
-                        0.0
-                    };
-                } else if !progress.engaged && limit > 0.0 && expected > limit {
-                    let ratios = balance_rates(&terms, &gradients, (device, explanation), scale)?;
-                    let excess = ratios.iter().map(|r| r.1).sum::<f64>() * (expected - limit) / expected;
-                    let mut below = 0.0;
-                    let start = ratios.iter().find(|r| {
+                // The count is held at `K` by the projection after every step ([`project`]); λ
+                // steers which gates trade: the slope-weighted median of the positive rates
+                // max(0, −⟨∂F, ∂Ê⟩) / |∂Ê|², F's push against the count where the projection holds
+                // it (269b6645c2's rule), measured at every step. An integral rule on λ with a
+                // projection only at the start (8ed727551e) let every MLP gate close within
+                // epochs and none reopen (the learned tiny library, GHA seeds 3–7), and on toys'
+                // gated copy under a budget in bits λ reached 4e5 while no gate closed.
+                // Where the constraint is slack (the last projection did not bind), λ is zero: the
+                // pull kept on below `K` closed every MLP gate of the learned tiny library and then
+                // the always-on parts (GHA, seeds 3–6).
+                let mut ratios = balance_rates(&terms, &gradients, (device, explanation), scale)?;
+                ratios.retain(|r| r.0 > 0.0);
+                let half = 0.5 * ratios.iter().map(|r| r.1).sum::<f64>();
+                let mut below = 0.0;
+                progress.multiplier = if bound {
+                    ratios.iter().find(|r| {
                         below += r.1;
-                        below >= excess && r.0 > 0.0
-                    });
-                    if let Some(&(balance, _)) = start {
-                        progress.engaged = true;
-                        progress.multiplier = balance;
-                        log::info!("library budget bound at {expected:.4} parts per token (K {limit}): λ starts at {balance:.4e}, the rate at the excess share of {} gates' weights", ratios.len());
-                    }
-                } else if progress.engaged && limit > 0.0 {
-                    let horizon = (draws.len() as f64).max(1.0 / (1.0 - ivon.beta1));
-                    progress.multiplier *= (((expected - limit) / limit).clamp(-1.0, 1.0) / horizon).exp();
-                }
-                let lambda = if progress.engaged { progress.multiplier } else { 0.0 };
+                        below >= half
+                    }).map_or(0.0, |r| r.0)
+                } else {
+                    0.0
+                };
+                let lambda = progress.multiplier;
                 for (i, mean, variance) in &terms {
                     let op = explanation.trainable[*i];
                     // At λ = 0 the term adds nothing, and the step is the budget-free one bit for bit.
@@ -5432,7 +5379,7 @@ pub fn fit_from(
             scorer.step_assignments(weight * LN_2);
             scorer.step_mixings(weight * LN_2);
             scorer.pin_mixings(&mut device_posterior)?;
-            if let Some(limit) = settings.budget.filter(|k| k.is_finite() && projected) {
+            if let Some(limit) = settings.budget.filter(|k| k.is_finite()) {
                 // The target eases from the first step's count to `K` with the horizon `H` of the
                 // step's averages, `K + (C₀ − K) e^{−t/H}`: a projection of the whole excess at once
                 // shut gates regardless of their worth (toys' gated copy at its true K, 32,100 bits
@@ -7186,18 +7133,14 @@ mod tests {
         }
     }
 
-    /// A tiny gated library meets its budget, an inequality, once its passes outlast the momentum
-    /// (`B` batches above `1 / (1 − β₁)`, as in a production fit, so the multiplier's horizon is one
-    /// pass): on the tiny decoder with ReLU functions (gated parts), trained on 256 sequences of its
-    /// tokens drawn uniformly (B = 128 batches of 2), with `K` at the heads plus half the gated share
-    /// of the free fit's count, the expected parts per token over the last 6 of 30 epochs (each
-    /// epoch's mean over its 128 steps) are at most `K` plus their standard error (from the epochs'
-    /// own spread) and at least 0.8 `K`, so a collapse of the parts still fails. A closed ReLU
-    /// function takes no data gradient, so the count reopens slowly once below `K`: no rule for λ
-    /// held it within three standard errors of `K` on seeds 3–7 on both GHA's Linux host and the Mac
-    /// (ba02aadbc1 and the variants it lists). With the fixture's 4 training sequences (B = 2 against
-    /// the momentum's 100 steps) the count at a fixed λ of 20 wandered between 5 and 16 parts over 120
-    /// epochs: no multiplier holds a mean of it at `K`.
+    /// A tiny gated library meets its budget, an inequality: on the tiny decoder with ReLU functions
+    /// (gated parts, their gate biases zero where `M` has none, lowered by the budget's projection),
+    /// trained on 256 sequences of its tokens drawn uniformly (B = 128 batches of 2), with `K` at the
+    /// heads plus half the gated share of the free fit's count, the expected parts per token over the
+    /// last 6 of 30 epochs (each epoch's mean over its 128 steps) are at most `K` plus their standard
+    /// error (from the epochs' own spread) and at least 0.8 `K`, so a collapse of the parts still
+    /// fails. A closed ReLU function takes no data gradient, so the count reopens slowly once below
+    /// `K`: an inequality, not an equality.
     #[test]
     fn a_tiny_gated_library_meets_its_budget() {
         let (native, layers, _, sequences) = tiny("library_budget_binds", "relu");
@@ -7223,10 +7166,8 @@ mod tests {
         let tail: Vec<f64> = bound.report.epochs.iter().rev().take(6).map(|e| e.expected_parts.unwrap()).collect();
         let mean = tail.iter().sum::<f64>() / tail.len() as f64;
         let spread = (tail.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (tail.len() - 1) as f64 / tail.len() as f64).sqrt();
-        let last = bound.report.epochs.last().unwrap();
-        // Every tenth epoch's count and multiplier, for a failure's message.
+        // Every epoch's count and multiplier, for a failure's message.
         let trace: Vec<String> = bound.report.epochs.iter().map(|e| format!("{:.2} at λ {:.3e}", e.expected_parts.unwrap_or(f64::NAN), e.multiplier.unwrap_or(f64::NAN))).collect();
-        assert!(last.multiplier.is_some_and(|l| l > 0.0), "the multiplier stayed at zero over the budget: {trace:?}");
         assert!(mean <= limit + spread && mean >= 0.8 * limit, "the last 6 epochs' mean {mean} ± {spread} parts per token against the budget {limit} (free {free_parts}): {trace:?}");
     }
 
@@ -7297,11 +7238,19 @@ mod tests {
             let posterior = Posterior::new(&explanation, 72).unwrap();
             let cells: usize = explanation.groups.iter().flat_map(|g| &g.cells).map(|c| c.rows.len() * c.cols.len()).sum();
             assert_eq!(cells, posterior.mean.iter().map(|m| m.len()).sum::<usize>(), "the groups partition the parameters");
-            // `M`'s MLPs have no bias, so neither do the library's: a zero input still maps to zero.
+            // `M`'s MLPs have no bias: a ReLU library's gate bias is zero (the one the budget's
+            // projection lowers) and other laws' libraries have none, so a zero input still maps to
+            // zero at the start.
             for l in 0..2 {
-                assert!(operator_named(&explanation.artifact.program, &format!("library.l{l}.mlp.gate_bias")).is_none());
+                let bias = operator_named(&explanation.artifact.program, &format!("library.l{l}.mlp.gate_bias"));
                 let rule = explanation.artifact.program.rules.iter().find(|r| r.name == format!("library.l{l}.mlp")).unwrap();
-                assert!(matches!(rule.nodes[1], Node::Affine { bias: None, .. }));
+                if law == "relu" {
+                    assert!(bias.is_some_and(|b| explanation.artifact.program.operators[b].matrix().iter().all(|v| *v == 0.0)));
+                    assert!(matches!(rule.nodes[1], Node::Affine { bias: Some(_), .. }));
+                } else {
+                    assert!(bias.is_none());
+                    assert!(matches!(rule.nodes[1], Node::Affine { bias: None, .. }));
+                }
             }
             let indexed: usize = explanation
                 .layers
@@ -7912,8 +7861,7 @@ mod tests {
             epochs: Vec::new(),
             removals: Vec::new(),
             multiplier: 0.0,
-            engaged: false,
-            previous: Some(vec![1.0, 2.0]),
+                previous: Some(vec![1.0, 2.0]),
             collection: COLLECTION,
             active: vec![false, true],
             done: false,
