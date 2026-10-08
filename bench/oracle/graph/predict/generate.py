@@ -9,8 +9,8 @@ logits) inside three question verbs, scale / cut / swap. Pieces of Qwen3-0.6B (n
                         oracle.rs's Component::Head, W_o[:, h] <- a W_o[:, h].
   L[l].mlp[i, j, ...]   MLP neurons i, j, ...: scale multiplies their activations SiLU(g_i.x)(u_i.x) by a,
                         i.e. their down columns (oracle.rs's Component::Neuron, summed).
-  L[l].mlp[:], L[l].head[:]   the whole MLP (every neuron) or the whole attention (every head) of layer l.
-  PD.tc[l][f, ...]      transcoder features (circuit-tracer's Qwen3-0.6B transcoders, --transcoders): the
+  L[l].mlp, L[l].attn   the whole MLP (every neuron) or the whole attention (every head) of layer l.
+  PD[l].mlp[f, ...]     transcoder features (circuit-tracer's Qwen3-0.6B transcoders, --transcoders): the
                         MLP output is the features' writes plus an exact error piece, so scale adds
                         (a - 1) relu(W_enc[f].y + b_enc[f]) W_dec[f] to the MLP output at positions 1..
                         (y the MLP's input); swap replaces the feature's activation at the last position.
@@ -323,13 +323,13 @@ def piece_text(p) -> str:
     if kind == "neurons":
         return f"L[{p[1]}].mlp[{', '.join(str(i) for i in p[2])}]"
     if kind == "mlp":
-        return f"L[{p[1]}].mlp[:]"
+        return f"L[{p[1]}].mlp"
     if kind == "attn":
-        return f"L[{p[1]}].head[:]"
+        return f"L[{p[1]}].attn"
     if kind == "tc":
-        return f"PD.tc[{p[1]}][{', '.join(str(i) for i in p[2])}]"
+        return f"PD[{p[1]}].mlp[{', '.join(str(i) for i in p[2])}]"
     if kind == "vpd":
-        return f"PD.vpd[{p[1]}].{p[2]}[{', '.join(str(i) for i in p[3])}]"
+        return f"PD[{p[1]}].{p[2]}[{', '.join(str(i) for i in p[3])}]"
     raise ValueError(p)
 
 
@@ -531,11 +531,13 @@ OPTIONS = {"types": None, "min_kl": float("-inf"), "aim": "mixed", "pieces": Non
 
 
 def parse_piece(text: str):
-    """A piece from its mech spelling (L[l].head[h], L[l].mlp[:], L[l].head[:], L[l].mlp[i, ...])."""
+    """A piece from its mech spelling (L[l].head[h], L[l].mlp, L[l].attn, L[l].mlp[i, ...]; the older
+    L[l].mlp[:] and L[l].head[:] accepted)."""
     if m := re.fullmatch(r"L\[(\d+)\]\.head\[(\d+)\]", text):
         return ("head", int(m[1]), int(m[2]))
-    if m := re.fullmatch(r"L\[(\d+)\]\.(mlp|head)\[:\]", text):
-        return ("mlp" if m[2] == "mlp" else "attn", int(m[1]))
+    if m := re.fullmatch(r"L\[(\d+)\]\.(mlp|head)\[:\]|L\[(\d+)\]\.(mlp|attn)", text):
+        layer, kind = (m[1], m[2]) if m[1] else (m[3], m[4])
+        return ("mlp" if kind == "mlp" else "attn", int(layer))
     if m := re.fullmatch(r"L\[(\d+)\]\.mlp\[([\d, ]+)\]", text):
         return ("neurons", int(m[1]), tuple(int(x) for x in m[2].split(",")))
     raise ValueError(text)
@@ -679,7 +681,7 @@ def batch_questions(m: Qwen3, w: Writer, draw: Draw, tokens: torch.Tensor, sourc
             l, hh, i = probes[r]
             v = rec["probe_values"][r].to(torch.float32).cpu()
             order = v[1:].abs().topk(min(3, T - 1)).indices + 1
-            piece = {-1: lambda: f"L[{l}].mlp[{i}]", -2: lambda: f"PD.tc[{l}][{i}]", -3: lambda: f"PD.vpd[{l}].{i[0]}[{i[1]}]"}[hh]() if hh < 0 else f"L[{l}].head[{hh}]"
+            piece = {-1: lambda: f"L[{l}].mlp[{i}]", -2: lambda: f"PD[{l}].mlp[{i}]", -3: lambda: f"PD[{l}].{i[0]}[{i[1]}]"}[hh]() if hh < 0 else f"L[{l}].head[{hh}]"
             level = "write norm" if hh >= 0 else ("activity v.x" if hh == -3 else "activation")
             ans = ", ".join(f"{int(p)}:{w.token(tokens[r, int(p)].item())} {v[int(p)].item():.2f}" for p in order)
             emit(r, "where", f"<text_tokens> {w.numbered(tokens[r].tolist())}\n<question> where is {piece} most active ({level}; position 0 excluded): three positions and levels\n",
@@ -734,7 +736,7 @@ def batch_questions(m: Qwen3, w: Writer, draw: Draw, tokens: torch.Tensor, sourc
                 bk, route = ("head", ROUTES[int(rng.integers(3))]) if bh >= 0 else ("mlp", "input")
             iv.cuts[r] = (ak, al, ah, bk, bl, bh, route)
             a_txt = "node(" + piece_text(("head", al, ah) if ak == "head" else (ak, al)) + ")"
-            b_txt = {"logits": "logits", "mlp": f"node(L[{bl}].mlp[:]).input", "head": f"node(L[{bl}].head[{bh}]).{route}"}[bk]
+            b_txt = {"logits": "logits", "mlp": f"node(L[{bl}].mlp).input", "head": f"node(L[{bl}].head[{bh}]).{route}"}[bk]
             desc.append(f"<counterfactual> {w.text(toks_cut[r].tolist())}\n<intervention> cut({a_txt} >> {b_txt})\n")
             extra.append({"edge": f"{a_txt} >> {b_txt}", "cut": "counterfactual"})
         # The writers' values on x' (graph.rs's counterfactual stand-in: an undeclared edge delivers the writer's value on x').

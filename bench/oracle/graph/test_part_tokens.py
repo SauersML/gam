@@ -17,27 +17,32 @@ sys.path.insert(0, str(HERE))
 
 import part_tokens as PT  # noqa: E402
 
-ADDRESSES = ["PD.vpd[2].v_proj[559]", "PD.vpd[0].c_fc[7]", "PD.vpd[3].down_proj[1200]", "L[2].head[6]", "L[5].mlp[:]", "L[0].head[:]",
-             "PD.vpd[1].q_proj[3]", "PD.vpd[1].o_proj[44]", "PD.vpd[2].k_proj[9]", "L[11].head[2]"]
+ADDRESSES = ["PD[2].v_proj[559]", "PD[0].c_fc[7]", "PD[3].down_proj[1200]", "L[2].head[6]", "L[5].mlp", "L[0].attn",
+             "PD[1].q_proj[3]", "PD[1].o_proj[44]", "PD[2].k_proj[9]", "L[11].head[2]"]
 
 
 def registry(seed=0):
     g = torch.Generator().manual_seed(seed)
     kinds = [PT.kind_of(a) for a in ADDRESSES]
-    dims = {"vpd.v": 6, "vpd.fc": 7, "vpd.down": 5, "vpd.q": 6, "vpd.o": 4, "vpd.k": 6, "head": 9, "mlp": 9, "attn": 9}
+    dims = {"pd.v": 6, "pd.fc": 7, "pd.down": 5, "pd.q": 6, "pd.o": 4, "pd.k": 6, "head": 9, "mlp": 9, "attn": 9}
     feats = {k: torch.randn(kinds.count(k), dims[k], generator=g) for k in dict.fromkeys(kinds)}
     return PT.Registry(ADDRESSES, feats)
 
 
 @pytest.mark.parametrize("address", ADDRESSES)
 def test_token_round_trip(address):
-    assert PT.address_of(PT.token_of(address)) == address
+    assert PT.address_of(PT.token_of(address)) == PT.canonical(address) == address
 
 
 def test_examples():
+    """g-mech's grammar: generic addresses both ways, older spellings accepted on input."""
+    pairs = {"PD[2].v_proj[559]": "<p:2.v.559>", "PD[1].q_proj.rest": "<p:1.q.rest>", "PD[3].mlp[12]": "<p:3.mlp.12>",
+             "PD[3].attn[4]": "<p:3.attn.4>", "L[2].head[6]": "<p:2.h.6>", "L[5].mlp": "<p:5.m>", "L[0].attn": "<p:0.a>"}
+    for address, token in pairs.items():
+        assert PT.token_of(address) == token and PT.address_of(token) == address
     assert PT.token_of("PD.vpd[2].v_proj[559]") == "<p:2.v.559>"
-    assert PT.token_of("L[2].head[6]") == "<p:2.h.6>"
-    assert PT.token_of("L[5].mlp[:]") == "<p:5.m>"
+    assert PT.token_of("L[5].mlp[:]") == "<p:5.m>" and PT.token_of("L[0].head[:]") == "<p:0.a>"
+    assert PT.token_of("PD.tc[14][37457]") == "<p:14.mlp.37457>"
 
 
 def test_relabeling_changes_nothing():
@@ -56,10 +61,10 @@ def test_relabeling_changes_nothing():
 
 def test_rewrite_uses_tokens():
     reg = registry()
-    text = "scale(L[2].head[6], 0) and cut(node(L[5].mlp[:]) >> logits) but not L[2].head[61] or L[3].head[6]"
+    text = "scale(L[2].head[6], 0) and cut(node(L[5].mlp[:]) >> logits) and L[5].mlp, but not L[2].head[61], L[3].head[6] or L[5].mlp[1, 2]"
     out = reg.rewrite(text)
-    assert "scale(<p:2.h.6>, 0)" in out and "node(<p:5.m>)" in out
-    assert "L[2].head[61]" in out and "L[3].head[6]" in out
+    assert "scale(<p:2.h.6>, 0)" in out and "node(<p:5.m>)" in out and "and <p:5.m>," in out
+    assert "L[2].head[61]" in out and "L[3].head[6]" in out and "L[5].mlp[1, 2]" in out
 
 
 def test_tokenizer_ids_are_contiguous():
@@ -75,7 +80,7 @@ def test_tokenizer_ids_are_contiguous():
     m.add_to_tokenizer(tok)
     ids = tok("scale(<p:2.h.6>, 0)", add_special_tokens=False)["input_ids"]
     assert base + reg.index["L[2].head[6]"] in ids
-    assert tok.decode([base + reg.index["PD.vpd[2].v_proj[559]"]]) == "<p:2.v.559>"
+    assert tok.decode([base + reg.index["PD[2].v_proj[559]"]]) == "<p:2.v.559>"
     assert "<p:2.h.6>" in tok.decode(ids, skip_special_tokens=True)  # survives the decoding the loops use
 
 
@@ -84,8 +89,8 @@ def test_sites_and_two_level_choice():
     m = PT.PartTokens(reg, hidden=16, emb_rms=1.0, base_vocab=100)
     assert reg.sites == sorted(set(reg.sites)) and len(reg.site) == len(ADDRESSES)
     h = torch.randn(16)
-    site = reg.site[reg.index["PD.vpd[2].v_proj[559]"]]
+    site = reg.site[reg.index["PD[2].v_proj[559]"]]
     idx, logits = m.part_logits_in(h, site)
-    assert reg.index["PD.vpd[2].v_proj[559]"] in idx and logits.shape == (len(idx),)
+    assert reg.index["PD[2].v_proj[559]"] in idx and logits.shape == (len(idx),)
     assert m.site_logits(h).shape == (len(reg.sites),)
     assert m.input_rows().shape == (len(ADDRESSES), 16) and m.tokens() == reg.tokens

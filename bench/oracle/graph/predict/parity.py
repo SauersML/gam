@@ -57,12 +57,15 @@ def parse_piece(text: str):
     m = re.fullmatch(r"L\[(\d+)\]\.mlp\[([\d, ]+)\]", text)
     if m:
         return ("neurons", int(m[1]), [int(x) for x in m[2].split(",")])
-    m = re.fullmatch(r"PD\.vpd\[(\d+)\]\.(\w+)\[([\d, ]+)\]", text)
+    m = re.fullmatch(r"PD(?:\.vpd)?\[(\d+)\]\.(q_proj|k_proj|v_proj|o_proj|c_fc|down_proj)\[([\d, ]+)\]", text)
     if m:
         return ("vpd", int(m[1]), m[2], [int(x) for x in m[3].split(",")])
-    m = re.fullmatch(r"PD\.tc\[(\d+)\]\[([\d, ]+)\]", text)
+    m = re.fullmatch(r"PD\.tc\[(\d+)\]\[([\d, ]+)\]|PD\[(\d+)\]\.mlp\[([\d, ]+)\]", text)
     if m:
-        return ("tc", int(m[1]), [int(x) for x in m[2].split(",")])
+        return ("tc", int(m[1] or m[3]), [int(x) for x in (m[2] or m[4]).split(",")])
+    m = re.fullmatch(r"L\[(\d+)\]\.(mlp|attn)", text)
+    if m:
+        return (m[2], int(m[1]))
     m = re.fullmatch(r"L\[(\d+)\]\.(mlp|head)\[:\]", text)
     if m:
         return ("mlp" if m[2] == "mlp" else "attn", int(m[1]))

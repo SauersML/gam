@@ -4,10 +4,14 @@ question or emitting one in a program is sensing it. Shared by predict/sft.py, p
 rl/train.py.
 
 Tokens (mech addresses in brackets; token_of / address_of convert both ways):
-  <p:L.S.I>      VPD subcomponent I of layer L's site S, S in q k v o fc down   (PD.vpd[L].v_proj[I] ...)
+  <p:L.S.I>      part I of layer L's site S: VPD S in q k v o fc down (PD[L].v_proj[I] ...), library S in
+                 attn mlp (PD[L].mlp[I]), transcoder S = mlp (feature I of layer L's MLP)
+  <p:L.S.rest>   a VPD site's remainder W - sum U V^T                           (PD[L].v_proj.rest)
   <p:L.h.I>      native head I of layer L                                     (L[L].head[I])
-  <p:L.m>        layer L's whole native MLP                                    (L[L].mlp[:])
-  <p:L.a>        layer L's whole native attention                              (L[L].head[:])
+  <p:L.m>        layer L's whole native MLP                                    (L[L].mlp)
+  <p:L.a>        layer L's whole native attention                              (L[L].attn)
+(g-mech's grammar; mech.py carries the same table, and older spellings such as PD.vpd[L].v_proj[I] or
+L[L].mlp[:] are accepted on input.)
 Native heads and blocks are parts only where nothing decomposes them (the registry lists what exists).
 
 Features. A part's feature vector is fixed by its kind:
@@ -42,56 +46,94 @@ SITES = {"q_proj": "q", "k_proj": "k", "v_proj": "v", "o_proj": "o", "c_fc": "fc
 CODES = {v: k for k, v in SITES.items()}
 
 
+def canonical(address: str) -> str:
+    """mech's generic spelling of a part's address (older spellings accepted): PD[L].<site>[I] (VPD sites
+    q_proj ... down_proj; library and transcoder sites attn, mlp), PD[L].<site>.rest, L[L].head[H], L[L].attn,
+    L[L].mlp."""
+    a = address.strip()
+    if m := re.fullmatch(r"PD\.(?:vpd|lib)\[(\d+)\]\.(\w+)\[(\d+)\]", a):  # PD.vpd[l].site[i], PD.lib[l].site[i]
+        return f"PD[{m[1]}].{m[2]}[{m[3]}]"
+    if m := re.fullmatch(r"PD\.tc\[(\d+)\]\[(\d+)\]", a):  # PD.tc[l][i]: a transcoder feature of layer l's MLP
+        return f"PD[{m[1]}].mlp[{m[2]}]"
+    if m := re.fullmatch(r"L\[(\d+)\]\.mlp\[:\]", a):
+        return f"L[{m[1]}].mlp"
+    if m := re.fullmatch(r"L\[(\d+)\]\.head\[:\]", a):
+        return f"L[{m[1]}].attn"
+    return a
+
+
 def token_of(address: str) -> str:
-    if m := re.fullmatch(r"PD\.vpd\[(\d+)\]\.(\w+)\[(\d+)\]", address):
-        return f"<p:{m[1]}.{SITES[m[2]]}.{m[3]}>"
-    if m := re.fullmatch(r"L\[(\d+)\]\.head\[(\d+)\]", address):
+    a = canonical(address)
+    if m := re.fullmatch(r"PD\[(\d+)\]\.(\w+)\[(\d+)\]", a):
+        return f"<p:{m[1]}.{SITES.get(m[2], m[2])}.{m[3]}>"
+    if m := re.fullmatch(r"PD\[(\d+)\]\.(\w+)\.rest", a):
+        return f"<p:{m[1]}.{SITES.get(m[2], m[2])}.rest>"
+    if m := re.fullmatch(r"L\[(\d+)\]\.head\[(\d+)\]", a):
         return f"<p:{m[1]}.h.{m[2]}>"
-    if m := re.fullmatch(r"L\[(\d+)\]\.mlp\[:\]", address):
+    if m := re.fullmatch(r"L\[(\d+)\]\.mlp", a):
         return f"<p:{m[1]}.m>"
-    if m := re.fullmatch(r"L\[(\d+)\]\.head\[:\]", address):
+    if m := re.fullmatch(r"L\[(\d+)\]\.attn", a):
         return f"<p:{m[1]}.a>"
     raise ValueError(f"no part token for {address!r}")
 
 
 def address_of(token: str) -> str:
-    if m := re.fullmatch(r"<p:(\d+)\.(q|k|v|o|fc|down)\.(\d+)>", token):
-        return f"PD.vpd[{m[1]}].{CODES[m[2]]}[{m[3]}]"
+    """mech's generic address of a part token (g-mech's grammar; mech.py carries the same table)."""
     if m := re.fullmatch(r"<p:(\d+)\.h\.(\d+)>", token):
         return f"L[{m[1]}].head[{m[2]}]"
     if m := re.fullmatch(r"<p:(\d+)\.m>", token):
-        return f"L[{m[1]}].mlp[:]"
+        return f"L[{m[1]}].mlp"
     if m := re.fullmatch(r"<p:(\d+)\.a>", token):
-        return f"L[{m[1]}].head[:]"
+        return f"L[{m[1]}].attn"
+    if m := re.fullmatch(r"<p:(\d+)\.(q|k|v|o|fc|down|attn|mlp)\.(\d+|rest)>", token):
+        site = CODES.get(m[2], m[2])
+        return f"PD[{m[1]}].{site}.rest" if m[3] == "rest" else f"PD[{m[1]}].{site}[{m[3]}]"
     raise ValueError(f"not a part token: {token!r}")
 
 
 def site_of(address: str) -> str:
-    """The site a part sits in (the first level of the site -> part hierarchy): a VPD site of a layer, or a
-    layer's native attention or MLP."""
-    if m := re.fullmatch(r"PD\.vpd\[(\d+)\]\.(\w+)\[\d+\]", address):
-        return f"{m[1]}.{SITES[m[2]]}"
-    if m := re.fullmatch(r"L\[(\d+)\]\.(head|mlp)\[.*\]", address):
-        return f"{m[1]}.{'attn' if m[2] == 'head' else 'mlp'}"
+    """The site a part sits in (the first level of the site -> part hierarchy): a decomposition site of a
+    layer, or a layer's native attention or MLP."""
+    a = canonical(address)
+    if m := re.fullmatch(r"PD\[(\d+)\]\.(\w+)(?:\[\d+\]|\.rest)", a):
+        return f"{m[1]}.{SITES.get(m[2], m[2])}"
+    if m := re.fullmatch(r"L\[(\d+)\]\.head\[\d+\]", a):
+        return f"{m[1]}.attn"
+    if m := re.fullmatch(r"L\[(\d+)\]\.(attn|mlp)", a):
+        return f"{m[1]}.{m[2]}"
     raise ValueError(address)
 
 
 def kind_of(address: str) -> str:
-    """The feature kind: one map per kind (VPD site, native head, MLP or attention)."""
-    if m := re.fullmatch(r"PD\.vpd\[\d+\]\.(\w+)\[\d+\]", address):
-        return "vpd." + SITES[m[1]]
-    if re.fullmatch(r"L\[\d+\]\.head\[\d+\]", address):
+    """The feature kind: one map per kind (decomposition site, native head, MLP or attention)."""
+    a = canonical(address)
+    if m := re.fullmatch(r"PD\[\d+\]\.(\w+)(?:\[\d+\]|\.rest)", a):
+        return "pd." + SITES.get(m[1], m[1])
+    if re.fullmatch(r"L\[\d+\]\.head\[\d+\]", a):
         return "head"
-    if address.endswith(".mlp[:]"):
+    if a.endswith(".mlp"):
         return "mlp"
     return "attn"
+
+
+def spellings(address: str) -> list[str]:
+    """Every spelling of an address a question may use (canonical and the older forms)."""
+    a = canonical(address)
+    out = {a, address}
+    if m := re.fullmatch(r"L\[(\d+)\]\.mlp", a):
+        out.add(f"L[{m[1]}].mlp[:]")
+    if m := re.fullmatch(r"L\[(\d+)\]\.attn", a):
+        out.add(f"L[{m[1]}].head[:]")
+    if (m := re.fullmatch(r"PD\[(\d+)\]\.(\w+)\[(\d+)\]", a)) and m[2] in SITES:
+        out.add(f"PD.vpd[{m[1]}].{m[2]}[{m[3]}]")
+    return sorted(out, key=len, reverse=True)
 
 
 class Registry:
     """The parts in a fixed order (the order of their token ids) and their features by kind."""
 
     def __init__(self, addresses: list[str], features: dict[str, torch.Tensor]):
-        self.addresses = list(addresses)
+        self.addresses = [canonical(a) for a in addresses]
         self.kinds = [kind_of(a) for a in self.addresses]
         self.features = features  # kind -> [parts of that kind in registry order, F_kind]
         self.tokens = [token_of(a) for a in self.addresses]
@@ -126,9 +168,10 @@ class Registry:
     def rewrite(self, text: str) -> str:
         """Every address of a registry part in a text replaced by its token."""
         if not hasattr(self, "_pattern"):
-            alts = sorted(self.addresses, key=len, reverse=True)
-            self._pattern = re.compile("|".join(re.escape(a) for a in alts))
-        return self._pattern.sub(lambda m: self.tokens[self.index[m[0]]], text)
+            self._spelled = {sp: i for i, a in enumerate(self.addresses) for sp in spellings(a)}
+            alts = sorted(self._spelled, key=len, reverse=True)
+            self._pattern = re.compile("|".join(re.escape(a) for a in alts) + r"(?![\w\[])")
+        return self._pattern.sub(lambda m: self.tokens[self._spelled[m[0]]], text)
 
 
 class PartTokens(nn.Module):
@@ -267,8 +310,8 @@ def build(native: str | None, pieces: str | None, vpd: str | None) -> Registry:
             U, V = uv[f"{name}.U"].float(), uv[f"{name}.V"].float()  # [C, d_out], [d_in, C]
             nu, nv = U.norm(dim=1), V.norm(dim=0)
             f = torch.cat([(V / nv).T * V.shape[0] ** 0.5, U / nu[:, None] * U.shape[1] ** 0.5, nv.log()[:, None], nu.log()[:, None]], dim=1)
-            features.setdefault(f"vpd.{SITES[site]}", []).append(f)
-            addresses += [f"PD.vpd[{layer}].{site}[{c}]" for c in range(U.shape[0])]
+            features.setdefault(f"pd.{SITES[site]}", []).append(f)
+            addresses += [f"PD[{layer}].{site}[{c}]" for c in range(U.shape[0])]
     feats = {k: torch.cat(v) if v[0].dim() == 2 else torch.stack(v) for k, v in features.items()}
     return Registry(addresses, feats)
 

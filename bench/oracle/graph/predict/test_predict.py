@@ -49,10 +49,11 @@ def test_piece_text_read_back(piece):
 
 
 def test_piece_text_mech_spelling():
-    assert G.piece_text(("mlp", 2)) == "L[2].mlp[:]"
-    assert G.piece_text(("attn", 2)) == "L[2].head[:]"
-    assert G.piece_text(("tc", 14, (5, 9))) == "PD.tc[14][5, 9]"
-    assert G.piece_text(("vpd", 1, "c_fc", (7,))) == "PD.vpd[1].c_fc[7]"
+    assert G.piece_text(("mlp", 2)) == "L[2].mlp"
+    assert G.piece_text(("attn", 2)) == "L[2].attn"
+    assert G.piece_text(("tc", 14, (5, 9))) == "PD[14].mlp[5, 9]"
+    assert G.piece_text(("vpd", 1, "c_fc", (7,))) == "PD[1].c_fc[7]"
+    assert G.parse_piece("L[2].mlp[:]") == ("mlp", 2) and G.parse_piece("L[2].attn") == ("attn", 2)
 
 
 def test_read_answer_and_kl():
