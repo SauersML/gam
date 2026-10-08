@@ -548,7 +548,7 @@ owned() {  # POD; 0 ours, 1 not ours, 2 unknown (RunPod gave no answer: the Mac 
 # The SSH key directory POD's record names (a run's, under RP/.ssh), deleted with the record.
 drop_keys() {  # POD
     local keys
-    read -r _ _ keys _ < "$ACTIVE/.$1.ssh" 2> /dev/null || return 0
+    read -r _ _ keys _ 2> /dev/null < "$ACTIVE/.$1.ssh" || return 0
     [[ $keys == "$RP/.ssh/"?* ]] && rm -rf "$keys"
     return 0
 }
@@ -2325,6 +2325,10 @@ launch() {
         fi
         [ -n "$DEADLINE" ] || { say "none of $GPU in stock on a working host"; exit 1; }
         (( $(date +%s) + 600 < DEADLINE )) || { say "none of $GPU in stock and less than 10 minutes left"; exit 1; }
+        # A spent offer is asked again after the wait: its stock may have moved to another machine (g-rl
+        # waited 35 min on out-of-stock community offers after its one secure A40 landed on a slow host
+        # and was spent); a pod on a failed host is still deleted at once (failed_here).
+        spent=()
         sleep 60
     fi
     done
