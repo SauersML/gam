@@ -52,6 +52,7 @@ def main() -> None:
     ap.add_argument("--device")
     ap.add_argument("--experiments", type=int, default=8, help="per score during the search (the result is rescored on a held-out seed)")
     ap.add_argument("--rankings", type=Path, default=DATA / "experiments/vpd_rankings")
+    ap.add_argument("--behaviors-dir", type=Path, help="the behavior files (default ~/mpd-data/graph_oracle/behaviors/<model>)")
     ap.add_argument("--export", type=Path)
     ap.add_argument("--vpd", type=Path, default=Path.home() / "mpd-data/engine/vpd4l_decomposition")
     ap.add_argument("--out", type=Path, default=DATA / "runs/vpd_min")
@@ -62,7 +63,8 @@ def main() -> None:
     for b in a.behaviors:
         if (out / f"{b}.json").exists():
             continue
-        cmd = [sys.executable, str(HERE / "search.py"), str(DATA / f"behaviors/{a.model}/{b}.json"), "--mode", "prefix",
+        behaviors = a.behaviors_dir or DATA / f"behaviors/{a.model}"
+        cmd = [sys.executable, str(HERE / "search.py"), str(behaviors / f"{b}.json"), "--mode", "prefix",
                "--ranking", str(a.rankings / f"{b}.json"), "--max-units", str(a.budget), "--objective", "fit",
                "--experiments", str(a.experiments), "--max-prune", "24", "--prompt-holdout", "4", "--vpd", str(a.vpd),
                "--prefix-growth", str(a.growth), "--tag", "_vpd_min", "--out", str(work)]
