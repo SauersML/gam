@@ -1099,16 +1099,22 @@ pub(crate) fn copies_on(s: &mut DeviceState, weights: &Weights, circuit: &Circui
         }
         s.device.axpy(&mut last, 1.0, &change).map_err(e)?;
     }
-    let picked = s.device.upload_indices(&job.scored.iter().map(|&r| r as u32).collect::<Vec<_>>()).map_err(e)?;
-    let last = s.device.gather_rows(&last, &picked).map_err(e)?;
-    let unit_last = s.device.rms_norm(&last, weights.final_norm.epsilon).map_err(e)?;
-    let gain = s.ensure(row(&weights.final_norm.gain)).map_err(e)?;
-    let mut normed_last = s.device.zeros(job.scored.len(), width).map_err(e)?;
-    s.device.scale_columns(&mut normed_last, &unit_last, s.get(gain).map_err(e)?, false).map_err(e)?;
-    let u = s.ensure(weights.unembedding.view()).map_err(e)?;
-    let mut logits = s.device.zeros(job.scored.len(), weights.unembedding.nrows()).map_err(e)?;
-    s.device.gemm(&mut logits, 1.0, &normed_last, Op::N, s.get(u).map_err(e)?, Op::T, 0.0, arithmetic).map_err(e)?;
-    let logits = s.device.download(&logits).map_err(e)?;
+    // A run scoring no rows (a donor or counterfactual run, read for its writes) makes no logits: a
+    // tensor of no rows does not download on every backend (CUDA keeps one value for it).
+    let logits = if job.scored.is_empty() {
+        Array2::zeros((0, weights.unembedding.nrows()))
+    } else {
+        let picked = s.device.upload_indices(&job.scored.iter().map(|&r| r as u32).collect::<Vec<_>>()).map_err(e)?;
+        let last = s.device.gather_rows(&last, &picked).map_err(e)?;
+        let unit_last = s.device.rms_norm(&last, weights.final_norm.epsilon).map_err(e)?;
+        let gain = s.ensure(row(&weights.final_norm.gain)).map_err(e)?;
+        let mut normed_last = s.device.zeros(job.scored.len(), width).map_err(e)?;
+        s.device.scale_columns(&mut normed_last, &unit_last, s.get(gain).map_err(e)?, false).map_err(e)?;
+        let u = s.ensure(weights.unembedding.view()).map_err(e)?;
+        let mut logits = s.device.zeros(job.scored.len(), weights.unembedding.nrows()).map_err(e)?;
+        s.device.gemm(&mut logits, 1.0, &normed_last, Op::N, s.get(u).map_err(e)?, Op::T, 0.0, arithmetic).map_err(e)?;
+        s.device.download(&logits).map_err(e)?
+    };
     // The units' writes come back only from a run that scores no rows: a donor run, whose writes
     // other runs read (swaps, site operations, `Checker::measure_typical`). On Qwen3-0.6B every
     // run's writes are about a gigabyte of float64.
