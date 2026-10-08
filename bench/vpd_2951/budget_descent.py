@@ -1227,6 +1227,10 @@ N_EDITS = int(os.environ.get('DESCENT_WEDITS', '0')) * batch // 8
 # DESCENT_ALLON=1: one sequence per 8 of the batch runs with every part's gate on, against M (ties the parts'
 # sum to M).
 ALLON = int(os.environ.get('DESCENT_ALLON', '0') == '1') * max(1, batch // 8)
+# DESCENT_REPEATS=n: n clean sequences of every 8 are a chunk of text followed by the same chunk again, so the training
+# text holds repeats, where the model copies by induction (Pile text rarely does: the rot explanation scored 4.67
+# bits per token on a repeat against 2.45 on the first pass at 10M tokens, VPD's switching function 1.32).
+REPEATS = int(os.environ.get('DESCENT_REPEATS', '0')) * batch // 8
 # Held-out weight edits: a fixed set, 4 per held-out sequence (32 in all), families in turn, seed 7.
 _g = np.random.default_rng(7)
 EVAL_EDITS = [(i, FAMILIES[(4 * i + k) % len(FAMILIES)]) for i in range(ev.shape[0]) for k in range(4)]
@@ -1938,6 +1942,9 @@ with open(out.replace('.json', '.tsv'), 'w') as f_:
 for step in range(steps):
     rows = rng.integers(0, train_rows, batch); rows = np.where(rows >= 1024, rows + 8, rows); offs = rng.integers(0, 513 - seq, batch)
     ids = torch.tensor(np.stack([tok[r, o:o + seq] for r, o in zip(rows, offs)]).astype(np.int64), device=dev)
+    if REPEATS:
+        rb = torch.arange(batch - REPEATS, batch, device=dev)                         # the batch's last (clean) sequences
+        ids[rb, seq // 2:] = ids[rb, :seq - seq // 2]
     t_step = time.time()
     kinds = [draw_edit(g_edits, FAMILIES[(step * N_EDITS + b) % len(FAMILIES)]) if b < N_EDITS else None for b in range(batch)]
     for b in range(N_EDITS, N_EDITS + ALLON):
