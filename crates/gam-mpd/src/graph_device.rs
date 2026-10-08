@@ -79,7 +79,7 @@ enum Field {
 const RESIDENT_BYTES: usize = 6 << 30;
 
 /// The bytes of counterfactual runs' arrays kept uploaded (the least recently used run's go first).
-const KEPT_REFERENCE_BYTES: usize = 2 << 30;
+const KEPT_REFERENCE_BYTES: usize = 1 << 30;
 
 static DEVICE: OnceLock<Mutex<DeviceState>> = OnceLock::new();
 
