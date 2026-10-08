@@ -811,6 +811,11 @@ def rot_record(recs, Rbs, keys, Rs=None):
     """Appends a core's per-token records (bits on, blocks on, training-gate bits) and, in calibration, its blocks'
     reads to the pass's state; with the pin, each block set's reads and bits (Rs: the block sets)."""
     for i_, ((hb, n_on, sb, Lj), Rb, key) in enumerate(zip(recs, Rbs, keys)):
+        if state['mode'] == 'hard':
+            # A hard pass's third record is its blocks' gates [B, T, ng, g], kept for the probes.
+            if state.get('probe') is not None:
+                state['probe'][key] = (sb.detach(), Rs[i_] if Rs is not None else None)
+            sb = None
         if state.get('calib') is not None:
             state['calib'].setdefault(key, []).append(Rb.detach().reshape(-1))
         if state.get('pin') is not None and Rs is not None:
@@ -843,7 +848,7 @@ def rot_gate_core(R, r, bits_i, idx, on, mode, extra=None):
     Lj = qeinsum('ni,nij->nj', bits_i, M_) + rot_tau_bits(R) + idx
     hb, n_on = (hard * Lj).sum((-1, -2)).reshape(-1), hard.sum((-1, -2)).reshape(-1)
     if mode == 'hard':
-        return qeinsum('...nj,nij->...ni', hard, hot), (hb, n_on, None, Lj), Rb
+        return qeinsum('...nj,nij->...ni', hard, hot), (hb, n_on, hard, Lj), Rb
     gb = rot_train_gate(hard, phi)
     return qeinsum('...nj,nij->...ni', gb, Lsm), (hb, n_on, (gb * Lj).sum((-1, -2)).reshape(-1), Lj), Rb
 
@@ -1516,6 +1521,26 @@ def evaluate(final=False):
             out['example_graph'] = graph
     if SHARE:
         out['parts'] = [share_parts(l, S) for l, S in SHARE.items()]
+    if ROT and ROTA:
+        # Induction: 128 random tokens, then the same 128 again; the blocks on at the repeat's tokens (where the next
+        # token can be copied from the first pass) against the first pass's, with each block's layer, map and rank.
+        g_ = torch.Generator().manual_seed(5)
+        ind = torch.randint(0, T.wte.shape[0], (1, 128), generator=g_).to(dev).repeat(1, 2)
+        install([None])
+        lm = run(ind, 'M')
+        state['probe'] = {}
+        lp = run(ind, 'hard')
+        kl_t = kl_bits(lm, lp)[0]
+        rows = []
+        for key, (gates, R) in state['probe'].items():
+            g1, g2 = gates[0, 1:128].mean(0), gates[0, 129:].mean(0)                       # [ng, g] on-rates
+            members = torch.zeros_like(g1).scatter_add_(1, R['L'].argmax(-1), torch.ones_like(g1)) if R is not None else g1 * 0
+            for n_, j_ in zip(*torch.nonzero((g2 - g1) > 0.5, as_tuple=True)):
+                rows.append({'map': key, 'group': int(n_), 'block': int(j_), 'rank': int(members[n_, j_]),
+                             'on_repeat': round(g2[n_, j_].item(), 3), 'on_first': round(g1[n_, j_].item(), 3)})
+        state['probe'] = None
+        out['induction'] = {'kl_first': round(kl_t[1:128].mean().item(), 3), 'kl_repeat': round(kl_t[129:].mean().item(), 3),
+                            'blocks_on_repeat_not_first': sorted(rows, key=lambda r: -(r['on_repeat'] - r['on_first']))[:40]}
     if ROT:
         run(ev[0:4], 'hard')
         ranks = torch.cat([torch.bincount(R['L'].argmax(-1).reshape(-1) + ROTG * torch.arange(R['ng'], device=dev).repeat_interleave(ROTG),
@@ -1837,7 +1862,12 @@ def save(step):
                     # assignments, thresholds, noise scales and widths, and the QK planes' assignments, thresholds,
                     # noise scales and widths.
                     'rota': {l: {x: {k: R[x][k].detach().float().cpu() for k in ('A', 'L', 'tau', 's', 'ls', 'ls_fc', 'ls_dn', 'Q0') if k in R[x]}
-                                 for x in ('q', 'k', 'ov')} for l, R in ROTA.items()}}, os.environ['DESCENT_SAVE'])
+                                 for x in ('q', 'k', 'ov')} for l, R in ROTA.items()},
+                    # The gate networks (per layer and part for rot, per map otherwise; W1, b1, W2) and their input:
+                    # 'dense' (every layer's streams from the dense pass) or the layer's own stream; the trunk if any.
+                    'gate_nets': {str(k): {w: v.detach().float().cpu() for w, v in P_.items()} for k, P_ in GN.items()},
+                    'gate_net_input': 'dense' if GN_DENSE else 'own', 'gate_trunk': {k: v.detach().float().cpu() for k, v in TRUNK.items()}},
+                   os.environ['DESCENT_SAVE'])
 
 draw(True)
 e = evaluate(); e['weight_edits'] = evaluate_edits(); print('start', e, flush=True); log['trace'].append({'step': 0, **e}); save(0)
