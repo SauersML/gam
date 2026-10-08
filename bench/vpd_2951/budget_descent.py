@@ -57,15 +57,6 @@ if not (vpd_model.TARGET_DIR / 'model_step_99999.safetensors').exists():  # the 
     vpd_model.load_file = lambda f: torch.load(f.replace('.safetensors', '.pt'), map_location='cpu', weights_only=True)
 VPD_DIR, TOKENS = (Path(sys.argv[10]) if sys.argv[10].endswith('.pth') else Path(sys.argv[10]).parent), sys.argv[11]
 import os
-# DESCENT_TOY=DIR: a real-valued toy of the toy gate as the target (bench/toys_2951/toy_target.py: its maps under
-# vpd_model's site names, its activation, its Gaussian head's outputs as the logits); TOKENS its tokens_descent.u16,
-# VPD unused, K in bits (the rot arm).
-TOY = os.environ.get('DESCENT_TOY')
-if TOY:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'toys_2951'))
-    import toy_target
-    load_target, site_names = (lambda dev: toy_target.load(TOY, dev)), toy_target.site_names(TOY)
-    vpd_model.gelu_tanh = toy_target.activation(TOY)
 # DESCENT_ARM=dir: each slice's gate reads its own direction g_i (signed), z = (g_i.x - tau_i)/s_i,
 # with g_i started at the slice's read v_i ||u_i||, signed so its firing on M's fit tokens is kept.
 ARM = os.environ.get('DESCENT_ARM', 'own')
@@ -130,10 +121,10 @@ vpdlike = start in ('vpd', 'vpdgroup')
 # Starts: svd, vpd, vpdgroup, neuron (the privileged axis: each MLP neuron's c_fc row and down_proj
 # column one exact part under one gate on its own pre-activation).
 # VPD's slices are read for the VPD starts' MLP maps and for the heads (DESCENT_SITES=all, any start).
-if (vpdlike or attn or (ARM == 'rot' and not TOY)) and str(VPD_DIR).endswith('.pth'):
+if (vpdlike or attn or ARM == 'rot') and str(VPD_DIR).endswith('.pth'):
     raw = torch.load(str(VPD_DIR), map_location='cpu', weights_only=True, mmap=True)
     load = lambda k: raw['_components.' + k.rsplit('.', 1)[0].replace('.', '-') + '.' + k.rsplit('.', 1)[1]].float().to(dev)
-elif vpdlike or attn or (ARM == 'rot' and not TOY):
+elif vpdlike or attn or ARM == 'rot':
     shapes = {k: v['shape'] for k, v in json.load(open(VPD_DIR / 'export.json'))['files'].items()}
     load = lambda k: torch.tensor(np.fromfile(VPD_DIR / f'{k}.f64', dtype='<f8').reshape(shapes[k]), dtype=torch.float32, device=dev)
 def frame(F, W):
@@ -1055,9 +1046,6 @@ for n in site_names():
 
 KINDS_ = ('q_proj', 'k_proj', 'v_proj', 'o_proj', 'c_fc', 'down_proj')
 FAMILIES = ('neurons_remove', 'neurons_scale', 'neurons_in_remove', 'neurons_in_scale', 'head_remove', 'head_scale', 'head_swap', 'random')
-if TOY:
-    # A toy's attention is zero (toy_target runs it as no attention): its edits are the MLP neurons'.
-    FAMILIES = FAMILIES[:4]
 def site_of(l, k):
     return f"h.{l}.{'mlp' if k in ('c_fc', 'down_proj') else 'attn'}.{k}"
 
@@ -1282,9 +1270,6 @@ if sliced:
         del cap
 
 def kl_bits(lm, lp):
-    if TOY:
-        # A Gaussian head's outputs, in units of the task residual: KL = |mu_M - mu_P|^2 / 2 nats.
-        return (lm.float() - lp.float()).pow(2).sum(-1) / (2 * math.log(2))
     pm = F.log_softmax(lm.float(), -1); pp = F.log_softmax(lp.float(), -1)
     return (pm.exp() * (pm - pp)).sum(-1) / math.log(2)
 
@@ -1491,16 +1476,15 @@ if ARM == 'rot':
     # zero-mean prior per tensor, plus its index among VPD's MLP subcomponents.
     with torch.no_grad():
         vb, total = {}, 0
-        for n in (mlp + attn if not TOY else ()):
+        for n in mlp + attn:
             per = 0.0
             for w, ax in (('V', 0), ('U', 1)):
                 t_ = load(f'{n}.{w}'); d_ = t_.shape[ax]
                 s2 = (0.01 * t_.pow(2).mean().sqrt()) ** 2; v_ = t_.pow(2).mean() + s2
                 per = per + 0.5 * (d_ * torch.log(v_ / s2) + (t_.pow(2).sum(ax) + d_ * s2) / v_ - d_) / math.log(2)
             vb[n] = per.mean().item(); total += per.numel()
-        if not TOY:
-            counts = {**VPD_COUNTS, **(VPD_ATTN_COUNTS if attn else {})}
-            K = K / sum(counts.values()) * sum(counts[n] * (vb[n] + math.log2(total)) for n in counts)
+        counts = {**VPD_COUNTS, **(VPD_ATTN_COUNTS if attn else {})}
+        K = K / sum(counts.values()) * sum(counts[n] * (vb[n] + math.log2(total)) for n in counts)
     print('rot budget B', round(K), 'bits per token; VPD subcomponent bits', {n: round(v) for n, v in vb.items()}, flush=True)
     # Each block's noise scale (a tenth of the root mean square of its read with all on), then the thresholds set
     # in the gated run, layer by layer, so the start's expected bits per token are B (the layers' shares as VPD's
@@ -1519,7 +1503,7 @@ if ARM == 'rot':
                 comps.append((R, 'tau', 's', f'h.{l}.attn.{key}', lambda R=R, f=bits0: f(R).mean().item(), share))
         R = ROT[l]
         comps.append((R, 'tau', 's', f'h.{l}.mlp.c_fc', lambda R=R: rot_slice_bits(R, rot_Q(R))[0].mean().item(),
-                      1.0 if TOY else VPD_COUNTS[f'h.{l}.mlp.c_fc'] + VPD_COUNTS[f'h.{l}.mlp.down_proj']))
+                      VPD_COUNTS[f'h.{l}.mlp.c_fc'] + VPD_COUNTS[f'h.{l}.mlp.down_proj']))
     with torch.no_grad():
         install([None])
         state['calib'] = {}
