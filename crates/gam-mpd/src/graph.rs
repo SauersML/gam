@@ -4713,14 +4713,33 @@ impl Checker {
                 if programs.iter().zip(&measured).any(|((g, _), &m)| m && !g.delete) {
                     self.prewarm_swapped(&standin, e)?;
                 }
+                // The predictions of programs with counterfactual stand-ins (their runs on the
+                // counterfactuals) in stacks where they stack (`run_stacked`), site experiments aside.
+                let mut swapped: Vec<Option<Array2<f64>>> = vec![None; programs.len()];
+                if !matches!(e, Experiment::Sites { .. }) {
+                    let stackable: Vec<usize> = (0..programs.len()).filter(|&k| measured[k] && !programs[k].0.delete && stacks(&self.weights, programs[k].1)).collect();
+                    let rows = self.counterfactual.as_ref().map_or(1, |(b, _)| b.tokens.len().max(1));
+                    for group in stackable.chunks((STACKED_ROWS / rows).max(1)).filter(|g| g.len() > 1) {
+                        let circuits: Vec<&Circuit> = group.iter().map(|&k| programs[k].1).collect();
+                        if let Some(out) = self.run_stacked(&circuits, &Experiment::Counterfactual) {
+                            for (&k, p) in group.iter().zip(out?) {
+                                swapped[k] = Some(p);
+                            }
+                        }
+                    }
+                }
                 let mut kls = Vec::with_capacity(programs.len());
-                for ((g, circuit), &m) in programs.iter().zip(&measured) {
+                for (k, ((g, circuit), &m)) in programs.iter().zip(&measured).enumerate() {
                     if !m {
                         kls.push(None);
                         continue;
                     }
                     let model = self.run(&g.complement_model(&self.weights), e)?;
-                    let predicted = if g.delete { self.without_parts(g)? } else { self.run_swapped(circuit, e)? };
+                    let predicted = match swapped[k].take() {
+                        Some(p) => p,
+                        None if g.delete => self.without_parts(g)?,
+                        None => self.run_swapped(circuit, e)?,
+                    };
                     kls.push(Some(kl_bits(&model, &predicted)));
                 }
                 Ok(kls)
