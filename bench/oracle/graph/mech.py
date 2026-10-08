@@ -293,12 +293,13 @@ class Piece:
         raise MechError(f"{self.name()} is a part; make it a node, node({self.name()}), before connecting it")
 
     def ir(self) -> dict:
-        """index: one int, a sorted list, null for every unit of the site, or "rest" for a VPD site's
-        remainder W - sum of its subcomponents."""
+        """index: one int, a sorted list, null for every unit of the site (VPD subcomponents are always
+        listed: the checker takes a VPD site's units by name), or "rest" for a VPD site's remainder
+        W - sum of its subcomponents."""
         if self.rest:
             return {"view": self.view, "layer": self.layer, "kind": self.kind, "index": "rest"}
         return {"view": self.view, "layer": self.layer, "kind": self.kind,
-                "index": None if self.whole() else self.index[0] if len(self.index) == 1 else list(self.index)}
+                "index": None if self.whole() and self.view != "vpd" else self.index[0] if len(self.index) == 1 else list(self.index)}
 
 
 class _Site:

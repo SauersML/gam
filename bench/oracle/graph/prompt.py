@@ -30,7 +30,8 @@ aligned to parts of the model; it may import only `from mech import align, claim
   takes `tokens` (the prompt as the model's token strings, such as " cat") and other variables (by
   parameter name) and returns a list with one value per position; its value at position t may use
   tokens 0..t only. The answer is the aligned variable no other variable reads: its value at t is the
-  token the model predicts after position t (None: no prediction).
+  token the model predicts after position t (a longer string: its first token; a list of strings: any of
+  them is right; None: no prediction).
 - align(variable, parts...): what these parts write into the residual stream holds the variable. A
   variable may span layers.
 - claim(pattern, parts...): the attention of these query and key parts follows the variable `pattern`,

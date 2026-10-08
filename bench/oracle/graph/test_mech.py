@@ -298,7 +298,7 @@ def test_whole_site():
     assert ir["valid"], ir["error"]
     assert [p["index"] for n in ir["nodes"] for p in n["pieces"]] == [None, None]
     v = mech.trace_inline(HEAD + "v = node(PD[1].c_fc[0:3072])\n", "vpd4l")
-    assert v["nodes"][0]["pieces"][0]["index"] is None
+    assert v["nodes"][0]["pieces"][0]["index"] == list(range(3072))  # the checker takes VPD units by name
 
 
 def test_low_level_ir():
