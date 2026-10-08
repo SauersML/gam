@@ -18,7 +18,7 @@ Features. A part's feature vector is fixed by its kind:
   VPD subcomponent u v^T of a site (read v in R^d_in, write u in R^d_out):
       [v / |v| * sqrt(d_in), u / |u| * sqrt(d_out), log |v|, log |u|]
   native head, attention or MLP: predict/vectors.py's 8 directions with their log singular values, flattened.
-Maps. Per kind, P_in (linear, rescaled to the RMS of the oracle's token embeddings) gives the token's input
+Maps. Per kind, P_in (linear of rank 256, rescaled to the RMS of the oracle's token embeddings) gives the token's input
 embedding and P_out (linear) its output row: the logit of part p after hidden state h is h . P_out(f_p),
 next to the base vocabulary's logits, so choosing a part is a softmax over the parts' own vectors. There
 are no per-ID parameters: relabeling the parts changes nothing (tested). For many parts the softmax is
@@ -182,17 +182,21 @@ class PartTokens(nn.Module):
     component and site_logits / part_logits_in give the two-level choice for views too large to score at
     once). Still permutation-invariant: a site's mean does not depend on the parts' order."""
 
-    def __init__(self, reg: Registry, hidden: int, emb_rms: float, base_vocab: int, dev=None):
+    def __init__(self, reg: Registry, hidden: int, emb_rms: float, base_vocab: int, dev=None, rank: int = 256):
         super().__init__()
         self.reg, self.base_vocab, self.emb_rms = reg, base_vocab, emb_rms
         names = {k: k.replace(".", "_") for k in reg.features}
         self.names = names
-        self.p_in = nn.ModuleDict({names[k]: nn.Linear(f.shape[1], hidden) for k, f in reg.features.items()})
-        self.p_out = nn.ModuleDict({names[k]: nn.Linear(f.shape[1], hidden, bias=False) for k, f in reg.features.items()})
-        self.s_in = nn.ModuleDict({names[k]: nn.Linear(f.shape[1], hidden, bias=False) for k, f in reg.features.items()})
-        self.s_out = nn.ModuleDict({names[k]: nn.Linear(f.shape[1], hidden, bias=False) for k, f in reg.features.items()})
+
+        def lin(f, bias):  # a linear map of rank `rank` (features of 1,538-8,200 numbers -> the oracle's width)
+            return nn.Sequential(nn.Linear(f, rank, bias=False), nn.Linear(rank, hidden, bias=bias))
+
+        self.p_in = nn.ModuleDict({names[k]: lin(f.shape[1], True) for k, f in reg.features.items()})
+        self.p_out = nn.ModuleDict({names[k]: lin(f.shape[1], False) for k, f in reg.features.items()})
+        self.s_in = nn.ModuleDict({names[k]: lin(f.shape[1], False) for k, f in reg.features.items()})
+        self.s_out = nn.ModuleDict({names[k]: lin(f.shape[1], False) for k, f in reg.features.items()})
         for m in list(self.p_out.values()) + list(self.s_out.values()):
-            nn.init.normal_(m.weight, std=0.02 / m.weight.shape[1] ** 0.5)  # parts start improbable
+            nn.init.normal_(m[1].weight, std=0.02 / rank**0.5)  # parts start improbable
         if dev is not None:
             self.to(dev)
         self.feats = {k: f.to(dev) if dev is not None else f for k, f in reg.features.items()}
@@ -223,7 +227,7 @@ class PartTokens(nn.Module):
 
     def site_rows(self) -> torch.Tensor:
         """[sites, hidden]: the output rows of the sites (the first level of the two-level choice)."""
-        out = torch.zeros(len(self.reg.sites), next(iter(self.s_out.values())).weight.shape[0], device=next(self.parameters()).device)
+        out = torch.zeros(len(self.reg.sites), next(iter(self.s_out.values()))[1].weight.shape[0], device=next(self.parameters()).device)
         for k in self.feats:
             out = out.index_copy(0, self.site_global[k], self.s_out[self.names[k]](self.site_feats[k]))
         return out

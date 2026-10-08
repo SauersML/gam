@@ -434,7 +434,14 @@ def main():
     if args.part_tokens:  # likewise: the base model reads addresses, the trained oracle part tokens
         params += setup_part_tokens(args.part_tokens, model, tok, dev)
 
-    opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=0.0)
+    # The LoRA at lr; every linear map of the part tokens at lr * rank / its fan-in, so its output moves per step
+    # like the LoRA's up-projections (rl/train.py, 79082b97de: one lr for both blew the part rows up together).
+    pt_ids = {id(p) for p in PARTS["module"].parameters()} if PARTS["module"] is not None else set()
+    groups = [{"params": [p for p in params if id(p) not in pt_ids], "lr": args.lr, "base_lr": args.lr}]
+    if PARTS["module"] is not None:
+        groups += [{"params": list(m.parameters()), "lr": args.lr * args.rank / m.in_features, "base_lr": args.lr * args.rank / m.in_features}
+                   for m in PARTS["module"].modules() if isinstance(m, nn.Linear)]
+    opt = torch.optim.AdamW(groups, weight_decay=0.0)
     big = dev.type == "cuda" and torch.cuda.get_device_properties(0).total_memory > 70 * 2**30
     if args.checkpointing == "on" or (args.checkpointing == "auto" and not big):  # recompute activations below 80 GB cards (8B ran out of 48 GB without)
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
@@ -456,7 +463,7 @@ def main():
         loss.backward()
         torch.nn.utils.clip_grad_norm_(params, 1.0)
         for g in opt.param_groups:
-            g["lr"] = args.lr * min(1.0, (step + 1) / args.warmup)
+            g["lr"] = g["base_lr"] * min(1.0, (step + 1) / args.warmup)
         opt.step()
         opt.zero_grad(set_to_none=True)
         step += 1
