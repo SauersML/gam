@@ -52,8 +52,8 @@ fn piece(layer: usize, kind: &str) -> PieceIr {
 fn full_program() -> Program {
     let mut nodes = Vec::new();
     for l in 0..LAYERS {
-        nodes.push(NodeIr { id: format!("a{l}"), pieces: vec![piece(l, "head")], rule: None });
-        nodes.push(NodeIr { id: format!("m{l}"), pieces: vec![piece(l, "mlp")], rule: None });
+        nodes.push(NodeIr { id: format!("a{l}"), pieces: vec![piece(l, "head")], claim: None });
+        nodes.push(NodeIr { id: format!("m{l}"), pieces: vec![piece(l, "mlp")], claim: None });
     }
     let order: Vec<String> = nodes.iter().map(|n| n.id.clone()).collect();
     let mut edges = Vec::new();
@@ -299,7 +299,7 @@ fn batch_scores_equal_single_scores() {
         draw(Family::Push, &[(SharedSite::Stream(1), Operation::Push { direction: 0, size: 1 })], 5, false),
     ];
     checker.sites = SiteUnits { pool, ..units };
-    let node = |id: &str, layer: usize, kind: &str, index: usize| NodeIr { id: id.into(), pieces: vec![PieceIr { view: "native".into(), layer, kind: kind.into(), index: Some(crate::graph::Index::One(index)) }], rule: None };
+    let node = |id: &str, layer: usize, kind: &str, index: usize| NodeIr { id: id.into(), pieces: vec![PieceIr { view: "native".into(), layer, kind: kind.into(), index: Some(crate::graph::Index::One(index)) }], claim: None };
     let mut partial = Program { model: "tiny".into(), valid: true, ..Program::default() };
     partial.nodes = vec![node("h", 1, "head", 0), node("m", 0, "mlp", 2)];
     partial.edges = vec![EdgeIr { from: "embed".into(), to: "m".into(), route: "input".into() }, EdgeIr { from: "m".into(), to: "h".into(), route: "value".into() }, EdgeIr { from: "h".into(), to: "logits".into(), route: "input".into() }];
@@ -470,7 +470,7 @@ fn widths_are_chosen_and_charged() {
     let (weights, sequences) = model("graph_sites_widths");
     let mut checker = Checker::new(weights, behavior(&sequences)).expect("checker");
     let mut program = Program { model: "tiny".into(), valid: true, ..Program::default() };
-    program.nodes = vec![NodeIr { id: "h".into(), pieces: vec![PieceIr { view: "native".into(), layer: 1, kind: "head".into(), index: Some(crate::graph::Index::One(0)) }], rule: None }];
+    program.nodes = vec![NodeIr { id: "h".into(), pieces: vec![PieceIr { view: "native".into(), layer: 1, kind: "head".into(), index: Some(crate::graph::Index::One(0)) }], claim: None }];
     program.edges = vec![EdgeIr { from: "h".into(), to: "logits".into(), route: "input".into() }];
     let (score, _) = checker.score(&program, 6, 1, true, None).expect("score");
     assert_eq!(score.widths.len(), 1);
@@ -535,7 +535,7 @@ fn head_operations_reach_a_vpd_view_attention() {
     let qkv = (wave(3, heads * dh, 0.2), wave(width, 3, 0.9));
     s.weights.vpd_attention.insert(0, crate::graph::VpdAttention { q: qkv.clone(), k: qkv.clone(), v: qkv, o: (wave(3, width, 1.3), wave(heads * dh, 3, 0.4)) });
     let mut program = Program { model: "tiny".into(), valid: true, ..Program::default() };
-    program.nodes = vec![NodeIr { id: "o".into(), pieces: vec![PieceIr { view: "vpd".into(), layer: 0, kind: "o_proj".into(), index: Some(crate::graph::Index::One(0)) }], rule: None }];
+    program.nodes = vec![NodeIr { id: "o".into(), pieces: vec![PieceIr { view: "vpd".into(), layer: 0, kind: "o_proj".into(), index: Some(crate::graph::Index::One(0)) }], claim: None }];
     program.edges = vec![EdgeIr { from: "o".into(), to: "logits".into(), route: "input".into() }];
     let graph = Graph::parse(&program, &s.weights).expect("parse");
     let circuit = graph.program(&s.weights, true);
@@ -625,7 +625,7 @@ fn memos_serve_a_later_checker() {
     let dir = std::env::temp_dir().join(format!("graph_memo_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let mut program = Program { model: "tiny".into(), valid: true, ..Program::default() };
-    program.nodes = vec![NodeIr { id: "h".into(), pieces: vec![PieceIr { view: "native".into(), layer: 0, kind: "head".into(), index: Some(crate::graph::Index::One(0)) }], rule: None }];
+    program.nodes = vec![NodeIr { id: "h".into(), pieces: vec![PieceIr { view: "native".into(), layer: 0, kind: "head".into(), index: Some(crate::graph::Index::One(0)) }], claim: None }];
     program.edges = vec![EdgeIr { from: "embed".into(), to: "h".into(), route: "input".into() }, EdgeIr { from: "h".into(), to: "logits".into(), route: "input".into() }];
     let mut first = Checker::new(weights.clone(), behavior(&sequences)).expect("checker");
     first.memo_dir = Some(dir.clone());
@@ -712,7 +712,7 @@ fn necessity_pays_for_left_out_mediators() {
     checker.sites = SiteUnits { pool: vec![draw(Family::Zero, &[(SharedSite::Mlp(0), Operation::Scale(0))], 0, true), draw(Family::Push, &[(SharedSite::Stream(1), Operation::Push { direction: 0, size: 1 })], 5, false)], ..units };
     let empty = Program { model: "tiny".into(), valid: true, ..Program::default() };
     let mut partial = Program { model: "tiny".into(), valid: true, ..Program::default() };
-    partial.nodes = vec![NodeIr { id: "a0".into(), pieces: vec![piece(0, "head")], rule: None }];
+    partial.nodes = vec![NodeIr { id: "a0".into(), pieces: vec![piece(0, "head")], claim: None }];
     partial.edges = ["query", "key", "value"].iter().map(|r| EdgeIr { from: "embed".into(), to: "a0".into(), route: (*r).into() }).chain(["embed", "a0"].iter().map(|w| EdgeIr { from: (*w).into(), to: "logits".into(), route: "input".into() })).collect();
     let scores = checker.score_batch(&[full_program(), partial, empty], 30, 3, true, None, 0).expect("scores");
     let (full, partial, none) = (&scores[0].0, &scores[1].0, &scores[2].0);
@@ -748,7 +748,7 @@ fn deleting_programs_score_named_parts_alone() {
     let mut full = full_program();
     full.nodes.iter_mut().find(|n| n.id == "m0").expect("m0").pieces = ["c_fc", "down_proj"].iter().flat_map(|k| [vpd(k, crate::graph::Index::Many((0..if *k == "c_fc" { 5 } else { 4 }).collect())), vpd(k, crate::graph::Index::Name("rest".into()))]).collect();
     let mut partial = Program { model: "tiny".into(), valid: true, ..Program::default() };
-    partial.nodes = vec![NodeIr { id: "a0".into(), pieces: vec![piece(0, "head")], rule: None }];
+    partial.nodes = vec![NodeIr { id: "a0".into(), pieces: vec![piece(0, "head")], claim: None }];
     partial.edges = ["query", "key", "value"].iter().map(|r| EdgeIr { from: "embed".into(), to: "a0".into(), route: (*r).into() }).chain(["embed", "a0"].iter().map(|w| EdgeIr { from: (*w).into(), to: "logits".into(), route: "input".into() })).collect();
     let counterfactual = Program { standin: Some("counterfactual".into()), ..partial.clone() };
     let empty = Program { model: "tiny".into(), valid: true, ..Program::default() };

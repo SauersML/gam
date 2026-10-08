@@ -44,8 +44,8 @@ fn piece(layer: usize, kind: &str) -> PieceIr {
 fn full_program() -> Program {
     let mut nodes = Vec::new();
     for l in 0..LAYERS {
-        nodes.push(NodeIr { id: format!("a{l}"), pieces: vec![piece(l, "head")], rule: None });
-        nodes.push(NodeIr { id: format!("m{l}"), pieces: vec![piece(l, "mlp")], rule: None });
+        nodes.push(NodeIr { id: format!("a{l}"), pieces: vec![piece(l, "head")], claim: None });
+        nodes.push(NodeIr { id: format!("m{l}"), pieces: vec![piece(l, "mlp")], claim: None });
     }
     let order: Vec<String> = nodes.iter().map(|n| n.id.clone()).collect();
     let mut edges = Vec::new();
@@ -112,7 +112,7 @@ fn parse_rejects_bad_programs() {
     let f = fixture("graph_parse");
     let library = Library::new(&f.device, &f.device, &f.native, &f.layers, &f.artifact, 1 << 28, 64).expect("library");
     let weights = Weights::of(&library);
-    let node = |id: &str, layer: usize, kind: &str, index: Option<Index>| NodeIr { id: id.into(), pieces: vec![PieceIr { view: "native".into(), layer, kind: kind.into(), index }], rule: None };
+    let node = |id: &str, layer: usize, kind: &str, index: Option<Index>| NodeIr { id: id.into(), pieces: vec![PieceIr { view: "native".into(), layer, kind: kind.into(), index }], claim: None };
     let mut program = Program { model: "tiny".into(), valid: true, ..Program::default() };
     program.nodes = vec![node("a", 0, "head", Some(Index::One(1))), node("b", 0, "head", Some(Index::Many(vec![0, 1])))];
     assert!(Graph::parse(&program, &weights).is_err(), "a head in two nodes");
@@ -184,7 +184,7 @@ fn counterfactual_undeclared_head_is_patched_from_the_counterfactual() {
     // Head (1, 0) (library head 2) reads its counterfactual read; everything else runs on the prompt.
     let z = library.run(&cf, &BTreeMap::new()).expect("cf run").reads[2].clone();
     let expected = library.log_probabilities(&library.run(&f.sequences, &[(2, z)].into()).expect("patched").last).expect("log p");
-    let node = |id: &str, layer: usize, kind: &str, index: Option<Index>| NodeIr { id: id.into(), pieces: vec![PieceIr { view: "native".into(), layer, kind: kind.into(), index }], rule: None };
+    let node = |id: &str, layer: usize, kind: &str, index: Option<Index>| NodeIr { id: id.into(), pieces: vec![PieceIr { view: "native".into(), layer, kind: kind.into(), index }], claim: None };
     let program = Program {
         model: "tiny".into(),
         valid: true,
@@ -247,7 +247,7 @@ fn transcoder_features_write_the_transcoder_and_the_rest_is_exact() {
     std::fs::create_dir_all(&dir).expect("dir");
     crate::test_support::transcoder_file(&dir.join("layer_1.safetensors"), 6, 8, 5);
     assert_eq!(weights.attach_transcoders(&dir).expect("attach"), 1);
-    let feature = |id: &str, index: Index| NodeIr { id: id.into(), pieces: vec![PieceIr { view: "transcoder".into(), layer: 1, kind: "feature".into(), index: Some(index) }], rule: None };
+    let feature = |id: &str, index: Index| NodeIr { id: id.into(), pieces: vec![PieceIr { view: "transcoder".into(), layer: 1, kind: "feature".into(), index: Some(index) }], claim: None };
     let program = Program { model: "tiny".into(), valid: true, nodes: vec![feature("f", Index::Many((0..6).collect()))], ..Program::default() };
     let graph = Graph::parse(&program, &weights).expect("parse");
     weights.load_features(&graph).expect("features");
@@ -277,7 +277,7 @@ fn transcoder_features_write_the_transcoder_and_the_rest_is_exact() {
     assert!(gap < 1e-6, "feature writes differ from the transcoder by {gap:e}");
     // One view per site; features in range.
     let mut both = program.clone();
-    both.nodes.push(NodeIr { id: "n".into(), pieces: vec![PieceIr { view: "native".into(), layer: 1, kind: "mlp".into(), index: Some(Index::One(0)) }], rule: None });
+    both.nodes.push(NodeIr { id: "n".into(), pieces: vec![PieceIr { view: "native".into(), layer: 1, kind: "mlp".into(), index: Some(Index::One(0)) }], claim: None });
     assert!(Graph::parse(&both, &weights).is_err(), "neurons and features of one MLP");
     let far = Program { nodes: vec![feature("f", Index::One(6))], ..program.clone() };
     assert!(Graph::parse(&far, &weights).is_err(), "feature out of range");
@@ -319,7 +319,7 @@ fn vpd_mlp_view_reads_the_hidden_stream_through_its_edges() {
     let vpd = exact_vpd(&weights);
     weights.vpd.insert(1, vpd);
     let piece = |layer: usize, view: &str, kind: &str, index: Option<Index>| PieceIr { view: view.into(), layer, kind: kind.into(), index };
-    let node = |id: &str, p: PieceIr| NodeIr { id: id.into(), pieces: vec![p], rule: None };
+    let node = |id: &str, p: PieceIr| NodeIr { id: id.into(), pieces: vec![p], claim: None };
     let all: Vec<usize> = (0..16).collect();
     let nodes = vec![
         node("a0", piece(0, "native", "head", None)),
@@ -390,11 +390,11 @@ fn vpd_attention_view_reads_queries_keys_values_through_its_edges() {
     let piece = |layer: usize, view: &str, kind: &str, index: Option<Index>| PieceIr { view: view.into(), layer, kind: kind.into(), index };
     let all = |n: usize| Some(Index::Many((0..n).collect()));
     let nodes = vec![
-        NodeIr { id: "a0".into(), pieces: vec![piece(0, "native", "head", None)], rule: None },
-        NodeIr { id: "m0".into(), pieces: vec![piece(0, "native", "mlp", None)], rule: None },
-        NodeIr { id: "QKV".into(), pieces: vec![piece(1, "vpd", "q_proj", all(wq.nrows())), piece(1, "vpd", "k_proj", all(wk.nrows())), piece(1, "vpd", "v_proj", all(wv.nrows()))], rule: None },
-        NodeIr { id: "O".into(), pieces: vec![piece(1, "vpd", "o_proj", all(wo.ncols()))], rule: None },
-        NodeIr { id: "m1".into(), pieces: vec![piece(1, "native", "mlp", None)], rule: None },
+        NodeIr { id: "a0".into(), pieces: vec![piece(0, "native", "head", None)], claim: None },
+        NodeIr { id: "m0".into(), pieces: vec![piece(0, "native", "mlp", None)], claim: None },
+        NodeIr { id: "QKV".into(), pieces: vec![piece(1, "vpd", "q_proj", all(wq.nrows())), piece(1, "vpd", "k_proj", all(wk.nrows())), piece(1, "vpd", "v_proj", all(wv.nrows()))], claim: None },
+        NodeIr { id: "O".into(), pieces: vec![piece(1, "vpd", "o_proj", all(wo.ncols()))], claim: None },
+        NodeIr { id: "m1".into(), pieces: vec![piece(1, "native", "mlp", None)], claim: None },
     ];
     let edge = |from: &str, to: &str| EdgeIr { from: from.into(), to: to.into(), route: "input".into() };
     let mut edges = Vec::new();
@@ -427,7 +427,7 @@ fn vpd_attention_view_reads_queries_keys_values_through_its_edges() {
     bad.edges.push(edge("QKV", "logits"));
     assert!(Graph::parse(&bad, &weights).is_err(), "q/k/v subcomponents write no residual");
     let mut mixed = cut.clone();
-    mixed.nodes.push(NodeIr { id: "h".into(), pieces: vec![piece(1, "native", "head", Some(Index::One(0)))], rule: None });
+    mixed.nodes.push(NodeIr { id: "h".into(), pieces: vec![piece(1, "native", "head", Some(Index::One(0)))], claim: None });
     assert!(Graph::parse(&mixed, &weights).is_err(), "heads and VPD subcomponents of one attention");
 }
 
@@ -453,7 +453,7 @@ fn library_parts_resolve_to_their_vpd_subcomponents() {
     std::fs::write(&path, start.to_string()).expect("write");
     assert_eq!(weights.attach_library(&path, "test").expect("attach"), 4);
     let piece = |view: &str, kind: &str, index: Index| PieceIr { view: view.into(), layer: 1, kind: kind.into(), index: Some(index) };
-    let node = |id: &str, pieces: Vec<PieceIr>| NodeIr { id: id.into(), pieces, rule: None };
+    let node = |id: &str, pieces: Vec<PieceIr>| NodeIr { id: id.into(), pieces, claim: None };
     let all = |n: usize| Index::Many((0..n).collect());
     let lib = Program { model: "tiny".into(), valid: true, nodes: vec![node("QKV", vec![piece("library", "attn", Index::One(0))]), node("O", vec![piece("library", "attn", Index::One(1))]), node("F", vec![piece("library", "mlp", Index::One(0))]), node("D", vec![piece("library", "mlp", Index::One(1))])], ..Program::default() };
     let vpd = Program {
@@ -492,7 +492,7 @@ fn qwen3_like_model_full_graph_and_counterfactual_empty_graph() {
         assert!(kl < 1e-9, "{name}: KL = {kl:e} bits");
     }
     // Opaque numbers count a key-value pair shared by two query heads once.
-    let one = Program { model: "tiny".into(), valid: true, nodes: vec![NodeIr { id: "h".into(), pieces: vec![PieceIr { view: "native".into(), layer: 0, kind: "head".into(), index: None }], rule: None }], ..Program::default() };
+    let one = Program { model: "tiny".into(), valid: true, nodes: vec![NodeIr { id: "h".into(), pieces: vec![PieceIr { view: "native".into(), layer: 0, kind: "head".into(), index: None }], claim: None }], ..Program::default() };
     let g = Graph::parse(&one, &weights).expect("parse");
     let h = &weights.layers[0].heads[0];
     let per_query = h.query.len() + h.output.len() + h.query_norm.as_ref().map_or(0, |(g, _)| g.len());
@@ -512,7 +512,7 @@ fn device_path_on_the_host_backend_is_the_host_run() {
     let mut with_reference = plain.clone();
     with_reference.reference = Some(counterfactual.clone());
     let rows: Vec<usize> = (0..plain.tokens.len()).collect();
-    let node = |id: &str, layer: usize, kind: &str, index: Option<Index>| NodeIr { id: id.into(), pieces: vec![PieceIr { view: "native".into(), layer, kind: kind.into(), index }], rule: None };
+    let node = |id: &str, layer: usize, kind: &str, index: Option<Index>| NodeIr { id: id.into(), pieces: vec![PieceIr { view: "native".into(), layer, kind: kind.into(), index }], claim: None };
     let partial = Program { model: "tiny".into(), valid: true, nodes: vec![node("h", 1, "head", Some(Index::One(0))), node("n", 0, "mlp", Some(Index::Many(vec![1, 4, 9]))), node("big", 1, "mlp", Some(Index::Many((0..14).collect())))], ..Program::default() };
     let full = Graph::parse(&full_program(), &weights).expect("full");
     let some = Graph::parse(&partial, &weights).expect("partial");
@@ -553,7 +553,7 @@ fn device_site_operations_on_the_host_backend_are_the_host_run() {
     let mut batch = Batch::new(&f.sequences).expect("batch");
     batch.reference = Some(counterfactual);
     let rows: Vec<usize> = (0..batch.tokens.len()).collect();
-    let node = |id: &str, layer: usize, kind: &str, index: Option<Index>| NodeIr { id: id.into(), pieces: vec![PieceIr { view: "native".into(), layer, kind: kind.into(), index }], rule: None };
+    let node = |id: &str, layer: usize, kind: &str, index: Option<Index>| NodeIr { id: id.into(), pieces: vec![PieceIr { view: "native".into(), layer, kind: kind.into(), index }], claim: None };
     let program = Program { model: "tiny".into(), valid: true, nodes: vec![node("h", 1, "head", Some(Index::One(0))), node("n", 0, "mlp", Some(Index::Many(vec![1, 4, 9])))], ..Program::default() };
     let graph = Graph::parse(&program, &weights).expect("parse");
     let mut state = crate::graph_device::DeviceState::new(Device::host());
@@ -640,7 +640,7 @@ fn device_path_on_a_qwen3_like_model_is_the_host_run() {
     let mut batch = Batch::new(&sequences).expect("batch");
     batch.reference = Some(std::sync::Arc::new(reference(&weights, &Batch::new(&cf).expect("cf batch")).expect("reference")));
     let rows: Vec<usize> = (0..batch.tokens.len()).collect();
-    let node = |id: &str, layer: usize, kind: &str, index: Option<Index>| NodeIr { id: id.into(), pieces: vec![PieceIr { view: "native".into(), layer, kind: kind.into(), index }], rule: None };
+    let node = |id: &str, layer: usize, kind: &str, index: Option<Index>| NodeIr { id: id.into(), pieces: vec![PieceIr { view: "native".into(), layer, kind: kind.into(), index }], claim: None };
     let partial = Program { model: "tiny".into(), valid: true, nodes: vec![node("h", 1, "head", Some(Index::One(0))), node("n", 0, "mlp", Some(Index::Many(vec![1, 4, 9])))], ..Program::default() };
     let graph = Graph::parse(&partial, &weights).expect("partial");
     let mut state = crate::graph_device::DeviceState::new(Device::host());
@@ -671,77 +671,6 @@ fn attend_rules_pick_their_positions() {
 }
 
 #[test]
-fn a_ruled_node_attends_by_its_rule_with_its_own_value_and_output() {
-    let f = fixture("graph_rule");
-    let library = Library::new(&f.device, &f.device, &f.native, &f.layers, &f.artifact, 1 << 28, 64).expect("library");
-    let weights = Weights::of(&library);
-    let mut program = full_program();
-    let a1 = program.nodes.iter().position(|n| n.id == "a1").expect("a1");
-    program.nodes[a1].rule = Some(serde_json::json!({"op": "attend", "offset": 1}));
-    // Edges into a ruled node reach only its value.
-    program.edges.retain(|e| !(e.to == "a1" && e.route != "value"));
-    let graph = Graph::parse(&program, &weights).expect("parse");
-    let batch = Batch::new(&f.sequences).expect("batch");
-    let rows: Vec<usize> = (0..batch.tokens.len()).collect();
-    let run = execute(&weights, &graph.program(&weights, true), &batch, &rows, &BTreeMap::new()).expect("execute");
-    // Independently: layer 1's heads read A v, v their value maps on the normed stream entering
-    // layer 1 (the model's own run), A the previous-token pattern.
-    let stream = library.run(&f.sequences, &BTreeMap::new()).expect("run").streams[2].clone();
-    let lw = &weights.layers[1];
-    let mut x_hat = stream.clone();
-    for mut row in x_hat.outer_iter_mut() {
-        let r = crate::operator_program::rms_scale(row.view(), lw.attention.epsilon);
-        row.zip_mut_with(&lw.attention.gain, |v, g| *v *= r * g);
-    }
-    let length = f.sequences[0].len();
-    let a = crate::graph::HeadRule::Offset(1).pattern(&f.sequences[0]);
-    let mut replace = BTreeMap::new();
-    for (h, w) in lw.heads.iter().enumerate() {
-        let v = x_hat.dot(&crate::graph::wide(w.value.t()));
-        let mut z = ndarray::Array2::<f64>::zeros(v.dim());
-        for s in 0..f.sequences.len() {
-            let span = s * length..(s + 1) * length;
-            z.slice_mut(ndarray::s![span.clone(), ..]).assign(&a.dot(&v.slice(ndarray::s![span, ..])));
-        }
-        replace.insert(weights.layers[0].heads.len() + h, z);
-    }
-    let expected = library.log_probabilities(&library.run(&f.sequences, &replace).expect("patched").last).expect("log p");
-    let kl = max(&kl_bits(&expected, &run.log_probabilities));
-    assert!(kl < 1e-9, "KL(rule computed by hand ‖ ruled node) = {kl:e} bits");
-    // M ignores the rule; query and key routes into a ruled node are refused; it prices no query or key.
-    let model = execute(&weights, &graph.model(&weights), &batch, &rows, &BTreeMap::new()).expect("model");
-    let clean = library.log_probabilities(&library.run(&f.sequences, &BTreeMap::new()).expect("run").last).expect("log p");
-    assert!(max(&kl_bits(&clean, &model.log_probabilities)) < 1e-9);
-    let mut bad = program.clone();
-    bad.edges.push(EdgeIr { from: "embed".into(), to: "a1".into(), route: "key".into() });
-    assert!(Graph::parse(&bad, &weights).is_err());
-    let unruled = Graph::parse(&full_program(), &weights).expect("full");
-    assert!(graph.opaque_numbers(&weights) < unruled.opaque_numbers(&weights));
-}
-
-#[test]
-fn device_path_runs_ruled_nodes_as_the_host() {
-    let f = fixture("graph_device_rule");
-    let library = Library::new(&f.device, &f.device, &f.native, &f.layers, &f.artifact, 1 << 28, 64).expect("library");
-    let weights = Weights::of(&library);
-    let mut program = full_program();
-    let a1 = program.nodes.iter().position(|n| n.id == "a1").expect("a1");
-    program.nodes[a1].rule = Some(serde_json::json!({"op": "attend", "query": {"op": "tokens"}, "key": {"op": "shift", "arg": {"op": "tokens"}, "by": 1}}));
-    program.edges.retain(|e| !(e.to == "a1" && e.route != "value"));
-    let graph = Graph::parse(&program, &weights).expect("parse");
-    let sequences: Vec<Vec<u32>> = f.sequences.iter().zip([12, 7, 9, 12, 5, 9]).map(|(s, n)| s[..n].to_vec()).collect();
-    let batch = Batch::new(&sequences).expect("batch");
-    let rows: Vec<usize> = (0..batch.tokens.len()).collect();
-    let circuit = graph.program(&weights, true);
-    let host = execute(&weights, &circuit, &batch, &rows, &BTreeMap::new()).expect("host");
-    let mut state = crate::graph_device::DeviceState::new(Device::host());
-    let job = crate::graph_device::Run { tokens: &batch.tokens, spans: &batch.spans, scored: &rows, swaps: &BTreeMap::new(), capture: false, reference: None, ops: &crate::graph::Interventions::default() };
-    let device = crate::graph_device::run_on(&mut state, &weights, &circuit, &job).expect("device");
-    let kl = max(&kl_bits(&host.log_probabilities, &device.log_probabilities));
-    assert!(kl < 1e-9, "KL(host ‖ device) with a ruled node = {kl:e} bits");
-}
-
-#[test]
 fn device_path_runs_vpd_views_as_the_host() {
     use ndarray::{Array2, Axis, s};
     let f = fixture("graph_device_vpd");
@@ -765,13 +694,13 @@ fn device_path_runs_vpd_views_as_the_host() {
     let piece = |kind: &str, index: Index| PieceIr { view: "vpd".into(), layer: 1, kind: kind.into(), index: Some(index) };
     let rest = || Index::Name("rest".into());
     let nodes = vec![
-        NodeIr { id: "a0".into(), pieces: vec![PieceIr { view: "native".into(), layer: 0, kind: "head".into(), index: None }], rule: None },
-        NodeIr { id: "m0".into(), pieces: vec![PieceIr { view: "native".into(), layer: 0, kind: "mlp".into(), index: None }], rule: None },
-        NodeIr { id: "QK".into(), pieces: vec![piece("q_proj", Index::Many(vec![0, 3])), piece("k_proj", Index::One(1)), piece("k_proj", rest())], rule: None },
-        NodeIr { id: "V".into(), pieces: vec![piece("v_proj", Index::Many(vec![2, 5]))], rule: None },
-        NodeIr { id: "O".into(), pieces: vec![piece("o_proj", Index::Many(vec![0, 1, 4]))], rule: None },
-        NodeIr { id: "F".into(), pieces: vec![piece("c_fc", Index::Many(vec![0, 2, 7])), piece("c_fc", rest())], rule: None },
-        NodeIr { id: "D".into(), pieces: vec![piece("down_proj", Index::Many(vec![1, 3, 5]))], rule: None },
+        NodeIr { id: "a0".into(), pieces: vec![PieceIr { view: "native".into(), layer: 0, kind: "head".into(), index: None }], claim: None },
+        NodeIr { id: "m0".into(), pieces: vec![PieceIr { view: "native".into(), layer: 0, kind: "mlp".into(), index: None }], claim: None },
+        NodeIr { id: "QK".into(), pieces: vec![piece("q_proj", Index::Many(vec![0, 3])), piece("k_proj", Index::One(1)), piece("k_proj", rest())], claim: None },
+        NodeIr { id: "V".into(), pieces: vec![piece("v_proj", Index::Many(vec![2, 5]))], claim: None },
+        NodeIr { id: "O".into(), pieces: vec![piece("o_proj", Index::Many(vec![0, 1, 4]))], claim: None },
+        NodeIr { id: "F".into(), pieces: vec![piece("c_fc", Index::Many(vec![0, 2, 7])), piece("c_fc", rest())], claim: None },
+        NodeIr { id: "D".into(), pieces: vec![piece("down_proj", Index::Many(vec![1, 3, 5]))], claim: None },
     ];
     let edge = |from: &str, to: &str| EdgeIr { from: from.into(), to: to.into(), route: "input".into() };
     let mut edges = vec![edge("QK", "O"), edge("F", "D")];
@@ -836,84 +765,120 @@ fn device_path_runs_transcoder_features_as_the_host() {
     }
 }
 
+/// `M`'s normed attention input at `layer` on `sequences` (recorded as the checker records it) and
+/// the batch.
+fn attention_input(weights: &Weights, sequences: &[Vec<u32>], layer: usize) -> (ndarray::Array2<f64>, Batch) {
+    let batch = Batch::new(sequences).expect("batch");
+    let circuit = Graph::empty().model(weights);
+    let unit = circuit.units.iter().position(|u| matches!(u.block, crate::graph::Block::Heads { layer: l, .. } if l == layer)).expect("heads");
+    let run = crate::graph::execute_with(weights, &circuit, &batch, &[], &BTreeMap::new(), &crate::graph::Interventions::recording([2 * layer].into())).expect("run");
+    (run.normed[&(unit, 0)].clone(), batch)
+}
+
+/// The pattern `block`'s first weighed head produces on each of `sequences`, as a pattern claim's
+/// rows (row t: positions 0..=t).
+fn produced_tables(weights: &Weights, block: &crate::graph::Block, sequences: &[Vec<u32>], layer: usize) -> Vec<serde_json::Value> {
+    let (x_hat, batch) = attention_input(weights, sequences, layer);
+    let produced = crate::graph::produced_patterns(weights, block, &x_hat, &batch.spans, &[]).expect("patterns");
+    let (_, patterns) = produced.iter().find(|(w, _)| *w > 0.0).expect("a head the parts reach");
+    patterns.iter().map(|a| serde_json::json!((0..a.nrows()).map(|t| (0..=t).map(|j| a[[t, j]]).collect::<Vec<f64>>()).collect::<Vec<_>>())).collect()
+}
+
+/// A behavior over `sequences` with their counterfactuals.
+fn claims_behavior(sequences: &[Vec<u32>], cf: &[Vec<u32>]) -> Behavior {
+    let prompts = sequences.iter().zip(cf).map(|(s, c)| Prompt { text: String::new(), token_ids: s.clone(), target_positions: vec![s.len() - 1], counterfactual: Some(Counterfactual { text: String::new(), token_ids: c.clone() }), attention_block: Vec::new() }).collect();
+    Behavior { id: "tiny".into(), model: "tiny".into(), family: String::new(), description: String::new(), frequency: None, prompts, split: "train".into(), model_accuracy: None }
+}
+
 #[test]
-fn a_ruled_node_over_vpd_parts_attends_by_its_rule() {
-    use ndarray::{Array2, Axis, s};
-    let f = fixture("graph_vpd_rule");
+fn attention_claims_are_checked_not_executed() {
+    let f = fixture("graph_claims");
+    let library = Library::new(&f.device, &f.device, &f.native, &f.layers, &f.artifact, 1 << 28, 64).expect("library");
+    let weights = Weights::of(&library);
+    let cf = counterfactuals(&f.sequences);
+    // A node of layer 1's head 0 among the full program's nodes.
+    let mut program = full_program();
+    let a1 = program.nodes.iter().position(|n| n.id == "a1").expect("a1");
+    program.nodes[a1].pieces = vec![PieceIr { view: "native".into(), layer: 1, kind: "head".into(), index: Some(Index::One(0)) }];
+    let plain = Graph::parse(&program, &weights).expect("parse");
+    let tables = |seqs: &[Vec<u32>]| produced_tables(&weights, &plain.blocks[a1], seqs, 1);
+    let with = |claim: serde_json::Value| {
+        let mut p = program.clone();
+        p.nodes[a1].claim = Some(claim);
+        Graph::parse(&p, &weights).expect("parse")
+    };
+    let truth = with(serde_json::json!({"op": "pattern", "prompts": tables(&f.sequences), "counterfactuals": tables(&cf)}));
+    let offset = with(serde_json::json!({"op": "attend", "offset": 1}));
+    let mut checker = Checker::new(weights.clone(), claims_behavior(&f.sequences, &cf)).expect("checker");
+    let true_error = checker.claim_error(&truth).expect("claim");
+    let false_error = checker.claim_error(&offset).expect("claim");
+    assert!(true_error < 1e-9, "a true claim costs {true_error:e} bits per row");
+    assert!(false_error > 1e-2, "a false claim costs {false_error:e} bits per row");
+    assert_eq!(checker.claim_error(&plain).expect("no claim"), 0.0);
+    // The claim changes nothing in execution (host and device), and the score charges it.
+    let mut batch = Batch::new(&f.sequences).expect("batch");
+    batch.reference = Some(std::sync::Arc::new(reference(&weights, &Batch::new(&cf).expect("cf batch")).expect("reference")));
+    let rows: Vec<usize> = (0..batch.tokens.len()).collect();
+    let base = execute(&weights, &plain.program(&weights, true), &batch, &rows, &BTreeMap::new()).expect("plain").log_probabilities;
+    let claimed = execute(&weights, &offset.program(&weights, true), &batch, &rows, &BTreeMap::new()).expect("claimed").log_probabilities;
+    assert_eq!(base, claimed, "a claim changes execution");
+    let mut state = crate::graph_device::DeviceState::new(Device::host());
+    let job = crate::graph_device::Run { tokens: &batch.tokens, spans: &batch.spans, scored: &rows, swaps: &BTreeMap::new(), capture: false, reference: batch.reference.as_deref(), ops: &crate::graph::Interventions::default() };
+    let device = crate::graph_device::run_on(&mut state, &weights, &offset.program(&weights, true), &job).expect("device").log_probabilities;
+    assert!(max(&kl_bits(&base, &device)) < 1e-9, "device");
+    assert_eq!(offset.opaque_numbers(&weights), plain.opaque_numbers(&weights), "a claim removes no weights from the price");
+    let mut false_program = program.clone();
+    false_program.nodes[a1].claim = Some(serde_json::json!({"op": "attend", "offset": 1}));
+    let (score, _) = checker.score(&false_program, 4, 1, true, None).expect("score");
+    assert!(score.claim_error_bits > 0.0 && (score.claim_error_bits - score.n * false_error).abs() < 1e-6 * score.claim_error_bits);
+    // A claim needs queries and keys.
+    let mut bad = program.clone();
+    let m1 = bad.nodes.iter().position(|n| n.id == "m1").expect("m1");
+    bad.nodes[m1].claim = Some(serde_json::json!({"op": "attend", "offset": 1}));
+    assert!(Graph::parse(&bad, &weights).is_err(), "a claim on an MLP");
+}
+
+#[test]
+fn attention_claims_on_vpd_parts_weigh_the_heads_they_reach() {
+    use ndarray::{Array2, Axis};
+    let f = fixture("graph_claims_vpd");
     let library = Library::new(&f.device, &f.device, &f.native, &f.layers, &f.artifact, 1 << 28, 64).expect("library");
     let mut weights = Weights::of(&library);
-    // An inexact view of layer 1's attention (nonzero remainders).
-    let partial = |w: &Array2<f64>, count: usize, scale: f64| (Array2::<f64>::eye(w.nrows()).slice(s![..count, ..]).to_owned() * scale, w.t().slice(s![.., ..count]).to_owned());
+    // Layer 1's attention as one subcomponent per query, key, value and output coordinate (U the
+    // identity's rows, V the matching columns of Wᵀ): subcomponents below the head width write
+    // head 0 alone.
     let lw = &weights.layers[1];
     let stack = |m: &dyn Fn(&crate::graph::HeadWeights) -> &crate::graph::Stored| crate::graph::wide(ndarray::concatenate(Axis(0), &lw.heads.iter().map(|h| m(h).view()).collect::<Vec<_>>()).expect("stack").view());
     let (wq, wk, wv) = (stack(&|h| &h.query), stack(&|h| &*h.key), stack(&|h| &*h.value));
     let wo = crate::graph::wide(ndarray::concatenate(Axis(1), &lw.heads.iter().map(|h| h.output.view()).collect::<Vec<_>>()).expect("hstack").view());
-    let o = (wo.t().slice(s![..wo.ncols() - 3, ..]).to_owned() * 0.5, Array2::<f64>::eye(wo.ncols()).slice(s![.., ..wo.ncols() - 3]).to_owned());
-    let view = crate::graph::VpdAttention { q: partial(&wq, wq.nrows() - 2, 0.8), k: partial(&wk, wk.nrows() - 3, 0.9), v: partial(&wv, wv.nrows() - 1, 0.6), o };
-    weights.vpd_attention.insert(1, view.clone());
-    let lw = &weights.layers[1];
-    let native = |id: &str, layer: usize, kind: &str| NodeIr { id: id.into(), pieces: vec![PieceIr { view: "native".into(), layer, kind: kind.into(), index: None }], rule: None };
-    let vpd = |kind: &str, index: Index| PieceIr { view: "vpd".into(), layer: 1, kind: kind.into(), index: Some(index) };
-    let (v_list, o_list) = (vec![0, 2, 5], vec![1, 3]);
-    let ruled = NodeIr { id: "R".into(), pieces: vec![vpd("v_proj", Index::Many(v_list.clone())), vpd("v_proj", Index::Name("rest".into())), vpd("o_proj", Index::Many(o_list.clone()))], rule: Some(serde_json::json!({"op": "attend", "offset": 1})) };
-    let nodes = vec![native("a0", 0, "head"), native("m0", 0, "mlp"), ruled, native("m1", 1, "mlp")];
-    let edge = |from: &str, to: &str, route: &str| EdgeIr { from: from.into(), to: to.into(), route: route.into() };
-    let mut edges = Vec::new();
-    for (to, writers) in [("a0", vec!["embed"]), ("m0", vec!["embed", "a0"]), ("R", vec!["embed", "a0", "m0"]), ("m1", vec!["embed", "a0", "m0", "R"]), ("logits", vec!["embed", "a0", "m0", "R", "m1"])] {
-        edges.extend(writers.into_iter().map(|w| edge(w, to, "input")));
-    }
-    let program = Program { model: "tiny".into(), valid: true, nodes, edges, ..Program::default() };
-    let graph = Graph::parse(&program, &weights).expect("parse");
+    let exact = |w: &Array2<f64>| (Array2::<f64>::eye(w.nrows()), w.t().to_owned());
+    let width = lw.heads[0].query.nrows();
+    weights.vpd_attention.insert(1, crate::graph::VpdAttention { q: exact(&wq), k: exact(&wk), v: exact(&wv), o: (wo.t().to_owned(), Array2::<f64>::eye(wo.ncols())) });
     let cf = counterfactuals(&f.sequences);
-    let plain = Batch::new(&f.sequences).expect("batch");
-    let mut with_reference = plain.clone();
+    let vpd = |kind: &str, index: Vec<usize>| PieceIr { view: "vpd".into(), layer: 1, kind: kind.into(), index: Some(Index::Many(index)) };
+    let program = |claim: Option<serde_json::Value>| Program { model: "tiny".into(), valid: true, nodes: vec![NodeIr { id: "QK".into(), pieces: vec![vpd("q_proj", (0..width).collect()), vpd("k_proj", (0..width / 2).collect())], claim }], ..Program::default() };
+    let plain = Graph::parse(&program(None), &weights).expect("parse");
+    // Only head 0 is reached (the other heads' query and key subcomponents are not named).
+    let (x_hat, batch) = attention_input(&weights, &f.sequences, 1);
+    let produced = crate::graph::produced_patterns(&weights, &plain.blocks[0], &x_hat, &batch.spans, &[]).expect("patterns");
+    assert!(produced[0].0 > 0.0 && produced[1..].iter().all(|(w, _)| *w == 0.0), "head weights {:?}", produced.iter().map(|p| p.0).collect::<Vec<_>>());
+    let tables = |seqs: &[Vec<u32>]| produced_tables(&weights, &plain.blocks[0], seqs, 1);
+    let truth = Graph::parse(&program(Some(serde_json::json!({"op": "pattern", "prompts": tables(&f.sequences), "counterfactuals": tables(&cf)}))), &weights).expect("parse");
+    let offset = Graph::parse(&program(Some(serde_json::json!({"op": "attend", "offset": 1}))), &weights).expect("parse");
+    let mut checker = Checker::new(weights.clone(), claims_behavior(&f.sequences, &cf)).expect("checker");
+    let (true_error, false_error) = (checker.claim_error(&truth).expect("claim"), checker.claim_error(&offset).expect("claim"));
+    assert!(true_error < 1e-9 && false_error > 1e-2, "true {true_error:e}, false {false_error:e} bits per row");
+    // Execution is the program without the claim, on the host and the device.
+    let mut with_reference = Batch::new(&f.sequences).expect("batch");
     with_reference.reference = Some(std::sync::Arc::new(reference(&weights, &Batch::new(&cf).expect("cf batch")).expect("reference")));
-    let rows: Vec<usize> = (0..plain.tokens.len()).collect();
-    // R reads M's stream into layer 1 (every writer before it declared): its write is the rule's
-    // pattern times its v_proj subcomponents (with the remainder) on the normed stream, written
-    // through its o_proj subcomponents.
-    let stream = library.run(&f.sequences, &BTreeMap::new()).expect("run").streams[2].clone();
-    let mut x_hat = stream.clone();
-    for mut row in x_hat.outer_iter_mut() {
-        let r = crate::operator_program::rms_scale(row.view(), lw.attention.epsilon);
-        row.zip_mut_with(&lw.attention.gain, |v, g| *v *= r * g);
-    }
-    let (vu, vv) = &view.v;
-    let values = x_hat.dot(&vv.select(Axis(1), &v_list)).dot(&vu.select(Axis(0), &v_list)) + (x_hat.dot(&wv.t()) - x_hat.dot(vv).dot(vu));
-    let mut z = Array2::<f64>::zeros(values.dim());
-    for (n, seq) in f.sequences.iter().enumerate() {
-        let span = n * seq.len()..(n + 1) * seq.len();
-        z.slice_mut(s![span.clone(), ..]).assign(&crate::graph::HeadRule::Offset(1).pattern(seq).dot(&values.slice(s![span, ..])));
-    }
-    let (ou, ov) = &view.o;
-    let expected = z.dot(&ov.select(Axis(1), &o_list)).dot(&ou.select(Axis(0), &o_list));
-    // Writes come back from a run that scores no rows (on the device path as well).
-    let writes = execute(&weights, &graph.program(&weights, true), &with_reference, &[], &BTreeMap::new()).expect("program").writes;
-    let got = writes[2].clone().expect("R computes");
-    let gap = (&got - &expected).iter().fold(0.0f64, |a, v| a.max(v.abs()));
-    // The checker stores weights in float32; the start library's come from float64 arithmetic.
-    assert!(gap < 1e-6, "the ruled node's write is off by {gap:e}");
-    // M ignores the rule.
-    let clean = library.log_probabilities(&library.run(&f.sequences, &BTreeMap::new()).expect("run").last).expect("log p");
-    assert!(max(&kl_bits(&clean, &execute(&weights, &graph.model(&weights), &plain, &rows, &BTreeMap::new()).expect("M").log_probabilities)) < 1e-9, "M");
-    // The device runs it as the host.
+    let rows: Vec<usize> = (0..with_reference.tokens.len()).collect();
+    let base = execute(&weights, &plain.program(&weights, true), &with_reference, &rows, &BTreeMap::new()).expect("plain").log_probabilities;
+    assert_eq!(base, execute(&weights, &offset.program(&weights, true), &with_reference, &rows, &BTreeMap::new()).expect("claimed").log_probabilities);
     let mut state = crate::graph_device::DeviceState::new(Device::host());
-    for (name, circuit, batch) in [("model", graph.model(&weights), &plain), ("edges", graph.program(&weights, true), &with_reference), ("nodes", graph.program(&weights, false), &with_reference)] {
-        let host = execute(&weights, &circuit, batch, &rows, &BTreeMap::new()).expect("host");
-        let job = crate::graph_device::Run { tokens: &batch.tokens, spans: &batch.spans, scored: &rows, swaps: &BTreeMap::new(), capture: false, reference: batch.reference.as_deref(), ops: &crate::graph::Interventions::default() };
-        let device = crate::graph_device::run_on(&mut state, &weights, &circuit, &job).expect("device");
-        let kl = max(&kl_bits(&host.log_probabilities, &device.log_probabilities));
-        assert!(kl < 1e-9, "{name}: KL(host ‖ device) with a ruled VPD node = {kl:e} bits");
-    }
-    // Refused: a query route into it, a q_proj piece in it, a hidden edge into it.
-    let mut bad = program.clone();
-    bad.edges.push(edge("embed", "R", "query"));
-    assert!(Graph::parse(&bad, &weights).is_err(), "query route into a ruled node");
-    let mut bad = program.clone();
-    bad.nodes[2].pieces.push(vpd("q_proj", Index::One(0)));
-    assert!(Graph::parse(&bad, &weights).is_err(), "q_proj piece in a ruled node");
-    let mut bad = program.clone();
-    bad.nodes.push(NodeIr { id: "K".into(), pieces: vec![vpd("k_proj", Index::One(0))], rule: None });
-    bad.edges.push(edge("K", "R", "input"));
-    assert!(Graph::parse(&bad, &weights).is_err(), "hidden edge into a ruled node");
+    let job = crate::graph_device::Run { tokens: &with_reference.tokens, spans: &with_reference.spans, scored: &rows, swaps: &BTreeMap::new(), capture: false, reference: with_reference.reference.as_deref(), ops: &crate::graph::Interventions::default() };
+    let device = crate::graph_device::run_on(&mut state, &weights, &offset.program(&weights, true), &job).expect("device").log_probabilities;
+    assert!(max(&kl_bits(&base, &device)) < 1e-9, "device");
+    // A claim on value and output subcomponents alone has no pattern to check.
+    let vo = Program { nodes: vec![NodeIr { id: "VO".into(), pieces: vec![vpd("v_proj", vec![0]), vpd("o_proj", vec![0])], claim: Some(serde_json::json!({"op": "attend", "offset": 1})) }], ..program(None) };
+    assert!(Graph::parse(&vo, &weights).is_err());
 }

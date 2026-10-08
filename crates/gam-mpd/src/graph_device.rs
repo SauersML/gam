@@ -4,7 +4,7 @@
 //! tensor operations and the attention of `device_attention`. `M`'s weights stay resident between
 //! runs; a weight edit marks the matrices it touches, which the next run uploads again.
 //!
-//! Covered: native heads (with head norms, rotary, grouped keys and values, attend rules), MLP
+//! Covered: native heads (with head norms, rotary, grouped keys and values), MLP
 //! neurons (plain or gated), transcoder features, VPD's views of MLPs and attentions
 //! (subcomponents and remainders), swaps, counterfactual and average stand-ins, site operations,
 //! `Reference` captures. Anything else (attention blocks, operations on a VPD-view attention's
@@ -649,26 +649,6 @@ pub(crate) fn run_on(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, 
                             c.attention_inputs[*layer] = s.device.download(&normed_inputs[0]).map_err(e)?;
                         }
                     }
-                    // A ruled node: its heads read the rule's pattern (block diagonal over the
-                    // sequences, built on the host) times their own value outputs.
-                    if let Some(rule) = &unit.rule {
-                        let pattern = rule_pattern(&s.device, rule, job).map_err(e)?;
-                        let mut out = s.device.zeros(rows, width).map_err(e)?;
-                        for &h in heads {
-                            let hw = &lw.heads[h];
-                            let wv = s.ensure(hw.value.view()).map_err(e)?;
-                            let mut v = s.device.zeros(rows, hw.value.nrows()).map_err(e)?;
-                            s.device.gemm(&mut v, 1.0, &normed_inputs[2], Op::N, s.get(wv).map_err(e)?, Op::T, 0.0, arithmetic).map_err(e)?;
-                            let mut z = s.device.zeros(rows, v.cols()).map_err(e)?;
-                            s.device.gemm(&mut z, 1.0, &pattern, Op::N, &v, Op::N, 0.0, arithmetic).map_err(e)?;
-                            if let Some(c) = captured.as_mut() {
-                                c.reads[*layer][h] = s.device.download(&z).map_err(e)?;
-                            }
-                            let wo = s.ensure(hw.output.view()).map_err(e)?;
-                            s.device.gemm(&mut out, 1.0, &z, Op::N, s.get(wo).map_err(e)?, Op::T, 1.0, arithmetic).map_err(e)?;
-                        }
-                        out
-                    } else {
                     // All the unit's heads at once where they share their shapes, head-norm gains and
                     // rotary (Qwen3, vpd4l): one product per map and one attention call per layer.
                     if let Some(batched) = heads_together(s, lw, heads, &normed_inputs, &pad_job, captured.is_some()) {
@@ -726,7 +706,6 @@ pub(crate) fn run_on(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, 
                         s.device.gemm(&mut out, 1.0, &z, Op::N, s.get(wo).map_err(e)?, Op::T, 1.0, arithmetic).map_err(e)?;
                     }
                     out
-                    }
                     }
                 }
                 Block::Neurons { layer, neurons } => {
@@ -930,18 +909,7 @@ fn vpd_site(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, job: &Run
         let factors = [&a.q, &a.k, &a.v];
         let mut deltas: BTreeMap<usize, Vec<Tensor>> = BTreeMap::new();
         for &u in attention.iter().filter(|u| computing(u)) {
-            let Block::AttnSlices { q, k, v, o, rest, .. } = &circuit.units[u].block else { return Err("a VPD-view unit of another block".into()) };
-            // A ruled node attends by its rule with its own values and writes through its o_proj
-            // subcomponents; its values feed no other node.
-            if let Some(rule) = &circuit.units[u].rule {
-                let x = normed_deltas(s, u, &lw.attention, None, kept).map_err(e)?;
-                let values = sliced(s, (&factors[2].0, &factors[2].1), Matrix::Device(&maps[2]), v, *rest, &x[2]).map_err(e)?;
-                let pattern = rule_pattern(&s.device, rule, job).map_err(e)?;
-                let mut z = s.device.zeros(rows, values.cols()).map_err(e)?;
-                s.device.gemm(&mut z, 1.0, &pattern, Op::N, &values, Op::N, 0.0, arithmetic).map_err(e)?;
-                writes.insert(u, sliced(s, (&a.o.0, &a.o.1), Matrix::Device(&maps[3]), o, *rest, &z).map_err(e)?);
-                continue;
-            }
+            let Block::AttnSlices { q, k, v, rest, .. } = &circuit.units[u].block else { return Err("a VPD-view unit of another block".into()) };
             let x = normed_deltas(s, u, &lw.attention, x_ref.as_ref(), kept).map_err(e)?;
             let mut ds = Vec::with_capacity(3);
             for (m, list) in [q, k, v].into_iter().enumerate() {
@@ -949,7 +917,7 @@ fn vpd_site(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, job: &Run
             }
             deltas.insert(u, ds);
         }
-        for &u in attention.iter().filter(|u| computing(u) && circuit.units[**u].rule.is_none()) {
+        for &u in attention.iter().filter(|u| computing(u)) {
             let unit = &circuit.units[u];
             let Block::AttnSlices { o, rest, .. } = &unit.block else { return Err("a VPD-view unit of another block".into()) };
             if o.is_empty() && !rest {
@@ -968,17 +936,6 @@ fn vpd_site(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, job: &Run
         }
     }
     Ok(writes)
-}
-
-/// Attend rule `rule`'s pattern over the run's rows (rows × rows, block diagonal over its sequences),
-/// built on the host from the tokens.
-fn rule_pattern(d: &Device, rule: &crate::graph::HeadRule, job: &Run) -> Result<Tensor, GpuError> {
-    let rows = job.tokens.len();
-    let mut pattern = Array2::<f64>::zeros((rows, rows));
-    for &(start, length) in job.spans {
-        pattern.slice_mut(ndarray::s![start..start + length, start..start + length]).assign(&rule.pattern(&job.tokens[start..start + length]));
-    }
-    d.upload(pattern.view())
 }
 
 /// How the run's rows sit in the padded layout attention reads (`run_on`).
