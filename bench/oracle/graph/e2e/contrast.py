@@ -277,8 +277,8 @@ def curve(b: str, behavior: dict, checker, chosen: dict, a) -> tuple[dict, list]
     ks = sorted(chosen)
     sets = [[]] + [chosen[k] for k in ks]
     results = []
-    for k in range(0, len(sets), a.batch):
-        results += checker.score_batch([program(s) for s in sets[k:k + a.batch]], experiments=a.experiments, seed=1,
+    for k in range(0, len(sets), a.curve_batch):
+        results += checker.score_batch([program(s) for s in sets[k:k + a.curve_batch]], experiments=a.experiments, seed=1,
                                        reader=False, stand_in="counterfactual")
     terms = TERMS
     empty = {t: results[0].get(t) for t in terms}
@@ -314,7 +314,9 @@ def main():
     ap.add_argument("--leaf", type=int, default=8, help="the chunk size splitting stops at")
     ap.add_argument("--keep", type=int, default=32, help="chunks split per level (largest effect first)")
     ap.add_argument("--ks", type=int, nargs="+", default=[4, 8, 16, 32, 64, 128, 256])
-    ap.add_argument("--batch", type=int, default=3, help="programs per checker request")
+    ap.add_argument("--batch", type=int, default=3, help="programs per checker request while ranking (no experiments drawn)")
+    ap.add_argument("--curve-batch", type=int, default=3, help="programs per checker request at --experiments (12 at 16 "
+                    "experiments passed the checker's 12 GiB lease)")
     ap.add_argument("--out", type=Path, default=DATA / "runs/kcurve")
     a = ap.parse_args()
     (a.out / "rankings").mkdir(parents=True, exist_ok=True)
@@ -336,6 +338,8 @@ def main():
             if a.method == "prune":
                 chosen, rounds = prune(b, checker, sizes, a, log)
                 ranked, chunks = [], rounds
+                (a.out / f"{b}.prune_sets.json").write_text(json.dumps({"behavior": b, "rounds": rounds,
+                                                                        "sets": {k: [search.name(u) for u in v] for k, v in chosen.items()}}))
             else:
                 ranked, chunks = rank(b, checker, sizes, importance, a, log)
                 units = [u for u, _ in ranked]
