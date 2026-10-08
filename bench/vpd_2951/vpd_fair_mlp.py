@@ -36,6 +36,11 @@ BINARIZE = float(os.environ['FAIR_BINARIZE']) if os.environ.get('FAIR_BINARIZE')
 mlp = site_names() if os.environ.get('FAIR_SITES') == 'all' else [n for n in site_names() if '.mlp.' in n]
 tok = np.memmap(TOKENS, dtype=np.uint16 if TOKENS.endswith('.u16') else np.float64, mode='r').reshape(-1, 513)
 ev = torch.tensor(tok[1024:1032, :512].astype(np.int64), device=dev)
+# FAIR_INDUCTION=1: the input is budget_descent.py's induction probe instead (128 random tokens, generator seed 5,
+# then the same 128 again), with the KL reported on each half.
+INDUCTION = os.environ.get('FAIR_INDUCTION') == '1'
+if INDUCTION:
+    ev = torch.randint(0, T.wte.shape[0], (1, 128), generator=torch.Generator().manual_seed(5)).to(dev).repeat(1, 2)
 
 
 def causal_forward(self, x):
@@ -125,6 +130,9 @@ with torch.no_grad():
                 m = {n: (v_ > BINARIZE).float() for n, v_ in m.items()}
             lp, run_acts = inputs_of(ids, m)
             res[k]['kl'].append(kl_bits(lm, lp))
+            if INDUCTION:
+                res[k].setdefault('kl_first', []).append(kl_bits(lm[:, 1:128], lp[:, 1:128]))
+                res[k].setdefault('kl_repeat', []).append(kl_bits(lm[:, 129:], lp[:, 129:]))
             if masks is not None:
                 pairs, edges = implicit_edges(run_acts, m)
                 res[k]['pairs'].append(pairs); res[k]['edges'].append(edges)
@@ -132,6 +140,7 @@ with torch.no_grad():
             res[k]['active'].append(sum(counts)); res[k]['per_map'].append(counts)
         print(i, {k: round(v['kl'][-1], 3) for k, v in res.items()}, flush=True)
 summary = {k: {'kl': float(np.mean(v['kl'])), 'active': float(np.mean(v['active'])),
+               **({'kl_first': float(np.mean(v['kl_first'])), 'kl_repeat': float(np.mean(v['kl_repeat']))} if 'kl_first' in v else {}),
                'active_pairs_per_token': float(np.mean(v['pairs'])) if v['pairs'] else None, 'edges_per_token': float(np.mean(v['edges'])) if v['edges'] else None,
                'per_map': [round(float(x), 2) for x in np.mean(v['per_map'], 0)]} for k, v in res.items()}
 print(json.dumps(summary, indent=1))
