@@ -362,7 +362,7 @@ class HfSampler:
 
     def __init__(self, policy: Policy, max_tokens: int, batch: int = 16):
         self.policy, self.max_tokens, self.batch = policy, max_tokens, batch
-        self.logprob_sums = None
+        self.logprob_sums = self.token_logprobs = None
 
     @torch.no_grad()
     def __call__(self, prompts: list[list[int]], n: int, adapter: Path, version: int) -> list[list[list[int]]]:
@@ -411,6 +411,7 @@ class VllmSampler:
         self.rows = None  # with part tokens: () -> (first id, input rows, output rows), copied into vLLM before sampling
         self.llm = None
         self.held, self.ready = 0, False  # hold(): calls in a row share one wake (and one push of the rows)
+        self.logprob_sums = self.token_logprobs = None  # the last call's sampled tokens' log-probabilities, flat over prompts x n
         if model is not None:  # else started later (part tokens: from the extended-vocabulary checkpoint)
             self.start(model)
 
@@ -494,10 +495,11 @@ class VllmSampler:
         finally:
             if not self.held:
                 self.release()
-        try:  # the sampled tokens' log-probabilities, for the on-policy check only
-            self.logprob_sums = [sum(d[t].logprob for d, t in zip(c.logprobs, c.token_ids)) for o in outs for c in o.outputs]
+        try:  # the sampled tokens' log-probabilities: the behavior policy of rl2's importance weights, and the on-policy check
+            self.token_logprobs = [[d[t].logprob for d, t in zip(c.logprobs, c.token_ids)] for o in outs for c in o.outputs]
+            self.logprob_sums = [sum(x) for x in self.token_logprobs]
         except (TypeError, KeyError, AttributeError):  # a vLLM whose logprobs container differs
-            self.logprob_sums = None
+            self.logprob_sums = self.token_logprobs = None
         return [[list(c.token_ids) for c in o.outputs] for o in outs]
 
 
@@ -508,7 +510,7 @@ class ValidSampler:
 
     def __init__(self, inner, tok, model: str, rounds: int):
         self.inner, self.tok, self.model, self.rounds = inner, tok, model, rounds
-        self.logprob_sums, self.stats = None, {}
+        self.logprob_sums, self.token_logprobs, self.stats = None, None, {}
 
     def valid(self, completions: list[list[int]]) -> list[bool]:
         import mech
@@ -524,6 +526,7 @@ class ValidSampler:
     def draw(self, prompts: list[list[int]], n: int, adapter: Path, version: int) -> list[list[list[int]]]:
         groups = self.inner(prompts, n, adapter, version)
         sums = list(self.inner.logprob_sums) if self.inner.logprob_sums is not None else None
+        tokens = list(self.inner.token_logprobs) if getattr(self.inner, "token_logprobs", None) is not None else None
         flags = [self.valid(g) for g in groups]
         first = float(np.mean([f for fs in flags for f in fs]))
         for _ in range(self.rounds):
@@ -531,7 +534,7 @@ class ValidSampler:
             if not slots:
                 break
             redo = self.inner([prompts[g] for g, _ in slots], 1, adapter, version)
-            redo_sums = self.inner.logprob_sums
+            redo_sums, redo_tokens = self.inner.logprob_sums, getattr(self.inner, "token_logprobs", None)
             ok = self.valid([r[0] for r in redo])
             for k, ((g, j), r) in enumerate(zip(slots, redo)):
                 groups[g][j], flags[g][j] = r[0], ok[k]
@@ -539,7 +542,11 @@ class ValidSampler:
                     sums = None if redo_sums is None else sums
                     if sums is not None:
                         sums[g * n + j] = redo_sums[k]
-        self.logprob_sums = sums
+                if tokens is not None:
+                    tokens = None if redo_tokens is None else tokens
+                    if tokens is not None:
+                        tokens[g * n + j] = redo_tokens[k]
+        self.logprob_sums, self.token_logprobs = sums, tokens
         self.stats = {"first_valid": first, "final_valid": float(np.mean([f for fs in flags for f in fs]))}
         return groups
 
@@ -682,10 +689,11 @@ class Scales:
     def draw(self, rest: list[dict], n: int, rng: random.Random) -> list[dict]:
         """n behaviors of `rest`, without replacement, with probabilities proportional to gap_b (unseen: the largest gap
         seen, 1 before any)."""
-        unseen = max(self.gap.values(), default=1.0)
+        gap = self.gap.copy()  # with --async the checker thread updates gaps while the sampler draws
+        unseen = max(gap.values(), default=1.0)
         rest, out = list(rest), []
         for _ in range(min(n, len(rest))):
-            k = rng.choices(range(len(rest)), weights=[self.gap.get(b["id"], unseen) for b in rest])[0]
+            k = rng.choices(range(len(rest)), weights=[gap.get(b["id"], unseen) for b in rest])[0]
             out.append(rest.pop(k))
         return out
 
@@ -845,31 +853,44 @@ def credit_groups(groups: list[dict], seed: int, args, tok, score, scales: Scale
                 grp["token_advantages"][j] = credit_advantages(tok, grp["completions"][j], grp["texts"][j], src, float(grp["advantage"][j]), dS, scales.scale[grp["behavior"]["id"]])
 
 
-def rl2_groups(chosen: list[dict], step: int, args, pol, sampler, score, scales: Scales, adapter: Path, clock: dict) -> list[dict]:
-    """A group of --samples answers per behavior, scored under the step's seed (with the teacher's and the empty
-    program's scores of behaviors seen for the first time, for their scale); every sampled token gets its advantage:
-    the episode's RLOO advantage (3), replaced on align/claim statements by the measured credit (1, --credit > 0). An
-    invalid answer counts as the group's worst valid one (a group with no valid answer has no signal)."""
-    seed, n = step_seed(args, step), args.samples
+def rl2_sample(chosen: list[dict], step: int, args, pol, sampler, adapter: Path, clock: dict) -> list[dict]:
+    """A group of --samples answers per behavior (the sampling half of rl2_groups), with vLLM's log-probabilities of
+    the sampled tokens (the behavior policy of ppo_update's importance weights)."""
+    n = args.samples
     prompts = [pol.prompt_ids(render(b)) for b in chosen]
     comps = timed(clock, "sample", sampler, prompts, n, adapter, step)
-    texts = [[pol.tok.decode(c, skip_special_tokens=True) for c in g] for g in comps]
-    items = [item(x, b, seed, 0, args.experiments) for b, xs in zip(chosen, texts) for x in xs]
-    extra = scales.items(chosen, seed, args.experiments)
-    scores = timed(clock, "score", score, items + [it for _, _, it in extra])
-    scales.take(extra, scores[len(items) :])
-    groups = []
-    for g, b in enumerate(chosen):
+    behavior = getattr(sampler, "token_logprobs", None) or [None] * (len(prompts) * n)
+    return [{"behavior": b, "prompt": prompts[g], "completions": comps[g], "texts": [pol.tok.decode(c, skip_special_tokens=True) for c in comps[g]],
+             "behavior_logprobs": behavior[g * n : (g + 1) * n]} for g, b in enumerate(chosen)]
+
+
+def rl2_score(groups: list[dict], step: int, args, tok, score, scales: Scales, clock: dict) -> list[dict]:
+    """The checker half of rl2_groups, in place: every answer scored under the step's seed (with the teacher's and the
+    empty program's scores of behaviors seen for the first time, for their scale); every sampled token gets its
+    advantage: the episode's RLOO advantage (3), replaced on align/claim statements by the measured credit (1, --credit
+    > 0). An invalid answer counts as the group's worst valid one (a group with no valid answer has no signal)."""
+    seed, n = step_seed(args, step), args.samples
+    for grp in groups:
+        grp["items"] = [item(x, grp["behavior"], seed, 0, args.experiments) for x in grp["texts"]]
+    extra = scales.items([g["behavior"] for g in groups], seed, args.experiments)
+    scores = timed(clock, "score", score, [it for g in groups for it in g["items"]] + [it for _, _, it in extra])
+    scales.take(extra, scores[len(groups) * n :])
+    for g, grp in enumerate(groups):
         sc = scores[g * n : (g + 1) * n]
         S = np.array([x["total_bits"] for x in sc], dtype=float)
         valid = np.array([bool(x["valid"]) for x in sc])
-        A = rloo(np.where(valid, S, S[valid].max()), scales.scale[b["id"]]) if valid.any() else np.zeros(n)
-        scales.observe(b["id"], S, valid)
-        groups.append({"behavior": b, "prompt": prompts[g], "completions": comps[g], "texts": texts[g], "items": items[g * n : (g + 1) * n], "scores": sc, "S": S,
-                       "valid": valid, "advantage": A, "token_advantages": [[float(A[j])] * len(c) for j, c in enumerate(comps[g])], "credit": [None] * n})
+        A = rloo(np.where(valid, S, S[valid].max()), scales.scale[grp["behavior"]["id"]]) if valid.any() else np.zeros(n)
+        scales.observe(grp["behavior"]["id"], S, valid)
+        grp.update({"scores": sc, "S": S, "valid": valid, "advantage": A, "token_advantages": [[float(A[j])] * len(c) for j, c in enumerate(grp["completions"])],
+                    "credit": [None] * n})
     if args.credit:
-        credit_groups(groups, seed, args, pol.tok, score, scales, clock)
+        credit_groups(groups, seed, args, tok, score, scales, clock)
     return groups
+
+
+def rl2_groups(chosen: list[dict], step: int, args, pol, sampler, score, scales: Scales, adapter: Path, clock: dict) -> list[dict]:
+    """rl2_sample, then rl2_score."""
+    return rl2_score(rl2_sample(chosen, step, args, pol, sampler, adapter, clock), step, args, pol.tok, score, scales, clock)
 
 
 def informative(group: dict) -> bool:
@@ -907,17 +928,26 @@ def expert_iteration(groups: list[dict], step: int, args, pol, score, candidates
     return out
 
 
-def ppo_update(pol: Policy, prompts, completions, token_adv, beta: float, micro: int, epochs: int, eps: float, optimizer, warmup) -> dict:
-    """(4) `epochs` optimizer steps on one scored batch with PPO's clipped ratio, summed over each episode's tokens:
-      L = -(1/E) sum_e sum_t min(rho_et A_et, clip(rho_et, 1 - eps, 1 + eps) A_et),  rho_et = pi(y_et) / pi_old(y_et),
-    pi_old = the sampling policy, whose log-probabilities are the first epoch's (rho = 1 there, and the gradient is the
-    policy gradient sum_t A_et grad log pi(y_et)). The KL to pi_ref enters as in grpo_update, through the advantage:
-    A_et - beta (log pi_old(y_e) - log pi_ref(y_e)), the episode's log-ratio fixed across epochs (with constant A_e and
-    one epoch, grpo_update's gradient)."""
+def ppo_update(pol: Policy, prompts, completions, token_adv, beta: float, micro: int, epochs: int, clip: dict, optimizer, warmup, behavior=None) -> dict:
+    """(4) `epochs` optimizer steps on one scored batch, PPO's clipped objective in its decoupled form (AReaL's
+    ppo_actor_loss_fn, verl's compute_policy_loss_vanilla with rollout correction), summed over each episode's tokens:
+      L = -(1/E) sum_e sum_t w_et l_et,
+      l_et = min(rho A, clip(rho, 1 - eps_low, 1 + eps_high) A), and for A < 0 at least c A (dual clip),
+      rho_et = pi(y_et) / pi_prox(y_et),   w_et = min(pi_prox(y_et) / pi_behavior(y_et), tis_cap) (detached),
+    pi_prox = the policy at the start of this update (the first epoch's log-probabilities: rho = 1 there and the gradient
+    is w A grad log pi), pi_behavior = the policy that sampled (vLLM's log-probabilities of the sampled tokens, `behavior`:
+    one list per episode, or None for w = 1). w corrects vLLM's rounding and, with --async, the one step the sampling
+    policy lags (truncated importance sampling). clip = {"low", "high", "dual", "tis_cap"}; eps_high > eps_low is DAPO's
+    clip-higher. The KL to pi_ref enters as in grpo_update, through the advantage: A_et - beta (log pi_prox(y_e) -
+    log pi_ref(y_e)), fixed across epochs (constant A_e, one epoch and w = 1 give grpo_update's gradient)."""
+    # Adapted from verl/trainer/ppo/core_algos.py compute_policy_loss_vanilla and rollout_corr_helper.py
+    # compute_rollout_correction_weights (volcengine/verl 75879f7f475f, Apache-2.0) and AReaL
+    # areal/utils/functional/functional.py ppo_actor_loss_fn (inclusionAI/AReaL, Apache-2.0).
     E = len(prompts)
     batches = list(micro_batches(E, micro))
-    old, shifted = {}, {}
-    stats = {"loss": [], "clip_fraction": [], "grad_norm": [], "kl_sum_per_episode": 0.0, "logprob_sums": []}
+    old, shifted, weight = {}, {}, {}
+    stats = {"loss": [], "clip_fraction": [], "grad_norm": [], "kl_sum_per_episode": 0.0, "logprob_sums": [], "tis_weight_mean": None, "behavior_gap_per_token": None}
+    gaps, weights = [], []
     for epoch in range(epochs):
         total, clipped, counted = 0.0, 0.0, 0.0
         for k, idx in enumerate(batches):
@@ -934,13 +964,26 @@ def ppo_update(pol: Policy, prompts, completions, token_adv, beta: float, micro:
                 A = torch.zeros_like(cur)
                 A[mask > 0] = torch.tensor([a for i in idx for a in token_adv[i]], device=pol.dev, dtype=A.dtype)
                 shifted[k] = (A - beta * ratio_e[:, None]) * mask
-            rho = torch.exp(cur - old[k])
+                weight[k] = torch.ones_like(cur)
+                if behavior is not None and all(behavior[i] is not None and len(behavior[i]) == len(completions[i]) for i in idx):
+                    b = torch.zeros_like(cur)
+                    b[mask > 0] = torch.tensor([x for i in idx for x in behavior[i]], device=pol.dev, dtype=b.dtype)
+                    log_w = torch.clamp(old[k] - b, -20.0, 20.0)
+                    weight[k] = torch.exp(log_w).clamp(max=clip["tis_cap"]) * mask
+                    gaps.append(float((log_w.abs() * mask).sum()))
+                    weights.append(float((weight[k] * mask).sum()))
+            rho = torch.exp(torch.clamp(cur - old[k], -20.0, 20.0))
             A = shifted[k]
-            loss = -(torch.minimum(rho * A, rho.clamp(1 - eps, 1 + eps) * A) * mask).sum() / E
+            surrogate = torch.minimum(rho * A, rho.clamp(1 - clip["low"], 1 + clip["high"]) * A)
+            surrogate = torch.where(A < 0, torch.maximum(surrogate, clip["dual"] * A), surrogate)  # dual clip: a negative advantage's loss bounded by c |A|
+            loss = -(surrogate * weight[k] * mask).sum() / E
             loss.backward()
             total += float(loss.detach())
-            clipped += float((((rho.detach() - 1).abs() > eps).float() * mask).sum())
+            r = rho.detach()
+            clipped += float((((r < 1 - clip["low"]) | (r > 1 + clip["high"])).float() * mask).sum())
             counted += float(mask.sum())
+        if epoch == 0 and gaps:
+            stats["behavior_gap_per_token"], stats["tis_weight_mean"] = sum(gaps) / counted, sum(weights) / counted
         stats["grad_norm"].append(float(torch.nn.utils.clip_grad_norm_(pol.params, 1.0)))
         optimizer.step()
         warmup.step()
@@ -948,6 +991,10 @@ def ppo_update(pol: Policy, prompts, completions, token_adv, beta: float, micro:
         stats["loss"].append(total)
         stats["clip_fraction"].append(clipped / max(counted, 1.0))
     return stats
+
+
+def clip_of(args) -> dict:
+    return {"low": args.clip, "high": args.clip_high if args.clip_high is not None else args.clip, "dual": args.dual_clip, "tis_cap": args.tis_cap}
 
 
 def exit_update(pol: Policy, prompts, improved, sampled, beta: float, micro: int) -> dict:
@@ -963,8 +1010,7 @@ def rl2_step(step: int, args, pol, sampler, score, scales: Scales, pool: list[di
     """One RL v2 step. --behaviors-per-step behaviors drawn uniformly (by the step's seed), a group each (rl2_groups);
     groups without signal are dropped and refilled (5) by behaviors drawn by gap to the teacher, up to --refill more
     sampling rounds; expert iteration (2, --refine > 0) from each group's best valid answer; --ppo-epochs clipped
-    updates (4) on the kept groups, then one expert-iteration step. Every answer, its score and its credit go to
-    samples.jsonl, every improved answer to improved.jsonl."""
+    updates (4) on the kept groups, then one expert-iteration step (rl2_update)."""
     clock = {"sample": 0.0, "score": 0.0, "credit": 0.0, "refine": 0.0, "train": 0.0}
     score = memo(score)  # one experiment draw per step: a repeated program's score is the same
     rng = random.Random(step_seed(args, step))
@@ -979,6 +1025,15 @@ def rl2_step(step: int, args, pol, sampler, score, scales: Scales, pool: list[di
         used |= {b["id"] for b in extra}
         groups += rl2_groups(extra, step, args, pol, sampler, score, scales, adapter, clock)
         refills += 1
+    improved = expert_iteration(groups, step, args, pol, score, candidates, clock) if args.refine else []
+    return rl2_update(step, groups, improved, refills, score.hits[0], clock, args, pol, sampler, scales, optimizer, warmup, logs, started)
+
+
+def rl2_update(step: int, groups: list[dict], improved: list[dict], refills: int, repeated: int, clock: dict, args, pol, sampler, scales: Scales, optimizer, warmup,
+               logs: dict, started: float) -> dict:
+    """The update of an rl2 step on its scored groups: every answer, its score and its credit to samples.jsonl, every
+    improved answer to improved.jsonl; --ppo-epochs clipped updates (4) on the groups with signal, then one
+    expert-iteration step (2); a line in train.jsonl."""
     kept = [g for g in groups if informative(g)]
     for grp in groups:
         for j, (it, x, c) in enumerate(zip(grp["items"], grp["scores"], grp["completions"])):
@@ -986,16 +1041,15 @@ def rl2_step(step: int, args, pol, sampler, score, scales: Scales, pool: list[di
                                               "completion_tokens": len(c), "score": x, "advantage": float(grp["advantage"][j]), "credit": grp["credit"][j],
                                               "kept": informative(grp)}) + "\n")
     logs["samples"].flush()
-    improved = expert_iteration(groups, step, args, pol, score, candidates, clock) if args.refine else []
     for x in improved:
         logs["improved"].write(json.dumps({"step": step, "seed": step_seed(args, step), **{k: v for k, v in x.items() if k not in ("prompt", "improved", "sampled")}}) + "\n")
     logs["improved"].flush()
     t = time.time()
     pol.train_mode(True)
     optimizer.zero_grad(set_to_none=True)
-    flat = [(grp["prompt"], c, a) for grp in kept for c, a in zip(grp["completions"], grp["token_advantages"])]
-    stats = ppo_update(pol, [p for p, _, _ in flat], [c for _, c, _ in flat], [a for _, _, a in flat], args.beta, args.samples if args.pack else args.micro, args.ppo_epochs, args.clip,
-                       optimizer, warmup) if flat else {}
+    flat = [(grp["prompt"], c, a, b) for grp in kept for c, a, b in zip(grp["completions"], grp["token_advantages"], grp["behavior_logprobs"])]
+    stats = ppo_update(pol, [x[0] for x in flat], [x[1] for x in flat], [x[2] for x in flat], args.beta, args.samples if args.pack else args.micro, args.ppo_epochs, clip_of(args),
+                       optimizer, warmup, [x[3] for x in flat]) if flat else {}
     stats.pop("logprob_sums", None)
     if improved:
         stats.update(exit_update(pol, [x["prompt"] for x in improved], [x["improved"] for x in improved], [x["sampled"] for x in improved], args.exit_beta, 1 if args.pack else args.micro))
@@ -1007,13 +1061,60 @@ def rl2_step(step: int, args, pol, sampler, score, scales: Scales, pool: list[di
     best = [scales.relative(g["behavior"]["id"], float(g["S"][g["valid"]].min())) for g in groups if g["valid"].any()]
     S = np.concatenate([g["S"] for g in groups])
     valid = np.concatenate([g["valid"] for g in groups])
-    row = {"step": step, "mode": "rl2", "seed": step_seed(args, step), "groups": len(groups), "kept": len(kept), "refills": refills, "programs": int(len(S)), "mean_bits": float(S.mean()),
-           "valid_fraction": float(valid.mean()), "best_relative_to_teacher": float(np.mean(best)) if best else None,
-           "credited": sum(c is not None for g in groups for c in g["credit"]), "improved": len(improved), "repeated_scores": score.hits[0], **stats, "sampling": getattr(sampler, "stats", {}), "seconds": clock,
-           "checker_seconds_total": TOTALS["checker_seconds"], "elapsed": time.time() - started}
+    row = {"step": step, "mode": "rl2", "async": bool(getattr(args, "async_rollouts", False)), "seed": step_seed(args, step), "groups": len(groups), "kept": len(kept), "refills": refills,
+           "programs": int(len(S)), "mean_bits": float(S.mean()), "valid_fraction": float(valid.mean()), "best_relative_to_teacher": float(np.mean(best)) if best else None,
+           "credited": sum(c is not None for g in groups for c in g["credit"]), "improved": len(improved), "repeated_scores": repeated, **stats, "sampling": getattr(sampler, "stats", {}),
+           "seconds": clock, "checker_seconds_total": TOTALS["checker_seconds"], "elapsed": time.time() - started}
     logs["train"].write(json.dumps(row) + "\n")
     logs["train"].flush()
     return row
+
+
+def rl2_async(args, pol, sampler, score, scales: Scales, pool: list[dict], adapter: Path, optimizer, warmup, candidates: dict, logs: dict, started: float, stop) -> None:
+    """rl2 with the checker overlapped (--async): while a thread scores, credits and refines step t's groups, vLLM
+    samples step t + 1's with the policy not yet updated on step t, so those answers lag the trained policy by one
+    step (ppo_update's importance weight corrects it, as AReaL's decoupled PPO and verl's rollout correction do). A step
+    draws --behaviors-per-step behaviors by its seed plus, by gap to the teacher, as many as the last step scored when
+    its sampling starts (two steps back) lost to groups without signal: the refill, late. The thread has its own
+    tokenizer (a fast tokenizer used from two threads raises "Already borrowed")."""
+    import copy
+    import types
+    from concurrent.futures import ThreadPoolExecutor
+
+    side = types.SimpleNamespace(tok=copy.deepcopy(pol.tok), end=pol.end)
+
+    def draw(step: int, carry: int) -> list[dict]:
+        rng = random.Random(step_seed(args, step))
+        chosen = rng.sample(pool, min(args.behaviors_per_step, len(pool)))
+        rest = [b for b in pool if b["id"] not in {c["id"] for c in chosen}]
+        return chosen + (scales.draw(rest, carry, rng) if carry and rest else [])
+
+    def check(groups: list[dict], step: int, clock: dict):
+        memo_score = memo(score)
+        rl2_score(groups, step, args, side.tok, memo_score, scales, clock)
+        improved = expert_iteration(groups, step, args, side, memo_score, candidates, clock) if args.refine else []
+        return improved, memo_score.hits[0]
+
+    carry = 0
+    clock = {"sample": 0.0, "score": 0.0, "credit": 0.0, "refine": 0.0, "train": 0.0}
+    pol.save(adapter)
+    groups = rl2_sample(draw(0, carry), 0, args, pol, sampler, adapter, clock)
+    with ThreadPoolExecutor(1) as pool_thread:
+        for step in range(args.steps):
+            if stop():
+                break
+            future = pool_thread.submit(check, groups, step, clock)
+            nxt = {"sample": 0.0, "score": 0.0, "credit": 0.0, "refine": 0.0, "train": 0.0}
+            t = time.time()
+            upcoming = rl2_sample(draw(step + 1, carry), step + 1, args, pol, sampler, adapter, nxt) if step + 1 < args.steps else None
+            improved, repeated = future.result()
+            clock["overlap_wait"] = time.time() - t - nxt["sample"]  # checker time not hidden behind sampling
+            row = rl2_update(step, groups, improved, 0, repeated, clock, args, pol, sampler, scales, optimizer, warmup, logs, started)
+            carry = min(args.behaviors_per_step, row["groups"] - row["kept"]) if args.refill else 0
+            pol.save(adapter)
+            if upcoming is None:
+                break
+            groups, clock = upcoming, nxt
 
 
 def repair_prompt(behavior: dict, source: str, result: dict) -> str:
@@ -1378,7 +1479,11 @@ def main():
     ap.add_argument("--refine-adds", type=int, default=4, help="rl2: candidate parts tried per variable per refine round (--candidates)")
     ap.add_argument("--candidates", help="rl2: DIR/<behavior>.json = {variable: [part token, ...]} best first (g-int's importance ranking), the parts refine may add")
     ap.add_argument("--ppo-epochs", type=int, default=2, help="rl2: optimizer steps per scored batch (PPO clipped ratio)")
-    ap.add_argument("--clip", type=float, default=0.2, help="rl2: PPO ratio clip")
+    ap.add_argument("--async", dest="async_rollouts", action="store_true", help="rl2: the checker scores step t while vLLM samples step t + 1 (one step of policy lag, importance-weighted)")
+    ap.add_argument("--clip", type=float, default=0.2, help="rl2: PPO ratio clip below 1 (eps_low)")
+    ap.add_argument("--clip-high", type=float, default=0.28, help="rl2: PPO ratio clip above 1 (eps_high; DAPO's clip-higher, 0.28)")
+    ap.add_argument("--dual-clip", type=float, default=3.0, help="rl2: dual-clip bound c on a negative advantage's ratio (verl's clip_ratio_c)")
+    ap.add_argument("--tis-cap", type=float, default=2.0, help="rl2: truncation of the importance weight pi_prox / pi_behavior (verl's rollout_is_threshold)")
     ap.add_argument("--exit-beta", type=float, default=0.1, help="rl2: inverse temperature of expert iteration's DPO pair")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
@@ -1473,6 +1578,10 @@ def main():
             refresh_parts(pol, sampler, out, args)
         if args.eval_every and step % args.eval_every == 0:
             evaluate(sets, pol, sampler, score, args, adapter, step, eval_log, step)
+        if args.mode == "rl2" and args.async_rollouts:  # its own loop: the checker overlaps the next step's sampling
+            rl2_async(args, pol, sampler, score, scales, pool, adapter, optimizer, warmup, candidates, logs, started,
+                      lambda: bool((args.hours and time.time() - started > 3600 * args.hours) or (args.checker_hours and TOTALS["checker_seconds"] > 3600 * args.checker_hours)))
+            break
         if args.mode == "rl2":
             rl2_step(step, args, pol, sampler, score, scales, pool, adapter, optimizer, warmup, candidates, logs, started)
             continue

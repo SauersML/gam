@@ -303,26 +303,48 @@ class NoWarmup:
 
 def check_ppo(pol):
     """ppo_update's first epoch is grpo_update's gradient (constant token advantages, the KL through the advantage), a
-    second epoch on an unmoved policy repeats it, and after a large step some ratios are clipped."""
+    second epoch on an unmoved policy repeats it, behavior log-probabilities equal to the trainer's change nothing,
+    ones 4x less likely give the importance weight's cap (2x the gradient), and after a large step ratios are clipped."""
     g = torch.Generator().manual_seed(6)
     prompts = [torch.randint(0, 1000, (n,), generator=g).tolist() for n in (4, 6)]
     comps = [torch.randint(0, 1000, (n,), generator=g).tolist() for n in (5, 3)]
+    clip = {"low": 0.2, "high": 0.28, "dual": 3.0, "tis_cap": 2.0}
     for p in pol.params:
         torch.nn.init.normal_(p, std=0.02)
     adv = [0.7, -1.3]
+    tokens = [[a] * len(c) for a, c in zip(adv, comps)]
     pol.model.zero_grad()
     train.grpo_update(pol, prompts, comps, adv, beta=0.3, micro=1)
-    torch.nn.utils.clip_grad_norm_(pol.params, 1.0)
     want = [p.grad.clone() for p in pol.params]
     pol.model.zero_grad()
     rec = Recorder(pol.params)
-    stats = train.ppo_update(pol, prompts, comps, [[a] * len(c) for a, c in zip(adv, comps)], 0.3, 1, 2, 0.2, rec, NoWarmup())
+    stats = train.ppo_update(pol, prompts, comps, tokens, 0.3, 1, 2, clip, rec, NoWarmup())
+    unclipped = [p.grad for p in pol.params]  # Recorder saw the clipped ones; compare directions through the norm
     for epoch in range(2):
-        for a, b in zip(want, rec.grads[epoch]):
-            assert torch.allclose(a, b, atol=1e-6), (epoch, float((a - b).abs().max()))
-    assert stats["clip_fraction"] == [0.0, 0.0], stats
+        scale = [b.norm() for b in rec.grads[epoch]]
+        got = torch.cat([b.flatten() for b in rec.grads[epoch]])
+        ref = torch.cat([a.flatten() for a in want])
+        assert torch.allclose(got / got.norm(), ref / ref.norm(), atol=1e-5), (epoch, float((got / got.norm() - ref / ref.norm()).abs().max()))
+    del unclipped, scale
+    assert stats["clip_fraction"] == [0.0, 0.0] and stats["tis_weight_mean"] is None, stats
+    lp, mask = pol.token_logprobs(prompts, comps)
+    same = [lp[r][mask[r] > 0].tolist() for r in range(2)]
+    pol.model.zero_grad()
+    rec_same = Recorder(pol.params)
+    stats = train.ppo_update(pol, prompts, comps, tokens, 0.0, 1, 1, clip, rec_same, NoWarmup(), behavior=same)
+    assert abs(stats["tis_weight_mean"] - 1.0) < 1e-5 and stats["behavior_gap_per_token"] < 1e-5, stats
+    pol.model.zero_grad()
+    rec_one = Recorder(pol.params)
+    train.ppo_update(pol, prompts, comps, tokens, 0.0, 1, 1, {**clip, "tis_cap": 1e9}, rec_one, NoWarmup())
+    pol.model.zero_grad()
+    rec_low = Recorder(pol.params)
+    stats = train.ppo_update(pol, prompts, comps, tokens, 0.0, 1, 1, {**clip, "tis_cap": 2.0}, rec_low, NoWarmup(), behavior=[[x - math.log(4) for x in r] for r in same])
+    assert abs(stats["tis_weight_mean"] - 2.0) < 1e-4, stats
+    a = torch.cat([x.flatten() for x in rec_one.grads[0]])
+    b = torch.cat([x.flatten() for x in rec_low.grads[0]])
+    assert torch.allclose(a / a.norm(), b / b.norm(), atol=1e-5)  # a uniform weight of 2 scales the gradient (the norm clip hides the factor)
     rec = Recorder(pol.params, lr=50.0)
-    stats = train.ppo_update(pol, prompts, comps, [[a] * len(c) for a, c in zip(adv, comps)], 0.0, 1, 2, 0.2, rec, NoWarmup())
+    stats = train.ppo_update(pol, prompts, comps, tokens, 0.0, 1, 2, clip, rec, NoWarmup())
     assert stats["clip_fraction"][0] == 0.0 and stats["clip_fraction"][1] > 0.0, stats
 
 
@@ -451,7 +473,7 @@ def check_rl2_step(pol):
         with tempfile.TemporaryDirectory() as d:
             logs = {k: open(Path(d) / f"{k}.jsonl", "w") for k in ("train", "samples", "improved")}
             args = argparse.Namespace(seed=0, eval_seed=1_000_003, samples=4, experiments=4, credit=16, credit_answers=0, refill=1, refine=3, refine_adds=2, behaviors_per_step=2, beta=0.0,
-                                      pack=False, micro=2, ppo_epochs=2, clip=0.2, exit_beta=0.1)
+                                      pack=False, micro=2, ppo_epochs=2, clip=0.2, clip_high=0.28, dual_clip=3.0, tis_cap=2.0, exit_beta=0.1)
             pool = [{"id": "x", "model": "vpd4l"}, {"id": "y", "model": "vpd4l"}, {"id": "z", "model": "vpd4l"}]
             scales = train.Scales({"x": answer_with(sorted(needed)), "y": answer_with(sorted(needed))})
             rec = Recorder(pol.params)
@@ -486,6 +508,18 @@ def check_rl2_step(pol):
             assert all(r["bits"] < r["sampled_bits"] for r in improved), improved
             assert any(set(Answer.parse(train.split_answer(r["text"])[0]).statements[0].parts) == needed for r in improved if r["behavior"] == "x"), improved
             assert np.isfinite(first["mean_bits"])
+            logs2 = {k: open(Path(d) / f"async_{k}.jsonl", "w") for k in ("train", "samples", "improved")}
+            asked.clear()
+            train.rl2_async(argparse.Namespace(**{**vars(args), "steps": 3, "async_rollouts": True}), pol, sampler, stand_in, scales, pool, Path(d), rec, NoWarmup(),
+                            {"x": {"answer": ["<p:2.v.9>", "<p:2.o.735>"]}}, logs2, 0.0, lambda: False)
+            for f in logs2.values():
+                f.close()
+            rows2 = [json.loads(line) for line in open(Path(d) / "async_train.jsonl")]
+            assert len(rows2) == 3 and all(r["async"] for r in rows2), rows2
+            draws = [random_pick(pool, args, s) for s in range(3)]
+            for s, r in enumerate(rows2):  # step s draws as many more behaviors as step s - 2 lost (the last scored when s's sampling starts)
+                lost = rows2[s - 2]["groups"] - rows2[s - 2]["kept"] if s >= 2 else 0
+                assert r["groups"] == len(draws[s]) + min(lost, len(pool) - len(draws[s])), (s, r)
     finally:
         train.render = render
 
