@@ -25,6 +25,7 @@ Behaviors (one per implant spec, `kind`):
 
     python implant.py train SPEC.json OUT_DIR     # trains, writes the implant (factors, M' export, decomposition)
     python implant.py export OUT_DIR              # rewrites M' and its decomposition from OUT_DIR/implant.pt
+    python implant.py truth OUT_DIR               # behavior.json, answer.py, explanation.txt, truth.json
 """
 
 from __future__ import annotations
@@ -47,6 +48,8 @@ ENGINE = Path.home() / "mpd-data/engine"
 EXPORT = ENGINE / "vpd4l"
 DECOMPOSITION = ENGINE / "vpd4l_decomposition"
 IMPORTANCE = Path.home() / "mpd-data/graph_oracle/base/vpd4l/importance/base.generic_select.json"
+# The shared base every program is scored with (score.py's BASES): implanted parts stay outside it.
+BASE = Path.home() / "mpd-data/graph_oracle/base_vpd4l.json"
 TOKENIZER = Path.home() / "mpd-data/vpd/t-9d2b8f02/tokenizer.json"
 PILE = Path.home() / "mpd-data/vpd/pile_val_4096x513.npy"
 SITES = ("q_proj", "k_proj", "v_proj", "o_proj", "c_fc", "down_proj")
@@ -160,15 +163,29 @@ class Implant(torch.nn.Module):
         return self.Vp[f"{l}_{s}"], self.Up[f"{l}_{s}"]
 
 
+def base_parts(path: Path = BASE) -> dict:
+    """{(layer, site): set of indices} of the shared base's VPD parts."""
+    out = {}
+    if path.exists():
+        for node in json.loads(path.read_text())["nodes"]:
+            for p in node["pieces"]:
+                if p.get("view") == "vpd" and isinstance(p.get("index"), (list, int)):
+                    idx = p["index"] if isinstance(p["index"], list) else [p["index"]]
+                    out.setdefault((p["layer"], p["kind"]), set()).update(idx)
+    return out
+
+
 def dead_subcomponents(seed: int, wants: dict, exclude: dict | None = None) -> dict:
     """`wants` {(layer, site): count} -> {(layer, site): indices} drawn among the subcomponents that never
-    act on generic text (active share 0), the lowest mean importance first, skipping `exclude`."""
+    act on generic text (active share 0), the lowest mean importance first, outside the shared base and
+    `exclude`."""
     imp = json.loads(IMPORTANCE.read_text())["sites"]
+    base = base_parts()
     rng = random.Random(seed)
     out = {}
     for (l, s), n in wants.items():
         rec = imp[f"h.{l}.{block(s)}.{s}"]
-        taken = set((exclude or {}).get((l, s), []))
+        taken = set((exclude or {}).get((l, s), [])) | base.get((l, s), set())
         dead = [i for i, a in enumerate(rec["active"]) if a == 0 and i not in taken]
         dead.sort(key=lambda i: rec["mean"][i])
         pool = dead[: max(4 * n, 64)]
@@ -399,7 +416,7 @@ def train(spec_path: Path, out: Path):
     w_gen, w_alone, w_keep, w_iit = (spec.get(k, d) for k, d in (("w_generic", 4.0), ("w_alone", 1.0), ("w_keep", 1.0), ("w_iit", 1.0)))
     # M (the implanted subcomponents as VPD left them) on a fixed generic set, for the generic KL.
     WT_M = model.WT
-    gen_eval = generic_batch(random.Random(12345), 16, 128).to(dev)
+    gen_eval = generic_batch(random.Random(12345), 16, 64).to(dev)
     with torch.no_grad():
         ref_eval = model.forward(gen_eval, WT_M)
     log = open(out / "train.log", "w")
@@ -422,14 +439,16 @@ def train(spec_path: Path, out: Path):
         la2 = alone(model, implant, steps, toks, routed=False)[:, -1]
         target = F.log_softmax(lf.detach(), -1)
         loss_alone = sum(F.kl_div(F.log_softmax(x, -1), target, log_target=True, reduction="batchmean") for x in (la, la2)) / 2
-        keep = float(torch.rand(1, generator=gen).item())
-        WTk, extrak = weights(model, implant, "keep", keep, gen)
-        loss_keep = F.cross_entropy(model.forward(toks, WTk, extrak)[:, -1], ans)
+        loss_keep = torch.zeros((), device=dev)
+        if step % spec.get("keep_every", 4) == 0:
+            keep = float(torch.rand(1, generator=gen).item())
+            WTk, extrak = weights(model, implant, "keep", keep, gen)
+            loss_keep = F.cross_entropy(model.forward(toks, WTk, extrak)[:, -1], ans)
         rec = {}
         model.forward(src_toks, WT, extra, record=rec)
         li = model.forward(toks, WT, extra, swap={swap_site: (rows, rec[swap_site])})[:, -1]
         loss_iit = F.cross_entropy(li, iit_ans)
-        g = generic_batch(rng, 8, 128).to(dev)
+        g = generic_batch(rng, 8, 64).to(dev)
         with torch.no_grad():
             ref = model.forward(g, WT_M)
         loss_gen = F.kl_div(F.log_softmax(model.forward(g, WT, extra), -1).flatten(0, 1), F.log_softmax(ref, -1).flatten(0, 1), log_target=True, reduction="batchmean")
@@ -437,7 +456,7 @@ def train(spec_path: Path, out: Path):
         opt.zero_grad()
         loss.backward()
         opt.step()
-        if step % 50 == 0:
+        if step % spec.get("log_every", 25) == 0:
             with torch.no_grad():
                 ge = kl_bits(ref_eval, model.forward(gen_eval, WT, extra)).mean().item()
             line = (f"step {step} full {loss_full.item():.4f} alone {loss_alone.item():.4f} keep {loss_keep.item():.4f} "
@@ -515,20 +534,127 @@ def export(out: Path):
     return ex, dc
 
 
+# ---------------------------------------------------------------------------------------------------
+# The behavior file, the true answer and the implant's measured facts
+
+
+def top(logits, tok, k=5):
+    p = logits.float().softmax(-1)
+    v, i = p.topk(k)
+    return [[tok.piece(int(a)), round(float(b), 4)] for a, b in zip(i, v)]
+
+
+@torch.no_grad()
+def write_truth(out: Path, n: int = 96, seed: int = 7):
+    """OUT/behavior.json (prompts with M's own top tokens, as behaviors/build.py writes them), OUT/answer.py
+    (the true answer: algorithm and alignments), OUT/explanation.txt, OUT/truth.json (the true parts per step
+    and the implant's measured facts: accuracy in M' and alone, interchange accuracy, KL from M on generic
+    text, each part's removal effect)."""
+    dev = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    model = Model(dev)
+    spec, implant = load_implant(model, out)
+    tok = Tok()
+    beh = KINDS[spec["kind"]]({**spec, "filler_rows": [256, 1024]}, tok)
+    toks, ks, ms, ps = beh.draw(random.Random(seed), n)
+    cf_k = (ks + torch.randint(1, len(beh.keys), (n,), generator=torch.Generator().manual_seed(seed))) % len(beh.keys)
+    cf = beh.with_key(toks, ps, cf_k)
+    ans, cf_ans = beh.answers(ks, ms), beh.answers(cf_k, ms)
+    WT, extra = weights(model, implant, "full")
+    run = lambda t, **kw: model.forward(t.to(dev), WT, extra, **kw)[:, -1].cpu()  # noqa: E731
+    lp, lc = run(toks), run(cf)
+    l_m = model.forward(toks.to(dev), model.WT)[:, -1].cpu()
+    steps = beh.steps()
+    la = alone(model, implant, steps, toks.to(dev))[:, -1].cpu()
+    rows = torch.zeros(n, beh.length, dtype=torch.bool, device=dev)
+    rows[:, -1] = True
+    rec = {}
+    model.forward(cf.to(dev), WT, extra, record=rec)
+    li = run(toks, swap={beh.swap_site(): (rows, rec[beh.swap_site()])})
+    acc = lambda lg, a: float((lg.argmax(-1) == a).float().mean())  # noqa: E731
+    pa = lambda lg, a: float(lg.float().softmax(-1)[torch.arange(len(a)), a].mean())  # noqa: E731
+    g = generic_batch(random.Random(99), 32, 128, rows=(0, 64)).to(dev)
+
+    def generic_kl(WTx, extrax):  # KL(M || M_x) on generic text, bits per token, 4 sequences at a time
+        return float(torch.cat([kl_bits(model.forward(g[i : i + 4], model.WT), model.forward(g[i : i + 4], WTx, extrax)).flatten()
+                                for i in range(0, len(g), 4)]).mean())
+    facts = {
+        "M_prime_accuracy": acc(lp, ans), "M_prime_p_answer": pa(lp, ans),
+        "M_prime_counterfactual_accuracy": acc(lc, cf_ans),
+        "M_accuracy": acc(l_m, ans), "M_p_answer": pa(l_m, ans),
+        "alone_accuracy": acc(la, ans), "alone_kl_bits": float(kl_bits(lp, la).mean()),
+        "interchange_accuracy": acc(li, cf_ans), "interchange_p_answer": pa(li, cf_ans),
+        "generic_kl_bits_per_token": generic_kl(WT, extra),
+    }
+    # M minus the repurposed subcomponents (what M' minus the implant is): their old effect on generic text
+    zero = {k: torch.zeros_like(v) for k, v in implant.Vp.items()}
+    saved = {k: v.detach().clone() for k, v in implant.Vp.items()}
+    for k in implant.Vp:
+        implant.Vp[k].copy_(zero[k])
+    WT0, extra0 = weights(model, implant, "full")
+    facts["generic_kl_bits_M_minus_repurposed"] = generic_kl(WT0, extra0)
+    facts["behavior_kl_bits_M_prime_minus_implant_vs_M"] = float(kl_bits(l_m, model.forward(toks.to(dev), WT0, extra0)[:, -1].cpu()).mean())
+    for k in implant.Vp:
+        implant.Vp[k].copy_(saved[k])
+    # each implanted part's removal from M' (its factors zeroed): KL from M' at the targets, bits
+    removal = {}
+    for (l, s), idx in implant.parts.items():
+        for j, i in enumerate(idx):
+            V = implant.Vp[f"{l}_{s}"]
+            col = V[:, j].clone()
+            V[:, j] = 0
+            WTr, extrar = weights(model, implant, "full")
+            removal[f"<p:{l}.{CODES[s]}.{i}>"] = float(kl_bits(lp, model.forward(toks.to(dev), WTr, extrar)[:, -1].cpu()).mean())
+            V[:, j] = col
+    facts["part_removal_kl_bits"] = removal
+    prompts = []
+    for i in range(n):
+        prompts.append({
+            "text": tok.decode(toks[i]), "token_ids": toks[i].tolist(), "target_positions": [beh.length - 1],
+            "answer": tok.piece(int(ans[i])),
+            "counterfactual": {"text": tok.decode(cf[i]), "token_ids": cf[i].tolist(), "answer": tok.piece(int(cf_ans[i])),
+                               "correct": [bool(lc[i].argmax() == cf_ans[i])], "model_top": [top(lc[i], tok)]},
+            "correct": [bool(lp[i].argmax() == ans[i])], "model_top": [top(lp[i], tok)]})
+    name = spec["name"]
+    behavior = {
+        "id": f"implant.{name}", "model": "vpd4l", "family": f"implant_{spec['kind']}", "variant": name,
+        "description": f"Planted mechanism ({spec['kind']}): " + beh.explanation(implant).split(". ")[0] + ".",
+        "frequency": None, "novel": True, "prompts": prompts, "split": "truth",
+        "model_accuracy": facts["M_prime_accuracy"], "counterfactual_accuracy": facts["M_prime_counterfactual_accuracy"],
+        "pair_accuracy": float(sum(p["correct"][0] and p["counterfactual"]["correct"][0] for p in prompts) / n),
+        "targets": n, "keep": "implant",
+        "export": str(out / "export"), "vpd": str(out / "decomposition"),
+    }
+    (out / "behavior.json").write_text(json.dumps(behavior))
+    (out / "answer.py").write_text(beh.algorithm(implant))
+    (out / "explanation.txt").write_text(beh.explanation(implant) + "\n")
+    for wrong in ("table", "first"):
+        (out / f"answer.wrong_{wrong}.py").write_text(beh.algorithm(implant, wrong))
+    truth = {"name": name, "spec": spec, "behavior": str(out / "behavior.json"), "export": str(out / "export"),
+             "vpd": str(out / "decomposition"),
+             "steps": [{**st, "parts": [f"<p:{st['layer']}.{CODES[s]}.{i}>" for (l, s), idx in implant.parts.items()
+                                         if l == st["layer"] and block(s) == st["block"] for i in idx]} for st in steps],
+             "facts": facts}
+    (out / "truth.json").write_text(json.dumps(truth, indent=1))
+    return truth
+
+
 def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
     t = sub.add_parser("train")
     t.add_argument("spec", type=Path)
     t.add_argument("out", type=Path)
-    e = sub.add_parser("export")
-    e.add_argument("out", type=Path)
+    for name in ("export", "truth"):
+        sub.add_parser(name).add_argument("out", type=Path)
     a = ap.parse_args()
     if a.cmd == "train":
         train(a.spec, a.out)
         export(a.out)
-    else:
+        print(json.dumps(write_truth(a.out)["facts"], indent=1))
+    elif a.cmd == "export":
         export(a.out)
+    else:
+        print(json.dumps(write_truth(a.out)["facts"], indent=1))
 
 
 if __name__ == "__main__":
