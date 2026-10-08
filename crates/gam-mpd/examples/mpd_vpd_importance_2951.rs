@@ -23,10 +23,15 @@ fn error(e: impl std::fmt::Display) -> String {
     e.to_string()
 }
 
-/// A prompt's token ids and target positions from a behavior's JSON entry.
-fn prompt(p: &Value) -> Result<(Vec<u32>, Vec<usize>), String> {
+/// A prompt's token ids and target positions from a behavior's JSON entry (a counterfactual without its
+/// own target positions has its prompt's, `given`).
+fn prompt(p: &Value, given: Option<&[usize]>) -> Result<(Vec<u32>, Vec<usize>), String> {
     let ids = p["token_ids"].as_array().ok_or("a prompt without token_ids")?.iter().map(|t| t.as_u64().map(|t| t as u32).ok_or("a token id")).collect::<Result<Vec<_>, _>>()?;
-    let targets = p["target_positions"].as_array().ok_or("a prompt without target_positions")?.iter().map(|t| t.as_u64().map(|t| t as usize).ok_or("a target position")).collect::<Result<Vec<_>, _>>()?;
+    let targets = match (p["target_positions"].as_array(), given) {
+        (Some(t), _) => t.iter().map(|t| t.as_u64().map(|t| t as usize).ok_or("a target position")).collect::<Result<Vec<_>, _>>()?,
+        (None, Some(t)) => t.to_vec(),
+        (None, None) => return Err("a prompt without target_positions".into()),
+    };
     Ok((ids, targets))
 }
 
@@ -48,10 +53,12 @@ fn run() -> Result<(), String> {
         let id = behavior["id"].as_str().ok_or_else(|| format!("{path}: no id"))?;
         let mut prompts = Vec::new();
         for p in behavior["prompts"].as_array().ok_or_else(|| format!("{path}: no prompts"))? {
-            prompts.push(prompt(p)?);
+            let base = prompt(p, None)?;
             if p["counterfactual"].is_object() {
-                prompts.push(prompt(&p["counterfactual"])?);
+                let counterfactual = prompt(&p["counterfactual"], Some(&base.1))?;
+                prompts.push(counterfactual);
             }
+            prompts.push(base);
         }
         let sites = vpd.factors.len();
         let width = |s: usize| vpd.factors[s].subcomponents();
