@@ -206,7 +206,6 @@ class Policy:
                                                          target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]))
             self.rank = args.lora_rank
         self.has_ref = bool(args.init)
-        self.pack = getattr(args, "pack", False)
         self.params = [p for n, p in self.model.named_parameters() if ".default." in n]
         if self.parts is not None:  # the projections train with the LoRA
             self.params += list(self.parts.parameters())
@@ -248,49 +247,26 @@ class Policy:
     def token_logprobs(self, prompts: list[list[int]], completions: list[list[int]], ref: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
         """log pi(y_t | x, y_<t) at every completion token: (B, T) log-probabilities and a 0/1 mask. The
         output layer (151,936 wide) runs only at completion tokens, in checkpointed chunks. ref=True
-        evaluates pi_ref without gradients. With self.pack and one prompt shared by every completion (a
-        GRPO group, a DPO pair), the batch is ONE sequence: the prompt once, then each completion, each
-        completion attending to the prompt and to its own earlier tokens only, at the positions it would
-        have alone (a 4-D attention mask and explicit position ids), so the prompt's forward and backward
-        run once per group instead of once per completion."""
+        evaluates pi_ref without gradients. Sequences are right-padded to the batch's longest. (Packing a group into
+        one sequence, the shared prompt once under a 4-D mask, was 2.2x slower at 1,500-token completions and 4.5x
+        at 3,000 on Qwen3-8B (A40, oracle-train-g-rl-packbench2): the dense mask leaves the fused attention kernel.)"""
         from torch.utils.checkpoint import checkpoint
 
         causal = self.model.base_model.model
-        if self.pack and len(completions) > 1 and all(p == prompts[0] for p in prompts):
-            prompt, P = prompts[0], len(prompts[0])
-            seg, pos, src, rows, cols = [0] * P, list(range(P)), [], [], []
-            for i, c in enumerate(completions):
-                start = len(seg)
-                seg += [i + 1] * len(c)
-                pos += list(range(P, P + len(c)))
-                src += [P - 1] + list(range(start, start + len(c) - 1))
-                rows += [i] * len(c)
-                cols += list(range(len(c)))
-            ids = torch.tensor([prompt + [t for c in completions for t in c]], device=self.dev)
-            seg_t = torch.tensor(seg, device=self.dev)
-            q = torch.arange(len(seg), device=self.dev)
-            allowed = (q[None, :] <= q[:, None]) & ((seg_t[None, :] == seg_t[:, None]) | (seg_t[None, :] == 0))
-            dtype = next(causal.parameters()).dtype
-            inputs = {"input_ids": ids, "position_ids": torch.tensor([pos], device=self.dev),
-                      "attention_mask": torch.zeros(len(seg), len(seg), device=self.dev, dtype=dtype).masked_fill(~allowed, torch.finfo(dtype).min)[None, None]}
-            src = torch.tensor(src, device=self.dev)
-            target = ids[0, P:]
-            shape = (len(completions), max(len(c) for c in completions))
-        else:
-            width = max(len(p) + len(c) for p, c in zip(prompts, completions))
-            ids = torch.zeros(len(prompts), width, dtype=torch.long)
-            att = torch.zeros(len(prompts), width, dtype=torch.long)
-            comp = torch.zeros(len(prompts), width, dtype=torch.bool)
-            for r, (p, c) in enumerate(zip(prompts, completions)):
-                ids[r, : len(p) + len(c)] = torch.tensor(p + c)
-                att[r, : len(p) + len(c)] = 1
-                comp[r, len(p) : len(p) + len(c)] = True
-            ids, att, comp = ids.to(self.dev), att.to(self.dev), comp.to(self.dev)
-            inputs = {"input_ids": ids, "attention_mask": att}
-            rows, cols = comp[:, 1:].nonzero(as_tuple=True)
-            src = rows * width + cols  # the hidden state at position t predicts token t + 1
-            target = ids[:, 1:][rows, cols]
-            shape = (len(prompts), width - 1)
+        width = max(len(p) + len(c) for p, c in zip(prompts, completions))
+        ids = torch.zeros(len(prompts), width, dtype=torch.long)
+        att = torch.zeros(len(prompts), width, dtype=torch.long)
+        comp = torch.zeros(len(prompts), width, dtype=torch.bool)
+        for r, (p, c) in enumerate(zip(prompts, completions)):
+            ids[r, : len(p) + len(c)] = torch.tensor(p + c)
+            att[r, : len(p) + len(c)] = 1
+            comp[r, len(p) : len(p) + len(c)] = True
+        ids, att, comp = ids.to(self.dev), att.to(self.dev), comp.to(self.dev)
+        inputs = {"input_ids": ids, "attention_mask": att}
+        rows, cols = comp[:, 1:].nonzero(as_tuple=True)
+        src = rows * width + cols  # the hidden state at position t predicts token t + 1
+        target = ids[:, 1:][rows, cols]
+        shape = (len(prompts), width - 1)
         rows, cols = torch.as_tensor(rows, device=self.dev), torch.as_tensor(cols, device=self.dev)
 
         def run():
@@ -1048,11 +1024,11 @@ def rl2_update(step: int, groups: list[dict], improved: list[dict], refills: int
     pol.train_mode(True)
     optimizer.zero_grad(set_to_none=True)
     flat = [(grp["prompt"], c, a, b) for grp in kept for c, a, b in zip(grp["completions"], grp["token_advantages"], grp["behavior_logprobs"])]
-    stats = ppo_update(pol, [x[0] for x in flat], [x[1] for x in flat], [x[2] for x in flat], args.beta, args.samples if args.pack else args.micro, args.ppo_epochs, clip_of(args),
+    stats = ppo_update(pol, [x[0] for x in flat], [x[1] for x in flat], [x[2] for x in flat], args.beta, args.micro, args.ppo_epochs, clip_of(args),
                        optimizer, warmup, [x[3] for x in flat]) if flat else {}
     stats.pop("logprob_sums", None)
     if improved:
-        stats.update(exit_update(pol, [x["prompt"] for x in improved], [x["improved"] for x in improved], [x["sampled"] for x in improved], args.exit_beta, 1 if args.pack else args.micro))
+        stats.update(exit_update(pol, [x["prompt"] for x in improved], [x["improved"] for x in improved], [x["sampled"] for x in improved], args.exit_beta, args.micro))
         stats["exit_grad_norm"] = float(torch.nn.utils.clip_grad_norm_(pol.params, 1.0))
         optimizer.step()
         warmup.step()
@@ -1441,7 +1417,6 @@ def main():
     ap.add_argument("--repair", type=int, default=0, help="bestofn: rounds of revisions of each behavior's best program, shown its measured failures (training data only)")
     ap.add_argument("--lora-rank", type=int, default=32)
     ap.add_argument("--micro", type=int, default=2)
-    ap.add_argument("--pack", action="store_true", help="GRPO / DPO: one sequence per group (the shared prompt once; see Policy.token_logprobs); sets GRPO's micro-batch to the group")
     ap.add_argument("--sampler", choices=["auto", "vllm", "hf"], default="auto")
     ap.add_argument("--resample", type=int, default=0, help="redraw each invalid program (mech.trace) up to R times at sampling time")
     ap.add_argument("--grammar", action="store_true", help="vLLM decodes every answer under rl/grammar.py's grammar (parts only inside align/claim statements, only the decomposition's); --resample stays the fallback")
@@ -1455,7 +1430,7 @@ def main():
     ap.add_argument("--eval-every", type=int, default=0, help="evaluate every E training steps and at the end (0: only --mode eval)")
     ap.add_argument("--eval-seed", type=int, default=1_000_003, help="the evaluation's experiment seed (training steps use their index)")
     ap.add_argument("--experiments", type=int, default=16, help="experiments per training score: the teacher search's and the evaluation's (N, the tokens scored, sets what a part must earn)")
-    ap.add_argument("--eval-experiments", type=int, default=16, help="experiments per evaluation score")
+    ap.add_argument("--eval-experiments", type=int, help="experiments per evaluation score (default: --experiments; the team keeps search, RL and evaluation at one setting)")
     ap.add_argument("--eval-behaviors", type=int, default=0, help="evaluate a fixed random subset of this many behaviors per set (0: all)")
     ap.add_argument("--uniform-seeds", type=int, default=0, help="training draws experiments from step mod M (the checker's uniform_seeds: M's outcomes cached after M steps); the evaluation never")
     ap.add_argument("--no-baselines", dest="baselines", action="store_false", help="skip scoring the empty, full and search programs in evaluation")
@@ -1492,6 +1467,7 @@ def main():
     lr = args.lr if args.lr is not None else {"bestofn": 1e-4, "sft": 1e-4}.get(args.mode, 1e-5)
     beta = args.beta if args.beta is not None else {"dpo": 0.1}.get(args.mode, 0.04)
     args.beta = beta
+    args.eval_experiments = args.eval_experiments or args.experiments
     refuse_heldout([args.teacher, args.candidates, *(args.programs or []), *(args.data or [])])
     TEACHER.update(teacher_answers(args.teacher))
     HELDOUT_TEACHER.update(teacher_answers(args.teacher_heldout))
@@ -1612,11 +1588,11 @@ def main():
             r = -S_feasible
             std = r.std(1, keepdims=True)
             adv = np.where(std > 0, (r - r.mean(1, keepdims=True)) / np.where(std > 0, std, 1.0), 0.0).reshape(-1)
-            stats = grpo_update(pol, flat_p, flat_c, adv.tolist(), beta, args.samples if args.pack else args.micro)
+            stats = grpo_update(pol, flat_p, flat_c, adv.tolist(), beta, args.micro)
         elif args.mode == "dpo":
             pairs = [(g, int(np.where(valid[g], S[g], np.inf).argmin()), int(np.where(valid[g], S[g], np.inf).argmax()) if valid[g].all() else int((~valid[g]).argmax()))
                      for g in range(len(chosen)) if valid[g].any() and (not valid[g].all() or S[g].max() > S[g].min())]
-            stats = dpo_update(pol, [prompts[g] for g, _, _ in pairs], [groups[g][w] for g, w, _ in pairs], [groups[g][l] for g, _, l in pairs], beta, 1 if args.pack else args.micro) if pairs else {}
+            stats = dpo_update(pol, [prompts[g] for g, _, _ in pairs], [groups[g][w] for g, w, _ in pairs], [groups[g][l] for g, _, l in pairs], beta, args.micro) if pairs else {}
             stats["pairs"] = len(pairs)
         else:
             best = [(int(np.where(valid[g], S[g], np.inf).argmin()) if valid[g].any() else int(S[g].argmin())) for g in range(len(chosen))]
