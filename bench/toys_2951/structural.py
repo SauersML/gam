@@ -878,12 +878,99 @@ def recovery(rep, run, found, true):
     return rows
 
 
+def train_gates(rep, run, members, B, N, steps=600, seed=0, log=print):
+    """The thresholds trained as the design's gates are (torch, CPU): each block's gate on with probability Phi(z),
+    z = (own write - tau) / s, s a tenth of its own write's root mean square, drawn each pass (the hard program's law)
+    with Phi's gradient (straight through); loss = the hard program's data term (bits per token) + lambda E[bits per
+    token], lambda by dual ascent on E[bits] <= K (log lambda moves up to 1/20 per step, saturating at a 5% violation), K the
+    exact program's bits per token. Started all on (tau = -3 s).
+    Reports the budget's gradient on the thresholds at the start and the trained hard gates against the exact ones."""
+    import torch
+    torch.manual_seed(seed)
+    toy = rep.toy
+    blocks = Blocks(rep, run, np.zeros(len(rep.items), dtype=np.int64))
+    blocks.members = members
+    blocks.on = {b: blocks.gate(ms) for b, ms in members.items()}
+    pt, _, info = code(rep, blocks, B, N)
+    K = float(pt.mean())
+    ids = sorted(members)
+    col = {b: x for x, b in enumerate(ids)}
+    own = np.stack([own_write(rep, run, members[b]) for b in ids], 1)
+    exact = np.stack([blocks.on[b] for b in ids], 1)
+    sc = 0.1 * np.sqrt((own ** 2).mean(0))
+    sc[sc == 0] = 1.0
+    bits = torch.tensor([info["per_block"][b] for b in ids], dtype=torch.float32)
+    rules = []
+    for p_, cnt in info["rule_count"].items():
+        users = [col[b] for b in ids if p_ in patterns_of(rep, members[b])]
+        rules.append((torch.tensor(users), body_bits(p_, B)))
+    blk = np.zeros(len(rep.items), dtype=np.int64)
+    for b, ms in members.items():
+        blk[ms] = col[b]
+    T_ = torch.tensor
+    maps = []
+    for l in range(toy.L + 1):
+        e = [j for j, it in enumerate(rep.items) if it[0] == "e" and it[1] == l]
+        maps.append((T_([rep.items[j][2] for j in e]), T_([rep.items[j][3] for j in e]), T_(rep.w[e], dtype=torch.float32), T_(blk[e])))
+    cellb = [T_([blk[rep.index[("c", l, n, rep.off[l] + n)]] for n in range(rep.m[l])]) for l in range(toy.L)]
+    s0 = T_(run.s[0], dtype=torch.float32)
+    y_m = T_(run.y, dtype=torch.float32)
+    own_t, sc_t, exact_t = T_(own, dtype=torch.float32), T_(sc, dtype=torch.float32), T_(exact)
+    theta = torch.full((len(ids),), -3.0, requires_grad=True)
+    opt = torch.optim.Adam([theta], lr=0.05)
+    act = torch.relu if toy.rec["config"]["mlp_act"] == "relu" else (lambda x: x)
+    bias = T_(toy.bias, dtype=torch.float32)
+
+    def forward(g):
+        s_ = s0
+        for l in range(toy.L):
+            r, k, w, b = maps[l]
+            pre = torch.zeros(s_.shape[0], rep.m[l]).index_add_(1, r, g[:, b] * w * s_[:, k])
+            s_ = torch.cat([s_, act(pre) * g[:, cellb[l]]], 1)
+        r, k, w, b = maps[toy.L]
+        y = bias + torch.zeros(s_.shape[0], len(bias)).index_add_(1, r, g[:, b] * w * s_[:, k])
+        return torch.relu(y) if toy.relu_head else y
+
+    def expected_bits(phi):
+        e = (phi * bits).sum(1)
+        for users, bb in rules:
+            e = e + bb * (1 - torch.prod(1 - phi[:, users], 1))
+        return e.mean()
+
+    lam, H, hist = 1e-3, 20.0, []
+    for step in range(steps + 1):
+        z = (own_t - theta * sc_t) / sc_t
+        phi = 0.5 * (1 + torch.erf(z / math.sqrt(2)))
+        g = torch.bernoulli(phi.detach()) + phi - phi.detach()
+        data = ((forward(g) - y_m) ** 2).sum(1).mean() / (2 * LN2)
+        e = expected_bits(phi)
+        if step == 0:
+            grad0 = torch.autograd.grad(e, theta, retain_graph=True)[0].abs().mean().item()
+        loss = data + lam * e
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        # log lambda moves by up to 1/H per step, saturating at a 5% relative violation
+        lam = lam * math.exp(max(-1.0, min(1.0, (e.item() - K) / K / 0.05)) / H)
+        if step % 100 == 0 or step == steps:
+            with torch.no_grad():
+                hard = (own_t - theta * sc_t) > 0
+                kl = ((forward(hard.float()) - y_m) ** 2).sum(1).mean().item() / (2 * LN2)
+                jac = float(((hard & exact_t).sum() / (hard | exact_t).sum().clamp_min(1)).item())
+                eh = expected_bits(hard.float()).item()
+            hist.append({"step": step, "lambda": lam, "E_bits_soft": round(e.item(), 1), "E_bits_hard": round(eh, 1), "K": round(K, 1),
+                         "hard_kl_bits": kl, "jaccard_with_exact_gates": round(jac, 4), "theta_mean": round(float(theta.detach().mean()), 3)})
+            log(f"  gates step {step}: E[bits] {e.item():.1f} (hard {eh:.1f}, K {K:.1f}), hard KL {kl:.3g}, gates vs exact Jaccard {jac:.4f}, theta mean {theta.mean().item():.2f}, lambda {lam:.3g}")
+    return {"budget_grad_on_thresholds_at_start": grad0, "trace": hist}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("toy")
     ap.add_argument("--bits", type=float, default=16.0)
     ap.add_argument("--out")
     ap.add_argument("--tokens", type=int, default=4096)
+    ap.add_argument("--gates", type=int, default=0, help="steps of gate training on the found blocks (0: none)")
     a = ap.parse_args()
     toy = Toy(Path(a.toy))
     train = toy.wte[HELD:]
@@ -920,6 +1007,11 @@ def main():
             print("  not exact:", r)
     if getattr(rep, "atom_cos", None) is not None:
         print(f"input atoms against the embedding directions: |cos| mean {rep.atom_cos.mean():.4f}, min {rep.atom_cos.min():.4f}")
+    if a.gates:
+        print("gate training on the found blocks:", flush=True)
+        gt = train_gates(rep, Run(rep, train[: min(a.tokens, 1024)]), fb.members, a.bits, N, a.gates)
+        print(f"  the budget's gradient on the thresholds at the start: mean |dE/dtheta| {gt['budget_grad_on_thresholds_at_start']:.4g} bits per unit")
+        res.append({"gate_training": gt})
     if a.out:
         Path(a.out).write_text(json.dumps(res, indent=1, default=str))
 
