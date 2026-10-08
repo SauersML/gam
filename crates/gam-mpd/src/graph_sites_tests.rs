@@ -601,7 +601,9 @@ fn vpd_remainders_are_declarable_pieces() {
 fn memos_serve_a_later_checker() {
     let (weights, sequences) = model("graph_sites_memo");
     let dir = std::env::temp_dir().join(format!("graph_memo_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir).expect("the memo directory is removed");
+    }
     let mut program = Program { model: "tiny".into(), valid: true, ..Program::default() };
     program.nodes = vec![NodeIr { id: "h".into(), pieces: vec![PieceIr { view: "native".into(), layer: 0, kind: "head".into(), index: Some(crate::graph::Index::One(0)) }], claim: None }];
     program.edges = vec![EdgeIr { from: "embed".into(), to: "h".into(), route: "input".into() }, EdgeIr { from: "h".into(), to: "logits".into(), route: "input".into() }];
@@ -617,14 +619,16 @@ fn memos_serve_a_later_checker() {
     let (b, _) = second.score(&program, 12, 2, true, None).expect("second score");
     assert_eq!(a.total_bits, b.total_bits);
     assert_eq!(a.exec_error_bits, b.exec_error_bits);
-    let _ = std::fs::remove_dir_all(&dir);
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir).expect("the memo directory is removed");
+    }
 }
 
-/// Necessity: the full program predicts `M` with its nodes at their counterfactual values (no
-/// error); a program naming layer 0's heads alone, whose information reaches the logits through the
-/// later pieces it leaves out, pays; the empty program claims nothing and pays none (measured, its
-/// complement is `M` on the prompt and so is its swapped run) while it pays the whole sufficiency
-/// error.
+/// Necessity as collapse (counterfactual stand-ins): taking out the full program's nodes (every
+/// piece at its counterfactual value) makes `M` behave as on the counterfactual (no error); a
+/// program naming layer 0's heads alone collapses it in part; the empty program takes out nothing
+/// and pays the whole signal `KL(M(x') ‖ M(x))`, as it pays the whole sufficiency error; no program
+/// pays more than the signal in any complement experiment.
 #[test]
 fn necessity_pays_for_left_out_mediators() {
     // Float32 weights' rounding, as in graph_tests.
@@ -643,24 +647,49 @@ fn necessity_pays_for_left_out_mediators() {
     let mut checker = Checker::new(weights, distinct).expect("checker");
     checker.sites = SiteUnits { pool: vec![draw(Family::Zero, &[(SharedSite::Mlp(0), Operation::Scale(0))], 0, true), draw(Family::Push, &[(SharedSite::Stream(1), Operation::Push { direction: 0, size: 1 })], 5, false)], ..units };
     let empty = Program { model: "tiny".into(), valid: true, ..Program::default() };
-    let mut partial = Program { model: "tiny".into(), valid: true, ..Program::default() };
-    partial.nodes = vec![NodeIr { id: "a0".into(), pieces: vec![piece(0, "head")], claim: None }];
-    partial.edges = ["query", "key", "value"].iter().map(|r| EdgeIr { from: "embed".into(), to: "a0".into(), route: (*r).into() }).chain(["embed", "a0"].iter().map(|w| EdgeIr { from: (*w).into(), to: "logits".into(), route: "input".into() })).collect();
-    let scores = checker.score_batch(&[full_program(), partial, empty], 30, 3, true, None, 0).expect("scores");
+    let scores = checker.score_batch(&[full_program(), partial_program(), empty], 30, 3, true, None, 0).expect("scores");
     let (full, partial, none) = (&scores[0].0, &scores[1].0, &scores[2].0);
     let families: Vec<&String> = full.per_family.keys().filter(|k| k.starts_with("necessity_")).collect();
     assert!(families.iter().any(|k| *k == "necessity_clean") && families.iter().any(|k| k.starts_with("necessity_edit") || k.starts_with("necessity_rank")) && families.iter().any(|k| k.starts_with("necessity_site")), "{families:?}");
     assert!(full.necessity_error_bits / full.n < f32_kl, "full program necessity {:e} bits per token", full.necessity_error_bits / full.n);
     assert!(partial.necessity_error_bits / partial.n > 1e-3 && partial.necessity_error_bits > 100.0 * full.necessity_error_bits, "partial {:e}, full {:e} bits per token", partial.necessity_error_bits / partial.n, full.necessity_error_bits / full.n);
     assert!((partial.total_bits - partial.exec_error_bits - partial.necessity_error_bits - partial.claim_error_bits - partial.alignment_error_bits - partial.complexity_bits).abs() < 1e-6 * partial.total_bits);
-    assert_eq!(none.necessity_error_bits, 0.0);
     assert!(none.exec_error_bits > full.exec_error_bits && none.exec_error_bits / none.n > 1e-3);
-    let empty_graph = Graph::empty();
-    let circuit = empty_graph.program(&checker.weights, true);
+    // Necessity is collapse: the empty program pays the signal KL(M(x') ‖ M(x)) on the clean
+    // prompts (taking out nothing leaves M on the prompt), a program of every piece nothing.
+    let clean = checker.model_outcome(&Graph::empty(), &crate::graph::Experiment::Clean).expect("M(x)");
+    let swapped = checker.model_outcome(&Graph::empty(), &crate::graph::Experiment::Counterfactual).expect("M(x')");
+    let signal = kl_bits(&swapped, &clean);
+    let mean_signal = signal.iter().sum::<f64>() / signal.len() as f64;
+    let paid = none.per_family.get("necessity_clean").expect("the empty program's clean necessity").mean_kl_bits;
+    assert!((paid - mean_signal).abs() <= 1e-9 * mean_signal.max(1.0) && mean_signal > 1e-3, "empty program's clean necessity {paid:e} vs the signal {mean_signal:e} bits per token");
+    assert!(none.necessity_error_bits > 100.0 * full.necessity_error_bits, "empty {:e}, full {:e} bits per token", none.necessity_error_bits / none.n, full.necessity_error_bits / full.n);
+    // Per complement experiment and target, no program pays more than the signal (the empty
+    // program's error there).
+    let graphs: Vec<Graph> = [full_program(), partial_program(), Program { model: "tiny".into(), valid: true, ..Program::default() }].iter().map(|p| Graph::parse(p, &checker.weights).expect("parse")).collect();
+    let circuits: Vec<Circuit> = graphs.iter().map(|g| g.program(&checker.weights, true)).collect();
     let targets = checker.targets().expect("targets");
     let experiments = sample(&checker.weights, true, 30, 3, &targets, &checker.sites);
-    let measured = checker.necessity_runs(&[(&empty_graph, &circuit)], &complements(&experiments)).expect("empty necessity");
-    assert!(measured[0].len() >= 3 && measured[0].iter().all(|kl| kl.as_ref().is_some_and(|kl| max(kl) < f32_kl)), "{:?}", measured[0].iter().map(|kl| kl.as_ref().map(|kl| max(kl))).collect::<Vec<_>>());
+    let pairs: Vec<(&Graph, &Circuit)> = graphs.iter().zip(&circuits).collect();
+    let measured = checker.necessity_runs(&pairs, &complements(&experiments)).expect("necessity");
+    assert!(measured[2].len() >= 3 && measured[2].iter().all(Option::is_some), "every complement experiment measured");
+    assert!((max(&measured[2][0].clone().expect("clean")) - max(&signal)).abs() <= 1e-9 * max(&signal), "the empty program's clean necessity is the signal per target");
+    for (e, empty) in measured[2].iter().enumerate() {
+        let empty = empty.as_ref().expect("measured");
+        for program in &measured[..2] {
+            let kl = program[e].as_ref().expect("measured");
+            assert!(kl.iter().zip(empty).all(|(k, s)| *k <= *s + 1e-12), "complement {e}: a program paid more than the signal: {kl:?} vs {empty:?}");
+        }
+        assert!(max(measured[0][e].as_ref().expect("measured")) < f32_kl, "complement {e}: the program of every piece collapses M to M(x')");
+    }
+}
+
+/// The program naming layer 0's heads alone (`necessity_pays_for_left_out_mediators`'s partial).
+fn partial_program() -> Program {
+    let mut partial = Program { model: "tiny".into(), valid: true, ..Program::default() };
+    partial.nodes = vec![NodeIr { id: "a0".into(), pieces: vec![piece(0, "head")], claim: None }];
+    partial.edges = ["query", "key", "value"].iter().map(|r| EdgeIr { from: "embed".into(), to: "a0".into(), route: (*r).into() }).chain(["embed", "a0"].iter().map(|w| EdgeIr { from: (*w).into(), to: "logits".into(), route: "input".into() })).collect();
+    partial
 }
 
 /// Deletion (the default with a VPD view attached): a program naming every VPD subcomponent and

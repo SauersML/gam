@@ -3979,10 +3979,12 @@ pub struct Score {
     pub total_bits: f64,
     pub exec_error_bits: f64,
     /// `N` times the mean, over the complement experiments the program's semantics measure
-    /// ([`complements`], equal weights), of `KL(M_c ‖ P_c)` per scored token: `M` with the
-    /// program's nodes taken out (deleted, or at their counterfactual values) and every other piece
-    /// on the prompt, against the program's prediction for it ([`Checker::necessity_runs`]). Zero
-    /// for a program of no nodes outside its shared base (it claims nothing).
+    /// ([`complements`], equal weights), of the per-token necessity error ([`Checker::necessity_runs`]):
+    /// with counterfactual stand-ins, how far `M` with the program's nodes at their counterfactual
+    /// values (every other piece on the prompt) stays from `M` on the counterfactual (collapse),
+    /// at most the signal, which the empty program pays; deleting, `KL(M_c ‖ P_c)` of `M` with the
+    /// nodes deleted against the program's prediction, zero for a program of no nodes outside its
+    /// shared base.
     pub necessity_error_bits: f64,
     /// `N` times the program's attention-claim error ([`Checker::claim_error`]): zero for true
     /// claims and for a program that makes none.
@@ -4678,7 +4680,8 @@ impl Checker {
         self.measure_runs(plan, &mut measured)?;
         // Necessity, for each program with nodes: the same complement experiments for every program.
         let complements = complements(&experiments);
-        let named: Vec<usize> = (0..parsed.len()).filter(|&i| self.necessity && parsed[i].0.blocks.len() > parsed[i].0.base.len()).collect();
+        // (Counterfactual programs of no nodes too: their parts' collapse is the whole signal.)
+        let named: Vec<usize> = (0..parsed.len()).filter(|&i| self.necessity && (!parsed[i].0.delete || parsed[i].0.blocks.len() > parsed[i].0.base.len())).collect();
         let necessity_kl = self.necessity_runs(&named.iter().map(|&i| (&parsed[i].0, &circuits[i])).collect::<Vec<_>>(), &complements)?;
         let mut necessity = vec![(0.0, BTreeMap::new()); parsed.len()];
         for (&i, kls) in named.iter().zip(&necessity_kl) {
@@ -4758,20 +4761,25 @@ impl Checker {
     }
 
     /// The necessity experiments' errors, per program per complement experiment (`None` where the
-    /// program's semantics have no such experiment): `M` with the program's nodes taken out and
-    /// every other piece computing on the prompt ([`Graph::complement_model`]), against the
-    /// program's prediction for it. Taken out means deleted for a deleting program ([`Graph::delete`];
-    /// clean and weight edits), whose prediction is `M`'s own run less the program's parts, nothing
-    /// recomputed ([`Checker::without_parts`]); otherwise set to their counterfactual values, the
-    /// prediction being the program run with the roles swapped (on the counterfactual, its
-    /// stand-ins from the prompt). A program that names every part its information flows through
-    /// predicts it; a part it leaves out that carries its nodes' information moves `M` away.
+    /// program's semantics have no such experiment), per scored token, from `M_c`: `M` with the
+    /// program's nodes taken out and every other piece computing on the prompt
+    /// ([`Graph::complement_model`]).
+    ///
+    /// With counterfactual stand-ins the nodes take their counterfactual values and necessity is
+    /// collapse, the mirror of sufficiency (the lead, 10-08): taking out the named parts together
+    /// should make `M` behave as on the counterfactual. The error is
+    /// `min(KL(M(x') ‖ M_c), KL(M(x') ‖ M(x)))` with `M(x')` `M`'s own output on the counterfactual
+    /// and `M(x)` on the prompt under the same experiment (weight edit or site operation): at most
+    /// the signal, which the empty program pays (its `M_c` is `M`), about zero for a complete
+    /// mechanism. Deleting programs ([`Graph::delete`]; clean and weight edits) compare `M_c` with
+    /// their prediction, `M`'s own run less the program's parts, nothing recomputed
+    /// ([`Checker::without_parts`]).
     pub(crate) fn necessity_runs(&mut self, programs: &[(&Graph, &Circuit)], complements: &[Experiment]) -> Result<Vec<Vec<Option<Vec<f64>>>>, String> {
         let mut out = vec![Vec::with_capacity(complements.len()); programs.len()];
         if programs.is_empty() {
             return Ok(out);
         }
-        let standin = Graph::empty().program(&self.weights, true);
+        let native = Graph::empty().model(&self.weights);
         let counterfactual = self.counterfactual.is_some();
         for e in complements {
             let measured: Vec<bool> = programs.iter().map(|(g, _)| if g.delete { !matches!(e, Experiment::Sites { .. }) } else { counterfactual }).collect();
@@ -4782,27 +4790,16 @@ impl Checker {
                 _ => None,
             };
             let result = (|| -> Result<Vec<Option<Vec<f64>>>, String> {
-                if programs.iter().zip(&measured).any(|((g, _), &m)| m && !g.delete) {
-                    self.prewarm_swapped(&standin, e)?;
-                }
-                // The predictions of programs with counterfactual stand-ins (their runs on the
-                // counterfactuals) in stacks where they stack (`run_stacked`), site experiments aside.
-                // And their complement models (every part on the prompt but theirs), stacked alike.
-                let mut swapped: Vec<Option<Array2<f64>>> = vec![None; programs.len()];
+                // With counterfactual stand-ins: M on the counterfactuals and on the prompts under the
+                // experiment, shared by every program.
+                let collapse = programs.iter().zip(&measured).any(|((g, _), &m)| m && !g.delete);
+                let (target, prompt) = if collapse { (Some(self.run_swapped(&native, e)?), Some(self.run(&native, e)?)) } else { (None, None) };
+                // The complement models of counterfactual programs that stack, as one batch
+                // (`run_complements`), site experiments aside.
                 let mut complemented: Vec<Option<Array2<f64>>> = vec![None; programs.len()];
                 if !matches!(e, Experiment::Sites { .. }) {
-                    let stackable: Vec<usize> = (0..programs.len()).filter(|&k| measured[k] && !programs[k].0.delete && stacks(&self.weights, programs[k].1)).collect();
-                    let rows = self.counterfactual.as_ref().map_or(1, |(b, _)| b.tokens.len().max(1));
-                    for group in stackable.chunks((STACKED_ROWS / rows).max(1)).filter(|g| g.len() > 1) {
-                        let circuits: Vec<&Circuit> = group.iter().map(|&k| programs[k].1).collect();
-                        if let Some(out) = self.run_stacked(&circuits, &Experiment::Counterfactual) {
-                            for (&k, p) in group.iter().zip(out?) {
-                                swapped[k] = Some(p);
-                            }
-                        }
-                    }
                     let rows = self.clean.0.tokens.len().max(1);
-                    let plain: Vec<usize> = stackable.into_iter().filter(|&k| programs[k].0.base.is_empty()).collect();
+                    let plain: Vec<usize> = (0..programs.len()).filter(|&k| measured[k] && !programs[k].0.delete && programs[k].0.base.is_empty() && !programs[k].0.blocks.is_empty() && stacks(&self.weights, programs[k].1)).collect();
                     for group in plain.chunks((STACKED_ROWS / rows).max(1)).filter(|g| g.len() > 1) {
                         let pairs: Vec<(&Graph, &Circuit)> = group.iter().map(|&k| (programs[k].0, programs[k].1)).collect();
                         if let Some(out) = self.run_complements(&pairs) {
@@ -4813,21 +4810,23 @@ impl Checker {
                     }
                 }
                 let mut kls = Vec::with_capacity(programs.len());
-                for (k, ((g, circuit), &m)) in programs.iter().zip(&measured).enumerate() {
+                for (k, ((g, _), &m)) in programs.iter().zip(&measured).enumerate() {
                     if !m {
                         kls.push(None);
                         continue;
                     }
-                    let model = match complemented[k].take() {
-                        Some(m) => m,
-                        None => self.run(&g.complement_model(&self.weights), e)?,
-                    };
-                    let predicted = match swapped[k].take() {
-                        Some(p) => p,
-                        None if g.delete => self.without_parts(g)?,
-                        None => self.run_swapped(circuit, e)?,
-                    };
-                    kls.push(Some(kl_bits(&model, &predicted)));
+                    if let (false, Some(target), Some(prompt)) = (g.delete, &target, &prompt) {
+                        // A program of no nodes outside its base takes nothing out: M_c is M.
+                        let model = match complemented[k].take() {
+                            Some(m) => m,
+                            None if g.blocks.len() <= g.base.len() => prompt.clone(),
+                            None => self.run(&g.complement_model(&self.weights), e)?,
+                        };
+                        kls.push(Some(kl_bits(target, &model).into_iter().zip(kl_bits(target, prompt)).map(|(c, s)| c.min(s)).collect()));
+                        continue;
+                    }
+                    let model = self.run(&g.complement_model(&self.weights), e)?;
+                    kls.push(Some(kl_bits(&model, &self.without_parts(g)?)));
                 }
                 Ok(kls)
             })();
@@ -4874,14 +4873,6 @@ impl Checker {
                 run_sites(&self.weights, circuit, (&base, &rows), None, draw, &self.sites)
             }
             _ => self.run(circuit, &Experiment::Counterfactual),
-        }
-    }
-
-    /// The counterfactual runs [`Checker::run_swapped`] reads, made with the current weights.
-    fn prewarm_swapped(&self, standin: &Circuit, e: &Experiment) -> Result<(), String> {
-        match e {
-            Experiment::Sites { draw } => self.site_inputs_on(standin, draw, true).map(|_| ()),
-            _ => self.referenced(standin, &self.counterfactual.as_ref().ok_or("the behavior has no counterfactuals")?.0).map(|_| ()),
         }
     }
 
