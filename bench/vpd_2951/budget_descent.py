@@ -1613,6 +1613,12 @@ class OneAdam(torch.optim.Adam):
         torch._foreach_addcdiv_(ps, ms, den, [(lr_ / bc) * -1 for lr_, bc in zip(lrs, bc1)])
 opt = OneAdam(groups)
 trainable = [q for g in groups for q in g['params']]
+# DESCENT_LR_DECAY=1: every step size falls linearly to a tenth of its start over the run's steps. At a constant
+# step the whole model's held-out KL rose from 2.78 to 2.91 bits per token between 10M and 15M tokens (and
+# descent-rotvpd's stalled at 3.0 from 10M), the gradient noise holding it off its minimum.
+LR_DECAY = os.environ.get('DESCENT_LR_DECAY') == '1'
+for g_ in groups:
+    g_['lr0'] = g_['lr']
 
 def draw(mean):
     """Install the posterior mean (mean) or one sample of every tensor (F only), then (exact) every
@@ -1797,6 +1803,9 @@ for step in range(steps):
         gk = torch.autograd.grad(ek, taus, retain_graph=True, allow_unused=True)
         ratio = torch.cat([(a.abs() / b.abs()).reshape(-1)[b.abs().reshape(-1) > 0] for a, b in zip(gF, gk) if a is not None and b is not None])
         lam = max(ratio.median().item(), 1e-12) if ratio.numel() else 1e-3
+    if LR_DECAY:
+        for g_ in opt.param_groups:
+            g_['lr'] = g_['lr0'] * (1 - 0.9 * step / max(1, steps - 1))
     opt.zero_grad(); (objective + lam * (ek - K)).backward(); opt.step()
     if DUAL == 'pin':
         pin_shift(ids, kinds)
