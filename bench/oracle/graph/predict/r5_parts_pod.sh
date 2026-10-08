@@ -29,7 +29,7 @@ if [ -n "${VECTORS:-}" ]; then
 fi
 fixed=(--types edit,swap,cut --pieces "$PIECES" --batch 64 --answer "${ANSWER:-distribution}")  # ANSWER=delta: the change only
 gen() { [ -s "$OUT/data/$1.jsonl" ] || $PY "$here/generate.py" --model "$TARGET" --out "$OUT/data/$1.jsonl" "${fixed[@]}" "${@:2}"; }
-gen train --windows "$TRAINW" --texts 16384 --offset 340000 --split train --seed 300
+gen train --windows "$TRAINW" --texts "${TRAIN_TEXTS:-16384}" --offset 340000 --split train --seed 300  # TRAIN_TEXTS: fewer texts, more epochs
 gen parts_all --windows "$HELDW" --texts 2048 --offset 50000 --split heldout --seed 301
 gen parts_moved --windows "$HELDW" --texts 4096 --offset 52048 --split heldout --min-kl 0.1 --seed 302
 sets=(--heldout "parts_all=$OUT/data/parts_all.jsonl" --heldout "parts_moved=$OUT/data/parts_moved.jsonl")
