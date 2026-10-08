@@ -36,7 +36,8 @@ aligned to parts of the model; it may import only `from mech import align, claim
 - claim(pattern, parts...): the attention of these query and key parts follows the variable `pattern`,
   whose value at t lists the positions 0..t attended (or maps positions to weights).
 - Parts are written as part tokens:
-{parts}  Every part you do not name is deleted. Name the parts that carry the information that decides
+{parts}  Every part you do not name is deleted, except the model's shared base: generic parts that run in every
+  program for free (naming one makes it yours). Name the parts that carry the information that decides
   the answer, and nothing more: write the smallest program that explains.
 - Comments and docstrings are your working notes: they cost nothing and nobody else reads them.
 - The explanation after the code says what each variable is, which parts hold it and how they connect,
@@ -52,7 +53,8 @@ aligned to parts of the model; it may import only `from mech import align, claim
 PARTS = {
     "vpd": ("  <p:L.S.I> subcomponent I (rank one) of VPD's decomposition of layer L's weight matrix S: q, k, v, o\n"
             "  (attention query, key, value, output) or fc, down (MLP input, output); per layer {sizes};\n"
-            "  <p:L.S.rest> what that matrix holds beyond its subcomponents.\n"),
+            "  <p:L.S.rest> what that matrix holds beyond its subcomponents (it costs as many part names as the\n"
+            "  matrix's rank).\n"),
     "library": ("  <p:L.attn.I>, <p:L.mlp.I> part I of our decomposition of layer L's attention or MLP (parts may\n"
                 "  overlap); per layer about {sizes}.\n"),
     "transcoder": ("  <p:L.mlp.I> feature I of the transcoder replacing layer L's MLP ({sizes} per layer);\n"
