@@ -69,12 +69,19 @@ os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")  # CUDA may be in
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent))
 import prompt  # noqa: E402
-from prompt import explanation_of, program_of, render  # noqa: E402
+from prompt import program_of, render, split_answer  # noqa: E402
 import scorer  # noqa: E402
 from scorer import SCORERS  # noqa: E402
 
 BEHAVIORS = Path.home() / "mpd-data/graph_oracle/behaviors"
 SEARCH = Path.home() / "mpd-data/graph_oracle/runs/search"
+
+
+def item(answer: str, behavior: dict, seed: int, uniform_seeds: int, experiments: int) -> dict:
+    """A scoring item from an oracle answer: prompt.split_answer's program (the last python block that
+    parses) and explanation (the plain English after it, which alone the reader reads)."""
+    source, explanation = split_answer(answer)
+    return {"source": source, "explanation": explanation, "behavior": behavior, "seed": seed, "uniform_seeds": uniform_seeds, "experiments": experiments}
 
 
 def behaviors(root: Path, model: str, split: str) -> list[dict]:
@@ -452,7 +459,7 @@ def repair(chosen: list[dict], best: list[dict], pol, sampler, score, args, adap
         prompts = [pol.prompt_ids(repair_prompt(b, program_of(x["text"]), x["score"])) for b, x in zip(chosen, best)]
         groups = sampler(prompts, args.samples, adapter, step)
         texts = [[pol.tok.decode(c, skip_special_tokens=True) for c in g] for g in groups]
-        scores = score([{"source": program_of(t), "explanation": explanation_of(t), "behavior": b, "seed": step, "uniform_seeds": args.uniform_seeds, "experiments": args.experiments} for b, ts in zip(chosen, texts) for t in ts])
+        scores = score([item(t, b, step, args.uniform_seeds, args.experiments) for b, ts in zip(chosen, texts) for t in ts])
         for g in range(len(chosen)):
             for j in range(args.samples):
                 r = scores[g * args.samples + j]
@@ -588,7 +595,7 @@ def evaluate(sets: dict[str, list[dict]], pol, sampler, score, args, adapter: Pa
             prompts = [pol.prompt_ids(render(b)) for b in pool]
             groups = sampler(prompts, args.samples, adapter, version)
             answers = [(b, pol.tok.decode(c, skip_special_tokens=True)) for b, g in zip(pool, groups) for c in g]
-            items = [{"source": program_of(t), "explanation": explanation_of(t), "behavior": b, "seed": args.eval_seed, "experiments": args.eval_experiments} for b, t in answers]
+            items = [item(t, b, args.eval_seed, 0, args.eval_experiments) for b, t in answers]
             base = [(b, n, src) for b in pool for n, src in (baselines(b).items() if args.baselines else [])]
             scores = score(items + [{"source": src, "behavior": b, "seed": args.eval_seed, "experiments": args.eval_experiments} for b, _, src in base])
             per_base = {}
@@ -818,7 +825,7 @@ def main():
         groups = sampler(prompts, args.samples, adapter, step)
         t1 = time.time()
         texts = [[pol.tok.decode(c, skip_special_tokens=True) for c in g] for g in groups]
-        items = [{"source": program_of(t), "explanation": explanation_of(t), "behavior": b, "seed": step, "uniform_seeds": args.uniform_seeds, "experiments": args.experiments} for b, ts in zip(chosen, texts) for t in ts]
+        items = [item(t, b, step, args.uniform_seeds, args.experiments) for b, ts in zip(chosen, texts) for t in ts]
         scores = score(items)
         t2 = time.time()
         S = np.array([s["total_bits"] for s in scores], dtype=float).reshape(len(chosen), args.samples)
