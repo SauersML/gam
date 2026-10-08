@@ -166,17 +166,112 @@ def writing(units: list) -> list:
     return [u for u in units if (u[1], teacher_run.BLOCK[u[2]]) in blocks]
 
 
+TERMS = ("total_bits", "exec_error_bits", "necessity_error_bits", "alignment_error_bits", "complexity_bits", "structure_bits",
+         "code_bits", "N", "parts", "valid")
+
+
+def algorithm_or_none(behavior: dict) -> str | None:
+    """The family algorithm, or None for a held-out family (no algorithm: node programs)."""
+    try:
+        return teacher.algorithm_of(behavior)
+    except ValueError:
+        return None
+
+
+def program_of(algorithm: str | None, units: list) -> str:
+    """The answer aligning `units` to the algorithm's answer, or the node program of `units` without an algorithm."""
+    if algorithm is None:
+        return search.source(units)
+    return algorithm.rstrip() + "\n\n\n" + (f"align(answer, {', '.join(map(teacher_run.token_of, units))})\n" if units else "")
+
+
+def mediate(b: str, behavior: dict, checker, sizes: dict, a, log) -> dict:
+    """Necessity-driven additions (the lead's 10-08 lever): from the prune's set at --start-k, the unnamed
+    subcomponents of the named set's layer and later, in chunks of --chunk per site, are measured by how much naming
+    them lowers the necessity error (scored on the clean and counterfactual prompts, --rank-experiments); the --keep
+    largest drops are split down to --leaf; then leaves are added greedily under the full score (each round the
+    --adds best-ranked untried leaves scored, the best kept while the total falls), and a train answer's parts are
+    pruned by edits.refine (part drops) under the full score."""
+    start = json.loads((a.out / f"{b}.prune.json").read_text())
+    algorithm = algorithm_or_none(behavior)
+    named = [search.unit_of(n) for n in next(r for r in start["curve"] if r["k"] == a.start_k)["units"]]
+    named = writing(named) if algorithm else named
+
+    def scored(sets, experiments, seed, necessity=True):
+        results = []
+        for k in range(0, len(sets), a.batch):
+            results += checker.score_batch([program_of(algorithm, x) for x in sets[k:k + a.batch]], experiments=experiments,
+                                           seed=seed, reader=False, stand_in="counterfactual", options=None if necessity else {"necessity": False})
+        return results
+
+    def necessity(chunks):
+        return [r["necessity_error_bits"] if r.get("valid", True) else float("inf")
+                for r in scored([named + [("sub", l, s, i) for i in ix] for l, s, ix in chunks], a.rank_experiments, 0)]
+
+    base = necessity([(0, "q_proj", ())])[0]
+    have = {(u[1], u[2], u[3]) for u in named}
+    first = min(u[1] for u in named)
+    free = {(l, s): [i for i in range(n) if (l, s, i) not in have] for (l, s), n in sizes.items() if l >= first}
+    chunks = [(l, s, tuple(ix[i:i + a.chunk])) for (l, s), ix in sorted(free.items()) for i in range(0, len(ix), a.chunk)]
+    drop = {c: base - n for c, n in zip(chunks, necessity(chunks))}
+    log(f"necessity {base:.5g} bits on the clean/counterfactual pair; {len(chunks)} chunks; largest drops " +
+        ", ".join(f"{c[0]}.{c[1]}[{c[2][0]}..] {drop[c]:.4g}" for c in sorted(chunks, key=lambda c: -drop[c])[:6]))
+    open_, size = sorted(chunks, key=lambda c: -drop[c]), a.chunk
+    while size > a.leaf:
+        size //= 2
+        top = [c for c in open_ if len(c[2]) > size][: a.keep]
+        halves = [h for l, s, ix in top for h in ((l, s, ix[:size]), (l, s, ix[size:])) if h[2]]
+        drop.update(zip(halves, [base - n for n in necessity(halves)]))
+        split = set(top)
+        open_ = sorted([c for c in open_ if c not in split] + halves, key=lambda c: -drop[c])
+        log(f"chunks of {size}: largest drops " + ", ".join(f"{c[0]}.{c[1]}[{c[2][0]}..] {drop[c]:.4g}"
+            for c in sorted(halves, key=lambda c: -drop[c])[:6]))
+    pool = [c for c in sorted(drop, key=lambda c: -drop[c]) if len(c[2]) <= a.leaf and drop[c] > 0]
+    empty, first_score = scored([[], named], a.experiments, 1)
+    current, total = list(named), first_score["total_bits"]
+    steps = [{"parts": len(current), **{t: first_score.get(t) for t in TERMS}}]
+    log(f"start: {len(current)} parts, total {total:.6g} (exec {first_score['exec_error_bits']:.5g}, necessity "
+        f"{first_score['necessity_error_bits']:.5g}) vs empty {empty['total_bits']:.6g}")
+    for _ in range(a.rounds):
+        tried = pool[: a.adds]
+        if not tried:
+            break
+        results = scored([current + [("sub", l, s, i) for i in ix] for l, s, ix in tried], a.experiments, 1)
+        best = min(range(len(tried)), key=lambda i: results[i]["total_bits"] if results[i].get("valid", True) else float("inf"))
+        pool = [c for c in pool if c not in tried[:best + 1]]  # the tried leaves ranked above the kept one are spent
+        if results[best]["total_bits"] >= total:
+            break
+        l, s, ix = tried[best]
+        current += [("sub", l, s, i) for i in ix]
+        total = results[best]["total_bits"]
+        steps.append({"parts": len(current), "added": f"{l}.{s}[{','.join(map(str, ix))}]", **{t: results[best].get(t) for t in TERMS}})
+        log(f"+ {l}.{s} {len(ix)} parts: {len(current)} parts, total {total:.6g} (exec {results[best]['exec_error_bits']:.5g}, "
+            f"necessity {results[best]['necessity_error_bits']:.5g})")
+    final = current
+    if algorithm:
+        import edits
+
+        answer, total, accepted = edits.refine(edits.Answer.parse(program_of(algorithm, current)),
+                                               lambda srcs: [r for k in range(0, len(srcs), a.batch) for r in checker.score_batch(
+                                                   srcs[k:k + a.batch], experiments=a.experiments, seed=1, reader=False, stand_in="counterfactual")],
+                                               None, a.refine_rounds, 0, log=log, max_drops=32)
+        final = [search.unit_of(f"s{t.split('.')[0][3:]}_{mech.SITE_OF[t.split('.')[1]]}_{t.split('.')[2][:-1]}")
+                 for st in answer.statements for t in st.parts]
+    last = scored([final], a.experiments, 1)[0]
+    log(f"final: {len(final)} parts, total {last['total_bits']:.6g} vs empty {empty['total_bits']:.6g} (exec "
+        f"{last['exec_error_bits']:.5g}, necessity {last['necessity_error_bits']:.5g}, complexity {last['complexity_bits']:.5g})")
+    return {"behavior": b, "start_k": a.start_k, "necessity_start": base, "empty": {t: empty.get(t) for t in TERMS}, "steps": steps,
+            "final": {"parts": len(final), "units": [search.name(u) for u in final], **{t: last.get(t) for t in TERMS}},
+            "reproduced": 1 - last["exec_error_bits"] / empty["exec_error_bits"], "beats_empty": last["total_bits"] < empty["total_bits"],
+            "drops": [{"chunk": [c[0], c[1], list(c[2])], "necessity_drop_bits": drop[c]} for c in sorted(drop, key=lambda c: -drop[c])[:256]]}
+
+
 def curve(b: str, behavior: dict, checker, chosen: dict, a) -> tuple[dict, list]:
     """The program without parts' score and, per k, the answer aligning chosen[k] (units) and its score."""
-    try:
-        algorithm = teacher.algorithm_of(behavior)
-    except ValueError:
-        algorithm = None  # a held-out family: node programs
+    algorithm = algorithm_or_none(behavior)
 
     def program(chosen):
-        if algorithm is None:
-            return search.source(chosen)
-        return algorithm.rstrip() + "\n\n\n" + (f"align(answer, {', '.join(map(teacher_run.token_of, chosen))})\n" if chosen else "")
+        return program_of(algorithm, chosen)
 
     ks = sorted(chosen)
     sets = [[]] + [chosen[k] for k in ks]
@@ -184,8 +279,7 @@ def curve(b: str, behavior: dict, checker, chosen: dict, a) -> tuple[dict, list]
     for k in range(0, len(sets), a.batch):
         results += checker.score_batch([program(s) for s in sets[k:k + a.batch]], experiments=a.experiments, seed=1,
                                        reader=False, stand_in="counterfactual")
-    terms = ("total_bits", "exec_error_bits", "necessity_error_bits", "alignment_error_bits", "complexity_bits", "structure_bits",
-             "code_bits", "N", "parts", "valid")
+    terms = TERMS
     empty = {t: results[0].get(t) for t in terms}
     rows = []
     for k, s, r in zip(ks, sets[1:], results[1:]):
@@ -205,7 +299,11 @@ def main():
     ap.add_argument("--importance", type=Path, default=DATA / "experiments/importance", help="mpd_vpd_importance_2951's tables (site sizes, order within a chunk)")
     ap.add_argument("--device")
     ap.add_argument("--experiments", type=int, default=16)
-    ap.add_argument("--method", choices=["prune", "removal"], default="prune", help="prune: iterative pruning from every "
+    ap.add_argument("--start-k", type=int, default=32, help="mediate: the prune set it starts from (OUT/<b>.prune.json)")
+    ap.add_argument("--adds", type=int, default=12, help="mediate: leaves scored per greedy round")
+    ap.add_argument("--rounds", type=int, default=12, help="mediate: greedy rounds")
+    ap.add_argument("--refine-rounds", type=int, default=3, help="mediate: edits.refine rounds (train answers)")
+    ap.add_argument("--method", choices=["prune", "removal", "mediate"], default="prune", help="prune: iterative pruning from every "
                     "subcomponent, removals re-measured in the current set each round; removal: one ranking by removal "
                     "from the full model, split down to --leaf, its prefixes")
     ap.add_argument("--drop", type=float, default=0.5, help="prune: the share of the parts dropped per round")
@@ -229,6 +327,11 @@ def main():
         log = lambda m: print(f"{b}: {m}", flush=True)  # noqa: E731
         with score_module.Checker(behavior["model"], export=a.export, views={"vpd": a.vpd}, device=a.device) as checker:
             checker.behavior(path)
+            if a.method == "mediate":
+                record = mediate(b, behavior, checker, sizes, a, log)
+                (a.out / f"{b}.mediate{a.start_k}.json").write_text(json.dumps(record, indent=1))
+                log(f"done in {time.time() - t0:.0f} s")
+                continue
             if a.method == "prune":
                 chosen, rounds = prune(b, checker, sizes, a, log)
                 ranked, chunks = [], rounds
