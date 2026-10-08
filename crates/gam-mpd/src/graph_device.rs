@@ -44,6 +44,9 @@ pub(crate) struct DeviceState {
     /// Products of counterfactual runs' arrays with weight matrices ([`DeviceState::reference_product`]),
     /// by run, array, layer and matrix; dropped whenever a weight changes.
     products: BTreeMap<(u64, Field, usize, usize), Tensor>,
+    /// A VPD view's summed matrix `Σ_i U_iᵀ V_iᵀ` by its factors' keys ([`DeviceState::summed`]);
+    /// dropped whenever a weight changes.
+    summed: HashMap<(Key, Key), Tensor>,
 }
 
 /// The bytes of reference products kept ([`DeviceState::reference_product`]): past them every
@@ -105,7 +108,7 @@ fn on_device<T: Send>(f: impl FnOnce(&mut DeviceState) -> T + Send) -> Option<T>
 
 impl DeviceState {
     pub(crate) fn new(device: Device) -> Self {
-        Self { device, generation: 0, resident: HashMap::new(), uploaded: Vec::new(), stacks: HashMap::new(), references: Vec::new(), rotations: HashMap::new(), products: BTreeMap::new() }
+        Self { device, generation: 0, resident: HashMap::new(), uploaded: Vec::new(), stacks: HashMap::new(), references: Vec::new(), rotations: HashMap::new(), products: BTreeMap::new(), summed: HashMap::new() }
     }
 
     fn arithmetic(&self) -> Arithmetic {
@@ -215,6 +218,19 @@ impl DeviceState {
         self.device.copy(kept).map_err(e)
     }
 
+    /// The summed matrix `Σ_i U_iᵀ V_iᵀ` (out × in: the matrix less its remainder) of the resident
+    /// factors `uk` (subcomponents × out) and `vk` (in × subcomponents), made on first use and kept
+    /// until a weight changes.
+    fn summed(&mut self, uk: Key, vk: Key) -> Result<(), GpuError> {
+        if !self.summed.contains_key(&(uk, vk)) {
+            let (uf, vf) = (self.get(uk)?, self.get(vk)?);
+            let mut sum = self.device.zeros(uf.cols(), vf.rows())?;
+            self.device.gemm(&mut sum, 1.0, uf, Op::T, vf, Op::T, 0.0, self.arithmetic())?;
+            self.summed.insert((uk, vk), sum);
+        }
+        Ok(())
+    }
+
     /// Array `key` of counterfactual run `r`, uploaded by [`DeviceState::ensure_reference`].
     fn reference(&self, r: &Reference, key: (Field, usize, usize)) -> Result<&Tensor, String> {
         self.references.iter().find(|(id, _)| *id == r.id).and_then(|(_, m)| m.get(&key)).ok_or_else(|| "a counterfactual array went missing".to_string())
@@ -294,6 +310,7 @@ fn dropped(at: (usize, usize, usize)) {
         s.resident.retain(|k, _| !same(k));
         s.stacks.retain(|(keys, _), _| !keys.iter().any(same));
         s.products.clear();
+        s.summed.clear();
     });
 }
 
@@ -305,6 +322,7 @@ pub(crate) fn forget(generation: u64) {
         s.uploaded.retain(|k| k.0 != generation);
         s.stacks.retain(|(keys, _), _| keys.first().is_none_or(|k| k.0 != generation));
         s.products.clear();
+        s.summed.clear();
     });
 }
 
@@ -1383,6 +1401,13 @@ fn sliced(s: &mut DeviceState, (u, v): (&Array2<f64>, &Array2<f64>), w: Matrix, 
     let subs: Vec<u32> = picked.iter().filter(|&&i| i < count).map(|&i| i as u32).collect();
     let remainder = picked.contains(&count);
     let (uk, vk) = (s.ensure(u.view())?, s.ensure(v.view())?);
+    // Most subcomponents named (g-int's chunk measurements name all but a chunk): their sum is the
+    // summed matrix, kept dense, less the ones left out, cheaper than the named ones' factors.
+    let (inputs, outputs) = (v.nrows(), u.ncols());
+    let left = left_out(count, &subs, mask).filter(|(ids, _)| inputs * outputs + ids.len() * (inputs + outputs) < subs.len() * (inputs + outputs));
+    if left.is_some() {
+        s.summed(uk, vk)?;
+    }
     let wk = match w {
         Matrix::Host(m) => Some(s.ensure(m.view())?),
         Matrix::Device(_) => None,
@@ -1396,7 +1421,24 @@ fn sliced(s: &mut DeviceState, (u, v): (&Array2<f64>, &Array2<f64>), w: Matrix, 
         (Matrix::Host(_), None) => return Err(GpuError::DriverCallFailed { reason: "a VPD matrix went missing".into() }),
     };
     let mut named = d.zeros(x.rows(), u.ncols())?;
-    if !subs.is_empty() {
+    if let Some((ids, weights)) = left {
+        let sum = s.summed.get(&(uk, vk)).ok_or_else(|| GpuError::DriverCallFailed { reason: "a summed VPD matrix went missing".into() })?;
+        d.gemm(&mut named, 1.0, x, Op::N, sum, Op::T, 0.0, arithmetic)?;
+        if !ids.is_empty() {
+            let n = ids.len();
+            let ids = d.upload_indices(&ids)?;
+            let (vs, us) = (d.gather_columns(vf, &ids)?, d.gather_rows(uf, &ids)?);
+            let mut xv = d.zeros(x.rows(), n)?;
+            d.gemm(&mut xv, 1.0, x, Op::N, &vs, Op::N, 0.0, arithmetic)?;
+            if let (Some(weights), Some((_, copy_of_row, _))) = (weights, mask) {
+                let per_row = d.gather_rows(&d.upload(weights.view())?, copy_of_row)?;
+                let mut weighed = d.zeros(x.rows(), n)?;
+                d.hadamard(&mut weighed, &xv, &per_row, false)?;
+                xv = weighed;
+            }
+            d.gemm(&mut named, -1.0, &xv, Op::N, &us, Op::N, 1.0, arithmetic)?;
+        }
+    } else if !subs.is_empty() {
         let ids = d.upload_indices(&subs)?;
         let (vs, us) = (d.gather_columns(vf, &ids)?, d.gather_rows(uf, &ids)?);
         let mut xv = d.zeros(x.rows(), subs.len())?;
@@ -1442,6 +1484,36 @@ fn sliced(s: &mut DeviceState, (u, v): (&Array2<f64>, &Array2<f64>), w: Matrix, 
         d.axpy(&mut out, -1.0, &named)?;
     }
     Ok(out)
+}
+
+/// The subcomponents (of `count`) a selection `subs` leaves out, with a stacked run's per-copy
+/// weights of each (copy × left out: one less the copy's count, from `mask`), when the named sum is
+/// the summed matrix less these: `subs` distinct and every count 0 or 1. Without a mask every copy
+/// is the one selection.
+fn left_out(count: usize, subs: &[u32], mask: Masked) -> Option<(Vec<u32>, Option<Array2<f64>>)> {
+    let mut seen = vec![false; count];
+    for &i in subs {
+        let slot = seen.get_mut(i as usize)?;
+        if *slot {
+            return None;
+        }
+        *slot = true;
+    }
+    let Some((m, ..)) = mask else {
+        return Some(((0..count as u32).filter(|&i| !seen[i as usize]).collect(), None));
+    };
+    if m.counts.ncols() != subs.len() || m.counts.iter().any(|&c| c != 0.0 && c != 1.0) {
+        return None;
+    }
+    // Per subcomponent its column in the mask; a subcomponent every copy names is no one's left out.
+    let mut column = vec![None; count];
+    for (k, &i) in subs.iter().enumerate() {
+        column[i as usize] = Some(k);
+    }
+    let everyone = |k: usize| m.counts.column(k).iter().all(|&c| c == 1.0);
+    let ids: Vec<u32> = (0..count).filter(|&i| column[i].is_none_or(|k| !everyone(k))).map(|i| i as u32).collect();
+    let weights = Array2::from_shape_fn((m.counts.nrows(), ids.len()), |(j, c)| column[ids[c] as usize].map_or(1.0, |k| 1.0 - m.counts[[j, k]]));
+    Some((ids, Some(weights)))
 }
 
 /// Whether a unit whose hidden reads are `hidden` reads unit `w`'s writes into its site's hidden

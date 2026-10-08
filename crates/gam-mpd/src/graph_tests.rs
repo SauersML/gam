@@ -703,6 +703,14 @@ fn stacking_programs(weights: &Weights, standin: &str) -> Vec<Graph> {
         (Vec::new(), vec![piece("c_fc", many(&[0, 2])), piece("down_proj", many(&[1]))]),
         (vec![piece("v_proj", many(&[5])), piece("o_proj", many(&[4]))], Vec::new()),
     ];
+    // A chunk measurement's program: every subcomponent but a chunk (named by its sum less the chunk).
+    let all_but = |n: usize, chunk: std::ops::Range<usize>| Index::Many((0..n).filter(|i| !chunk.contains(i)).collect());
+    let (vpd, attention) = (&weights.vpd[&1], &weights.vpd_attention[&1]);
+    let mut programs = programs;
+    programs.push((
+        vec![piece("q_proj", all_but(attention.q.0.nrows(), 0..1)), piece("k_proj", all_but(attention.k.0.nrows(), 2..3)), piece("v_proj", all_but(attention.v.0.nrows(), 1..3)), piece("o_proj", all_but(attention.o.0.nrows(), 0..2))],
+        vec![piece("c_fc", all_but(vpd.fc_u.nrows(), 3..6)), piece("down_proj", all_but(vpd.down_u.nrows(), 0..2))],
+    ));
     let edge = |from: &str, to: &str, route: &str| EdgeIr { from: from.into(), to: to.into(), route: route.into() };
     programs
         .into_iter()
@@ -745,6 +753,11 @@ fn stacked_equals_own(weights: &Weights, circuits: &[crate::graph::Circuit], bat
         let mine = execute(weights, circuit, own, &rows, &BTreeMap::new()).expect("own run").log_probabilities;
         let kl = max(&kl_bits(&mine, copy));
         assert!(kl < 1e-9, "program {j}: KL(own run ‖ stacked copy) = {kl:e} bits");
+        // Alone on the device as well (a program naming most subcomponents takes their sum less the rest).
+        let alone = crate::graph_device::Run { tokens: &own.tokens, spans: &own.spans, scored: &rows, swaps: &BTreeMap::new(), capture: false, reference: own.reference.as_deref(), ops: &crate::graph::Interventions::default() };
+        let device = run_on(&mut state, weights, circuit, &alone).expect("device run").log_probabilities;
+        let kl = max(&kl_bits(&mine, &device));
+        assert!(kl < 1e-9, "program {j}: KL(host ‖ device) = {kl:e} bits");
     }
     copies
 }
@@ -765,6 +778,7 @@ fn stacked_vpd_programs_are_their_own_runs() {
     let copies = stacked_equals_own(&weights, &circuits, &deleting, &deleting);
     // The copies differ: each names its own subcomponents.
     assert!(max(&kl_bits(&copies[0], &copies[2])) > 1e-6, "programs 0 and 2 run alike");
+    assert!(max(&kl_bits(&copies[4], &copies[2])) > 1e-6, "programs 4 and 2 run alike");
     // Counterfactual stand-ins stack only where every layer has VPD views (here layer 0 has none).
     let mut counterfactual = graphs[0].clone();
     counterfactual.delete = false;
