@@ -9,11 +9,15 @@ and into the logits), so it equals M with its undeclared pieces replaced by stan
             most; stops when no addition lowers it.
   removal   from the full program: each step removes the head or MLP sub-block whose removal lowers
             the total most; stops when no removal lowers it.
+  prefix    the units of a ranking (--ranking: native heads and neurons, or the attached decomposition's
+            subcomponents, e.g. VPD's ranked by its importance, patch_ranking.py), its geometric prefixes,
+            then pruning (prune); with subcomponents the VPD view is attached (deletion: unnamed parts
+            contribute zero).
 Every candidate of a step is scored under the same experiment seed; the final program is rescored
 under a held-out seed. Candidates go to --workers checker processes as score_batch requests (each
 checker scores its share in parallel threads, RAYON_NUM_THREADS).
 
-  search.py BEHAVIOR.json [--mode addition|removal|both] [--experiments 16] [--workers 1] [--stand-in counterfactual]
+  search.py BEHAVIOR.json [--mode addition|removal|both|prefix] [--ranking FILE] [--experiments 16] [--workers 1] [--stand-in counterfactual]
 Writes ~/mpd-data/graph_oracle/runs/search/<behavior>.<mode>.json (trajectory, final program source,
 its terms, checker calls) and appends the final program to status.tsv as program "search_<mode>".
 """
@@ -39,42 +43,27 @@ import score  # noqa: E402
 
 OUT = Path.home() / "mpd-data/graph_oracle/runs/search"
 
-# A unit: ("head", layer, head) or ("mlp", layer, start, stop) for neurons start..stop-1.
-
-
-# A VPD unit: ("vpd", layer, kc, kd) = the kc c_fc and kd down_proj subcomponents of layer l's MLP with
-# the largest measured removal effect (RANKING: per site, subcomponent indices from largest effect down).
-RANKING: dict[str, list[int]] = {}
-GROW = 2  # a VPD unit's growth factor per move (--grow)
-
-
-def load_ranking(path: Path) -> None:
-    """Removal effects of VPD subcomponents (g-mech's measure/vpd_induction_removal.py output:
-    sites -> {"kl_bits": [per subcomponent]}), as per-site index orders, largest effect first."""
-    sites = json.loads(Path(path).read_text())["sites"]
-    for key, v in sites.items():
-        layer, site_name = int(key.split(".")[1]), key.split(".")[-1]
-        kl = v["kl_bits"]
-        RANKING[f"{layer}.{site_name}"] = sorted(range(len(kl)), key=lambda i: -kl[i])
+# A unit: ("head", layer, head), ("mlp", layer, start, stop) for neurons start..stop-1, or ("sub", layer,
+# site, index) for one subcomponent of the attached decomposition (VPD).
 
 
 def site(unit) -> int:
     """The residual stream a unit reads (design.txt section 5): attention at 2l, MLP at 2l+1."""
-    return 2 * unit[1] + (unit[0] in ("mlp", "vpd") or (unit[0] == "sub" and unit[2] in ("c_fc", "down_proj")))
+    return 2 * unit[1] + (unit[0] == "mlp" or (unit[0] == "sub" and unit[2] in ("c_fc", "down_proj")))
 
 
 def name(unit) -> str:
-    return {"head": "h", "mlp": "m", "vpd": "v", "sub": "s"}[unit[0]] + "_".join(str(x) for x in unit[1:]) if unit[0] != "head" else f"h{unit[1]}_{unit[2]}"
+    return {"head": "h", "mlp": "m", "sub": "s"}[unit[0]] + "_".join(str(x) for x in unit[1:]) if unit[0] != "head" else f"h{unit[1]}_{unit[2]}"
 
 
 def unit_of(text: str):
-    """The unit a name() denotes: h<l>_<h>, m<l>_<start>_<stop>, v<l>_<kc>_<kd> or s<l>_<matrix>_<index>."""
+    """The unit a name() denotes: h<l>_<h>, m<l>_<start>_<stop> or s<l>_<matrix>_<index>."""
     if text[0] == "s":
         layer, rest = text[1:].split("_", 1)
         matrix, index = rest.rsplit("_", 1)
         return ("sub", int(layer), matrix, int(index))
     parts = [int(x) for x in text[1:].split("_")]
-    return ({"h": "head", "m": "mlp", "v": "vpd"}[text[0]], *parts)
+    return ({"h": "head", "m": "mlp"}[text[0]], *parts)
 
 
 def ranked_native(path: Path, model: str = "vpd4l", per_number: bool = True) -> list[tuple]:
@@ -103,12 +92,7 @@ def ranked_subcomponents(path: Path) -> list[tuple]:
 def piece(unit) -> str:
     if unit[0] == "head":
         return f"L[{unit[1]}].head[{unit[2]}]"
-    if unit[0] == "mlp":
-        return f"L[{unit[1]}].mlp[{unit[2]}:{unit[3]}]"
-    l, kc, kd = unit[1:]
-    c = ", ".join(map(str, sorted(RANKING[f"{l}.c_fc"][:kc])))
-    d = ", ".join(map(str, sorted(RANKING[f"{l}.down_proj"][:kd])))
-    return f"PD[{l}].c_fc[{c}], PD[{l}].down_proj[{d}]"
+    return f"L[{unit[1]}].mlp[{unit[2]}:{unit[3]}]"
 
 
 def _slices(indices) -> str:
@@ -221,11 +205,10 @@ class Pool:
             c.close()
 
 
-def all_units(model: str, mlp_view: str = "native"):
-    """Every unit: the heads, and per layer its MLP as one native block or (mlp_view "vpd") a VPD unit placeholder."""
+def all_units(model: str):
+    """Every native unit: the heads, and per layer its MLP as one block."""
     s = mech.shapes(model)
-    mlps = [("mlp", l, 0, s["d_mlp"]) for l in range(s["layers"])] if mlp_view == "native" else [("vpd", l, 0, 0) for l in range(s["layers"])]
-    return [("head", l, h) for l in range(s["layers"]) for h in range(s["heads"])] + mlps
+    return [("head", l, h) for l in range(s["layers"]) for h in range(s["heads"])] + [("mlp", l, 0, s["d_mlp"]) for l in range(s["layers"])]
 
 
 def objective_of(kind: str):
@@ -239,16 +222,15 @@ def objective_of(kind: str):
 
 
 def greedy(pool: Pool, model: str, mode: str, experiments: int, seed: int, min_neurons: int, log, start=None,
-           mlp_view: str = "native", checkpoint=None, objective=None) -> dict:
-    """`start`: the units to start from (default: none for addition, every unit for removal). With mlp_view
-    "vpd" (addition only), MLPs enter as VPD units grown by doubling along the removal ranking."""
+           checkpoint=None, objective=None) -> dict:
+    """`start`: the units to start from (default: none for addition, every unit for removal)."""
     objective = objective or (lambda r: r["total_bits"])
-    full = all_units(model, mlp_view)
+    full = all_units(model)
     current = list(start) if start is not None else [] if mode == "addition" else list(full)
     # Addition draws from `outside`: the pieces not declared yet, as dyadic blocks (whole units the
     # start does not touch; a start's partial MLP blocks leave nothing outside in that layer).
-    touched = {(u[0], u[1]) if u[0] in ("mlp", "vpd") else u for u in current}
-    outside = [u for u in full if ((u[0], u[1]) if u[0] in ("mlp", "vpd") else u) not in touched] if mode == "addition" else []
+    touched = {(u[0], u[1]) if u[0] == "mlp" else u for u in current}
+    outside = [u for u in full if ((u[0], u[1]) if u[0] == "mlp" else u) not in touched] if mode == "addition" else []
     best = pool.score([source(current)], experiments, seed)[0]
     trajectory = [{"step": 0, "units": [name(u) for u in current], "total_bits": best["total_bits"],
                    "exec_error_bits": best["exec_error_bits"], "complexity_bits": best.get("complexity_bits"), "calls": pool.calls}]
@@ -259,17 +241,8 @@ def greedy(pool: Pool, model: str, mode: str, experiments: int, seed: int, min_n
         moves = []  # (units, outside, (verb, block))
         if mode == "addition":
             for u in outside:
-                if u[0] == "vpd":  # a layer's VPD MLP enters with its strongest subcomponent of each matrix
-                    moves.append((current + [("vpd", u[1], 1, 1)], [v for v in outside if v != u], ("add", ("vpd", u[1], 1, 1))))
-                    continue
                 for b, rest in pieces_of(u, min_neurons):
                     moves.append((current + [b], [v for v in outside if v != u] + rest, ("add", b)))
-            for u in [u for u in current if u[0] == "vpd"]:  # grow a VPD MLP: GROW times the c_fc or the down_proj subcomponents
-                for grown in (("vpd", u[1], min(GROW * u[2], len(RANKING[f"{u[1]}.c_fc"])), u[3]),
-                              ("vpd", u[1], u[2], min(GROW * u[3], len(RANKING[f"{u[1]}.down_proj"]))),
-                              ("vpd", u[1], min(GROW * u[2], len(RANKING[f"{u[1]}.c_fc"])), min(GROW * u[3], len(RANKING[f"{u[1]}.down_proj"])))):
-                    if grown != u:
-                        moves.append(([v for v in current if v != u] + [grown], outside, ("grow", grown)))
         else:
             for u in current:
                 for b, rest in pieces_of(u, min_neurons):
@@ -414,7 +387,7 @@ def main() -> None:
                     help="prefix mode: score necessity throughout (default: only the final pruning and the result, from the "
                          "program found without it)")
     ap.add_argument("--device", help="the checker's device (gpu: the single-precision device path)")
-    ap.add_argument("--max-units", type=int, default=8192, help="prefix mode with --mlp-view vpd: the top ranked subcomponents considered")
+    ap.add_argument("--max-units", type=int, default=8192, help="prefix mode with a ranking: the top ranked units considered")
     ap.add_argument("--rank-experiments", type=int, default=0, help="prefix mode: draws beyond clean and counterfactual per one-unit ranking program")
     ap.add_argument("--experiments", type=int, default=16)
     ap.add_argument("--seed", type=int, default=0)
@@ -429,11 +402,11 @@ def main() -> None:
     ap.add_argument("--objective", default="total", choices=["total", "shared", "fit"],
                     help="minimize the score's total, the total over the families every program shares, or over the fit "
                          "families (table.FIT; the held-out ones, table.HELDOUT, stay for reporting)")
-    ap.add_argument("--mlp-view", default="native", choices=["native", "vpd"], help="MLP units: native neuron blocks or VPD subcomponents")
-    ap.add_argument("--ranking", type=Path, help="with --mlp-view vpd: measured removal effects of VPD subcomponents (sites -> kl_bits)")
+    ap.add_argument("--ranking", type=Path, help="prefix mode: the units' order, {\"mixed\": [[unit name, value], ...]} (largest "
+                                                 "first; patch_ranking.py), {\"native\": ...} (ranked_native) or a VPD removal scan "
+                                                 "{\"sites\": ...} (ranked_subcomponents)")
     ap.add_argument("--vpd", type=Path, default=Path.home() / "mpd-data/engine/vpd4l_decomposition",
-                    help="with --mlp-view vpd: VPD's decomposition export (the checker's vpd view)")
-    ap.add_argument("--grow", type=int, default=2, help="with --mlp-view vpd: growth factor of a VPD unit per move")
+                    help="VPD's decomposition export (the checker's vpd view, attached when the ranking names subcomponents)")
     ap.add_argument("--prompt-holdout", type=int, default=0,
                     help="drop every K-th prompt (i %% K == 0) before searching: the prompts the oracle is evaluated on (g-rl)")
     a = ap.parse_args()
@@ -446,13 +419,9 @@ def main() -> None:
         behavior["prompts"] = [p for i, p in enumerate(behavior["prompts"]) if i % a.prompt_holdout != 0]
         path = out / f"{behavior['id']}.train_prompts.json"
         path.write_text(json.dumps(behavior))
-    if a.mlp_view == "vpd":
-        global GROW
-        GROW = a.grow
-        if a.mode != "prefix":
-            load_ranking(a.ranking)
-    mixed = a.ranking is not None and "mixed" in json.loads(a.ranking.read_text())
-    views = {"vpd": a.vpd} if a.mlp_view == "vpd" or mixed else None
+    data = None if a.ranking is None else json.loads(a.ranking.read_text())
+    subs = data is not None and ("sites" in data or any(n.startswith("s") for n, _ in data.get("mixed", [])))
+    views = {"vpd": a.vpd} if subs else None
     pool = Pool(model, path, a.workers, a.export, a.stand_in, views, out / f"{behavior['id']}{a.tag}.candidates.jsonl", a.device,
                 necessity=a.search_necessity or a.mode != "prefix")
     try:
@@ -469,9 +438,8 @@ def main() -> None:
                 partial = out / f"{stem}.partial.json"
                 save = lambda state: partial.write_text(json.dumps(state, indent=1))
                 if mode == "prefix":
-                    data = None if a.ranking is None else json.loads(a.ranking.read_text())
                     ranked = None if data is None else ([unit_of(n) for n, _ in data["mixed"]] if "mixed" in data
-                                                        else ranked_subcomponents(a.ranking) if a.mlp_view == "vpd"
+                                                        else ranked_subcomponents(a.ranking) if "sites" in data
                                                         else ranked_native(a.ranking, model))[: a.max_units]
                     objective = objective_of(a.objective)
                     found = prefix_search(pool, model, a.experiments, a.seed, a.block, log, a.rank_experiments, save,
@@ -484,8 +452,8 @@ def main() -> None:
                                             found["trajectory"], save)
                         found.update(units=units, source=source(units), score=best)
                 else:
-                    found = greedy(pool, model, mode, a.experiments, a.seed, a.min_neurons, log, start_units, a.mlp_view,
-                                   save, objective_of(a.objective))
+                    found = greedy(pool, model, mode, a.experiments, a.seed, a.min_neurons, log, start_units, save,
+                                   objective_of(a.objective))
                 heldout = pool.score([found["source"]], a.experiments, a.heldout_seed)[0]
                 found.update(units=[name(u) for u in found["units"]], heldout=heldout, calls=pool.calls - start, stand_in=a.stand_in, checker=Path(str(score.BINARY)).name,
                              experiments=a.experiments, seed=a.seed, heldout_seed=a.heldout_seed)

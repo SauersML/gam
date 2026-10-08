@@ -1,5 +1,6 @@
-"""Reference programs for the graph oracle's end-to-end checks (#2951): mech sources that every score
-must order the same way on one behavior.
+"""Reference programs for the graph oracle's end-to-end checks (#2951): mech sources in native units (traced
+and scored with no decomposition attached, decomposition "native") that every score must order the same
+way on one behavior.
 
   empty(model)                no node: every piece a stand-in
   hand(model)                 the hand-written example program of the model (examples/<model>_*.py)
@@ -52,8 +53,11 @@ def hand(model: str, behavior: str | None = None, family: str = "induction") -> 
 
 
 def hand_heads(model: str) -> set[tuple[int, int]]:
-    """The (layer, head) pairs the hand program declares."""
-    ir = mech.trace_inline(hand(model), model)
+    """The (layer, head) pairs the hand program declares (none without a native hand program)."""
+    source = hand_for(model, family="induction")
+    ir = mech.trace_inline(source, model, decomposition="native") if source else {"valid": False}
+    if not ir["valid"]:
+        return set()
     return {(p["layer"], i) for n in ir["nodes"] for p in n["pieces"] if p["kind"] == "head"
             for i in ([p["index"]] if isinstance(p["index"], int) else p["index"])}
 
@@ -88,4 +92,7 @@ def full(model: str) -> str:
 
 
 def references(model: str, seed: int = 0) -> dict[str, str]:
-    return {"hand": hand(model), "empty": empty(model), "random": random_heads(model, 3, seed), "full": full(model)}
+    """empty, random and full, and the hand program when the model has a native one."""
+    found = hand_for(model, family="induction")
+    native = found is not None and mech.trace_inline(found, model, decomposition="native")["valid"]
+    return {**({"hand": found} if native else {}), "empty": empty(model), "random": random_heads(model, 3, seed), "full": full(model)}

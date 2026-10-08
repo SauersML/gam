@@ -277,7 +277,7 @@ def answer(a, b: str) -> None:
             "refine_bits": total, "parts": parts,
             "variables": [s.variable for s in refined.statements if s.kind != "claim"], "accepted": [str(e) for e in accepted],
             "search": str(found), "checker": a.checker_commit, "checker_binary": str(score_module.BINARY),
-            "base": os.environ.get("GRAPH_BASE"), "stand_in": a.stand_in or "checker default",
+            "base": os.environ.get("GRAPH_BASE"), "stand_in": a.stand_in,
             "settings": {"mode": a.mode, "nonempty": a.nonempty, "budget": a.budget, "experiments": a.experiments, "seed": 0,
                          "rounds": a.rounds, "adds": a.adds, "drops": a.drops,
                          "final_experiments": a.final_experiments, "final_seed": 1}, "seconds": round(time.time() - t0)}
@@ -316,8 +316,9 @@ def main():
     ap.add_argument("--adds", type=int, default=8, help="carrier candidates tried per variable per round")
     ap.add_argument("--drops", type=int, default=32, help="part drops sampled per round")
     ap.add_argument("--batch", type=int, default=8, help="programs per checker request")
-    ap.add_argument("--stand-in", choices=["delete", "counterfactual"], help="what unnamed parts compute (default: the "
-                    "checker's, deletion with a decomposition attached)")
+    ap.add_argument("--stand-in", choices=["delete", "counterfactual"], default="counterfactual",
+                    help="what unnamed parts compute: their values on the counterfactual prompt (the lead's 10-08 decision), "
+                         "or zero")
     ap.add_argument("--checker-commit", help="the checker's commit (default: GRAPH_CHECKER's suffix)")
     a = ap.parse_args()
     for k in ("behaviors_dir", "export", "vpd", "rankings", "carriers", "search", "out"):

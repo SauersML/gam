@@ -1,12 +1,12 @@
 """The graph oracle's whole path on a tiny random model (#2951), for CI: mech traces the reference and
 search programs, the Rust checker (GRAPH_CHECKER, built from crates/gam-mpd/examples/mpd_graph_2951.rs)
 scores them on e2e/tiny.py's export and behavior, and the terms obey what every valid score must:
-  - the full program (every piece, every edge) costs at most its numbers' exact price (precision pricing
-    may quantize, exact weights being one option);
+  - the full program (every piece, every edge) is the model: no execution error, and its total is its terms'
+    sum (execution, necessity, claims, alignments, complexity, reader);
   - with counterfactual stand-ins the empty program's execution error is the behavior's own signal
-    KL(M(x) || M(x')) at the targets: positive, and it costs no opaque numbers;
-  - a program's opaque count grows with the pieces it declares; code bits are its Python tokens times
-    log2 of the token types;
+    KL(M(x) || M(x')) at the targets: positive, and it names no part;
+  - a program's parts, numbers and structure bits grow with the pieces it declares; code bits are its Python
+    tokens times log2 of the token types, and complexity is structure + code + explanation;
   - one score_batch request gives the same terms as separate requests.
 
   GRAPH_CHECKER=target/release/examples/mpd_graph_2951 python -m pytest bench/oracle/graph/e2e/test_tiny.py
@@ -60,15 +60,18 @@ def scored(c, irs, seed=0):
                       "N": None, "reader_top": 0})["scores"]
 
 
+TERMS = ("exec_error_bits", "necessity_error_bits", "claim_error_bits", "alignment_error_bits", "binding_error_bits",
+         "complexity_bits", "reader_error_bits")
+
+
 def test_full_program_is_the_model(checker):
-    """Every piece declared: with precision pricing each block may run quantized, but exact weights are one
-    of its options, so the total never exceeds the exact price of its numbers, and its execution error is
-    all quantization error (none from stand-ins: there are none)."""
+    """Every piece declared and every edge listed: M itself, so no execution error (no stand-ins, weights
+    exact), and the total is the sum of its terms."""
     units = search.all_units("tiny")
     (s,) = scored(checker, [ir(units)])
     assert s["valid"], s["error"]
-    exact = 0.5 * math.log2(s["N"]) * s["opaque_numbers"]
-    assert s["opaque_bits"] <= exact + 1e-6 and s["total_bits"] <= exact + s["code_bits"] + 1e-6, (s["total_bits"], exact)
+    assert s["exec_error_bits"] / s["N"] < 1e-6, s["per_family"]
+    assert math.isclose(s["total_bits"], sum(s.get(k) or 0.0 for k in TERMS), rel_tol=1e-9), s
 
 
 def test_empty_program_carries_the_signal_for_free(checker):
@@ -83,10 +86,12 @@ def test_terms_follow_the_declared_pieces(checker):
     head, mlp = units[0], units[-1]
     small, large, everything = scored(checker, [ir([head]), ir([head, mlp]), ir(units)])
     assert 0 < small["opaque_numbers"] < large["opaque_numbers"] < everything["opaque_numbers"]
+    assert 0 < small["parts"] < large["parts"] < everything["parts"]
+    assert 0 < small["structure_bits"] < large["structure_bits"] < everything["structure_bits"]
     for s, us in ((small, [head]), (large, [head, mlp])):
         tokens, types = mech.code_length(search.source(us))
         assert math.isclose(s["code_bits"], tokens * math.log2(types), rel_tol=1e-9)
-        assert math.isclose(s["opaque_bits"], 0.5 * math.log2(s["N"]) * s["opaque_numbers"], rel_tol=1e-9)
+        assert math.isclose(s["complexity_bits"], s["structure_bits"] + s["code_bits"] + s.get("explanation_bits", 0.0), rel_tol=1e-9)
 
 
 def test_batch_equals_single_requests(checker):

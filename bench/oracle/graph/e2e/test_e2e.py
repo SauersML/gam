@@ -1,5 +1,6 @@
-"""End-to-end checks of the graph oracle's score (#2951) on vpd4l induction: the reference programs trace,
-the oracle prompt renders, and the checker orders them the way every valid score must:
+"""End-to-end checks of the graph oracle's score (#2951) on vpd4l induction: the native reference programs
+trace (decomposition "native"; with VPD attached the checker takes its subcomponents only), the oracle
+prompt renders, and the checker orders them the way every valid score must:
   full program (every piece declared, every edge listed): execution error ~0, the largest opaque cost;
   empty program < random irrelevant heads (total bits);
   search's best program (e2e/search.py's result for the behavior, when one exists) < empty and < random.
@@ -34,10 +35,10 @@ needs_checker = pytest.mark.skipif(not (score.BINARY.exists() and BEHAVIOR.exist
 
 def test_references_trace():
     for name, source in programs.references("vpd4l").items():
-        ir = mech.trace_inline(source, "vpd4l")
+        ir = mech.trace_inline(source, "vpd4l", decomposition="native")
         assert ir["valid"], (name, ir["error"])
         assert (ir["nodes"] == []) == (name == "empty"), name
-    full = mech.trace_inline(programs.full("vpd4l"), "vpd4l")
+    full = mech.trace_inline(programs.full("vpd4l"), "vpd4l", decomposition="native")
     s = mech.shapes("vpd4l")
     assert len(full["nodes"]) == 2 * s["layers"]
     # every writer (embed, then each block in causal order) into every later block and the logits
@@ -47,7 +48,7 @@ def test_references_trace():
 
 def test_random_heads_avoid_hand():
     used = programs.hand_heads("vpd4l")
-    ir = mech.trace_inline(programs.random_heads("vpd4l", 3, 0), "vpd4l")
+    ir = mech.trace_inline(programs.random_heads("vpd4l", 3, 0), "vpd4l", decomposition="native")
     drawn = {(n["pieces"][0]["layer"], n["pieces"][0]["index"]) for n in ir["nodes"]}
     assert len(drawn) == 3 and not drawn & used
 
@@ -76,7 +77,7 @@ def test_all_valid(scores):
 def test_full_program_is_the_model(scores):
     full = scores["full"]
     assert full["exec_error_bits"] / full["N"] < 1e-6, full["per_family"]
-    assert full["opaque_numbers"] > max(r["opaque_numbers"] for n, r in scores.items() if n != "full")
+    assert full["parts"] > max(r["parts"] for n, r in scores.items() if n != "full")
     assert full["total_bits"] > scores["empty"]["total_bits"]
 
 
@@ -88,7 +89,7 @@ def test_empty_beats_random_heads(scores):
 @needs_checker
 def test_hand_terms(scores):
     for n, r in scores.items():
-        print(n, {k: r[k] for k in ("total_bits", "exec_error_bits", "opaque_bits", "code_bits")})
+        print(n, {k: r.get(k) for k in ("total_bits", "exec_error_bits", "necessity_error_bits", "complexity_bits")})
 
 
 def best_search_program() -> str | None:
@@ -122,7 +123,7 @@ class FakePool:
         import search
         out = []
         for src in sources:
-            ir = mech.trace_inline(src, "vpd4l")
+            ir = mech.trace_inline(src, "vpd4l", decomposition="native")
             assert ir["valid"], ir["error"]
             total = 100.0
             for n in ir["nodes"]:
@@ -133,7 +134,7 @@ class FakePool:
                     total += 1 - 5 * ((p["layer"], idx[0]) in {(1, 1), (2, 4)})
                 else:
                     total += sum(0.01 - 0.04 * (p["layer"] == 0 and i < 768) for i in idx)
-            out.append({"total_bits": total, "exec_error_bits": total, "opaque_bits": 0.0})
+            out.append({"total_bits": total, "exec_error_bits": total, "complexity_bits": 0.0})
         self.calls += len(sources)
         return out
 
@@ -155,7 +156,7 @@ def test_search_programs_trace_and_names_round_trip():
     units = search.all_units("vpd4l")
     for u in units + [b for b, _ in search.pieces_of(("mlp", 2, 0, 3072), 384)]:
         assert search.unit_of(search.name(u)) == u
-    ir = mech.trace_inline(search.source(units), "vpd4l")
+    ir = mech.trace_inline(search.source(units), "vpd4l", decomposition="native")
     assert ir["valid"], ir["error"]
     # every unit, and every causal edge among them, embed and the logits
     sites = sorted(search.site(u) for u in units)
@@ -197,16 +198,19 @@ def test_table_reads_sweep_search_and_oracle(tmp_path):
                    "oracle best of n (step 4)": ("1.3000", ""), "oracle mean (step 4)": ("2.2000", "")}
 
 
-def test_vpd_units_take_the_strongest_subcomponents():
+def test_subcomponent_programs_name_part_tokens():
+    """VPD subcomponents enter as part tokens, one node per layer's attention or MLP; a node reads the
+    residual only through c_fc / q / k / v parts and writes it only through down_proj / o_proj ones."""
     import search
-    search.RANKING.update({"0.c_fc": [53, 726, 1131, 5], "0.down_proj": [3257, 1149, 607, 9]})
-    u = ("vpd", 0, 2, 3)
-    assert search.unit_of(search.name(u)) == u and search.site(u) == 1
-    ir = mech.trace_inline(search.source([("head", 2, 4), u]), "vpd4l")
+    units = [("sub", 2, "o_proj", 7), ("sub", 0, "c_fc", 5), ("sub", 0, "down_proj", 9), ("sub", 0, "c_fc", 1)]
+    assert all(search.unit_of(search.name(u)) == u for u in units)
+    src = search.source(units)
+    assert "<p:0.fc.1>, <p:0.fc.5>, <p:0.down.9>" in src and "<p:2.o.7>" in src
+    ir = mech.trace_inline(src, "vpd4l")
     assert ir["valid"], ir["error"]
-    (vpd,) = [n for n in ir["nodes"] if n["pieces"][0]["view"] == "vpd"]
-    got = {p["kind"]: p["index"] for p in vpd["pieces"]}
-    assert got == {"c_fc": [53, 726], "down_proj": [607, 1149, 3257]}
+    got = {n["id"]: {(p["kind"], i) for p in n["pieces"] for i in ([p["index"]] if isinstance(p["index"], int) else p["index"])}
+           for n in ir["nodes"]}
+    assert got == {"vm0": {("c_fc", 1), ("c_fc", 5), ("down_proj", 9)}, "va2": {("o_proj", 7)}}, got
 
 
 def test_search_main_writes_its_result(tmp_path, monkeypatch):
@@ -242,11 +246,11 @@ def test_prefix_search_takes_pieces_that_pay_only_together():
         def score(self, sources, experiments, seed):
             out = []
             for src in sources:
-                ir = mech.trace_inline(src, "vpd4l")
+                ir = mech.trace_inline(src, "vpd4l", decomposition="native")
                 heads = {(n["pieces"][0]["layer"], n["pieces"][0]["index"]) for n in ir["nodes"] if n["pieces"][0]["kind"] == "head"}
                 exec_ = 100.0 - 50.0 * ({(1, 1), (2, 4)} <= heads) - 0.5 * len(heads & {(1, 1), (2, 4)})
                 total = exec_ + 2.0 * len(ir["nodes"])
-                out.append({"total_bits": total, "exec_error_bits": exec_, "opaque_bits": total - exec_, "N": 1,
+                out.append({"total_bits": total, "exec_error_bits": exec_, "complexity_bits": total - exec_, "N": 1,
                             "per_family": {"clean": {"tokens": 1, "mean_kl_bits": exec_}, "counterfactual": {"tokens": 1, "mean_kl_bits": exec_}}})
             self.calls += len(sources)
             return out
