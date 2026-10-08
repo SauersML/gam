@@ -110,7 +110,7 @@ class Checker:
             answer["base"] = self.request({"op": "base", "path": self.base})
         return answer
 
-    def score(self, program, experiments=32, seed=0, routing="edges", N=None, reader=True, reader_top=8, stand_in="input"):
+    def score(self, program, experiments=32, seed=0, routing="edges", N=None, reader=True, reader_top=8, stand_in="counterfactual"):
         """Every score term (design.txt section 5). `program` is Python source, an IR dict, or {"source",
         "explanation"} (the oracle's answer split by prompt.split_answer); the reader reads the explanation
         alone (none when absent). An untraceable source is scored as the empty program, flagged invalid. The reader term comes from the reader_score
@@ -118,11 +118,13 @@ class Checker:
         are returned for a later reader pass."""
         return self.score_batch([program], experiments, seed, routing, N, reader, reader_top, stand_in)[0]
 
-    def score_batch(self, programs, experiments=32, seed=0, routing="edges", N=None, reader=True, reader_top=8, stand_in="input", uniform_seeds=None, options=None):
+    def score_batch(self, programs, experiments=32, seed=0, routing="edges", N=None, reader=True, reader_top=8, stand_in="counterfactual", uniform_seeds=None, options=None):
         """score() for many programs of the current behavior under one seed, in one checker request (the server
         runs M once per experiment it has not cached and the programs in parallel). uniform_seeds m: the
         experiments are drawn from seed mod m, so m collections recur across a caller's seeds (58119de9b3).
-        options: further request keys passed to the server as they are (e.g. experiment families)."""
+        options: further request keys passed to the server as they are (e.g. experiment families). stand_in:
+        what the parts a program does not name carry when it names no "standin": "counterfactual" (their values
+        on the prompt's counterfactual; the lead's default for every program, 10-08 01:09) or "delete"."""
         irs = [self.ir(p) for p in programs]
         request = {"op": "score", "programs": irs, "experiments": experiments, "seed": seed,
                    "routing": routing, "N": N, "reader_top": reader_top if reader else 0, "stand_in": stand_in, **(options or {})}

@@ -90,6 +90,6 @@ def test_shared_base_joins_every_program(tmp_path):
         empty = {"model": "vpd4l", "nodes": [], "edges": [], "python_tokens": 0, "token_types": 0, "valid": True}
         taking = {**empty, "nodes": [{"id": "m", "pieces": [{"view": "vpd", "layer": 3, "kind": "c_fc", "index": [0]}]}],
                   "edges": [{"from": "embed", "to": "m", "route": "input"}]}
-        a, b = c.score_batch([empty, taking], experiments=2, reader=False)
+        a, b = c.score_batch([empty, taking], experiments=2, reader=False, stand_in="delete")  # the base is deletion's
         assert a["valid"] and b["valid"] and a["base_bits"] > 0 and math.isclose(b["base_bits"], a["base_bits"] / 2, rel_tol=1e-9)
         assert math.isclose(a["total_bits"], a["exec_error_bits"] + a["complexity_bits"], rel_tol=1e-9)
