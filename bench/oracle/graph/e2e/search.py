@@ -108,7 +108,7 @@ def piece(unit) -> str:
     l, kc, kd = unit[1:]
     c = ", ".join(map(str, sorted(RANKING[f"{l}.c_fc"][:kc])))
     d = ", ".join(map(str, sorted(RANKING[f"{l}.down_proj"][:kd])))
-    return f"PD.vpd[{l}].c_fc[{c}], PD.vpd[{l}].down_proj[{d}]"
+    return f"PD[{l}].c_fc[{c}], PD[{l}].down_proj[{d}]"
 
 
 def _slices(indices) -> str:
@@ -144,7 +144,7 @@ def nodes_of(units) -> list[tuple[str, str, int, bool, bool]]:
     for l, idx in mlp.items():
         out.append((f"m{l}", f"L[{l}].mlp[{_slices(idx)}]", 2 * l + 1, True, True))
     for (l, block), sites in sub.items():
-        pieces = ", ".join(f"PD.vpd[{l}].{m}[{_slices(sites[m])}]" for m in SITES_OF[block] if m in sites)
+        pieces = ", ".join(f"PD[{l}].{m}[{_slices(sites[m])}]" for m in SITES_OF[block] if m in sites)
         reads = bool(set(sites) & {"c_fc", "q_proj", "k_proj", "v_proj"})
         writes = bool(set(sites) & {"down_proj", "o_proj"})
         out.append((f"{'va' if block == 'attn' else 'vm'}{l}", pieces, 2 * l + (block == "mlp"), reads, writes))

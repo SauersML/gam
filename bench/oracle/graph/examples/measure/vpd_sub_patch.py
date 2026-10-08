@@ -279,7 +279,7 @@ def program(table: dict, beh: dict) -> str:
            "from mech import node, edges, PD, embed, logits", ""]
     for n in nodes:
         l, _, ps, _ = n
-        body = ", ".join(f"PD.vpd[{l}].{k}[{', '.join(map(str, v))}]" for k, v in ps.items())
+        body = ", ".join(f"PD[{l}].{k}[{', '.join(map(str, v))}]" for k, v in ps.items())
         out.append(f"{name(n)} = node(")
         out += [f"    {row}" for row in textwrap.wrap(body, 96, break_long_words=False)]
         out.append(")")

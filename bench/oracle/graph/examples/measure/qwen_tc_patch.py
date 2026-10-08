@@ -1,4 +1,4 @@
-"""Which transcoder features of Qwen3-0.6B's MLPs carry a behavior's answer (for PD.tc programs): at
+"""Which transcoder features of Qwen3-0.6B's MLPs carry a behavior's answer (PD[l].mlp parts): at
 each given layer, the ReLU transcoder (~/mpd-data/transcoders/qwen3-0.6b-lowl0, a_i = relu(W_enc[i] . x
 + b_enc[i]) on the MLP's input x, writing a_i W_dec[i]) is run on the clean and the counterfactual
 prompts; the CANDIDATES features whose write changes most between them (sum over positions of

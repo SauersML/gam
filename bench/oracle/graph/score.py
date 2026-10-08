@@ -25,11 +25,12 @@ BINARY = Path(os.environ.get("GRAPH_CHECKER") or (PUBLISHED if PUBLISHED.exists(
 HERE = Path(__file__).resolve().parent
 
 
-def trace(source, model):
-    """The IR of a program's source, through mech's sandboxed tracer (g-mech's bench/oracle/graph/mech.py)."""
+def trace(source, model, behavior=None, decomposition=None):
+    """The IR of a program's source, through mech's sandboxed tracer (g-mech's bench/oracle/graph/mech.py):
+    its algorithm evaluated on `behavior`'s prompts, PD bound to `decomposition`."""
     sys.path.insert(0, str(HERE))
     import mech
-    return mech.trace(source, model)
+    return mech.trace(source, model, behavior=behavior, decomposition=decomposition)
 
 
 def tokenizer(model):
@@ -79,6 +80,9 @@ class Checker:
         self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1, env=env)
         self.request({"op": "load", "export": str(export), **{k: str(Path(v).expanduser()) for k, v in (views or {}).items()}, **({"device": device} if device else {})})
         self.behavior_record = None
+        # What a program's PD names: the attached decomposition (the library over VPD when both are).
+        views = views or {}
+        self.decomposition = "library" if "library" in views else "vpd" if "vpd" in views else "transcoder" if "transcoders" in views else "native"
 
     def request(self, message):
         self.process.stdin.write(json.dumps(message) + "\n")
@@ -123,7 +127,7 @@ class Checker:
             return program
         source, explanation = (program, "") if isinstance(program, str) else (program["source"], program.get("explanation") or "")
         try:
-            ir = trace(source, self.model)
+            ir = trace(source, self.model, self.behavior_record, self.decomposition)
         except Exception as e:  # the tracer's error is the program's error
             ir = {"model": self.model, "nodes": [], "edges": [], "python_tokens": 0, "token_types": 0,
                   "source": source, "valid": False, "error": f"{type(e).__name__}: {e}"}

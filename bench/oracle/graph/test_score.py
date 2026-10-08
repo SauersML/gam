@@ -36,7 +36,8 @@ def checker(tmp_path_factory):
 
 
 def test_batch_scores_every_term_and_equals_single(checker):
-    example = (HERE / "examples/vpd4l_induction_native.py").read_text()
+    example = ("from mech import node, edges, L, embed, logits\nprev = node(L[1].head[1])\nind = node(L[2].head[4])\n"
+               "edges(embed >> prev, prev >> ind.key, embed >> ind, ind >> logits, embed >> logits)\n")  # no views: native
     programs = ["", example, "import os\nnode(L[9].head[0])\n"]
     together = checker.score_batch(programs, experiments=12, seed=5, reader=False)
     assert [s["valid"] for s in together] == [True, True, False]
@@ -61,7 +62,7 @@ def test_reader_items(checker):
 def test_ir_carries_explanation():
     import types
 
-    fake = types.SimpleNamespace(model="vpd4l")
+    fake = types.SimpleNamespace(model="vpd4l", behavior_record=None, decomposition="vpd")
     ir = score.Checker.ir(fake, {"source": "from mech import L\n", "explanation": "L2.H4 copies the token."})
     assert ir["valid"] and ir["explanation"] == "L2.H4 copies the token."
     assert score.Checker.ir(fake, "from mech import L\n")["explanation"] == ""

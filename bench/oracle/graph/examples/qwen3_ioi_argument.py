@@ -19,21 +19,21 @@ h11_9 = node(L[11].head[9])  # recovers 2.02 bits
 h11_13 = node(L[11].head[13])  # recovers 2.01 bits
 h13_6 = node(L[13].head[6])  # recovers 1.45 bits
 # layer 16's MLP as the transcoder features that recover more than their price when patched alone (0.28 bits summed)
-tc16 = node(PD.tc[16][4282, 18146, 22890, 41987, 52503, 63450, 64441, 75112, 84562, 105827, 130169, 136136])
+tc16 = node(PD[16].mlp[4282, 18146, 22890, 41987, 52503, 63450, 64441, 75112, 84562, 105827, 130169, 136136])
 h17_0 = node(L[17].head[0])  # recovers 1.62 bits
 h17_3 = node(L[17].head[3])  # recovers 1.12 bits
 h17_13 = node(L[17].head[13])  # recovers 0.70 bits
 # layer 18's MLP as the transcoder features that recover more than their price when patched alone (0.20 bits summed)
-tc18 = node(PD.tc[18][6202, 17433, 24980, 37802, 46810, 54515, 55740, 57186, 83497, 102661, 105447, 114535, 114905, 116821, 153012, 163100])
+tc18 = node(PD[18].mlp[6202, 17433, 24980, 37802, 46810, 54515, 55740, 57186, 83497, 102661, 105447, 114535, 114905, 116821, 153012, 163100])
 h19_2 = node(L[19].head[2])  # recovers 3.06 bits
 h19_8 = node(L[19].head[8])  # recovers 1.16 bits
 # layer 19's MLP as the transcoder features that recover more than their price when patched alone (0.47 bits summed)
-tc19 = node(PD.tc[19][3091, 45736, 63852, 67110, 77678, 87919, 137296, 142064])
+tc19 = node(PD[19].mlp[3091, 45736, 63852, 67110, 77678, 87919, 137296, 142064])
 h21_0 = node(L[21].head[0])  # recovers 2.39 bits
 h21_11 = node(L[21].head[11])  # recovers 1.34 bits
 h22_8 = node(L[22].head[8])  # recovers 1.58 bits
 # layer 22's MLP as the transcoder features that recover more than their price when patched alone (0.03 bits summed)
-tc22 = node(PD.tc[22][33352, 45461, 48501, 109127, 157530])
+tc22 = node(PD[22].mlp[33352, 45461, 48501, 109127, 157530])
 h23_6 = node(L[23].head[6])  # recovers 2.23 bits
 h25_4 = node(L[25].head[4])  # recovers 1.27 bits
 h25_5 = node(L[25].head[5])  # recovers 0.86 bits

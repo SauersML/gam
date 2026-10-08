@@ -1,39 +1,69 @@
 """The `mech` library of the graph oracle (#2951): the only module an oracle program may import.
 
-A program declares nodes bound to pieces of the target model M's weights and the edges between them:
+A program (design_v2 section 1) is an ALGORITHM in plain Python over the prompt's tokens, BINDINGS that
+name the parts of the target model M holding its variables, and optional attention CLAIMS. Induction on
+vpd4l with VPD attached ("A B ... A -> B"):
 
-    from mech import node, edges, L, PD, embed, logits
-    prev  = node(L[1].head[1])                 # a native head: its rows of q, k, v and columns of o
-    match = node(L[2].head[4])
-    boost = node(L[3].mlp[118, 2051])          # native MLP neurons: gate/up rows, down columns
-    part  = node(PD.vpd[2].c_fc[1534], PD.vpd[2].down_proj[77])   # VPD subcomponents (vpd4l)
-    edges(
-        prev >> match.key,                     # routes: .query .key .value (heads), .input (any read)
-        embed >> match.query,
-        match >> logits,
-    )
+    from mech import bind, claim
 
-Addresses (layer l, indices i, j, ... from 0):
-  L[l].head[h, ...]          native attention heads (Qwen3: query heads; a head's k/v rows are those of
-                             its key-value group, shared with the other heads of the group)
-  L[l].mlp[i, ...]           native MLP neurons (L[l].attn: all heads of layer l)
-  PD.vpd[l].<site>[i, ...]   VPD subcomponents U_i V_i^T, site in q_proj k_proj v_proj o_proj c_fc down_proj;
-                             PD.vpd[l].<site>.rest is the site's remainder W - sum of its subcomponents
-  PD.lib[l].attn[i, ...]     our library's parts of layer l's attention (.mlp[i]: of its MLP); parts may
-                             overlap, so a part may sit in several nodes (vpd4l: decomp's start, arm
-                             LIBRARY_ARM; part i = the i-th component of that block in the file)
-  PD.tc[l][i, ...]           transcoder features of layer l's MLP (Qwen3-0.6B)
-Indices may be ints, slices or ranges; a site without indices (L[3].mlp) is all of its units.
-`node(*pieces)` makes one node (its pieces in one layer's attention or one layer's MLP); `writer >> reader` declares an
-edge (writer: a node or embed; reader: a route handle, a node = all of its reads, or logits) and
-`edges(...)` lists them. node(L[1].head[1], rule=attend(offset=1)) replaces a head's query and key by
-an attention rule (attend(offset=k), attend(query=tokens, key=shift(tokens, 1)), attend(first=True)).
-Undeclared pieces and edges carry the model's values on the prompt's counterfactual. Comments and docstrings are free text: the English of the explanation.
+    def back(tokens):
+        # each position attends to the one before it
+        return [[t - 1] if t else [0] for t in range(len(tokens))]
 
-trace(source, model) checks a program and runs it in a sandboxed child process, returning the IR the
-checker reads (design.txt section 5); code_length counts its Python tokens; english extracts its
-comments and docstrings; shapes(model) is the registry of model sizes (shapes.json, built from the
-weight and config files by `mech.py shapes --write`).
+    def prev(tokens, back):
+        # the token before each position, which layer 1 moves forward one position
+        return [tokens[js[0]] if t else None for t, js in enumerate(back)]
+
+    def match(tokens, prev):
+        # each position attends to the earlier positions whose previous token is its own token
+        return [[j for j in range(t) if prev[j] == tokens[t]] for t in range(len(tokens))]
+
+    def answer(tokens, match):
+        # the token at the latest such position: the one that followed the current token before
+        return [tokens[js[-1]] if js else None for js in match]
+
+    claim(back, <p:1.q.316>, <p:1.k.329>)
+    bind(prev, <p:1.v.228>, <p:1.v.346>, <p:1.o.311>, <p:1.o.340>)
+    claim(match, <p:2.q.335>, <p:2.k.206>)
+    bind(answer, <p:2.v.559>, <p:2.o.735>, <p:3.v.677>, <p:3.o.806>)
+
+The algorithm. A variable is a top-level function, named by its name, that takes `tokens` (the prompt as
+M's token strings, such as " cat") and other variables (by parameter name) and returns one value per
+position: a string, number, bool or None, or a list or tuple of them. Its value at position t may use
+tokens 0..t only. Other functions are helpers. Comments and docstrings are free working notes.
+bind(variable, parts...): what the parts write into the residual stream holds the variable. A variable
+may span layers (one node per layer's attention or MLP); a part belongs to one node.
+claim(pattern, parts...): `pattern`'s value at t lists the positions 0..t that the parts' attention at
+query t attends to, uniformly (none: position 0), or maps positions to weights; the parts are q_proj
+and k_proj parts (or native heads), in one layer or several (the pattern holds in each). A claim states
+what the parts compute; they still compute it with M's weights.
+The answer is the one bound variable that no variable reads: its value at t is the token M predicts
+after position t.
+Edges follow the data flow: a variable reading `tokens` reads the token embedding; one reading another
+variable reads the writes of that variable's parts (through unbound steps); a variable spanning layers
+feeds its own later parts; the answer's parts and the embedding write the logits.
+
+Parts (layer L, index I, from 0). The oracle writes one part token per part; text spellings in brackets:
+  <p:L.S.I>     [PD[L].<site>[I, ...]] part I of the attached decomposition at layer L's site S:
+                VPD: S in q k v o fc down (sites q_proj k_proj v_proj o_proj c_fc down_proj);
+                our library: S in attn mlp; transcoders: S = mlp (the features of layer L's MLP)
+  <p:L.S.rest>  [PD[L].<site>.rest] a VPD site's remainder W - sum of its subcomponents
+  <p:L.h.I>     [L[L].head[I, ...]] a native attention head; <p:L.a> [L[L].attn] all heads of layer L
+  <p:L.m>       [L[L].mlp] a native MLP
+Native units appear only where the attached decomposition leaves a block uncovered: none with VPD or the
+library, heads with transcoders. Text indices may be ints, slices or ranges.
+
+The low-level form, without an algorithm: node(*parts) makes one node; `writer >> reader` is an edge
+(writer: a node or embed; reader: a node, a route node.query/.key/.value/.input, or logits); edges(...)
+lists them.
+
+trace(source, model, behavior=...) checks a program, runs it in a sandboxed child process and, given
+the behavior, evaluates the algorithm on its prompts: per bound variable, interchange pairs (prompt i
+with the variable's value from prompt j, the next prompt of i's length, and the answer at each of i's
+targets), and each claim's pattern on every prompt and counterfactual. It returns the IR the checker
+reads. Parts a program leaves out are the checker's stand-ins (deleted, with a decomposition attached).
+code_length counts Python tokens (a part token is one); english extracts comments and docstrings;
+shapes(model) is the registry of model sizes (shapes.json, `mech.py shapes --write`).
 """
 
 from __future__ import annotations
@@ -45,29 +75,39 @@ import inspect
 import io
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
 import threading
 import tokenize
 import traceback
+import types
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 SHAPES_FILE = HERE / "shapes.json"
 MODELS = ("qwen3-0.6b", "qwen3-1.7b", "qwen3-8b", "vpd4l")
 QWEN3 = {"qwen3-0.6b": "Qwen/Qwen3-0.6B", "qwen3-1.7b": "Qwen/Qwen3-1.7B", "qwen3-8b": "Qwen/Qwen3-8B"}
+VPD4L_TOKENIZER = Path.home() / "mpd-data/vpd/t-9d2b8f02/tokenizer.json"
 VIEWS = ("native", "vpd", "library", "transcoder")
 SITES = ("q_proj", "k_proj", "v_proj", "o_proj", "c_fc", "down_proj")
+# Per decomposition: its sites (PD[l].<site>) and the blocks it covers (no native units there).
+DECOMPOSITIONS = {"vpd": SITES, "library": ("attn", "mlp"), "transcoder": ("mlp",)}
+COVERS = {"vpd": ("attn", "mlp"), "library": ("attn", "mlp"), "transcoder": ("mlp",)}
+DEFAULT_DECOMPOSITION = {"vpd4l": "vpd", "qwen3-0.6b": "transcoder"}
+CODES = {"q_proj": "q", "k_proj": "k", "v_proj": "v", "o_proj": "o", "c_fc": "fc", "down_proj": "down",
+         "attn": "attn", "mlp": "mlp"}  # a site's code in part tokens
+SITE_OF = {code: site for site, code in CODES.items()}
+PART = re.compile(r"<p:(\d+)\.(?:(q|k|v|o|fc|down|attn|mlp)\.(\d+|rest)|h\.(\d+)|(a|m))>")
 ROUTES = ("query", "key", "value", "input")
-EXPORTS = ("node", "edges", "L", "PD", "embed", "logits", "attend", "tokens", "shift")
-ATTRIBUTES = ("head", "attn", "mlp", "vpd", "lib", "tc", "query", "key", "value", "input") + SITES
-LIBRARY_ARM = "grouped_own"  # the arm of decomp's start that PD.lib addresses
-DEFAULT_STANDIN = "counterfactual"
+EXPORTS = ("bind", "claim", "node", "edges", "L", "PD", "embed", "logits")
+ATTRIBUTES = ("head", "attn", "mlp", "rest", "query", "key", "value", "input") + SITES
+LIBRARY_ARM = "grouped_own"  # the arm of decomp's start that the library view addresses
 
 
 class MechError(Exception):
-    """An invalid program: a bad address, edge or construct."""
+    """An invalid program: a bad address, edge, binding or construct."""
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -136,6 +176,8 @@ def build_shapes(data: Path) -> dict:
     }
 
 
+
+
 # ---------------------------------------------------------------------------------------------------
 # Program objects
 
@@ -143,11 +185,15 @@ _PROGRAM: "_Program | None" = None
 
 
 class _Program:
-    def __init__(self, model: str):
+    def __init__(self, model: str, decomposition: str | None, namespace: dict):
         self.model = model
         self.shape = shapes(model)
+        self.decomposition = decomposition
+        self.namespace = namespace
         self.nodes: list[Node] = []
         self.edges: dict[tuple, Edge] = {}
+        self.bound: dict[str, list[Piece]] = {}
+        self.claimed: dict[str, list[Piece]] = {}
 
 
 def _shape() -> dict | None:
@@ -176,23 +222,44 @@ def _indices(key, size: int | None, what: str) -> tuple[int, ...]:
 
 
 class Piece:
-    """Pieces of one of M's sites: (view, layer, kind, indices)."""
+    """Parts of one of M's sites: (view, layer, kind, indices). The view is "native" or the attached
+    decomposition; kind is the IR's: head, mlp (native), a VPD site, attn/mlp (library), feature
+    (transcoder)."""
 
     def __init__(self, view: str, layer: int, kind: str, index: tuple[int, ...], size: int | None = None,
                  rest: bool = False):
         self.view, self.layer, self.kind, self.index, self.size, self.rest = view, layer, kind, index, size, rest
 
+    def site(self) -> str:
+        """The site's name in PD[l].<site>."""
+        return "mlp" if self.kind == "feature" else self.kind
+
+    def whole(self) -> bool:
+        return self.size is not None and len(self.index) == self.size
+
     def name(self) -> str:
+        l = self.layer
         if self.rest:
-            return f"PD.vpd[{self.layer}].{self.kind}.rest"
+            return f"PD[{l}].{self.site()}.rest"
+        if self.view == "native" and self.whole():
+            return f"L[{l}].{'attn' if self.kind == 'head' else 'mlp'}"
         i = ", ".join(map(str, self.index[:4])) + (", ..." if len(self.index) > 4 else "")
         if self.view == "native":
-            return f"L[{self.layer}].{self.kind}[{i}]"
-        if self.view == "transcoder":
-            return f"PD.tc[{self.layer}][{i}]"
-        if self.view == "library":
-            return f"PD.lib[{self.layer}].{self.kind}[{i}]"
-        return f"PD.{'vpd' if self.view == 'vpd' else 'lib'}[{self.layer}].{self.kind}[{i}]"
+            return f"L[{l}].{self.kind}[{i}]"
+        return f"PD[{l}].{self.site()}[{i}]"
+
+    def tokens(self) -> list[str]:
+        """The part tokens of its units."""
+        l = self.layer
+        if self.rest:
+            return [f"<p:{l}.{CODES[self.site()]}.rest>"]
+        if self.view == "native":
+            if self.whole():
+                return [f"<p:{l}.{'a' if self.kind == 'head' else 'm'}>"]
+            if self.kind != "head":
+                raise MechError(f"{self.name()}: MLP neurons have no part tokens")
+            return [f"<p:{l}.h.{i}>" for i in self.index]
+        return [f"<p:{l}.{CODES[self.site()]}.{i}>" for i in self.index]
 
     def block(self) -> str:
         return "mlp" if self.kind in ("mlp", "c_fc", "down_proj", "feature") else "attn"
@@ -222,32 +289,32 @@ class Piece:
         return [("hidden", l)]  # c_fc writes its layer's MLP hidden pre-activation
 
     def __rshift__(self, other):
-        raise MechError(f"{self.name()} is a piece; make it a node, node({self.name()}), before connecting it")
+        raise MechError(f"{self.name()} is a part; make it a node, node({self.name()}), before connecting it")
 
     def ir(self) -> dict:
         """index: one int, a sorted list, null for every unit of the site, or "rest" for a VPD site's
         remainder W - sum of its subcomponents."""
         if self.rest:
             return {"view": self.view, "layer": self.layer, "kind": self.kind, "index": "rest"}
-        whole = self.size is not None and len(self.index) == self.size
         return {"view": self.view, "layer": self.layer, "kind": self.kind,
-                "index": None if whole else self.index[0] if len(self.index) == 1 else list(self.index)}
+                "index": None if self.whole() else self.index[0] if len(self.index) == 1 else list(self.index)}
 
 
 class _Site:
     def __init__(self, view: str, layer: int, kind: str, size: int | None):
         self.view, self.layer, self.kind, self.size = view, layer, kind, size
 
+    def _what(self) -> str:
+        return Piece(self.view, self.layer, self.kind, (0,)).name().rsplit("[", 1)[0]
+
     def __getitem__(self, key) -> Piece:
-        what = Piece(self.view, self.layer, self.kind, (0,)).name().rsplit("[", 1)[0]
-        return Piece(self.view, self.layer, self.kind, _indices(key, self.size, what), self.size)
+        return Piece(self.view, self.layer, self.kind, _indices(key, self.size, self._what()), self.size)
 
     @property
     def rest(self) -> Piece:
-        """A VPD site's remainder W - sum of its subcomponents, e.g. PD.vpd[2].q_proj.rest."""
+        """A VPD site's remainder W - sum of its subcomponents, e.g. PD[2].q_proj.rest."""
         if self.view != "vpd":
-            raise MechError(f"{Piece(self.view, self.layer, self.kind, (0,)).name().rsplit('[', 1)[0]}.rest: "
-                            "only a VPD site has a remainder")
+            raise MechError(f"{self._what()}.rest: only a VPD site has a remainder")
         return Piece(self.view, self.layer, self.kind, (), self.size, rest=True)
 
     def whole(self) -> Piece:
@@ -271,7 +338,7 @@ class _NativeLayer:
         self._l = l
 
     def __getattr__(self, name: str):
-        raise MechError(f"L[{self._l}].{name}: a layer has .head[h], .attn (all heads) and .mlp[i]")
+        raise MechError(f"L[{self._l}].{name}: a layer has .head[h], .attn (all heads) and .mlp")
 
     @property
     def head(self) -> _Site:
@@ -294,75 +361,108 @@ class _Layers:
         return _NativeLayer(_layer(l, "L"))
 
 
-def _view(view: str, name: str):
-    shape = _shape()
-    if shape is not None and not shape["views"].get(view):
-        raise MechError(f"PD.{name}: the {view} view is not available for {_PROGRAM.model}")
-    return None if shape is None else shape["views"][view]
+def _decomposition(what: str) -> str:
+    if _PROGRAM is None or _PROGRAM.decomposition is None:
+        raise MechError(f"{what}: no decomposition is attached" + (f" for {_PROGRAM.model}" if _PROGRAM else ""))
+    return _PROGRAM.decomposition
 
 
-class _DecompLayer:
-    def __init__(self, view: str, name: str, l: int):
-        self._view, self._name, self._l = view, name, l
+def _site(decomposition: str, l: int, site: str) -> _Site:
+    """Layer l's site of the attached decomposition."""
+    if site not in DECOMPOSITIONS[decomposition]:
+        raise MechError(f"PD[{l}].{site}: the {decomposition} decomposition's sites are "
+                        f"{', '.join(DECOMPOSITIONS[decomposition])}")
+    sizes = _PROGRAM.shape["views"].get(decomposition)
+    if not sizes:
+        raise MechError(f"PD[{l}].{site}: no {decomposition} decomposition exists for {_PROGRAM.model}")
+    if decomposition == "vpd":
+        return _Site("vpd", l, site, sizes[l][site])
+    if decomposition == "library":
+        return _Site("library", l, site, sizes["parts"][l][site])
+    return _Site("transcoder", l, "feature", sizes[l])
 
-    def __getattr__(self, site: str) -> _Site:
-        if site not in SITES:
-            raise MechError(f"PD.{self._name}[{self._l}].{site}: sites are {', '.join(SITES)}")
-        sizes = _view(self._view, self._name)
-        return _Site(self._view, self._l, site, sizes and sizes[self._l][site])
 
-
-class _LibLayer:
-    """Our library's parts of layer l: .attn[i] (a part of the attention) and .mlp[i] (of the MLP)."""
+class _PDLayer:
+    """Layer l's parts of the attached decomposition: PD[l].<site>[i, ...] and PD[l].<site>.rest."""
 
     def __init__(self, l: int):
         self._l = l
 
-    def _site(self, block: str) -> _Site:
-        counts = _view("library", "lib")
-        return _Site("library", self._l, block, counts and counts["parts"][self._l][block])
-
-    attn = property(lambda self: self._site("attn"))
-    mlp = property(lambda self: self._site("mlp"))
-
-    def __getattr__(self, name: str):
-        raise MechError(f"PD.lib[{self._l}].{name}: library parts are PD.lib[l].attn[i] and PD.lib[l].mlp[i]")
-
-
-class _Decomp:
-    def __init__(self, view: str, name: str):
-        self._view, self._name = view, name
-
-    def __getitem__(self, l):
-        l = _layer(l, f"PD.{self._name}")
-        if self._view == "transcoder":
-            widths = _view(self._view, self._name)
-            return _Site("transcoder", l, "feature", widths and widths[l])
-        _view(self._view, self._name)
-        return _LibLayer(l) if self._view == "library" else _DecompLayer(self._view, self._name, l)
+    def __getattr__(self, site: str) -> _Site:
+        return _site(_decomposition(f"PD[{self._l}].{site}"), self._l, site)
 
 
 class _PD:
-    vpd = _Decomp("vpd", "vpd")
-    lib = _Decomp("library", "lib")
-    tc = _Decomp("transcoder", "tc")
+    def __getitem__(self, l) -> _PDLayer:
+        return _PDLayer(_layer(l, "PD"))
+
+    def __getattr__(self, name: str):
+        raise MechError(f"PD.{name}: PD[l].<site>[i] names part i of the attached decomposition (or a part token "
+                        "such as <p:2.v.559>)")
+
+
+def _part(token: str) -> Piece:
+    """The part a part token names (<p:2.v.559>, <p:1.q.rest>, <p:3.h.4>, <p:0.a>, <p:1.m>)."""
+    m = PART.fullmatch(token)
+    if m is None:
+        raise MechError(f"{token!r} is not a part token (<p:L.S.I>, <p:L.S.rest>, <p:L.h.I>, <p:L.a>, <p:L.m>)")
+    l = _layer(int(m[1]), "<p:")
+    if m[2]:
+        site = _site(_decomposition(token), l, SITE_OF[m[2]])
+        return site.rest if m[3] == "rest" else site[int(m[3])]
+    native = _NativeLayer(l)
+    if m[4]:
+        return native.head[int(m[4])]
+    return (native.attn if m[5] == "a" else native.mlp).whole()
+
+
+def _covered(p: Piece) -> None:
+    """Native units only where the attached decomposition leaves the block uncovered."""
+    decomposition = _PROGRAM and _PROGRAM.decomposition
+    if p.view == "native" and decomposition and p.block() in COVERS[decomposition]:
+        sites = ", ".join(f"PD[{p.layer}].{s}" for s in DECOMPOSITIONS[decomposition]
+                          if decomposition != "vpd" or (s in ("c_fc", "down_proj")) == (p.block() == "mlp"))
+        raise MechError(f"{p.name()}: layer {p.layer}'s {p.block()} is decomposed by {decomposition}; "
+                        f"name its parts ({sites}) instead of native units")
+
+
+def _pieces(parts, what: str) -> tuple[Piece, ...]:
+    """Part arguments (pieces, whole sites, part tokens, or lists of them) as pieces."""
+    out = []
+    for p in (q for p in parts for q in (p if isinstance(p, (list, tuple)) else (p,))):
+        if isinstance(p, str):
+            p = _part(p)
+        elif isinstance(p, _Site):
+            p = p.whole()
+        if not isinstance(p, Piece):
+            raise MechError(f"{what}: {p!r} is not a part (a part token such as <p:2.v.559>, or PD[2].v_proj[559])")
+        _covered(p)
+        out.append(p)
+    if not out:
+        raise MechError(f"{what} needs at least one part")
+    return tuple(out)
+
+
+def _merged(pieces) -> tuple[Piece, ...]:
+    merged: dict[tuple, set] = {}
+    for p in pieces:
+        merged.setdefault((p.view, p.layer, p.kind, p.size, p.rest), set()).update(p.index)
+    return tuple(Piece(v, l, k, tuple(sorted(i)), n, r) for (v, l, k, n, r), i in merged.items())
 
 
 class Node:
     """A node: a set of pieces that compute with their actual inputs, routed by declared edges."""
 
-    def __init__(self, pieces: tuple[Piece, ...]):
+    def __init__(self, pieces: tuple[Piece, ...], register: bool = True):
         self.pieces = pieces
         self.id: str | None = None
-        self.rule: Rule | None = None
-        if _PROGRAM is not None:
+        self.claim: dict | None = None
+        if _PROGRAM is not None and register:
             _PROGRAM.nodes.append(self)
 
     def _route(self, route: str) -> "Route":
-        if self.rule is not None and route in ("query", "key"):
-            raise MechError(f"node {self.label()}'s rule replaces its {route}; route its value or input")
         if not any(route in r for p in self.pieces for (_, _, r) in p.reads()):
-            raise MechError(f"node {self.label()} has no {route} read (query/key/value need a head or a q/k/v_proj piece)")
+            raise MechError(f"node {self.label()} has no {route} read (query/key/value need a head or a q/k/v_proj part)")
         return Route(self, route)
 
     query = property(lambda self: self._route("query"))
@@ -372,6 +472,13 @@ class Node:
 
     def label(self) -> str:
         return self.id or "(" + ", ".join(p.name() for p in self.pieces) + ")"
+
+    def site(self) -> tuple[int, str]:
+        p = self.pieces[0]
+        return p.layer, p.block()
+
+    def writes_residual(self) -> bool:
+        return any(w[0] == "resid" for p in self.pieces for w in p.writes())
 
     def __rshift__(self, other) -> "Edge":
         return _edge(self, other)
@@ -421,6 +528,16 @@ class Edge:
         return _edge(self.dst, other)
 
 
+def _connects(src, target, route: str) -> bool:
+    """Whether a piece of `src` (a node or embed) writes where a piece of `target` (a node or logits)
+    reads it later through `route`."""
+    writes = [("resid", -1)] if src is embed else [w for p in src.pieces for w in p.writes()]
+    reads = ([("resid", 2 * _PROGRAM.shape["layers"] if _PROGRAM else 10**9, ("input",))] if target is logits
+             else [r for p in target.pieces for r in p.reads()])
+    return any((ws == rs == "resid" and w < r or ws == rs != "resid" and w == r) and route in routes
+               for ws, w in writes for rs, r, routes in reads)
+
+
 def _edge(src, dst) -> Edge:
     if isinstance(dst, Node):
         dst = dst.input
@@ -432,12 +549,7 @@ def _edge(src, dst) -> Edge:
         raise MechError(f"{dst!r} is not a reader (a node, a route handle such as node.key, or logits)")
     if src is target:
         raise MechError(f"node {src.label()} cannot read itself")
-    writes = [("resid", -1)] if src is embed else [w for p in src.pieces for w in p.writes()]
-    reads = ([("resid", 2 * _PROGRAM.shape["layers"] if _PROGRAM else 10**9, ("input",))] if target is logits
-             else [r for p in target.pieces for r in p.reads()])
-    ok = any((ws == rs == "resid" and w < r or ws == rs != "resid" and w == r) and route in routes
-             for ws, w in writes for rs, r, routes in reads)
-    if not ok:
+    if not _connects(src, target, route):
         name = "embed" if src is embed else src.label()
         reader = "logits" if target is logits else f"{target.label()}.{route}"
         raise MechError(f"edge {name} >> {reader} connects nothing: no piece of the writer writes "
@@ -448,73 +560,13 @@ def _edge(src, dst) -> Edge:
     return edge
 
 
-class Expr:
-    """A token-level quantity a rule compares: `tokens` (the token at a position) or shift(expr, k)
-    (expr at the position k earlier)."""
-
-    def __init__(self, ir: dict):
-        self.ir = ir
-
-
-tokens = Expr({"op": "tokens"})
-
-
-def shift(expr: Expr, k: int) -> Expr:
-    """`expr` read k positions earlier: shift(tokens, 1) is the previous token."""
-    if not isinstance(expr, Expr) or not isinstance(k, int) or isinstance(k, bool) or k < 1:
-        raise MechError("shift(expr, k): expr is tokens or a shift, k a positive int")
-    return Expr({"op": "shift", "arg": expr.ir, "by": k})
-
-
-class Rule:
-    def __init__(self, ir: dict):
-        self.ir = ir
-
-
-def attend(offset: int | None = None, query: Expr | None = None, key: Expr | None = None,
-           first: bool = False) -> Rule:
-    """An attention rule for a head node, replacing its query and key computation: the head attends
-    uniformly to the earlier positions j that satisfy the rule, and computes its value and output with
-    the model's own weights on its actual (routed) value input. attend(offset=k): j = t - k;
-    attend(query=q, key=k): every j < t with k at j equal to q at t (induction: query=tokens,
-    key=shift(tokens, 1)); attend(first=True): j = 0. With no such j the head attends to position 0."""
-    given = (offset is not None) + (query is not None or key is not None) + bool(first)
-    if given != 1:
-        raise MechError("attend(): give exactly one of offset=k, query=... with key=..., or first=True")
-    if offset is not None:
-        if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
-            raise MechError("attend(offset=k): k is an int >= 0")
-        return Rule({"op": "attend", "offset": offset})
-    if first:
-        return Rule({"op": "attend", "first": True})
-    if not isinstance(query, Expr) or not isinstance(key, Expr):
-        raise MechError("attend(query=..., key=...): both are tokens or shift(tokens, k)")
-    return Rule({"op": "attend", "query": query.ir, "key": key.ir})
-
-
-def node(*pieces, rule=None) -> Node:
-    """One node made of `pieces` (addresses such as L[1].head[1] or PD.vpd[2].c_fc[5, 9]); `rule`: an
-    attention rule (attend(...)) for a node of native heads."""
-    if rule is not None and not isinstance(rule, Rule):
-        raise MechError("rule=: an attention rule such as attend(offset=1)")
-    pieces = tuple(q for p in pieces for q in (p if isinstance(p, (list, tuple)) else (p,)))  # node([a, b]) too
-    if not pieces:
-        raise MechError("node() needs at least one piece")
-    pieces = tuple(p.whole() if isinstance(p, _Site) else p for p in pieces)
-    for p in pieces:
-        if not isinstance(p, Piece):
-            raise MechError(f"node(): {p!r} is not a piece address such as L[1].head[1]")
+def node(*parts) -> Node:
+    """One node made of `parts` (part tokens such as <p:2.v.559>, or PD[2].c_fc[5, 9], L[1].head[1])."""
+    pieces = _pieces(parts, "node()")
     if len({(p.layer, p.block()) for p in pieces}) > 1:
-        raise MechError("a node's pieces must lie in one layer's attention or one layer's MLP; "
+        raise MechError("a node's parts must lie in one layer's attention or one layer's MLP; "
                         "make one node per site and connect them with edges")
-    if rule is not None and any(p.kind != "head" for p in pieces):
-        raise MechError("an attention rule applies to a node of native heads (L[l].head[...])")
-    merged: dict[tuple, set] = {}
-    for p in pieces:
-        merged.setdefault((p.view, p.layer, p.kind, p.size, p.rest), set()).update(p.index)
-    made = Node(tuple(Piece(v, l, k, tuple(sorted(i)), n, r) for (v, l, k, n, r), i in merged.items()))
-    made.rule = rule
-    return made
+    return Node(_merged(pieces))
 
 
 def edges(*declared) -> None:
@@ -522,6 +574,297 @@ def edges(*declared) -> None:
     for e in (f for d in declared for f in (d if isinstance(d, (list, tuple)) else (d,))):  # edges([...]) too
         if not isinstance(e, Edge):
             raise MechError(f"edges(): {e!r} is not an edge `writer >> reader`")
+
+
+def _variable(fn, what: str) -> str:
+    """The name of a variable: a function the program defines with `def`."""
+    if _PROGRAM is None:
+        raise MechError(f"{what}() runs inside a program")
+    if not isinstance(fn, types.FunctionType) or fn.__name__ == "<lambda>" or _PROGRAM.namespace.get(fn.__name__) is not fn:
+        raise MechError(f"{what}(): the first argument is a variable, a function the program defines with def "
+                        f"(its name is the variable's name), not {fn!r}")
+    return fn.__name__
+
+
+def bind(variable, *parts) -> None:
+    """The variable `variable` (a function of the algorithm) is held by what `parts` write into the
+    residual stream."""
+    name = _variable(variable, "bind")
+    _PROGRAM.bound.setdefault(name, []).extend(_pieces(parts, f"bind({name}, ...)"))
+
+
+def claim(pattern, *parts) -> None:
+    """The attention of `parts` (q_proj and k_proj parts, or native heads, in each of their layers)
+    follows the pattern variable `pattern`: at query t, the positions its value lists (uniformly) or
+    weighs."""
+    name = _variable(pattern, "claim")
+    _PROGRAM.claimed.setdefault(name, []).extend(_pieces(parts, f"claim({name}, ...)"))
+
+
+# ---------------------------------------------------------------------------------------------------
+# The algorithm
+
+class _Algorithm:
+    """A program's variables: functions of `tokens` and of each other, evaluated on token sequences."""
+
+    def __init__(self, namespace: dict, roots):
+        self.functions: dict[str, types.FunctionType] = {}
+        self.params: dict[str, tuple[str, ...]] = {}
+        todo = list(roots)
+        while todo:
+            name = todo.pop()
+            if name in self.functions:
+                continue
+            fn = self.functions[name] = namespace[name]
+            params = []
+            for p in inspect.signature(fn).parameters.values():
+                if p.kind is not p.POSITIONAL_OR_KEYWORD or p.default is not p.empty:
+                    raise MechError(f"variable {name}: parameter {p.name} is not a plain parameter (a variable "
+                                    "takes tokens and other variables by name)")
+                if p.name != "tokens":
+                    if not isinstance(namespace.get(p.name), types.FunctionType) or namespace[p.name].__name__ != p.name:
+                        raise MechError(f"variable {name}: parameter {p.name} names no variable (a variable takes "
+                                        "tokens and other variables, functions of the program, by name)")
+                    todo.append(p.name)
+                params.append(p.name)
+            self.params[name] = tuple(params)
+        self.readers = {n: [m for m in self.params if n in self.params[m]] for n in self.params}
+        for name in self.params:  # rejects cycles
+            self.upstream(name)
+
+    def upstream(self, name: str, stack: tuple = ()) -> set:
+        """Every variable `name` depends on, and "tokens" if it reads them."""
+        if name in stack:
+            raise MechError("variables " + " -> ".join(stack[stack.index(name):] + (name,)) + " read each other")
+        out = set()
+        for p in self.params[name]:
+            out.add(p)
+            if p != "tokens":
+                out |= self.upstream(p, stack + (name,))
+        return out
+
+    def sources(self, name: str, held) -> set:
+        """What `name` reads through steps that no part holds: variables in `held` and "tokens"."""
+        out = set()
+        for p in self.params[name]:
+            out |= {p} if p == "tokens" or p in held else self.sources(p, held)
+        return out
+
+    def values(self, tokens: list, wanted, fixed: dict | None = None) -> dict:
+        """The values of the variables `wanted` on `tokens` ({name: list}); `fixed` sets variables'
+        values instead of computing them."""
+        values = dict(fixed or {})
+
+        def value(name):
+            if name not in values:
+                args = [list(tokens) if p == "tokens" else list(value(p)) for p in self.params[name]]
+                try:
+                    out = self.functions[name](*args)
+                except MechError:
+                    raise
+                except RecursionError:
+                    raise
+                except Exception as e:
+                    line = _line_of(e)
+                    raise MechError((f"line {line}: " if line else "") + f"variable {name}: {type(e).__name__}: {e}") from None
+                if not isinstance(out, (list, tuple)) or len(out) != len(tokens):
+                    raise MechError(f"variable {name} returned {len(out) if isinstance(out, (list, tuple)) else repr(out)} "
+                                    f"values for {len(tokens)} positions (a variable returns one value per position)")
+                values[name] = list(out)
+            return values[name]
+
+        return {name: value(name) for name in wanted}
+
+
+def _pattern_row(value, t: int, what: str) -> list[float]:
+    """One query position's claimed attention (positions, or {position: weight}) as weights 0..t."""
+    row = [0.0] * (t + 1)
+    items = value.items() if isinstance(value, dict) else [(j, 1.0) for j in (value or [])]
+    for j, w in items:
+        if not isinstance(j, int) or isinstance(j, bool) or not 0 <= j <= t:
+            raise MechError(f"{what} at position {t}: {j!r} is not a position 0..{t}")
+        if not isinstance(w, (int, float)) or isinstance(w, bool) or not w >= 0:
+            raise MechError(f"{what} at position {t}: weight {w!r} is not a number >= 0")
+        row[j] += float(w)
+    if not sum(row):
+        row[0] = 1.0  # no position: the head rests on position 0
+    return row
+
+
+def _evaluate(program: _Program, algorithm: _Algorithm, answer: str, behavior: dict, ir: dict) -> None:
+    """The algorithm on the behavior: interchange pairs per bound variable, claimed patterns, and how
+    often the answer is the prompt's next token."""
+    prompts, targets = behavior["prompts"], behavior["targets"]
+    cache: dict[tuple, dict] = {}
+
+    def at(i: int, t: int, name: str) -> list:  # a variable on prompt i cut after position t
+        key = (i, t)
+        if name not in cache.setdefault(key, {}):
+            cache[key].update(algorithm.values(prompts[i][: t + 1], [name], cache[key]))
+        return cache[key][name]
+
+    right = total = 0
+    for i, ts in enumerate(targets):
+        for t in ts:
+            a = at(i, t, answer)[t]
+            right += t + 1 < len(prompts[i]) and a == prompts[i][t + 1]
+            total += 1
+    ir["algorithm_accuracy"] = right / total if total else None
+    def swapped(i: int, j: int, v: str) -> list | None:  # the answers at i's targets with v from prompt j
+        out = []
+        for t in targets[i]:
+            a = algorithm.values(prompts[i][: t + 1], [answer], {v: at(j, t, v)})[answer][t]
+            if a is None:
+                return None
+            if not isinstance(a, str):
+                raise MechError(f"the answer {answer} at position {t} of prompt {i} is {a!r}, not a token string")
+            out.append(a)
+        return out
+
+    n = len(prompts)
+    for b in ir["bindings"]:
+        v = b["variable"]
+        for i, ts in enumerate(targets):
+            # the source: the first later prompt of i's length (cyclically) under which the answer is
+            # defined and changes, else the first under which it is defined
+            clean, first = [at(i, t, answer)[t] for t in ts], None
+            for k in range(i + 1, i + n):
+                j = k % n
+                if not ts or len(prompts[j]) != len(prompts[i]):
+                    continue
+                answers = swapped(i, j, v)
+                if answers is not None:
+                    first = first or (j, answers)
+                    if answers != clean:
+                        first = (j, answers)
+                        break
+            if first:
+                b["pairs"].append({"base": i, "source": first[0], "answer_text": first[1]})
+    for n in program.nodes:
+        if n.claim is None:
+            continue
+        name, rows = n.claim["variable"], {}
+        for side in ("prompts", "counterfactuals"):
+            rows[side] = []
+            for tokens in behavior.get(side) or []:
+                value = algorithm.values(tokens, [name])[name]
+                rows[side].append([_pattern_row(value[t], t, f"claimed pattern {name}") for t in range(len(tokens))])
+        n.claim = {"op": "pattern", "variable": name, **rows}
+
+
+def _validate(program: _Program, namespace: dict, ir: dict, behavior: dict | None) -> None:
+    named = set()
+    for name, value in namespace.items():
+        if isinstance(value, Node) and value.id is None and not name.startswith("_"):
+            value.id = name
+            named.add(name)
+    k = 0
+    for n in program.nodes:
+        while n.id is None:
+            if f"node{k}" not in named:
+                n.id = f"node{k}"
+            k += 1
+    bound, claimed = program.bound, program.claimed
+    if set(bound) & set(claimed):
+        raise MechError(f"{', '.join(sorted(set(bound) & set(claimed)))}: a variable is bound (a value parts write) "
+                        "or claimed (an attention pattern), not both")
+    algorithm = _Algorithm(namespace, list(bound) + list(claimed)) if bound or claimed else None
+    taken = {n.id for n in program.nodes}
+    held: dict[str, list[Node]] = {}
+    for name, pieces in bound.items():  # one node per layer's attention or MLP
+        sites = sorted({(p.layer, p.block()) for p in pieces})
+        for layer, block in sites:
+            made = Node(_merged(p for p in pieces if (p.layer, p.block()) == (layer, block)))
+            made.id = name if len(sites) == 1 else f"{name}.{layer}.{block}"
+            if not made.writes_residual():
+                raise MechError(f"bind({name}, ...): its parts in layer {layer}'s {block} write no residual stream "
+                                f"(q/k/v_proj and c_fc parts write their own site's stream); bind the "
+                                f"{'o_proj' if block == 'attn' else 'down_proj'} parts that carry the variable, "
+                                f"or claim the attention pattern")
+            held.setdefault(name, []).append(made)
+    owner = {}
+    for n in [m for ms in held.values() for m in ms]:
+        for p in n.pieces:
+            for i in (("rest",) if p.rest else p.index):
+                owner[(p.view, p.layer, p.kind, i)] = n
+    for name, pieces in claimed.items():  # per layer, the node of the claimed parts
+        if any(p.block() != "attn" for p in pieces):
+            raise MechError(f"claim({name}, ...): a claim is about attention parts")
+        layers = sorted({p.layer for p in pieces})
+        for layer in layers:
+            group = [p for p in pieces if p.layer == layer]
+            if not any(p.kind in ("q_proj", "k_proj", "head", "attn") for p in group):
+                raise MechError(f"claim({name}, ...): name layer {layer}'s q_proj and k_proj parts (or heads) whose "
+                                "queries and keys produce the pattern")
+            homes = {owner.get((p.view, p.layer, p.kind, i)) for p in group for i in (("rest",) if p.rest else p.index)}
+            if len(homes) > 1:
+                raise MechError(f"claim({name}, ...): layer {layer}'s claimed parts are bound to a variable in part; "
+                                "claim parts that are all bound to one variable in a layer, or none bound")
+            home = homes.pop()
+            if home is None:
+                home = Node(_merged(group))
+                home.id = name if len(layers) == 1 else f"{name}.{layer}.attn"
+            elif home.claim is not None:
+                raise MechError(f"claim({name}, ...): node {home.id} already carries the claim {home.claim['variable']}")
+            home.claim = {"variable": name}
+            held.setdefault(name, []).append(home)
+    for name, ns in held.items():
+        for n in ns:
+            if n not in program.nodes:
+                if n.id in taken:
+                    raise MechError(f"node {n.id} of variable {name} is also a node the program names; rename one")
+                program.nodes.append(n)
+    owner = {}
+    for n in program.nodes:
+        for p in n.pieces:
+            if p.view == "library":
+                continue  # library parts may overlap; the checker takes the union per node
+            for i in (("rest",) if p.rest else p.index):
+                o = owner.setdefault((p.view, p.layer, p.kind, i), n.id)
+                if o != n.id:
+                    raise MechError(f"{Piece(p.view, p.layer, p.kind, (i,), rest=p.rest).name()} is in nodes {o} and "
+                                    f"{n.id}; a part belongs to one node")
+    ir["bindings"], ir["variables"], ir["answer"] = [], [], None
+    if algorithm is not None:
+        sinks = [v for v in bound if not algorithm.readers[v]]
+        if len(sinks) != 1:
+            raise MechError("the answer is the one bound variable no variable reads; " +
+                            (f"{', '.join(sinks)} are all unread" if sinks else "bind the answer's parts"))
+        answer = ir["answer"] = sinks[0]
+
+        def connect(src, dst) -> bool:
+            if src is dst or not _connects(src, dst, "input"):
+                return False
+            program.edges.setdefault((id(src), id(dst), "input"), Edge(src, dst, "input"))
+            return True
+
+        line = {v: algorithm.functions[v].__code__.co_firstlineno for v in algorithm.functions}
+        for name, ns in held.items():
+            for s in sorted(algorithm.sources(name, held), key=lambda s: (s != "tokens", line.get(s, 0))):
+                writers = [embed] if s == "tokens" else held[s]
+                if not any([w is n or connect(w, n) for w in writers for n in ns]):  # every pair connected
+                    raise MechError(f"variable {name} reads {s}, but no part of " + ("the token embedding" if s == "tokens" else s) +
+                                    f" writes where a part of {name} reads it later")
+            for a in ns:  # a variable spanning layers feeds its own later parts
+                for b in ns:
+                    if a.site() < b.site():
+                        connect(a, b)
+        for n in held[answer]:
+            connect(n, logits)
+        connect(embed, logits)
+        ir["variables"] = [{"name": v, "reads": list(algorithm.params[v]),
+                            "role": "bound" if v in bound else "claimed" if v in claimed else "step",
+                            "nodes": [n.id for n in held.get(v, [])]}
+                           for v in sorted(algorithm.params, key=line.get)]
+        ir["bindings"] = [{"variable": v, "nodes": [n.id for n in held[v]], "pairs": []} for v in bound]
+        if behavior is not None:
+            _evaluate(program, algorithm, answer, behavior, ir)
+    ir["nodes"] = [{"id": n.id, "pieces": [p.ir() for p in n.pieces],
+                    "claim": n.claim if n.claim and "op" in n.claim else None} for n in program.nodes]
+    ir["claims"] = {n.id: n.claim["variable"] for n in program.nodes if n.claim}
+    ir["edges"] = [{"from": "embed" if e.src is embed else e.src.id,
+                    "to": "logits" if e.dst is logits else e.dst.id, "route": e.route}
+                   for e in program.edges.values()]
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -619,21 +962,56 @@ def _line_of(exc: BaseException) -> int | None:
     return lines[-1] if lines else None
 
 
-def trace_inline(source: str, model: str) -> dict:
-    """Checks and runs `source` in this process (trusted sources only; `trace` sandboxes) -> IR."""
-    global _PROGRAM
-    ir = {"model": model, "standin": DEFAULT_STANDIN, "nodes": [], "edges": [], "python_tokens": 0,
-          "token_types": 0, "source": source, "valid": False, "error": None}
+def quote_parts(source: str) -> str:
+    """`source` with each bare part token (<p:2.v.559>) outside strings and comments written as a string
+    literal ("<p:2.v.559>"), so that it parses as Python."""
+    if "<p:" not in source:
+        return source
     try:
-        ir["python_tokens"], ir["token_types"] = code_length(source)
+        skip = [(t.start, t.end) for t in tokenize.generate_tokens(io.StringIO(source).readline)
+                if t.type in (tokenize.STRING, tokenize.COMMENT) or "FSTRING" in tokenize.tok_name[t.type]]
+    except (tokenize.TokenError, SyntaxError, IndentationError):
+        skip = []
+    starts = [0]
+    for line in source.splitlines(keepends=True):
+        starts.append(starts[-1] + len(line))
+    spans = [(starts[a[0] - 1] + a[1], starts[b[0] - 1] + b[1]) for a, b in skip]
+    out, last = [], 0
+    for m in PART.finditer(source):
+        if any(a <= m.start() < b for a, b in spans):
+            continue
+        out += [source[last:m.start()], f'"{m[0]}"']
+        last = m.end()
+    return "".join(out) + source[last:]
+
+
+def _empty(source: str, model: str, decomposition: str | None) -> dict:
+    return {"model": model, "decomposition": decomposition, "nodes": [], "edges": [], "bindings": [],
+            "variables": [], "answer": None, "claims": {}, "python_tokens": 0, "token_types": 0,
+            "source": source, "valid": False, "error": None}
+
+
+def _trace(source: str, model: str, behavior: dict | None = None, decomposition: str | None = None) -> dict:
+    """Checks and runs `source` in this process -> IR, with answers as token strings (`behavior`: the
+    prompts, counterfactuals and targets as token strings, behavior_tokens()). The sandboxed child's
+    entry point."""
+    global _PROGRAM
+    decomposition = DEFAULT_DECOMPOSITION.get(model) if decomposition is None else decomposition
+    decomposition = None if decomposition == "native" else decomposition
+    ir = _empty(source, model, decomposition)
+    quoted = quote_parts(source)
+    try:
+        ir["python_tokens"], ir["token_types"] = code_length(quoted)
     except (SyntaxError, tokenize.TokenError, IndentationError):
         pass
     try:
         if model not in MODELS:
             raise MechError(f"unknown model {model!r}; models: {', '.join(MODELS)}")
+        if decomposition is not None and decomposition not in DECOMPOSITIONS:
+            raise MechError(f"unknown decomposition {decomposition!r}: {', '.join(DECOMPOSITIONS)} or native")
         if len(source) > MAX_SOURCE:
             raise MechError(f"program longer than {MAX_SOURCE} characters")
-        tree = ast.parse(source, "<program>")
+        tree = ast.parse(quoted, "<program>")
         imported = check(tree)
         exports = {name: globals()[name] for name in EXPORTS}
         namespace = {"__builtins__": SAFE_BUILTINS, "__name__": "program"}
@@ -645,16 +1023,16 @@ def trace_inline(source: str, model: str) -> dict:
             else:
                 namespace[bound] = exports[name]
         tree = ast.fix_missing_locations(_NoImports().visit(tree))
-        _PROGRAM = program = _Program(model)
+        _PROGRAM = program = _Program(model, decomposition, namespace)
         try:
             exec(compile(tree, "<program>", "exec"), namespace)
+            _validate(program, namespace, ir, behavior)
         finally:
             _PROGRAM = None
-        _validate(program, namespace, ir)
         ir["valid"] = True
     except MechError as e:
         line = _line_of(e)
-        ir["error"] = (f"line {line}: " if line else "") + str(e)
+        ir["error"] = (f"line {line}: " if line and not str(e).startswith("line ") else "") + str(e)
     except SyntaxError as e:
         ir["error"] = f"line {e.lineno}: syntax error: {e.msg}"
     except RecursionError:
@@ -663,43 +1041,88 @@ def trace_inline(source: str, model: str) -> dict:
         line = _line_of(e)
         ir["error"] = (f"line {line}: " if line else "") + f"{type(e).__name__}: {e}"
     if not ir["valid"]:
-        ir["nodes"], ir["edges"] = [], []
+        ir.update(nodes=[], edges=[], bindings=[], variables=[], answer=None, claims={})
     return ir
 
 
-def _validate(program: _Program, namespace: dict, ir: dict) -> None:
-    named = set()
-    for name, value in namespace.items():
-        if isinstance(value, Node) and value.id is None and not name.startswith("_"):
-            value.id = name
-            named.add(name)
-    k = 0
-    for n in program.nodes:
-        while n.id is None:
-            if f"node{k}" not in named:
-                n.id = f"node{k}"
-            k += 1
-    owner: dict[tuple, str] = {}
-    view_of: dict[tuple, str] = {}
-    for n in program.nodes:
-        for p in n.pieces:
-            v = view_of.setdefault((p.layer, p.block()), p.view)
-            if v != p.view:
-                raise MechError(f"layer {p.layer}'s {p.block()} is read through two views ({v} and {p.view}); "
-                                f"use one view per layer's attention and MLP")
-            if p.view == "library":
-                continue  # library parts may overlap; the checker takes the union per node
-            for i in (("rest",) if p.rest else p.index):
-                o = owner.setdefault((p.view, p.layer, p.kind, i), n.id)
-                if o != n.id:
-                    raise MechError(f"{Piece(p.view, p.layer, p.kind, (i,)).name()} is in nodes {o} and {n.id}; "
-                                    f"a piece belongs to one node")
-    ir["standin"] = DEFAULT_STANDIN
-    ir["nodes"] = [{"id": n.id, "pieces": [p.ir() for p in n.pieces], "rule": n.rule and n.rule.ir}
-                   for n in program.nodes]
-    ir["edges"] = [{"from": "embed" if e.src is embed else e.src.id,
-                    "to": "logits" if e.dst is logits else e.dst.id, "route": e.route}
-                   for e in program.edges.values()]
+_TOKENIZERS: dict = {}
+
+
+def tokenizer(model: str):
+    """The target's tokenizer (the `tokenizers` library): vpd4l's file, or Qwen3's tokenizer.json (every
+    size shares it) through the Hugging Face cache (downloaded when missing)."""
+    if model not in _TOKENIZERS:
+        import tokenizers
+
+        if model == "vpd4l":
+            _TOKENIZERS[model] = tokenizers.Tokenizer.from_file(str(VPD4L_TOKENIZER))
+        else:
+            from huggingface_hub import hf_hub_download
+
+            _TOKENIZERS[model] = tokenizers.Tokenizer.from_file(hf_hub_download(QWEN3[model], "tokenizer.json"))
+    return _TOKENIZERS[model]
+
+
+_VOCABULARIES: dict = {}
+
+
+def _token_id(model: str, text: str, known: dict) -> int | None:
+    """The id of the single token `text` decodes from: one of the behavior's own tokens, else the lowest
+    id of M's vocabulary that decodes to it."""
+    if text in known:
+        return known[text]
+    if model not in _VOCABULARIES:
+        tk = tokenizer(model)
+        strings = tk.decode_batch([[i] for i in range(tk.get_vocab_size())], skip_special_tokens=False)
+        vocabulary: dict[str, int] = {}
+        for i, s in enumerate(strings):
+            vocabulary.setdefault(s, i)
+        _VOCABULARIES[model] = vocabulary
+    return _VOCABULARIES[model].get(text)
+
+
+def behavior_tokens(behavior, model: str) -> tuple[dict, dict]:
+    """(what the algorithm runs on: {"prompts", "counterfactuals", "targets"}, each token as M's string;
+    {token string: id} of the behavior's tokens). `behavior`: a behavior record or its file."""
+    if not isinstance(behavior, dict):
+        behavior = json.loads(Path(behavior).expanduser().read_text())
+    tk = tokenizer(model)
+    prompts = [p["token_ids"] for p in behavior["prompts"]]
+    counterfactuals = [p["counterfactual"]["token_ids"] for p in behavior["prompts"] if p.get("counterfactual")]
+    ids = sorted({i for row in prompts + counterfactuals for i in row})
+    strings = dict(zip(ids, tk.decode_batch([[i] for i in ids], skip_special_tokens=False)))
+    known: dict[str, int] = {}
+    for i in ids:
+        known.setdefault(strings[i], i)
+    payload = {"prompts": [[strings[i] for i in row] for row in prompts],
+               "counterfactuals": [[strings[i] for i in row] for row in counterfactuals],
+               "targets": [list(p["target_positions"]) for p in behavior["prompts"]]}
+    if len(payload["counterfactuals"]) != len(prompts):
+        payload["counterfactuals"] = []
+    return payload, known
+
+
+def _answer_ids(ir: dict, model: str, known: dict | None) -> dict:
+    """Adds each interchange answer's token id (the checker's "answer"); a string that is not one token
+    makes the program invalid."""
+    for b in ir.get("bindings") or []:
+        for pair in b["pairs"]:
+            pair["answer"] = []
+            for text in pair["answer_text"]:
+                i = _token_id(model, text, known or {})
+                if i is None:
+                    ir.update(nodes=[], edges=[], bindings=[], variables=[], answer=None, claims={}, valid=False,
+                              error=f"the answer {text!r} (variable {ir.get('answer')}, interchanging {b['variable']}, "
+                                    f"prompt {pair['base']}) is not one token of {model}")
+                    return ir
+                pair["answer"].append(i)
+    return ir
+
+
+def trace_inline(source: str, model: str, behavior=None, decomposition: str | None = None) -> dict:
+    """Checks and runs `source` in this process (trusted sources only; `trace` sandboxes) -> IR."""
+    payload, known = behavior_tokens(behavior, model) if behavior is not None else (None, None)
+    return _answer_ids(_trace(source, model, payload, decomposition), model, known)
 
 
 MEMORY = 1 << 30  # bytes a traced program may use
@@ -733,21 +1156,23 @@ def _footprint(pid: int) -> int:
     return struct.unpack_from("Q", buf.raw, 72)[0]
 
 
-def _invalid(source: str, model: str, error: str) -> dict:
+def _invalid(source: str, model: str, decomposition: str | None, error: str) -> dict:
+    ir = _empty(source, model, DEFAULT_DECOMPOSITION.get(model) if decomposition is None else decomposition)
     try:
-        tokens, types = code_length(source)
+        ir["python_tokens"], ir["token_types"] = code_length(quote_parts(source))
     except (SyntaxError, tokenize.TokenError, IndentationError, ValueError):
-        tokens, types = 0, 0
-    return {"model": model, "standin": DEFAULT_STANDIN, "nodes": [], "edges": [], "python_tokens": tokens,
-            "token_types": types, "source": source, "valid": False, "error": error}
+        pass
+    ir["error"] = error
+    return ir
 
 
-def _traced_child(source: str, model: str, timeout: float) -> dict:
-    """Forks a child that traces `source` under CPU/memory limits; waits for it with a wall-clock
-    deadline, watching its footprint on macOS (RLIMIT_AS is not enforced there)."""
+def _traced_child(req: dict) -> dict:
+    """Forks a child that traces the request's program under CPU/memory limits; waits for it with a
+    wall-clock deadline, watching its footprint on macOS (RLIMIT_AS is not enforced there)."""
     import select
     import time
 
+    source, model, timeout = req["source"], req["model"], req.get("timeout", 10.0)
     r, w = os.pipe()
     pid = os.fork()
     if pid == 0:  # child
@@ -755,7 +1180,7 @@ def _traced_child(source: str, model: str, timeout: float) -> dict:
             os.close(r)
             _limit(timeout)
             sys.setrecursionlimit(500)
-            data = json.dumps(trace_inline(source, model)).encode()
+            data = json.dumps(_trace(source, model, req.get("behavior"), req.get("decomposition"))).encode()
             view = memoryview(data)
             while view:
                 view = view[os.write(w, view):]
@@ -782,33 +1207,39 @@ def _traced_child(source: str, model: str, timeout: float) -> dict:
     finally:
         os.close(r)
         _, status = os.waitpid(pid, 0)
+    decomposition = req.get("decomposition")
     if over or (os.WIFSIGNALED(status) and os.WTERMSIG(status) == signal.SIGKILL and not late):
-        return _invalid(source, model, f"memory limit of {MEMORY >> 20} MiB exceeded")
+        return _invalid(source, model, decomposition, f"memory limit of {MEMORY >> 20} MiB exceeded")
     if late or (os.WIFSIGNALED(status) and os.WTERMSIG(status) == signal.SIGXCPU):
-        return _invalid(source, model, f"time limit of {timeout} s exceeded")
+        return _invalid(source, model, decomposition, f"time limit of {timeout} s exceeded")
     try:
         return json.loads(b"".join(chunks))
     except ValueError:
-        return _invalid(source, model, f"the program crashed the tracer (status {status})")
+        return _invalid(source, model, decomposition, f"the program crashed the tracer (status {status})")
 
 
 def serve() -> None:
-    """JSON lines on stdin {"source", "model", "timeout"} -> IR lines on stdout, one forked child each."""
+    """JSON lines on stdin {"source", "model", "timeout", "behavior", "decomposition"} -> IR lines on
+    stdout, one forked child each."""
     for model in MODELS:
         shapes(model)
     for line in sys.stdin:
-        req = json.loads(line)
-        print(json.dumps(_traced_child(req["source"], req["model"], req.get("timeout", 10.0))), flush=True)
+        print(json.dumps(_traced_child(json.loads(line))), flush=True)
 
 
 _SERVERS = threading.local()
 
 
-def trace(source: str, model: str, timeout: float = 10.0) -> dict:
+def trace(source: str, model: str, timeout: float = 10.0, behavior=None, decomposition: str | None = None) -> dict:
     """Checks and runs `source` sandboxed (restricted names and builtins; a forked child with CPU and
-    memory limits and a wall-clock deadline) -> IR dict (design.txt section 5). Each thread keeps one
+    memory limits and a wall-clock deadline) -> IR dict. `behavior` (a record or its file): evaluate the
+    algorithm's interchange pairs and claims on its prompts; `decomposition`: what PD names ("vpd",
+    "library", "transcoder", or "native" for none; the model's default when None). Each thread keeps one
     tracer server (`mech.py serve`, started with -I -S: no site hooks, the standard library only, no
     memory-ledger reservation), so a trace costs a fork, a few milliseconds."""
+    payload, known = behavior_tokens(behavior, model) if behavior is not None else (None, None)
+    request = json.dumps({"source": source, "model": model, "timeout": timeout, "behavior": payload,
+                          "decomposition": decomposition})
     for attempt in range(2):
         server = getattr(_SERVERS, "proc", None)
         if server is None or server.poll() is not None or _SERVERS.pid != os.getpid():  # a forked caller starts its own
@@ -818,23 +1249,26 @@ def trace(source: str, model: str, timeout: float = 10.0) -> dict:
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1,
                 env={**os.environ, "MPD_MEM_GIB": "1"})
         try:
-            server.stdin.write(json.dumps({"source": source, "model": model, "timeout": timeout}) + "\n")
+            server.stdin.write(request + "\n")
             server.stdin.flush()
             line = server.stdout.readline()
             if line:
-                return json.loads(line)
+                return _answer_ids(json.loads(line), model, known)
         except (BrokenPipeError, OSError, ValueError):
             pass
         server.kill()
         _SERVERS.proc = None
-    return _invalid(source, model, "the tracer server failed")
+    return _invalid(source, model, decomposition, "the tracer server failed")
 
 
-def trace_many(sources: list[str], model: str, timeout: float = 10.0, workers: int = 8) -> list[dict]:
+def trace_many(sources: list[str], model: str, timeout: float = 10.0, workers: int = 8, behavior=None,
+               decomposition: str | None = None) -> list[dict]:
     from concurrent.futures import ThreadPoolExecutor
 
+    if behavior is not None and not isinstance(behavior, dict):
+        behavior = json.loads(Path(behavior).expanduser().read_text())
     with ThreadPoolExecutor(workers) as pool:
-        return list(pool.map(lambda s: trace(s, model, timeout), sources))
+        return list(pool.map(lambda s: trace(s, model, timeout, behavior, decomposition), sources))
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -847,16 +1281,17 @@ OPERATORS = ("!", "!=", "%", "%=", "&", "&=", "(", ")", "*", "**", "**=", "*=", 
              "->", ".", "...", "/", "//", "//=", "/=", ":", ":=", ";", "<", "<<", "<<=", "<=", "=", "==", ">",
              ">=", ">>", ">>=", "@", "@=", "[", "]", "^", "^=", "{", "|", "|=", "}", "~")
 LITERAL_CHARACTERS = {chr(c) for c in range(32, 127)} | {"\t", "\n"}
-FIXED_NAMES = set(EXPORTS) | set(ATTRIBUTES) | set(SAFE_BUILTINS) | {"mech"}
+FIXED_NAMES = set(EXPORTS) | set(ATTRIBUTES) | set(SAFE_BUILTINS) | {"mech", "tokens"}
 SKIPPED = {tokenize.COMMENT, tokenize.NL, tokenize.NEWLINE, tokenize.INDENT, tokenize.DEDENT,
            tokenize.ENCODING, tokenize.ENDMARKER}
 
 
 def code_length(source: str) -> tuple[int, int]:
-    """(python_tokens, token_types). Tokens of the code without comments and docstrings: a name or
-    keyword or operator is one token, a number or string literal one token per character as written.
-    token_types = keywords + operators + mech and builtin names + names the program defines +
-    literal characters (printable ASCII, tab, newline and any other character the literals use)."""
+    """(python_tokens, token_types) of a source whose part tokens are quoted (quote_parts). Tokens of the
+    code without comments and docstrings: a name, keyword, operator or part token is one token, a number
+    or string literal one token per character as written. token_types = keywords + operators + mech and
+    builtin names + names the program defines + part tokens + literal characters (printable ASCII, tab,
+    newline and any other character the literals use)."""
     tree = ast.parse(source)
     docs = _docstring_ranges(tree, source)
 
@@ -870,6 +1305,10 @@ def code_length(source: str) -> tuple[int, int]:
         if t.type in SKIPPED or not t.string:
             continue
         literal = t.type in (tokenize.NUMBER, tokenize.STRING) or "STRING" in tokenize.tok_name[t.type]
+        if t.type == tokenize.STRING and PART.fullmatch(t.string[1:-1]) and t.string[0] == t.string[-1]:
+            tokens += 1
+            names.add(t.string[1:-1])
+            continue
         if literal:
             if t.type == tokenize.STRING and in_doc(t.start, t.end):
                 continue
@@ -884,6 +1323,7 @@ def code_length(source: str) -> tuple[int, int]:
 
 def english(source: str) -> str:
     """The program's comments and docstrings (bare string statements) in source order, one per line."""
+    source = quote_parts(source)
     tree = ast.parse(source)
     items = [((n.lineno, n.col_offset), inspect.cleandoc(n.value.value)) for n in ast.walk(tree)
              if isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant) and isinstance(n.value.value, str)]
@@ -899,6 +1339,7 @@ def main() -> None:
     t.add_argument("--model", required=True)
     t.add_argument("--timeout", type=float, default=10.0)
     t.add_argument("--inline", action="store_true", help="no CPU/memory limits (trusted programs)")
+    t.add_argument("--decomposition", help="vpd, library, transcoder or native (default: the model's)")
     s = sub.add_parser("shapes", help="print or rebuild the model shape registry")
     s.add_argument("--data", type=Path, default=Path.home() / "mpd-data")
     s.add_argument("--write", action="store_true")
@@ -910,7 +1351,7 @@ def main() -> None:
         if not a.inline:
             _limit(a.timeout)
         sys.setrecursionlimit(500)
-        print(json.dumps(trace_inline(source, a.model)))
+        print(json.dumps(_trace(source, a.model, None, a.decomposition)))
     elif a.command == "serve":
         serve()
     elif a.command == "shapes":

@@ -149,9 +149,7 @@ class Vpd4l:
 
     def decode(self, token: int) -> str:
         if self.tokenizer is None:
-            import prompt
-
-            self.tokenizer = prompt.tokenizer("vpd4l")
+            self.tokenizer = mech.tokenizer("vpd4l")
         return self.tokenizer.decode([token])
 
 
@@ -253,9 +251,7 @@ class Qwen3:
 
     def decode(self, token: int) -> str:
         if self.tokenizer is None:
-            import prompt
-
-            self.tokenizer = prompt.tokenizer(self.name)
+            self.tokenizer = mech.tokenizer(self.name)
         return self.tokenizer.decode([token])
 
 
@@ -353,20 +349,22 @@ def facts(engine, ir: dict, behavior: dict, chunk: int = 64) -> dict[str, dict]:
 
 
 def address(p: dict) -> str:
-    idx = p["index"]
+    """A piece as the oracle writes it: its part tokens (<p:2.v.559>, <p:1.q.rest>, <p:3.h.4>, <p:0.a>,
+    <p:1.m>), or in text where no part tokens exist (a whole decomposition site, native neurons)."""
+    idx, l = p["index"], p["layer"]
+    site = "mlp" if p["kind"] == "feature" else p["kind"]
     if idx == "rest":
-        return f"PD.vpd[{p['layer']}].{p['kind']}.rest"
+        return f"<p:{l}.{mech.CODES[site]}.rest>"
+    units = idx if isinstance(idx, list) else [idx]
     if p["view"] == "native":
-        site = f"L[{p['layer']}].{p['kind']}"
-    elif p["view"] == "vpd":
-        site = f"PD.vpd[{p['layer']}].{p['kind']}"
-    elif p["view"] == "library":
-        site = f"PD.lib[{p['layer']}].{p['kind']}"
-    else:
-        site = f"PD.tc[{p['layer']}]"
+        if idx is None:
+            return f"<p:{l}.{'a' if p['kind'] == 'head' else 'm'}>"
+        if p["kind"] == "head":
+            return ", ".join(f"<p:{l}.h.{h}>" for h in units)
+        return f"L[{l}].mlp[{', '.join(map(str, units))}]"
     if idx is None:
-        return site
-    return f"{site}[{', '.join(map(str, idx if isinstance(idx, list) else [idx]))}]"
+        return f"PD[{l}].{site}"
+    return ", ".join(f"<p:{l}.{mech.CODES[site]}.{i}>" for i in units)
 
 
 def role(f: dict) -> str:
@@ -385,18 +383,6 @@ def role(f: dict) -> str:
     return line
 
 
-def rule_source(rule: dict, alias: dict[str, str]) -> str:
-    """An attention rule as mech source: attend(offset=k), attend(first=True), attend(query=..., key=...)."""
-    def expr(e: dict) -> str:
-        return alias["tokens"] if e["op"] == "tokens" else f"{alias['shift']}({expr(e['arg'])}, {e['by']})"
-
-    if "offset" in rule:
-        return f"{alias['attend']}(offset={rule['offset']})"
-    if rule.get("first"):
-        return f"{alias['attend']}(first=True)"
-    return f"{alias['attend']}(query={expr(rule['query'])}, key={expr(rule['key'])})"
-
-
 def source_of(ir: dict, behavior: dict, facts_of: dict[str, dict], score: dict | None = None) -> str:
     """Clean mech source for `ir` with measured-fact comments and docstring."""
     head = (f"Behavior {behavior['id']} ({ir['model']}): {behavior['description']}")
@@ -410,24 +396,19 @@ def source_of(ir: dict, behavior: dict, facts_of: dict[str, dict], score: dict |
         lines += ["", *textwrap.wrap(
             f"Score: {score['total_bits']:.4g} bits in total (execution error {score['exec_error_bits']:.4g}, "
             f"opaque numbers {score.get('opaque_bits', 0):.4g}, code {score.get('code_bits', 0):.4g}).", 100)]
+    if ir.get("bindings") or any(n.get("claim") or n.get("rule") for n in ir["nodes"]):
+        raise ValueError("the printer prints node-and-edge programs; this one has bindings or claims")
     used = {"node"} | ({"edges"} if ir["edges"] else set())
-    views = {p["view"] for n in ir["nodes"] for p in n["pieces"]}
-    used |= ({"L"} if "native" in views else set()) | ({"PD"} if views & {"vpd", "library", "transcoder"} else set())
+    texts = [address(p) for n in ir["nodes"] for p in n["pieces"]]
+    used |= ({"L"} if any(t.startswith("L[") for t in texts) else set()) | ({"PD"} if any(t.startswith("PD[") for t in texts) else set())
     used |= {e["from"] for e in ir["edges"] if e["from"] == "embed"} | {e["to"] for e in ir["edges"] if e["to"] == "logits"}
     order = [x for x in ("node", "edges", "L", "PD", "embed", "logits") if x in used]
-    ids = {n["id"] for n in ir["nodes"]}
-    alias = {k: (f"{k}_" if k in ids else k) for k in ("attend", "tokens", "shift")}  # a node may be named tokens
-    rules = [n["rule"] for n in ir["nodes"] if n.get("rule")]
-    out = ['"""' + "\n".join(lines) + '\n"""', f"from mech import {', '.join(order)}"]
-    if rules:
-        names = {"attend"} | ({"tokens", "shift"} if any("query" in r for r in rules) else set())
-        out.append("from mech import " + ", ".join(k if alias[k] == k else f"{k} as {alias[k]}" for k in ("attend", "tokens", "shift") if k in names))
-    out.append("")
+    out = ['"""' + "\n".join(lines) + '\n"""', f"from mech import {', '.join(order)}", ""]
     for n in ir["nodes"]:
         f = facts_of.get(n["id"])
         if f:
             out += [f"# {row}" for row in textwrap.wrap(role(f), 98)]
-        args = [address(p) for p in n["pieces"]] + ([f"rule={rule_source(n['rule'], alias)}"] if n.get("rule") else [])
+        args = [address(p) for p in n["pieces"]]
         call = f"{n['id']} = node({', '.join(args)})"
         if len(call) > 100:
             body = textwrap.wrap(", ".join(args), 96, break_long_words=False)
@@ -443,8 +424,6 @@ def source_of(ir: dict, behavior: dict, facts_of: dict[str, dict], score: dict |
 
 SITE_WORDS = {"q_proj": "query", "k_proj": "key", "v_proj": "value", "o_proj": "output", "c_fc": "input",
               "down_proj": "output"}
-RULE_WORDS = {"offset": "attends to the position {k} back", "first": "attends to the first position",
-              "match": "attends to every earlier position whose previous token is the current token"}
 
 
 def part_words(n: dict) -> str:
@@ -469,14 +448,6 @@ def part_words(n: dict) -> str:
     return "; ".join(out)
 
 
-def rule_words(rule: dict | None) -> str:
-    if not rule:
-        return ""
-    if "offset" in rule:
-        return RULE_WORDS["offset"].format(k=rule["offset"])
-    return RULE_WORDS["first"] if rule.get("first") else RULE_WORDS["match"]
-
-
 def explanation_of(ir: dict, behavior: dict, facts_of: dict[str, dict]) -> str:
     """The program's plain-English explanation (what the reader reads): what each part does, from the
     measured facts in words, and how the parts connect, from the declared edges."""
@@ -486,8 +457,7 @@ def explanation_of(ir: dict, behavior: dict, facts_of: dict[str, dict]) -> str:
         f = facts_of.get(n["id"])
         words = name[n["id"]]
         plural = "," in words or ";" in words or any(w in words for w in ("neurons", "subcomponents", "features", "parts"))
-        rule = rule_words(n.get("rule"))
-        subject = words[0].upper() + words[1:] + (f", which {rule.replace('attends', 'attend' if plural else 'attends')}," if rule else "")
+        subject = words[0].upper() + words[1:]
         if f:
             d, z, rank = f["removal_answer_bits"], f["direct_answer_logit"], f["direct_answer_rank_median"]
             be, matter, work = ("are", "matter", "work") if plural else ("is", "matters", "works")
@@ -523,7 +493,8 @@ def explanation_of(ir: dict, behavior: dict, facts_of: dict[str, dict]) -> str:
                          f"{name[e['from']]}{route}.")
         if writers:
             lines.append(f"The output reads {', '.join(name[w] for w in writers)}.")
-    lines.append("Everything else behaves as it does on the edited prompt.")
+    lines.append("Every other part of the model is deleted." if ir.get("decomposition")
+                 else "Everything else behaves as it does on the edited prompt.")
     return " ".join(lines)
 
 
@@ -567,8 +538,9 @@ def printed(ir: dict, behavior: dict, score: dict | None = None, measured: dict 
     SHAPE[0] = mech.shapes(ir["model"])
     measured = measured if measured is not None else facts(engine_for(ir["model"]), ir, behavior)
     src = source_of(ir, behavior, measured, score)
-    check = mech.trace_inline(src, ir["model"])
-    if not check["valid"] or (check["nodes"], check["edges"]) != (ir["nodes"], ir["edges"]):
+    check = mech.trace_inline(src, ir["model"], decomposition=ir.get("decomposition") or "native")
+    shape = lambda g: ([(n["id"], n["pieces"]) for n in g["nodes"]], g["edges"])  # noqa: E731
+    if not check["valid"] or shape(check) != shape(ir):
         raise ValueError(f"the printed program does not trace back to the same IR: {check['error']}")
     return src, graph_of(ir, behavior, measured, score)
 
@@ -581,14 +553,15 @@ def main():
     ap.add_argument("--out-dir", type=Path, default=Path.home() / "mpd-data/graph_oracle/printed")
     ap.add_argument("--score", type=Path, help="the program's score JSON (score.py), stated in the docstring")
     ap.add_argument("--wrong", action="store_true", help="also write NAME.wrong.py: the facts on the wrong nodes (R3)")
+    ap.add_argument("--decomposition", help="what PD names: vpd, library, transcoder or native (default: the model's)")
     a = ap.parse_args()
     behavior = json.loads(a.behavior.read_text())
     text = a.program.read_text()
     if a.program.suffix == ".json":
         data = json.loads(text)
-        ir = data if "nodes" in data else mech.trace_inline(data["source"], behavior["model"])
+        ir = data if "nodes" in data else mech.trace_inline(data["source"], behavior["model"], decomposition=a.decomposition)
     else:
-        ir = mech.trace_inline(text, behavior["model"])
+        ir = mech.trace_inline(text, behavior["model"], decomposition=a.decomposition)
     if not ir["valid"]:
         sys.exit(f"invalid program: {ir['error']}")
     score = json.loads(a.score.read_text()) if a.score else None
