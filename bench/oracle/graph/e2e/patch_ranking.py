@@ -47,14 +47,37 @@ def vpd_rankings(a, s) -> int:
     return written
 
 
+def importance_rankings(a) -> int:
+    """Every VPD subcomponent ranked by VPD's causal importance on the behavior's prompts and counterfactuals
+    (mpd_vpd_importance_2951's mean over every position): under the checker's deletion semantics an unnamed
+    part contributes zero, as VPD's masks zero it."""
+    written = 0
+    for path in sorted(a.importance.glob("*.json")):
+        record = json.loads(path.read_text())
+        units = [(g, f"s{site['layer']}_{name.split('.')[-1]}_{i}") for name, site in record["sites"].items()
+                 for i, g in enumerate(site["mean"]) if g > 0]
+        units.sort(key=lambda x: -x[0])
+        (a.out / f"{record['behavior']}.json").write_text(json.dumps({"behavior": record["behavior"], "source": f"{path} (VPD's importances)",
+                                                                      "mixed": [[n, v] for v, n in units]}))
+        written += 1
+    return written
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--tables", type=Path, default=DATA / "examples")
     ap.add_argument("--out", type=Path, default=DATA / "patch_rankings")
     ap.add_argument("--model", default="vpd4l")
     ap.add_argument("--vpd", action="store_true", help="the VPD vocabulary: native heads and VPD MLP subcomponents")
+    ap.add_argument("--importance", type=Path, help="mpd_vpd_importance_2951's output directory: every VPD subcomponent "
+                                                    "ranked by VPD's importance (--out default .../importance_rankings)")
     a = ap.parse_args()
     s = mech.shapes(a.model)
+    if a.importance:
+        a.out = a.out if a.out != DATA / "patch_rankings" else DATA / "importance_rankings"
+        a.out.mkdir(parents=True, exist_ok=True)
+        print(f"{importance_rankings(a)} rankings in {a.out}")
+        return
     if a.vpd:
         a.out = a.out if a.out != DATA / "patch_rankings" else DATA / "vpd_rankings"
         a.out.mkdir(parents=True, exist_ok=True)
