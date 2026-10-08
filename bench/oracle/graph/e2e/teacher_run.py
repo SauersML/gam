@@ -17,7 +17,8 @@ VPD subcomponents to an answer in the oracle's format.
                               OUT/<behavior>.py, .answer.txt, .graph.json, .trajectory.jsonl (every scored program),
                               and a line in OUT/manifest.jsonl (behavior, answer path, score terms, checker commit).
 Held-out behaviors (the behavior's split, behaviors/build.py) never get answers. The checker is GRAPH_CHECKER (pin a
-copy named by its commit: --checker-commit, default the binary name's suffix after its last dot).
+copy named by its commit: --checker-commit, default the binary name's suffix after its last dot). With the model's
+shared base (GRAPH_BASE, as score.Checker takes it) every score includes it and the search ranks only parts outside it.
 """
 
 from __future__ import annotations
@@ -40,8 +41,9 @@ import mech  # noqa: E402
 import teacher  # noqa: E402
 
 DATA = Path.home() / "mpd-data/graph_oracle"
-TERMS = ("total_bits", "exec_error_bits", "necessity_error_bits", "alignment_error_bits", "claim_error_bits", "code_bits",
-         "opaque_bits", "base_bits", "reader_error_bits", "N", "experiments", "python_tokens", "opaque_numbers", "valid")
+TERMS = ("total_bits", "exec_error_bits", "necessity_error_bits", "alignment_error_bits", "claim_error_bits", "complexity_bits",
+         "structure_bits", "code_bits", "explanation_bits", "base_bits", "reader_error_bits", "N", "experiments", "parts",
+         "python_tokens", "opaque_numbers", "valid")
 
 
 def values_of(algorithm: str, names: list[str], tokens: list[str]) -> dict:
@@ -111,6 +113,23 @@ def carriers(a) -> None:
         print(f"{b}: carriers for {', '.join(f'{v} ({len(c)})' for v, c in table.items())}", flush=True)
 
 
+def base_units(model: str) -> set[str]:
+    """The ranking names (s<layer>_<site>_<i>) of the subcomponents in the model's shared base (GRAPH_BASE, as
+    score.Checker takes it), which every program is scored with: the search ranks only the parts outside it."""
+    import score as score_module
+
+    base = os.environ.get("GRAPH_BASE")
+    if not base:
+        return set()
+    ir = json.loads(Path(score_module.BASES[model] if base in ("1", "True") else Path(base).expanduser()).read_text())
+    out = set()
+    for n in ir["nodes"]:
+        for p in n["pieces"]:
+            idx = p["index"]
+            out |= {f"s{p['layer']}_{p['kind']}_{i}" for i in (idx if isinstance(idx, list) else [idx]) if isinstance(i, int)}
+    return out
+
+
 def answer(a, b: str) -> None:
     """The `answer` command for one behavior (module doc)."""
     import printer
@@ -125,8 +144,16 @@ def answer(a, b: str) -> None:
     out.mkdir(parents=True, exist_ok=True)
     found = a.search / "search" / f"{b}.prefix_vpd_min.json"
     if not found.exists():
+        rankings, base = a.rankings, base_units(behavior["model"])
+        if base:
+            rankings = a.search / "rankings"
+            rankings.mkdir(parents=True, exist_ok=True)
+            ranked = json.loads((a.rankings / f"{b}.json").read_text())
+            ranked["mixed"] = [u for u in ranked["mixed"] if u[0] not in base]
+            ranked["source"] += f"; the {len(base)} parts of the shared base left out"
+            (rankings / f"{b}.json").write_text(json.dumps(ranked))
         cmd = [sys.executable, str(HERE / "vpd_min.py"), b, "--out", str(a.search), "--behaviors-dir", str(a.behaviors_dir),
-               "--vpd", str(a.vpd), "--rankings", str(a.rankings), "--export", str(a.export)]
+               "--vpd", str(a.vpd), "--rankings", str(rankings), "--export", str(a.export)]
         cmd += ["--device", a.device] if a.device else []
         subprocess.run(cmd, check=True)
     if not found.exists():
