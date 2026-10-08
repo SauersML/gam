@@ -893,15 +893,24 @@ def rot_core_args():
     ga = torch.full((), max(0.05, 1 - state.get('progress', 0.0) / ANNEAL), device=dev) if gate == 'anneal' else None
     return on, ga
 
-def rot_record(recs, Rbs, keys):
+def rot_record(recs, Rbs, keys, Rs=None):
     """Appends a core's per-token records (bits on, blocks on, training-gate bits) and, in calibration, its blocks'
-    reads to the pass's state."""
-    for (hb, n_on, sb), Rb, key in zip(recs, Rbs, keys):
+    reads to the pass's state; with the pin, each block set's reads and bits (Rs: the block sets)."""
+    for i_, ((hb, n_on, sb, Lj), Rb, key) in enumerate(zip(recs, Rbs, keys)):
         if state.get('calib') is not None:
             state['calib'].setdefault(key, []).append(Rb.detach().reshape(-1))
+        if state.get('pin') is not None and Rs is not None:
+            # The clean sequences' every eighth token.
+            state['pin'].append((Rs[i_], Rb.detach().index_select(0, state['pin_rows'])[:, ::8], Lj.detach()))
         state['hard'].append(hb); state['rot_on'].append(n_on)
         if sb is not None:
             state['soft'].append(sb)
+
+# DESCENT_LOGGATE=1: a block's guard reads its own write on a log scale, z = (ln R - tau) / s with tau a log threshold
+# and s one e-fold (toys, cd27062d48): a block writing nothing is off exactly and the training noise is relative;
+# with the linear read z = (R - tau) / s, tokens whose write is zero keep Phi(-tau / s) of every block in the
+# expected bits.
+LOGGATE = os.environ.get('DESCENT_LOGGATE') == '1'
 
 def rot_gate_core(R, r, bits_i, idx, on, ga, mode, extra=None):
     """The gates of R's slices [B, T, ng, g] from their reads r and their bits bits_i [ng, g] (extra: the gate
@@ -911,7 +920,7 @@ def rot_gate_core(R, r, bits_i, idx, on, ga, mode, extra=None):
     hot = (R['L'].argmax(-1, keepdim=True) == torch.arange(g, device=r.device)).float(); Lsm = torch.softmax(R['L'], -1)
     M_ = hot if mode == 'hard' else Lsm
     Rb = (qeinsum('...ni,nij->...nj', r.pow(2), M_) + 1e-20).sqrt()
-    z = (Rb - R['tau']) / R['s']
+    z = ((Rb.log() if LOGGATE else Rb) - R['tau']) / R['s']
     if extra is not None:
         z = z + extra
     hard, phi = (z > 0).float(), 0.5 * (1 + torch.erf(z / SQ2))
@@ -920,11 +929,11 @@ def rot_gate_core(R, r, bits_i, idx, on, ga, mode, extra=None):
     Lj = qeinsum('ni,nij->nj', bits_i, M_) + rot_tau_bits(R) + idx
     hb, n_on = (hard * Lj).sum((-1, -2)).reshape(-1), hard.sum((-1, -2)).reshape(-1)
     if mode == 'hard':
-        return qeinsum('...nj,nij->...ni', hard, hot), (hb, n_on, None), Rb
+        return qeinsum('...nj,nij->...ni', hard, hot), (hb, n_on, None, Lj), Rb
     gb = rot_train_gate(hard, phi, z, ga)
-    return qeinsum('...nj,nij->...ni', gb, Lsm), (hb, n_on, (gb * Lj).sum((-1, -2)).reshape(-1)), Rb
+    return qeinsum('...nj,nij->...ni', gb, Lsm), (hb, n_on, (gb * Lj).sum((-1, -2)).reshape(-1), Lj), Rb
 
-def rot_fc_core(R, p, xe, Q, ex, idx, on, ga, mode):
+def rot_fc_core(R, p, xe, Q, ex, idx, on, ga, sc, mode):
     """A c_fc map after M's product p = x W^T: its slices' coefficients (with the read noise xe), its blocks' gates
     (ex: the gate network's term) and its output; returns (output, gates, records, block reads)."""
     sh = p.shape[:-1]
@@ -936,7 +945,7 @@ def rot_fc_core(R, p, xe, Q, ex, idx, on, ga, mode):
         gam = torch.ones_like(c)
     else:
         bits_i, wn = rot_slice_bits(R, Q)
-        abar = permuted(vpd_model.gelu_tanh(p), R['perm'], R['inv']).view(*sh, R['ng'], ROTG)
+        abar = permuted(vpd_model.gelu_tanh(p if sc is None else p * sc), R['perm'], R['inv']).view(*sh, R['ng'], ROTG)
         gam, rec, Rb = rot_gate_core(R, qeinsum('...nk,nki->...ni', abar, Q).abs() * wn, bits_i, idx, on, ga, mode, ex)
         recs.append(rec); Rbs.append(Rb)
     return permuted(qeinsum('...ni,nki->...nk', c * gam, Q).reshape(*sh, -1), R['inv'], R['perm']), gam, recs, Rbs
@@ -947,16 +956,20 @@ def make_rot_fc(n, l):
         p = x @ W.T
         if state['mode'] == 'M':
             return p
+        # c_fc rows G scaled by 1 + a (an entry-wise neuron edit), on the shared compiler's side: the represented
+        # output rows after the block projection (h = D Pi p), and in the gate's all-on read GELU(D p).
+        sc = None
         for b, kind, G, a in state['entry'].get(n, ()):
             if kind == 'out':
-                # c_fc rows G scaled by 1 + a, entry-wise in every slice's read.
-                sc = torch.ones(p.shape[-1], device=p.device); sc[G] = 1 + a
-                p = p.index_copy(0, torch.tensor([b], device=p.device), (p[b] * sc)[None])
+                sc = torch.ones(p.shape[0], 1, p.shape[-1], device=p.device) if sc is None else sc
+                sc[b, 0, G] = 1 + a
         Q = rot_Q(R)
         xe = x @ torch.randn(R['ng'] * ROTG, x.shape[-1], device=x.device).T if state.get('noise') else None
         ex = gate_net(l, 'mlp', x).view(*p.shape[:-1], R['ng'], R['g']) if GN and state['mode'] != 'all' else None
-        out, gam, recs, Rbs = rot_run(rot_fc_core, R, p, xe, Q, ex, rot_index_bits_t(), *rot_core_args(), state['mode'])
-        rot_record(recs, Rbs, [n])
+        out, gam, recs, Rbs = rot_run(rot_fc_core, R, p, xe, Q, ex, rot_index_bits_t(), *rot_core_args(), sc, state['mode'])
+        if sc is not None:
+            out = out * sc
+        rot_record(recs, Rbs, [n], [R])
         state['rot'][l] = (gam, Q)
         return out
     return fwd
@@ -974,12 +987,13 @@ def make_rot_dn(n, l):
             return a @ W.T
         sh = a.shape[:-1]
         gam, Q = state['rot'][l]
-        z, c = rot_run(rot_dn_core, R, a, gam, Q, state['mode'])
         for b, kind, G, a_ in state['entry'].get(n, ()):
             if kind == 'in':
-                # down_proj columns G scaled by 1 + a, entry-wise in every slice's write.
-                sc = torch.ones(z.shape[-1], device=z.device); sc[G] = 1 + a_
-                z = z.index_copy(0, torch.tensor([b], device=z.device), (z[b] * sc)[None])
+                # down_proj columns G scaled by 1 + a (an entry-wise neuron edit), on the shared compiler's side: the
+                # represented input columns before the block projection (y = W_dn Pi D a).
+                sc = torch.ones(a.shape[-1], device=a.device); sc[G] = 1 + a_
+                a = a.index_copy(0, torch.tensor([b], device=a.device), (a[b] * sc)[None])
+        z, c = rot_run(rot_dn_core, R, a, gam, Q, state['mode'])
         y = z @ W.T
         if state.get('noise'):
             eps = torch.randn(R['ng'] * ROTG, W.shape[0], device=a.device)
@@ -1134,7 +1148,7 @@ def rot_attention(i, h, causal):
         ex = tuple(ex)
     z, c, recs, Rbs = rot_run(rot_attention_core, Rq, Rk, Ro, q, k, v, causal, Qq, Qk, Q, noise, ex, rot_index_bits_t(),
                               *rot_core_args(), state['mode'])
-    rot_record(recs, Rbs, [f'h.{i}.attn.q_proj', f'h.{i}.attn.k_proj', f'h.{i}.attn.o_proj'])
+    rot_record(recs, Rbs, [f'h.{i}.attn.q_proj', f'h.{i}.attn.k_proj', f'h.{i}.attn.o_proj'], [Rq, Rk, Ro])
     y = site('o_proj')(z)
     if state.get('noise'):
         y = y + (c * Ro['ls_dn'].exp()).reshape(B_, T_, -1) @ torch.randn(NH * HD, y.shape[-1], device=h.device)
@@ -1645,7 +1659,7 @@ if ARM == 'rot':
         run(ids_c, 'soft')
         for R, tk, sk, key, _, _ in comps:
             rb = torch.stack(state['calib'][key]).view(-1, *R[sk].shape)
-            R[sk] = 0.1 * rb.pow(2).mean(0).sqrt().clamp_min(1e-12)
+            R[sk] = torch.ones_like(R[sk]) if LOGGATE else 0.1 * rb.pow(2).mean(0).sqrt().clamp_min(1e-12)
         ib = rot_index_bits(); share_all = sum(c[5] for c in comps)
         for R, tk, sk, key, bits0, share in comps:
             state['calib'] = {}
@@ -1653,7 +1667,8 @@ if ARM == 'rot':
             flat = torch.cat(state['calib'][key])
             on = K * share / share_all / (bits0() + ib)
             idx = torch.randperm(flat.numel(), device=dev)[:2_000_000]
-            R[tk].fill_(torch.quantile(flat[idx].float(), max(0.0, 1 - on / R[sk].numel())).item())
+            fl = flat[idx].float()
+            R[tk].fill_(torch.quantile(fl.log() if LOGGATE else fl, max(0.0, 1 - on / R[sk].numel())).item())
         state['calib'] = None
         run(ids_c, 'hard')
         print('rot start: bits per token', round(torch.stack(state['hard']).sum(0).mean().item()), 'blocks on per token',
@@ -1885,6 +1900,35 @@ e = evaluate(); e['weight_edits'] = evaluate_edits(); print('start', e, flush=Tr
 g_edits = np.random.default_rng(11)
 step_seconds = []
 t0 = time.time()
+# DESCENT_DUAL=pin (toys, cd27062d48): lambda stays at the balance rate it starts at, and after every step every
+# threshold moves by one common shift, the least for which the hard program's bits per clean token are at most K
+# (bisection over the step's recorded block reads, a sample of the clean tokens; no shift where the budget never
+# binds). Pinning the expected (soft) count instead drove toys' hard KL to 158 bits per token, and the multiplier
+# alone left the MLP 16% under budget.
+def pin_shift(kinds):
+    pins, state['pin'] = state.get('pin'), None
+    if not pins:
+        return
+    sets = [(R, (Rb.log() if LOGGATE else Rb).reshape(-1, *Lj.shape), Lj) for R, Rb, Lj in pins]
+    def bits(d):
+        tot = 0.0
+        for R, rb, Lj in sets:
+            tau = R['tau_leaf'][0] if 'tau_leaf' in R else R['tau']
+            tot = tot + (((rb - tau.detach() - d) / R['s'] > 0).float() * Lj).sum((-1, -2)).mean()
+        return float(tot)
+    lo, hi = -20.0, 20.0
+    if bits(lo) <= K:
+        return
+    for _ in range(30):
+        mid = 0.5 * (lo + hi)
+        lo, hi = (lo, mid) if bits(mid) <= K else (mid, hi)
+    with torch.no_grad():
+        for R in {id(R): R for R, _, _ in sets}.values():
+            (R['tau_leaf'][0] if 'tau_leaf' in R else R['tau']).add_(hi)
+
+LOG_EVERY = max(1, 400_000 // (batch * seq))
+with open(out.replace('.json', '.tsv'), 'w') as f_:
+    f_.write('step\ttokens\ttrain_kl\ttrain_F\tbits_train_gates\tbits_hard\tlambda\n')
 for step in range(steps):
     state['progress'] = step / max(1, steps - 1)
     rows = rng.integers(0, train_rows, batch); rows = np.where(rows >= 1024, rows + 8, rows); offs = rng.integers(0, 513 - seq, batch)
@@ -1908,6 +1952,8 @@ for step in range(steps):
             lm = lm.index_copy(0, torch.arange(b_, b_ + LRM, device=dev), run(ids[b_:b_ + LRM], 'all'))
             state['drop_leftover'] = False
         install(kinds)
+    state['pin'] = [] if DUAL == 'pin' else None
+    state['pin_rows'] = torch.tensor([b for b, k_ in enumerate(kinds) if k_ is None] or [0], device=dev)
     lp = run(ids, 'soft')
     kl_seq = kl_bits(lm, lp).mean(-1)
     kl = kl_seq.mean()
@@ -1939,7 +1985,7 @@ for step in range(steps):
         Kt = K0 * (K / K0) ** min(1.0, step / B)
     else:
         Kt = K
-    if DUAL == 'logint':
+    if DUAL in ('logint', 'pin'):
         if step == 0:
             # lambda starts at the median over thresholds of the balance |dF/dtau| / |dE[k]/dtau|.
             taus = [mu for _, key, mu, _ in leaves if key == 'tau'] if FMODE else [cont[key] for cont, key, _ in slots if key == 'tau']
@@ -1948,9 +1994,12 @@ for step in range(steps):
             ratio = torch.cat([(a.abs() / b.abs()).reshape(-1)[b.abs().reshape(-1) > 0] for a, b in zip(gF, gk) if a is not None and b is not None])
             lam = max(ratio.median().item(), 1e-12) if ratio.numel() else 1e-3
         opt.zero_grad(); (objective + lam * (ek - K)).backward(); opt.step()
-        # The relative violation, capped at +1 as it is bounded by -1 below, so lambda rises no faster than
-        # it can fall (an uncapped rise ran away at K = 64 while the count started at 3.7 K).
-        lam = lam * math.exp(min((ek.item() - K) / K, 1.0) / B_H)
+        if DUAL == 'pin':
+            pin_shift(kinds)
+        else:
+            # The relative violation, capped at +1 as it is bounded by -1 below, so lambda rises no faster than
+            # it can fall (an uncapped rise ran away at K = 64 while the count started at 3.7 K).
+            lam = lam * math.exp(min((ek.item() - K) / K, 1.0) / B_H)
         g_f = None
     elif DUAL == 'fixed':
         opt.zero_grad(); (objective + lam * torch.log(ek)).backward(); opt.step()
@@ -1972,6 +2021,11 @@ for step in range(steps):
     if dev == 'cuda':
         torch.cuda.synchronize()
     step_seconds.append(time.time() - t_step)
+    if (step + 1) % LOG_EVERY == 0:
+        # The loss curve between evaluations: every 0.4M training tokens, the step's training KL and F, its bits per
+        # clean token (training gates and hard), and lambda.
+        with open(out.replace('.json', '.tsv'), 'a') as f_:
+            f_.write(f"{step + 1}\t{(step + 1) * batch * seq}\t{kl.item():.4f}\t{objective.item():.4f}\t{ek.item():.0f}\t{hk:.0f}\t{lam:.4g}\n")
     last = step == steps - 1 or time.time() - t0 > LIMIT
     if (step + 1) % EVAL == 0 or last:
         # This step's parts on per clean training token, per map (at the sample under F), and under F each
