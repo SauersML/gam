@@ -1322,9 +1322,13 @@ impl Graph {
         // A shared base's nodes are generic machinery, always on: each reads every earlier write
         // (`embed` and every residual writer before its site), every later node and the logits read
         // its write, and within its site it joins every other node either way (c_fc to down_proj,
-        // q/k/v to o_proj). These edges are implied by the base, not declared.
+        // q/k/v to o_proj); the logits read `embed` too, as in the model's residual stream. These
+        // edges are implied by the base, not declared.
         let base: BTreeSet<usize> = ids.iter().enumerate().filter(|(_, id)| program.base.contains(id)).map(|(k, _)| k).collect();
         let declared = (edges.len(), internal.len());
+        if !base.is_empty() && !edges.contains(&(Writer::Embed, None, Route::Input)) {
+            edges.push((Writer::Embed, None, Route::Input));
+        }
         for &b in &base {
             let site = blocks[b].site();
             let mut implied: Vec<(Writer, Option<usize>, Route)> = blocks[b].reads().into_iter().map(|route| (Writer::Embed, Some(b), route)).collect();
@@ -4452,7 +4456,10 @@ impl Checker {
                     self.reference_bytes = usize::MAX;
                     let before = self.held_references();
                     let prewarm = std::time::Instant::now();
-                    chunk.iter().try_for_each(|&r| self.prewarm(&runs[r].1))?;
+                    // Deleting programs read no counterfactual run (their stand-ins are zero).
+                    if parsed.iter().any(|(g, _, _)| !g.delete) {
+                        chunk.iter().try_for_each(|&r| self.prewarm(&runs[r].1))?;
+                    }
                     seconds[1] += prewarm.elapsed().as_secs_f64();
                     made_bytes += self.held_references().saturating_sub(before);
                     // Chunks as large as the budget holds.
