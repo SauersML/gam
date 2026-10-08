@@ -1748,31 +1748,6 @@ if sliced:
                 SHARE_A[l] = {'cand_v': cand_v, 'cand_o': cand_o, 'L_v': L_v.requires_grad_(), 'L_o': L_o.requires_grad_(),
                               't': A[v]['tau'].detach().clone().requires_grad_(), 's': A[v]['s'].clone()}
         del cap
-if DESTKV and sliced:
-    # The k slices' thresholds on their destination signal: the start's quantile of it (as the own reads' were set),
-    # the noise scale a tenth of its root mean square per slice. And a check: with every k slice on, the scores are
-    # M's.
-    with torch.no_grad():
-        ids_k = torch.tensor(tok[0:2, :512].astype(np.int64), device=dev)
-        install([None]); state['calib'] = {}
-        run(ids_k, 'soft')
-        for l in range(T.n_layer):
-            n = f'h.{l}.attn.k_proj'
-            sg = torch.stack(state['calib'][n]).view(-1, NH, 512, A[n]['tau'].shape[-1])
-            A[n]['s'] = 0.1 * sg.pow(2).mean((0, 2)).sqrt().clamp_min(1e-12)
-            flat = sg.reshape(-1); idx = torch.randperm(flat.numel(), device=dev)[:2_000_000]
-            A[n]['tau'].fill_(torch.quantile(flat[idx], start_q(1 - START_SCALE * VPD_ATTN_COUNTS.get(n, 1.0) / (NH * sg.shape[-1]))).item())
-        state['calib'] = None
-        install(['allon', 'allon']); state['mode'] = 'soft'
-        h0 = vpd_model.rms(T.wte[ids_k], T.norms[0], T.eps)
-        q0 = T._rope((h0 @ T.site('h.0.attn.q_proj').W.T).view(2, 512, NH, HD).transpose(1, 2), 512)
-        k0 = T._rope((h0 @ T.site('h.0.attn.k_proj').W.T).view(2, 512, NH, HD).transpose(1, 2), 512)
-        causal0 = torch.ones(512, 512, dtype=torch.bool, device=dev).tril()
-        s_d, s_m = dest_k_scores(0, h0, q0, causal0), (q0 @ k0.transpose(-1, -2)) / math.sqrt(HD)
-        print('destkv check: every k slice on, scores against M\'s, max |diff|', float((s_d - s_m).masked_fill(~causal0, 0).abs().max()),
-              'of', float(s_m.masked_fill(~causal0, 0).abs().max()), flush=True)
-        install([None])
-
 def kl_bits(lm, lp):
     return KLBits.apply(lm, lp)
 
@@ -2080,6 +2055,31 @@ if start in ('vpd', 'neuron') and not (SHARE or SHARE_A or EXACT or ARM in ('dir
         print('thresholds set in the gated run: parts on per token', round(torch.stack(state['hard']).sum(0).mean().item(), 1),
               [round(h.mean().item(), 2) for h in state['hard']], flush=True)
 
+if DESTKV and sliced:
+    # The k slices' thresholds on their destination signal: the start's quantile of it (as the own reads' were set),
+    # the noise scale a tenth of its root mean square per slice. And a check: with every k slice on, the scores are
+    # M's.
+    with torch.no_grad():
+        ids_k = torch.tensor(tok[0:2, :512].astype(np.int64), device=dev)
+        install([None]); state['calib'] = {}
+        run(ids_k, 'soft')
+        for l in range(T.n_layer):
+            n = f'h.{l}.attn.k_proj'
+            sg = torch.stack(state['calib'][n]).view(-1, NH, 512, A[n]['tau'].shape[-1])
+            A[n]['s'] = 0.1 * sg.pow(2).mean((0, 2)).sqrt().clamp_min(1e-12)
+            flat = sg.reshape(-1); idx = torch.randperm(flat.numel(), device=dev)[:2_000_000]
+            A[n]['tau'].fill_(torch.quantile(flat[idx], start_q(1 - START_SCALE * VPD_ATTN_COUNTS.get(n, 1.0) / (NH * sg.shape[-1]))).item())
+        state['calib'] = None
+        install(['allon', 'allon']); state['mode'] = 'soft'
+        h0 = vpd_model.rms(T.wte[ids_k], T.norms[0], T.eps)
+        q0 = T._rope((h0 @ T.site('h.0.attn.q_proj').W.T).view(2, 512, NH, HD).transpose(1, 2), 512)
+        k0 = T._rope((h0 @ T.site('h.0.attn.k_proj').W.T).view(2, 512, NH, HD).transpose(1, 2), 512)
+        causal0 = torch.ones(512, 512, dtype=torch.bool, device=dev).tril()
+        s_d, s_m = dest_k_scores(0, h0, q0, causal0), (q0 @ k0.transpose(-1, -2)) / math.sqrt(HD)
+        print('destkv check: every k slice on, scores against M\'s, max |diff|', float((s_d - s_m).masked_fill(~causal0, 0).abs().max()),
+              'of', float(s_m.masked_fill(~causal0, 0).abs().max()), flush=True)
+        install([None])
+
 if ARM == 'rot':
     # B: the bits of K of VPD's MLP subcomponents, each at a width of 1% of its tensor's root mean square under the
     # zero-mean prior per tensor, plus its index among VPD's MLP subcomponents.
@@ -2376,8 +2376,9 @@ t0 = time.time()
 # pass's own count (sampled parameters and gates, upstream blocks drawn off) let the held-out hard program run
 # 7.0M bits per token at 5M tokens against K = 4.2M.
 def delivered_kl(ids, kinds, lm):
-    """The delivered (hard) program's KL in bits per token on up to four of the step's clean sequences (lm: M's logits)."""
-    rows = [b for b, k_ in enumerate(kinds) if k_ is None][:4] or [0]
+    """The delivered (hard) program's KL in bits per token on up to four of the step's clean natural-text sequences (not
+    the repeated ones; lm: M's logits)."""
+    rows = [b for b, k_ in enumerate(kinds) if k_ is None and b < len(kinds) - REPEATS][:4] or [0]
     install([None] * len(rows))
     with torch.no_grad():
         kl_ = kl_bits(lm[rows], run(ids[rows], 'hard')).mean().item()
@@ -2476,7 +2477,9 @@ for step in range(steps):
         # pass's own under st (one-hot assignments, hard gates: the delivered program), else a hard pass.
         G_t = gates_evaluated(True)
         conc = CPS * ek + G_t
-        clean = [b for b, k_ in enumerate(kinds) if k_ is None]
+        # (natural text only: the repeated sequences train the copying, but the limit is on natural text, where
+        # including them held the held-out KL at 0.63 against kappa 0.553)
+        clean = [b for b, k_ in enumerate(kinds) if k_ is None and b < batch - REPEATS]
         kl_dl = kl_seq[clean].mean().item() if gate == 'st' else delivered_kl(ids, kinds, lm)
         if step == 0:
             # mu starts at the balance ||d concepts / d tau|| / ||d bits / d tau|| over all thresholds (a per-threshold
