@@ -57,6 +57,16 @@ import os
 # DESCENT_ARM=dir: each slice's gate reads its own direction g_i (signed), z = (g_i.x - tau_i)/s_i,
 # with g_i started at the slice's read v_i ||u_i||, signed so its firing on M's fit tokens is kept.
 ARM = os.environ.get('DESCENT_ARM', 'own')
+# DESCENT_LEVIN (default 1; the rot arm): the objective per clean token is KL_t + log2(C_t), Levin's cost: C_t the
+# concepts a reader follows to run the explanation at token t, the concepts of the blocks on (1 for the gate plus,
+# per slice, its read, its write and its scales: 4 for an MLP or OV slice, whose neuron-space or head-space
+# direction inside the block is not counted, 3 for a q or k slice) plus the gates evaluated (every non-empty
+# block's, the head scores read by score gates, and a gate network's parameters). Halving what a reader follows is
+# worth one bit of prediction error; there is no budget and no tuned weight. Bits-back (DESCENT_F) is off: data is
+# effectively unlimited. K (the second argument) sets only the start's thresholds, at K VPD subcomponents' 4
+# concepts each per token. Blocks never on in an evaluation's hard passes are pruned (off for good; all-on keeps
+# them, so P stays exact).
+LEVIN = os.environ.get('DESCENT_LEVIN', '1') == '1' and ARM == 'rot'
 dev = os.environ.get('DESCENT_DEV') or ('cuda' if torch.cuda.is_available() else 'mps')
 # DESCENT_EXACT=1: every map's slices sum to M's weight at every step by construction (below). The
 # frames' duals and writes are computed in full float32 (TF32's 10-bit mantissa would break the sum);
@@ -655,8 +665,8 @@ def permuted(x, idx, inv):
     """x[..., idx] for a permutation idx with inverse inv."""
     return _Permuted.apply(x, idx, inv)
 if ARM == 'rot':
-    if start != 'neuron' or os.environ.get('DESCENT_F') != '1':
-        raise SystemExit('DESCENT_ARM=rot: the neuron start, F')
+    if start != 'neuron' or (os.environ.get('DESCENT_F') == '1') == LEVIN:
+        raise SystemExit('DESCENT_ARM=rot: the neuron start, and F (DESCENT_F=1) or the Levin objective (DESCENT_LEVIN=1)')
     with torch.no_grad():
         for l in range(T.n_layer):
             fc, dn = f'h.{l}.mlp.c_fc', f'h.{l}.mlp.down_proj'
@@ -775,8 +785,14 @@ def rot_Q(R):
                      ('mean', [R_['A_leaf'][0] for R_ in ROT_ALL if 'A_leaf' in R_ and R_['A'].shape[-1] == g])):
         at = [i for i, t in enumerate(As) if t is A]
         if at:
-            return rot_memo((name, torch.is_grad_enabled(), g), As, lambda: rot_Q_all(As))[at[0]]
-    return rot_Q_all([A])[0]
+            Q = rot_memo((name, torch.is_grad_enabled(), g), As, lambda: rot_Q_all(As))[at[0]]
+            break
+    else:
+        Q = rot_Q_all([A])[0]
+    if R.get('Q0') is None:
+        return Q
+    with full_float32():
+        return R['Q0'] @ Q
 
 def rot_slice_bits(R, Q):
     """Per slice [ng, g]: its description in bits (dense read and write at its widths, its rotation angles' share)
@@ -785,6 +801,8 @@ def rot_slice_bits(R, Q):
     nf = qeinsum('nki,nkm,nmi->ni', Q, R['Gfc'], Q); nd = qeinsum('nki,nkm,nmi->ni', Q, R['Gdn'], Q)
     di, do = R['di'], R['do']
     vf = (nf.sum() + di * sf.sum()) / (di * nf.numel()); vd = (nd.sum() + do * sd.sum()) / (do * nd.numel())
+    if LEVIN:
+        return torch.full_like(nd, 4.0), nd.clamp_min(0).sqrt()
     bits = 0.5 * (di * torch.log(vf / sf) + (nf + di * sf) / vf - di) + 0.5 * (do * torch.log(vd / sd) + (nd + do * sd) / vd - do)
     return bits / math.log(2) + rot_angle_bits(R), nd.clamp_min(0).sqrt()
 
@@ -800,7 +818,9 @@ def rot_angle_bits(R):
     return 0.5 * (kl.sum(-1) + kl.sum(-2)) / math.log(2)
 
 def rot_tau_bits(R):
-    """Per block [ng, g]: its threshold's description in bits (the fitted-mean prior)."""
+    """Per block [ng, g]: its threshold's description in bits (the fitted-mean prior); under LEVIN its gate's concept."""
+    if LEVIN:
+        return torch.ones_like(R['s'])
     if 'tau_leaf' not in R:
         return torch.zeros_like(R['s'])
     mu, ls = R['tau_leaf']
@@ -808,13 +828,18 @@ def rot_tau_bits(R):
     return 0.5 * (torch.log(v) - 2 * ls + ((mu - mu.mean()).pow(2) + (2 * ls).exp()) / v - 1) / math.log(2)
 
 def rot_index_bits():
-    """log2 of the number of blocks (MLP, OV and QK blocks with a slice or plane)."""
+    """log2 of the number of blocks (MLP, OV and QK blocks with a slice or plane); under LEVIN the gate's concept
+    (the start's per-block cost beside its slices')."""
+    if LEVIN:
+        return 1.0
     Ls = [R['L'] for R in ROT_ALL]
     return rot_memo('index', Ls, lambda: math.log2(max(2, int(torch.stack(
         [(torch.zeros(L.shape[:2], device=dev).scatter_(1, L.argmax(-1), 1.0) > 0).sum() for L in Ls]).sum()))))
 
 def rot_index_bits_t():
-    """rot_index_bits as a device scalar, with no host wait."""
+    """rot_index_bits as a device scalar, with no host wait (0 under LEVIN: the gate's concept is rot_tau_bits')."""
+    if LEVIN:
+        return torch.zeros((), device=dev)
     Ls = [R['L'] for R in ROT_ALL]
     return rot_memo('index_t', Ls, lambda: torch.stack(
         [(torch.zeros(L.shape[:2], device=dev).scatter_(1, L.argmax(-1), 1.0) > 0).sum() for L in Ls]).sum().clamp_min(2).float().log2())
@@ -880,7 +905,7 @@ def rot_gate_core(R, r, bits_i, idx, on, mode, extra=None):
     z = ((Rb.log() if LOGGATE else Rb) - R['tau']) / R['s']
     if extra is not None:
         z = z + extra
-    hard, phi = (z > 0).float(), 0.5 * (1 + torch.erf(z / SQ2))
+    hard, phi = (z > 0).float() * R['keep'], 0.5 * (1 + torch.erf(z / SQ2)) * R['keep']
     if on is not None:
         hard, phi = hard.index_fill(0, on, 1.0), phi.index_fill(0, on, 1.0)
     Lj = qeinsum('ni,nij->nj', bits_i, M_) + rot_tau_bits(R) + idx
@@ -902,7 +927,8 @@ def rot_fc_core(R, p, xe, Q, ex, idx, on, sc, mode):
         gam = torch.ones_like(c)
     else:
         bits_i, wn = rot_slice_bits(R, Q)
-        abar = permuted(vpd_model.gelu_tanh(p if sc is None else p * sc), R['perm'], R['inv']).view(*sh, R['ng'], ROTG)
+        pa = p if sc is None else p * sc
+        abar = permuted(pa if READSIDE else vpd_model.gelu_tanh(pa), R['perm'], R['inv']).view(*sh, R['ng'], ROTG)
         gam, rec, Rb = rot_gate_core(R, qeinsum('...nk,nki->...ni', abar, Q).abs() * wn, bits_i, idx, on, mode, ex)
         recs.append(rec); Rbs.append(Rb)
     return permuted(qeinsum('...ni,nki->...nk', c * gam, Q).reshape(*sh, -1), R['inv'], R['perm']), gam, recs, Rbs
@@ -997,6 +1023,18 @@ if ARM == 'rot' and attn:
                                  'ls': torch.full((ng, GA), math.log(0.01 * W.pow(2).mean().sqrt().item()), device=dev, requires_grad=True)}
             Gv = Wv.view(ng, GA, -1); Go = Wo.T.reshape(ng, GA, -1)
             Q0s = {}
+            if ATTN_START == 'vpd' and ng == NH:
+                # Per-head groups: each head's basis starts at VPD's subcomponents' writes restricted to the head's
+                # coordinates, largest ||v_i|| ||u_i,head|| first, orthonormalized in that order.
+                for name, n_ in (('q', 'q_proj'), ('k', 'k_proj'), ('ov', 'v_proj')):
+                    Vv_, Uv_ = load(f'h.{l}.attn.{n_}.V'), load(f'h.{l}.attn.{n_}.U')
+                    Qh = []
+                    for hh in range(NH):
+                        Uh = Uv_[:, hh * HD:(hh + 1) * HD]
+                        order = torch.argsort(-(Vv_.norm(dim=0) * Uh.norm(dim=1))).cpu().numpy()
+                        D_ = (Uh / Uh.norm(dim=1, keepdim=True).clamp_min(1e-12)).T.cpu().double().numpy()[:, order]
+                        Qh.append(torch.tensor(sl.qr(D_, mode='full')[0][:, :GA], dtype=torch.float32, device=dev))
+                    Q0s[name] = torch.stack(Qh)
             if ATTN_START == 'vpd' and ng == 1:
                 # VPD's subcomponents' directions as the start's basis: q's, k's and v's writes (in the map's output
                 # space), largest ||v_i|| ||u_i|| first, orthonormalized in that order (completed by the orthogonal
@@ -1012,6 +1050,30 @@ if ARM == 'rot' and attn:
             for name, Q0 in Q0s.items():
                 ROTA[l][name]['Q0'] = Q0
 ROT_ALL = list(ROT.values()) + [R[x] for R in ROTA.values() for x in ('q', 'k', 'ov')]
+for R in ROT_ALL:
+    R['keep'] = torch.ones_like(R['s'])                                             # 0: pruned (never on)
+
+def nonempty(R, soft=False):
+    """Per block [ng, g]: 1 where a slice is assigned to it (soft: 1 - prod_i (1 - A_ij), A the assignment softmax)."""
+    if soft:
+        return 1 - torch.log1p(-torch.softmax(R['L'], -1).clamp_max(1 - 1e-6)).sum(1).exp()
+    return torch.zeros(R['L'].shape[:2], device=dev).scatter_(1, R['L'].argmax(-1), 1.0)
+
+def gates_evaluated(soft):
+    """LEVIN: the gates a reader evaluates on every token: each non-empty unpruned block's (soft: expected under the
+    assignment softmax), the head scores the score gates read, and the gate networks' parameters."""
+    extra = sum(t_.numel() for P_ in GN.values() for t_ in P_.values()) + sum(t_.numel() for t_ in TRUNK.values())
+    extra += T.n_layer * NH if SCOREGATE and ROTA else 0
+    return sum((nonempty(R, soft) * R['keep']).sum() for R in ROT_ALL) + extra
+
+def concepts_total():
+    """LEVIN: the whole decomposition's concepts: each non-empty unpruned block's 1 + 4 per MLP or OV slice (3 per q or
+    k slice), plus the gates' extra concepts (head scores, gate network parameters)."""
+    tot = gates_evaluated(False) - sum((nonempty(R) * R['keep']).sum() for R in ROT_ALL)
+    for R in ROT_ALL:
+        ranks = torch.zeros(R['L'].shape[:2], device=dev).scatter_add_(1, R['L'].argmax(-1), torch.ones(R['L'].shape[:2], device=dev))
+        tot = tot + ((ranks > 0).float() * R['keep'] * (1 + (3 if 'G' in R else 4) * ranks)).sum()
+    return float(tot)
 
 # DESCENT_GATENET=H: each layer's gates also read a small causal network of the layer's own input at the token
 # (the normed residual stream entering the attention, or the MLP): one hidden layer of H units (GELU), its output
@@ -1083,6 +1145,8 @@ def gate_net(l, part, x):
 
 def rot_read_bits(R, Q):
     """Per q or k slice [ng, g]: its dense read's description and its angles' share, in bits."""
+    if LEVIN:
+        return torch.full_like(R['s'], 3.0)
     s2 = (2 * R['ls']).exp(); d_ = R['di']
     nr = qeinsum('nki,nkm,nmi->ni', Q, R['G'], Q)
     v = (nr.sum() + d_ * s2.sum()) / (d_ * nr.numel())
@@ -1151,6 +1215,17 @@ def rot_attention(i, h, causal):
         for R_ in (Rq, Rk, Ro):
             m_ = R_['ng'] * R_['g']; ex.append(gn[..., o_:o_ + m_].view(B_, T_, R_['ng'], R_['g'])); o_ += m_
         ex = tuple(ex)
+    if SCOREGATE and state['mode'] != 'all':
+        # Each head's largest attention logit at the token (M's q and k on P's stream), standardized per head on
+        # the first pass, read by the q, k and OV blocks' gates (z += beta s).
+        with torch.no_grad():
+            sm = ((T._rope(q.view(B_, T_, NH, HD).transpose(1, 2), T_) @ T._rope(k.view(B_, T_, NH, HD).transpose(1, 2), T_).transpose(-1, -2))
+                  / math.sqrt(HD)).masked_fill(~causal, float('-inf')).amax(-1)                  # [B, H, T]
+            if i not in SCORE_NORM:
+                SCORE_NORM[i] = (sm.mean((0, 2))[None, :, None], sm.std((0, 2)).clamp_min(1e-6)[None, :, None])
+            sc = ((sm - SCORE_NORM[i][0]) / SCORE_NORM[i][1]).transpose(1, 2)                   # [B, T, H]
+        terms = [sc[..., None] * R_['beta'] if R_['ng'] == NH else (sc @ R_['beta'].view(-1, NH).T).view(B_, T_, 1, -1) for R_ in (Rq, Rk, Ro)]
+        ex = tuple(terms) if ex is None else tuple(e_ + t_ for e_, t_ in zip(ex, terms))
     z, c, recs, Rbs = rot_run(rot_attention_core, Rq, Rk, Ro, q, k, v, causal, Qq, Qk, Q, noise, ex, rot_index_bits_t(),
                               *rot_core_args(), 'all' if state.get('allon_family') == 'attn' else state['mode'])
     rot_record(recs, Rbs, [f'h.{i}.attn.q_proj', f'h.{i}.attn.k_proj', f'h.{i}.attn.o_proj'], [Rq, Rk, Ro])
@@ -1533,11 +1608,20 @@ def evaluate(final=False):
     install([None])
     r = {'kl': [], 'kl_soft': [], 'kl_all_on': [], 'active': [], 'active_soft': [], 'per_map': [], 'edges_on': [], 'edges_on_soft': []}
     graph = None
+    if LEVIN:
+        G_ev, seen = gates_evaluated(False).item(), {}
     for i in range(0, ev.shape[0], 4):
         ids = ev[i:i + 4]
         lm = run(ids, 'M')
+        state['probe'] = {} if LEVIN else None
         lp = run(ids, 'hard'); r['kl'].append(kl_bits(lm, lp).mean().item())
         r['active'].append(torch.stack(state['hard']).sum(0).mean().item())
+        if LEVIN:
+            # Levin's cost per token, and each block's on-anywhere (for the pruning).
+            r.setdefault('log2_concepts', []).append(torch.log2(torch.stack(state['hard']).sum(0) + G_ev).mean().item())
+            for g_, R_ in state['probe'].values():
+                seen[id(R_)] = (R_, torch.maximum(seen[id(R_)][1], g_.amax((0, 1))) if id(R_) in seen else g_.amax((0, 1)))
+            state['probe'] = None
         r['per_map'].append([h.mean().item() for h in state['hard']])
         if EDGES:
             r['edges_on'].append(torch.stack(state['edges_hard']).sum(0).mean().item())
@@ -1576,12 +1660,14 @@ def evaluate(final=False):
     ind = torch.randint(0, T.wte.shape[0], (16, 100), generator=g_).to(dev).repeat(1, 2)
     install([None] * 16)
     lm = run(ind, 'M')
-    state['probe'] = {} if ROT and ROTA else None
+    state['probe'] = {} if (ROT and ROTA) or LEVIN else None
     lp = run(ind, 'hard')
     kl_t = kl_bits(lm, lp)
     loss = lambda lg: (-F.log_softmax(lg[:, 100:-1].float(), -1).gather(-1, ind[:, 101:, None]).mean() / math.log(2)).item()
     rows = []
     for key, (gates, R) in (state['probe'] or {}).items():
+        if LEVIN:
+            seen[id(R)] = (R, torch.maximum(seen[id(R)][1], gates.amax((0, 1))) if id(R) in seen else gates.amax((0, 1)))
         g1, g2 = gates[:, 1:100].mean((0, 1)), gates[:, 100:].mean((0, 1))                 # [ng, g] on-rates
         members = torch.zeros_like(g1).scatter_add_(1, R['L'].argmax(-1), torch.ones_like(g1)) if R is not None else g1 * 0
         for n_, j_ in zip(*torch.nonzero((g2 - g1) > 0.5, as_tuple=True)):
@@ -1591,6 +1677,18 @@ def evaluate(final=False):
     out['induction'] = {'kl_first': round(kl_t[:, 1:100].mean().item(), 3), 'kl_repeat': round(kl_t[:, 100:].mean().item(), 3),
                         'loss_repeat_M': round(loss(lm), 3), 'loss_repeat_P': round(loss(lp), 3),
                         'blocks_on_repeat_not_first': sorted(rows, key=lambda r: -(r['on_repeat'] - r['on_first']))[:40]}
+    if LEVIN:
+        # Levin's cost of the delivered program (KL + log2 of the concepts on plus the gates evaluated, per token);
+        # then the non-empty blocks never on in these hard passes (held-out text, the induction check) are pruned.
+        out['levin'] = out['kl'] + out['log2_concepts']
+        out['gates_evaluated'] = G_ev
+        cut_n = 0
+        for R_, anyon in seen.values():
+            cut = (anyon == 0) & (nonempty(R_) > 0) & (R_['keep'] > 0)
+            R_['keep'][cut] = 0.0; cut_n += int(cut.sum())
+        out['pruned_now'] = cut_n
+        out['pruned_total'] = int(sum(((R_['keep'] == 0) & (nonempty(R_) > 0)).sum() for R_ in ROT_ALL))
+        out['concepts_total'] = concepts_total()
     if ROT:
         run(ev[0:4], 'hard')
         ranks = torch.cat([torch.bincount(R['L'].argmax(-1).reshape(-1) + ROTG * torch.arange(R['ng'], device=dev).repeat_interleave(ROTG),
@@ -1680,6 +1778,8 @@ if ARM == 'rot':
             vb[n] = per.mean().item(); total += per.numel()
         counts = {**VPD_COUNTS, **(VPD_ATTN_COUNTS if attn else {})}
         K = K / sum(counts.values()) * sum(counts[n] * (vb[n] + math.log2(total)) for n in counts)
+        if LEVIN:
+            K = 4 * float(sys.argv[2])
     print('rot budget B', round(K), 'bits per token; VPD subcomponent bits', {n: round(v) for n, v in vb.items()}, flush=True)
     # Each block's noise scale (a tenth of the root mean square of its read with all on), then the thresholds set
     # in the gated run, layer by layer, so the start's expected bits per token are B (the layers' shares as VPD's
@@ -1748,10 +1848,14 @@ slots = [(P[n], w, rms(P[n][w])) for n in mlp for w in (('F',) if EXACT else ('V
 slots += [x for R in ROT_ALL for x in ((R, 'A', 1 / 3), (R, 'tau', 100 / 3 * R['s'].mean().item()), (R, 'L', 20 / 3))]
 slots += [x for P_ in GN.values() for x in ((P_, 'W1', rms(P_['W1'])), (P_, 'b1', 0.1), (P_, 'W2', 1 / math.sqrt(GATENET)))]
 if SCOREGATE:
-    # beta by its threshold's step in z (a tenth of the noise scale per step, against a standardized score).
+    # beta by its threshold's step in z (a tenth of the noise scale per step, against a standardized score). A rot
+    # attention block in a head's group reads that head's score; one in a group across heads reads every head's.
     for n in sliced:
         A[n]['beta'] = torch.zeros_like(A[n]['tau']).detach().requires_grad_()
     slots += [(A[n], 'beta', 100 / 3) for n in sliced]
+    for R in [R_[x] for R_ in ROTA.values() for x in ('q', 'k', 'ov')]:
+        R['beta'] = torch.zeros(R['ng'], R['g'], *(() if R['ng'] == NH else (NH,)), device=dev, requires_grad=True)
+        slots.append((R, 'beta', 100 / 3))
 slots += [(TRUNK, k, rms(TRUNK[k])) for k in TRUNK]
 slots += [(A[n], w, rms(A[n][w])) for n in sliced for w in (('V', 'U') if ATTN_FREE else ('F',)) if not GATES_ONLY] + [(A[n], 'tau', 100 / 3 * A[n]['s'].mean().item()) for n in sliced]
 for l, S in SHARE_A.items():
@@ -1903,20 +2007,23 @@ def save(step):
         torch.save({'step': step, 'start': start, 'arm': ARM, 'gate': gate,
                     'maps': {n: {k: P[n][k].detach().float().cpu() for k in ('V', 'U', 'tau', 's')} for n in mlp},
                     # The heads' slices (DESCENT_SITES=all): reads V [H, d_in_h, C], writes U [H, C, d_out_h].
-                    'attn': {n: {k: A[n][k].detach().float().cpu() for k in ('V', 'U', 'tau', 's')} for n in sliced},
+                    'attn': {n: {k: A[n][k].detach().float().cpu() for k in ('V', 'U', 'tau', 's', 'beta') if k in A[n]} for n in sliced},
                     'tied': {dn: (fc, own.cpu()) for dn, (fc, own) in GROUP.items()},
                     # rot: per layer the neuron order (groups of DESCENT_ROT consecutive), angles, assignments,
                     # thresholds, noise scales and the slices' log widths.
                     'rot': {l: {k: R[k].detach().float().cpu() if R[k].dtype.is_floating_point else R[k].cpu()
-                                for k in ('perm', 'A', 'L', 'tau', 's', 'ls_fc', 'ls_dn', 'Q0') if k in R} for l, R in ROT.items()},
-                    # Each group's basis: Q = Q0 (I + S)^-1 (I - S) for groups larger than 64 (Q0 the start's basis where
-                    # saved, else I), exp(S) otherwise, S the skew part of A's strict upper triangle; the guard reads
-                    # ln R against tau (log) or R (linear).
+                                for k in ('perm', 'A', 'L', 'tau', 's', 'ls_fc', 'ls_dn', 'Q0', 'keep') if k in R} for l, R in ROT.items()},
+                    # Each group's basis: Q = Q0 (I + S)^-1 (I - S) for groups larger than 64, Q0 exp(S) otherwise (Q0 the
+                    # start's basis where saved, else I), S the skew part of A's strict upper triangle; the guard reads
+                    # ln R against tau (log) or R (linear); the gate also adds beta . (the heads' standardized largest
+                    # attention logits) where beta is saved, and is off where keep is 0 (pruned).
                     'rot_basis': {'cayley_above': 64, 'guard': 'log' if LOGGATE else 'linear'},
+                    # The score gates' per-layer standardization of each head's largest attention logit (mean, std).
+                    'score_norm': {l: (m_.flatten().cpu(), s_.flatten().cpu()) for l, (m_, s_) in SCORE_NORM.items()},
                     # rot attention: per layer the OV groups' (consecutive value coordinates of the heads) angles,
                     # assignments, thresholds, noise scales and widths, and the QK planes' assignments, thresholds,
                     # noise scales and widths.
-                    'rota': {l: {x: {k: R[x][k].detach().float().cpu() for k in ('A', 'L', 'tau', 's', 'ls', 'ls_fc', 'ls_dn', 'Q0') if k in R[x]}
+                    'rota': {l: {x: {k: R[x][k].detach().float().cpu() for k in ('A', 'L', 'tau', 's', 'ls', 'ls_fc', 'ls_dn', 'Q0', 'keep', 'beta') if k in R[x]}
                                  for x in ('q', 'k', 'ov')} for l, R in ROTA.items()},
                     # The gate networks (per layer and part for rot, per map otherwise; W1, b1, W2) and their input:
                     # 'dense' (every layer's streams from the dense pass) or the layer's own stream; the trunk if any.
@@ -1976,9 +2083,16 @@ def pin_shift(ids, kinds):
 
 LOG_EVERY = max(1, 400_000 // (batch * seq))
 with open(out.replace('.json', '.tsv'), 'w') as f_:
-    f_.write('step\ttokens\ttrain_kl\ttrain_F\tbits_train_gates\tbits_hard\tlambda\n')
+    f_.write('step\ttokens\ttrain_kl\ttrain_F\tbits_train_gates\tbits_hard\t' + ('gates_evaluated' if LEVIN else 'lambda') + '\n')
+# DESCENT_FRESH=1 (default under LEVIN): the training sequences are the token file's rows in a fixed random order,
+# each used once (none repeated before the file's 134M tokens are used), the held-out rows 1024..1031 left out.
+FRESH = os.environ.get('DESCENT_FRESH', '1' if LEVIN else '0') == '1'
+if FRESH:
+    order = np.random.default_rng(1).permutation(tok.shape[0] - 8); order = np.where(order >= 1024, order + 8, order)
 for step in range(steps):
     rows = rng.integers(0, train_rows, batch); rows = np.where(rows >= 1024, rows + 8, rows); offs = rng.integers(0, 513 - seq, batch)
+    if FRESH:
+        rows = order[np.arange(step * batch, (step + 1) * batch) % len(order)]
     ids = torch.tensor(np.stack([tok[r, o:o + seq] for r, o in zip(rows, offs)]).astype(np.int64), device=dev)
     if REPEATS:
         rb = torch.arange(batch - REPEATS, batch, device=dev)                         # the batch's last (clean) sequences
@@ -2011,7 +2125,11 @@ for step in range(steps):
         # The per-token budget counts the edges on beside the parts on.
         ek = ek + torch.stack(state['edges_soft']).sum(0).mean()
         hk += torch.stack(state['edges_hard']).sum(0).mean().item()
-    if step == 0:
+    if LEVIN:
+        # Levin's cost on the clean tokens: log2 of the concepts on (expected gates) plus the gates evaluated.
+        G_t = gates_evaluated(True)
+        objective = objective + (torch.log2(torch.stack(state['soft']).sum(0) + G_t) * counted).sum() / counted.sum()
+    if step == 0 and not LEVIN:
         # lambda starts at the median over thresholds of the balance |dF/dtau| / |dE[k]/dtau|.
         taus = [mu for _, key, mu, _ in leaves if key == 'tau'] if FMODE else [cont[key] for cont, key, _ in slots if key == 'tau']
         gF = torch.autograd.grad(objective, taus, retain_graph=True, allow_unused=True)
@@ -2022,7 +2140,9 @@ for step in range(steps):
         for g_ in opt.param_groups:
             g_['lr'] = g_['lr0'] * (1 - 0.9 * step / max(1, steps - 1))
     opt.zero_grad(); (objective + lam * (ek - K)).backward(); opt.step()
-    if DUAL == 'pin':
+    if LEVIN:
+        lam = G_t.item()                                                           # logged in lambda's place
+    elif DUAL == 'pin':
         pin_shift(ids, kinds)
     elif DUAL == 'loghard':
         lam = lam * math.exp(min((delivered_bits(ids, kinds) - K) / K, 1.0) / B_H)
