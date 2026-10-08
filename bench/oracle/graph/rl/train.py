@@ -207,6 +207,10 @@ class Policy:
         if self.parts is not None:
             torch.save(self.parts.state_dict(), Path(path) / "part_tokens.pt")
 
+    @torch.no_grad()
+    def part_rows(self) -> tuple[int, torch.Tensor, torch.Tensor]:
+        return self.first_part, self.parts.input_rows().detach().to(torch.bfloat16), self.parts.output_rows().detach().to(torch.bfloat16)
+
     def materialize(self, out_dir: Path, base_name: str) -> Path:
         """A base checkpoint carrying the current part rows (vLLM samples from it)."""
         import part_vocab
@@ -342,6 +346,7 @@ class VllmSampler:
         self.share, self.args, self.rank = args.share_gpu, args, rank
         self.max_tokens, self.end = args.max_tokens, end
         self.policy = None  # with --share-gpu: the trainer, moved to the host while vLLM samples
+        self.rows = None  # with part tokens: () -> (first id, input rows, output rows), copied into vLLM before sampling
         self.start(args.base)
 
     def start(self, model: str):
@@ -352,6 +357,19 @@ class VllmSampler:
                        gpu_memory_utilization=a.gpu_memory, max_model_len=a.max_model_len, seed=a.seed, enable_sleep_mode=self.share)
         if self.share:
             self.llm.sleep(level=1)  # weights to host memory, KV cache freed: the trainer loads next
+
+    def push_rows(self):
+        """Copies the part tokens' current rows into vLLM's embedding and output layer in place (an in-process
+        engine, VLLM_ENABLE_V1_MULTIPROCESSING=0), so sampling uses this step's projections without
+        rewriting the checkpoint; the prefix cache is reset since prompts may hold part tokens."""
+        first, rows_in, rows_out = self.rows()
+
+        def put(model):
+            model.model.embed_tokens.weight.data[first : first + rows_in.shape[0]].copy_(rows_in)
+            model.lm_head.weight.data[first : first + rows_out.shape[0]].copy_(rows_out)
+
+        self.llm.apply_model(put)
+        self.llm.reset_prefix_cache()
 
     def reload(self, model: Path):
         """Restarts vLLM on a materialized checkpoint (part tokens' current rows)."""
@@ -375,6 +393,8 @@ class VllmSampler:
             self.policy.model.to("cpu")
             torch.cuda.empty_cache()
             self.llm.wake_up()
+        if self.rows is not None:
+            self.push_rows()
         params = SamplingParams(n=n, temperature=1.0, top_p=1.0, top_k=-1, max_tokens=self.max_tokens, stop_token_ids=[self.end], logprobs=0)
         try:
             outs = self.llm.generate([{"prompt_token_ids": p} for p in prompts], params, lora_request=LoRARequest(f"policy{version}", version + 1, str(adapter)), use_tqdm=False)
@@ -785,7 +805,7 @@ def main():
     ap.add_argument("--sampler", choices=["auto", "vllm", "hf"], default="auto")
     ap.add_argument("--resample", type=int, default=0, help="redraw each invalid program (mech.trace) up to R times at sampling time")
     ap.add_argument("--part-tokens", help="part tokens: g-predict's part_tokens.load(SPEC) module; its projections train with the LoRA and vLLM samples from a materialized checkpoint")
-    ap.add_argument("--materialize-every", type=int, default=0, help="GRPO/DPO/bestofn with --part-tokens: rewrite the checkpoint and restart vLLM every K steps (0: at the start only)")
+    ap.add_argument("--materialize-every", type=int, default=0, help="with --part-tokens: also rewrite the checkpoint and restart vLLM every K steps (0: only at the start; the rows are copied in place before every sampling call)")
     ap.add_argument("--share-gpu", action="store_true", help="one GPU for vLLM and the trainer: vLLM sleeps (weights to host) while training and the trainer moves to the host while sampling, so --gpu-memory can be 0.8")
     ap.add_argument("--execution-only", action="store_true", help="score without the reader term (required when GRAPH_READER is unset and the checker scores)")
     ap.add_argument("--hf-batch", type=int, default=16, help="sequences per transformers generate call (the Mac / CPU sampler)")
@@ -828,6 +848,8 @@ def main():
         scorer.WORKERS, scorer.EXPORT, scorer.MEMORY_GIB, scorer.VIEWS, scorer.DEVICE, scorer.BATCH, scorer.ITEMS_EVERY, scorer.ITEM_STRIDE = args.score_workers, args.export, args.checker_gib, views_of(args), args.checker_device, args.score_batch, args.reader_items, args.reader_item_stride
         print(json.dumps(rescore(args, SCORERS[args.scorer])))
         return
+    if args.part_tokens:  # in-process vLLM engine: part rows are copied into its weights before each sampling call
+        os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
     use_vllm = args.sampler == "vllm" or (args.sampler == "auto" and torch.cuda.is_available() and __import__("importlib").util.find_spec("vllm") is not None)
     sampler = None
     if use_vllm:  # vLLM first, on the first visible GPU, before the trainer touches CUDA
@@ -839,8 +861,9 @@ def main():
     pol = Policy(args, dev)
     if isinstance(sampler, VllmSampler):
         sampler.policy = pol
-        if pol.parts is not None:  # vLLM samples from a checkpoint carrying the part rows
+        if pol.parts is not None:  # vLLM samples from a checkpoint with the extended vocabulary, then gets the rows in place
             sampler.reload(pol.materialize(out / "vocab", args.base))
+            sampler.rows = pol.part_rows
     if sampler is None:
         sampler = HfSampler(pol, args.max_tokens, args.hf_batch)
     if args.resample:
@@ -865,7 +888,6 @@ def main():
     if args.mode == "sft":
         sft(args, pol, pool, optimizer, open(out / "train.jsonl", "a"))
         pol.save(adapter)
-        refresh_parts(pol, sampler, out, args)
         print(json.dumps(evaluate(sets, pol, sampler, score, args, adapter, 1, open(out / "eval.jsonl", "a"), args.sft_steps)))
         return
     log = open(out / "train.jsonl", "a")
