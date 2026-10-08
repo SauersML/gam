@@ -54,6 +54,7 @@ DIR/best.jsonl (bestofn: the kept programs), DIR/adapter (the policy).
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import random
@@ -396,6 +397,7 @@ class VllmSampler:
         self.policy = None  # with --share-gpu: the trainer, moved to the host while vLLM samples
         self.rows = None  # with part tokens: () -> (first id, input rows, output rows), copied into vLLM before sampling
         self.llm = None
+        self.held, self.ready = 0, False  # hold(): calls in a row share one wake (and one push of the rows)
         if model is not None:  # else started later (part tokens: from the extended-vocabulary checkpoint)
             self.start(model)
 
@@ -427,7 +429,7 @@ class VllmSampler:
 
         if self.llm is not None and self.share:
             raise RuntimeError("vLLM's sleep mode allows one engine per process: no restart with --share-gpu")
-        self.llm = None
+        self.llm, self.ready = None, False
         gc.collect()
         torch.cuda.empty_cache()
         if self.share and self.policy is not None:
@@ -437,24 +439,48 @@ class VllmSampler:
         if self.share and self.policy is not None:
             self.policy.model.to(self.policy.dev)
 
-    def __call__(self, prompts: list[list[int]], n: int, adapter: Path, version: int) -> list[list[list[int]]]:
-        from vllm import SamplingParams
-        from vllm.lora.request import LoRARequest
-
-        rows = self.rows() if self.rows is not None else None  # computed where the trainer's projections live, before it moves
-        if self.share:  # one GPU: the trainer's weights leave while vLLM wakes with its whole share
+    def acquire(self):
+        """Readies vLLM to sample: the part rows are computed where the trainer's projections live, then (one GPU)
+        the trainer's weights leave while vLLM wakes with its whole share, and the rows are copied in."""
+        rows = self.rows() if self.rows is not None else None
+        if self.share:
             self.policy.model.to("cpu")
             torch.cuda.empty_cache()
             self.llm.wake_up()
         if rows is not None:
             self.push_rows(rows)
+        self.ready = True
+
+    def release(self):
+        if self.ready and self.share:
+            self.llm.sleep(level=1)
+            self.policy.model.to(self.policy.dev)
+        self.ready = False
+
+    @contextlib.contextmanager
+    def hold(self):
+        """Sampling calls inside share one wake: vLLM stays awake and the trainer on the host between them (the
+        validity redraws; each wake and sleep moves the trainer's weights, 16 GB for Qwen3-8B, both ways)."""
+        self.held += 1
+        try:
+            yield
+        finally:
+            self.held -= 1
+            if not self.held:
+                self.release()
+
+    def __call__(self, prompts: list[list[int]], n: int, adapter: Path, version: int) -> list[list[list[int]]]:
+        from vllm import SamplingParams
+        from vllm.lora.request import LoRARequest
+
+        if not self.ready:
+            self.acquire()
         params = SamplingParams(n=n, temperature=1.0, top_p=1.0, top_k=-1, max_tokens=self.max_tokens, stop_token_ids=[self.end], logprobs=0)
         try:
             outs = self.llm.generate([{"prompt_token_ids": p} for p in prompts], params, lora_request=LoRARequest(f"policy{version}", version + 1, str(adapter)), use_tqdm=False)
         finally:
-            if self.share:
-                self.llm.sleep(level=1)
-                self.policy.model.to(self.policy.dev)
+            if not self.held:
+                self.release()
         try:  # the sampled tokens' log-probabilities, for the on-policy check only
             self.logprob_sums = [sum(d[t].logprob for d, t in zip(c.logprobs, c.token_ids)) for o in outs for c in o.outputs]
         except (TypeError, KeyError, AttributeError):  # a vLLM whose logprobs container differs
@@ -479,6 +505,10 @@ class ValidSampler:
             return list(ex.map(lambda c: bool(mech.trace(program_of(to_mech(self.tok.decode(c, skip_special_tokens=True))), self.model)["valid"]), completions))
 
     def __call__(self, prompts: list[list[int]], n: int, adapter: Path, version: int) -> list[list[list[int]]]:
+        with self.inner.hold() if hasattr(self.inner, "hold") else contextlib.nullcontext():
+            return self.draw(prompts, n, adapter, version)
+
+    def draw(self, prompts: list[list[int]], n: int, adapter: Path, version: int) -> list[list[list[int]]]:
         groups = self.inner(prompts, n, adapter, version)
         sums = list(self.inner.logprob_sums) if self.inner.logprob_sums is not None else None
         flags = [self.valid(g) for g in groups]

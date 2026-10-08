@@ -46,7 +46,8 @@ def main():
     check_sft_examples()
     check_rescore()
     check_valid_sampler()
-    print("ok: checker scorer order, behaviors and one batch per (behavior, seed); repair keeps a revision only when it lowers S; evaluation summary; SFT data uses each training behavior's best program only; rescore; validity redraws")
+    check_redraws_share_wake()
+    print("ok: checker scorer order, behaviors and one batch per (behavior, seed); repair keeps a revision only when it lowers S; evaluation summary; SFT data uses each training behavior's best program only; rescore; validity redraws (one vLLM wake per draw)")
 
 
 def check_repair():
@@ -176,6 +177,52 @@ def check_valid_sampler():
     out = vs([[0], [0]], 4, Path("."), 0)
     assert calls == [(2, 4), (4, 1)], calls  # 4 invalid slots redrawn once
     assert all(len(g) == 4 for g in out) and vs.stats == {"first_valid": 0.5, "final_valid": 1.0}, vs.stats
+
+
+def check_redraws_share_wake():
+    """With one GPU, the validity redraws run inside one vLLM wake: the trainer moves to the host and back once
+    per draw, not once per redraw round (a stand-in engine records the moves)."""
+    import train
+
+    events = []
+
+    class Engine:
+        def wake_up(self):
+            events.append("wake")
+
+        def sleep(self, level):
+            events.append("sleep")
+
+        def generate(self, prompts, params, lora_request=None, use_tqdm=False):
+            first = not any(e.startswith("generate") for e in events)
+            events.append(f"generate {len(prompts)}")
+            out = types.SimpleNamespace(token_ids=[1 if first else 0], logprobs=None)  # the first draw invalid, redraws valid
+            return [types.SimpleNamespace(outputs=[out] * params["n"]) for _ in prompts]
+
+    class Model:
+        def to(self, dev):
+            events.append(f"to {dev}")
+
+    fake = types.ModuleType("vllm")
+    fake.SamplingParams = lambda **k: k
+    request = types.ModuleType("vllm.lora.request")
+    request.LoRARequest = lambda *a: None
+    saved = {k: sys.modules.get(k) for k in ("vllm", "vllm.lora", "vllm.lora.request")}
+    sys.modules.update({"vllm": fake, "vllm.lora": types.ModuleType("vllm.lora"), "vllm.lora.request": request})
+    try:
+        inner = train.VllmSampler(types.SimpleNamespace(share_gpu=True, max_tokens=8), 4, 0)
+        inner.llm, inner.policy = Engine(), types.SimpleNamespace(model=Model(), dev="cuda:0")
+        good = "from mech import node, edges, PD, logits\nh = node(PD[1].down_proj[3])\nedges(h >> logits)\n"
+        tok = types.SimpleNamespace(decode=lambda c, skip_special_tokens=True: "nonsense(" if c[0] == 1 else good)
+        vs = train.ValidSampler(inner, tok, "vpd4l", 2)
+        vs([[0], [0]], 2, Path("."), 0)
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = v
+    assert events == ["to cpu", "wake", "generate 2", "generate 4", "sleep", "to cuda:0"], events
 
 
 if __name__ == "__main__":

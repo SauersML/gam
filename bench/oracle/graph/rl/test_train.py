@@ -221,6 +221,14 @@ def check_registry_parts(base: Path):
     groups = pol.param_groups(1e-4)  # the LoRA at lr, each projection at lr * rank / its feature width
     assert sorted(id(p) for g in groups for p in g["params"]) == sorted(id(p) for p in pol.params)
     assert groups[0]["lr"] == 1e-4 and sorted({round(g["lr"], 12) for g in groups[1:]}) == [round(1e-4 * 4 / 12, 12), round(1e-4 * 4 / 10, 12)]
+    with torch.no_grad():  # trained projections come back from a saved adapter (--init: the next round, or eval)
+        for p in pol.parts.parameters():
+            p.add_(0.01 * torch.randn(p.shape, generator=g))
+    with tempfile.TemporaryDirectory() as d:
+        pol.save(Path(d))
+        again = train.Policy(argparse.Namespace(base=str(base), init=d, lora_rank=4, part_tokens=str(path)), torch.device("cpu"))
+    (f0, i0, o0), (f1, i1, o1) = pol.part_rows(), again.part_rows()
+    assert f0 == f1 and torch.equal(i0, i1) and torch.equal(o0, o1)
 
 
 def check_init_adapter(base: Path):
