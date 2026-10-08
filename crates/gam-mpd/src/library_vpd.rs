@@ -133,6 +133,20 @@ struct Component {
     /// during the fit (gate sharing, `library_mdl::Share`); empty keeps it on its own gate.
     #[serde(default)]
     candidates: Vec<usize>,
+    /// Beside its own read, its head's largest attention score ([`ScoreRead`]).
+    #[serde(default)]
+    score: Option<ScoreRead>,
+}
+
+/// A component's read of a head's largest pre-softmax score at the token (`Node::MaxScore`, with
+/// every q and k slice on, so `M`'s), beside its own read: its gate is
+/// `ln ‖V_bᵀx‖ + w s_h(t) − ln τ_b`, its own weight `w` and threshold, at the attention's input
+/// (a score gate: what a residual read cannot see, a repeat at an induction position, the head's
+/// score shows).
+#[derive(Clone, Debug, Deserialize)]
+struct ScoreRead {
+    head: usize,
+    weight: f64,
 }
 
 #[derive(Deserialize)]
@@ -512,13 +526,25 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
         // `detectors`: the stage's detectors, where its gates read them (`Read::Detectors`): the
         // gates' direction rows are the combinations over the detectors and the detectors'
         // operators follow the stage's others.
-        let gate_ops = |prefix: &str, comps: &[usize], cols: &Interface, share: bool, detectors: Option<&DetectorSet>| -> Result<Vec<Operator>, String> {
+        // `heads`: a score stage's heads (`ScoreRead`): its gate rows read its own groups' log norms
+        // and every head's largest score (`score_features`), each row its own column and its head's.
+        let gate_ops = |prefix: &str, comps: &[usize], cols: &Interface, share: bool, detectors: Option<&DetectorSet>, heads: Option<usize>| -> Result<Vec<Operator>, String> {
             let count = comps.len();
             let direction = direction_of(comps)?;
             // A stage with logit reads gates on squared reads (`Read::Logits`).
             let squared = logits_of(comps);
             let mut ops = Vec::new();
             match direction {
+                false if heads.is_some() => {
+                    let h = heads.unwrap_or(0);
+                    let g = Array2::from_shape_fn((count, count + h), |(b, j)| match &components[comps[b]].score {
+                        _ if j == b => 1.0,
+                        Some(ScoreRead { head, weight }) if j == count + head => *weight,
+                        _ => 0.0,
+                    });
+                    ops.push(dense(&format!("{prefix}.direction"), units(count)?, score_features(count, h)?, g)?);
+                    ops.push(dense(&format!("{prefix}.threshold"), units(count)?, Interface::constant(), Array2::from_shape_fn((count, 1), |(b, _)| log_threshold(components[comps[b]].tau)))?);
+                }
                 false if share => {
                     // Shared own gates read the squared norm of their components' reads: gate m's
                     // pre-activation Σ_b A_mb ‖V_bᵀx‖² − τ_m|τ_m|, which at a 0/1 assignment is on
@@ -569,6 +595,9 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
             ops.push(dense(&format!("{prefix}.width"), units(count)?, Interface::constant(), Array2::from_shape_fn((count, 1), |(b, _)| width(b)))?);
             if share && direction {
                 ops.push(dense(&format!("{prefix}.assign"), units(count)?, units(count)?, Array2::eye(count))?);
+            }
+            if let Some(h) = heads {
+                ops.push(Operator::identity(format!("{prefix}.score_heads"), score_heads(h)?));
             }
             if let Some(set) = detectors {
                 let (k, d) = (set.directions.len(), cols.width());
@@ -676,6 +705,13 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
         // head's logits, so the first head's rule makes every head's q and k writes and the
         // spread's constants, and every rule reads them. Per stacked row whether a logit read's.
         let a_logits = logits_of(&a_comps);
+        // A score stage (`ScoreRead`): own reads, unshared, uncarried, beside no logit read.
+        let a_scored = a_comps.iter().any(|&b| components[b].score.is_some());
+        if a_scored
+            && (a_logits || a_carried > 0 || attn_shared || direction_of(&a_comps)? || a_comps.iter().any(|&b| components[b].score.as_ref().is_some_and(|r| r.head >= layer.reads.len())))
+        {
+            return Err(error(format!("layer {l}: score reads gate unshared own-read components at the attention's input, with no carried component, logit read or head past {}", layer.reads.len())));
+        }
         if a_logits && (a_carried > 0 || a_comps.iter().any(|&b| !slices_on(b, site(Kind::Output)).is_empty())) {
             return Err(error(format!("layer {l}: a logit-read stage with carried components or o slices")));
         }
@@ -694,7 +730,7 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
                 for (row, slice) in read_rows.iter().enumerate() {
                     held.entry(*slice).or_default().push((format!("{name}.attn.read"), Held::Read { row }));
                 }
-                let mut gates = gate_ops(&format!("{name}.attn"), &a_comps, &x_interface, attn_shared, detector_set(l, 0))?;
+                let mut gates = gate_ops(&format!("{name}.attn"), &a_comps, &x_interface, attn_shared, detector_set(l, 0), a_scored.then_some(layer.reads.len()))?;
                 operators.append(&mut gates);
                 for (s, picked) in &selections {
                     if !picked.is_empty() {
@@ -705,7 +741,7 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
                     let groups = a_carried + a_comps.len();
                     operators.push(dense(&format!("{name}.attn.select_own"), units(a_comps.len())?, units(groups)?, selection(&(a_carried..groups).collect::<Vec<_>>(), groups))?);
                 }
-                if a_logits {
+                if a_logits || a_scored {
                     for (h2, &read2) in layer.reads.iter().enumerate() {
                         let Node::Attend { query: q2, key: k2, scale: c2, rotary: r2, causal: m2, .. } = native.nodes[read2].clone() else {
                             return Err(error(format!("layer {l} head {h2}: the read is not an attention node")));
@@ -724,12 +760,14 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
                             operators.push(dense(&w_name, rows, units(picked.len())?, u)?);
                         }
                     }
+                }
+                if a_logits {
                     let u = |r: usize, c: usize| factors[q].u[[read_rows[r].1, c]];
                     operators.append(&mut spread_ops(&format!("{name}.attn"), (&head_rows(key)?, layer.reads.len()), (rotary, scale.value()), (&stacked, &widths, &logit_rows), &u)?);
                 }
                 (base, base + 1, base + 2, base + 3)
             } else {
-                let gate_names = match (a_direction, attn_shared) {
+                let gate_names = match (a_direction || a_scored, attn_shared) {
                     (true, _) => ("direction", "threshold"),
                     (false, true) => ("assign", "threshold"),
                     (false, false) => ("gate_identity", "threshold"),
@@ -770,6 +808,16 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
                 let w = nodes.len() - 1;
                 nodes.push(Node::Gated { value: a, gate: z, scale: Some(w) });
                 (Some(nodes.len() - 1), z, w)
+            } else if a_scored {
+                let writes: Vec<(usize, usize)> = (0..layer.reads.len())
+                    .map(|h2| Ok((find(&artifact, &operators, &format!("{name}.h{h2}.q"))?, find(&artifact, &operators, &format!("{name}.h{h2}.k"))?)))
+                    .collect::<Result<_, String>>()?;
+                let part = |p: &str| find(&artifact, &operators, &format!("{name}.attn.{p}"));
+                let (a, z) = score_gate_nodes(&mut nodes, (0, read_op, part("select0")?, part("select1")?, part("score_heads")?), &writes, (scale, rotary, causal, widths.len()), (gate_a, gate_b));
+                nodes.push(Node::Constant { operator: soft });
+                let w = nodes.len() - 1;
+                nodes.push(Node::Gated { value: a, gate: z, scale: Some(w) });
+                (Some(nodes.len() - 1), z, w)
             } else {
                 stage_nodes(&mut nodes, 0, (read_op, gate_a, gate_b, soft), assign, a_direction, own, Some(parts), widths.len(), detector_ops(&artifact, &operators, base, &format!("{name}.attn")))
             };
@@ -786,7 +834,7 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
                 } else {
                     shared(&artifact, &format!("select{}", s % KINDS.len()))?
                 };
-                let write = if a_logits && j < 2 {
+                let write = if (a_logits || a_scored) && j < 2 {
                     find(&artifact, &operators, &w_name)?
                 } else {
                     let u = Array2::from_shape_fn((rows.width(), picked.len()), |(r, c)| factors[*s].u[[read_rows[picked[c]].1, h * hd + r]]);
@@ -846,7 +894,7 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
             let (mut gate_parts, mut soft_parts) = cross_parts(&artifact, &mut nodes, (&mut operators, base), &format!("{name}.o"), &o_cross, &inputs)?;
             let carried: Vec<usize> = o_carriers[o_carried..].iter().filter(|b| a_comps.contains(b)).map(|b| a_comps.iter().position(|a| a == b).unwrap_or(0)).collect();
             if !carried.is_empty() {
-                let gate_names = match (a_direction, attn_shared) {
+                let gate_names = match (a_direction || a_scored, attn_shared) {
                     (true, _) => ("direction", "threshold"),
                     (false, true) => ("assign", "threshold"),
                     (false, false) => ("gate_identity", "threshold"),
@@ -859,7 +907,18 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
                 );
                 let assign = if attn_shared { Some(index_of(&artifact.program, &format!("{name}.attn.assign"))?) } else { None };
                 let own = if a_own { Some(index_of(&artifact.program, &format!("{name}.attn.select_own"))?) } else { None };
-                let (_, z, s) = stage_nodes(&mut nodes, heads, stage_ops, assign, a_direction, own, None, widths.len(), detector_ops(&artifact, &[], 0, &format!("{name}.attn")));
+                let (_, z, s) = if a_scored {
+                    let named = |p: &str| index_of(&artifact.program, &format!("{name}.{p}"));
+                    let writes: Vec<(usize, usize)> = (0..heads).map(|h2| Ok((named(&format!("h{h2}.q"))?, named(&format!("h{h2}.k"))?))).collect::<Result<_, String>>()?;
+                    let Node::Attend { scale, rotary, causal, .. } = native.nodes[layer.reads[0]].clone() else {
+                        return Err(error(format!("layer {l}: a head read is not an attention node")));
+                    };
+                    let (_, z) = score_gate_nodes(&mut nodes, (heads, stage_ops.0, named("attn.select0")?, named("attn.select1")?, named("attn.score_heads")?), &writes, (scale, rotary, causal, widths.len()), (stage_ops.1, stage_ops.2));
+                    nodes.push(Node::Constant { operator: stage_ops.3 });
+                    (None, z, nodes.len() - 1)
+                } else {
+                    stage_nodes(&mut nodes, heads, stage_ops, assign, a_direction, own, None, widths.len(), detector_ops(&artifact, &[], 0, &format!("{name}.attn")))
+                };
                 operators.push(dense(&format!("{name}.o.select_gate"), units(carried.len())?, units(a_comps.len())?, selection(&carried, a_comps.len()))?);
                 nodes.push(Node::Affine { terms: vec![(z, base + operators.len() - 1)], bias: None });
                 gate_parts.push(nodes.len() - 1);
@@ -874,7 +933,7 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
                 if is_shared(&o_own) {
                     return Err(error(format!("layer {l}: gate sharing at the o stage is not built (only at the attention's and the MLP's inputs)")));
                 }
-                let mut gates = gate_ops(&format!("{name}.o"), &o_own, &concat, false, None)?;
+                let mut gates = gate_ops(&format!("{name}.o"), &o_own, &concat, false, None, None)?;
                 let first = base + operators.len();
                 operators.append(&mut gates);
                 if o_direction {
@@ -952,7 +1011,7 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
             dense(&format!("{name}.mlp.dn_read"), dn_stacked.clone(), up_rows.clone(), Array2::from_shape_fn((dn_rows.len(), hidden), |(r, j)| factors[dn].v[[j, dn_rows[r]]]))?,
             dense(&format!("{name}.mlp.dn_write"), out_rows.clone(), dn_stacked.clone(), Array2::from_shape_fn((out_rows.width(), dn_rows.len()), |(r, c)| factors[dn].u[[dn_rows[c], r]]))?,
         ];
-        let mut gates = gate_ops(&format!("{name}.mlp.fc"), &f_comps, &h2_interface, is_shared(&f_comps), detector_set(l, 2))?;
+        let mut gates = gate_ops(&format!("{name}.mlp.fc"), &f_comps, &h2_interface, is_shared(&f_comps), detector_set(l, 2), None)?;
         operators.append(&mut gates);
         let mut inputs = vec![h2];
         inputs.extend(extra_inputs(&f_cross, &inputs));
@@ -1036,7 +1095,7 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
             // (cross-stage sharing: parts spanning the read and the write maps, as descent's share
             // arm, d6ad2537cb); their own gates stay unshared among themselves.
             let follows = is_shared(&d_own);
-            let mut gates = gate_ops(&format!("{name}.mlp.dn"), &d_own, &up_rows, false, None)?;
+            let mut gates = gate_ops(&format!("{name}.mlp.dn"), &d_own, &up_rows, false, None, None)?;
             let first = base + operators.len();
             operators.append(&mut gates);
             if d_direction {
@@ -1168,24 +1227,25 @@ fn groups_of(artifact: Artifact, layers: &[LayerNodes], gate: Gate) -> Result<Ex
         trainable.push(g);
         let (rows, cols) = (program.operators[g].rows.width(), program.operators[g].cols.width());
         let detectors = named(&format!("{prefix}.detectors")).ok();
+        let sparse = detectors.is_some() || named(&format!("{prefix}.score_heads")).is_ok();
         let values = program.operators[g].matrix();
         let mut off = Vec::new();
         for b in 0..rows {
-            let cells = match detectors {
-                Some(_) => {
+            let cells = match sparse {
+                true => {
                     off.extend((0..cols).filter(|j| values[[b, *j]] == 0.0).map(|j| Cells { operator: g, rows: vec![b], cols: j..j + 1 }));
                     (0..cols).filter(|j| values[[b, *j]] != 0.0).map(|j| Cells { operator: g, rows: vec![b], cols: j..j + 1 }).collect()
                 }
-                None => vec![Cells { operator: g, rows: vec![b], cols: 0..cols }],
+                false => vec![Cells { operator: g, rows: vec![b], cols: 0..cols }],
             };
             groups.push(Group { name: format!("{prefix}.g{b}"), cells });
             into.push(groups.len() - 1);
         }
+        if !off.is_empty() {
+            groups.push(Group { name: format!("{prefix}.off"), cells: off });
+            removed.push(groups.len() - 1);
+        }
         if let Some(d) = detectors {
-            if !off.is_empty() {
-                groups.push(Group { name: format!("{prefix}.off"), cells: off });
-                removed.push(groups.len() - 1);
-            }
             trainable.push(d);
             for j in 0..program.operators[d].rows.width() {
                 groups.push(Group { name: format!("{prefix}.det{j}"), cells: vec![Cells { operator: d, rows: vec![j], cols: 0..program.operators[d].cols.width() }] });
@@ -1446,6 +1506,43 @@ fn concat_interface(parts: &[Interface]) -> Result<Interface, String> {
     Interface::new(parts.iter().flat_map(|p| p.groups().to_vec()).collect()).map_err(error)
 }
 
+/// A score stage's heads' largest scores, one column each (`Node::MaxScore`, concatenated).
+fn score_heads(heads: usize) -> Result<Interface, String> {
+    concat_interface(&vec![units(1)?; heads])
+}
+
+/// A score stage's gate features: its `count` groups' log norms, then its heads' largest scores.
+fn score_features(count: usize, heads: usize) -> Result<Interface, String> {
+    concat_interface(&[units(count)?, score_heads(heads)?])
+}
+
+/// A score stage's gate pre-activations (`ScoreRead`) from its input `x`: its stacked reads
+/// (`read`), their `groups` group norms' logs and, per head (its q and k writes in `writes`, through
+/// the selections `select_q` and `select_k`), the largest score of its query over its keys with
+/// every q and k slice on (`Node::MaxScore`; `score_heads` the identity marking the stage), through
+/// the gate rows `gate` and the thresholds `threshold`; returns (the stacked reads, the gate node).
+fn score_gate_nodes(nodes: &mut Vec<Node>, (x, read, select_q, select_k, score_heads): (usize, usize, usize, usize, usize), writes: &[(usize, usize)], (scale, rotary, causal, groups): (Scale, Option<Rotary>, bool, usize), (gate, threshold): (usize, usize)) -> (usize, usize) {
+    let push = |nodes: &mut Vec<Node>, node: Node| {
+        nodes.push(node);
+        nodes.len() - 1
+    };
+    let a = push(nodes, Node::Affine { terms: vec![(x, read)], bias: None });
+    let norms = push(nodes, Node::GroupNorm { input: a });
+    let logs = push(nodes, Node::Pointwise { input: norms, laws: vec![Law::Log; groups] });
+    let sq = push(nodes, Node::Affine { terms: vec![(a, select_q)], bias: None });
+    let sk = push(nodes, Node::Affine { terms: vec![(a, select_k)], bias: None });
+    let mut scores = Vec::with_capacity(writes.len());
+    for &(wq, wk) in writes {
+        let qh = push(nodes, Node::Affine { terms: vec![(sq, wq)], bias: None });
+        let kh = push(nodes, Node::Affine { terms: vec![(sk, wk)], bias: None });
+        scores.push(push(nodes, Node::MaxScore { query: qh, key: kh, scale, rotary, causal }));
+    }
+    let joined = push(nodes, Node::Concat { parts: scores });
+    let marked = push(nodes, Node::Affine { terms: vec![(joined, score_heads)], bias: None });
+    let features = push(nodes, Node::Concat { parts: vec![logs, marked] });
+    (a, push(nodes, Node::Affine { terms: vec![(features, gate)], bias: Some(threshold) }))
+}
+
 /// A logit-read stage's constants ([`Read::Logits`], [`logit_nodes`]), named `{prefix}.spread.*`,
 /// for `heads` heads of key rows `key` (a head's width `d_h`), with the attention's rotation and
 /// scale `c`, over the stage's stacked read rows `stacked` (components of `widths`, `logit` the
@@ -1699,8 +1796,8 @@ fn set_gate(part: &mut Dumped, read: String, (on, tau, g): StageGate) {
 pub fn dump_parts(native: &OperatorProgram, layers: &[LayerNodes], artifact: &Artifact, start: &Path, arm: &str, inputs: &FamilyInputs, dir: &Path) -> Result<usize, String> {
     let records: Vec<ArmRecord> = serde_json::from_slice(&std::fs::read(start).map_err(|e| error(format!("{}: {e}", start.display())))?).map_err(error)?;
     let components = records.into_iter().find(|r| r.arm == arm).ok_or_else(|| error(format!("{}: no arm {arm}", start.display())))?.components;
-    if components.iter().any(|c| matches!(c.read, Read::Active { .. } | Read::Logits { .. } | Read::Detectors { .. })) {
-        return Err(error("dump_parts: all-on activation, logit and detector reads are not dumped"));
+    if components.iter().any(|c| matches!(c.read, Read::Active { .. } | Read::Logits { .. } | Read::Detectors { .. }) || c.score.is_some()) {
+        return Err(error("dump_parts: all-on activation, logit, detector and score reads are not dumped"));
     }
     let read_site = |c: &Component| match &c.read {
         Read::Own([site, _]) => *site,
@@ -2223,6 +2320,94 @@ mod tests {
         assert!(own > 1e-3 && (own - detected).abs() <= 1e-9 * own, "detector gates {detected} bits against own gates {own}");
         let mixed = super::explanation(&native, &layers, &factors, &start, "mixed");
         assert!(mixed.as_ref().is_err_and(|e| e.contains("gates one way")), "a stage with both kinds of read is refused: {:?}", mixed.err());
+        std::fs::remove_dir_all(&factors).expect("the factors are removed");
+    }
+
+    /// Score gates (`ScoreRead`): q slices in threes on their own reads beside their head's largest
+    /// score, each k slice and the v slices on their own reads, then the o slices and the MLP's.
+    /// With every gate open the explanation is `M` (under 1e-5 bits); each q component's gate
+    /// pre-activation equals its definition from `M`'s maps, `ln ‖V_bᵀx_t‖ + w max_{u ≤ t} c ⟨q̃_t, k̃_u⟩
+    /// − ln τ_b` (its head's queries and keys turned to their positions), within 1e-8, and the
+    /// scores move the gates (two tokens of a component differ in their score term).
+    #[test]
+    fn score_reads_gate_on_their_heads_largest_scores() {
+        use crate::operator_program::Node;
+        let tag = "library_vpd_scores";
+        let dir = crate::test_support::tiny_export(tag, 2);
+        let factors = std::env::temp_dir().join(format!("gam_mpd_{tag}_factors_{}", std::process::id()));
+        let frames = exact_frames(&dir, &factors, 11);
+        let imported = import_language_model(&dir, 6, 12).expect("the tiny export imports");
+        std::fs::remove_dir_all(dir).expect("the tiny export is removed");
+        let native = split_sites(&imported.program).expect("the native sites");
+        let layers = layer_nodes(&native, 2).expect("the layers");
+        let count = |site: usize| frames[site].0.ncols();
+        let weight = 0.5;
+        let mut components = Vec::new();
+        for l in 0..2 {
+            let heads = layers[l].reads.len();
+            let (q, k, v, o, fc, dn) = (6 * l, 6 * l + 1, 6 * l + 2, 6 * l + 3, 6 * l + 4, 6 * l + 5);
+            for (n, i) in (0..count(q)).step_by(3).enumerate() {
+                let slices: Vec<[usize; 2]> = (i..(i + 3).min(count(q))).map(|j| [q, j]).collect();
+                components.push(serde_json::json!({"read": {"own": [q, i]}, "tau": -1.0, "slices": slices, "score": {"head": n % heads, "weight": weight}}));
+            }
+            components.extend((0..count(k)).map(|i| serde_json::json!({"read": {"own": [k, i]}, "tau": -1.0, "slices": [[k, i]]})));
+            components.push(serde_json::json!({"read": {"own": [v, 0]}, "tau": -1.0, "slices": (0..count(v)).map(|i| [v, i]).collect::<Vec<_>>()}));
+            components.extend((0..count(o)).map(|i| serde_json::json!({"read": {"own": [o, i]}, "tau": -1.0, "slices": [[o, i]]})));
+            components.extend((0..count(fc)).map(|i| serde_json::json!({"read": {"own": [fc, i]}, "tau": -1.0, "slices": [[fc, i], [dn, i]]})));
+            components.extend((count(fc)..count(dn)).map(|i| serde_json::json!({"read": {"own": [dn, i]}, "tau": -1.0, "slices": [[dn, i]]})));
+        }
+        let start = factors.join("start.json");
+        std::fs::write(&start, serde_json::json!([{"arm": "scores", "components": components}]).to_string()).expect("the start");
+        let explanation = super::explanation(&native, &layers, &factors, &start, "scores").expect("the explanation");
+        let SlotValues::Tokens(tokens) = &imported.family.slots[0] else { panic!("a token slot") };
+        let sequences: Vec<Vec<u32>> = tokens.chunks(12).map(<[u32]>::to_vec).collect();
+        let batch = Batch::new(sequences[..3].to_vec(), sequences[3..6].to_vec()).expect("the batch");
+        let device = Device::host();
+        let clean: Vec<Experiment> = (0..3).map(|base| Experiment { base, source: base, explained: vec![true; 4], patch: None, position: 0 }).collect();
+        let blocks: Vec<_> = explanation.layers.iter().map(|l| l.sites.clone()).collect();
+        let bits: f64 = Interchange::new(&device, &native, &blocks, &explanation.artifact, &explanation.trainable, Vec::new(), 1 << 30, 64).expect("the experiments").evaluate(&batch, &clean, false).expect("evaluate").bits.iter().flatten().sum();
+        assert!(bits.abs() < 1e-5, "every gate open: KL(M ‖ P) = {bits} bits");
+        let (flat, _, reads) = crate::interchange::sites(&explanation.artifact, &layers).expect("the flat program");
+        let trace = flat.execute(&imported.family, false).expect("the trace");
+        let layout = imported.family.layout.as_ref().expect("a layout");
+        for l in 0..2 {
+            let threshold = super::index_of(&flat, &format!("library.l{l}.attn.threshold")).expect("the thresholds");
+            let gate = flat.nodes.iter().position(|n| matches!(n, Node::Affine { terms, bias: Some(b) } if *b == threshold && terms.len() == 1)).expect("the gate node");
+            let x = &trace.values[reads[2 * l]];
+            let op = |name: &str| super::index_of(&native, name).map(|i| native.operators[i].matrix()).expect("a map");
+            let Node::Attend { scale, rotary, .. } = native.nodes[layers[l].reads[0]].clone() else { panic!("an attend node") };
+            let c = scale.value();
+            let heads = layers[l].reads.len();
+            let turned = |v: Vec<f64>, p: u32| {
+                let mut v = v;
+                if let Some(r) = rotary {
+                    r.rotate(&mut v, None, p);
+                }
+                Array1::from(v)
+            };
+            let rows = x.nrows();
+            let largest = Array2::from_shape_fn((rows, heads), |(t, h)| {
+                let (qm, km) = (x.dot(&op(&format!("blocks.{l}.q{h}")).t()), x.dot(&op(&format!("blocks.{l}.k{h}")).t()));
+                let qt = turned(qm.row(t).to_vec(), layout.position[t]);
+                (0..rows)
+                    .filter(|&u| layout.sequence[u] == layout.sequence[t] && layout.position[u] <= layout.position[t])
+                    .map(|u| c * qt.dot(&turned(km.row(u).to_vec(), layout.position[u])))
+                    .fold(f64::NEG_INFINITY, f64::max)
+            });
+            let q = 6 * l;
+            let z = &trace.values[gate];
+            let mut moved = false;
+            for (n, i) in (0..count(q)).step_by(3).enumerate() {
+                let h = n % heads;
+                for t in 0..rows {
+                    let norm = (i..(i + 3).min(count(q))).map(|j| x.row(t).dot(&frames[q].0.column(j)).powi(2)).sum::<f64>().sqrt();
+                    let want = norm.max(gam_gpu::tensor::LOG_FLOOR).ln() + weight * largest[[t, h]] + super::log_threshold(-1.0);
+                    assert!((z[[t, n]] - want).abs() <= 1e-8 * want.abs().max(1.0), "layer {l} component {n} token {t}: {} against {want}", z[[t, n]]);
+                }
+                moved |= (largest[[0, h]] - largest[[rows - 1, h]]).abs() > 1e-6;
+            }
+            assert!(moved, "layer {l}: the scores move the gates");
+        }
         std::fs::remove_dir_all(&factors).expect("the factors are removed");
     }
 

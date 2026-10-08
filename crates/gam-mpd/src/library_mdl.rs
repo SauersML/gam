@@ -2369,9 +2369,12 @@ struct GatedStage {
     /// row) ([`GatedStage::account`]).
     groups: Vec<Vec<usize>>,
     /// A detector stage's detectors, evaluated on every token, and per component the detectors its
-    /// gate reads (`library_vpd`'s `Read::Detectors`; none elsewhere, [`GatedStage::account`]).
+    /// gate reads (`library_vpd`'s `Read::Detectors`; none elsewhere, [`GatedStage::account`]); a
+    /// score stage's heads, whose largest scores its gates read (`library_vpd`'s score reads), each
+    /// one concept per token.
     detectors: f64,
     gate_reads: Vec<f64>,
+    score_heads: f64,
     /// The stage's operators' prefix (`library.l{l}.attn`, `.o`, `.mlp.fc`, `.mlp.dn`).
     prefix: String,
     /// The node holding each component's gate pre-activation: the gate node, or in a shared
@@ -2443,7 +2446,7 @@ impl GatedStage {
                 None => gate,
             };
             let width = index_of(flat, &format!("{prefix}.width"))?;
-            stages.push(Self { input, threshold, direction, slices, groups: Vec::new(), detectors: 0.0, gate_reads: Vec::new(), prefix: prefix.to_string(), component_gate, assign, width });
+            stages.push(Self { input, threshold, direction, slices, groups: Vec::new(), detectors: 0.0, gate_reads: Vec::new(), score_heads: operator_named(flat, &format!("{prefix}.score_heads")).map_or(0.0, |op| flat.operators[op].rows.width() as f64), prefix: prefix.to_string(), component_gate, assign, width });
             Ok(())
         };
         // A stage's read holds the components carried in from other blocks first
@@ -3475,6 +3478,7 @@ fn count_terms(
                 // the detectors it reads; in a shared stage each gate in use once (its components'
                 // assignment, as the delivered program holds it).
                 always += stage.detectors
+                    + stage.score_heads
                     + match stage.assign {
                         Some(op) => {
                             let a = scorer.assignments.iter().find(|a| a.operator == op).ok_or("a shared stage without its assignment")?.values(Relaxation::Hard);
