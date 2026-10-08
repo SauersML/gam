@@ -76,6 +76,7 @@ def test_tokenizer_ids_are_contiguous():
     ids = tok("scale(<p:2.h.6>, 0)", add_special_tokens=False)["input_ids"]
     assert base + reg.index["L[2].head[6]"] in ids
     assert tok.decode([base + reg.index["PD.vpd[2].v_proj[559]"]]) == "<p:2.v.559>"
+    assert "<p:2.h.6>" in tok.decode(ids, skip_special_tokens=True)  # survives the decoding the loops use
 
 
 def test_sites_and_two_level_choice():

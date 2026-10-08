@@ -219,8 +219,9 @@ class PartTokens(nn.Module):
         return torch.cat([base.float(), h.float() @ self.rows("out").T.float()], dim=-1)
 
     def add_to_tokenizer(self, tok):
-        """Adds the part tokens in registry order; their ids are base_vocab + registry index."""
-        added = tok.add_tokens(self.reg.tokens, special_tokens=True)
+        """Adds the part tokens in registry order; their ids are base_vocab + registry index. Ordinary added
+        tokens, not special ones: decoding with skip_special_tokens must keep them (rl/train.py does the same)."""
+        added = tok.add_tokens(self.reg.tokens, special_tokens=False)
         ids = tok.convert_tokens_to_ids(self.reg.tokens)
         if ids != list(range(self.base_vocab, self.base_vocab + len(self.reg.tokens))):
             raise ValueError(f"part token ids are not contiguous from {self.base_vocab} ({added} added)")
