@@ -815,11 +815,29 @@ def rescore(args, score) -> dict:
     return summary
 
 
+VOCAB_DIR = None
+
+
+def vocab_dir() -> Path:
+    """The extended-vocabulary checkpoint's directory: one temporary directory per process, removed at exit.
+    Under --out, a Qwen3-8B checkpoint (17 GB) was copied back from the pod with the outputs, and the next
+    process's second copy filled the pod's disk."""
+    global VOCAB_DIR
+    if VOCAB_DIR is None:
+        import atexit
+        import shutil
+        import tempfile
+
+        VOCAB_DIR = Path(tempfile.mkdtemp(prefix="rl-vocab-"))
+        atexit.register(shutil.rmtree, VOCAB_DIR, True)
+    return VOCAB_DIR
+
+
 def refresh_parts(pol, sampler, out: Path, args):
     """With part tokens and vLLM: rewrite the checkpoint with the current part rows and restart vLLM on it."""
     inner = sampler.inner if isinstance(sampler, ValidSampler) else sampler
     if pol.parts is not None and isinstance(inner, VllmSampler):
-        inner.reload(pol.materialize(out / "vocab", args.base))
+        inner.reload(pol.materialize(vocab_dir(), args.base))
 
 
 def views_of(args) -> dict | None:
@@ -920,7 +938,7 @@ def main():
     if isinstance(sampler, VllmSampler):
         sampler.policy = pol
         if pol.parts is not None:  # vLLM starts once, on a checkpoint with the extended vocabulary; the rows then come in place
-            sampler.reload(pol.materialize(out / "vocab", args.base))
+            sampler.reload(pol.materialize(vocab_dir(), args.base))
             sampler.rows = pol.part_rows
     if sampler is None:
         sampler = HfSampler(pol, args.max_tokens, args.hf_batch)
