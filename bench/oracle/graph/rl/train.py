@@ -85,7 +85,8 @@ from scorer import SCORERS  # noqa: E402
 
 BEHAVIORS = Path.home() / "mpd-data/graph_oracle/behaviors"
 SEARCH = Path.home() / "mpd-data/graph_oracle/runs/search"
-TEACHER: dict[str, str] = {}  # --teacher's answers by behavior id (teacher_answers)
+TEACHER: dict[str, str] = {}  # --teacher's answers by behavior id (teacher_answers): training behaviors
+HELDOUT_TEACHER: dict[str, str] = {}  # --teacher-heldout's: evaluation baselines only, never SFT or RL
 
 
 def item(answer: str, behavior: dict, seed: int, uniform_seeds: int, experiments: int) -> dict:
@@ -160,8 +161,8 @@ def baselines(b: dict) -> dict[str, str]:
             out["example_" + name] = (HERE.parent / "examples" / f"{name}.py").read_text()
     for p in sorted(SEARCH.glob(f"{b['id']}.*.json")):
         out["search_" + p.stem[len(b["id"]) + 1 :]] = json.loads(p.read_text())["source"]
-    if b["id"] in TEACHER:
-        out["teacher"] = TEACHER[b["id"]]
+    if b["id"] in TEACHER or b["id"] in HELDOUT_TEACHER:
+        out["teacher"] = TEACHER.get(b["id"]) or HELDOUT_TEACHER[b["id"]]
     return out
 
 
@@ -611,16 +612,27 @@ def step_seed(args, step: int) -> int:
 
 
 def teacher_answers(root) -> dict[str, str]:
-    """g-int's teacher answers by behavior id: DIR/<behavior>.answer.txt (teacher.py: the python block and its English),
-    else a bare DIR/<behavior>.py program as the answer's python block."""
+    """g-int's teacher answers by behavior id: DIR/manifest.jsonl's "answer" files (e2e/teacher_run.py; a behavior's
+    last line wins; a path that does not exist here, e.g. on a pod, is read from DIR by its name), else every
+    DIR/<behavior>.answer.txt, else a bare DIR/<behavior>.py program as the answer's python block."""
     out = {}
     if root:
         root = Path(root).expanduser()
+        if (root / "manifest.jsonl").exists():
+            last = {r["behavior"]: Path(r["answer"]) for r in map(json.loads, open(root / "manifest.jsonl"))}
+            return {b: (path if path.exists() else root / path.name).read_text() for b, path in sorted(last.items())}
         for p in sorted(root.glob("*.answer.txt")):
             out[p.name[: -len(".answer.txt")]] = p.read_text()
         for p in sorted(root.glob("*.py")):
             out.setdefault(p.stem, "```python\n" + p.read_text().strip() + "\n```")
     return out
+
+
+def refuse_heldout(paths) -> None:
+    """Held-out answers (teacher_heldout/) are evaluation baselines: no training input may come from that directory."""
+    for path in paths:
+        if path and "teacher_heldout" in Path(path).expanduser().resolve().parts:
+            raise SystemExit(f"{path}: held-out answers are for evaluation only (--teacher-heldout), never training")
 
 
 class Scales:
@@ -803,12 +815,17 @@ def timed(clock: dict, key: str, fn, *a, **kw):
 
 
 def credit_groups(groups: list[dict], seed: int, args, tok, score, scales: Scales, clock: dict):
-    """(1) The credit edits (edits.credit_edits: --credit part drops sampled, every statement drop) of every distinct
-    valid answer of the groups, scored in one call under the step's seed, then each answer's token advantages."""
+    """(1) The credit edits (edits.credit_edits: --credit part drops sampled, every statement drop) of each group's
+    distinct valid answers (--credit-answers: the best and K - 1 others at random), scored in one call under the step's
+    seed, then each credited answer's token advantages."""
     requests, entries = [], []
     for g, grp in enumerate(groups):
         rng = random.Random(seed * 1009 + g)
-        for src in dict.fromkeys(it["source"] for it, ok in zip(grp["items"], grp["valid"]) if ok):
+        order = np.argsort(np.where(grp["valid"], grp["S"], np.inf), kind="stable")  # the best valid answer first
+        sources = list(dict.fromkeys(grp["items"][j]["source"] for j in order if grp["valid"][j]))
+        if args.credit_answers and len(sources) > args.credit_answers:  # the best and K - 1 others at random
+            sources = sources[:1] + rng.sample(sources[1:], args.credit_answers - 1)
+        for src in sources:
             answer = edits.Answer.parse(src)
             es = edits.credit_edits(answer, args.credit, rng)
             if es:
@@ -1330,14 +1347,14 @@ def main():
     ap.add_argument("--part-tokens", help="part tokens: the registry file of g-predict's part_tokens.py build; the projections train with the LoRA and vLLM gets the rows in place")
     ap.add_argument("--materialize-every", type=int, default=0, help="with --part-tokens: also rewrite the checkpoint and restart vLLM every K steps (0: only at the start; the rows are copied in place before every sampling call)")
     ap.add_argument("--share-gpu", action="store_true", help="one GPU for vLLM and the trainer: vLLM sleeps (weights to host) while training and the trainer moves to the host while sampling, so --gpu-memory can be 0.8")
-    ap.add_argument("--execution-only", action="store_true", help="score without the reader term (required when GRAPH_READER is unset and the checker scores)")
+    ap.add_argument("--no-reader", action="store_true", help="score without the reader term (required when GRAPH_READER is unset and the checker scores); execution, necessity, alignment, claims and complexity stay on")
     ap.add_argument("--hf-batch", type=int, default=16, help="sequences per transformers generate call (the Mac / CPU sampler)")
     ap.add_argument("--gpu-memory", type=float, default=0.85, help="vLLM's share of its GPU (lower it when the trainer shares the GPU)")
     ap.add_argument("--prompt-holdout", type=int, default=4, help="every K-th prompt of each training behavior is held out for evaluation (0: none)")
     ap.add_argument("--eval-every", type=int, default=0, help="evaluate every E training steps and at the end (0: only --mode eval)")
     ap.add_argument("--eval-seed", type=int, default=1_000_003, help="the evaluation's experiment seed (training steps use their index)")
-    ap.add_argument("--experiments", type=int, default=32, help="experiments per training score (fewer: cheaper, same expectation, more variance)")
-    ap.add_argument("--eval-experiments", type=int, default=32, help="experiments per evaluation score")
+    ap.add_argument("--experiments", type=int, default=16, help="experiments per training score: the teacher search's and the evaluation's (N, the tokens scored, sets what a part must earn)")
+    ap.add_argument("--eval-experiments", type=int, default=16, help="experiments per evaluation score")
     ap.add_argument("--eval-behaviors", type=int, default=0, help="evaluate a fixed random subset of this many behaviors per set (0: all)")
     ap.add_argument("--uniform-seeds", type=int, default=0, help="training draws experiments from step mod M (the checker's uniform_seeds: M's outcomes cached after M steps); the evaluation never")
     ap.add_argument("--no-baselines", dest="baselines", action="store_false", help="skip scoring the empty, full and search programs in evaluation")
@@ -1352,8 +1369,10 @@ def main():
     ap.add_argument("--rescore-tag", default="rescore", help="rescore: output name RUN/rescore_<tag>.jsonl")
     ap.add_argument("--oracle-runs", help="directory of the per-behavior best-program files (default ~/mpd-data/graph_oracle/runs/oracle; a pod writes under its outputs)")
     ap.add_argument("--run-name", help="the run's name in runs/oracle/<behavior>.<run>.json (default: the --out directory's name)")
-    ap.add_argument("--teacher", help="teacher answers (DIR/<behavior>.answer.txt or .py): rl2's reward scale, an evaluation baseline, and SFT answers for training behaviors")
+    ap.add_argument("--teacher", help="teacher answers (DIR/manifest.jsonl, <behavior>.answer.txt or .py): rl2's reward scale, an evaluation baseline, and SFT answers for training behaviors")
+    ap.add_argument("--teacher-heldout", help="held-out behaviors' teacher answers (~/mpd-data/graph_oracle/teacher_heldout): evaluation baselines only")
     ap.add_argument("--credit", type=int, default=16, help="rl2: part drops sampled per answer for per-token credit (every statement drop is scored too; 0: episode advantages only)")
+    ap.add_argument("--credit-answers", type=int, default=0, help="rl2: answers credited per group: the best valid one and K - 1 other distinct valid ones drawn at random (0: every distinct valid answer)")
     ap.add_argument("--refill", type=int, default=1, help="rl2: sampling rounds that replace groups without signal by behaviors drawn by gap to the teacher")
     ap.add_argument("--refine", type=int, default=2, help="rl2: rounds of edits.refine from each group's best answer for expert iteration (0: off)")
     ap.add_argument("--refine-adds", type=int, default=4, help="rl2: candidate parts tried per variable per refine round (--candidates)")
@@ -1363,12 +1382,14 @@ def main():
     ap.add_argument("--exit-beta", type=float, default=0.1, help="rl2: inverse temperature of expert iteration's DPO pair")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
-    if args.scorer == "checker" and not os.environ.get("GRAPH_READER") and not args.execution_only:
-        raise SystemExit("the score includes the reader term: set GRAPH_READER (reader_score.py serve) or pass --execution-only")
+    if args.scorer == "checker" and not os.environ.get("GRAPH_READER") and not args.no_reader:
+        raise SystemExit("the score includes the reader term: set GRAPH_READER (reader_score.py serve) or pass --no-reader")
     lr = args.lr if args.lr is not None else {"bestofn": 1e-4, "sft": 1e-4}.get(args.mode, 1e-5)
     beta = args.beta if args.beta is not None else {"dpo": 0.1}.get(args.mode, 0.04)
     args.beta = beta
+    refuse_heldout([args.teacher, args.candidates, *(args.programs or []), *(args.data or [])])
     TEACHER.update(teacher_answers(args.teacher))
+    HELDOUT_TEACHER.update(teacher_answers(args.teacher_heldout))
     random.seed(args.seed)
     torch.manual_seed(args.seed)
     out = Path(args.out)

@@ -392,6 +392,21 @@ def check_rl2_pieces():
 
     picks = [sc.draw([{"id": "a"}, {"id": "b"}], 1, random.Random(i))[0]["id"] for i in range(400)]
     assert picks.count("a") > 300, picks.count("a")
+    import json
+
+    with tempfile.TemporaryDirectory() as d:  # teacher_run.py's manifest, written on another machine; the held-out refusal
+        (Path(d) / "x.answer.txt").write_text("answer x")
+        lines = [{"behavior": "x", "answer": "/elsewhere/old.answer.txt"}, {"behavior": "x", "answer": "/elsewhere/x.answer.txt"}]
+        (Path(d) / "manifest.jsonl").write_text("".join(json.dumps(r) + "\n" for r in lines))
+        assert train.teacher_answers(d) == {"x": "answer x"}
+        held = Path(d) / "teacher_heldout"
+        held.mkdir()
+        train.refuse_heldout([d, None])
+        try:
+            train.refuse_heldout([str(held)])
+            raise AssertionError("held-out answers accepted for training")
+        except SystemExit:
+            pass
 
 
 def check_rl2_step(pol):
@@ -435,7 +450,7 @@ def check_rl2_step(pol):
     try:
         with tempfile.TemporaryDirectory() as d:
             logs = {k: open(Path(d) / f"{k}.jsonl", "w") for k in ("train", "samples", "improved")}
-            args = argparse.Namespace(seed=0, eval_seed=1_000_003, samples=4, experiments=4, credit=16, refill=1, refine=3, refine_adds=2, behaviors_per_step=2, beta=0.0,
+            args = argparse.Namespace(seed=0, eval_seed=1_000_003, samples=4, experiments=4, credit=16, credit_answers=0, refill=1, refine=3, refine_adds=2, behaviors_per_step=2, beta=0.0,
                                       pack=False, micro=2, ppo_epochs=2, clip=0.2, exit_beta=0.1)
             pool = [{"id": "x", "model": "vpd4l"}, {"id": "y", "model": "vpd4l"}, {"id": "z", "model": "vpd4l"}]
             scales = train.Scales({"x": answer_with(sorted(needed)), "y": answer_with(sorted(needed))})
@@ -453,6 +468,14 @@ def check_rl2_step(pol):
             assert scales.scale == {"x": 4.0, "y": 4.0, "z": 1e4} and scales.target["z"] == 0.0  # the teacher's 4 parts; z: the empty program's total
             assert first["improved"] >= 1 and len(first["loss"]) == 2 and "exit_sft_loss" in first, first
             assert first["repeated_scores"] > 0, first  # refinement starts from an answer the credit scored
+            texts3 = [answer_with(["<p:2.v.559>", "<p:2.o.735>"]), answer_with(["<p:2.v.559>"]), answer_with(["<p:2.v.559>", "<p:3.o.1>"]), answer_with(["<p:2.o.735>"])]
+            items = [train.item(t, pool[0], 0, 0, 4) for t in texts3]
+            sc3 = stand_in(items)
+            grp = {"behavior": pool[0], "completions": [pol.tok.encode(t, add_special_tokens=False) for t in texts3], "texts": texts3, "items": items, "scores": sc3,
+                   "S": np.array([x["total_bits"] for x in sc3]), "valid": np.array([x["valid"] for x in sc3]), "advantage": np.zeros(4), "token_advantages": [[0.0]] * 4, "credit": [None] * 4}
+            train.credit_groups([grp], 0, argparse.Namespace(**{**vars(args), "credit_answers": 2}), pol.tok, stand_in, scales, {"credit": 0.0})
+            best = int(np.argmin(grp["S"]))
+            assert sum(c is not None for c in grp["credit"]) == 2 and grp["credit"][best] is not None, grp["credit"]  # the best and one other
             assert len(rec.grads) == 3  # two PPO epochs and the expert-iteration step
             for f in logs.values():
                 f.close()
