@@ -452,6 +452,7 @@ def check_rl2_step(pol):
             assert first["groups"] == 3 and first["kept"] == 2 and first["refills"] == 1 and asked[-1] == "z", (first, asked)
             assert scales.scale == {"x": 4.0, "y": 4.0, "z": 1e4} and scales.target["z"] == 0.0  # the teacher's 4 parts; z: the empty program's total
             assert first["improved"] >= 1 and len(first["loss"]) == 2 and "exit_sft_loss" in first, first
+            assert first["repeated_scores"] > 0, first  # refinement starts from an answer the credit scored
             assert len(rec.grads) == 3  # two PPO epochs and the expert-iteration step
             for f in logs.values():
                 f.close()

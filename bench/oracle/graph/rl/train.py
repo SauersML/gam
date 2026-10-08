@@ -79,7 +79,6 @@ sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent))
 sys.path.insert(0, str(HERE.parent / "predict"))  # g-predict's part_tokens
 import edits  # noqa: E402
-import prompt  # noqa: E402
 from prompt import program_of, render, split_answer  # noqa: E402
 import scorer  # noqa: E402
 from scorer import SCORERS  # noqa: E402
@@ -768,6 +767,31 @@ def edit_item(source: str, behavior: dict, seed: int, experiments: int) -> dict:
     return {"source": source, "explanation": "", "behavior": behavior, "seed": seed, "experiments": experiments, "reader": False}
 
 
+def memo(score):
+    """score with every distinct item (behavior, program, explanation, seed, experiments, reader, options) scored once:
+    within one step the credit's base answers, refinement's start and edits that coincide repeat."""
+    cache, hits = {}, [0]
+
+    def key(it):
+        return (it["behavior"].get("path", it["behavior"]["id"]), it["source"], it.get("explanation", ""), it.get("seed"), it.get("uniform_seeds") or 0, it.get("experiments"),
+                it.get("reader", True), json.dumps(it.get("options"), sort_keys=True))
+
+    def run(items):
+        keys = [key(it) for it in items]
+        first = {}
+        for k, it in zip(keys, items):
+            if k not in cache:
+                first.setdefault(k, it)
+        hits[0] += len(items) - len(first)
+        if first:
+            for k, r in zip(first, score(list(first.values()))):
+                cache[k] = r
+        return [cache[k] for k in keys]
+
+    run.hits = hits
+    return run
+
+
 def timed(clock: dict, key: str, fn, *a, **kw):
     t = time.time()
     try:
@@ -925,6 +949,7 @@ def rl2_step(step: int, args, pol, sampler, score, scales: Scales, pool: list[di
     updates (4) on the kept groups, then one expert-iteration step. Every answer, its score and its credit go to
     samples.jsonl, every improved answer to improved.jsonl."""
     clock = {"sample": 0.0, "score": 0.0, "credit": 0.0, "refine": 0.0, "train": 0.0}
+    score = memo(score)  # one experiment draw per step: a repeated program's score is the same
     rng = random.Random(step_seed(args, step))
     chosen = rng.sample(pool, min(args.behaviors_per_step, len(pool)))
     groups = rl2_groups(chosen, step, args, pol, sampler, score, scales, adapter, clock)
@@ -967,7 +992,7 @@ def rl2_step(step: int, args, pol, sampler, score, scales: Scales, pool: list[di
     valid = np.concatenate([g["valid"] for g in groups])
     row = {"step": step, "mode": "rl2", "seed": step_seed(args, step), "groups": len(groups), "kept": len(kept), "refills": refills, "programs": int(len(S)), "mean_bits": float(S.mean()),
            "valid_fraction": float(valid.mean()), "best_relative_to_teacher": float(np.mean(best)) if best else None,
-           "credited": sum(c is not None for g in groups for c in g["credit"]), "improved": len(improved), **stats, "sampling": getattr(sampler, "stats", {}), "seconds": clock,
+           "credited": sum(c is not None for g in groups for c in g["credit"]), "improved": len(improved), "repeated_scores": score.hits[0], **stats, "sampling": getattr(sampler, "stats", {}), "seconds": clock,
            "checker_seconds_total": TOTALS["checker_seconds"], "elapsed": time.time() - started}
     logs["train"].write(json.dumps(row) + "\n")
     logs["train"].flush()
@@ -1437,7 +1462,7 @@ def main():
         t1 = time.time()
         texts = [[pol.tok.decode(c, skip_special_tokens=True) for c in g] for g in groups]
         items = [item(t, b, step_seed(args, step), args.uniform_seeds, args.experiments) for b, ts in zip(chosen, texts) for t in ts]
-        scores = score(items)
+        scores = memo(score)(items)  # identical answers of a group scored once, as in rl2
         t2 = time.time()
         TOTALS["checker_seconds"] += t2 - t1
         S = np.array([s["total_bits"] for s in scores], dtype=float).reshape(len(chosen), args.samples)
