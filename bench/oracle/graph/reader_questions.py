@@ -19,7 +19,9 @@ it, on the same questions. Control: each behavior's questions read with another 
 (a seeded derangement of the behaviors), which must save nothing.
 
   reader_questions.py build --manifest MANIFEST.jsonl --out QUESTIONS.jsonl [--per-type 16]
-  reader_questions.py score --questions QUESTIONS.jsonl --out RESULT.json [--model Qwen/Qwen3-8B --device mps]
+  reader_questions.py explain --out EXPLANATIONS.json     (the answers' English from measured facts, printer.py)
+  reader_questions.py score --questions QUESTIONS.jsonl --out RESULT.json [--explanations EXPLANATIONS.json]
+                            [--model Qwen/Qwen3-8B --device mps]
 build runs the checker (score.Checker, GRAPH_CHECKER) for the switch questions; --types picks the types.
 """
 
@@ -259,6 +261,37 @@ def build_behavior(entry: dict, per_type: int, seed: int, checker=None, types=("
     return out
 
 
+def explain(entry: dict, checker) -> tuple[str, dict]:
+    """A teacher answer's English rewritten by printer.algorithm_explanation from facts measured on M on the
+    fit half of the behavior's prompts (even indices; the scored switch questions use the odd ones):
+    removal facts, how often M's top token is the expected answer and where it is not, the switch flip
+    share (the whole answer's, stated for its one aligned variable), the interchange test (the answer's
+    alignment error, for one aligned variable) and the reproduce and remove shares of the answer's score
+    against the empty program's. Returns (explanation, facts)."""
+    import mech
+    import printer
+    import prompt as P
+
+    path = Path.home() / "mpd-data/graph_oracle/behaviors" / entry["model"] / f"{entry['behavior']}.json"
+    behavior = json.loads(path.read_text())
+    fit = [i for i in range(len(behavior["prompts"])) if i % 2 == 0]
+    source = P.program_of(Path(entry["answer"]).read_text())
+    ir = mech.trace_inline(source, entry["model"], behavior=behavior, decomposition="vpd")
+    if not ir["valid"]:
+        raise ValueError(f"{entry['behavior']}: {ir['error']}")
+    printer.SHAPE[0] = mech.shapes(entry["model"])
+    half = {**behavior, "prompts": [behavior["prompts"][i] for i in fit]}
+    measured = printer.facts(printer.engine_for(entry["model"]), printer.variable_ir(ir), half)
+    aligned = [v["name"] for v in ir["variables"] if v["pieces"] and v["role"] == "aligned"]
+    if len(aligned) == 1:
+        rows = [r for r in complement_rows(checker, entry, path, len(behavior["prompts"])) if r["prompt"] % 2 == 0]
+        f = measured.setdefault(aligned[0], {})
+        f["switch_flip_share"] = (sum(r["complement"][1] > r["complement"][0] for r in rows) / len(rows)) if rows else None
+        f["alignment_error_bits"] = entry["score"].get("alignment_error_bits")
+    score = {**entry["score"], "empty": entry.get("empty_score")}
+    return printer.algorithm_explanation(ir, behavior, measured, score, prompts=fit), measured
+
+
 # -------------------------------------------------------------------------------------------- scoring
 
 def score(backend, questions: list[dict], explanations: dict[str, str], seed: int = 0) -> dict:
@@ -326,7 +359,7 @@ def summarize(rows: list[dict], temperature: float = 1.0) -> dict:
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("command", choices=["build", "score"])
+    ap.add_argument("command", choices=["build", "explain", "score"])
     ap.add_argument("--manifest", default=str(Path.home() / "mpd-data/graph_oracle/teacher/manifest.jsonl"))
     ap.add_argument("--questions")
     ap.add_argument("--out", required=True)
@@ -342,6 +375,22 @@ def main():
     ap.add_argument("--max-batch", type=int, default=8)
     args = ap.parse_args()
     entries = [json.loads(line) for line in open(args.manifest) if line.strip()]
+    if args.command == "explain":  # --out: {behavior: explanation}; answers with the new English beside it
+        import printer
+        import prompt as P
+        import score as S
+
+        checker = S.Checker("vpd4l", views={"vpd": str(Path.home() / "mpd-data/engine/vpd4l_decomposition")}, device="gpu")
+        out, facts_of, root = {}, {}, Path(args.out).with_suffix("")
+        root.mkdir(parents=True, exist_ok=True)
+        for e in entries:
+            out[e["behavior"]], facts_of[e["behavior"]] = explain(e, checker)
+            (root / f"{e['behavior']}.answer.txt").write_text(printer.answer_of(P.program_of(Path(e["answer"]).read_text()), out[e["behavior"]]))
+            print(e["behavior"], out[e["behavior"]][:160].replace("\n", " "), flush=True)
+        checker.close()
+        Path(args.out).write_text(json.dumps(out, indent=1))
+        Path(args.out).with_suffix(".facts.json").write_text(json.dumps(facts_of, indent=1, default=str))
+        return
     if args.command == "build":
         checker = None
         if "switch" in args.types.split(","):
