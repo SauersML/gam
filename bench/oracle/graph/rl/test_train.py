@@ -392,7 +392,7 @@ def check_rl2_pieces():
 
     with tempfile.TemporaryDirectory() as d:  # teacher_run.py's manifest, written on another machine; the held-out refusal
         (Path(d) / "x.answer.txt").write_text("answer x")
-        lines = [{"behavior": "x", "answer": "/elsewhere/old.answer.txt"}, {"behavior": "x", "answer": "/elsewhere/x.answer.txt"}]
+        lines = [{"behavior": "x", "answer": "/elsewhere/old.answer.txt"}, {"behavior": "x", "answer": "/elsewhere/x.answer.txt"}, {"behavior": "y", "answer": "/elsewhere/y.answer.txt"}]
         (Path(d) / "manifest.jsonl").write_text("".join(json.dumps(r) + "\n" for r in lines))
         assert train.teacher_answers(d) == {"x": "answer x"}
         held = Path(d) / "teacher_heldout"

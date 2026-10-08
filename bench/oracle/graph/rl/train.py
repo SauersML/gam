@@ -601,9 +601,10 @@ def teacher_answers(root) -> dict[str, str]:
     out = {}
     if root:
         root = Path(root).expanduser()
-        if (root / "manifest.jsonl").exists():
+        if (root / "manifest.jsonl").exists():  # a line whose answer file is not there (yet: answers append while runs finish) is skipped
             last = {r["behavior"]: Path(r["answer"]) for r in map(json.loads, open(root / "manifest.jsonl"))}
-            return {b: (path if path.exists() else root / path.name).read_text() for b, path in sorted(last.items())}
+            found = {b: path if path.exists() else root / path.name for b, path in sorted(last.items())}
+            return {b: path.read_text() for b, path in found.items() if path.exists()}
         for p in sorted(root.glob("*.answer.txt")):
             out[p.name[: -len(".answer.txt")]] = p.read_text()
         for p in sorted(root.glob("*.py")):
@@ -1428,6 +1429,7 @@ def main():
     ap.add_argument("--gpu-memory", type=float, default=0.85, help="vLLM's share of its GPU (lower it when the trainer shares the GPU)")
     ap.add_argument("--prompt-holdout", type=int, default=4, help="every K-th prompt of each training behavior is held out for evaluation (0: none)")
     ap.add_argument("--eval-every", type=int, default=0, help="evaluate every E training steps and at the end (0: only --mode eval)")
+    ap.add_argument("--skip-first-eval", action="store_true", help="no evaluation at step 0 (the starting policy is evaluated once elsewhere, e.g. by its SFT run, on the same eval seed)")
     ap.add_argument("--eval-seed", type=int, default=1_000_003, help="the evaluation's experiment seed (training steps use their index)")
     ap.add_argument("--experiments", type=int, default=16, help="experiments per training score: the teacher search's and the evaluation's (N, the tokens scored, sets what a part must earn)")
     ap.add_argument("--eval-experiments", type=int, help="experiments per evaluation score (default: --experiments; the team keeps search, RL and evaluation at one setting)")
@@ -1552,7 +1554,7 @@ def main():
         pol.save(adapter)
         if args.materialize_every and step and step % args.materialize_every == 0:
             refresh_parts(pol, sampler, out, args)
-        if args.eval_every and step % args.eval_every == 0:
+        if args.eval_every and step % args.eval_every == 0 and not (step == 0 and args.skip_first_eval):
             evaluate(sets, pol, sampler, score, args, adapter, step, eval_log, step)
         if args.mode == "rl2" and args.async_rollouts:  # its own loop: the checker overlaps the next step's sampling
             rl2_async(args, pol, sampler, score, scales, pool, adapter, optimizer, warmup, candidates, logs, started,
