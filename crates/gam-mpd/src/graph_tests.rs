@@ -711,8 +711,10 @@ fn stacked_vpd_programs_are_their_own_runs() {
             let mut edges = Vec::new();
             let mut writers = vec!["embed"];
             if !a.is_empty() {
+                // An edge on each route the node's parts read.
+                let read = |kind: &str| a.iter().any(|p| p.kind == kind);
+                edges.extend([("q_proj", "query"), ("k_proj", "key"), ("v_proj", "value")].iter().filter(|(k, _)| read(k)).map(|(_, r)| edge("embed", "A", r)));
                 nodes.push(NodeIr { id: "A".into(), pieces: a, claim: None });
-                edges.extend(["query", "key", "value"].iter().map(|r| edge("embed", "A", r)));
                 writers.push("A");
             }
             if !m.is_empty() {
