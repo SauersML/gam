@@ -1967,8 +1967,8 @@ pub fn execute(weights: &Weights, circuit: &Circuit, batch: &Batch, scored: &[us
 
 /// The most rows a stacked run holds ([`execute_stacked`]): its hidden activations take rows × the
 /// MLP's width, and vpd4l's behaviors hold about a thousand rows (at 2^14 rows a score of chunk
-/// programs passed the 12 GiB lease score.py gives a vpd4l checker).
-const STACKED_ROWS: usize = 1 << 13;
+/// programs passed the 12 GiB lease score.py gives a vpd4l checker, at 2^13 it peaked at 15 GB).
+const STACKED_ROWS: usize = 1 << 12;
 
 /// Whether `circuit` computes as the model's stream with every part it leaves out deleted or at its
 /// counterfactual value, so that it can run stacked with others ([`execute_stacked`]): its
