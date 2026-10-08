@@ -3,8 +3,11 @@
 signal: sig[b, h, t, c] = max over u <= t of |Cf[b, h, u, c] (Qr[b, h, t] . K_c(u))|, no gradient;
 scores: s[b, h, t, u] = sum_c G[b, h, t, c] Cf[b, h, u, c] (Qr[b, h, t] . K_c(u)) for u <= t, with gradients in Qr, G,
 Cf and U; K_c(u) = rope_u(U[h, c]) = U_c cos_u + rot(U_c) sin_u, rot(w) = cat(-w[n:], w[:n]).
-Each program loops over slices and key (or query) blocks with one tl.dot (TF32) per slice and tile, building the
-keys in registers, so no [T, T] per slice or [T, HD, C] tensor is written."""
+Each program loops over slices and key (or query) blocks with one tl.dot per slice and tile, building the keys in
+registers, so no [T, T] per slice or [T, HD, C] tensor is written. The scores' forward multiplies in TF32; the signal
+(a gate's input only) and the backward multiply bfloat16 operands with float32 sums: on an A40 at B = 32, T = 512,
+C = 512 the backward takes 628 ms per layer against 898 in TF32 and the signal 126 against 151, the gradients within
+2.5e-3 of float64 (1.0e-3 in TF32) and the signal within a median 1.1e-3 of TF32's."""
 import torch
 import triton
 import triton.language as tl
@@ -53,7 +56,7 @@ def _dest_signal(Q, Cf, U, COS, SIN, OUT, T, C,
                 cs = tl.load(COS + u[:, None] * HD + d[None, :], mask=u[:, None] < T, other=0.0)          # [BU, HD]
                 sn = tl.load(SIN + u[:, None] * HD + d[None, :], mask=u[:, None] < T, other=0.0)
                 k = u_c[None, :] * cs + r_c[None, :] * sn                                                  # [BU, HD]
-                s = tl.dot(q, tl.trans(k))                                                                 # [BT, BU]
+                s = tl.dot(q.to(tl.bfloat16), tl.trans(k.to(tl.bfloat16)))                                                                 # [BT, BU]
                 cu = tl.load(Cf + bh * sc_bh + u * sc_t + c, mask=u < T, other=0.0)                         # [BU]
                 s = tl.abs(s * cu[None, :])
                 s = tl.where((u[None, :] <= t[:, None]) & (u[None, :] < T), s, 0.0)
@@ -118,7 +121,7 @@ def _bwd_q(Q, GT, CT, U, COS, SIN, DS, DQ, T, C, NH: tl.constexpr, HD: tl.conste
             gt = tl.load(GT + (bh * C + c) * T + t, mask=t < T, other=0.0)
             cu = tl.load(CT + (bh * C + c) * T + u, mask=u < T, other=0.0)
             a = ds * gt[:, None] * cu[None, :]
-            acc += tl.dot(a, k)
+            acc += tl.dot(a.to(tl.bfloat16), k.to(tl.bfloat16))
     tl.store(DQ + bh * T * HD + t[:, None] * HD + d[None, :], acc, mask=t[:, None] < T)
 
 
@@ -144,7 +147,7 @@ def _bwd_g(Q, CT, U, COS, SIN, DS, DGT, T, C, NH: tl.constexpr, HD: tl.constexpr
             c = tl.minimum(cb * CB + ci, C - 1)
             uc = tl.load(U + (h * C + c) * HD + d); rc = tl.load(U + (h * C + c) * HD + dr) * sg
             k = uc[None, :] * cs + rc[None, :] * sn
-            w = tl.dot(q, tl.trans(k))
+            w = tl.dot(q.to(tl.bfloat16), tl.trans(k.to(tl.bfloat16)))
             cu = tl.load(CT + (bh * C + c) * T + u, mask=u < T, other=0.0)
             v = tl.sum(ds * w * cu[None, :], axis=1)
             acc += tl.where(cols[None, :] == ci, v[:, None], 0.0)
@@ -178,14 +181,14 @@ def _bwd_cu(Q, GT, CT, U, COS, SIN, DS, DCT, DU, T, C, NH: tl.constexpr, HD: tl.
             c = tl.minimum(cb * CB + ci, C - 1)
             uc = tl.load(U + (h * C + c) * HD + d); rc = tl.load(U + (h * C + c) * HD + dr) * sg
             k = uc[None, :] * cs + rc[None, :] * sn
-            w = tl.dot(q, tl.trans(k))
+            w = tl.dot(q.to(tl.bfloat16), tl.trans(k.to(tl.bfloat16)))
             gt = tl.load(GT + (bh * C + c) * T + t, mask=t < T, other=0.0)
             cu = tl.load(CT + (bh * C + c) * T + u, mask=u < T, other=0.0)
             a = ds * gt[:, None]
             vc = tl.sum(a * w, axis=0)
             acc_c += tl.where(cols[None, :] == ci, vc[:, None], 0.0)
             x = a * cu[None, :]
-            vu = tl.sum(q * tl.dot(x, cs) + qp * tl.dot(x, snp), axis=0)
+            vu = tl.sum(q * tl.dot(x.to(tl.bfloat16), cs.to(tl.bfloat16)) + qp * tl.dot(x.to(tl.bfloat16), snp.to(tl.bfloat16)), axis=0)
             acc_u += tl.where(cols[:, None] == ci, vu[None, :], 0.0)
     cc = cb * CB + cols
     tl.store(DCT + (bh * C + cc[None, :]) * T + u[:, None], acc_c, mask=(u[:, None] < T) & (cc[None, :] < C))
