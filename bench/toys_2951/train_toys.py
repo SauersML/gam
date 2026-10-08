@@ -159,8 +159,9 @@ def tms(out: Path, identity: bool, seed: int):
 # ---------------------------------------------------------------------------- resid MLP (CC)
 
 
-def resid_mlp(out: Path, layers: int, seed: int):
-    n, d, m, p = 100, 1000, 50, 0.01
+def resid_mlp(out: Path, layers: int, seed: int, width: int = 1):
+    # width w: w times the functions and neurons (the scaling runs), the stream as wide
+    n, d, m, p = 100 * width, 1000, 50 * width, 0.01 * (1 if width == 1 else 1 / width)
     steps = {1: 2000, 2: 3000, 3: 4000}[layers]
     # the embedding is the same for every seed (seed 0), so seeds share the stream's coordinates
     E = torch.randn(n, d, generator=torch.Generator().manual_seed(0))
@@ -231,7 +232,7 @@ def resid_mlp_truth(E, Wi, Wo, xs):
 # ---------------------------------------------------------------------------- gated copy
 
 
-def gated_copy(out: Path, seed: int, signed: bool = True):
+def gated_copy(out: Path, seed: int, signed: bool = True, width: int = 1):
     """A high-rank operation at a known place: built, not trained. Two gated copies of a subspace,
     y_A = c_A a (a in [-1, 1]^8) and y_B = c_B b (b in [-1, 1]^4), c_A and c_B each 1 with
     probability 1/4, else 0, beside 8 sparse features passed through a ReLU, y_f = ReLU(f) (f_j
@@ -243,7 +244,7 @@ def gated_copy(out: Path, seed: int, signed: bool = True):
     the neurons. Unsigned (gated_copy_pos): a in [0, 1]^8 and b in [0, 1]^4, coordinate i one neuron
     ReLU(a_i + G c - G) written e_i, so every neuron of a copy fires on every token with c = 1 (a
     split into neurons then costs as many bits per token as the whole copy)."""
-    copies, features, G, SIGMA = [("A", 8), ("B", 4)], 8, 2.0, 0.05
+    copies, features, G, SIGMA = [("A", 8 * width), ("B", 4 * width)], 8 * width, 2.0, 0.05
     gen = torch.Generator().manual_seed(1)
     rows = HELD_OUT + TRAIN_ROWS
     width = sum(r for _, r in copies)
@@ -709,6 +710,9 @@ if __name__ == "__main__":
         "resid_mlp_3l": lambda: resid_mlp(out, 3, seed),
         "gated_copy": lambda: gated_copy(out, seed),
         "gated_copy_pos": lambda: gated_copy(out, seed, signed=False),
+        # the scaling runs: w times the copies' ranks, the features, the functions and the neurons
+        **{f"gated_copy_w{w}": (lambda w=w: gated_copy(out, seed, width=w)) for w in (2, 4)},
+        **{f"resid_mlp_2l_w{w}": (lambda w=w: resid_mlp(out, 2, seed, width=w)) for w in (2, 4)},
         "modadd_113": lambda: modadd(out, seed),
         "induction": lambda: induction(out, seed),
     }[name]()

@@ -1,53 +1,54 @@
 """The structural code on the toy gate's real-valued MLP toys (#2951 design, 10-07): a standalone reference
-prototype, fast enough to iterate in seconds.
+prototype, built to scale linearly in the model: no dense all-pairs comparison, exactness through local solves,
+the dictionary from the weights' own vectors, execution batched over items, guards that are small reads.
 
-usage: ~/mpd-data/venv/bin/python bench/toys_2951/structural.py TOY_DIR [--bits B] [--out OUT.json]
+usage: ~/mpd-data/venv/bin/python bench/toys_2951/structural.py TOY_DIR [--bits B] [--gates STEPS] [--out OUT.json]
 
-Representation, exact by construction on the stream's reachable span:
-- Atoms of the stream: the input atoms and every neuron's write (its down_proj column). The input atoms are the
-  coordinates the layer-0 stream varies in, when they are as many as its rank (axes are named by index); else its
-  independent components (FastICA, as many as the centred stream's rank, each signed so its largest
-  entry is positive), each made exact where the data pins it: one within 11 degrees of a coordinate axis becomes the axis
-  (an axis is named by its index, a direction costs its numbers), and one along which some stream rows lie alone (two or more
-  rows along one exact direction near it) becomes that direction, and components that span coordinate axes become those axes; and, where the stream's mean leaves their span, that remainder (the constant atom,
-  whose edges are biases); every input atom has unit norm. The stream at layer l is A_l s_l exactly: s_l holds each input's coefficients (zero where
-  absent) and each earlier neuron's activation.
-- Edges: c_fc^l is the sum over neurons n and atoms k of e_n E_l[n, k] (dual_k)^T with E_l = W_fc^l A_l (the
-  overcomplete frame's writes W F^+, F the atoms' dual frame), the head likewise (H = head A_L), and each neuron's
-  down_proj slice writes its own atom. Directions the stream never takes carry nothing.
-- A block is any set of edges and neuron down slices (cells), in any maps and layers, with one gate: the norm of its
-  own write at its gate stage (the last stage of its earliest layer: the pre-activations its c_fc edges write, or
-  after the activation the writes of its cells, or the head's outputs), on above zero (to rounding).
+Dictionary of the stream (one, shared across layers), from the weights' own vectors: the embedding's rows (each
+input's write), every neuron's write (its down_proj column) and the head's rows (its reads). Directions two or more
+of these vectors share (unit vectors hashed at B-bit precision: no pairwise comparison) are the candidate atoms.
+Each write vector is coded greedily on them, every step a least-squares solve on its own small support (a local
+frame, never a pseudo-inverse of a map), and what remains on coordinate axes, so every code is exact. A vector whose
+code would cost more than the vector (more than d B / (log2 d + B) axes) is its own atom (its code: that atom, weight 1). An input's stream
+coefficients are its embedding row's code and a neuron writes its own code, so the stream at every layer is A s
+exactly.
 
-Code, in bits (numbers at B bits, an index at log2 of its dictionary, a set of k of n at log2 C(n, k) + log2(n + 1)):
-- A block's parts: raw parts, per map its receivers, senders and numbers (dense, zeros charged, or the edges named
-  in the rectangle), and bindings of rules. A cell's units: the neuron with its in-edges, its down slice and its
-  atom's out-edges in the block. Senders or receivers shared by every unit of the block with one weight are the
-  block's roles (named per block); the rest bind units into bindings (connected components). A binding's pattern
-  is its units' weights with its own senders and receivers as slots; a pattern used by two or more bindings is a
-  rule: its body (the pattern's numbers) is defined once, and each binding is a row of its table.
-- Per token: each block on costs log2(#blocks), its roles' names, its raw parts, and log2(#bindings of the rule)
-  per binding; each rule used by a block on costs its body once.
-- Definitions (paid once through F): the input atoms (learned), each block's threshold, roles and raw parts, each
-  binding's table row, each rule's body. M's own neuron writes and head are the dictionary every explanation shares.
+Items: read edges (a c_fc row's, or a head row's, inner product with an atom it can meet: w_i . a_k, nonzero only)
+and write edges (a neuron's code entries). With every item on, P is M (checked at every evaluation). A block is any
+set of items, in any maps and layers, with one guard: the norm of its own write at its gate stage (the last stage
+of its earliest layer: the pre-activations its read edges write, after the activation its neurons' writes, or the
+head's outputs), on above zero to rounding: a read of the block's own output, no gate network.
 
-Explanations scored: the true blocks (as rules where the code finds repeats, and dense), the pieces (the start: each
-atom's fan-out into each map, each neuron's cell with its bias), and the one the search finds: from the pieces,
-merges of blocks (a block with the cells its edges feed, the fan-outs of one atom, blocks that fire together),
-each kept where it lowers J = E_t[bits per token] + definitions / N and keeps every gated run exact."""
+Code, in bits (numbers at B bits, an index at log2 of its dictionary, k of n named at log2 C(n, k) + log2(n + 1)).
+A block's units are its neurons that write (with their read edges in, their writes, and the reads of the atoms they
+write); senders every unit shares with one weight are the block's roles; the rest join units into bindings. A
+binding's pattern is its weights (quantized at B bits) with its own atoms and receivers as slots; a pattern two or
+more bindings share is a rule (found by hashing patterns: the candidate list is the pattern's bucket).
+- A number costs B bits, a weight of exactly +-1 its sign.
+- Per token, each block on: log2(#blocks), its roles' names, its raw items (names and numbers), log2(#bindings of
+  its rule) per binding; each rule used by a block on: its body once.
+- Definitions, paid once through F: the learned atoms, each block's threshold, roles and raw items, each binding's
+  table row, each rule's body. M's own maps are the dictionary every explanation shares.
+
+Search: from the pieces (each atom's reads per map, each neuron with its bias and its writes), moves from short
+candidate lists: a block with the blocks its edges feed, or that feed its neurons, or that read its neurons'
+atoms; all blocks reading one atom; all blocks firing on the same tokens, and each with the next such block; a
+block's bindings split by their tokens; a block's edges moved to the block holding the neurons they feed; and every
+move of one shape made at once (moves whose blocks share a signature, found by hashing: a rule's bindings change
+together and keep their rule). Each is scored by its change of J = E_t[bits per token] + definitions / N from aggregates (no full recount), applied best
+first on disjoint blocks, kept only if every new block's gating stays exact. A merge whose guard reads the same stage
+as some merged blocks' guards is first scored with their union as its tokens, and dropped if that loses."""
 
 import argparse
 import itertools
 import json
 import math
-import sys
+import time
 from pathlib import Path
 
 import numpy as np
-import scipy.linalg as sla
 import scipy.sparse as sp
 from scipy.special import gammaln
-from sklearn.decomposition import FastICA
 
 HELD = 4096
 LN2 = math.log(2)
@@ -66,7 +67,7 @@ class Toy:
         rec = json.loads((d / "export.json").read_text())
         self.rec, c = rec, rec["config"]
         W = lambda n: np.fromfile(d / f"{n}.f64", dtype="<f8").reshape(rec["files"][n]["shape"])  # noqa: E731
-        self.name, self.kind = d.name, rec.get("real_valued")
+        self.name, self.kind, self.dir = d.name, rec.get("real_valued"), d
         self.L = c["n_layers"]
         self.wte = W("wte")
         self.fc = [W(f"blocks.{l}.mlp.c_fc") for l in range(self.L)]
@@ -79,182 +80,325 @@ class Toy:
         self.relu_head = c["head"]["relu"]
         self.act = (lambda x: np.maximum(x, 0.0)) if c["mlp_act"] == "relu" else (lambda x: x)
         self.truth = json.loads((d / "truth.json").read_text())
-        self.dir = d
-
-    def out(self, r):
-        y = r @ self.head.T + self.bias
-        return np.maximum(y, 0.0) if self.relu_head else y
 
     def run(self, R):
         r = R
         for l in range(self.L):
             r = r + self.act(r @ self.fc[l].T) @ self.dn[l].T
-        return self.out(r)
+        y = r @ self.head.T + self.bias
+        return np.maximum(y, 0.0) if self.relu_head else y
+
+
+# ----------------------------------------------------------------------------------------------- dictionary
+
+
+def unit_rows(V):
+    """Rows as unit vectors signed so their largest entry (the first, on ties) is positive, and their scales."""
+    n = np.linalg.norm(V, axis=1)
+    U = V / np.maximum(n, 1e-300)[:, None]
+    top = np.abs(U).argmax(1)
+    sgn = np.sign(U[np.arange(len(U)), top])
+    return U * sgn[:, None], n * sgn
+
+
+def recurring(V, B):
+    """Directions two or more rows of V share, by hashing their unit vectors at B-bit precision."""
+    U, n = unit_rows(V[np.linalg.norm(V, axis=1) > 0])
+    keys = np.round(U * 2.0 ** B).astype(np.int64)
+    groups = {}
+    for x, key in enumerate(map(bytes, keys)):
+        groups.setdefault(key, []).append(x)
+    return np.array([U[xs].mean(0) for xs in groups.values() if len(xs) >= 2]).reshape(-1, V.shape[1])
+
+
+class Dictionary:
+    """The stream's atoms: recurring directions, coordinate axes and own atoms (module note), as dense unit columns
+    (axes included: the toys are small; at scale an axis is its index)."""
+
+    def __init__(self, toy: Toy, B):
+        d = toy.wte.shape[1]
+        writes = [toy.wte] + [w.T for w in toy.dn]
+        R = recurring(np.vstack(writes + [toy.head]), B)
+        R = R / np.linalg.norm(R, axis=1, keepdims=True)
+        self.d, self.B = d, B
+        self.R = R                                  # recurring atoms (unit rows)
+        self.atoms = {}                             # key -> column index; key ('r', i), ('x', j) or ('o', name)
+        self.cols = []
+        self.limit = d * B / (math.log2(d) + B)     # an axes code longer than this: the vector is its own atom
+        self.own_count = 0
+        self.codes = {}
+        self.input_codes = self.code(toy.wte, "input")
+        self.neuron_codes = [self.code(w.T, f"neuron{l}") for l, w in enumerate(toy.dn)]
+        self.A = np.column_stack(self.cols) if self.cols else np.zeros((d, 0))
+
+    def atom(self, key, vec=None):
+        """The column of atom `key` (an axis ('x', j) is built from its index; others from vec)."""
+        if key not in self.atoms:
+            self.atoms[key] = len(self.cols)
+            if key[0] == "x":
+                vec = np.zeros(self.d)
+                vec[key[1]] = 1.0
+            self.cols.append(vec)
+        return self.atoms[key]
+
+    def code(self, V, tag):
+        """Exact sparse codes of V's rows: (rows, atom index, coefficient) triples."""
+        rows, idx, val = [], [], []
+        corr = V @ self.R.T if len(self.R) else np.zeros((len(V), 0))
+        for r in range(len(V)):
+            v = V[r]
+            nv = np.linalg.norm(v)
+            if nv == 0:
+                continue
+            support, res = [], v.copy()
+            c = corr[r].copy()
+            coef = np.zeros(0)
+            while len(support) < 64 and len(self.R):
+                if support:
+                    c = self.R @ res
+                k = int(np.abs(c).argmax())
+                if abs(c[k]) <= 1e-9 * nv or k in support:
+                    break
+                support.append(k)
+                S = self.R[support].T
+                coef = np.linalg.lstsq(S, v, rcond=None)[0]
+                res = v - S @ coef
+                if np.linalg.norm(res) <= 1e-10 * nv:
+                    break
+            res[np.abs(res) <= 1e-12 * nv] = 0.0
+            axes = np.nonzero(res)[0]
+            if len(support) + len(axes) > self.limit:
+                k = self.atom(("o", f"{tag}:{r}"), v.copy())   # the vector itself: its code is the atom, weight 1
+                self.own_count += 1
+                rows.append(r), idx.append(k), val.append(1.0)
+                continue
+            for k, cf in zip(support, coef):
+                if abs(cf) > 1e-12 * nv:
+                    nz = np.nonzero(self.R[k])[0]
+                    if len(nz) == 1:   # a recurring direction that is an axis is named as the axis
+                        rows.append(r), idx.append(self.atom(("x", int(nz[0])))), val.append(cf * self.R[k, nz[0]])
+                    else:
+                        rows.append(r), idx.append(self.atom(("r", int(k)), self.R[k])), val.append(cf)
+            for j in axes:
+                rows.append(r), idx.append(self.atom(("x", int(j)))), val.append(res[j])
+        return np.array(rows, dtype=np.int64), np.array(idx, dtype=np.int64), np.array(val)
+
+    def bits(self):
+        """The learned atoms' definition: a recurring or own atom its d numbers, an axis its index."""
+        learned = sum(1 for key in self.atoms if key[0] in ("r", "o"))
+        return learned * self.d * self.B + len(self.atoms) * math.log2(max(self.d, 2))
+
+
+# ---------------------------------------------------------------------------------------------- the split
 
 
 class Rep:
-    """The atoms, the edges and the items (edges and cells) every explanation partitions into blocks."""
+    """The items every explanation partitions into blocks: read edges ('r', map, receiver, atom) and write edges
+    ('w', layer, neuron, atom), with their weights."""
 
-    def __init__(self, toy: Toy, fit_rows: np.ndarray):
-        self.toy = toy
-        self.A0, self.const = input_atoms(fit_rows)
-        self.n_in = self.A0.shape[1]
-        self.dual0 = sla.pinv(self.A0)
-        L, m = toy.L, [w.shape[0] for w in toy.fc]
-        # global atom ids: inputs 0..n_in-1, then each layer's neurons
-        self.off = [self.n_in + sum(m[:l]) for l in range(L + 1)]
-        self.n_atoms = self.off[L]
-        self.A = [np.column_stack([self.A0] + toy.dn[:l]) for l in range(L + 1)]
-        self.E = [toy.fc[l] @ self.A[l] for l in range(L)]
-        self.H = toy.head @ self.A[L]
-        self.G = [toy.dn[l].T @ toy.dn[l] for l in range(L)]
-        # items: (kind, map, receiver, sender) with kind 'e' (an edge of c_fc^map or of the head, map = L) or 'c'
-        # (a cell: neuron receiver of layer map)
+    def __init__(self, toy: Toy, B):
+        t0 = time.time()
+        self.toy, self.B = toy, B
+        D = self.D = Dictionary(toy, B)
+        L, self.m = toy.L, [w.shape[0] for w in toy.fc]
+        self.C = D.A.shape[1]
+        rows, idx, val = D.input_codes
+        self.S0 = sp.csr_matrix((val, (rows, idx)), shape=(toy.wte.shape[0], self.C))
+        readable = set(idx.tolist())
         items, w = [], []
         for l in range(L + 1):
-            M_ = self.E[l] if l < L else self.H
-            tol = 1e-9 * np.abs(M_).max()
-            for i, k in zip(*np.nonzero(np.abs(M_) > tol)):
-                items.append(("e", l, int(i), int(k)))
-                w.append(float(M_[i, k]))
-        for l in range(L):
-            for n in range(m[l]):
-                items.append(("c", l, n, self.off[l] + n))
-                w.append(1.0)
+            M_ = toy.fc[l] if l < L else toy.head
+            ks = np.array(sorted(readable), dtype=np.int64)
+            E = M_ @ D.A[:, ks]
+            tol = 1e-12 * max(np.abs(E).max(), 1e-300)
+            for i, x in zip(*np.nonzero(np.abs(E) > tol)):
+                items.append(("r", l, int(i), int(ks[x])))
+                w.append(float(E[i, x]))
+            if l < L:
+                nr, nk, nv = D.neuron_codes[l]
+                for n, k, c in zip(nr, nk, nv):
+                    items.append(("w", l, int(n), int(k)))
+                    w.append(float(c))
+                readable |= set(nk.tolist())
         self.items, self.w = items, np.array(w)
-        self.index = {it: j for j, it in enumerate(items)}
-        self.m = m
-        self.n_recv = m + [toy.head.shape[0]]
-        self.scale = max(np.abs(self.E[l]).max() for l in range(L)) if L else 1.0
-        self.scale = max(self.scale, np.abs(self.H).max())
-
-    def coeffs(self, R):
-        return R @ self.dual0.T
-
-    def check_split(self, R):
-        """M through the edges (every item on) against M itself: the split's error on these inputs."""
-        s = self.coeffs(R)
-        recon = s @ self.A0.T - R
-        for l in range(self.toy.L):
-            a = self.toy.act(s @ self.E[l].T)
-            s = np.column_stack([s, a])
-        y = s @ self.H.T + self.toy.bias
-        y = np.maximum(y, 0.0) if self.toy.relu_head else y
-        return float(np.abs(recon).max()), float(np.abs(y - self.toy.run(R)).max())
-
-
-def input_atoms(R):
-    """The input atoms (module note) as columns, and the constant atom's index (None without one)."""
-    mu = R.mean(0)
-    X = R - mu
-    sv = sla.svdvals(X)
-    rank = int(np.sum(sv > sv[0] * max(X.shape) * np.finfo(float).eps))
-    support = np.nonzero(np.abs(X).max(0) > 0)[0]
-    if len(support) == rank:
-        # the stream varies in exactly `rank` coordinates: they are the atoms
-        A = np.eye(R.shape[1])[:, support]
-        rest = mu - A @ (A.T @ mu)
-        if np.linalg.norm(rest) <= 1e-12 * max(np.linalg.norm(mu), 1e-300):
-            return A, None
-        return np.column_stack([snap(rest), A]), 0
-    A = FastICA(rank, whiten="unit-variance", random_state=0, max_iter=2000, tol=1e-6).fit(X).mixing_
-    A = A * np.sign(A[np.abs(A).argmax(0), np.arange(rank)])
-    norms = np.linalg.norm(A, axis=0)
-    U = R / np.maximum(np.linalg.norm(R, axis=1, keepdims=True), 1e-300)
-    for k in range(rank):
-        top = int(np.abs(A[:, k]).argmax())
-        if abs(A[top, k]) / norms[k] > 0.98:
-            A[:, k] = 0.0
-            A[top, k] = norms[k]
-            continue
-        # rows near this component; among them the largest set along one exact direction
-        near = U[np.abs(U @ (A[:, k] / norms[k])) > 0.99]
-        if len(near) >= 2:
-            near = near * np.sign(near @ A[:, k])[:, None]
-            same = (near @ near.T) > 1 - 1e-10
-            top = int(same.sum(1).argmax())
-            if same[top].sum() >= 2:
-                A[:, k] = near[same[top]].mean(0)
-                A[:, k] *= norms[k] / np.linalg.norm(A[:, k])
-    A = A / np.linalg.norm(A, axis=0)
-    rest = mu - A @ sla.lstsq(A, mu)[0]
-    if np.linalg.norm(rest) <= 1e-9 * max(np.linalg.norm(mu), 1e-300):
-        return A, None
-    return np.column_stack([snap(rest), A]), 0
+        self.n_recv = self.m + [toy.head.shape[0]]
+        self.scale = float(np.abs(self.w).max())
+        self.unit = int(round(1.0 / self.scale * 2.0 ** B))   # a weight of exactly 1, quantized
+        self.const = None
+        # the constant atom: one every input carries with one coefficient (its read edges are biases)
+        col = self.S0.tocsc()
+        for k in range(self.C):
+            v = col[:, k].toarray().ravel()
+            if np.all(v != 0) and np.ptp(v) <= 1e-12 * abs(v[0]):
+                self.const = k
+                break
+        self.own_atom = {}
+        for key, k in D.atoms.items():
+            if key[0] == "o" and key[1].startswith("neuron"):
+                l_, n_ = key[1][6:].split(":")
+                self.own_atom[(int(l_), int(n_))] = k
+        self.kind = np.array([it[0] == "w" for it in items])
+        self.layer = np.array([it[1] for it in items])
+        self.recv = np.array([it[2] for it in items])
+        self.atom = np.array([it[3] for it in items])
+        self.seconds = time.time() - t0
 
 
-def snap(v):
-    """A unit direction: the coordinate axis it lies within 11 degrees of, else itself."""
-    top = int(np.abs(v).argmax())
-    if abs(v[top]) / np.linalg.norm(v) > 0.98:
-        return np.eye(len(v))[top] * np.sign(v[top])
-    return v / np.linalg.norm(v)
+EPS = 1e-9   # a guard is on where its block's own write exceeds this (to rounding: exact zeros are off)
+
+
+def m_run(rep, tokens):
+    """M's run in atom coefficients through the items (every one on): per layer the stream coefficients and the
+    activations, and the outputs."""
+    prog = Program(rep, {0: list(range(len(rep.items)))})
+    ss, aa = [], []
+    y = prog.run(rep.S0[tokens].toarray(), "all", ss, aa)
+    return ss, aa, y
+
+
+def scatter(vals, to, n):
+    """Sum the columns of vals into n columns by `to` (one sparse product)."""
+    S = sp.csr_matrix((np.ones(len(to)), (np.arange(len(to)), to)), shape=(len(to), n))
+    return np.asarray(vals @ S) if vals.shape[1] else np.zeros((vals.shape[0], n))
 
 
 class Run:
-    """M's run in atom coefficients on fixed inputs, with each item's contribution, for gates and checks."""
+    def __init__(self, rep, tokens):
+        self.rep, self.T = rep, len(tokens)
+        self.s, self.a, self.y = m_run(rep, tokens)
+        self.tokens = tokens
 
-    def __init__(self, rep: Rep, R):
-        self.rep, toy = rep, rep.toy
-        s = rep.coeffs(R)
-        self.s, self.pre, self.a = [], [], []
-        for l in range(toy.L):
-            self.s.append(s)
-            pre = s @ rep.E[l].T
-            a = toy.act(pre)
-            self.pre.append(pre)
-            self.a.append(a)
-            s = np.column_stack([s, a])
-        self.s.append(s)
-        self.T = R.shape[0]
-        self.y = toy.out(R + sum(self.a[l] @ toy.dn[l].T for l in range(toy.L)))
+    def live(self, l, k):
+        """Tokens on which atom k's coefficient is nonzero at layer l's input (cached)."""
+        key = (l, k)
+        if not hasattr(self, "_live"):
+            self._live = {}
+        if key not in self._live:
+            self._live[key] = self.s[min(l, len(self.s) - 1)][:, k] != 0
+        return self._live[key]
 
-    def contrib(self, j):
-        """Item j's contribution per token: an edge's E[i, k] s_k, a cell's activation."""
-        kind, l, i, k = self.rep.items[j]
-        if kind == "c":
-            return self.a[l][:, i]
-        return self.rep.w[j] * self.s[l][:, k]
-
-
-def gate_stage(rep, members):
-    """(layer, stage) of a block's gate: its earliest layer; there the cells' writes (stage 1) if it has cells in that
-    layer, else the c_fc pre-activations (stage 0); the head is layer L."""
-    layers = [rep.items[j][1] for j in members]
-    l0 = min(layers)
-    has_cell = any(rep.items[j][0] == "c" and rep.items[j][1] == l0 for j in members)
-    return l0, 1 if has_cell else 0
+    def contrib(self, js):
+        """Items' contributions per token (tokens x items): a read edge w s_k, a write edge c a_n."""
+        rep = self.rep
+        js = np.asarray(js)
+        out = np.empty((self.T, len(js)))
+        for l in set(rep.layer[js].tolist()):
+            sel = rep.layer[js] == l
+            jj = js[sel]
+            wr = rep.kind[jj]
+            vals = np.empty((self.T, len(jj)))
+            if (~wr).any():
+                vals[:, ~wr] = self.s[l][:, rep.atom[jj[~wr]]] * rep.w[jj[~wr]]
+            if wr.any():
+                vals[:, wr] = self.a[l][:, rep.recv[jj[wr]]] * rep.w[jj[wr]]
+            out[:, sel] = vals
+        return out
 
 
-def own_write(rep, run, members):
-    """The block's own write norm per token at its gate stage, from the run's (all-on) quantities."""
-    l0, st = gate_stage(rep, members)
-    if l0 < rep.toy.L and st == 1:
-        cells = [rep.items[j][2] for j in members if rep.items[j][0] == "c" and rep.items[j][1] == l0]
-        a = run.a[l0][:, cells]
-        return np.sqrt(np.maximum(np.einsum("ti,ij,tj->t", a, rep.G[l0][np.ix_(cells, cells)], a), 0.0))
-    js = [j for j in members if rep.items[j][1] == l0 and rep.items[j][0] == "e"]
-    recv = np.array([rep.items[j][2] for j in js])
-    vals = np.stack([run.contrib(j) for j in js], 1)
-    u, inv = np.unique(recv, return_inverse=True)
-    acc = np.zeros((run.T, len(u)))
-    np.add.at(acc.T, inv, vals.T)
+def gate_stage(rep, ms):
+    ms = np.asarray(ms)
+    l0 = int(rep.layer[ms].min())
+    st = int(bool((rep.kind[ms] & (rep.layer[ms] == l0)).any()))
+    return l0, st
+
+
+def own_write(rep, run, ms):
+    """The block's own write norm per token at its gate stage: its items there summed per receiver (a neuron's
+    pre-activation, an atom's coefficient, an output)."""
+    ms = np.asarray(ms)
+    l0, st = gate_stage(rep, ms)
+    js = ms[(rep.layer[ms] == l0) & (rep.kind[ms] == bool(st))]
+    to = rep.atom[js] if st else rep.recv[js]
+    u, inv = np.unique(to, return_inverse=True)
+    acc = scatter(run.contrib(js), inv, len(u))
     return np.sqrt((acc ** 2).sum(1))
 
 
-class Blocks:
-    """A partition of the items into blocks, with each block's gate (own write > tol) on the run."""
+def gate_of(rep, run, ms):
+    return own_write(rep, run, ms) > EPS
 
-    def __init__(self, rep, run, assign):
-        self.rep, self.run = rep, run
-        self.members = {}
-        for j, b in enumerate(assign):
-            self.members.setdefault(int(b), []).append(j)
-        self.on = {b: self.gate(ms) for b, ms in self.members.items()}
 
-    def gate(self, ms):
-        w = own_write(self.rep, self.run, ms)
-        return w > 1e-9 * max(1.0, float(w.max()))
+class Program:
+    """P compiled for batched execution: per map, its items grouped by (block, sender): each group's gated sender
+    column, one sparse product to the receivers; each stage's guards from the same groups, summed per (block,
+    receiver) by one sparse product and per block by another. Per token the work is the items' count, a constant
+    factor of M's."""
+
+    def __init__(self, rep, members):
+        self.rep = rep
+        self.ids = sorted(members)
+        blk = np.zeros(len(rep.items), dtype=np.int64)
+        for x, b in enumerate(self.ids):
+            blk[members[b]] = x
+        stage = np.array([gate_stage(rep, members[b]) for b in self.ids]).reshape(-1, 2)
+        L = rep.toy.L
+        self.read, self.write, self.gread, self.gwrite = [], [], [], []
+        for l in range(L + 1):
+            r_ = np.nonzero((~rep.kind) & (rep.layer == l))[0]
+            self.read.append(self.groups(blk[r_], rep.atom[r_], rep.recv[r_], rep.w[r_], rep.n_recv[l]))
+            here = np.nonzero((stage[:, 0] == l) & (stage[:, 1] == 0))[0]
+            sel = r_[np.isin(blk[r_], here)]
+            self.gread.append((here, self.guard_groups(blk[sel], rep.atom[sel], rep.recv[sel], rep.w[sel])))
+            if l < L:
+                w_ = np.nonzero(rep.kind & (rep.layer == l))[0]
+                self.write.append(self.groups(blk[w_], rep.recv[w_], rep.atom[w_], rep.w[w_], rep.C))
+                here = np.nonzero((stage[:, 0] == l) & (stage[:, 1] == 1))[0]
+                sel = w_[np.isin(blk[w_], here)]
+                self.gwrite.append((here, self.guard_groups(blk[sel], rep.recv[sel], rep.atom[sel], rep.w[sel])))
+
+    @staticmethod
+    def groups(b, src, dst, w, n_dst):
+        key = b * (int(src.max(initial=0)) + 1) + src
+        u, inv = np.unique(key, return_inverse=True)
+        gb, gs = u // (int(src.max(initial=0)) + 1), u % (int(src.max(initial=0)) + 1)
+        M = sp.csr_matrix((w, (inv, dst)), shape=(len(u), n_dst))
+        return gb, gs, M
+
+    def guard_groups(self, b, src, dst, w):
+        if not len(b):
+            return None
+        key_g = b * (int(src.max()) + 1) + src
+        ug, inv_g = np.unique(key_g, return_inverse=True)
+        gs = ug % (int(src.max()) + 1)
+        key_r = b * (int(dst.max()) + 1) + dst
+        ur, inv_r = np.unique(key_r, return_inverse=True)
+        M = sp.csr_matrix((w, (inv_g, inv_r)), shape=(len(ug), len(ur)))
+        to_block = sp.csr_matrix((np.ones(len(ur)), (np.arange(len(ur)), ur // (int(dst.max()) + 1))), shape=(len(ur), len(self.ids)))
+        return gs, M, to_block
+
+    @staticmethod
+    def apply(g, x, grp):
+        gb, gs, M = grp
+        if not len(gb):
+            return np.zeros((x.shape[0], M.shape[1]))
+        return np.asarray((g[:, gb] * x[:, gs]) @ M)
+
+    def guards(self, g, x, gg):
+        here, G = gg
+        if G is None:
+            return
+        gs, M, to_block = G
+        own = np.sqrt(np.asarray((np.asarray(x[:, gs] @ M) ** 2) @ to_block))
+        g[:, here] = own[:, here] > EPS
+
+    def run(self, s, mode="hard", ss=None, aa=None):
+        rep, toy = self.rep, self.rep.toy
+        g = np.ones((s.shape[0], len(self.ids)))
+        for l in range(toy.L + 1):
+            if ss is not None:
+                ss.append(s)
+            if mode == "hard":
+                self.guards(g, s, self.gread[l])
+            out = self.apply(g, s, self.read[l])
+            if l == toy.L:
+                y = out + toy.bias
+                return np.maximum(y, 0.0) if toy.relu_head else y
+            if mode == "hard":
+                self.guards(g, toy.act(self.apply(np.ones_like(g), s, self.read[l])), self.gwrite[l])
+            a = toy.act(out)
+            if aa is not None:
+                aa.append(a)
+            s = s + self.apply(g, a, self.write[l])
 
 
 # --------------------------------------------------------------------------------------------- the code
@@ -266,39 +410,40 @@ _DESC, _RAW = {}, {}
 def describe(rep, ms):
     key = tuple(sorted(ms))
     if key not in _DESC:
-        _DESC[key] = _describe(rep, ms)
+        _DESC[key] = _describe(rep, list(key))
     return _DESC[key]
 
 
 def _describe(rep, ms):
-    """A block's content: its units (cells with their in-edges and their atom's out-edges in the block), its roles
-    (senders and receivers every unit shares with one weight), its bindings (components of units sharing other
-    senders or receivers) with their patterns, and its raw edges (those outside the units)."""
-    toy = rep.toy
-    cells = {(rep.items[j][1], rep.items[j][2]) for j in ms if rep.items[j][0] == "c"}
-    atom_of = {rep.off[l] + n: (l, n) for l, n in cells}
-    units = {u: {"in": [], "out": []} for u in cells}
-    raw = []
-    rnd = lambda x: round(x / rep.scale, 6)  # noqa: E731
+    """Units (neurons writing in the block, with their read edges in and their writes), the block's reads of atoms its
+    units write (each with the binding of the writers), roles, bindings with their patterns, raw items."""
+    q = lambda x: int(round(x / rep.scale * 2.0 ** rep.B))  # noqa: E731
+    units, writers = {}, {}
     for j in ms:
-        kind, l, i, k = rep.items[j]
-        if kind == "c":
-            continue
-        if (l, i) in units:
-            units[(l, i)]["in"].append((("a", k), rnd(rep.w[j])))
-        elif k in atom_of:
-            units[atom_of[k]]["out"].append((("r", l, i), rnd(rep.w[j])))
+        if rep.kind[j]:
+            u = (int(rep.layer[j]), int(rep.recv[j]))
+            units.setdefault(u, {"in": [], "w": [], "items": []})
+            writers.setdefault(int(rep.atom[j]), set()).add(u)
+    raw, reads = [], {}
+    for j in ms:
+        l, i, k = int(rep.layer[j]), int(rep.recv[j]), int(rep.atom[j])
+        if rep.kind[j]:
+            units[(l, i)]["w"].append((("a", k), q(rep.w[j])))
+            units[(l, i)]["items"].append(j)
+        elif (l, i) in units:
+            units[(l, i)]["in"].append((("a", k), q(rep.w[j])))
+            units[(l, i)]["items"].append(j)
+        elif k in writers and all(u[0] < l for u in writers[k]):
+            reads.setdefault(k, []).append(j)
         else:
             raw.append(j)
     roles = set()
     if len(units) >= 2:
-        for side in ("in", "out"):
-            seen = {}
-            for u, d in units.items():
-                for key, w in d[side]:
-                    seen.setdefault(key, []).append(w)
-            roles |= {(side, key) for key, ws in seen.items() if len(ws) == len(units) and len(set(ws)) == 1}
-    # bindings: units joined by the senders or receivers they share outside the roles
+        seen = {}
+        for d in units.values():
+            for key, w in d["in"]:
+                seen.setdefault(key, []).append(w)
+        roles = {key for key, ws in seen.items() if len(ws) == len(units) and len(set(ws)) == 1}
     parent = {u: u for u in units}
 
     def find(u):
@@ -308,611 +453,602 @@ def _describe(rep, ms):
         return u
     by_key = {}
     for u, d in units.items():
-        for side in ("in", "out"):
-            for key, _ in d[side]:
-                if (side, key) not in roles:
-                    by_key.setdefault((side, key), []).append(u)
+        for key, _ in d["in"] + d["w"]:
+            if key not in roles:
+                by_key.setdefault(key, []).append(u)
     for us in by_key.values():
         for u in us[1:]:
             parent[find(u)] = find(us[0])
     comps = {}
     for u in units:
         comps.setdefault(find(u), []).append(u)
+    comp_of = {u: r for r, us in comps.items() for u in us}
+    comp_reads = {}
+    for k, js in reads.items():
+        comp_reads.setdefault(comp_of[min(writers[k])], []).extend(js)
     bindings = []
-    for us in comps.values():
-        bindings.append((pattern(units, us, roles), us))
+    for r, us in comps.items():
+        rd = [(("a", int(rep.atom[j])), ("r", int(rep.layer[j]), int(rep.recv[j])), q(rep.w[j])) for j in comp_reads.get(r, [])]
+        items = [j for u in us for j in units[u]["items"]] + comp_reads.get(r, [])
+        bindings.append((pattern(units, us, roles, rd), us, items))
     return {"units": units, "roles": roles, "bindings": bindings, "raw": raw}
 
 
-def pattern(units, us, roles):
-    """A binding's canonical pattern: its units' weights, the roles by weight, its own senders and receivers as slots
-    numbered in order of appearance, minimized over the orders of its units (up to 4; beyond, sorted)."""
+def pattern(units, us, roles, reads):
+    """A binding's canonical pattern: per unit its layer, its roles' weights, its own read edges and its writes, then
+    the binding's reads of the atoms it writes, with its atoms and receivers as slots numbered in order of
+    appearance; minimized over the orders of its units (up to 4; beyond, sorted by their own encodings). Ends with
+    the slots' count. A binding of more than GROUP units has no pattern another can share (it stays raw)."""
     def enc(order):
         slots, out = {}, []
         for u in order:
             d = units[u]
-            rec = [u[0]]
-            for side in ("in", "out"):
-                rw = sorted(w for key, w in d[side] if (side, key) in roles)
-                own = []
-                for key, w in sorted(((key, w) for key, w in d[side] if (side, key) not in roles), key=lambda kw: kw[1]):
-                    slot = slots.setdefault((side, key), len(slots))
-                    own.append((slot, key[0] if side == "in" else ("r", key[1]), w))
-                rec.append((tuple(rw), tuple(own)))
-            out.append(tuple(rec))
-        return tuple(out)
+            rw = tuple(sorted(w for key, w in d["in"] if key in roles))
+            own_in = tuple((slots.setdefault(key, len(slots)), w) for key, w in sorted(((k_, w) for k_, w in d["in"] if k_ not in roles), key=lambda kw: kw[1]))
+            wr = tuple((slots.setdefault(key, len(slots)), w) for key, w in sorted(d["w"], key=lambda kw: kw[1]))
+            out.append((u[0], rw, own_in, wr))
+        rd = tuple(sorted((slots.setdefault(ak, len(slots)), slots.setdefault(rk, len(slots)), w) for ak, rk, w in sorted(reads, key=lambda x: (x[2], x[1]))))
+        return (tuple(out), rd, len(slots))
+    if len(us) > GROUP:
+        return ("raw", tuple(sorted(us)))   # beyond a group of GROUP units a binding is no rule's
     if len(us) <= 4:
         return min(enc(p) for p in itertools.permutations(us))
     return enc(sorted(us, key=lambda u: enc([u])))
 
 
-def raw_bits(rep, js, B):
-    """Raw edges, per map: receivers and senders named, numbers dense (zeros charged) or the edges named in the
-    rectangle and their numbers."""
+GROUP = 32   # the most units a rule's binding holds (local: canonical forms cost the group, never the model)
+
+
+def body_bits(p, B, unit=None):
+    """A rule's body: its numbers (a weight of exactly +-1 costs its sign; `unit` its quantized value) and its units'
+    and slots' structure."""
+    units, rd, n_slots = p
+    ws = [w for u in units for w in u[1]] + [w for u in units for part in (u[2], u[3]) for _, w in part] + [w for _, _, w in rd]
+    return sum(1 if unit is not None and abs(w) == unit else B for w in ws) + len(units) + n_slots
+
+
+def raw_bits(rep, js, B, ms=()):
+    """Raw items, per map and kind: receivers and senders named, numbers dense (zeros charged) or the items named
+    in their rectangle and their numbers. Names are relative to what the block (ms) already holds: a neuron's own
+    atom is implied by the neuron, and an atom a neuron of the block writes is named among the block's atoms."""
     bits = 0.0
-    by_map = {}
+    groups = {}
     for j in js:
-        _, l, i, k = rep.items[j]
-        by_map.setdefault(l, []).append((i, k))
-    for l, ed in by_map.items():
-        R_, S_ = {i for i, _ in ed}, {k for _, k in ed}
-        n_s = rep.off[l] if l < rep.toy.L else rep.n_atoms
-        bits += name_set(rep.n_recv[l], len(R_)) + name_set(n_s, len(S_))
-        rect = len(R_) * len(S_)
-        bits += min(rect * B, log2C(rect, len(ed)) + len(ed) * B)
+        groups.setdefault((bool(rep.kind[j]), int(rep.layer[j])), []).append(j)
+    block_atoms = {int(rep.atom[j]) for j in ms if rep.kind[j]}
+    for (wr, l), g in groups.items():
+        R_ = set(rep.recv[g].tolist())
+        if wr:
+            S_ = {int(rep.atom[j]) for j in g if rep.own_atom.get((l, int(rep.recv[j]))) != int(rep.atom[j])}
+            inner = set()
+        else:
+            S_all = set(rep.atom[g].tolist())
+            inner = S_all & block_atoms
+            S_ = S_all - inner
+        bits += name_set(rep.n_recv[l], len(R_)) + (name_set(rep.C, len(S_)) if S_ else 0.0)
+        bits += name_set(len(block_atoms), len(inner)) if inner else 0.0
+        rect = len(R_) * len(set(rep.atom[g].tolist()))
+        nums = sum(1 if abs(abs(rep.w[j]) - 1.0) <= 1e-12 else B for j in g)
+        bits += min(rect * B, log2C(rect, len(g)) + nums)
     return bits
 
 
-def block_cost(rep, ms, count, B, rules_on=True):
-    """A block's per-token content bits (all but its index) and its definition bits, given every pattern's count of
-    bindings in the explanation (a pattern used twice or more is a rule)."""
+def block_cost(rep, ms, rule_status):
+    """(per-token content bits without the block's index and its rules' binding indices, definition bits)
+    given which of its bindings are rules."""
     d = describe(rep, ms)
-    is_rule = tuple(bool(rules_on and count.get(p, 0) >= 2) for p, _ in d["bindings"])
-    key = (tuple(sorted(ms)), is_rule)
+    key = (tuple(sorted(ms)), tuple(rule_status))
     if key not in _RAW:
         rawj = list(d["raw"])
-        cells_raw = 0
-        for (p, us), r in zip(d["bindings"], is_rule):
+        for (p, us, js), r in zip(d["bindings"], rule_status):
             if not r:
-                cells_raw += len(us)
-                unit_atoms = {rep.off[l] + n for l, n in us}
-                for j in ms:
-                    kind, l2, i, k = rep.items[j]
-                    if kind == "e" and ((l2, i) in us or k in unit_atoms):
-                        rawj.append(j)
-        _RAW[key] = raw_bits(rep, rawj, B) + (name_set(sum(rep.m), cells_raw) if cells_raw else 0.0)
-    role_names = sum(math.log2(rep.n_atoms) if side == "in" else math.log2(max(rep.n_recv[k_[1]], 2)) for side, k_ in d["roles"])
-    bits = role_names + _RAW[key]
-    dbits = B + role_names + _RAW[key]
-    for (p, us), r in zip(d["bindings"], is_rule):
-        if r:
-            bits += math.log2(count[p])
-            dbits += table_bits(rep, p, us)
-    return bits, dbits
-
-
-def patterns_of(rep, ms):
-    return [p for p, _ in describe(rep, ms)["bindings"]]
-
-
-def code(rep, blocks: Blocks, B, N, rules_on=True):
-    """Per-token bits (array over the run's tokens) and the definitions' bits of an explanation (rules_on False: every
-    binding raw, the dense code of the same blocks)."""
-    count = {}
-    for ms in blocks.members.values():
-        for p in patterns_of(rep, ms):
-            count[p] = count.get(p, 0) + 1
-    rules = {p: c for p, c in count.items() if c >= 2 and rules_on}
-    nB = len(blocks.members)
-    per_tok = np.zeros(blocks.run.T)
-    defs = rep.n_in * rep.A0.shape[0] * B   # the learned input atoms
-    rule_on = {p: np.zeros(blocks.run.T, bool) for p in rules}
-    per_block = {}
-    for b, ms in blocks.members.items():
-        bits, dbits = block_cost(rep, ms, count, B, rules_on)
-        per_block[b] = bits + math.log2(max(nB, 2))
-        per_tok += blocks.on[b] * per_block[b]
-        defs += dbits
-        for p in patterns_of(rep, ms):
-            if p in rules:
-                rule_on[p] |= blocks.on[b]
-    for p in rules:
-        per_tok += rule_on[p] * body_bits(p, B)
-        defs += body_bits(p, B)
-    return per_tok, defs, {"blocks": nB, "rules": len(rules), "bindings_in_rules": sum(rules.values()), "per_block": per_block, "rule_count": rules}
+                rawj += js
+        rb = raw_bits(rep, rawj, rep.B, ms)
+        role_names = len(d["roles"]) * math.log2(rep.C)
+        table = sum(len(us) * math.log2(sum(rep.m)) + p[2] * math.log2(rep.C) for (p, us, js), r in zip(d["bindings"], rule_status) if r)
+        _RAW[key] = (role_names + rb, rep.B + role_names + rb + table)
+    return _RAW[key]
 
 
 class State:
-    """An explanation under search, with what a move's change of J needs: each block's costs, the patterns' counts and
-    the blocks using each, the blocks on per token."""
+    """An explanation (blocks and their guards' tokens) with the aggregates a move's change of J reads: per block
+    its costs; per pattern its bindings' count, its users, per token its bindings on and its users on."""
 
-    def __init__(self, rep, run, members, on, B, N):
-        self.rep, self.run, self.B, self.N = rep, run, B, N
-        self.members, self.on = dict(members), dict(on)
-        self.count, self.users = {}, {}
-        for b, ms in self.members.items():
-            for p in patterns_of(rep, ms):
-                self.count[p] = self.count.get(p, 0) + 1
-                self.users.setdefault(p, set()).add(b)
-        self.cost = {b: block_cost(rep, ms, self.count, B) for b, ms in self.members.items()}
-        self.n_on = sum(on.astype(float) for on in self.on.values())
+    def __init__(self, rep, run, members, N):
+        self.rep, self.run, self.N, self.B = rep, run, N, rep.B
+        self.members = {b: list(ms) for b, ms in members.items()}
+        self.on = {b: gate_of(rep, run, ms) for b, ms in self.members.items()}
         self.fresh = max(self.members) + 1
+        self.count, self.users = {}, {}
+        self.bind_on, self.users_on = {}, {}
+        for b, ms in self.members.items():
+            self._add_patterns(b, +1)
+        self.cost = {b: block_cost(rep, ms, self.status(ms)) for b, ms in self.members.items()}
+        self.n_on = sum(o.astype(float) for o in self.on.values())
         self.J = self.total()
 
-    def total(self):
-        pt, defs, _ = code(self.rep, self, self.B, self.N)
-        return float(pt.mean()) + defs / self.N
+    def pats(self, ms):
+        out = {}
+        for p, us, js in describe(self.rep, ms)["bindings"]:
+            out[p] = out.get(p, 0) + 1
+        return out
 
-    def rule_on(self, p, drop=(), add=()):
-        on = np.zeros(self.run.T, bool)
-        for b in self.users.get(p, ()):
-            if b not in drop:
-                on |= self.on[b]
-        for ms, o in add:
-            if p in patterns_of(self.rep, ms):
-                on |= o
-        return on
+    def status(self, ms, count=None):
+        count = self.count if count is None else count
+        return [count.get(p, 0) >= 2 for p, _, _ in describe(self.rep, ms)["bindings"]]
+
+    def _add_patterns(self, b, sign):
+        on = self.on[b].astype(float)
+        for p, nb in self.pats(self.members[b]).items():
+            self.count[p] = self.count.get(p, 0) + sign * nb
+            us = self.users.setdefault(p, set())
+            (us.add if sign > 0 else us.discard)(b)
+            self.bind_on[p] = self.bind_on.get(p, 0.0) + sign * nb * on
+            self.users_on[p] = self.users_on.get(p, 0.0) + sign * on
+
+    def pattern_terms(self, p, count, bind_on, users_on):
+        if count < 2:
+            return 0.0
+        return math.log2(count) * bind_on + body_bits(p, self.B, self.rep.unit) * (users_on > 0)
+
+    def total(self):
+        """J counted from scratch (the check on the aggregates)."""
+        nB = len(self.members)
+        tok = sum(self.on[b] * (self.cost[b][0] + math.log2(max(nB, 2))) for b in self.members)
+        defs = self.rep.D.bits() + sum(self.cost[b][1] for b in self.members)
+        for p, c in self.count.items():
+            if c >= 2:
+                tok = tok + self.pattern_terms(p, c, self.bind_on[p], self.users_on[p])
+                defs += body_bits(p, self.B, self.rep.unit)
+        return float(np.mean(tok)) + defs / self.N
 
     def delta(self, c, parts, ons):
-        """J after replacing blocks c by `parts` (gated by `ons`), minus J now."""
-        rep, B = self.rep, self.B
-        new_count = dict(self.count)
+        """J after replacing blocks c by parts (with guards' tokens ons), minus J now."""
+        count = dict(self.count)
+        touched = {}
         for b in c:
-            for p in patterns_of(rep, self.members[b]):
-                new_count[p] -= 1
-        part_pats = [patterns_of(rep, ms) for ms in parts]
-        for ps in part_pats:
-            for p in ps:
-                new_count[p] = new_count.get(p, 0) + 1
-        touched = {p for b in c for p in patterns_of(rep, self.members[b])} | {p for ps in part_pats for p in ps}
-        changed = {p for p in touched if new_count.get(p, 0) != self.count.get(p, 0)}
-        affected = set().union(*[self.users.get(p, set()) for p in changed]) - set(c) if changed else set()
-        nB, nB2 = len(self.members), len(self.members) - len(c) + len(parts)
-        n_on2 = self.n_on - sum(self.on[b] for b in c) + sum(ons)
-        d_tok = math.log2(max(nB2, 2)) * n_on2 - math.log2(max(nB, 2)) * self.n_on
-        d_def = 0.0
-        for b in c:
-            d_tok = d_tok - self.on[b] * self.cost[b][0]
-            d_def -= self.cost[b][1]
+            for p, nb in self.pats(self.members[b]).items():
+                count[p] -= nb
+                touched.setdefault(p, [0.0, 0.0])
+                touched[p][0] = touched[p][0] - nb * self.on[b]
+                touched[p][1] = touched[p][1] - self.on[b]
         for ms, on in zip(parts, ons):
-            bits, dbits = block_cost(rep, ms, new_count, B)
-            d_tok = d_tok + on * bits
-            d_def += dbits
+            for p, nb in self.pats(ms).items():
+                count[p] = count.get(p, 0) + nb
+                touched.setdefault(p, [0.0, 0.0])
+                touched[p][0] = touched[p][0] + nb * on
+                touched[p][1] = touched[p][1] + on
+        flips = {p for p in touched if (count.get(p, 0) >= 2) != (self.count.get(p, 0) >= 2)}
+        affected = set().union(*[self.users.get(p, set()) for p in flips]) - set(c) if flips else set()
+        nB, nB2 = len(self.members), len(self.members) - len(c) + len(parts)
+        lg, lg2 = math.log2(max(nB, 2)), math.log2(max(nB2, 2))
+        n_on2 = self.n_on - sum(self.on[b] for b in c) + sum(ons)
+        tok = lg2 * n_on2 - lg * self.n_on
+        dfs = 0.0
+        for b in c:
+            tok = tok - self.on[b] * self.cost[b][0]
+            dfs -= self.cost[b][1]
+        for ms, on in zip(parts, ons):
+            cb = block_cost(self.rep, ms, self.status(ms, count))
+            tok = tok + on * cb[0]
+            dfs += cb[1]
         for b in affected:
-            bits, dbits = block_cost(rep, self.members[b], new_count, B)
-            d_tok = d_tok + self.on[b] * (bits - self.cost[b][0])
-            d_def += dbits - self.cost[b][1]
-        adds = list(zip(parts, ons))
-        for p in touched:
-            old_r, new_r = self.count.get(p, 0) >= 2, new_count.get(p, 0) >= 2
-            if old_r or new_r:
-                bb = body_bits(p, B)
-                if old_r:
-                    d_tok = d_tok - bb * self.rule_on(p)
-                    d_def -= bb
-                if new_r:
-                    d_tok = d_tok + bb * self.rule_on(p, drop=c, add=adds)
-                    d_def += bb
-        return float(np.mean(d_tok)) + d_def / self.N
+            cb = block_cost(self.rep, self.members[b], self.status(self.members[b], count))
+            tok = tok + self.on[b] * (cb[0] - self.cost[b][0])
+            dfs += cb[1] - self.cost[b][1]
+        for p, (dbo, duo) in touched.items():
+            old = self.pattern_terms(p, self.count.get(p, 0), self.bind_on.get(p, 0.0), self.users_on.get(p, 0.0))
+            new = self.pattern_terms(p, count.get(p, 0), self.bind_on.get(p, 0.0) + dbo, self.users_on.get(p, 0.0) + duo)
+            tok = tok + (new - old)
+            flip = (count.get(p, 0) >= 2) - (self.count.get(p, 0) >= 2)
+            if flip:
+                dfs += body_bits(p, self.B, self.rep.unit) * flip
+        return float(np.mean(tok)) + dfs / self.N
 
     def apply(self, c, parts, ons):
+        dJ = self.delta(c, parts, ons)
+        flips_before = dict(self.count)
         for b in c:
-            for p in patterns_of(self.rep, self.members[b]):
-                self.count[p] -= 1
-                self.users[p].discard(b)
+            self._add_patterns(b, -1)
             self.n_on = self.n_on - self.on[b]
             del self.members[b], self.on[b], self.cost[b]
+        new = []
         for ms, on in zip(parts, ons):
             b = self.fresh
             self.fresh += 1
-            self.members[b], self.on[b] = ms, on
-            for p in patterns_of(self.rep, ms):
-                self.count[p] = self.count.get(p, 0) + 1
-                self.users.setdefault(p, set()).add(b)
+            self.members[b], self.on[b] = list(ms), on
+            self._add_patterns(b, +1)
             self.n_on = self.n_on + on
-        self.cost = {b: block_cost(self.rep, ms, self.count, self.B) for b, ms in self.members.items()}
-        self.J = self.total()
-
-    def gate(self, ms):
-        return Blocks.gate(self, ms)
-
-
-def body_bits(p, B):
-    """A rule's body: its numbers (each unit's role and slot weights) and its slots' kinds."""
-    nums = sum(len(rw) + len(own) for unit in p for rw, own in unit[1:])
-    return nums * B + sum(len(own) for unit in p for _, own in unit[1:]) * 2 + len(p)
+            new.append(b)
+        changed = {p for p in set(flips_before) | set(self.count) if (flips_before.get(p, 0) >= 2) != (self.count.get(p, 0) >= 2)}
+        redo = set(new) | (set().union(*[self.users.get(p, set()) for p in changed]) if changed else set())
+        for b in redo:
+            self.cost[b] = block_cost(self.rep, self.members[b], self.status(self.members[b]))
+        self.J += dJ
 
 
-def table_bits(rep, p, us):
-    """A binding's row in its rule's table: its units' neurons and its slots' atoms or receivers."""
-    bits = len(us) * math.log2(sum(rep.m))
-    slots = {s for unit in p for _, own in unit[1:] for s, _, _ in own}
-    return bits + len(slots) * math.log2(rep.n_atoms)
+# ------------------------------------------------------------------------------------------------- moves
+
+
+def exact_if_gated(rep, run, ms, on):
+    """Gating the block by `on` keeps P = M: on its off tokens every item whose effect leaves the block (a read edge
+    into a neuron the block does not write for, a write, a head edge) contributes nothing."""
+    off = ~on
+    if not off.any():
+        return True
+    ms = np.asarray(ms)
+    writers = set(zip(rep.layer[ms][rep.kind[ms]].tolist(), rep.recv[ms][rep.kind[ms]].tolist()))
+    keep = np.array([j for j in ms if rep.kind[j] or rep.layer[j] == rep.toy.L or (int(rep.layer[j]), int(rep.recv[j])) not in writers], dtype=np.int64)
+    if not len(keep):
+        return True
+    # per item the largest |contribution| over the off tokens: |weight| times its sender's largest |value| there
+    worst = 0.0
+    for l in set(rep.layer[keep].tolist()):
+        for wr in (False, True):
+            jj = keep[(rep.layer[keep] == l) & (rep.kind[keep] == wr)]
+            if not len(jj):
+                continue
+            src = rep.recv[jj] if wr else rep.atom[jj]
+            u, inv = np.unique(src, return_inverse=True)
+            vals = (run.a[l] if wr else run.s[l])[off][:, u]
+            worst = max(worst, float((np.abs(vals).max(0)[inv] * np.abs(rep.w[jj])).max()))
+    return worst <= 1e-9 * rep.scale
+
+
+def candidates(rep, st):
+    """Merges, from short lists (no pairs over a whole bucket): a block with the blocks its read edges feed, or
+    that feed its neurons, or that read the atoms its neurons write; all blocks reading one atom; all blocks
+    firing on the same tokens, and each with the next one."""
+    where = {j: b for b, ms in st.members.items() for j in ms}
+    writer_block, reader_blocks, feed_blocks = {}, {}, {}
+    for j, b in where.items():
+        l, i, k = int(rep.layer[j]), int(rep.recv[j]), int(rep.atom[j])
+        if rep.kind[j]:
+            writer_block[(l, i)] = b
+        else:
+            if k != rep.const:
+                reader_blocks.setdefault(k, set()).add(b)
+            if l < rep.toy.L:
+                feed_blocks.setdefault((l, i), set()).add(b)
+    out = set()
+    for b, ms in st.members.items():
+        ms = np.asarray(ms)
+        reads = ms[~rep.kind[ms] & (rep.layer[ms] < rep.toy.L)]
+        fed = {writer_block[(int(rep.layer[j]), int(rep.recv[j]))] for j in reads if (int(rep.layer[j]), int(rep.recv[j])) in writer_block}
+        neurons = set(zip(rep.layer[ms][rep.kind[ms]].tolist(), rep.recv[ms][rep.kind[ms]].tolist()))
+        feed = set().union(*[feed_blocks.get(u, set()) for u in neurons]) if neurons else set()
+        fan = set().union(*[reader_blocks.get(int(k), set()) for k in rep.atom[ms][rep.kind[ms]]]) if neurons else set()
+        for grp in (fed, feed, fan, feed | fan):
+            if grp - {b}:
+                out.add(frozenset(grp | {b}))
+    for bs in reader_blocks.values():
+        if len(bs) > 1:
+            out.add(frozenset(bs))
+            s_ = sorted(bs)
+            out.update(frozenset(x) for x in zip(s_, s_[1:]))
+    by_on = {}
+    for b, on in st.on.items():
+        by_on.setdefault(on.tobytes(), []).append(b)
+    for bs in by_on.values():
+        if len(bs) > 1:
+            out.add(frozenset(bs))
+            s_ = sorted(bs)
+            out.update(frozenset(x) for x in zip(s_, s_[1:]))
+    return [(c, [[j for b in c for j in st.members[b]]]) for c in out if len(c) > 1]
+
+
+def splits(rep, st):
+    """A block's bindings grouped by their own guards' tokens (the rest one more block), and each group alone."""
+    out = []
+    for b, ms in st.members.items():
+        d = describe(rep, ms)
+        if len(d["bindings"]) < 2:
+            continue
+        by_on = {}
+        for p, us, js in d["bindings"]:
+            by_on.setdefault(gate_of(rep, st.run, js).tobytes(), []).extend(js)
+        parts = list(by_on.values())
+        if len(parts) < 2:
+            continue
+        rest = d["raw"]
+        out.append((frozenset([b]), parts + ([rest] if rest else [])))
+        for p_ in parts:
+            ps = set(p_)
+            out.append((frozenset([b]), [p_, [j for j in ms if j not in ps]]))
+    return out
+
+
+def transfers(rep, st):
+    """A block's read edges into neurons another block writes for, or reading atoms another block's neurons write,
+    moved into that block, where the target's guard is on wherever the moved edges write (the move can stay exact;
+    a bit test, before any scoring)."""
+    writer_block, atom_block = {}, {}
+    for b, ms in st.members.items():
+        for j in ms:
+            if rep.kind[j]:
+                writer_block[(int(rep.layer[j]), int(rep.recv[j]))] = b
+                atom_block[int(rep.atom[j])] = b
+    out = []
+    for b, ms in st.members.items():
+        to = {}
+        for j in ms:
+            if rep.kind[j]:
+                continue
+            x = writer_block.get((int(rep.layer[j]), int(rep.recv[j]))) if rep.layer[j] < rep.toy.L else None
+            if x is None or x == b:
+                x = atom_block.get(int(rep.atom[j]))
+            if x is not None and x != b:
+                to.setdefault(x, []).append(j)
+        for x, js in to.items():
+            live = np.zeros(st.run.T, bool)
+            for k in set(rep.atom[js].tolist()):
+                live |= st.run.live(int(rep.layer[js[0]]), k)
+            if (live & ~st.on[x]).any():
+                continue
+            moved = set(js)
+            rest = [j for j in ms if j not in moved]
+            out.append((frozenset([b, x]), ([rest] if rest else []) + [st.members[x] + js]))
+    return out
+
+
+def block_signature(rep, ms):
+    """A block's shape without its atoms' and receivers' identities: its bindings' patterns and its raw items'
+    kinds, layers and quantized weights (hashable)."""
+    d = describe(rep, ms)
+    q = lambda x: int(round(x / rep.scale * 2.0 ** rep.B))  # noqa: E731
+    raw = tuple(sorted((bool(rep.kind[j]), int(rep.layer[j]), q(rep.w[j])) for j in d["raw"]))
+    return (tuple(sorted(hash(p) for p, _, _ in d["bindings"])), raw)
+
+
+def lifted(rep, st, moves):
+    """Moves of one shape made at once: moves whose blocks have the same signatures (and parts the same sizes) are
+    joined, on disjoint blocks, into one move (a rule's bindings change together, keeping their rule). Grouping is
+    by hashing: no pairs."""
+    sig_cache = {}
+
+    def sig(b):
+        if b not in sig_cache:
+            sig_cache[b] = block_signature(rep, st.members[b])
+        return sig_cache[b]
+    groups = {}
+    for c, parts in moves:
+        key = (tuple(sorted(hash(sig(b)) for b in c)), tuple(sorted(len(p) for p in parts)))
+        groups.setdefault(key, []).append((c, parts))
+    out = []
+    for ms_ in groups.values():
+        if len(ms_) < 2:
+            continue
+        used, cs, ps = set(), set(), []
+        for c, parts in ms_:
+            if used & set(c):
+                continue
+            used |= set(c)
+            cs |= set(c)
+            ps += parts
+        if len(ps) > len(ms_[0][1]):
+            out.append((frozenset(cs), ps))
+    return out
+
+
+def search(rep, run, assign, N, log=print, max_rounds=200):
+    """Local search on J (module note). Returns the state and per-round wall times."""
+    members = {}
+    for j, b in enumerate(assign):
+        members.setdefault(int(b), []).append(j)
+    st = State(rep, run, members, N)
+    log(f"  start: {len(st.members)} blocks, J {st.J:.1f}")
+    bad, times = set(), []
+    for rnd in range(max_rounds):
+        t0 = time.time()
+        moves = candidates(rep, st) + splits(rep, st) + transfers(rep, st)
+        moves += lifted(rep, st, moves)
+        scored = []
+        for c, parts in moves:
+            key = (tuple(sorted(c)), tuple(sorted(len(p) for p in parts)))
+            if key in bad:
+                continue
+            if len(parts) == 1:
+                # a merge's guard reads its gate stage's items: where some merged blocks' guards read the same stage,
+                # their union is the merged guard's tokens (to cancellation); a merge that loses even so is not scored
+                stg = gate_stage(rep, parts[0])
+                same = [b for b in c if gate_stage(rep, st.members[b]) == stg]
+                if same and st.delta(c, parts, [np.logical_or.reduce([st.on[b] for b in same])]) >= -1e-9:
+                    continue
+            ons = [gate_of(rep, run, ms) for ms in parts]
+            if not all(exact_if_gated(rep, run, ms, on) for ms, on in zip(parts, ons)):
+                bad.add(key)
+                continue
+            dJ = st.delta(c, parts, ons)
+            if dJ < -1e-9:
+                scored.append((dJ, c, parts, ons))
+        applied = 0
+        used = set()
+        for dJ, c, parts, ons in sorted(scored, key=lambda x: x[0]):
+            if used & set(c) or (applied and st.delta(c, parts, ons) >= -1e-9):
+                continue
+            st.apply(c, parts, ons)
+            used |= set(c)
+            applied += 1
+        times.append({"round": rnd, "moves": len(moves), "applied": applied, "seconds": time.time() - t0})
+        if not applied:
+            break
+        log(f"  round {rnd}: {len(moves)} moves scored, {applied} applied, now {len(st.members)} blocks, J {st.J:.1f}, {times[-1]['seconds']:.2f} s")
+    J_full = st.total()
+    if abs(J_full - st.J) > 1e-6 * max(1.0, abs(J_full)):
+        log(f"  aggregates drifted: J {st.J:.4f} against a full count {J_full:.4f}")
+    st.J = J_full
+    log(f"  end: {len(st.members)} blocks, J {st.J:.1f}")
+    return st, times
 
 
 # ------------------------------------------------------------------------------------------ explanations
 
 
 def pieces(rep):
-    """The start: each atom's fan-out into each map, each neuron's cell with its bias edge (from the mean atom)."""
-    keys, assign = {}, []
-    for it in rep.items:
-        kind, l, i, k = it
-        if kind == "c":
-            key = ("cell", l, i)
-        elif k == rep.const and l < rep.toy.L:
-            key = ("cell", l, i)            # a bias edge goes with its neuron
+    """The start: each atom's reads per map; each neuron with its bias (the constant atom's read into it) and its
+    writes."""
+    keys = []
+    for j in range(len(rep.items)):
+        l, i, k = int(rep.layer[j]), int(rep.recv[j]), int(rep.atom[j])
+        if rep.kind[j] or (k == rep.const and l < rep.toy.L):
+            keys.append(("n", l, i))
         else:
-            key = ("fan", l, k)
-        assign.append(keys.setdefault(key, len(keys)))
-    return np.array(assign)
+            keys.append(("a", l, k))
+    ids = {key: x for x, key in enumerate(dict.fromkeys(keys))}
+    return np.array([ids[key] for key in keys])
 
 
 def neurons(rep):
-    """Rank-one neuron pieces (descent's rot arm's answer): each neuron one block, its in-edges, its cell and its atom's
-    out-edges; edges from input atoms to the head each atom's own block."""
-    assign = []
-    for kind, l, i, k in rep.items:
-        if kind == "c" or (kind == "e" and l < rep.toy.L):
-            key = (l, i)
-        elif k >= rep.n_in:
-            lay = max(x for x in range(rep.toy.L) if rep.off[x] <= k)
-            key = (lay, k - rep.off[lay])
+    """Rank-one neuron pieces: each neuron's read edges in, its writes and the reads of the atoms only it writes."""
+    writer = {}
+    for j in np.nonzero(rep.kind)[0]:
+        writer.setdefault(int(rep.atom[j]), set()).add((int(rep.layer[j]), int(rep.recv[j])))
+    keys = []
+    for j in range(len(rep.items)):
+        l, i, k = int(rep.layer[j]), int(rep.recv[j]), int(rep.atom[j])
+        if rep.kind[j] or l < rep.toy.L:
+            keys.append(("n", l, i))
+        elif k in writer and len(writer[k]) == 1:
+            keys.append(("n",) + min(writer[k]))
         else:
-            key = ("in", k)
-        assign.append(key)
-    ids = {key: x for x, key in enumerate(dict.fromkeys(assign))}
-    return np.array([ids[key] for key in assign])
+            keys.append(("a", l, k))
+    ids = {key: x for x, key in enumerate(dict.fromkeys(keys))}
+    return np.array([ids[key] for key in keys])
 
 
-def truth(rep, dense_neurons=False):
-    """The true blocks. gated_copy: per mechanism its neurons' cells, every edge into them and their atoms' out-edges.
-    resid_mlp: per function the fan-out of the input atom matched to its embedding direction (into both layers' c_fc
-    and the head), per neuron its cell with its bias and its atom's out-edges (dense_neurons: all neurons one block,
-    as SPD's W_out). Items no mechanism names stay pieces."""
+def truth(rep):
+    """The true blocks. gated_copy: per mechanism its neurons' reads in, their writes and the head's reads of the
+    atoms they write. resid_mlp: per function every read of its input atom (both layers' c_fc and the head); per
+    neuron its writes and the reads of its atom. Items no mechanism names stay pieces."""
     toy = rep.toy
-    start = pieces(rep)
-    assign = start + 10_000
-    mechs = toy.truth["mechanisms"]
+    assign = pieces(rep) + 10_000
     if toy.kind == "gated_copy":
-        for mi, m in enumerate(mechs):
-            dn = np.fromfile(toy.dir / m["operators"]["blocks.0.mlp.down_proj"]["file"], dtype="<f8").reshape(m["operators"]["blocks.0.mlp.down_proj"]["shape"])
-            neurons = set(np.nonzero(np.abs(dn).sum(0) > 0)[0].tolist())
-            atoms = {rep.off[0] + n for n in neurons}
-            for j, (kind, l, i, k) in enumerate(rep.items):
-                if (kind == "c" and i in neurons) or (kind == "e" and l == 0 and i in neurons) or (kind == "e" and k in atoms):
+        for mi, m in enumerate(toy.truth["mechanisms"]):
+            e = m["operators"]["blocks.0.mlp.down_proj"]
+            dn = np.fromfile(toy.dir / e["file"], dtype="<f8").reshape(e["shape"])
+            mine = set(np.nonzero(np.abs(dn).sum(0) > 0)[0].tolist())
+            atoms = {int(rep.atom[j]) for j in np.nonzero(rep.kind)[0] if rep.recv[j] in mine}
+            for j in range(len(rep.items)):
+                if (rep.layer[j] == 0 and rep.recv[j] in mine) or (not rep.kind[j] and rep.layer[j] == toy.L and rep.atom[j] in atoms):
                     assign[j] = mi
     elif toy.kind == "resid_mlp":
-        E = toy.head * toy.rec["config"]["head"]["task_residual"]       # the embedding rows (W_U = E^T)
-        first = 0 if rep.const is None else 1
-        Ain = rep.A0[:, first:]
-        cos = np.abs((E / np.linalg.norm(E, axis=1, keepdims=True)) @ (Ain / np.linalg.norm(Ain, axis=0, keepdims=True)))
-        match = first + cos.argmax(1)
+        E = toy.head * toy.rec["config"]["head"]["task_residual"]
+        A = rep.D.A / np.linalg.norm(rep.D.A, axis=0)
+        cos = np.abs((E / np.linalg.norm(E, axis=1, keepdims=True)) @ A)
+        match = cos.argmax(1)
         rep.atom_cos = cos.max(1)
         fn = {int(k): f for f, k in enumerate(match)}
-        for j, (kind, l, i, k) in enumerate(rep.items):
-            if kind == "e" and k in fn:
+        writer = {int(rep.atom[j]): (int(rep.layer[j]), int(rep.recv[j])) for j in np.nonzero(rep.kind)[0]}
+        for j in range(len(rep.items)):
+            k = int(rep.atom[j])
+            if not rep.kind[j] and k in fn:
                 assign[j] = fn[k]
-            elif kind == "c" or (kind == "e" and k == rep.const and l < toy.L) or (kind == "e" and k >= rep.n_in):
-                n_id = (l, i) if kind == "c" or k == rep.const else None
-                if kind == "e" and k >= rep.n_in:
-                    lay = max(x for x in range(toy.L) if rep.off[x] <= k)
-                    n_id = (lay, k - rep.off[lay])
-                assign[j] = 20_000 if dense_neurons else 30_000 + n_id[0] * 1000 + n_id[1]
+            elif rep.kind[j]:
+                assign[j] = 30_000 + 1000 * int(rep.layer[j]) + int(rep.recv[j])
+            elif k in writer:
+                assign[j] = 30_000 + 1000 * writer[k][0] + writer[k][1]
     return assign
 
 
-# ------------------------------------------------------------------------------------------------- search
+# ------------------------------------------------------------------------------------------------ execution
 
 
-def J_of(rep, blocks, B, N, rules_on=True):
-    pt, defs, info = code(rep, blocks, B, N, rules_on)
-    return float(pt.mean()) + defs / N, pt, defs, info
+def execute(rep, tokens, members, mode="hard", chunk=512):
+    """P on `tokens` (Program), every block gated by its guard on P's own run (mode 'hard') or every block on."""
+    prog = Program(rep, members)
+    return np.vstack([prog.run(rep.S0[tokens[i:i + chunk]].toarray(), mode) for i in range(0, len(tokens), chunk)])
 
 
-def exact_if_merged(rep, run, ms, on):
-    """Whether gating the merged block by `on` keeps P = M: on its off tokens, every edge whose receiver's cell is
-    outside the block writes nothing, and every cell in it is inactive."""
-    off = ~on
-    if not off.any():
-        return True
-    cells = {(rep.items[j][1], rep.items[j][2]) for j in ms if rep.items[j][0] == "c"}
-    for j in ms:
-        kind, l, i, k = rep.items[j]
-        if kind == "c" or (l < rep.toy.L and (l, i) not in cells) or l == rep.toy.L:
-            if np.abs(run.contrib(j)[off]).max() > 1e-9 * rep.scale:
-                return False
-    return True
+def errors(rep, tokens, members):
+    """P's error against M in bits per token (Gaussian head, outputs in units of the task residual), gated and with
+    every block on, and the seconds of P's and M's runs."""
+    y_m = rep.toy.run(rep.toy.wte[tokens])
+    t0 = time.time()
+    y_m = rep.toy.run(rep.toy.wte[tokens])
+    tm = time.time() - t0
+    t0 = time.time()
+    y_h = execute(rep, tokens, members, "hard")
+    tp = time.time() - t0
+    y_a = execute(rep, tokens, members, "all")
+    kl = lambda y: float(((y - y_m) ** 2).sum(1).mean() / (2 * LN2))  # noqa: E731
+    return {"hard": kl(y_h), "all_on": kl(y_a), "P_seconds": tp, "M_seconds": tm}
 
 
-def search(rep, run, assign, B, N, log=print, max_rounds=400, verbose=False):
-    """Local search on J from `assign`: each round scores every merge (candidates) and every split (splits) by its
-    change of J, then applies the improving ones on disjoint blocks, best first, each scored again just before (so
-    every applied move lowers J), with every new block's gating exact; ends when no move lowers J."""
-    blocks = Blocks(rep, run, assign)
-    st = State(rep, run, blocks.members, blocks.on, B, N)
-    log(f"  start: {len(st.members)} blocks, J {st.J:.1f}")
-    bad = set()
-    for rnd in range(max_rounds):
-        moves = [(c, [[j for b in c for j in st.members[b]]]) for c in candidates(rep, st)]
-        moves += [(frozenset([b]), parts) for b, parts in splits(rep, st)]
-        moves += transfers(rep, st)
-        scored = []
-        for c, parts in moves:
-            key = (tuple(sorted(c)), tuple(sorted(len(p) for p in parts)))
-            if key in bad:
-                continue
-            ons = [st.gate(ms) for ms in parts]
-            if not all(exact_if_merged(rep, run, ms, on) for ms, on in zip(parts, ons)):
-                bad.add(key)
-                continue
-            dJ = st.delta(c, parts, ons)
-            if dJ < -1e-9:
-                scored.append((dJ, c, parts, ons))
-        if not scored:
-            break
-        scored.sort(key=lambda x: x[0])
-        used, applied = set(), 0
-        for dJ, c, parts, ons in scored:
-            if used & set(c):
-                continue
-            if applied and st.delta(c, parts, ons) >= -1e-9:
-                continue
-            J0 = st.J
-            st.apply(c, parts, ons)
-            used |= set(c)
-            applied += 1
-            if verbose:
-                log(f"    {'merge' if len(parts) == 1 else 'split'} {len(c)} -> {[len(p) for p in parts]} items, on {[round(float(o.mean()), 3) for o in ons]}, J {J0:.2f} -> {st.J:.2f}")
-        log(f"  round {rnd}: {applied} moves, now {len(st.members)} blocks, J {st.J:.1f}")
-    log(f"  end: {len(st.members)} blocks, J {st.J:.1f}")
-    assign = np.zeros(len(rep.items), dtype=np.int64)
-    for b, ms in st.members.items():
-        assign[ms] = b
-    return assign, st
-
-
-def splits(rep, blocks):
-    """Splits to try: a block's bindings (with the edges into and out of their units) grouped by their own gates'
-    tokens, the rest of its items one more block; and each such group peeled off alone."""
-    out = []
-    for b, ms in blocks.members.items():
-        d = describe(rep, ms)
-        if len(d["bindings"]) < 2:
-            continue
-        unit_of = {}
-        for g, (_, us) in enumerate(d["bindings"]):
-            for u in us:
-                unit_of[u] = g
-        groups = {}
-        rest = []
-        for j in ms:
-            kind, l, i, k = rep.items[j]
-            if kind == "c" or (l < rep.toy.L and (l, i) in unit_of):
-                groups.setdefault(unit_of[(l, i)], []).append(j)
-                continue
-            src = next(((l2, n) for (l2, n) in unit_of if rep.off[l2] + n == k), None)
-            if src is not None:
-                groups.setdefault(unit_of[src], []).append(j)
-            else:
-                rest.append(j)
-        by_on = {}
-        for g, js in groups.items():
-            by_on.setdefault(blocks.gate(js).tobytes(), []).extend(js)
-        parts = list(by_on.values())
-        if len(parts) < 2:
-            continue
-        out.append((b, parts + ([rest] if rest else [])))
-        for p_ in parts:
-            others = [j for j in ms if j not in set(p_)]
-            out.append((b, [p_, others]))
-    return out
-
-
-def transfers(rep, blocks):
-    """Moves of items between two blocks: the edges of a block that feed the cells another block holds, or that leave
-    the atoms of its cells, into that block."""
-    cell_block = {}
-    for b, ms in blocks.members.items():
-        for j in ms:
-            if rep.items[j][0] == "c":
-                cell_block[(rep.items[j][1], rep.items[j][2])] = b
-    atom_block = {rep.off[l] + n: b for (l, n), b in cell_block.items()}
-    out = []
-    for b, ms in blocks.members.items():
-        to = {}
-        for j in ms:
-            kind, l, i, k = rep.items[j]
-            if kind != "e":
-                continue
-            x = cell_block.get((l, i)) if l < rep.toy.L else None
-            if x is None or x == b:
-                x = atom_block.get(k)
-            if x is not None and x != b:
-                to.setdefault(x, []).append(j)
-        for x, js in to.items():
-            moved = set(js)
-            rest = [j for j in ms if j not in moved]
-            parts = ([rest] if rest else []) + [blocks.members[x] + js]
-            out.append((frozenset([b, x]), parts))
-    return out
-
-
-def candidates(rep, blocks):
-    """Merges to try: a block with the blocks holding the cells its c_fc edges feed, or the edges out of its cells'
-    atoms, or the edges into its cells; the blocks holding one atom's fan-outs and its cell; blocks that fire on the
-    same tokens."""
-    where = {}
-    for b, ms in blocks.members.items():
-        for j in ms:
-            where[j] = b
-    cell_block = {(rep.items[j][1], rep.items[j][2]): b for j, b in where.items() if rep.items[j][0] == "c"}
-    atom_blocks = {}
-    for j, b in where.items():
-        kind, l, i, k = rep.items[j]
-        a = rep.off[l] + i if kind == "c" else k
-        if kind == "c" or k != rep.const:
-            atom_blocks.setdefault(a, set()).add(b)
-    edges_from, edges_into = {}, {}
-    for j, b in where.items():
-        kind, l, i, k = rep.items[j]
-        if kind == "e":
-            edges_from.setdefault(k, set()).add(b)
-            if l < rep.toy.L:
-                edges_into.setdefault((l, i), set()).add(b)
-    out = set()
-    for b, ms in blocks.members.items():
-        fed = {cell_block[(rep.items[j][1], rep.items[j][2])] for j in ms
-               if rep.items[j][0] == "e" and rep.items[j][1] < rep.toy.L and (rep.items[j][1], rep.items[j][2]) in cell_block}
-        if fed - {b}:
-            out.add(frozenset(fed | {b}))
-        # the blocks holding the edges out of this block's cells' atoms, and those holding the edges into its cells
-        cells = [(rep.items[j][1], rep.items[j][2]) for j in ms if rep.items[j][0] == "c"]
-        fan = set().union(*[edges_from.get(rep.off[l] + n, set()) for l, n in cells]) if cells else set()
-        feed = set().union(*[edges_into.get(c, set()) for c in cells]) if cells else set()
-        for grp in (fan, feed, fan | feed):
-            if grp - {b}:
-                out.add(frozenset(grp | {b}))
-    for a, bs in atom_blocks.items():
-        if len(bs) > 1:
-            out.add(frozenset(bs))
-            for x, y in itertools.combinations(sorted(bs), 2):
-                out.add(frozenset((x, y)))
-    by_on = {}
-    for b, on in blocks.on.items():
-        by_on.setdefault(on.tobytes(), []).append(b)
-    for bs in by_on.values():
-        if len(bs) > 1:
-            out.add(frozenset(bs))
-            for x, y in itertools.combinations(sorted(bs), 2):
-                out.add(frozenset((x, y)))
-    return [c for c in out if len(c) > 1]
-
-
-# ----------------------------------------------------------------------------------------------- scoring
-
-
-def p_run_error(rep, R, members):
-    """P's hard-gated run on R (gates from P's own run), its error against M in bits per token (Gaussian head in units
-    of the task residual), and with every block on."""
-    toy = rep.toy
-    out = {}
-    for mode in ("hard", "all"):
-        s = rep.coeffs(R)
-        gates = {}
-        for l in range(toy.L + 1):
-            if l < toy.L:
-                pre_all = s @ rep.E[l].T
-                a_all = toy.act(pre_all)
-            # gates of the blocks whose stage is in this layer
-            sub = Run.__new__(Run)
-            sub.rep, sub.T = rep, R.shape[0]
-            sub.s = [None] * (toy.L + 1)
-            sub.a = [None] * toy.L
-            sub.s[l] = s
-            if l < toy.L:
-                sub.a[l] = a_all
-            for b, ms in members.items():
-                if gate_stage(rep, ms)[0] == l:
-                    w = own_write(rep, sub, ms) if mode == "hard" else np.ones(R.shape[0])
-                    gates[b] = w > 1e-9 * max(1.0, float(w.max())) if mode == "hard" else np.ones(R.shape[0], bool)
-            if l == toy.L:
-                break
-            g_item = {}
-            for b, ms in members.items():
-                for j in ms:
-                    g_item[j] = b
-            pre = np.zeros((R.shape[0], rep.m[l]))
-            cellg = np.ones((R.shape[0], rep.m[l]))
-            for j, (kind, l2, i, k) in enumerate(rep.items):
-                if l2 != l:
-                    continue
-                g = gates.get(g_item[j])
-                if g is None:   # a block gated later (a later layer's stage) is on until its gate
-                    g = np.ones(R.shape[0], bool)
-                if kind == "e":
-                    pre[:, i] += g * rep.w[j] * s[:, k]
-                else:
-                    cellg[:, i] = g
-            a = toy.act(pre) * cellg
-            s = np.column_stack([s, a])
-        y = np.zeros((R.shape[0], rep.H.shape[0])) + toy.bias
-        for j, (kind, l2, i, k) in enumerate(rep.items):
-            if kind == "e" and l2 == toy.L:
-                y[:, i] += gates[g_item[j]] * rep.w[j] * s[:, k]
-        y = np.maximum(y, 0.0) if toy.relu_head else y
-        out[mode] = float(((y - toy.run(R)) ** 2).sum(1).mean() / (2 * LN2))
-    return out
-
-
-def summary(rep, run, name, assign, B, N, true_assign=None, rules_on=True):
-    blocks = Blocks(rep, run, assign)
-    J, pt, defs, info = J_of(rep, blocks, B, N, rules_on)
-    sizes = sorted((len(ms) for ms in blocks.members.values()), reverse=True)
-    rec = {"explanation": name, "blocks": info["blocks"], "rules": info["rules"], "bindings_in_rules": info["bindings_in_rules"],
-           "bits_per_token": float(pt.mean()), "definitions_bits": float(defs), "J": J,
-           "blocks_on_per_token": float(np.mean([on.mean() for on in blocks.on.values()]) * len(blocks.on)),
-           "largest_blocks_items": sizes[:5]}
+def summary(rep, run, name, assign, N, true_assign=None):
+    members = {}
+    for j, b in enumerate(assign):
+        members.setdefault(int(b), []).append(j)
+    st = State(rep, run, members, N)
+    rules = {p: c for p, c in st.count.items() if c >= 2}
+    tok = float(st.J - (rep.D.bits() + sum(st.cost[b][1] for b in st.members) + sum(body_bits(p, rep.B, rep.unit) for p in rules)) / N)
+    rec = {"explanation": name, "blocks": len(st.members), "rules": len(rules), "bindings_in_rules": int(sum(rules.values())),
+           "bits_per_token": tok, "definitions_bits": float((st.J - tok) * N), "J": st.J,
+           "blocks_on_per_token": float(st.n_on.mean()), "largest_blocks_items": sorted((len(ms) for ms in st.members.values()), reverse=True)[:5]}
     if true_assign is not None:
-        rec["recovery"] = recovery(rep, run, blocks, Blocks(rep, run, true_assign))
-    return rec, blocks
+        rec["recovery"] = recovery(rep, run, st, true_assign)
+    return rec, st
 
 
-def recovery(rep, run, found, true):
-    """Per true block (of more than one item): the found block holding most of its items, the share of its items it
-    holds (and of the found block's items that are the true block's), and their gates' agreement (Jaccard)."""
-    where = {j: b for b, ms in found.members.items() for j in ms}
+def recovery(rep, run, st, true_assign):
+    where = {j: b for b, ms in st.members.items() for j in ms}
+    true = {}
+    for j, b in enumerate(true_assign):
+        true.setdefault(int(b), []).append(j)
     rows = []
-    for tb, ms in true.members.items():
-        if len(ms) < 2 or tb >= 10_000 and tb < 20_000:
+    for tb, ms in true.items():
+        if len(ms) < 2 or 10_000 <= tb < 20_000:
             continue
         hits = {}
         for j in ms:
             hits[where[j]] = hits.get(where[j], 0) + 1
         fb = max(hits, key=hits.get)
-        on_t, on_f = true.on[tb], found.on[fb]
-        rows.append({"true": int(tb), "items": len(ms), "found": int(fb), "found_items": len(found.members[fb]),
-                     "recall": hits[fb] / len(ms), "precision": hits[fb] / len(found.members[fb]),
+        on_t, on_f = gate_of(rep, run, ms), st.on[fb]
+        rows.append({"true": int(tb), "items": len(ms), "found": int(fb), "found_items": len(st.members[fb]),
+                     "recall": hits[fb] / len(ms), "precision": hits[fb] / len(st.members[fb]),
                      "gate_jaccard": float((on_t & on_f).sum() / max((on_t | on_f).sum(), 1)),
-                     "layers": sorted({rep.items[j][1] for j in found.members[fb]})})
+                     "layers": sorted(set(rep.layer[st.members[fb]].tolist()))})
     return rows
 
 
-def train_gates(rep, run, members, B, N, steps=600, seed=0, log=print):
-    """The thresholds trained as the design's gates are (torch, CPU): each block's gate on with probability Phi(z),
-    z = (own write - tau) / s, s a tenth of its own write's root mean square, drawn each pass (the hard program's law)
-    with Phi's gradient (straight through); loss = the hard program's data term (bits per token) + lambda E[bits per
-    token], lambda by dual ascent on E[bits] <= K (log lambda moves up to 1/20 per step, saturating at a 5% violation), K the
-    exact program's bits per token. Started all on (tau = -3 s).
-    Reports the budget's gradient on the thresholds at the start and the trained hard gates against the exact ones."""
+# --------------------------------------------------------------------------------------------- gate training
+
+
+def train_gates(rep, run, members, N, steps=600, seed=0, log=print):
+    """The guards' thresholds trained as the design's gates are (torch, CPU): each block on with probability Phi(z),
+    z = (own write - tau) / s (s a tenth of its own write's root mean square, the own write from M's run), drawn each
+    pass with Phi's gradient straight through; loss = the hard program's data term (bits per token) + lambda E[bits
+    per token], lambda by dual ascent on E[bits] <= K (K the exact program's bits per token; log lambda moves up to
+    1/20 per step, saturating at a 5% violation), from all on (tau = -3 s). Reports the budget's gradient on the
+    thresholds at the start, the trained hard gates against the exact ones, and the seconds per step."""
     import torch
     torch.manual_seed(seed)
     toy = rep.toy
-    blocks = Blocks(rep, run, np.zeros(len(rep.items), dtype=np.int64))
-    blocks.members = members
-    blocks.on = {b: blocks.gate(ms) for b, ms in members.items()}
-    pt, _, info = code(rep, blocks, B, N)
-    K = float(pt.mean())
-    ids = sorted(members)
+    st = State(rep, run, members, N)
+    ids = sorted(st.members)
     col = {b: x for x, b in enumerate(ids)}
-    own = np.stack([own_write(rep, run, members[b]) for b in ids], 1)
-    exact = np.stack([blocks.on[b] for b in ids], 1)
+    lg = math.log2(max(len(ids), 2))
+    K = float(st.J - (rep.D.bits() + sum(st.cost[b][1] for b in ids) + sum(body_bits(p, rep.B, rep.unit) for p, c in st.count.items() if c >= 2)) / N)
+    own = np.stack([own_write(rep, run, st.members[b]) for b in ids], 1)
+    exact = np.stack([st.on[b] for b in ids], 1)
     sc = 0.1 * np.sqrt((own ** 2).mean(0))
     sc[sc == 0] = 1.0
-    bits = torch.tensor([info["per_block"][b] for b in ids], dtype=torch.float32)
-    rules = []
-    for p_, cnt in info["rule_count"].items():
-        users = [col[b] for b in ids if p_ in patterns_of(rep, members[b])]
-        rules.append((torch.tensor(users), body_bits(p_, B)))
-    blk = np.zeros(len(rep.items), dtype=np.int64)
-    for b, ms in members.items():
-        blk[ms] = col[b]
+    rules = [(p, c) for p, c in st.count.items() if c >= 2]
+    bits = np.array([st.cost[b][0] + lg for b in ids])
+    per_bind = np.zeros((len(ids), len(rules)))
+    for r, (p, c) in enumerate(rules):
+        for b in st.users[p]:
+            per_bind[col[b], r] = st.pats(st.members[b])[p]
     T_ = torch.tensor
-    maps = []
-    for l in range(toy.L + 1):
-        e = [j for j, it in enumerate(rep.items) if it[0] == "e" and it[1] == l]
-        maps.append((T_([rep.items[j][2] for j in e]), T_([rep.items[j][3] for j in e]), T_(rep.w[e], dtype=torch.float32), T_(blk[e])))
-    cellb = [T_([blk[rep.index[("c", l, n, rep.off[l] + n)]] for n in range(rep.m[l])]) for l in range(toy.L)]
+    bits_t = T_(bits, dtype=torch.float32) + T_(per_bind @ np.array([math.log2(c) for p, c in rules]) if rules else np.zeros(len(ids)), dtype=torch.float32)
+    users = [T_(np.nonzero(per_bind[:, r])[0]) for r in range(len(rules))]
+    bodies = [body_bits(p, rep.B, rep.unit) for p, c in rules]
+    prog = Program(rep, st.members)
+
+    def tgroup(grp):
+        gb, gs, M = grp
+        Mt = M.T.tocoo()
+        return T_(gb), T_(gs), torch.sparse_coo_tensor(np.vstack([Mt.row, Mt.col]), T_(Mt.data, dtype=torch.float32), Mt.shape)
+    maps = [(tgroup(prog.read[l]), tgroup(prog.write[l]) if l < toy.L else None) for l in range(toy.L + 1)]
     s0 = T_(run.s[0], dtype=torch.float32)
     y_m = T_(run.y, dtype=torch.float32)
     own_t, sc_t, exact_t = T_(own, dtype=torch.float32), T_(sc, dtype=torch.float32), T_(exact)
@@ -921,83 +1057,91 @@ def train_gates(rep, run, members, B, N, steps=600, seed=0, log=print):
     act = torch.relu if toy.rec["config"]["mlp_act"] == "relu" else (lambda x: x)
     bias = T_(toy.bias, dtype=torch.float32)
 
+    def apply(g, x, grp):
+        gb, gs, Mt = grp
+        return torch.sparse.mm(Mt, (g[:, gb] * x[:, gs]).T).T
+
     def forward(g):
         s_ = s0
-        for l in range(toy.L):
-            r, k, w, b = maps[l]
-            pre = torch.zeros(s_.shape[0], rep.m[l]).index_add_(1, r, g[:, b] * w * s_[:, k])
-            s_ = torch.cat([s_, act(pre) * g[:, cellb[l]]], 1)
-        r, k, w, b = maps[toy.L]
-        y = bias + torch.zeros(s_.shape[0], len(bias)).index_add_(1, r, g[:, b] * w * s_[:, k])
-        return torch.relu(y) if toy.relu_head else y
+        for l in range(toy.L + 1):
+            out = apply(g, s_, maps[l][0])
+            if l == toy.L:
+                y = bias + out
+                return torch.relu(y) if toy.relu_head else y
+            s_ = s_ + apply(g, act(out), maps[l][1])
 
     def expected_bits(phi):
-        e = (phi * bits).sum(1)
-        for users, bb in rules:
-            e = e + bb * (1 - torch.prod(1 - phi[:, users], 1))
+        e = (phi * bits_t).sum(1)
+        for u, bb in zip(users, bodies):
+            e = e + bb * (1 - torch.prod(1 - phi[:, u], 1))
         return e.mean()
 
-    lam, H, hist = 1e-3, 20.0, []
+    lam, H, hist, t0 = 1e-3, 20.0, [], time.time()
     for step in range(steps + 1):
-        z = (own_t - theta * sc_t) / sc_t
+        z = own_t / sc_t - theta
         phi = 0.5 * (1 + torch.erf(z / math.sqrt(2)))
         g = torch.bernoulli(phi.detach()) + phi - phi.detach()
         data = ((forward(g) - y_m) ** 2).sum(1).mean() / (2 * LN2)
         e = expected_bits(phi)
         if step == 0:
             grad0 = torch.autograd.grad(e, theta, retain_graph=True)[0].abs().mean().item()
-        loss = data + lam * e
         opt.zero_grad()
-        loss.backward()
+        (data + lam * e).backward()
         opt.step()
-        # log lambda moves by up to 1/H per step, saturating at a 5% relative violation
         lam = lam * math.exp(max(-1.0, min(1.0, (e.item() - K) / K / 0.05)) / H)
         if step % 100 == 0 or step == steps:
             with torch.no_grad():
-                hard = (own_t - theta * sc_t) > 0
+                hard = own_t / sc_t - theta > 0
                 kl = ((forward(hard.float()) - y_m) ** 2).sum(1).mean().item() / (2 * LN2)
                 jac = float(((hard & exact_t).sum() / (hard | exact_t).sum().clamp_min(1)).item())
                 eh = expected_bits(hard.float()).item()
-            hist.append({"step": step, "lambda": lam, "E_bits_soft": round(e.item(), 1), "E_bits_hard": round(eh, 1), "K": round(K, 1),
-                         "hard_kl_bits": kl, "jaccard_with_exact_gates": round(jac, 4), "theta_mean": round(float(theta.detach().mean()), 3)})
-            log(f"  gates step {step}: E[bits] {e.item():.1f} (hard {eh:.1f}, K {K:.1f}), hard KL {kl:.3g}, gates vs exact Jaccard {jac:.4f}, theta mean {theta.mean().item():.2f}, lambda {lam:.3g}")
-    return {"budget_grad_on_thresholds_at_start": grad0, "trace": hist}
+            hist.append({"step": step, "E_bits_soft": round(e.item(), 1), "E_bits_hard": round(eh, 1), "K": round(K, 1),
+                         "hard_kl_bits": kl, "jaccard_with_exact_gates": round(jac, 4), "lambda": lam})
+            log(f"  gates step {step}: E[bits] {e.item():.1f} (hard {eh:.1f}, K {K:.1f}), hard KL {kl:.3g}, gates vs exact Jaccard {jac:.4f}, lambda {lam:.3g}")
+    return {"budget_grad_on_thresholds_at_start": grad0, "seconds_per_step": (time.time() - t0) / (steps + 1), "trace": hist}
+
+
+# ------------------------------------------------------------------------------------------------------ main
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("toy")
-    ap.add_argument("--bits", type=float, default=16.0)
+    ap.add_argument("--bits", type=int, default=16)
     ap.add_argument("--out")
-    ap.add_argument("--tokens", type=int, default=4096)
+    ap.add_argument("--tokens", type=int, default=2048)
     ap.add_argument("--gates", type=int, default=0, help="steps of gate training on the found blocks (0: none)")
     a = ap.parse_args()
     toy = Toy(Path(a.toy))
-    train = toy.wte[HELD:]
-    rep = Rep(toy, train)
-    print(f"{toy.name}: {rep.n_in} input atoms ({'one constant' if rep.const is not None else 'no constant'}), {sum(rep.m)} neurons, {len(rep.items)} items; "
-          f"split error (stream, outputs) {rep.check_split(toy.wte[:HELD])}", flush=True)
+    rep = Rep(toy, a.bits)
+    D = rep.D
+    print(f"{toy.name}: {rep.C} atoms ({sum(1 for k in D.atoms if k[0] == 'r')} recurring, {sum(1 for k in D.atoms if k[0] == 'x')} axes, "
+          f"{D.own_count} own), {sum(rep.m)} neurons, {len(rep.items)} items, constant atom {rep.const}; dictionary and split {rep.seconds:.1f} s", flush=True)
+    train = np.arange(HELD, toy.wte.shape[0])
     run = Run(rep, train[: a.tokens])
-    N = train.shape[0]
+    held = np.arange(min(HELD, 1024))
+    N = len(train)
     t_assign = truth(rep)
+    named = [("truth", t_assign), ("neuron pieces", neurons(rep)), ("pieces (start)", pieces(rep))]
     res = []
-    named = [("truth", t_assign, True), ("truth, dense code", t_assign, False), ("neuron pieces", neurons(rep), True),
-             ("neuron pieces, dense code", neurons(rep), False), ("pieces (start)", pieces(rep), True)]
-    if toy.kind == "resid_mlp":
-        named.append(("truth, neurons one block", truth(rep, True), True))
-    for name, asg, ro in named:
-        rec, _ = summary(rep, run, name, asg, a.bits, N, rules_on=ro)
+    for name, asg in named:
+        rec, st = summary(rep, run, name, asg, N)
+        rec["error_bits_per_token"] = errors(rep, held, st.members)
         res.append(rec)
     print("search:", flush=True)
-    found, _ = search(rep, run, pieces(rep), a.bits, N)
-    rec, fb = summary(rep, run, "found", found, a.bits, N, t_assign)
+    t0 = time.time()
+    st, times = search(rep, run, pieces(rep), N)
+    search_s = time.time() - t0
+    found = np.zeros(len(rep.items), dtype=np.int64)
+    for b, ms in st.members.items():
+        found[ms] = b
+    rec, st = summary(rep, run, "found", found, N, t_assign)
+    rec["error_bits_per_token"] = errors(rep, held, st.members)
+    rec["search_seconds"] = search_s
+    rec["round_seconds"] = [round(t["seconds"], 3) for t in times]
     res.append(rec)
-    held = toy.wte[:HELD][:1024]
-    for r_, asg in zip(res, [x[1] for x in named] + [found]):
-        r_["kl_bits_per_token"] = p_run_error(rep, held, Blocks(rep, Run(rep, held[:8]), asg).members)
     for r_ in res:
-        rr = {k: (round(v, 2) if isinstance(v, float) else v) for k, v in r_.items() if k != "recovery"}
-        print(json.dumps(rr), flush=True)
+        print(json.dumps({k: (round(v, 2) if isinstance(v, float) else v) for k, v in r_.items() if k not in ("recovery", "round_seconds")}), flush=True)
     rows = res[-1]["recovery"]
     exact = sum(r["recall"] == 1.0 and r["precision"] == 1.0 for r in rows)
     print(f"recovery: {exact} of {len(rows)} true blocks found exactly; mean recall {np.mean([r['recall'] for r in rows]):.3f}, "
@@ -1005,13 +1149,21 @@ def main():
     for r in rows:
         if r["recall"] < 1.0 or r["precision"] < 1.0:
             print("  not exact:", r)
+            break
     if getattr(rep, "atom_cos", None) is not None:
-        print(f"input atoms against the embedding directions: |cos| mean {rep.atom_cos.mean():.4f}, min {rep.atom_cos.min():.4f}")
+        print(f"input atoms against the embedding directions: |cos| mean {rep.atom_cos.mean():.6f}, min {rep.atom_cos.min():.6f}")
+    scale = {"toy": toy.name, "neurons": sum(rep.m), "atoms": rep.C, "items": len(rep.items), "dictionary_split_seconds": rep.seconds,
+             "library_bits": res[-1]["definitions_bits"], "bits_per_token": res[-1]["bits_per_token"], "search_seconds": search_s,
+             "search_rounds": len(times), "mean_round_seconds": float(np.mean([t["seconds"] for t in times])),
+             "P_over_M_seconds": res[-1]["error_bits_per_token"]["P_seconds"] / max(res[-1]["error_bits_per_token"]["M_seconds"], 1e-9)}
     if a.gates:
         print("gate training on the found blocks:", flush=True)
-        gt = train_gates(rep, Run(rep, train[: min(a.tokens, 1024)]), fb.members, a.bits, N, a.gates)
-        print(f"  the budget's gradient on the thresholds at the start: mean |dE/dtheta| {gt['budget_grad_on_thresholds_at_start']:.4g} bits per unit")
+        gt = train_gates(rep, Run(rep, train[:1024]), st.members, N, a.gates)
+        print(f"  the budget's gradient on the thresholds at the start: mean |dE/dtheta| {gt['budget_grad_on_thresholds_at_start']:.4g}; {gt['seconds_per_step']:.3f} s per step")
+        scale["gate_step_seconds"] = gt["seconds_per_step"]
         res.append({"gate_training": gt})
+    print("scale:", json.dumps({k: (round(v, 3) if isinstance(v, float) else v) for k, v in scale.items()}))
+    res.append({"scale": scale})
     if a.out:
         Path(a.out).write_text(json.dumps(res, indent=1, default=str))
 
