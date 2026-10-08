@@ -17,7 +17,7 @@ use gam_mpd::{
 };
 use ndarray::{Array1, Axis};
 use serde_json::{Value, json};
-use std::path::Path;
+use std::{collections::BTreeMap, path::Path};
 
 fn error(e: impl std::fmt::Display) -> String {
     e.to_string()
@@ -66,17 +66,27 @@ fn run() -> Result<(), String> {
         let mut target: Vec<Array1<f64>> = (0..sites).map(|s| Array1::zeros(width(s))).collect();
         let mut active: Vec<Array1<f64>> = (0..sites).map(|s| Array1::zeros(width(s))).collect();
         let (mut rows, mut target_rows) = (0usize, 0usize);
-        for (ids, targets) in &prompts {
-            let family = sequence_family(&[ids.as_slice()])?;
-            for (s, g) in vpd.importances(&family)?.into_iter().enumerate() {
-                sum[s] += &g.sum_axis(Axis(0));
-                active[s] += &g.mapv(|x| f64::from(u8::from(x > 0.0))).sum_axis(Axis(0));
-                for &t in targets.iter().filter(|&&t| t < g.nrows()) {
-                    target[s] += &g.row(t);
+        // prompts of one length run as one family (its rows sequence-major), at most 64 at a time
+        let mut by_length: BTreeMap<usize, Vec<&(Vec<u32>, Vec<usize>)>> = BTreeMap::new();
+        for p in &prompts {
+            by_length.entry(p.0.len()).or_default().push(p);
+        }
+        for (length, group) in &by_length {
+            for chunk in group.chunks(64) {
+                let views: Vec<&[u32]> = chunk.iter().map(|p| p.0.as_slice()).collect();
+                let family = sequence_family(&views)?;
+                for (s, g) in vpd.importances(&family)?.into_iter().enumerate() {
+                    sum[s] += &g.sum_axis(Axis(0));
+                    active[s] += &g.mapv(|x| f64::from(u8::from(x > 0.0))).sum_axis(Axis(0));
+                    for (i, p) in chunk.iter().enumerate() {
+                        for &t in p.1.iter().filter(|&&t| t < *length) {
+                            target[s] += &g.row(i * length + t);
+                        }
+                    }
                 }
+                rows += length * chunk.len();
+                target_rows += chunk.iter().map(|p| p.1.iter().filter(|&&t| t < *length).count()).sum::<usize>();
             }
-            rows += ids.len();
-            target_rows += targets.iter().filter(|&&t| t < ids.len()).count();
         }
         let per = |a: &Array1<f64>, n: usize| a.iter().map(|x| x / n.max(1) as f64).collect::<Vec<_>>();
         let record = json!({
