@@ -12,8 +12,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import grammar  # noqa: E402
 
-GOOD = """I copy the previous token.
-```python
+GOOD = """```python
 def answer(tokens):
     # x<val, a < b, `code`, x < prev, a <= b
     return tokens
@@ -22,6 +21,7 @@ def answer(tokens):
 align(answer, <p:2.v.559>, <p:2.o.735>)
 claim(answer, <p:1.q.3>, <p:1.k.rest>)
 ```
+
 Layer 2's value and output subcomponents copy it; `a < b`."""
 
 
@@ -51,13 +51,14 @@ def test_answers_against_the_grammar():
         return all(m.accept_token(t) for t in tok.encode(text, add_special_tokens=False)) and m.accept_token(tok.convert_tokens_to_ids("<|im_end|>"))
 
     assert accepts(GOOD)
-    assert accepts(GOOD.split("I copy the previous token.\n")[1])  # no prose before the block
+    assert not accepts("I copy the previous token.\n" + GOOD)  # no prose before the block (the teacher answers have none)
+    assert not accepts(GOOD + "\nA second line of English.")  # the explanation is one line, then the answer ends
     assert not accepts(GOOD.replace("# x<val", "# <p:2.v.559> x<val"))  # a part in a comment
     assert not accepts(GOOD.replace("<p:2.v.559>", "<p:2.v.1024>"))  # beyond v_proj's 1,024 subcomponents
     assert not accepts(GOOD.replace("<p:2.v.559>", "<p:7.v.5>"))  # no layer 7
     assert not accepts(GOOD + "\n```python\nx = 1\n```")  # a second block
     assert not accepts(GOOD.replace("copy it;", "copy <p:2.v.559>;"))  # a part in the English
-    assert not accepts(GOOD.replace("```\nLayer", "Layer"))  # the block never closes
+    assert not accepts(GOOD.replace("```\n\nLayer", "Layer"))  # the block never closes
 
 
 @pytest.mark.skipif(importlib.util.find_spec("xgrammar") is None, reason="xgrammar is not installed")

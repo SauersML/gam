@@ -1,15 +1,17 @@
 """The oracle answer's grammar for guided decoding (#2951 graph oracle, RL v2 item 6): vLLM samples only answers of
 the form
 
-  [prose] ```python
+  ```python
   <lines of code>
-  ``` [the English explanation]
+  ```
+
+  <the English explanation, one line>  (then the turn ends: the grammar admits nothing more)
 
 in which a part (<p:L.S.I>) appears only as an argument of a one-line align(variable, part, ...) or claim(variable,
 part, ...) statement, at least one align statement is written (an answer that aligns nothing is valid to mech and
 scores as the empty program plus its code: the loophole the 10-08 SFT fell into) and only as a part of the attached decomposition (the registry's part tokens, plus each
-site's remainder <p:L.S.rest>). Every other line and the prose around the block are free text with neither "<p:"
-nor three backticks in a row, so split_answer finds this block and mech reads every part where it can. The
+site's remainder <p:L.S.rest>). Every other code line and the explanation are free text with neither "<p:"
+nor three backticks in a row (the explanation also without a newline: an answer cannot ramble on after it), so split_answer finds this block and mech reads every part where it can. The
 grammar is xgrammar's EBNF; a part token and its spelling in ordinary tokens both match (a part token's text is
 its name). Validity redraws (train.py --resample) stay for what a grammar cannot see (unknown names, rules).
 
@@ -83,8 +85,8 @@ def vpd_tokens(model: str) -> list[str]:
 def answer_grammar(tokens: list[str]) -> str:
     """The answer's EBNF (module docstring) with parts drawn from `tokens`."""
     return "\n".join([
-        'root ::= text "```python\\n" code "```" text',
-        free("text", ""),
+        'root ::= "```python\\n" code "```\\n\\n" explanation',  # the teacher answers' form: the block, a blank line, one line of English, the end
+        free("explanation", "\\n"),
         "code ::= free_code (claim free_code)* align free_code (statement free_code)*",  # at least one align with a part
         free("free_code", "\\t"),  # no tabs in code: the teacher answers indent with spaces, and tab runs were a runaway
         "statement ::= align | claim",
@@ -125,7 +127,7 @@ def main():
     compiled = xgr.GrammarCompiler(xgr.TokenizerInfo.from_huggingface(tok)).compile_grammar(g)
     for path in a.check:
         matcher = xgr.GrammarMatcher(compiled)
-        ids = tok.encode(Path(path).read_text(), add_special_tokens=False)
+        ids = tok.encode(Path(path).read_text().strip(), add_special_tokens=False)  # as SFT targets are written (stripped)
         ok = all(matcher.accept_token(t) for t in ids)
         print(json.dumps({"answer": path, "accepted": ok, "complete": ok and matcher.accept_token(tok.eos_token_id)}))
 
