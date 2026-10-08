@@ -171,15 +171,24 @@ struct ArmRecord {
 }
 
 /// A layer's means over a calibration text with every part on (`M`'s): of the normed stream into
-/// its MLP (`mlp`, `E[x]`) and of the MLP's activations (`activation`, `E[act]`). With them the
-/// MLP's c_fc slices read `x − E[x]` and its down slices `act − E[act]`, and two always-on mean
-/// parts write `E[p] = W_fc E[x]` into the pre-activations and `W_dn E[act]` into the output, so
-/// every part on is still `M` and a part off is that part mean-ablated (the activation law's mean
-/// is not zero), as descent's mean parts (`DESCENT_MEANPARTS`).
+/// its attention (`attention`, `E[x]`), into its MLP (`mlp`, `E[x]`) and of the MLP's activations
+/// (`activation`, `E[act]`); each may be absent (empty). With the MLP's, its c_fc slices read
+/// `x − E[x]` and its down slices `act − E[act]`, and two always-on mean parts write
+/// `E[p] = W_fc E[x]` into the pre-activations and `W_dn E[act]` into the output. With the
+/// attention's, its q, k and v slices read `x − E[x]` and each head's q, k and v get always-on mean
+/// parts `W E[x]` (pre-rotation: with its q and k parts off a head attends by position alone, as
+/// descent's `DESCENT_MEANQK`), its o slices read the heads' outputs less their mean values
+/// (`E[v]`; the pattern's rows sum to one) and an always-on part writes `W_o E[v]`. Every part on
+/// is still `M`, and a part off is that part mean-ablated (the activation law's mean is not zero),
+/// as descent's mean parts (`DESCENT_MEANPARTS`).
 #[derive(Clone, Debug, Deserialize)]
 struct LayerMeans {
     layer: usize,
+    #[serde(default)]
+    attention: Vec<f64>,
+    #[serde(default)]
     mlp: Vec<f64>,
+    #[serde(default)]
     activation: Vec<f64>,
 }
 
@@ -735,6 +744,32 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
         if a_logits && (a_carried > 0 || a_comps.iter().any(|&b| !slices_on(b, site(Kind::Output)).is_empty())) {
             return Err(error(format!("layer {l}: a logit-read stage with carried components or o slices")));
         }
+        // The attention's mean parts (`LayerMeans`): `E[x]` at its input, and per head `M`'s q, k and
+        // v of it (pre-rotation).
+        let attn_means: Option<(Array1<f64>, Vec<[Array1<f64>; 3]>)> = match layer_means.iter().find(|m| m.layer == l && !m.attention.is_empty()) {
+            Some(m) => {
+                if m.attention.len() != d || a_logits {
+                    return Err(error(format!("layer {l}: attention means of {} for an input of {d}, or beside logit reads", m.attention.len())));
+                }
+                let ex = Array1::from(m.attention.clone());
+                let map = |node: usize| -> Result<Array1<f64>, String> {
+                    match &native.nodes[node] {
+                        Node::Affine { terms, bias: None } if terms.len() == 1 => Ok(native.operators[terms[0].1].matrix().dot(&ex)),
+                        other => Err(error(format!("layer {l}: a head's projection is {other:?}"))),
+                    }
+                };
+                let heads = layer
+                    .reads
+                    .iter()
+                    .map(|&read| match &native.nodes[read] {
+                        Node::Attend { query, key, value, .. } => Ok([map(*query)?, map(*key)?, map(*value)?]),
+                        _ => Err(error(format!("layer {l}: a head read is not an attention node"))),
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+                Some((ex, heads))
+            }
+            None => None,
+        };
         let logit_rows: Vec<bool> = a_comps.iter().flat_map(|&b| [q, k, v].map(|s| (slices_on(b, s).len(), matches!(components[b].read, Read::Logits { .. })))).flat_map(|(n, logit)| vec![logit; n]).collect();
         for (h, &read) in layer.reads.iter().enumerate() {
             let Node::Attend { query, key, value, scale, rotary, causal } = native.nodes[read].clone() else {
@@ -781,6 +816,20 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
                         }
                     }
                 }
+                if let Some((ex, heads)) = &attn_means {
+                    operators.push(Operator::identity(format!("{name}.attn.center"), x_interface.clone()));
+                    operators.push(dense(&format!("{name}.attn.center_bias"), x_interface.clone(), Interface::constant(), (-ex).insert_axis(Axis(1)))?);
+                    // A score stage's rules read every head's q and k: its first makes every head's q and k
+                    // means.
+                    for (h2, (means, &read2)) in heads.iter().zip(&layer.reads).enumerate().filter(|_| a_scored) {
+                        let Node::Attend { query: q2, key: k2, .. } = native.nodes[read2].clone() else {
+                            return Err(error(format!("layer {l} head {h2}: the read is not an attention node")));
+                        };
+                        for (j, node) in [q2, k2].into_iter().enumerate() {
+                            operators.push(dense(&format!("{name}.h{h2}.{}_mean", ["q", "k", "v"][j]), head_rows(node)?, Interface::constant(), means[j].clone().insert_axis(Axis(1)))?);
+                        }
+                    }
+                }
                 if a_logits {
                     let u = |r: usize, c: usize| factors[q].u[[read_rows[r].1, c]];
                     operators.append(&mut spread_ops(&format!("{name}.attn"), (&head_rows(key)?, layer.reads.len()), (rotary, scale.value()), (&stacked, &widths, &logit_rows), &u)?);
@@ -794,6 +843,12 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
                 };
                 (shared(&artifact, "read")?, shared(&artifact, gate_names.0)?, shared(&artifact, gate_names.1)?, shared(&artifact, "width")?)
             };
+            // Each head's rule makes its own v mean, and outside a score stage its q and k means.
+            if let Some((_, heads)) = &attn_means {
+                for (j, node) in [query, key, value].into_iter().enumerate().filter(|(j, _)| !a_scored || *j == 2) {
+                    operators.push(dense(&format!("{name}.h{h}.{}_mean", ["q", "k", "v"][j]), head_rows(node)?, Interface::constant(), heads[h][j].clone().insert_axis(Axis(1)))?);
+                }
+            }
             let assign = match (attn_shared, h) {
                 (false, _) => None,
                 (true, 0) => Some(if a_direction { base + 4 } else { base + 1 }),
@@ -815,6 +870,26 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
                     None => index_of(&artifact.program, part),
                 }
             };
+            // With mean parts, the slices read `x − E[x]` (`LayerMeans`), and each head's q, k and v
+            // add their means.
+            let reads_from = match &attn_means {
+                Some(_) => {
+                    nodes.push(Node::Affine { terms: vec![(0, find(&artifact, &operators, &format!("{name}.attn.center"))?)], bias: Some(find(&artifact, &operators, &format!("{name}.attn.center_bias"))?) });
+                    nodes.len() - 1
+                }
+                None => 0,
+            };
+            // Per head its q, k and v mean parts.
+            let mean_of = |h2: usize, j: usize| find(&artifact, &operators, &format!("{name}.h{h2}.{}_mean", ["q", "k", "v"][j]));
+            // This head's means, and a score stage's every head's q and k means.
+            let own_means: Option<[usize; 3]> = match &attn_means {
+                Some(_) => Some([mean_of(h, 0)?, mean_of(h, 1)?, mean_of(h, 2)?]),
+                None => None,
+            };
+            let score_means: Option<Vec<(usize, usize)>> = match (&attn_means, a_scored) {
+                (Some(_), true) => Some((0..layer.reads.len()).map(|h2| Ok((mean_of(h2, 0)?, mean_of(h2, 1)?))).collect::<Result<Vec<_>, String>>()?),
+                _ => None,
+            };
             let (gated, _, _) = if a_logits {
                 let writes: Vec<(usize, usize)> = (0..layer.reads.len())
                     .map(|h2| Ok((find(&artifact, &operators, &format!("{name}.h{h2}.q"))?, find(&artifact, &operators, &format!("{name}.h{h2}.k"))?)))
@@ -833,13 +908,13 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
                     .map(|h2| Ok((find(&artifact, &operators, &format!("{name}.h{h2}.q"))?, find(&artifact, &operators, &format!("{name}.h{h2}.k"))?)))
                     .collect::<Result<_, String>>()?;
                 let part = |p: &str| find(&artifact, &operators, &format!("{name}.attn.{p}"));
-                let (a, z) = score_gate_nodes(&mut nodes, (0, read_op, part("select0")?, part("select1")?, part("score_heads")?), &writes, (scale, rotary, causal, widths.len()), (gate_a, gate_b));
+                let (a, z) = score_gate_nodes(&mut nodes, (reads_from, read_op, part("select0")?, part("select1")?, part("score_heads")?), (&writes, score_means.as_deref()), (scale, rotary, causal, widths.len()), (gate_a, gate_b));
                 nodes.push(Node::Constant { operator: soft });
                 let w = nodes.len() - 1;
                 nodes.push(Node::Gated { value: a, gate: z, scale: Some(w) });
                 (Some(nodes.len() - 1), z, w)
             } else {
-                stage_nodes(&mut nodes, (0, 0), (read_op, gate_a, gate_b, soft), assign, a_direction, own, Some(parts), widths.len(), detector_ops(&artifact, &operators, base, &format!("{name}.attn")))
+                stage_nodes(&mut nodes, (0, reads_from), (read_op, gate_a, gate_b, soft), assign, a_direction, own, Some(parts), widths.len(), detector_ops(&artifact, &operators, base, &format!("{name}.attn")))
             };
             let gated = gated.ok_or("the gated reads")?;
             let mut projections = Vec::new();
@@ -865,7 +940,7 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
                     base + operators.len() - 1
                 };
                 nodes.push(Node::Affine { terms: vec![(gated, select)], bias: None });
-                nodes.push(Node::Affine { terms: vec![(nodes.len() - 1, write)], bias: None });
+                nodes.push(Node::Affine { terms: vec![(nodes.len() - 1, write)], bias: own_means.map(|m| m[j]) });
                 projections.push(nodes.len() - 1);
             }
             nodes.push(Node::Attend { query: projections[0], key: projections[1], value: projections[2], scale, rotary, causal });
@@ -903,10 +978,34 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
             let mut nodes: Vec<Node> = (0..inputs.len()).map(|index| Node::Param { index }).collect();
             nodes.push(Node::Concat { parts: (0..heads).collect() });
             let c = nodes.len() - 1;
+            // With mean parts (`LayerMeans`): the o slices read the heads' outputs less their mean
+            // values, an always-on part writes `W_o E[v]`, and the attention stage's recomputed gate
+            // reads `x − E[x]`.
+            let o_means = match &attn_means {
+                Some((_, heads_means)) => {
+                    let Node::Affine { terms, .. } = &native.nodes[layer.attention] else { return Err(error(format!("layer {l}: the attention's output is not one affine map"))) };
+                    let mut written = Array1::<f64>::zeros(out_rows.width());
+                    for (&read, means) in layer.reads.iter().zip(heads_means) {
+                        let (_, op) = terms.iter().find(|(a, _)| *a == read).ok_or_else(|| error(format!("layer {l}: a head the o map does not read")))?;
+                        written += &native.operators[*op].matrix().dot(&means[2]);
+                    }
+                    let values: Vec<f64> = heads_means.iter().flat_map(|m| m[2].iter().copied()).collect();
+                    let first = base + operators.len();
+                    operators.push(Operator::identity(format!("{name}.o.center"), concat.clone()));
+                    operators.push(dense(&format!("{name}.o.center_bias"), concat.clone(), Interface::constant(), Array1::from(values).mapv(|v| -v).insert_axis(Axis(1)))?);
+                    operators.push(dense(&format!("{name}.o.mean"), out_rows.clone(), Interface::constant(), written.insert_axis(Axis(1)))?);
+                    nodes.push(Node::Affine { terms: vec![(c, first)], bias: Some(first + 1) });
+                    let centered = nodes.len() - 1;
+                    nodes.push(Node::Affine { terms: vec![(heads, index_of(&artifact.program, &format!("{name}.attn.center"))?)], bias: Some(index_of(&artifact.program, &format!("{name}.attn.center_bias"))?) });
+                    Some((centered, nodes.len() - 1, first + 2))
+                }
+                None => None,
+            };
+            let o_reads = o_means.map_or(c, |(centered, _, _)| centered);
             // The o reads after their gate when the gate does not read them (no own norm gates), so
             // each row reads only its components on (`DeviceProgram`'s gated reads).
             let late = (!o_own.is_empty() && !o_direction).then(|| {
-                nodes.push(Node::Affine { terms: vec![(c, base)], bias: None });
+                nodes.push(Node::Affine { terms: vec![(o_reads, base)], bias: None });
                 nodes.len() - 1
             });
             // The gate columns of the o carriers: from the attention input stage's gate (recomputed
@@ -933,11 +1032,16 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
                     let Node::Attend { scale, rotary, causal, .. } = native.nodes[layer.reads[0]].clone() else {
                         return Err(error(format!("layer {l}: a head read is not an attention node")));
                     };
-                    let (_, z) = score_gate_nodes(&mut nodes, (heads, stage_ops.0, named("attn.select0")?, named("attn.select1")?, named("attn.score_heads")?), &writes, (scale, rotary, causal, widths.len()), (stage_ops.1, stage_ops.2));
+                    let means = match o_means {
+                        Some(_) => Some((0..heads).map(|h2| Ok((named(&format!("h{h2}.q_mean"))?, named(&format!("h{h2}.k_mean"))?))).collect::<Result<Vec<_>, String>>()?),
+                        None => None,
+                    };
+                    let x_reads = o_means.map_or(heads, |(_, x_centered, _)| x_centered);
+                    let (_, z) = score_gate_nodes(&mut nodes, (x_reads, stage_ops.0, named("attn.select0")?, named("attn.select1")?, named("attn.score_heads")?), (&writes, means.as_deref()), (scale, rotary, causal, widths.len()), (stage_ops.1, stage_ops.2));
                     nodes.push(Node::Constant { operator: stage_ops.3 });
                     (None, z, nodes.len() - 1)
                 } else {
-                    stage_nodes(&mut nodes, (heads, heads), stage_ops, assign, a_direction, own, None, widths.len(), detector_ops(&artifact, &[], 0, &format!("{name}.attn")))
+                    stage_nodes(&mut nodes, (heads, o_means.map_or(heads, |(_, x_centered, _)| x_centered)), stage_ops, assign, a_direction, own, None, widths.len(), detector_ops(&artifact, &[], 0, &format!("{name}.attn")))
                 };
                 operators.push(dense(&format!("{name}.o.select_gate"), units(carried.len())?, units(a_comps.len())?, selection(&carried, a_comps.len()))?);
                 nodes.push(Node::Affine { terms: vec![(z, base + operators.len() - 1)], bias: None });
@@ -970,11 +1074,11 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
             }
             let (z, s) = joined(&mut nodes, gate_parts, soft_parts);
             let a_o = late.unwrap_or_else(|| {
-                nodes.push(Node::Affine { terms: vec![(c, base)], bias: None });
+                nodes.push(Node::Affine { terms: vec![(o_reads, base)], bias: None });
                 nodes.len() - 1
             });
             nodes.push(Node::Gated { value: a_o, gate: z, scale: Some(s) });
-            nodes.push(Node::Affine { terms: vec![(nodes.len() - 1, base + 1)], bias: None });
+            nodes.push(Node::Affine { terms: vec![(nodes.len() - 1, base + 1)], bias: o_means.map(|(_, _, mean)| mean) });
             let arguments = inputs.iter().map(|&n| Argument::Native(n)).collect();
             let inputs = inputs.iter().map(|&n| node_interface(n)).collect::<Result<_, _>>()?;
             let rule = Rule { name: format!("{name}.o"), inputs, output: nodes.len() - 1, nodes };
@@ -1040,7 +1144,7 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
         let mut nodes: Vec<Node> = (0..inputs.len()).map(|index| Node::Param { index }).collect();
         // With mean parts (`LayerMeans`): the c_fc slices read `x − E[x]`, the down slices
         // `act − E[act]`, and `E[p]` and `W_dn E[act]` are written on every token.
-        let means = match layer_means.iter().find(|m| m.layer == l) {
+        let means = match layer_means.iter().find(|m| m.layer == l && !(m.mlp.is_empty() && m.activation.is_empty())) {
             Some(m) => {
                 if m.mlp.len() != d2 || m.activation.len() != hidden || f_active {
                     return Err(error(format!("layer {l}: means of {} and {} for an MLP of {d2} and {hidden}, or beside all-on activation reads", m.mlp.len(), m.activation.len())));
@@ -1578,12 +1682,13 @@ fn score_features(count: usize, heads: usize) -> Result<Interface, String> {
     concat_interface(&[units(count)?, score_heads(heads)?])
 }
 
-/// A score stage's gate pre-activations (`ScoreRead`) from its input `x`: its stacked reads
+/// A score stage's gate pre-activations (`ScoreRead`) from its input `x` (less its mean with mean
+/// parts, whose heads' q and k means `means` the scores' queries and keys add): its stacked reads
 /// (`read`), their `groups` group norms' logs and, per head (its q and k writes in `writes`, through
 /// the selections `select_q` and `select_k`), the largest score of its query over its keys with
 /// every q and k slice on (`Node::MaxScore`; `score_heads` the identity marking the stage), through
 /// the gate rows `gate` and the thresholds `threshold`; returns (the stacked reads, the gate node).
-fn score_gate_nodes(nodes: &mut Vec<Node>, (x, read, select_q, select_k, score_heads): (usize, usize, usize, usize, usize), writes: &[(usize, usize)], (scale, rotary, causal, groups): (Scale, Option<Rotary>, bool, usize), (gate, threshold): (usize, usize)) -> (usize, usize) {
+fn score_gate_nodes(nodes: &mut Vec<Node>, (x, read, select_q, select_k, score_heads): (usize, usize, usize, usize, usize), (writes, means): (&[(usize, usize)], Option<&[(usize, usize)]>), (scale, rotary, causal, groups): (Scale, Option<Rotary>, bool, usize), (gate, threshold): (usize, usize)) -> (usize, usize) {
     let push = |nodes: &mut Vec<Node>, node: Node| {
         nodes.push(node);
         nodes.len() - 1
@@ -1594,9 +1699,10 @@ fn score_gate_nodes(nodes: &mut Vec<Node>, (x, read, select_q, select_k, score_h
     let sq = push(nodes, Node::Affine { terms: vec![(a, select_q)], bias: None });
     let sk = push(nodes, Node::Affine { terms: vec![(a, select_k)], bias: None });
     let mut scores = Vec::with_capacity(writes.len());
-    for &(wq, wk) in writes {
-        let qh = push(nodes, Node::Affine { terms: vec![(sq, wq)], bias: None });
-        let kh = push(nodes, Node::Affine { terms: vec![(sk, wk)], bias: None });
+    for (h, &(wq, wk)) in writes.iter().enumerate() {
+        let mean = means.map(|m| m[h]);
+        let qh = push(nodes, Node::Affine { terms: vec![(sq, wq)], bias: mean.map(|m| m.0) });
+        let kh = push(nodes, Node::Affine { terms: vec![(sk, wk)], bias: mean.map(|m| m.1) });
         scores.push(push(nodes, Node::MaxScore { query: qh, key: kh, scale, rotary, causal }));
     }
     let joined = push(nodes, Node::Concat { parts: scores });
@@ -2390,8 +2496,9 @@ mod tests {
     }
 
     /// Mean parts (`LayerMeans`, from `M`'s run on the text itself): with every part on the
-    /// explanation is `M` (under 1e-5 bits); with every MLP part off each MLP writes its mean
-    /// output `W_dn E[act]` on every token and its pre-activations are `E[p] = W_fc E[x]`, its parts
+    /// explanation is `M` (under 1e-5 bits); with every part off each MLP writes its mean output
+    /// `W_dn E[act]` on every token and its pre-activations are `E[p] = W_fc E[x]`, each head's v
+    /// is its mean `W_v E[x]`, and the attention's output is `Σ_h W_o^h E[v_h]`: every part
     /// mean-ablated.
     #[test]
     fn mean_parts_keep_m_and_turn_off_to_the_mean() {
@@ -2407,13 +2514,13 @@ mod tests {
         let count = |site: usize| frames[site].0.ncols();
         let trace = native.execute(&imported.family, false).expect("M's trace");
         let mean = |node: usize| trace.values[node].mean_axis(ndarray::Axis(0)).expect("rows").to_vec();
-        let means: Vec<serde_json::Value> = (0..2).map(|l| serde_json::json!({"layer": l, "mlp": mean(layers[l].normed), "activation": mean(layers[l].active)})).collect();
+        let means: Vec<serde_json::Value> = (0..2).map(|l| serde_json::json!({"layer": l, "attention": mean(layers[l].normed_stream), "mlp": mean(layers[l].normed), "activation": mean(layers[l].active)})).collect();
         let arm = |name: &str, tau: f64| {
             let mut components = Vec::new();
             for l in 0..2 {
                 let (q, o, fc, dn) = (6 * l, 6 * l + 3, 6 * l + 4, 6 * l + 5);
                 let slices: Vec<[usize; 2]> = (q..=o).flat_map(|s| (0..count(s)).map(move |i| [s, i])).collect();
-                components.push(serde_json::json!({"read": {"own": [q, 0]}, "tau": -1.0, "slices": slices}));
+                components.push(serde_json::json!({"read": {"own": [q, 0]}, "tau": tau, "slices": slices}));
                 components.extend((0..count(fc)).map(|i| serde_json::json!({"read": {"own": [fc, i]}, "tau": tau, "slices": [[fc, i], [dn, i]]})));
                 components.extend((count(fc)..count(dn)).map(|i| serde_json::json!({"read": {"own": [dn, i]}, "tau": tau, "slices": [[dn, i]]})));
             }
@@ -2434,6 +2541,28 @@ mod tests {
         let (flat, _, _) = crate::interchange::sites(&off.artifact, &layers).expect("the flat program");
         let p_trace = flat.execute(&imported.family, false).expect("P's trace");
         for l in 0..2 {
+            let heads = layers[l].reads.len();
+            let mut parts: Vec<String> = (0..heads).map(|h| format!("h{h}.v_mean")).collect();
+            parts.extend(["o.mean".to_string(), "mlp.fc_mean".to_string()]);
+            for part in parts {
+                let bias = super::index_of(&flat, &format!("library.l{l}.{part}")).expect("the mean part");
+                let node = flat.nodes.iter().position(|n| matches!(n, Node::Affine { bias: Some(b), .. } if *b == bias)).expect("its node");
+                let row = flat.operators[bias].matrix().column(0).to_owned();
+                let gap = p_trace.values[node].rows().into_iter().map(|r| (&r - &row).iter().fold(0.0_f64, |m, e| m.max(e.abs()))).fold(0.0_f64, f64::max);
+                assert!(gap <= 1e-12 * row.iter().fold(1.0_f64, |m, e| m.max(e.abs())), "layer {l} {part}: every token writes the mean, off by {gap}");
+            }
+            let ex = Array1::from(mean(layers[l].normed_stream));
+            let Node::Affine { terms, .. } = &native.nodes[layers[l].attention] else { panic!("the o map") };
+            let mut want = Array1::<f64>::zeros(native.operators[terms[0].1].rows.width());
+            for &read in &layers[l].reads {
+                let Node::Attend { value, .. } = &native.nodes[read] else { panic!("a head") };
+                let Node::Affine { terms: v, .. } = &native.nodes[*value] else { panic!("a value map") };
+                let (_, op) = terms.iter().find(|(a, _)| *a == read).expect("the head's o columns");
+                want += &native.operators[*op].matrix().dot(&native.operators[v[0].1].matrix().dot(&ex));
+            }
+            let o_mean = flat.operators[super::index_of(&flat, &format!("library.l{l}.o.mean")).expect("the o mean")].matrix().column(0).to_owned();
+            let err = (&o_mean - &want).iter().fold(0.0_f64, |m, e| m.max(e.abs()));
+            assert!(err <= 1e-12 * want.iter().fold(1.0_f64, |m, e| m.max(e.abs())), "layer {l}: the o mean part is Σ W_o^h E[v_h], off by {err}");
             for (part, want) in [("fc_mean", None), ("dn_mean", Some(()))] {
                 let bias = super::index_of(&flat, &format!("library.l{l}.mlp.{part}")).expect("the mean part");
                 let node = flat.nodes.iter().position(|n| matches!(n, Node::Affine { bias: Some(b), .. } if *b == bias)).expect("its node");
@@ -2485,8 +2614,12 @@ mod tests {
             components.extend((0..count(fc)).map(|i| serde_json::json!({"read": {"own": [fc, i]}, "tau": -1.0, "slices": [[fc, i], [dn, i]]})));
             components.extend((count(fc)..count(dn)).map(|i| serde_json::json!({"read": {"own": [dn, i]}, "tau": -1.0, "slices": [[dn, i]]})));
         }
+        // The same arm with mean parts (`LayerMeans`, from `M`'s run on the text).
+        let trace = native.execute(&imported.family, false).expect("M's trace");
+        let mean = |node: usize| trace.values[node].mean_axis(ndarray::Axis(0)).expect("rows").to_vec();
+        let means: Vec<serde_json::Value> = (0..2).map(|l| serde_json::json!({"layer": l, "attention": mean(layers[l].normed_stream), "mlp": mean(layers[l].normed), "activation": mean(layers[l].active)})).collect();
         let start = factors.join("start.json");
-        std::fs::write(&start, serde_json::json!([{"arm": "scores", "components": components}]).to_string()).expect("the start");
+        std::fs::write(&start, serde_json::json!([{"arm": "scores", "components": components}, {"arm": "scores_means", "components": components, "means": means}]).to_string()).expect("the start");
         let explanation = super::explanation(&native, &layers, &factors, &start, "scores").expect("the explanation");
         let SlotValues::Tokens(tokens) = &imported.family.slots[0] else { panic!("a token slot") };
         let sequences: Vec<Vec<u32>> = tokens.chunks(12).map(<[u32]>::to_vec).collect();
@@ -2496,6 +2629,9 @@ mod tests {
         let blocks: Vec<_> = explanation.layers.iter().map(|l| l.sites.clone()).collect();
         let bits: f64 = Interchange::new(&device, &native, &blocks, &explanation.artifact, &explanation.trainable, Vec::new(), 1 << 30, 64).expect("the experiments").evaluate(&batch, &clean, false).expect("evaluate").bits.iter().flatten().sum();
         assert!(bits.abs() < 1e-5, "every gate open: KL(M ‖ P) = {bits} bits");
+        let centered = super::explanation(&native, &layers, &factors, &start, "scores_means").expect("the explanation");
+        let bits: f64 = Interchange::new(&device, &native, &blocks, &centered.artifact, &centered.trainable, Vec::new(), 1 << 30, 64).expect("the experiments").evaluate(&batch, &clean, false).expect("evaluate").bits.iter().flatten().sum();
+        assert!(bits.abs() < 1e-5, "every gate open with mean parts: KL(M ‖ P) = {bits} bits");
         let (flat, _, reads) = crate::interchange::sites(&explanation.artifact, &layers).expect("the flat program");
         let trace = flat.execute(&imported.family, false).expect("the trace");
         let layout = imported.family.layout.as_ref().expect("a layout");

@@ -2676,8 +2676,13 @@ impl Scorer {
             return Err("an operator holding both mixed reads and mixed writes".into());
         }
         let differentiated: Vec<usize> = explanation.trainable.iter().copied().chain(assignments.iter().map(|a| a.operator)).collect();
+        // Each layer's mean parts: its MLP's two, its o map's one, and each head's q, k and v.
         let mean_parts: Vec<f64> = (0..explanation.layers.len())
-            .map(|l| ["mlp.fc_mean", "mlp.dn_mean"].iter().filter(|part| operator_named(&explanation.artifact.program, &format!("library.l{l}.{part}")).is_some()).count() as f64)
+            .map(|l| {
+                let named = |part: &str| operator_named(&explanation.artifact.program, &format!("library.l{l}.{part}")).is_some();
+                let heads = (0..).take_while(|h| named(&format!("h{h}.q_mean"))).count();
+                (["mlp.fc_mean", "mlp.dn_mean", "o.mean"].iter().filter(|part| named(part)).count() + 3 * heads) as f64
+            })
             .collect();
         let mut experiments =
             Interchange::new(device, native, &sites, &explanation.artifact, &differentiated, reads, settings.numeric_bytes, settings.head_tile_rows)?;
