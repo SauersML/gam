@@ -630,6 +630,40 @@ def block_concepts(rep, ms, rule_status):
     return float(1 + len(srcs - tgts) + len(tgts - srcs) + nums), 0.0
 
 
+def interface(rep, ms):
+    """The directions a block reads and writes (block_concepts's nodes)."""
+    srcs, tgts = set(), set()
+    for j in ms:
+        l, i, k = int(rep.layer[j]), int(rep.recv[j]), int(rep.atom[j])
+        if rep.kind[j]:
+            srcs.add(("n", l, i))
+            tgts.add(("a", k))
+        else:
+            srcs.add(("a", k))
+            tgts.add(("n", l, i) if l < rep.toy.L else ("o", i))
+    return srcs - tgts, tgts - srcs
+
+
+def total_concepts(rep, st):
+    """The whole decomposition's concepts at the library level: every distinct direction read or written by any part
+    counted once, each part's gate and its core's free numbers outside rule bindings, each rule's body once."""
+    dirs, total = set(), 0.0
+    for b, ms in st.members.items():
+        r_, w_ = interface(rep, ms)
+        dirs |= r_ | w_
+        status = st.status(ms)
+        d = describe(rep, ms)
+        raw = list(d["raw"]) + [j for (p, us, js), r in zip(d["bindings"], status) if not r for j in js]
+        total += 1 + sum(0 if rep.kind[j] and rep.own_atom.get((int(rep.layer[j]), int(rep.recv[j]))) == int(rep.atom[j]) and abs(rep.w[j] - 1.0) <= 1e-12 else 1
+                         for j in raw)
+    saved = COST
+    globals()["COST"] = "concepts"
+    bodies = sum(body_bits(p, rep.B) for p, c in st.count.items() if c >= 2)
+    globals()["COST"] = saved
+    return {"total_concepts": float(len(dirs) + total + bodies), "distinct_directions": len(dirs), "parts": len(st.members),
+            "gates_and_core_numbers": float(total), "rule_bodies": float(bodies)}
+
+
 def block_cost(rep, ms, rule_status):
     """(per-token content bits without the block's index and its rules' binding indices, definition bits)
     given which of its bindings are rules; under COST "concepts", block_concepts."""
@@ -1093,6 +1127,7 @@ def summary(rep, run, name, assign, N, true_assign=None):
     rec = {"explanation": name, "cost": COST, "blocks": len(st.members), "rules": len(rules), "bindings_in_rules": int(sum(rules.values())),
            "bits_per_token": tok, "definitions_bits": float((st.J - tok) * N), "J": st.J,
            "blocks_on_per_token": float(st.n_on.mean()), "largest_blocks_items": sorted((len(ms) for ms in st.members.values()), reverse=True)[:5]}
+    rec.update(total_concepts(rep, st))
     if true_assign is not None:
         rec["recovery"] = recovery(rep, run, st, true_assign)
     return rec, st
