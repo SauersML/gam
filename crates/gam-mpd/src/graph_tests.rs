@@ -868,6 +868,23 @@ fn stacked_counterfactual_programs_are_their_own_runs() {
     with_reference.reference = Some(std::sync::Arc::new(reference(&weights, &Batch::new(&counterfactuals(&f.sequences)).expect("cf batch")).expect("reference")));
     let copies = stacked_equals_own(&weights, &circuits, &with_reference, &with_reference);
     assert!(max(&kl_bits(&copies[0], &copies[2])) > 1e-6, "programs 0 and 2 run alike");
+    // Their complement models (necessity: every part on the prompt but the program's, which keep
+    // their counterfactual values) stack too, each copy its complement model's own run.
+    let rows: Vec<usize> = (0..with_reference.tokens.len()).collect();
+    let refs: Vec<&crate::graph::Circuit> = circuits.iter().collect();
+    let mut state = crate::graph_device::DeviceState::new(Device::host());
+    let mut runner = |c: &crate::graph::Circuit, job: &crate::graph_device::Run, copies: &crate::graph_device::Copies| {
+        assert!(crate::graph_device::stack_covered(&weights, c, job, copies), "the device stacks the complements");
+        Some(crate::graph_device::copies_on(&mut state, &weights, c, job, Some(copies)))
+    };
+    let routed: Vec<bool> = graphs.iter().map(|g| g.edges.iter().any(|(w, r, _)| *w == crate::graph::Writer::Embed && r.is_none())).collect();
+    assert!(routed.iter().all(|&r| r), "the programs route the embedding to the logits");
+    let complements = crate::graph::execute_complements_with(&weights, (&refs, &routed), (&with_reference, &rows), &mut runner).expect("the complements stack").expect("stacked complements");
+    for (j, (g, copy)) in graphs.iter().zip(&complements).enumerate() {
+        let own = execute(&weights, &g.complement_model(&weights), &with_reference, &rows, &BTreeMap::new()).expect("own complement").log_probabilities;
+        let kl = max(&kl_bits(&own, copy));
+        assert!(kl < 1e-9, "program {j}: KL(own complement ‖ stacked copy) = {kl:e} bits");
+    }
 }
 
 #[test]
