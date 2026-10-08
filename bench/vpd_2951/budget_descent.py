@@ -365,6 +365,28 @@ del X
 
 state = {'mode': 'M', 'soft': [], 'hard': [], 'gates': {}, 'share': {}, 'r': {}, 'writers': {}, 'on': {}, 'gate': {}, 'edges_soft': [], 'edges_hard': [], 'share_a': {}, 'wedits_M': {}, 'wedits_P': {}, 'entry': {}, 'force_on': [], 'gn_in': {}}
 SQ2 = math.sqrt(2)
+
+def slice_gates(read, c, un, tau, s, taun, ex):
+    """A slice map's gates (hard, expected) from its own reads (read, or |c| un when None) and thresholds (tau, s and
+    the negative side's taun or None, broadcast against c; ex: the gate network's term, or None)."""
+    if taun is None:
+        z = ((c.abs() * un if read is None else read) - tau) / s
+    else:
+        z = torch.maximum(c * un - tau, -c * un - taun) / s
+    if ex is not None:
+        z = z + ex
+    return (z > 0).float(), 0.5 * (1 + torch.erf(z / SQ2))
+
+_slice_compiled = []
+def slice_gates_run(*a):
+    """slice_gates(*a), compiled (torch.compile; inductor fuses the chain and its backward) on CUDA outside
+    calibration (speed: the gate ladder's slice arms ran these element-wise passes one kernel each)."""
+    if dev != 'cuda' or state.get('calib') is not None:
+        return slice_gates(*a)
+    if not _slice_compiled:
+        _slice_compiled.append(torch.compile(slice_gates))
+    return _slice_compiled[0](*a)
+
 def make(n):
     st = T.site(n); p = P[n]; grp = GROUP.get(n); mult = MULT.get(n)
     layer = int(n.split('.')[1])
@@ -440,17 +462,16 @@ def make(n):
                 return emit(c * hard)
             state['soft'].append(soft.sum(-1).reshape(-1))
             return emit(c * soft)
-        read = x @ p['G'] if ARM == 'dir' else c if start == 'neuron' else c.abs() * un
+        read = x @ p['G'] if ARM == 'dir' else c if start == 'neuron' else None
         if state.get('calib') is not None:
-            state['calib'].setdefault(n, []).append(read.detach().reshape(-1))
-        z = ((read - p['tau']) if 'taun' not in p else torch.maximum(c * un - p['tau'], -c * un - p['taun'])) / p['s']
+            state['calib'].setdefault(n, []).append((c.abs() * un if read is None else read).detach().reshape(-1))
+        ex = None
         if n in GN:
             # The layer's gate network on the MLP's own input (the normed stream entering c_fc).
             if n.endswith('c_fc'):
                 state['gn_in'][('mlp', layer)] = x
-            z = z + gate_net_s(n, state['gn_in'][('mlp', layer)])
-        hard = (z > 0).float()
-        phi = 0.5 * (1 + torch.erf(z / SQ2))
+            ex = gate_net_s(n, state['gn_in'][('mlp', layer)])
+        hard, phi = slice_gates_run(read, c, un, p['tau'], p['s'], p.get('taun'), ex)
         if state['force_on']:
             on = torch.tensor(state['force_on'], device=z.device)
             hard = hard.index_fill(0, on, 1.0); phi = phi.index_fill(0, on, 1.0)
@@ -543,18 +564,15 @@ def make_attn(n):
         else:
             if state.get('calib') is not None:
                 state['calib'].setdefault(n, []).append((c.abs() * p['U'].norm(dim=-1)[:, None, :]).reshape(-1))
-            if 'taun' in p:
-                cs = c * p['U'].norm(dim=-1)[:, None, :]
-                z = torch.maximum(cs - p['tau'][:, None, :], -cs - p['taun'][:, None, :]) / p['s'][:, None, :]
-            else:
-                z = (c.abs() * p['U'].norm(dim=-1)[:, None, :] - p['tau'][:, None, :]) / p['s'][:, None, :]
+            ex = None
             if n in GN:
                 # The layer's gate network on the stream entering the attention (q's input; o reads it too).
                 if not p['o']:
                     state['gn_in'][('attn', n.split('.')[1])] = x
                 g_ = gate_net_s(n, state['gn_in'][('attn', n.split('.')[1])])
-                z = z + g_.reshape(-1, NH, z.shape[-1]).permute(1, 0, 2)
-            hard, phi = force_rows((z > 0).float(), 0.5 * (1 + torch.erf(z / SQ2)), x.shape[1])
+                ex = g_.reshape(-1, NH, c.shape[-1]).permute(1, 0, 2)
+            hard, phi = force_rows(*slice_gates_run(None, c, p['U'].norm(dim=-1)[:, None, :], p['tau'][:, None, :], p['s'][:, None, :],
+                                                    p['taun'][:, None, :] if 'taun' in p else None, ex), x.shape[1])
             state['hard'].append(hard.sum((0, 2)))
             if state['mode'] == 'hard':
                 g = hard
@@ -1274,14 +1292,9 @@ def attn_v(l, h, pattern):
         else:
             if state.get('calib') is not None:
                 state['calib'].setdefault(n, []).append(r.detach().reshape(-1))
-            if 'taun' in p:
-                ms = m * p['U'].norm(dim=-1)[None, :, None, :]
-                z = torch.maximum(ms - p['tau'][None, :, None, :], -ms - p['taun'][None, :, None, :]) / p['s'][None, :, None, :]
-            else:
-                z = (r - p['tau'][None, :, None, :]) / p['s'][None, :, None, :]
-            if n in GN:
-                z = z + gate_net_s(n, h).view(B_, T_, NH, -1).permute(0, 2, 1, 3)
-            hard = (z > 0).float(); soft = 0.5 * (1 + torch.erf(z / SQ2))
+            ex = gate_net_s(n, h).view(B_, T_, NH, -1).permute(0, 2, 1, 3) if n in GN else None
+            hard, soft = slice_gates_run(r, m, p['U'].norm(dim=-1)[None, :, None, :], p['tau'][None, :, None, :], p['s'][None, :, None, :],
+                                         p['taun'][None, :, None, :] if 'taun' in p else None, ex)
         if state['force_on']:
             # The all-on sequences' gates on.
             on = torch.tensor(state['force_on'], device=hard.device)
