@@ -15,7 +15,27 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import re
+import sys
 from collections import Counter, defaultdict
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import part_tokens  # noqa: E402
+
+DECOMP = re.compile(r"PD(?:\.vpd)?\[(\d+)\]\.(q_proj|k_proj|v_proj|o_proj|c_fc|down_proj)\[([\d, ]+)\]")
+
+
+def with_part_tokens(text: str) -> str:
+    """Decomposition parts named by their part tokens (one token, or a bracketed list for a group) and whole
+    native blocks in mech's generic spelling (L[l].mlp, L[l].attn)."""
+    def parts(m):
+        toks = [part_tokens.token_of(f"PD[{m[1]}].{m[2]}[{i.strip()}]") for i in m[3].split(",")]
+        return toks[0] if len(toks) == 1 else "[" + ", ".join(toks) + "]"
+
+    text = DECOMP.sub(parts, text)
+    text = re.sub(r"L\[(\d+)\]\.mlp\[:\]", r"L[\1].mlp", text)
+    return re.sub(r"L\[(\d+)\]\.head\[:\]", r"L[\1].attn", text)
 
 
 def main():
@@ -25,6 +45,7 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--per-type", type=int, default=0)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--part-tokens", action="store_true", help="name decomposition parts by their part tokens (<p:L.S.I>)")
     args = ap.parse_args()
     by_type = defaultdict(list)
     for path in args.shards + args.average_cuts:
@@ -40,7 +61,8 @@ def main():
                 continue
             behavior = q["text_id"] if q["source"] == "behavior" else None
             by_type[q["type"]].append({
-                "messages": [{"role": "user", "content": q["input"]}, {"role": "assistant", "content": q["answer"]}],
+                "messages": [{"role": "user", "content": with_part_tokens(q["input"]) if args.part_tokens else q["input"]},
+                             {"role": "assistant", "content": with_part_tokens(q["answer"]) if args.part_tokens else q["answer"]}],
                 "type": q["type"], "source": q["source"], "behavior": behavior, "piece_split": q.get("piece_split", "train"),
                 "cut_semantics": ("average" if average else "counterfactual") if q["type"] == "cut" else None, "shard": path})
     rng = random.Random(args.seed)
