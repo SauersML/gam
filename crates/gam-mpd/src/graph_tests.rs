@@ -923,3 +923,53 @@ fn bindings_are_checked_by_interchange() {
     unknown.bindings[0].nodes = vec!["nowhere".into()];
     assert!(Graph::parse(&unknown, &weights).is_err());
 }
+
+#[test]
+fn device_path_runs_head_operations_on_a_vpd_attention_as_the_host() {
+    use crate::graph::{Donor, HeadRead, Interventions, execute_with};
+    let f = fixture("graph_device_head_reads");
+    let library = Library::new(&f.device, &f.device, &f.native, &f.layers, &f.artifact, 1 << 28, 64).expect("library");
+    let mut weights = Weights::of(&library);
+    let lw = &weights.layers[1];
+    let stack = |m: &dyn Fn(&crate::graph::HeadWeights) -> &crate::graph::Stored| crate::graph::wide(ndarray::concatenate(ndarray::Axis(0), &lw.heads.iter().map(|h| m(h).view()).collect::<Vec<_>>()).expect("stack").view());
+    let (wq, wk, wv) = (stack(&|h| &h.query), stack(&|h| &*h.key), stack(&|h| &*h.value));
+    let wo = crate::graph::wide(ndarray::concatenate(ndarray::Axis(1), &lw.heads.iter().map(|h| h.output.view()).collect::<Vec<_>>()).expect("hstack").view());
+    let exact_in = |w: &ndarray::Array2<f64>| (ndarray::Array2::eye(w.nrows()), w.t().to_owned());
+    weights.vpd_attention.insert(1, crate::graph::VpdAttention { q: exact_in(&wq), k: exact_in(&wk), v: exact_in(&wv), o: (wo.t().to_owned(), ndarray::Array2::eye(wo.ncols())) });
+    let piece = |layer: usize, view: &str, kind: &str, index: Option<Index>| PieceIr { view: view.into(), layer, kind: kind.into(), index };
+    let all = |n: usize| Some(Index::Many((0..n).collect()));
+    let nodes = vec![
+        NodeIr { id: "a0".into(), pieces: vec![piece(0, "native", "head", None)], claim: None },
+        NodeIr { id: "QKV".into(), pieces: vec![piece(1, "vpd", "q_proj", all(wq.nrows())), piece(1, "vpd", "k_proj", all(wk.nrows())), piece(1, "vpd", "v_proj", all(wv.nrows()))], claim: None },
+        NodeIr { id: "O".into(), pieces: vec![piece(1, "vpd", "o_proj", all(wo.ncols()))], claim: None },
+    ];
+    let edge = |from: &str, to: &str| EdgeIr { from: from.into(), to: to.into(), route: "input".into() };
+    let edges = vec![edge("embed", "a0"), edge("embed", "QKV"), edge("a0", "QKV"), edge("QKV", "O"), edge("embed", "logits"), edge("O", "logits")];
+    let graph = Graph::parse(&Program { model: "tiny".into(), valid: true, nodes, edges, ..Program::default() }, &weights).expect("parse");
+    let circuit = graph.program(&weights, true);
+    let cf = counterfactuals(&f.sequences);
+    let mut batch = Batch::new(&f.sequences).expect("batch");
+    batch.reference = Some(std::sync::Arc::new(reference(&weights, &Batch::new(&cf).expect("cf batch")).expect("reference")));
+    let mut donor_batch = Batch::new(&cf).expect("donor");
+    donor_batch.reference = Some(std::sync::Arc::new(reference(&weights, &Batch::new(&f.sequences).expect("batch")).expect("reference")));
+    let rows: Vec<usize> = (0..batch.tokens.len()).collect();
+    let donor_run = execute_with(&weights, &circuit, &donor_batch, &[], &BTreeMap::new(), &Interventions { record_reads: [2].into(), ..Interventions::default() }).expect("donor");
+    let embed = crate::graph::wide(weights.embedding.select(ndarray::Axis(0), &donor_batch.tokens.iter().map(|t| *t as usize).collect::<Vec<_>>()).view());
+    let ops = Interventions {
+        head_reads: vec![(2, 1, HeadRead::Scale(0.5), vec![3, 7, 20]), (2, 0, HeadRead::Swap, vec![5, 6, 40])],
+        record_reads: [2].into(),
+        donor: Some(Donor { embed, writes: donor_run.writes.clone(), normed: donor_run.normed.clone(), reads: donor_run.reads.clone() }),
+        ..Interventions::default()
+    };
+    let host = execute_with(&weights, &circuit, &batch, &rows, &BTreeMap::new(), &ops).expect("host");
+    let mut state = crate::graph_device::DeviceState::new(Device::host());
+    let job = crate::graph_device::Run { tokens: &batch.tokens, spans: &batch.spans, scored: &rows, swaps: &BTreeMap::new(), capture: false, reference: batch.reference.as_deref(), ops: &ops };
+    let device = crate::graph_device::run_on(&mut state, &weights, &circuit, &job).expect("device");
+    let kl = max(&kl_bits(&host.log_probabilities, &device.log_probabilities));
+    assert!(kl < 1e-9, "KL(host ‖ device) under head operations = {kl:e} bits");
+    let o = 2;
+    let gap = (&host.reads[&o] - &device.reads[&o]).iter().fold(0.0f64, |m, v| m.max(v.abs()));
+    assert!(gap < 1e-9, "recorded reads differ by {gap:e}");
+    let plain = execute(&weights, &circuit, &batch, &rows, &BTreeMap::new()).expect("plain").log_probabilities;
+    assert!(max(&kl_bits(&plain, &host.log_probabilities)) > 1e-9, "the operations change the run");
+}

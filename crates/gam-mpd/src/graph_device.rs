@@ -6,9 +6,9 @@
 //!
 //! Covered: native heads (with head norms, rotary, grouped keys and values), MLP
 //! neurons (plain or gated), transcoder features, VPD's views of MLPs and attentions
-//! (subcomponents and remainders), swaps, counterfactual and average stand-ins, site operations,
-//! `Reference` captures. Anything else (attention blocks, operations on a VPD-view attention's
-//! heads) returns `None` and runs on the host.
+//! (subcomponents and remainders, with operations on their heads' reads), swaps, counterfactual
+//! and average stand-ins, site operations, `Reference` captures. Attention blocks return `None`
+//! and run on the host.
 use crate::{
     device_attention::{Segment, forward_segments},
     device_program::{gelu_tanh_constant, law_of},
@@ -380,13 +380,12 @@ fn standins(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, r: &Refer
 /// `circuit` run on the process's device ([`use_device`]), or `None` when there is none or the
 /// circuit holds a block the device path does not cover.
 pub(crate) fn run(weights: &Weights, circuit: &Circuit, job: &Run) -> Option<Result<Execution, String>> {
-    // A VPD-view attention's heads attend together (alike) and operations on them run on the
-    // host.
+    // A VPD-view attention's heads attend together (alike).
     let covered = |b: &Block| match b {
         Block::Heads { .. } | Block::Neurons { .. } | Block::Slices { .. } | Block::Features { .. } => true,
         Block::AttnSlices { layer, .. } => weights.layers.get(*layer).is_some_and(|lw| lw.heads.first().is_some_and(|first| lw.heads.iter().all(|h| alike(h, first, false)))),
     };
-    if !circuit.units.iter().all(|u| covered(&u.block)) || !job.ops.head_reads.is_empty() || !job.ops.record_reads.is_empty() {
+    if !circuit.units.iter().all(|u| covered(&u.block)) {
         return None;
     }
     on_device(|s| run_on(s, weights, circuit, job))
@@ -604,6 +603,7 @@ pub(crate) fn run_on(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, 
     };
     let ops = job.ops;
     let mut kept = BTreeMap::new();
+    let mut reads_kept = BTreeMap::new();
     if let Some(c) = captured.as_mut() {
         c.embed = s.device.download(&st.embed).map_err(e)?;
     }
@@ -614,7 +614,7 @@ pub(crate) fn run_on(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, 
         let site = circuit.units[order[at]].block.site();
         let end = order[at..].iter().position(|&u| circuit.units[u].block.site() != site).map_or(order.len(), |k| at + k);
         let pad_job = Padding { places: padded.as_ref(), sequences, longest };
-        let mut slice_writes = vpd_site(s, weights, circuit, job, (site, &order[at..end]), &st, &pad_job, &mut kept)?;
+        let mut slice_writes = vpd_site(s, weights, circuit, job, (site, &order[at..end]), &st, &pad_job, (&mut kept, &mut reads_kept))?;
         for &u in &order[at..end] {
             let unit = &circuit.units[u];
             if !unit.computes {
@@ -803,7 +803,9 @@ pub(crate) fn run_on(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, 
     } else {
         vec![None; units]
     };
-    Ok(Execution::of(log_probabilities, writes, captured, kept))
+    let mut execution = Execution::of(log_probabilities, writes, captured, kept);
+    execution.reads = reads_kept;
+    Ok(execution)
 }
 
 /// The writes of a site's VPD-view units (`graph::run`'s passes), by unit. An MLP's: each reader of
@@ -813,7 +815,7 @@ pub(crate) fn run_on(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, 
 /// of the queries, keys and values (a unit with `o_proj` subcomponents) takes the counterfactual
 /// ones plus the q/k/v writes it reads, runs the heads' attention on them (no head norms, as on the
 /// host) and writes through its `o_proj` subcomponents.
-fn vpd_site(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, job: &Run, (site, units): (usize, &[usize]), st: &Streams, pad: &Padding, kept: &mut BTreeMap<(usize, usize), Array2<f64>>) -> Result<BTreeMap<usize, Tensor>, String> {
+fn vpd_site(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, job: &Run, (site, units): (usize, &[usize]), st: &Streams, pad: &Padding, (kept, reads_kept): (&mut BTreeMap<(usize, usize), Array2<f64>>, &mut BTreeMap<usize, Array2<f64>>)) -> Result<BTreeMap<usize, Tensor>, String> {
     let e = |e: GpuError| e.to_string();
     let (rows, width, arithmetic, ops) = (job.tokens.len(), weights.width(), s.arithmetic(), job.ops);
     let mut writes = BTreeMap::new();
@@ -931,7 +933,13 @@ fn vpd_site(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, job: &Run
                 }
             }
             let [q, k, v]: [Tensor; 3] = qkv.try_into().map_err(|_| "three projections")?;
-            let z = attend(s, (q, k, v), (lw.heads.len(), head.query.nrows()), head, false, pad).map_err(e)?;
+            let mut z = attend(s, (q, k, v), (lw.heads.len(), head.query.nrows()), head, false, pad).map_err(e)?;
+            // Operations on the heads' reads (and their recording) act on the host copy, as there.
+            if ops.head_reads.iter().any(|(at, ..)| *at == site) || ops.record_reads.contains(&site) {
+                let mut host = s.device.download(&z).map_err(e)?;
+                ops.head_reads_of(site, u, lw, &mut host, reads_kept);
+                z = s.device.upload(host.view()).map_err(e)?;
+            }
             writes.insert(u, sliced(s, (&a.o.0, &a.o.1), Matrix::Device(&maps[3]), o, *rest, &z).map_err(e)?);
         }
     }

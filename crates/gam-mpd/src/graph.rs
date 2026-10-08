@@ -3141,7 +3141,7 @@ impl Interventions {
     /// Unit `u`'s heads' reads `z` at `site` under the head operations there (a head's columns
     /// scaled, or taken from the same unit's reads on the donor), kept in `kept` when the site is
     /// recorded.
-    fn head_reads_of(&self, site: usize, u: usize, layer: &LayerWeights, z: &mut Array2<f64>, kept: &mut BTreeMap<usize, Array2<f64>>) {
+    pub(crate) fn head_reads_of(&self, site: usize, u: usize, layer: &LayerWeights, z: &mut Array2<f64>, kept: &mut BTreeMap<usize, Array2<f64>>) {
         for (_, h, read, rows) in self.head_reads.iter().filter(|(s, ..)| *s == site) {
             let from: usize = layer.heads.iter().take(*h).map(|w| w.value.nrows()).sum();
             let cols = from..from + layer.heads.get(*h).map_or(0, |w| w.value.nrows());
@@ -3166,7 +3166,8 @@ impl Interventions {
         if scalings.is_empty() {
             return None;
         }
-        let mut out = reference.clone();
+        // A new identity: the device keeps uploaded copies of a run's arrays by it.
+        let mut out = Reference { id: next_reference_id(), ..reference.clone() };
         for (site, h, read, rows) in scalings {
             if let (HeadRead::Scale(f), Some(z)) = (read, out.reads.get_mut(site / 2).and_then(|l| l.get_mut(*h))) {
                 let n = z.nrows();
