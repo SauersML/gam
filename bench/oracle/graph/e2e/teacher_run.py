@@ -6,8 +6,11 @@ VPD subcomponents to an answer in the oracle's format.
                            where the variable's value differs between the two prompts; VPD's importance at those
                            positions over both prompts (mpd_vpd_importance_2951's target mean) ranks every
                            subcomponent: CARRIERS/<behavior>.json {variable: [part token, ...]} best first.
-  answer BEHAVIOR_ID...    1. the search (vpd_min.py under deletion, subcomponents ranked by VPD importance; its
-                              result is reused when it exists);
+  answer BEHAVIOR_ID...    1. the search under deletion over subcomponents ranked by VPD importance: by default in the
+                              answer format itself (answer_search: the family algorithm with align(answer, top k), so
+                              the code scored is the answer's), or vpd_min.py's node programs (--mode nodes; reused when
+                              its result exists), whose per-node declarations and edge lists cost code the answer never
+                              carries;
                            2. teacher.assignments: the search's nodes aligned to the algorithm's variables, every
                               assignment scored, the best kept;
                            3. edits.refine, the variables' carriers as candidates (parts the answer names elsewhere
@@ -38,6 +41,7 @@ sys.path.insert(0, str(HERE))
 
 import edits  # noqa: E402
 import mech  # noqa: E402
+import search  # noqa: E402
 import teacher  # noqa: E402
 
 DATA = Path.home() / "mpd-data/graph_oracle"
@@ -133,6 +137,58 @@ def base_units(model: str) -> set[str]:
     return out
 
 
+BLOCK = {"q_proj": "attn", "k_proj": "attn", "v_proj": "attn", "o_proj": "attn", "c_fc": "mlp", "down_proj": "mlp"}
+WRITER = {"attn": "o_proj", "mlp": "down_proj"}
+
+
+def token_of(unit) -> str:
+    """A subcomponent ("sub", layer, matrix, index) as its part token."""
+    return f"<p:{unit[1]}.{mech.CODES[unit[2]]}.{unit[3]}>"
+
+
+def closed(units: list, ranked: list) -> list:
+    """`units` made a valid alignment: every block with parts gets its best-ranked residual writer (mech rejects an
+    alignment whose block writes no residual stream), and a set without a reading part gets the best-ranked one (the
+    answer reads the tokens) with its block's writer."""
+    out = list(units)
+    if not any(WRITER[BLOCK[u[2]]] != u[2] for u in out):
+        out += [next(r for r in ranked if WRITER[BLOCK[r[2]]] != r[2])]
+    have = {(u[1], BLOCK[u[2]]) for u in out if WRITER[BLOCK[u[2]]] == u[2]}
+    for l, block in sorted({(u[1], BLOCK[u[2]]) for u in out} - have):
+        writer = next((r for r in ranked if r[1] == l and r[2] == WRITER[block]), None)
+        if writer:
+            out.append(writer)
+    return list(dict.fromkeys(out))
+
+
+def answer_search(algorithm: str, ranked: list, scored, budget: int, log=print) -> list:
+    """The ranked-prefix search in the answer format itself: the family algorithm with every part on the answer,
+    align(answer, top k subcomponents) (closed()), for k = 1, 2, 4, ... up to the budget, then 8 steps between the
+    best k's neighbours; the best prefix's units ([] when no prefix beats the algorithm without parts)."""
+    def program(units):
+        return algorithm.rstrip() + "\n\n\n" + (f"align(answer, {', '.join(map(token_of, units))})\n" if units else "")
+
+    ks, k = [0], 1
+    while k < min(budget, len(ranked)):
+        ks.append(k)
+        k *= 2
+    ks.append(min(budget, len(ranked)))
+    sets = {k: closed(ranked[:k], ranked) if k else [] for k in ks}
+    totals = dict(zip(ks, edits.totals(scored([program(sets[k]) for k in ks], stage="prefix"))))
+    log("prefixes: " + ", ".join(f"{k}:{totals[k]:.6g}" for k in ks))
+    best = min(ks, key=lambda k: totals[k])
+    if best:
+        i = ks.index(best)
+        lo, hi = ks[max(i - 1, 0)], ks[min(i + 1, len(ks) - 1)]
+        steps = sorted({lo + (hi - lo) * j // 8 for j in range(1, 8)} - set(ks))
+        sets.update({k: closed(ranked[:k], ranked) for k in steps})
+        totals.update(zip(steps, edits.totals(scored([program(sets[k]) for k in steps], stage="prefix"))))
+        log("refine: " + ", ".join(f"{k}:{totals[k]:.6g}" for k in steps))
+        best = min(totals, key=lambda k: totals[k])
+    log(f"best k = {best}: {len(sets[best])} parts, {totals[best]:.6g} bits")
+    return sets[best]
+
+
 def answer(a, b: str) -> None:
     """The `answer` command for one behavior (module doc)."""
     import printer
@@ -145,31 +201,25 @@ def answer(a, b: str) -> None:
         return
     out = a.out
     out.mkdir(parents=True, exist_ok=True)
+    rankings, ranked = a.rankings, json.loads((a.rankings / f"{b}.json").read_text())
+    base = base_units(behavior["model"])
+    if base:
+        rankings = a.search / "rankings"
+        rankings.mkdir(parents=True, exist_ok=True)
+        kept = [u for u in ranked["mixed"] if u[0] not in base and u[0].rsplit("_", 1)[0] not in base]
+        ranked["source"] += f"; the shared base's {len(ranked['mixed']) - len(kept)} subcomponents left out"
+        ranked["mixed"] = kept
+        (rankings / f"{b}.json").write_text(json.dumps(ranked))
     found = a.search / "search" / f"{b}.prefix_vpd_min.json"
-    if not found.exists():
-        rankings, base = a.rankings, base_units(behavior["model"])
-        if base:
-            rankings = a.search / "rankings"
-            rankings.mkdir(parents=True, exist_ok=True)
-            ranked = json.loads((a.rankings / f"{b}.json").read_text())
-            kept = [u for u in ranked["mixed"] if u[0] not in base and u[0].rsplit("_", 1)[0] not in base]
-            ranked["source"] += f"; the shared base's {len(ranked['mixed']) - len(kept)} subcomponents left out"
-            ranked["mixed"] = kept
-            (rankings / f"{b}.json").write_text(json.dumps(ranked))
+    if a.mode == "nodes" and not found.exists():
         cmd = [sys.executable, str(HERE / "vpd_min.py"), b, "--out", str(a.search), "--behaviors-dir", str(a.behaviors_dir),
                "--vpd", str(a.vpd), "--rankings", str(rankings), "--export", str(a.export)]
         cmd += ["--device", a.device] if a.device else []
         subprocess.run(cmd, check=True)
-    if not found.exists():
+    if a.mode == "nodes" and not found.exists():
         print(f"{b}: the search left no result", flush=True)
         return
     t0 = time.time()
-    search = json.loads(found.read_text())
-    ir = teacher.search_ir(search, behavior["model"])
-    candidates = teacher.assignments(ir, teacher.algorithm_of(behavior), behavior)
-    if not candidates:
-        print(f"{b}: no assignment (fewer residual-writing nodes than aligned variables)", flush=True)
-        return
     trajectory = open(out / f"{b}.trajectory.jsonl", "w")
     checker = score_module.Checker(behavior["model"], export=a.export, views={"vpd": a.vpd}, device=a.device)
     try:
@@ -185,6 +235,19 @@ def answer(a, b: str) -> None:
             trajectory.flush()
             return results
 
+        if a.mode == "nodes":
+            ir = teacher.search_ir(json.loads(found.read_text()), behavior["model"])
+        else:
+            units = answer_search(teacher.algorithm_of(behavior), [search.unit_of(n) for n, _ in ranked["mixed"]], scored,
+                                  a.budget, log=lambda m: print(f"{b}: {m}", flush=True))
+            if not units:
+                print(f"{b}: no prefix beats the program without parts", flush=True)
+                return
+            ir = teacher.search_ir({"source": search.source(units)}, behavior["model"])
+        candidates = teacher.assignments(ir, teacher.algorithm_of(behavior), behavior)
+        if not candidates:
+            print(f"{b}: no assignment (fewer residual-writing nodes than aligned variables)", flush=True)
+            return
         first = scored(candidates, stage="assignment")
         totals = edits.totals(first)
         best = min(range(len(candidates)), key=lambda k: totals[k])
@@ -192,7 +255,7 @@ def answer(a, b: str) -> None:
         start = edits.Answer.parse(candidates[best])
         named = {p for s in start.statements for p in s.parts}
         table = json.loads((a.carriers / f"{b}.json").read_text()) if (a.carriers / f"{b}.json").exists() else {}
-        pool = {v: [p for p in ranked if p not in named] for v, ranked in table.items()}
+        pool = {v: [p for p in order if p not in named] for v, order in table.items()}
         refined, total, accepted = edits.refine(start, scored, pool, a.rounds, a.adds, max_drops=a.drops,
                                                 log=lambda m: print(f"{b}: {m}", flush=True))
         final = scored([refined.source(), candidates[best]], experiments=a.final_experiments, seed=1, stage="held-out seed")
@@ -233,7 +296,11 @@ def main():
     ap.add_argument("--keep", type=int, default=256, help="carriers: candidates kept per variable")
     ap.add_argument("--importance-bin", type=Path, help="carriers: mpd_vpd_importance_2951")
     ap.add_argument("--importance-device", default="gpu")
-    ap.add_argument("--search", type=Path, default=DATA / "runs/vpd_min_delete", help="vpd_min.py's --out")
+    ap.add_argument("--mode", choices=["answer", "nodes"], default="answer",
+                    help="answer: the prefix search in the answer format (answer_search); nodes: vpd_min.py's node search")
+    ap.add_argument("--budget", type=int, default=2048, help="answer mode: the most ranked subcomponents a prefix takes")
+    ap.add_argument("--search", type=Path, default=DATA / "runs/vpd_min_delete", help="nodes mode: vpd_min.py's --out (and the "
+                    "base-filtered rankings)")
     ap.add_argument("--out", type=Path, default=DATA / "teacher")
     ap.add_argument("--device")
     ap.add_argument("--experiments", type=int, default=8, help="per score while choosing and refining (seed 0)")
