@@ -587,11 +587,41 @@ def algorithm_source(ir: dict, behavior: dict, facts_of: dict[str, dict], score:
     return "\n".join(out).rstrip() + "\n"
 
 
-def algorithm_explanation(ir: dict, behavior: dict, facts_of: dict[str, dict]) -> str:
-    """An algorithm program's plain-English explanation: per variable, what it is (its author's words),
-    which parts hold it or produce its attention pattern, what removing them does, and what it reads."""
+def departures(behavior: dict, model: str, prompts=None, examples: int = 2) -> tuple[float | None, int, list[str]]:
+    """M against the behavior's expected answers on `prompts` (indices; all by default): the share of
+    targets where M's top token is the expected token, the number of targets, and up to `examples`
+    targets where it is not, in words (the text's end, M's top token, the expected token)."""
+    tk = mech.tokenizer(model)
+    hits, words = [], []
+    for i in (range(len(behavior["prompts"])) if prompts is None else prompts):
+        p = behavior["prompts"][i]
+        for k, t in enumerate(p["target_positions"]):
+            if not p.get("model_top") or k >= len(p["model_top"]) or t + 1 >= len(p["token_ids"]):
+                continue
+            top, expected = p["model_top"][k][0][0], tk.decode([p["token_ids"][t + 1]])
+            hits.append(top == expected)
+            if top != expected and len(words) < examples:
+                text = tk.decode(p["token_ids"][: t + 1], skip_special_tokens=True)
+                words.append(f"after {json.dumps(text[-48:], ensure_ascii=False)} M predicts {json.dumps(top, ensure_ascii=False)}, "
+                             f"not {json.dumps(expected, ensure_ascii=False)}")
+    return (sum(hits) / len(hits) if hits else None), len(hits), words
+
+
+def algorithm_explanation(ir: dict, behavior: dict, facts_of: dict[str, dict], score: dict | None = None, prompts=None) -> str:
+    """An algorithm program's plain-English explanation, stating measured facts about M and never the
+    behavior's rule as if M followed it: the behavior (the task), how often M's top token is the expected
+    answer and where it is not (on `prompts`, the indices the facts are measured on); per variable what it
+    is (its author's words), the parts aligned to it, what removing them does to the answer, how often
+    switching them to their counterfactual values makes M prefer the counterfactual's answer
+    (switch_flip_share) and its interchange test (alignment_error_bits) when measured; with a score that
+    carries the empty program's ("empty"), the shares of M's clean-vs-counterfactual difference the named
+    parts reproduce on their own and remove inside M."""
     says = described(ir["source"])
-    lines = [behavior["description"].rstrip(".") + "."]
+    lines = [f"The behavior: {behavior['description'].rstrip('.')}."]
+    share, n, words = departures(behavior, ir["model"], prompts)
+    if share is not None:
+        line = f"M's top token is the expected answer on {share:.0%} of the behavior's {n} targets"
+        lines.append(line + ("; for example, " + "; ".join(words) if words else "") + ".")
     for v in ir["variables"]:
         name, what = v["name"], says.get(v["name"], "")
         reads = [r if r != "tokens" else "the tokens" for r in v["reads"]]
@@ -600,16 +630,30 @@ def algorithm_explanation(ir: dict, behavior: dict, facts_of: dict[str, dict]) -
             pieces = v["pieces"]
             parts = part_words({"pieces": pieces})
             many = sum(1 if not isinstance(p["index"], list) else len(p["index"]) for p in pieces) > 1
-            sentence += (f"; {parts} hold{'' if many else 's'} it" if v["role"] == "aligned"
+            sentence += (f"; {parts} {'are' if many else 'is'} aligned to it" if v["role"] == "aligned"
                          else f"; it is the attention pattern of {parts}")
-            f = facts_of.get(name)
-            if f:
+            f = facts_of.get(name) or {}
+            them = "them" if many else "it"
+            if "removal_answer_bits" in f:
                 d = f["removal_answer_bits"]
-                sentence += (f", and removing {'them' if many else 'it'} {'lowers' if d < 0 else 'raises'} the "
-                             f"answer's log-probability by {abs(d):.2f} bits")
+                sentence += f". Removing {them} {'lowers' if d < 0 else 'raises'} the answer's log-probability by {abs(d):.2f} bits per target"
+            if f.get("switch_flip_share") is not None:
+                sentence += (f". Switching {them} to {'their' if many else 'its'} values on the counterfactual prompt makes M prefer "
+                             f"the counterfactual's answer on {f['switch_flip_share']:.0%} of the targets where the two answers differ")
+            if f.get("alignment_error_bits") is not None:
+                e = f["alignment_error_bits"]
+                sentence += (f". Swapping {them} between prompts inside M moves M's output as {name} predicts"
+                             + (" (alignment error 0 bits)" if e == 0 else f" with an alignment error of {e:.0f} bits"))
         else:
-            sentence += ", a step no part holds on its own"
+            sentence += "; no parts are aligned to it"
         lines.append(sentence + ".")
+    empty = (score or {}).get("empty")
+    if score and empty and empty.get("exec_error_bits") and empty.get("necessity_error_bits"):
+        reproduce = 1 - score["exec_error_bits"] / empty["exec_error_bits"]
+        remove = 1 - score["necessity_error_bits"] / empty["necessity_error_bits"]
+        lines.append(f"Run on their own, with every other part at its value on the counterfactual prompt, the named parts reproduce "
+                     f"{reproduce:.0%} of the difference between M's outputs on the prompt and on its counterfactual; switched to "
+                     f"their counterfactual values inside M, they remove {remove:.0%} of it.")
     lines.append(f"{ir['answer']} is the prediction.")
     lines.append("Every other part of the model writes what it writes on the counterfactual prompt.")
     return " ".join(lines)
@@ -660,7 +704,7 @@ def printed(ir: dict, behavior: dict, score: dict | None = None, measured: dict 
         check = mech.trace_inline(src, ir["model"], behavior=behavior, decomposition=ir.get("decomposition") or "native")
         if not check["valid"] or {k: check[k] for k in ("nodes", "edges", "alignments")} != {k: ir[k] for k in ("nodes", "edges", "alignments")}:
             raise ValueError(f"the printed program does not trace back to the same IR: {check['error']}")
-        explanation = algorithm_explanation(ir, behavior, measured)
+        explanation = algorithm_explanation(ir, behavior, measured, score)
         return src, {"behavior": behavior["id"], "model": ir["model"], "description": behavior["description"],
                      "variables": [{**v, **measured.get(v["name"], {})} for v in ir["variables"]], "nodes": ir["nodes"],
                      "edges": ir["edges"], "explanation": explanation, "score": score}

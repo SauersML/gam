@@ -94,25 +94,45 @@ class Encoder:
         return ids
 
 
-def log_loss(backend, enc: Encoder, explanation: str | None, questions: list[dict]) -> np.ndarray:
+def log_loss(backend, enc: Encoder, explanation: str | None, questions: list[dict], temperature: float = 1.0) -> np.ndarray:
     """Bits per question: -log2 of the reader's probability of the true option, normalized over the options."""
-    return read(backend, enc, explanation, questions)[0]
+    return np.array([graded(lp, q["answer"], temperature)[0] for lp, q in zip(option_logprobs(backend, enc, explanation, questions), questions)])
 
 
-def read(backend, enc: Encoder, explanation: str | None, questions: list[dict]) -> tuple[np.ndarray, np.ndarray]:
-    """(bits per question, whether the reader's most probable option is the true one)."""
+def option_logprobs(backend, enc: Encoder, explanation: str | None, questions: list[dict]) -> list[list[float]]:
+    """The reader's log-probabilities of each question's options' first tokens (not normalized)."""
     if not questions:
-        return np.zeros(0), np.zeros(0, dtype=bool)
+        return []
     suffixes = [enc.question(q) for q in questions]
     reads = [[(len(s) - 1, enc.options(q))] for s, q in zip(suffixes, questions)]
-    got = backend.read(enc.prefix(explanation), suffixes, reads)
-    bits, right = [], []
-    for q, r in zip(questions, got):
-        lp = np.asarray(r[0], dtype=np.float64)
-        lp = lp - np.logaddexp.reduce(lp)
-        bits.append(-lp[q["answer"]] / LN2)
-        right.append(int(np.argmax(lp)) == q["answer"])
-    return np.array(bits), np.array(right)
+    return [[float(x) for x in r[0]] for r in backend.read(enc.prefix(explanation), suffixes, reads)]
+
+
+def graded(lp, answer: int, temperature: float = 1.0) -> tuple[float, bool]:
+    """(bits, right): -log2 of the true option's probability with the options' log-probabilities divided by
+    `temperature` and normalized over the options, and whether the most probable option is the true one."""
+    lp = np.asarray(lp, dtype=np.float64) / temperature
+    lp = lp - np.logaddexp.reduce(lp)
+    return float(-lp[answer] / LN2), int(np.argmax(lp)) == answer
+
+
+def fit_temperature(rows: list[dict]) -> float:
+    """The one temperature of a reader: the T minimizing the mean bits of the calibration questions read
+    without any explanation (golden-section search on log T over [1/20, 20])."""
+    sel = [r for r in rows if r.get("split") == "calibrate"]
+    if not sel:
+        return 1.0
+    cost = lambda lt: float(np.mean([graded(r["lp"]["none"], r["answer"], math.exp(lt))[0] for r in sel]))  # noqa: E731
+    a, b = math.log(1 / 20), math.log(20)
+    g = (math.sqrt(5) - 1) / 2
+    c, d = b - g * (b - a), a + g * (b - a)
+    for _ in range(60):
+        if cost(c) < cost(d):
+            b = d
+        else:
+            a = c
+        c, d = b - g * (b - a), a + g * (b - a)
+    return math.exp((a + b) / 2)
 
 
 def derangement(n: int, seed: int) -> list[int]:
@@ -147,8 +167,24 @@ def _algorithm(program_source: str):
     return algorithm, [n for n in algorithm.params if n != "answer"]
 
 
-def build_behavior(entry: dict, per_type: int, seed: int, checker=None, types=("next", "switch", "step")) -> list[dict]:
-    """The questions of one teacher answer (manifest entry), of the given types."""
+def complement_rows(checker, entry: dict, path: Path, prompts: int, rng=None, per_half: int | None = None) -> list[dict]:
+    """The checker's clean complement run of the answer's parts at targets where M's top tokens on the prompt
+    and the counterfactual differ (with rng and per_half: up to per_half of each parity half)."""
+    import prompt as P
+
+    source = P.program_of(Path(entry["answer"]).read_text())
+    checker.behavior(str(path))
+    reply = checker.request({"op": "complement", "program": checker.ir(source), "stand_in": "counterfactual"})
+    rows = [r for r in reply["tokens"] if r["clean_top"] != r["counterfactual_top"] and r["prompt"] < prompts]
+    if rng is None:
+        return rows
+    halves = [[r for r in rows if r["prompt"] % 2 == h] for h in (0, 1)]
+    return [r for half in halves for r in rng.sample(half, min(per_half, len(half)))]
+
+
+def build_behavior(entry: dict, per_type: int, seed: int, checker=None, types=("next", "switch", "step"), fresh: str | None = None) -> list[dict]:
+    """The questions of one teacher answer (manifest entry), of the given types; `fresh`: the root of a
+    fresh build of the behaviors (behaviors/build.py with another seed) for the scored next questions."""
     import mech
     import prompt as P
 
@@ -160,26 +196,39 @@ def build_behavior(entry: dict, per_type: int, seed: int, checker=None, types=("
     base = {"behavior": entry["behavior"], "family": entry["family"]}
     prompts = behavior["prompts"]
     out = []
-    # next: M's top token against 3 other prompts' top tokens.
-    tops = [(i, k, p["model_top"][k][0][0]) for i, p in enumerate(prompts) for k, _ in enumerate(p["target_positions"]) if p.get("model_top")]
-    for i, k, top in (rng.sample(tops, min(per_type, len(tops))) if "next" in types else []):
-        others = sorted({t for _, _, t in tops if t != top})
-        if len(others) < 3:
-            continue
-        options = rng.sample(others, 3) + [top]
-        rng.shuffle(options)
-        pos = prompts[i]["target_positions"][k]
-        out.append({**base, "type": "next", "text": decode(prompts[i]["token_ids"][: pos + 1]), "options": options, "answer": options.index(top)})
-    # switch: the checker's clean complement run of the answer's parts.
+    def next_questions(behavior_prompts, n, split, exclude=frozenset()):
+        tops = [(i, k, p["model_top"][k][0][0]) for i, p in enumerate(behavior_prompts) for k, _ in enumerate(p["target_positions"])
+                if p.get("model_top") and k < len(p["model_top"])]
+        tops = [t for t in tops if decode(behavior_prompts[t[0]]["token_ids"][: behavior_prompts[t[0]]["target_positions"][t[1]] + 1]) not in exclude]
+        made = []
+        for i, k, top in rng.sample(tops, min(n, len(tops))):
+            others = sorted({t for _, _, t in tops if t != top})
+            if len(others) < 3:
+                continue
+            options = rng.sample(others, 3) + [top]
+            rng.shuffle(options)
+            pos = behavior_prompts[i]["target_positions"][k]
+            made.append({**base, "type": "next", "split": split, "text": decode(behavior_prompts[i]["token_ids"][: pos + 1]),
+                         "options": options, "answer": options.index(top)})
+        return made
+
+    if "next" in types:
+        # Scored next questions on fresh prompts (a new seed of the behavior, texts the answer's fit never saw);
+        # the behavior's own prompts give the calibration set (answered without any explanation).
+        seen = {decode(p["token_ids"][: t + 1]) for p in prompts for t in p["target_positions"]}
+        found = [Path(fresh) / entry["model"] / d / f"{entry['behavior']}.json" for d in ("", "dropped")] if fresh else []
+        fresh_path = next((f for f in found if f.exists()), None)  # a fresh build may drop the behavior; its prompts still serve
+        if fresh_path is not None:
+            out += next_questions(json.loads(fresh_path.read_text())["prompts"], per_type, "score", frozenset(seen))
+        out += next_questions(prompts, per_type, "calibrate")
+    # switch: the checker's clean complement run of the answer's parts. Prompts of even index are the fit
+    # half (explain's facts; calibration questions), odd ones the scored questions.
     if checker is not None and "switch" in types:
-        source = P.program_of(Path(entry["answer"]).read_text())
-        checker.behavior(str(path))
-        reply = checker.request({"op": "complement", "program": checker.ir(source), "stand_in": "counterfactual"})
-        rows = [r for r in reply["tokens"] if r["clean_top"] != r["counterfactual_top"] and r["prompt"] < len(prompts)]
-        for r in rng.sample(rows, min(per_type, len(rows))):
+        for r in complement_rows(checker, entry, path, len(prompts), rng, per_type):
             p = prompts[r["prompt"]]
             shift = len(p["counterfactual"]["token_ids"]) - len(p["token_ids"])
-            out.append({**base, "type": "switch", "text": decode(p["token_ids"][: r["position"] + 1]),
+            out.append({**base, "type": "switch", "split": "score" if r["prompt"] % 2 else "calibrate",
+                        "text": decode(p["token_ids"][: r["position"] + 1]),
                         "counterfactual": decode(p["counterfactual"]["token_ids"][: r["position"] + shift + 1]),
                         "clean_token": decode([r["clean_top"]]), "counter_token": decode([r["counterfactual_top"]]),
                         "answer": 0 if r["complement"][1] > r["complement"][0] else 1, "complement": r["complement"]})
@@ -205,7 +254,7 @@ def build_behavior(entry: dict, per_type: int, seed: int, checker=None, types=("
                 vb = algorithm.values(seq(kb, ib), [var])[var][pb]
             except Exception:  # noqa: BLE001 - a variable the algorithm cannot compute on this text asks nothing
                 continue
-            out.append({**base, "type": "step", "variable": var, "text": decode(ids(ka, ia)[: pa + 1]), "other": decode(ids(kb, ib)[: pb + 1]),
+            out.append({**base, "type": "step", "split": "check", "variable": var, "text": decode(ids(ka, ia)[: pa + 1]), "other": decode(ids(kb, ib)[: pb + 1]),
                         "answer": 0 if repr(va) != repr(vb) else 1, "values": [repr(va)[:80], repr(vb)[:80]]})
     return out
 
@@ -213,7 +262,9 @@ def build_behavior(entry: dict, per_type: int, seed: int, checker=None, types=("
 # -------------------------------------------------------------------------------------------- scoring
 
 def score(backend, questions: list[dict], explanations: dict[str, str], seed: int = 0) -> dict:
-    """Bits per question with the behavior's own explanation, with none, and with another behavior's."""
+    """Every question read with the behavior's own explanation, with none, and with another behavior's (the
+    options' raw log-probabilities kept, so a temperature applies afterwards); the summary at the
+    temperature fit on the calibration questions read without an explanation."""
     enc = Encoder(backend.tokenizer)
     names = sorted({q["behavior"] for q in questions})
     swap = dict(zip(names, (names[j] for j in derangement(len(names), seed)))) if len(names) > 1 else {}
@@ -221,25 +272,33 @@ def score(backend, questions: list[dict], explanations: dict[str, str], seed: in
     for b in names:
         qs = [q for q in questions if q["behavior"] == b]
         t0 = time.time()
-        own, own_r = read(backend, enc, explanations.get(b), qs)
-        none, none_r = read(backend, enc, None, qs)
-        other, other_r = read(backend, enc, explanations.get(swap.get(b, b)), qs) if swap else (none, none_r)
+        own = option_logprobs(backend, enc, explanations.get(b), qs)
+        none = option_logprobs(backend, enc, None, qs)
+        other = option_logprobs(backend, enc, explanations.get(swap.get(b, b)), qs) if swap else none
         print(f"reader questions: {b} {len(qs)} questions {time.time() - t0:.1f} s", file=sys.stderr, flush=True)
         for k, q in enumerate(qs):
-            rows.append({"behavior": b, "family": q["family"], "type": q["type"], "own": float(own[k]), "none": float(none[k]), "shuffled": float(other[k]),
-                         "right": [bool(own_r[k]), bool(none_r[k]), bool(other_r[k])], "shuffled_from": swap.get(b)})
-    return {"rows": rows, "summary": summarize(rows)}
+            rows.append({"behavior": b, "family": q["family"], "type": q["type"], "split": q.get("split", "score"), "answer": q["answer"],
+                         "lp": {"own": own[k], "none": none[k], "shuffled": other[k]}, "shuffled_from": swap.get(b)})
+    t = fit_temperature(rows)
+    return {"rows": rows, "temperature": t, "summary": summarize(rows, t), "summary_uncalibrated": summarize(rows, 1.0)}
 
 
-def summarize(rows: list[dict]) -> dict:
-    """Bits saved per question (none - own, and none - shuffled) by question type: mean, SE over questions,
-    and SE over behaviors (behavior means as the units); and by family."""
-    out = {}
-    for key in sorted({r["type"] for r in rows}) + ["all"]:
-        sel = [r for r in rows if key == "all" or r["type"] == key]
+def summarize(rows: list[dict], temperature: float = 1.0) -> dict:
+    """Bits saved per question (none - own, and none - shuffled) at `temperature`, per question type on the
+    scored questions (the step consistency check apart): mean, SE over questions and SE over behaviors
+    (behavior means as the units), accuracy; and per family."""
+    graded_rows = []
+    for r in rows:
+        g = {arm: graded(r["lp"][arm], r["answer"], temperature) for arm in ("own", "none", "shuffled")}
+        graded_rows.append({**{k: r[k] for k in ("behavior", "family", "type", "split")}, **{arm: g[arm][0] for arm in g},
+                            "right": [g[arm][1] for arm in ("own", "none", "shuffled")]})
+    out = {"temperature": temperature}
+    scored = [r for r in graded_rows if r["split"] in ("score", "check")]
+    for key in sorted({r["type"] for r in scored}) + ["next+switch"]:
+        sel = [r for r in scored if (r["type"] in ("next", "switch") if key == "next+switch" else r["type"] == key)]
         if not sel:
             continue
-        entry = {"questions": len(sel)}
+        entry = {"questions": len(sel), "behaviors": len({r["behavior"] for r in sel})}
         for arm in ("own", "shuffled"):
             s = np.array([r["none"] - r[arm] for r in sel])
             by_b = {}
@@ -249,13 +308,19 @@ def summarize(rows: list[dict]) -> dict:
             entry[f"saved_{arm}"] = float(s.mean())
             entry[f"se_questions_{arm}"] = float(s.std(ddof=1) / math.sqrt(len(s))) if len(s) > 1 else float("nan")
             entry[f"se_behaviors_{arm}"] = float(means.std(ddof=1) / math.sqrt(len(means))) if len(means) > 1 else float("nan")
+        d = np.array([r["shuffled"] - r["own"] for r in sel])  # own against the shuffled control, per behavior
+        by_b = {}
+        for r, v in zip(sel, d):
+            by_b.setdefault(r["behavior"], []).append(v)
+        means = np.array([np.mean(v) for v in by_b.values()])
+        entry["own_over_shuffled"] = float(d.mean())
+        entry["se_behaviors_own_over_shuffled"] = float(means.std(ddof=1) / math.sqrt(len(means))) if len(means) > 1 else float("nan")
         entry["bits_none"] = float(np.mean([r["none"] for r in sel]))
         entry["bits_own"] = float(np.mean([r["own"] for r in sel]))
-        if all("right" in r for r in sel):  # the reader's most probable option right: own, none, shuffled
-            entry["accuracy"] = [float(np.mean([r["right"][k] for r in sel])) for k in range(3)]
+        entry["accuracy"] = [float(np.mean([r["right"][k] for r in sel])) for k in range(3)]  # own, none, shuffled
         out[key] = entry
-    out["families"] = {f: {t: float(np.mean([r["none"] - r["own"] for r in rows if r["family"] == f and r["type"] == t]))
-                           for t in sorted({r["type"] for r in rows if r["family"] == f})} for f in sorted({r["family"] for r in rows})}
+    out["families"] = {f: {t: float(np.mean([r["none"] - r["own"] for r in scored if r["family"] == f and r["type"] == t]))
+                           for t in sorted({r["type"] for r in scored if r["family"] == f})} for f in sorted({r["family"] for r in scored})}
     return out
 
 
@@ -268,6 +333,8 @@ def main():
     ap.add_argument("--per-type", type=int, default=16)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--types", default="next,switch,step", help="build: the question types")
+    ap.add_argument("--fresh", help="build: the root of a fresh build of the behaviors (another seed) for the scored next questions")
+    ap.add_argument("--explanations", help="score: a JSON {behavior: explanation} in place of the manifest's answers' explanations")
     ap.add_argument("--model", default="Qwen/Qwen3-8B")
     ap.add_argument("--device")
     ap.add_argument("--dtype", choices=["float32", "bfloat16"])
@@ -283,7 +350,7 @@ def main():
             checker = S.Checker("vpd4l", views={"vpd": str(Path.home() / "mpd-data/engine/vpd4l_decomposition")}, device="gpu")
         with open(args.out, "w") as f:
             for e in entries:
-                qs = build_behavior(e, args.per_type, args.seed, checker, args.types.split(","))
+                qs = build_behavior(e, args.per_type, args.seed, checker, args.types.split(","), args.fresh)
                 print(e["behavior"], {t: sum(q["type"] == t for q in qs) for t in ("next", "switch", "step")}, flush=True)
                 for q in qs:
                     f.write(json.dumps(q) + "\n")
@@ -294,13 +361,14 @@ def main():
     from reader_score import CachedReader
 
     questions = [json.loads(line) for line in open(args.questions) if line.strip()]
-    explanations = {e["behavior"]: P.explanation_of(Path(e["answer"]).read_text()) for e in entries}
+    explanations = ({e["behavior"]: P.explanation_of(Path(e["answer"]).read_text()) for e in entries} if not args.explanations
+                    else json.loads(Path(args.explanations).read_text()))
     backend = CachedReader(args.model, args.batch_tokens, args.max_batch, args.seed, args.device, args.dtype)
     start = time.time()
     result = score(backend, questions, explanations, args.seed)
     result.update({"reader": backend.describe(), "seconds": time.time() - start, "questions": len(questions)})
     Path(args.out).write_text(json.dumps(result, indent=1))
-    print(json.dumps(result["summary"], indent=1))
+    print(json.dumps({"temperature": result["temperature"], **{k: v for k, v in result["summary"].items() if k != "families"}}, indent=1))
 
 
 if __name__ == "__main__":

@@ -99,3 +99,13 @@ align(answer, <p:0.fc.1>)
     assert steps == ["key"]
     assert algorithm.values(["a", "b"], ["key", "answer"]) == {"key": ["A", "B"], "answer": ["A!", "B!"]}
     assert RQ._algorithm("x = 1\n") == (None, [])
+
+
+def test_temperature():
+    # Calibration questions read without an explanation: the reader puts 0.99 on option 0, right half the time.
+    rows = [{"split": "calibrate", "answer": a, "lp": {"none": [math.log(0.99), math.log(0.01)]}} for a in (0, 1) * 8]
+    t = RQ.fit_temperature(rows)
+    assert t > 10  # the best a temperature can do for a coin flip is to flatten the reader toward 1/2
+    bits, right = RQ.graded([math.log(0.99), math.log(0.01)], 1, t)
+    assert bits < 1.2 and not right
+    assert RQ.fit_temperature([{"split": "score", "answer": 0, "lp": {"none": [0.0, -1.0]}}]) == 1.0
