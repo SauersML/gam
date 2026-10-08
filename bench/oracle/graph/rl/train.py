@@ -213,6 +213,17 @@ class Policy:
             p.requires_grad_(True)
         self.end = self.tok.convert_tokens_to_ids("<|im_end|>")
 
+    def param_groups(self, lr: float) -> list[dict]:
+        """AdamW groups: the LoRA at lr, each part-token projection at lr * rank / fan_in. Adam moves every entry
+        by about lr per step, so a linear map's output moves by about lr * fan_in per unit input; the scale gives the
+        projections (fan_in = a part kind's feature width, 1,538-3,842 for vpd4l) the per-step output change of the
+        LoRA's up-projections (fan_in = rank). With one lr for both, the first SFT step on Qwen3-8B (lr 1e-4) moved
+        every part's output row toward the same hidden state and the targets fell from 4.9 to 69.5 bits per token."""
+        groups = [{"params": [p for n, p in self.model.named_parameters() if ".default." in n], "lr": lr}]
+        if self.parts is not None:
+            groups += [{"params": list(m.parameters()), "lr": lr * self.rank / m.in_features} for m in self.parts.modules() if isinstance(m, torch.nn.Linear)]
+        return groups
+
     def prompt_ids(self, text: str) -> list[int]:
         chat = self.tok.apply_chat_template([{"role": "user", "content": text}], add_generation_prompt=True, enable_thinking=False, tokenize=False)
         return self.tok.encode(chat, add_special_tokens=False)
@@ -623,7 +634,7 @@ def sft_examples(args, pol, pool: list[dict]) -> tuple[list, list]:
     return keep(programs), keep(questions)
 
 
-def sft(args, pol, pool, optimizer, log) -> dict:
+def sft(args, pol, pool, optimizer, warmup, log) -> dict:
     """--sft-steps steps of SFT: each batch draws --batch examples, a program example with probability
     --program-share and a question otherwise; loss = -(1/B) sum_e sum_t log pi(y_et) (sft_update)."""
     programs, questions = sft_examples(args, pol, pool)
@@ -641,6 +652,7 @@ def sft(args, pol, pool, optimizer, log) -> dict:
         stats = sft_update(pol, [p for p, _ in batch], [c for _, c in batch], args.micro)
         stats["grad_norm"] = float(torch.nn.utils.clip_grad_norm_(pol.params, 1.0))
         optimizer.step()
+        warmup.step()
         optimizer.zero_grad(set_to_none=True)
         tokens = sum(len(c) for _, c in batch)
         log.write(json.dumps({"step": step, "loss_nats_per_example": stats["loss"], "bits_per_token": stats["loss"] * len(batch) / tokens / np.log(2), **{k: v for k, v in stats.items() if k != "loss"},
@@ -824,7 +836,7 @@ def main():
     ap.add_argument("--scorer", choices=sorted(SCORERS), default="checker")
     ap.add_argument("--score-workers", type=int, default=1, help="checker servers per target model, each scoring whole behaviors in parallel")
     ap.add_argument("--checker", help="the checker binary (mpd_graph_2951; score.py's GRAPH_CHECKER); on MATS name target/release/examples/mpd_graph_2951 so the job builds it")
-    ap.add_argument("--vpd-view", help="VPD's decomposition export for the checker's vpd view (programs with PD.vpd pieces are invalid without it; vpd4l: ~/mpd-data/engine/vpd4l_decomposition)")
+    ap.add_argument("--vpd-view", help="VPD's decomposition export for the checker's vpd view (programs naming VPD parts are invalid without it; vpd4l: ~/mpd-data/engine/vpd4l_decomposition)")
     ap.add_argument("--checker-device", choices=["gpu"], help="run the checker's large products on the single-precision device (float32; compare scores only within one device)")
     ap.add_argument("--reader-items", type=int, default=0, help="without a reader server, keep the reader items of every K-th scored program for offline reader scoring (0: none)")
     ap.add_argument("--reader-item-stride", type=int, default=1, help="of a kept program's reader items, keep every S-th (an unbiased subsample of the reader term's mean)")
@@ -839,6 +851,7 @@ def main():
     ap.add_argument("--max-tokens", type=int, default=1536)
     ap.add_argument("--max-model-len", type=int, default=8192)
     ap.add_argument("--lr", type=float)
+    ap.add_argument("--warmup", type=int, default=20, help="optimizer steps of linear learning-rate warmup")
     ap.add_argument("--beta", type=float, help="grpo: KL weight (default 0.04); dpo: inverse temperature (default 0.1)")
     ap.add_argument("--sft-epochs", type=int, default=1)
     ap.add_argument("--repair", type=int, default=0, help="bestofn: rounds of revisions of each behavior's best program, shown its measured failures (training data only)")
@@ -929,9 +942,10 @@ def main():
         return
     if not pool:
         raise SystemExit(f"no train behaviors under {root / args.model}")
-    optimizer = torch.optim.AdamW(pol.params, lr=lr, weight_decay=0.0)
+    optimizer = torch.optim.AdamW(pol.param_groups(lr), weight_decay=0.0)
+    warmup = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda s: min(1.0, (s + 1) / args.warmup))  # linear over --warmup optimizer steps
     if args.mode == "sft":
-        sft(args, pol, pool, optimizer, open(out / "train.jsonl", "a"))
+        sft(args, pol, pool, optimizer, warmup, open(out / "train.jsonl", "a"))
         pol.save(adapter)
         print(json.dumps(evaluate(sets, pol, sampler, score, args, adapter, 1, open(out / "eval.jsonl", "a"), args.sft_steps)))
         return
@@ -993,6 +1007,7 @@ def main():
                 stats = sft_update(pol, [prompts[g] for g in keep], [best[g]["completion"] for g in keep], args.micro)
                 torch.nn.utils.clip_grad_norm_(pol.params, 1.0)
                 optimizer.step()
+                warmup.step()
                 optimizer.zero_grad(set_to_none=True)
             stats.update({"kept": len(keep), "repaired": len(repaired), "kept_mean_bits": float(np.mean([best[g]["score"]["total_bits"] for g in keep])) if keep else None})
         sums = stats.pop("logprob_sums", None)
@@ -1001,6 +1016,7 @@ def main():
         if args.mode != "bestofn":
             stats["grad_norm"] = float(torch.nn.utils.clip_grad_norm_(pol.params, 1.0))
             optimizer.step()
+            warmup.step()
         t3 = time.time()
         tokens = [len(c) for c in flat_c]
         log.write(json.dumps({"step": step, "mode": args.mode, "behaviors": len(chosen), "programs": len(items), "mean_bits": float(S.mean()), "best_bits": float(S.min(1).mean()),

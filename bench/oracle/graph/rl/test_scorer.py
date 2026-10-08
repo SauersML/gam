@@ -161,7 +161,7 @@ def check_valid_sampler():
     before and after."""
     import train
 
-    good = "from mech import node, edges, L, logits\nh = node(L[1].head[0])\nedges(h >> logits)\n"
+    good = "from mech import node, edges, PD, logits\nh = node(PD[1].down_proj[3])\nedges(h >> logits)\n"
     tok = types.SimpleNamespace(decode=lambda c, skip_special_tokens=True: good if c[0] > 0 else "nonsense(")
     calls = []
 

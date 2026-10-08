@@ -190,9 +190,9 @@ def check_registry_parts(base: Path):
     become mech addresses for the checker; SFT targets get part tokens for addresses."""
     import part_tokens
 
-    addresses = [f"PD.vpd[{l}].v_proj[{i}]" for l in (1, 2) for i in (3, 7)] + ["PD.vpd[0].c_fc[12]"]
+    addresses = [f"PD[{l}].v_proj[{i}]" for l in (1, 2) for i in (3, 7)] + ["PD[0].c_fc[12]"]
     g = torch.Generator().manual_seed(9)
-    reg = part_tokens.Registry(addresses, {"vpd.v": torch.randn(4, 10, generator=g), "vpd.fc": torch.randn(1, 12, generator=g)})
+    reg = part_tokens.Registry(addresses, {"pd.v": torch.randn(4, 10, generator=g), "pd.fc": torch.randn(1, 12, generator=g)})
     path = Path(tempfile.mkdtemp()) / "reg.safetensors"
     reg.save(path)
     args = argparse.Namespace(base=str(base), init=None, lora_rank=4, part_tokens=str(path))
@@ -215,9 +215,12 @@ def check_registry_parts(base: Path):
             once = causal(input_ids=ids).logits
     assert torch.allclose(plain, once, atol=1e-6)
     text = "```python\nx = bind('v', <p:2.v.7>, <p:0.fc.12>)\n```\nThe value head."
-    assert train.to_mech(text) == "```python\nx = bind('v', PD.vpd[2].v_proj[7], PD.vpd[0].c_fc[12])\n```\nThe value head."
-    assert pol.parts.reg.rewrite("node(PD.vpd[1].v_proj[3])") == "node(<p:1.v.3>)"
+    assert train.to_mech(text) == "```python\nx = bind('v', PD[2].v_proj[7], PD[0].c_fc[12])\n```\nThe value head."
+    assert pol.parts.reg.rewrite("node(PD[1].v_proj[3], PD.vpd[2].v_proj[7])") == "node(<p:1.v.3>, <p:2.v.7>)"  # either spelling
     assert pol.tok.decode([first + 4]) == "<p:0.fc.12>"
+    groups = pol.param_groups(1e-4)  # the LoRA at lr, each projection at lr * rank / its feature width
+    assert sorted(id(p) for g in groups for p in g["params"]) == sorted(id(p) for p in pol.params)
+    assert groups[0]["lr"] == 1e-4 and sorted({round(g["lr"], 12) for g in groups[1:]}) == [round(1e-4 * 4 / 12, 12), round(1e-4 * 4 / 10, 12)]
 
 
 def check_init_adapter(base: Path):
