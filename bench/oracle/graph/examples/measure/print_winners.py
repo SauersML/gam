@@ -26,8 +26,8 @@ def main():
     for path in sys.argv[1:]:
         for line in Path(path).read_text().splitlines():
             r = json.loads(line)
-            if "error" not in r:
-                records[r["example"]] = r
+            if "error" not in r:  # rescore_examples.py names the example, score_programs.py its file
+                records[r.get("example") or r["program"].removesuffix(".py")] = r
     OUT.mkdir(parents=True, exist_ok=True)
     for name, r in sorted(records.items()):
         if r["program"]["total_bits"] >= r["empty"]["total_bits"]:
