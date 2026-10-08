@@ -363,8 +363,20 @@ with torch.no_grad():
 X_FC = {n: X[n] for n in mlp if n.endswith('c_fc')} if ARM == 'rot' else {}
 del X
 
-state = {'mode': 'M', 'soft': [], 'hard': [], 'gates': {}, 'share': {}, 'r': {}, 'writers': {}, 'on': {}, 'gate': {}, 'edges_soft': [], 'edges_hard': [], 'share_a': {}, 'wedits_M': {}, 'wedits_P': {}, 'entry': {}, 'force_on': [], 'gn_in': {}}
+state = {'mode': 'M', 'soft': [], 'hard': [], 'gates': {}, 'share': {}, 'r': {}, 'writers': {}, 'on': {}, 'gate': {}, 'edges_soft': [], 'edges_hard': [], 'share_a': {}, 'wedits_M': {}, 'wedits_P': {}, 'entry': {}, 'force_on': [], 'gn_in': {}, 'score': {}, 'mlp_x': {}}
 SQ2 = math.sqrt(2)
+# DESCENT_SCOREGATE=1 (slice arms): every attention slice's gate also reads its head's largest attention logit at the
+# slice's token, s_h(t) = max_{u <= t} q_t . k_u / sqrt(hd) from M's q and k maps on P's own stream (standardized per
+# head on the first pass), z += beta s_h(t) with one beta per slice (started at 0, so the start is the own read). A
+# read of the residual stream cannot see a repeat; the head's own scores can (toys' induction toy: AUC 0.91-0.97 at
+# the second copy's tokens, own reads 0.33-0.75).
+SCOREGATE = os.environ.get('DESCENT_SCOREGATE') == '1'
+SCORE_NORM = {}
+# DESCENT_READSIDE=1 (slice arms): a down_proj slice's gate reads its direction on the layer's pre-activation,
+# |v . (W_fc x)| ||u|| with x the normed stream entering the MLP (the read side, in the stream), in place of its own
+# read of the activation, |v . GELU(h)| ||u|| (toys' superposition toy: stream-side gates exact, neuron-space gates
+# at Jaccard 0.51). A c_fc slice's own read is already its direction on the stream.
+READSIDE = os.environ.get('DESCENT_READSIDE') == '1'
 
 def slice_gates(read, c, un, tau, s, taun, ex):
     """A slice map's gates (hard, expected) from its own reads (read, or |c| un when None) and thresholds (tau, s and
@@ -409,6 +421,8 @@ def make(n):
             state['dense'][(layer, 1)] = x
         if state['mode'] == 'M':
             return x @ st.W.T
+        if READSIDE and n.endswith('c_fc'):
+            state['mlp_x'][layer] = x
         c = x @ p['V']
         un = un0 = p['U'].norm(dim=1)
         for b, kind, G, a in state['entry'].get(n, ()):
@@ -463,6 +477,8 @@ def make(n):
             state['soft'].append(soft.sum(-1).reshape(-1))
             return emit(c * soft)
         read = x @ p['G'] if ARM == 'dir' else c if start == 'neuron' else None
+        if READSIDE and n.endswith('down_proj'):
+            read = ((state['mlp_x'][layer] @ T.site(f'h.{layer}.mlp.c_fc').W.T) @ p['V']).abs() * un
         if state.get('calib') is not None:
             state['calib'].setdefault(n, []).append((c.abs() * un if read is None else read).detach().reshape(-1))
         ex = None
@@ -571,6 +587,10 @@ def make_attn(n):
                     state['gn_in'][('attn', n.split('.')[1])] = x
                 g_ = gate_net_s(n, state['gn_in'][('attn', n.split('.')[1])])
                 ex = g_.reshape(-1, NH, c.shape[-1]).permute(1, 0, 2)
+            if 'beta' in p:
+                # The head's largest attention logit at the slice's token (the query's for q and o, the key's for k).
+                sg = state['score'][int(n.split('.')[1])].permute(1, 0, 2).reshape(NH, -1, 1) * p['beta'][:, None, :]
+                ex = sg if ex is None else ex + sg
             hard, phi = force_rows(*slice_gates_run(None, c, p['U'].norm(dim=-1)[:, None, :], p['tau'][:, None, :], p['s'][:, None, :],
                                                     p['taun'][:, None, :] if 'taun' in p else None, ex), x.shape[1])
             state['hard'].append(hard.sum((0, 2)))
@@ -1297,6 +1317,9 @@ def attn_v(l, h, pattern):
             if state.get('calib') is not None:
                 state['calib'].setdefault(n, []).append(r.detach().reshape(-1))
             ex = gate_net_s(n, h).view(B_, T_, NH, -1).permute(0, 2, 1, 3) if n in GN else None
+            if 'beta' in p:
+                sg = state['score'][l][..., None] * p['beta'][None, :, None, :]
+                ex = sg if ex is None else ex + sg
             hard, soft = slice_gates_run(r, m, p['U'].norm(dim=-1)[None, :, None, :], p['tau'][None, :, None, :], p['s'][None, :, None, :],
                                          p['taun'][None, :, None, :] if 'taun' in p else None, ex)
         if state['force_on']:
@@ -1331,6 +1354,14 @@ def hidden(ids):
         if ROTA:
             x = x + rot_attention(i, h, causal)
         else:
+            if SCOREGATE and state['mode'] != 'all':
+                with torch.no_grad():
+                    qf = T._rope((h @ site('q_proj').W.T).view(B_, T_, NH, HD).transpose(1, 2), T_)
+                    kf = T._rope((h @ site('k_proj').W.T).view(B_, T_, NH, HD).transpose(1, 2), T_)
+                    sm = ((qf @ kf.transpose(-1, -2)) / math.sqrt(HD)).masked_fill(~causal, float('-inf')).amax(-1)   # [B, H, T]
+                    if i not in SCORE_NORM:
+                        SCORE_NORM[i] = (sm.mean((0, 2))[None, :, None], sm.std((0, 2)).clamp_min(1e-6)[None, :, None])
+                    state['score'][i] = (sm - SCORE_NORM[i][0]) / SCORE_NORM[i][1]
             q = T._rope(site('q_proj')(h).view(B_, T_, NH, HD).transpose(1, 2), T_)
             k = T._rope(site('k_proj')(h).view(B_, T_, NH, HD).transpose(1, 2), T_)
             pattern = ((q @ k.transpose(-1, -2)) / math.sqrt(HD)).masked_fill(~causal, float('-inf')).softmax(-1)
@@ -1538,26 +1569,28 @@ def evaluate(final=False):
             out['example_graph'] = graph
     if SHARE:
         out['parts'] = [share_parts(l, S) for l, S in SHARE.items()]
-    if ROT and ROTA:
-        # Induction: 128 random tokens, then the same 128 again; the blocks on at the repeat's tokens (where the next
-        # token can be copied from the first pass) against the first pass's, with each block's layer, map and rank.
-        g_ = torch.Generator().manual_seed(5)
-        ind = torch.randint(0, T.wte.shape[0], (1, 128), generator=g_).to(dev).repeat(1, 2)
-        install([None])
-        lm = run(ind, 'M')
-        state['probe'] = {}
-        lp = run(ind, 'hard')
-        kl_t = kl_bits(lm, lp)[0]
-        rows = []
-        for key, (gates, R) in state['probe'].items():
-            g1, g2 = gates[0, 1:128].mean(0), gates[0, 129:].mean(0)                       # [ng, g] on-rates
-            members = torch.zeros_like(g1).scatter_add_(1, R['L'].argmax(-1), torch.ones_like(g1)) if R is not None else g1 * 0
-            for n_, j_ in zip(*torch.nonzero((g2 - g1) > 0.5, as_tuple=True)):
-                rows.append({'map': key, 'group': int(n_), 'block': int(j_), 'rank': int(members[n_, j_]),
-                             'on_repeat': round(g2[n_, j_].item(), 3), 'on_first': round(g1[n_, j_].item(), 3)})
-        state['probe'] = None
-        out['induction'] = {'kl_first': round(kl_t[1:128].mean().item(), 3), 'kl_repeat': round(kl_t[129:].mean().item(), 3),
-                            'blocks_on_repeat_not_first': sorted(rows, key=lambda r: -(r['on_repeat'] - r['on_first']))[:40]}
+    # Induction: 16 random 100-token sequences, each followed by itself again. KL(M || P) on the first and on the second
+    # copy, M's and P's loss in bits on the second copy (each of its tokens can be copied from the first), and (rot
+    # with attention) the blocks on at the second copy's tokens against the first's, with each block's map and rank.
+    g_ = torch.Generator().manual_seed(5)
+    ind = torch.randint(0, T.wte.shape[0], (16, 100), generator=g_).to(dev).repeat(1, 2)
+    install([None] * 16)
+    lm = run(ind, 'M')
+    state['probe'] = {} if ROT and ROTA else None
+    lp = run(ind, 'hard')
+    kl_t = kl_bits(lm, lp)
+    loss = lambda lg: (-F.log_softmax(lg[:, 100:-1].float(), -1).gather(-1, ind[:, 101:, None]).mean() / math.log(2)).item()
+    rows = []
+    for key, (gates, R) in (state['probe'] or {}).items():
+        g1, g2 = gates[:, 1:100].mean((0, 1)), gates[:, 100:].mean((0, 1))                 # [ng, g] on-rates
+        members = torch.zeros_like(g1).scatter_add_(1, R['L'].argmax(-1), torch.ones_like(g1)) if R is not None else g1 * 0
+        for n_, j_ in zip(*torch.nonzero((g2 - g1) > 0.5, as_tuple=True)):
+            rows.append({'map': key, 'group': int(n_), 'block': int(j_), 'rank': int(members[n_, j_]),
+                         'on_repeat': round(g2[n_, j_].item(), 3), 'on_first': round(g1[n_, j_].item(), 3)})
+    state['probe'] = None
+    out['induction'] = {'kl_first': round(kl_t[:, 1:100].mean().item(), 3), 'kl_repeat': round(kl_t[:, 100:].mean().item(), 3),
+                        'loss_repeat_M': round(loss(lm), 3), 'loss_repeat_P': round(loss(lp), 3),
+                        'blocks_on_repeat_not_first': sorted(rows, key=lambda r: -(r['on_repeat'] - r['on_first']))[:40]}
     if ROT:
         run(ev[0:4], 'hard')
         ranks = torch.cat([torch.bincount(R['L'].argmax(-1).reshape(-1) + ROTG * torch.arange(R['ng'], device=dev).repeat_interleave(ROTG),
@@ -1714,6 +1747,11 @@ slots = [(P[n], w, rms(P[n][w])) for n in mlp for w in (('F',) if EXACT else ('V
 # rot: rotation angles by 1e-3 per step, thresholds by a tenth of their noise scale, assignment logits by 0.02.
 slots += [x for R in ROT_ALL for x in ((R, 'A', 1 / 3), (R, 'tau', 100 / 3 * R['s'].mean().item()), (R, 'L', 20 / 3))]
 slots += [x for P_ in GN.values() for x in ((P_, 'W1', rms(P_['W1'])), (P_, 'b1', 0.1), (P_, 'W2', 1 / math.sqrt(GATENET)))]
+if SCOREGATE:
+    # beta by its threshold's step in z (a tenth of the noise scale per step, against a standardized score).
+    for n in sliced:
+        A[n]['beta'] = torch.zeros_like(A[n]['tau']).detach().requires_grad_()
+    slots += [(A[n], 'beta', 100 / 3) for n in sliced]
 slots += [(TRUNK, k, rms(TRUNK[k])) for k in TRUNK]
 slots += [(A[n], w, rms(A[n][w])) for n in sliced for w in (('V', 'U') if ATTN_FREE else ('F',)) if not GATES_ONLY] + [(A[n], 'tau', 100 / 3 * A[n]['s'].mean().item()) for n in sliced]
 for l, S in SHARE_A.items():
