@@ -29,6 +29,9 @@ vpd_model.VPD_PTH = Path(sys.argv[3])
 TOKENS, out = sys.argv[4], sys.argv[5]
 dev = os.environ.get('DESCENT_DEV') or ('cuda' if torch.cuda.is_available() else 'mps')
 T = load_target(dev); V = load_vpd(T, dev)
+# FAIR_BINARIZE=c: the masks made hard, 1 where clamp(CI, 0, 1) > c and 0 elsewhere (VPD's own switching function
+# as an on/off program, as ours are scored); default the continuous masks.
+BINARIZE = float(os.environ['FAIR_BINARIZE']) if os.environ.get('FAIR_BINARIZE') else None
 # FAIR_SITES=all masks all 24 sites (attention too, VPD's published setting); default the 8 MLP maps.
 mlp = site_names() if os.environ.get('FAIR_SITES') == 'all' else [n for n in site_names() if '.mlp.' in n]
 tok = np.memmap(TOKENS, dtype=np.uint16 if TOKENS.endswith('.u16') else np.float64, mode='r').reshape(-1, 513)
@@ -117,6 +120,9 @@ with torch.no_grad():
                     'own_causal_1': ci(own_acts, True), 'all_on': None}
         for k, masks in settings.items():
             m = ones if masks is None else {n: masks[n] for n in mlp}
+            if BINARIZE is not None and masks is not None:
+                # Hard masks: a subcomponent fully on where its mask exceeds the cut, off elsewhere.
+                m = {n: (v_ > BINARIZE).float() for n, v_ in m.items()}
             lp, run_acts = inputs_of(ids, m)
             res[k]['kl'].append(kl_bits(lm, lp))
             if masks is not None:
