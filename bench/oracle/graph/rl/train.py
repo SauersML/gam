@@ -478,7 +478,7 @@ def sft_examples(args, pol, pool: list[dict]) -> tuple[list, list]:
         pattern = os.path.expanduser(pattern)
         for path in sorted(glob.glob(os.path.join(pattern, "*.json") if os.path.isdir(pattern) else pattern)):
             r = json.loads(Path(path).read_text())
-            if r.get("behavior") not in by_id or not r.get("source"):
+            if r.get("behavior") not in by_id or not (r.get("source") or r.get("answer") or r.get("answer_path")):
                 continue
             if "score" not in r:  # an unscored program (a printed hand-written example): always an example
                 best[path] = r
