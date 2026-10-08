@@ -23,6 +23,9 @@ EXPORTS = {
 PUBLISHED = Path.home() / "mpd-data/graph_oracle/bin/mpd_graph_2951"
 BINARY = Path(os.environ.get("GRAPH_CHECKER") or (PUBLISHED if PUBLISHED.exists() else Path.home() / "mpd-data/scratch/g-exec/bin/mpd_graph_2951"))
 HERE = Path(__file__).resolve().parent
+# Each model's published shared base (g-exec2): generic machinery declared once per model, a program IR whose nodes
+# the checker adds to every scored program (always on, connected to every node, priced apart in base_bits).
+BASES = {"vpd4l": Path.home() / "mpd-data/graph_oracle/base/vpd4l/base_v1.json"}
 
 
 def trace(source, model, behavior=None, decomposition=None):
@@ -57,14 +60,16 @@ def reader_request(address, message):
 
 
 class Checker:
-    def __init__(self, model, export=None, memory_gib=None, threads=None, views=None, device=None, memo_dir=None):
+    def __init__(self, model, export=None, memory_gib=None, threads=None, views=None, device=None, memo_dir=None, base=None):
         """memory_gib: the server's mem-lease (vpd4l: a batch of 8 programs at 8 threads ran under 12 GiB and
         was killed under 8 GiB); threads: its rayon threads (RAYON_NUM_THREADS when unset, 6 by default: runs
         in parallel each hold their own streams and log-probabilities); views: decomposition views to attach,
         {"vpd": DIR, "transcoders": DIR} (the server's load keys); device: "gpu" runs the large products on
         the single-precision device (the server's load key; float32, so compare scores within one device);
         memo_dir: the server's --memo-dir (GRAPH_MEMO_DIR when unset), small per-behavior memos of the targets
-        and native bit widths that later runs on the same behavior reuse (builds from a6a063a9c4 on)."""
+        and native bit widths that later runs on the same behavior reuse (builds from a6a063a9c4 on); base: the
+        shared base every program is scored with (a base IR file, or True for the model's published BASES entry;
+        GRAPH_BASE when unset; builds from 83b6a221ad on)."""
         # Qwen3-0.6B's load in float64 passed 16.3 GiB and was killed under a 16 GiB lease.
         memory_gib = memory_gib or (28 if model.startswith("qwen3") else 12)
         env = dict(os.environ)
@@ -80,6 +85,8 @@ class Checker:
         self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1, env=env)
         self.request({"op": "load", "export": str(export), **{k: str(Path(v).expanduser()) for k, v in (views or {}).items()}, **({"device": device} if device else {})})
         self.behavior_record = None
+        base = base if base is not None else os.environ.get("GRAPH_BASE")
+        self.base = str(BASES[model] if base is True or base == "1" else Path(base).expanduser()) if base else None
         # What a program's PD names: the attached decomposition (the library over VPD when both are).
         views = views or {}
         self.decomposition = "library" if "library" in views else "vpd" if "vpd" in views else "transcoder" if "transcoders" in views else "native"
@@ -98,7 +105,10 @@ class Checker:
     def behavior(self, path):
         path = Path(path).expanduser()
         self.behavior_record = json.loads(path.read_text())
-        return self.request({"op": "behavior", "path": str(path)})
+        answer = self.request({"op": "behavior", "path": str(path)})
+        if self.base:
+            answer["base"] = self.request({"op": "base", "path": self.base})
+        return answer
 
     def score(self, program, experiments=32, seed=0, routing="edges", N=None, reader=True, reader_top=8, stand_in="input"):
         """Every score term (design.txt section 5). `program` is Python source, an IR dict, or {"source",

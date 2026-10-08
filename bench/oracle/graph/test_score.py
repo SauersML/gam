@@ -17,7 +17,7 @@ sys.path.insert(0, str(HERE))
 import score  # noqa: E402
 
 SOURCE = Path.home() / "mpd-data/graph_oracle/behaviors/vpd4l/induction_random.words8.json"
-TERMS = ["total_bits", "exec_error_bits", "code_bits", "opaque_bits", "opaque_numbers", "python_tokens", "N", "experiments"]
+TERMS = ["total_bits", "exec_error_bits", "complexity_bits", "structure_bits", "code_bits", "base_bits", "opaque_numbers", "python_tokens", "N", "experiments"]
 
 pytestmark = pytest.mark.skipif(not (score.BINARY.exists() and score.EXPORTS["vpd4l"].exists() and SOURCE.exists()),
                                 reason="no checker binary, vpd4l export or behavior file")
@@ -67,3 +67,28 @@ def test_ir_carries_explanation():
     assert ir["valid"] and ir["explanation"] == "L2.H4 copies the token."
     assert score.Checker.ir(fake, "from mech import L\n")["explanation"] == ""
     assert score.Checker.ir(fake, ir) is ir
+
+
+def test_shared_base_joins_every_program(tmp_path):
+    """A base of two layer-3 VPD subcomponents (c_fc and down_proj): the empty program is scored as the base alone
+    (its parts priced in base_bits, outside total_bits); a program naming one of them takes it over."""
+    vpd = Path.home() / "mpd-data/engine/vpd4l_decomposition"
+    if not vpd.exists():
+        pytest.skip("no vpd4l decomposition")
+    record = json.loads(SOURCE.read_text())
+    record["prompts"] = record["prompts"][:4]
+    behavior = tmp_path / "induction4.json"
+    behavior.write_text(json.dumps(record))
+    base = {"model": "vpd4l", "nodes": [{"id": "base_m3", "pieces": [{"view": "vpd", "layer": 3, "kind": "c_fc", "index": [0]},
+                                                                     {"view": "vpd", "layer": 3, "kind": "down_proj", "index": [0]}]}],
+            "edges": [], "base": ["base_m3"], "valid": True}
+    path = tmp_path / "base.json"
+    path.write_text(json.dumps(base))
+    with score.Checker("vpd4l", views={"vpd": vpd}, base=path) as c:
+        assert c.behavior(behavior)["base"]["parts"] == 2
+        empty = {"model": "vpd4l", "nodes": [], "edges": [], "python_tokens": 0, "token_types": 0, "valid": True}
+        taking = {**empty, "nodes": [{"id": "m", "pieces": [{"view": "vpd", "layer": 3, "kind": "c_fc", "index": [0]}]}],
+                  "edges": [{"from": "embed", "to": "m", "route": "input"}]}
+        a, b = c.score_batch([empty, taking], experiments=2, reader=False)
+        assert a["valid"] and b["valid"] and a["base_bits"] > 0 and math.isclose(b["base_bits"], a["base_bits"] / 2, rel_tol=1e-9)
+        assert math.isclose(a["total_bits"], a["exec_error_bits"] + a["complexity_bits"], rel_tol=1e-9)
