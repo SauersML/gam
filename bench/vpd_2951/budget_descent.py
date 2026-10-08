@@ -1520,7 +1520,7 @@ def attn_v(l, h, pattern):
     if state['mode'] != 'all' and slice_mean(n):
         # The mean part: the pattern's rows sum to 1, so the mixed coefficients less the mean coefficients are the
         # mixed deviations.
-        cmv = head_coefficients(XBAR[n][None], p['V'], False).permute(1, 0, 2)[None]   # [1, H, 1, C]
+        cmv = head_coefficients(XBAR[n][None], p['V'], False)[None]               # [1, H, 1, C]
         m = m - cmv
     if state['mode'] == 'all':
         g = 1.0; mg = m * g
