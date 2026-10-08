@@ -57,16 +57,19 @@ import os
 # DESCENT_ARM=dir: each slice's gate reads its own direction g_i (signed), z = (g_i.x - tau_i)/s_i,
 # with g_i started at the slice's read v_i ||u_i||, signed so its firing on M's fit tokens is kept.
 ARM = os.environ.get('DESCENT_ARM', 'own')
-# DESCENT_LEVIN (default 1; the rot arm): the objective per clean token is KL_t + log2(C_t), Levin's cost: C_t the
-# concepts a reader follows to run the explanation at token t, the concepts of the blocks on (1 for the gate plus,
-# per slice, its read, its write and its scales: 4 for an MLP or OV slice, whose neuron-space or head-space
-# direction inside the block is not counted, 3 for a q or k slice) plus the gates evaluated (every non-empty
-# block's, the head scores read by score gates, and a gate network's parameters). Halving what a reader follows is
-# worth one bit of prediction error; there is no budget and no tuned weight. Bits-back (DESCENT_F) is off: data is
-# effectively unlimited. K (the second argument) sets only the start's thresholds, at K VPD subcomponents' 4
-# concepts each per token. Blocks never on in an evaluation's hard passes are pruned (off for good; all-on keeps
-# them, so P stays exact).
-LEVIN = os.environ.get('DESCENT_LEVIN', '1') == '1' and ARM == 'rot'
+# DESCENT_CONCEPTS (default 1; the rot arm): the objective is the concepts a reader follows per clean token, those of
+# the blocks on (1 for the gate plus, per slice, its read, its write and its scales: 4 for an MLP or OV slice, whose
+# neuron-space or head-space direction inside the block is not counted, 3 for a q or k slice) plus the gates
+# evaluated (every non-empty block's, the head scores read by score gates, the mean parts, a gate network's
+# parameters), minimized subject to the delivered (hard) program's KL on clean text at most kappa (DESCENT_KAPPA,
+# default 0.553 bits per token, VPD's published whole-model KL): faithfulness is a requirement, not a price. The
+# multiplier mu follows the step's delivered KL on its clean sequences (fresh text, so unseen) by log-integral
+# ascent. The start has every block on (thresholds at the 1% quantile of each block set's reads), where KL is about
+# 0. Bits-back (DESCENT_F) is off. Blocks never on in an evaluation's hard passes are pruned (off for good; all-on
+# keeps them, so P stays exact). (Levin's per-token KL + log2 concepts, tried first, traded faithfulness for
+# concepts at one bit per halving: hard KL rose from 3.1 to 6.2 as the count fell.)
+CONCEPTS = os.environ.get('DESCENT_CONCEPTS', '1') == '1' and ARM == 'rot'
+KAPPA = float(os.environ.get('DESCENT_KAPPA', '0.553'))
 dev = os.environ.get('DESCENT_DEV') or ('cuda' if torch.cuda.is_available() else 'mps')
 # DESCENT_EXACT=1: every map's slices sum to M's weight at every step by construction (below). The
 # frames' duals and writes are computed in full float32 (TF32's 10-bit mantissa would break the sum);
@@ -682,8 +685,8 @@ def permuted(x, idx, inv):
     """x[..., idx] for a permutation idx with inverse inv."""
     return _Permuted.apply(x, idx, inv)
 if ARM == 'rot':
-    if start != 'neuron' or (os.environ.get('DESCENT_F') == '1') == LEVIN:
-        raise SystemExit('DESCENT_ARM=rot: the neuron start, and F (DESCENT_F=1) or the Levin objective (DESCENT_LEVIN=1)')
+    if start != 'neuron' or (os.environ.get('DESCENT_F') == '1') == CONCEPTS:
+        raise SystemExit('DESCENT_ARM=rot: the neuron start, and F (DESCENT_F=1) or the concepts objective (DESCENT_CONCEPTS=1)')
     with torch.no_grad():
         for l in range(T.n_layer):
             fc, dn = f'h.{l}.mlp.c_fc', f'h.{l}.mlp.down_proj'
@@ -818,7 +821,7 @@ def rot_slice_bits(R, Q):
     nf = qeinsum('nki,nkm,nmi->ni', Q, R['Gfc'], Q); nd = qeinsum('nki,nkm,nmi->ni', Q, R['Gdn'], Q)
     di, do = R['di'], R['do']
     vf = (nf.sum() + di * sf.sum()) / (di * nf.numel()); vd = (nd.sum() + do * sd.sum()) / (do * nd.numel())
-    if LEVIN:
+    if CONCEPTS:
         return torch.full_like(nd, 4.0), nd.clamp_min(0).sqrt()
     bits = 0.5 * (di * torch.log(vf / sf) + (nf + di * sf) / vf - di) + 0.5 * (do * torch.log(vd / sd) + (nd + do * sd) / vd - do)
     return bits / math.log(2) + rot_angle_bits(R), nd.clamp_min(0).sqrt()
@@ -835,8 +838,8 @@ def rot_angle_bits(R):
     return 0.5 * (kl.sum(-1) + kl.sum(-2)) / math.log(2)
 
 def rot_tau_bits(R):
-    """Per block [ng, g]: its threshold's description in bits (the fitted-mean prior); under LEVIN its gate's concept."""
-    if LEVIN:
+    """Per block [ng, g]: its threshold's description in bits (the fitted-mean prior); under CONCEPTS its gate's concept."""
+    if CONCEPTS:
         return torch.ones_like(R['s'])
     if 'tau_leaf' not in R:
         return torch.zeros_like(R['s'])
@@ -845,17 +848,17 @@ def rot_tau_bits(R):
     return 0.5 * (torch.log(v) - 2 * ls + ((mu - mu.mean()).pow(2) + (2 * ls).exp()) / v - 1) / math.log(2)
 
 def rot_index_bits():
-    """log2 of the number of blocks (MLP, OV and QK blocks with a slice or plane); under LEVIN the gate's concept
+    """log2 of the number of blocks (MLP, OV and QK blocks with a slice or plane); under CONCEPTS the gate's concept
     (the start's per-block cost beside its slices')."""
-    if LEVIN:
+    if CONCEPTS:
         return 1.0
     Ls = [R['L'] for R in ROT_ALL]
     return rot_memo('index', Ls, lambda: math.log2(max(2, int(torch.stack(
         [(torch.zeros(L.shape[:2], device=dev).scatter_(1, L.argmax(-1), 1.0) > 0).sum() for L in Ls]).sum()))))
 
 def rot_index_bits_t():
-    """rot_index_bits as a device scalar, with no host wait (0 under LEVIN: the gate's concept is rot_tau_bits')."""
-    if LEVIN:
+    """rot_index_bits as a device scalar, with no host wait (0 under CONCEPTS: the gate's concept is rot_tau_bits')."""
+    if CONCEPTS:
         return torch.zeros((), device=dev)
     Ls = [R['L'] for R in ROT_ALL]
     return rot_memo('index_t', Ls, lambda: torch.stack(
@@ -919,7 +922,10 @@ def rot_gate_core(R, r, bits_i, idx, on, mode, extra=None):
     blocks' reads Rb."""
     g = R['L'].shape[-1]
     hot = (R['L'].argmax(-1, keepdim=True) == torch.arange(g, device=r.device)).float(); Lsm = torch.softmax(R['L'], -1)
-    M_ = hot if mode == 'hard' else Lsm
+    # Every pass runs the one-hot assignment (the delivered program's), with the softmax's gradient in training: the
+    # expected assignment mixed blocks' gates per slice, so lev-st's training pass (hard gates) scored 3.3 bits per
+    # token against its delivered program's 6.2.
+    M_ = hot if mode == 'hard' else hot + Lsm - Lsm.detach()
     Rb = (qeinsum('...ni,nij->...nj', r.pow(2), M_) + 1e-20).sqrt()
     z = ((Rb.log() if LOGGATE else Rb) - R['tau']) / R['s']
     if extra is not None:
@@ -937,7 +943,7 @@ def rot_gate_core(R, r, bits_i, idx, on, mode, extra=None):
         # Each gate's binary entropy in bits, summed per token.
         ph = phi.clamp(1e-7, 1 - 1e-7)
         Hs = -(ph * ph.log2() + (1 - ph) * (1 - ph).log2()).sum((-1, -2)).reshape(-1)
-    return qeinsum('...nj,nij->...ni', gb, Lsm), (hb, n_on, (gb * Lj).sum((-1, -2)).reshape(-1), Lj, Hs), Rb
+    return qeinsum('...nj,nij->...ni', gb, M_), (hb, n_on, (gb * Lj).sum((-1, -2)).reshape(-1), Lj, Hs), Rb
 
 def rot_fc_core(R, p, xe, Q, ex, idx, on, sc, mode):
     """A c_fc map after M's product p = x W^T: its slices' coefficients (with the read noise xe), its blocks' gates
@@ -1119,7 +1125,7 @@ def nonempty(R, soft=False):
     return torch.zeros(R['L'].shape[:2], device=dev).scatter_(1, R['L'].argmax(-1), 1.0)
 
 def gates_evaluated(soft):
-    """LEVIN: the gates a reader evaluates on every token: each non-empty unpruned block's (soft: expected under the
+    """CONCEPTS: the gates a reader evaluates on every token: each non-empty unpruned block's (soft: expected under the
     assignment softmax), the head scores the score gates read, and the gate networks' parameters."""
     extra = sum(t_.numel() for P_ in GN.values() for t_ in P_.values()) + sum(t_.numel() for t_ in TRUNK.values())
     extra += T.n_layer * NH if SCOREGATE and ROTA else 0
@@ -1128,7 +1134,7 @@ def gates_evaluated(soft):
     return sum((nonempty(R, soft) * R['keep']).sum() for R in ROT_ALL) + extra
 
 def concepts_total():
-    """LEVIN: the whole decomposition's concepts: each non-empty unpruned block's 1 + 4 per MLP or OV slice (3 per q or
+    """CONCEPTS: the whole decomposition's concepts: each non-empty unpruned block's 1 + 4 per MLP or OV slice (3 per q or
     k slice), plus the gates' extra concepts (head scores, gate network parameters)."""
     tot = gates_evaluated(False) - sum((nonempty(R) * R['keep']).sum() for R in ROT_ALL)
     for R in ROT_ALL:
@@ -1206,7 +1212,7 @@ def gate_net(l, part, x):
 
 def rot_read_bits(R, Q):
     """Per q or k slice [ng, g]: its dense read's description and its angles' share, in bits."""
-    if LEVIN:
+    if CONCEPTS:
         return torch.full_like(R['s'], 3.0)
     s2 = (2 * R['ls']).exp(); d_ = R['di']
     nr = qeinsum('nki,nkm,nmi->ni', Q, R['G'], Q)
@@ -1677,12 +1683,12 @@ def evaluate(final=False, start_eval=False):
     install([None])
     r = {'kl': [], 'kl_soft': [], 'kl_all_on': [], 'active': [], 'active_soft': [], 'per_map': [], 'edges_on': [], 'edges_on_soft': []}
     graph = None
-    if LEVIN:
+    if CONCEPTS:
         G_ev, seen = gates_evaluated(False).item(), {}
     for i in range(0, ev.shape[0], 4):
         ids = ev[i:i + 4]
         lm = run(ids, 'M')
-        state['probe'] = {} if LEVIN else None
+        state['probe'] = {} if CONCEPTS else None
         state['alone'] = {} if ROT and i == 0 else None
         lp = run(ids, 'hard'); r['kl'].append(kl_bits(lm, lp).mean().item())
         if state['alone'] is not None:
@@ -1690,9 +1696,8 @@ def evaluate(final=False, start_eval=False):
             alone_rec = {l: acts_alone(l, *v) for l, v in state['alone'].items()}
             state['alone'] = None
         r['active'].append(torch.stack(state['hard']).sum(0).mean().item())
-        if LEVIN:
-            # Levin's cost per token, and each block's on-anywhere (for the pruning).
-            r.setdefault('log2_concepts', []).append(torch.log2(torch.stack(state['hard']).sum(0) + G_ev).mean().item())
+        if CONCEPTS:
+            # Each block's on-anywhere (for the pruning).
             for g_, R_ in state['probe'].values():
                 seen[id(R_)] = (R_, torch.maximum(seen[id(R_)][1], g_.amax((0, 1))) if id(R_) in seen else g_.amax((0, 1)))
             state['probe'] = None
@@ -1734,13 +1739,13 @@ def evaluate(final=False, start_eval=False):
     ind = torch.randint(0, T.wte.shape[0], (16, 100), generator=g_).to(dev).repeat(1, 2)
     install([None] * 16)
     lm = run(ind, 'M')
-    state['probe'] = {} if (ROT and ROTA) or LEVIN else None
+    state['probe'] = {} if (ROT and ROTA) or CONCEPTS else None
     lp = run(ind, 'hard')
     kl_t = kl_bits(lm, lp)
     loss = lambda lg: (-F.log_softmax(lg[:, 100:-1].float(), -1).gather(-1, ind[:, 101:, None]).mean() / math.log(2)).item()
     rows = []
     for key, (gates, R) in (state['probe'] or {}).items():
-        if LEVIN:
+        if CONCEPTS:
             seen[id(R)] = (R, torch.maximum(seen[id(R)][1], gates.amax((0, 1))) if id(R) in seen else gates.amax((0, 1)))
         g1, g2 = gates[:, 1:100].mean((0, 1)), gates[:, 100:].mean((0, 1))                 # [ng, g] on-rates
         members = torch.zeros_like(g1).scatter_add_(1, R['L'].argmax(-1), torch.ones_like(g1)) if R is not None else g1 * 0
@@ -1754,11 +1759,11 @@ def evaluate(final=False, start_eval=False):
     if ROT:
         out['mlp_acts_alone'] = {l: round(v[0], 4) for l, v in alone_rec.items()}
         out['mlp_acts_alone_all'] = round(1 - sum(v[2] for v in alone_rec.values()) / max(1e-30, sum(v[3] for v in alone_rec.values())), 4)
-    if LEVIN:
-        # Levin's cost of the delivered program (KL + log2 of the concepts on plus the gates evaluated, per token);
-        # then the non-empty blocks never on in these hard passes (held-out text, the induction check) are pruned.
-        out['levin'] = out['kl'] + out['log2_concepts']
+    if CONCEPTS:
+        # The delivered program's concepts per token (on, plus the gates evaluated); then the non-empty blocks never on
+        # in these hard passes (held-out text, the induction check) are pruned.
         out['gates_evaluated'] = G_ev
+        out['concepts_per_token'] = out['active'] + G_ev
         cut_n = 0
         for R_, anyon in (seen.values() if not start_eval else ()):
             # (none at the start's evaluation: the start's thresholds are a calibration, not a trained choice)
@@ -1856,8 +1861,8 @@ if ARM == 'rot':
             vb[n] = per.mean().item(); total += per.numel()
         counts = {**VPD_COUNTS, **(VPD_ATTN_COUNTS if attn else {})}
         K = K / sum(counts.values()) * sum(counts[n] * (vb[n] + math.log2(total)) for n in counts)
-        if LEVIN:
-            K = 4 * float(sys.argv[2])
+        if CONCEPTS:
+            K = KAPPA
     print('rot budget B', round(K), 'bits per token; VPD subcomponent bits', {n: round(v) for n, v in vb.items()}, flush=True)
     # Each block's noise scale (a tenth of the root mean square of its read with all on), then the thresholds set
     # in the gated run, layer by layer, so the start's expected bits per token are B (the layers' shares as VPD's
@@ -1908,7 +1913,7 @@ if ARM == 'rot':
             on = K * share / share_all / (bits0() + ib)
             idx = torch.randperm(flat.numel(), device=dev)[:2_000_000]
             fl = flat[idx].float()
-            R[tk].fill_(torch.quantile(fl.log() if LOGGATE else fl, max(0.0, 1 - on / R[sk].numel())).item())
+            R[tk].fill_(torch.quantile(fl.log() if LOGGATE else fl, 0.01 if CONCEPTS else max(0.0, 1 - on / R[sk].numel())).item())
         state['calib'] = None
         run(ids_c, 'hard')
         print('rot start: bits per token', round(torch.stack(state['hard']).sum(0).mean().item()), 'blocks on per token',
@@ -2137,6 +2142,15 @@ t0 = time.time()
 # toys' hard KL to 158 bits per token, and the multiplier alone left the MLP 16% under budget; pinning the training
 # pass's own count (sampled parameters and gates, upstream blocks drawn off) let the held-out hard program run
 # 7.0M bits per token at 5M tokens against K = 4.2M.
+def delivered_kl(ids, kinds, lm):
+    """The delivered (hard) program's KL in bits per token on up to four of the step's clean sequences (lm: M's logits)."""
+    rows = [b for b, k_ in enumerate(kinds) if k_ is None][:4] or [0]
+    install([None] * len(rows))
+    with torch.no_grad():
+        kl_ = kl_bits(lm[rows], run(ids[rows], 'hard')).mean().item()
+    install(kinds)
+    return kl_
+
 def delivered_bits(ids, kinds):
     """The delivered (hard, posterior-mean) program's bits per token on up to four of the step's clean sequences."""
     rows = [b for b, k_ in enumerate(kinds) if k_ is None][:4] or [0]
@@ -2177,10 +2191,10 @@ def pin_shift(ids, kinds):
 
 LOG_EVERY = max(1, 400_000 // (batch * seq))
 with open(out.replace('.json', '.tsv'), 'w') as f_:
-    f_.write('step\ttokens\ttrain_kl\ttrain_F\tbits_train_gates\tbits_hard\t' + ('gates_evaluated' if LEVIN else 'lambda') + '\n')
-# DESCENT_FRESH=1 (default under LEVIN): the training sequences are the token file's rows in a fixed random order,
+    f_.write('step\ttokens\ttrain_kl\ttrain_F\tbits_train_gates\tbits_hard\tlambda' + ('\tgates_evaluated\tkl_delivered' if CONCEPTS else '') + '\n')
+# DESCENT_FRESH=1 (default under CONCEPTS): the training sequences are the token file's rows in a fixed random order,
 # each used once (none repeated before the file's 134M tokens are used), the held-out rows 1024..1031 left out.
-FRESH = os.environ.get('DESCENT_FRESH', '1' if LEVIN else '0') == '1'
+FRESH = os.environ.get('DESCENT_FRESH', '1' if CONCEPTS else '0') == '1'
 if FRESH:
     order = np.random.default_rng(1).permutation(tok.shape[0] - 8); order = np.where(order >= 1024, order + 8, order)
 for step in range(steps):
@@ -2219,14 +2233,26 @@ for step in range(steps):
         # The per-token budget counts the edges on beside the parts on.
         ek = ek + torch.stack(state['edges_soft']).sum(0).mean()
         hk += torch.stack(state['edges_hard']).sum(0).mean().item()
-    if LEVIN:
-        # Levin's cost on the clean tokens: log2 of the concepts on (expected gates) plus the gates evaluated.
-        G_t = gates_evaluated(True)
-        objective = objective + (torch.log2(torch.stack(state['soft']).sum(0) + G_t) * counted).sum() / counted.sum()
     if GATE_H:
+        # (in bits, beside the KL)
         gate_H = torch.stack(state['gate_H']).sum(0).mean()
         objective = objective + gate_H
-    if step == 0 and not LEVIN:
+    if CONCEPTS:
+        # The concepts per clean token (the training gates' blocks on, plus the gates evaluated), against mu times the
+        # bits (KL and the gates' entropy). The delivered KL on the step's clean sequences drives mu: the training
+        # pass's own under st (one-hot assignments, hard gates: the delivered program), else a hard pass.
+        G_t = gates_evaluated(True)
+        conc = ek + G_t
+        clean = [b for b, k_ in enumerate(kinds) if k_ is None]
+        kl_dl = kl_seq[clean].mean().item() if gate == 'st' else delivered_kl(ids, kinds, lm)
+        if step == 0:
+            # mu starts at the median over thresholds of the balance |d concepts / d tau| / |d bits / d tau|.
+            taus = [cont[key] for cont, key, _ in slots if key == 'tau']
+            gC = torch.autograd.grad(conc, taus, retain_graph=True, allow_unused=True)
+            gB = torch.autograd.grad(objective, taus, retain_graph=True, allow_unused=True)
+            ratio = torch.cat([(a.abs() / b.abs()).reshape(-1)[b.abs().reshape(-1) > 0] for a, b in zip(gC, gB) if a is not None and b is not None])
+            lam = max(ratio.median().item(), 1e-12) if ratio.numel() else 1.0
+    if step == 0 and not CONCEPTS:
         # lambda starts at the median over thresholds of the balance |dF/dtau| / |dE[k]/dtau|.
         taus = [mu for _, key, mu, _ in leaves if key == 'tau'] if FMODE else [cont[key] for cont, key, _ in slots if key == 'tau']
         gF = torch.autograd.grad(objective, taus, retain_graph=True, allow_unused=True)
@@ -2236,9 +2262,10 @@ for step in range(steps):
     if LR_DECAY:
         for g_ in opt.param_groups:
             g_['lr'] = g_['lr0'] * (1 - 0.9 * step / max(1, steps - 1))
-    opt.zero_grad(); (objective if LEVIN else objective + lam * (ek - K)).backward(); opt.step()
-    if LEVIN:
-        lam = G_t.item()                                                           # logged in lambda's place
+    opt.zero_grad(); (conc + lam * objective if CONCEPTS else objective + lam * (ek - K)).backward(); opt.step()
+    if CONCEPTS:
+        # mu: log-integral ascent on the delivered KL's relative excess over kappa (capped at +1, as below).
+        lam = lam * math.exp(min((kl_dl - KAPPA) / KAPPA, 1.0) / B_H)
     elif DUAL == 'pin':
         pin_shift(ids, kinds)
     elif DUAL == 'loghard':
@@ -2254,7 +2281,8 @@ for step in range(steps):
         # The loss curve between evaluations: every 0.4M training tokens, the step's training KL and F, its bits per
         # clean token (training gates and hard), and lambda.
         with open(out.replace('.json', '.tsv'), 'a') as f_:
-            f_.write(f"{step + 1}\t{(step + 1) * batch * seq}\t{kl.item():.4f}\t{objective.item():.4f}\t{ek.item():.0f}\t{hk:.0f}\t{lam:.4g}\n")
+            f_.write(f"{step + 1}\t{(step + 1) * batch * seq}\t{kl.item():.4f}\t{objective.item():.4f}\t{ek.item():.0f}\t{hk:.0f}\t{lam:.4g}"
+                     + (f"\t{G_t.item():.0f}\t{kl_dl:.4f}" if CONCEPTS else '') + "\n")
     last = step == steps - 1 or time.time() - t0 > LIMIT
     if (step + 1) % EVAL == 0 or last:
         # This step's parts on per clean training token, per map (at the sample under F), and under F each
