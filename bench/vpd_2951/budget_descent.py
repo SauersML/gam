@@ -863,6 +863,8 @@ def rot_fc_core(R, p, xe, Q, ex, idx, on, sc, mode):
 def make_rot_fc(n, l):
     R = ROT[l]; W = T.site(n).W
     def fwd(x):
+        if state.get('dense') is not None:
+            state['dense'][(l, 1)] = x
         p = x @ W.T
         if state['mode'] == 'M':
             return p
@@ -970,6 +972,10 @@ ROT_ALL = list(ROT.values()) + [R[x] for R in ROTA.values() for x in ('q', 'k', 
 # weights are part of the switching function, described once per run under F (zero-mean priors), not counted per
 # token; the output layer starts at zero, so the start is the own-read gates'.
 GATENET = int(os.environ.get('DESCENT_GATENET', '0'))
+# DESCENT_GATENET_DENSE=1: the gate networks read, at each token, the streams of every layer from a dense pass run
+# first (every part on: P = M up to the parts' sum), VPD's own_causal_1 scheme (its causal CI network reads every
+# site's input from such a pass); without it each reads only its own layer's stream from the gated pass.
+GN_DENSE = os.environ.get('DESCENT_GATENET_DENSE') == '1'
 GN = {}
 if ARM == 'rot' and GATENET:
     for l in range(T.n_layer):
@@ -977,15 +983,11 @@ if ARM == 'rot' and GATENET:
         if ROTA:
             outs['attn'] = sum(ROTA[l][x]['ng'] * ROTA[l][x]['g'] for x in ('q', 'k', 'ov'))
         for part, n_out in outs.items():
-            d_ = T.wte.shape[1]
+            d_ = T.wte.shape[1] * ((2 if ROTA else 1) * T.n_layer if GN_DENSE else 1)
             GN[(l, part)] = {'W1': (torch.randn(d_, GATENET, device=dev) * math.sqrt(2 / d_)).requires_grad_(),
                              'b1': torch.zeros(GATENET, device=dev, requires_grad=True),
                              'W2': torch.zeros(GATENET, n_out, device=dev, requires_grad=True)}
 
-# DESCENT_GATENET_DENSE=1 (slice arms): the gate networks read, at each token, the streams of every layer from a dense
-# pass run first (every part on: P = M up to the parts' sum), VPD's own_causal_1 scheme (its causal CI network reads
-# every site's input from such a pass); without it each reads only its own layer's stream from the gated pass.
-GN_DENSE = os.environ.get('DESCENT_GATENET_DENSE') == '1'
 if ARM != 'rot' and GATENET:
     # Slice arms: one network per map, reading its layer's stream (the MLP's or the attention's normed input), one
     # output per slice.
@@ -1009,6 +1011,8 @@ def gate_net(l, part, x):
     if (l, part) not in GN:
         return 0.0
     P_ = GN[(l, part)]
+    if GN_DENSE:
+        x = state['gn_feats']
     return F.gelu(x @ P_['W1'] + P_['b1']) @ P_['W2']
 
 def rot_read_bits(R, Q):
@@ -1065,6 +1069,8 @@ def rot_attention_core(Rq, Rk, Ro, q, k, v, causal, Qq, Qk, Q, noise, ex, idx, o
 def rot_attention(i, h, causal):
     """Layer i's attention output under the rot arm: M's q, k, v and o products around rot_attention_core."""
     Rq, Rk, Ro = ROTA[i]['q'], ROTA[i]['k'], ROTA[i]['ov']; B_, T_ = h.shape[0], h.shape[1]
+    if state.get('dense') is not None:
+        state['dense'][(i, 0)] = h
     site = lambda k: T.site(f'h.{i}.attn.{k}')
     q, k, v = site('q_proj')(h), site('k_proj')(h), site('v_proj')(h)
     Qq, Qk, Q = rot_Q(Rq), rot_Q(Rk), rot_Q(Ro)
