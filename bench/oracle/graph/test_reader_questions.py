@@ -73,8 +73,9 @@ def test_log_loss_and_score():
     qs = [NEXT, SWITCH, STEP, {**NEXT, "behavior": "c"}]
     res = RQ.score(stub, qs, {"b": "explanation b", "c": "explanation c"})
     s = res["summary"]
-    assert s["next"]["questions"] == 2 and s["next"]["saved_own"] == pytest.approx(2.0 + math.log2(0.7))
-    assert s["switch"]["saved_own"] == pytest.approx(1.0 + math.log2(0.3))
+    # with an explanation the stub picks option 0: right on NEXT (answer 0) and STEP, wrong on SWITCH (answer 1)
+    assert s["next"]["questions"] == 2 and s["next"]["own"] == 1.0 and s["next"]["chance"] == 0.25
+    assert s["switch"]["own"] == 0.0 and s["step"]["own"] == 1.0 and s["switch"]["most_common"] == 1.0
     # the control reads the other behavior's explanation (the stub sees one either way)
     assert all(r["shuffled_from"] != r["behavior"] for r in res["rows"])
 

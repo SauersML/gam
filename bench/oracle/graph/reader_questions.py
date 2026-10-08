@@ -9,14 +9,16 @@ Questions (one behavior; ground truths measured on M or computed by the family a
   switch   with the answer's parts switched to their counterfactual values and every other part computing
            on the prompt (the checker's clean complement run, mpd_graph_2951 op "complement"), whether M
            gives the counterfactual's top token a higher probability than the prompt's top token; asked at
-           target tokens where the two top tokens differ;
+           target tokens where the two top tokens differ, as many with the answer yes as no;
   step     whether an intermediate variable of the family algorithm (a function other than `answer`) has
            a different value at the target token on two texts: a prompt and its counterfactual, or two
-           prompts of the behavior.
-Score: per question the reader's log-loss -log2 q(true option), q normalized over the options' first
-tokens at the start of the reader's reply. bits saved = log-loss without an explanation - log-loss with
-it, on the same questions. Control: each behavior's questions read with another behavior's explanation
-(a seeded derangement of the behaviors), which must save nothing.
+           prompts of the behavior, as many with the answer yes as no.
+Reported: questions answered correctly (the reader's most probable option, its options' first tokens at the
+start of its reply), with the behavior's own explanation and with another behavior's (a seeded derangement
+of the behaviors), against chance and against always giving the most common answer; yes/no questions are
+balanced, so that baseline is 50%. Kept per question: the options' raw log-probabilities with the own, no
+and another explanation, and one temperature per reader fit on calibration questions read without an
+explanation (the scale a log-loss of the options would use).
 
   reader_questions.py build --manifest MANIFEST.jsonl --out QUESTIONS.jsonl [--per-type 16]
   reader_questions.py explain --out EXPLANATIONS.json     (the answers' English from measured facts, printer.py)
@@ -180,8 +182,13 @@ def complement_rows(checker, entry: dict, path: Path, prompts: int, rng=None, pe
     rows = [r for r in reply["tokens"] if r["clean_top"] != r["counterfactual_top"] and r["prompt"] < prompts]
     if rng is None:
         return rows
-    halves = [[r for r in rows if r["prompt"] % 2 == h] for h in (0, 1)]
-    return [r for half in halves for r in rng.sample(half, min(per_half, len(half)))]
+    # Per parity half, as many targets that flip as targets that do not (yes and no balanced).
+    out = []
+    for h in (0, 1):
+        flips = [[r for r in rows if r["prompt"] % 2 == h and (r["complement"][1] > r["complement"][0]) == f] for f in (True, False)]
+        k = min(per_half // 2, *(len(x) for x in flips))
+        out += [r for x in flips for r in rng.sample(x, k)]
+    return out
 
 
 def build_behavior(entry: dict, per_type: int, seed: int, checker=None, types=("next", "switch", "step"), fresh: str | None = None) -> list[dict]:
@@ -247,17 +254,23 @@ def build_behavior(entry: dict, per_type: int, seed: int, checker=None, types=("
                 j = rng.randrange(len(prompts))
                 if j != i and prompts[j]["target_positions"]:
                     cands.append((("prompt", i, pos), ("prompt", j, prompts[j]["target_positions"][0])))
-        for (ka, ia, pa), (kb, ib, pb) in rng.sample(cands, min(per_type, len(cands))):
+        seq = lambda kind, i: toks["prompts" if kind == "prompt" else "counterfactuals"][i]  # noqa: E731
+        ids = lambda kind, i: prompts[i]["token_ids"] if kind == "prompt" else prompts[i]["counterfactual"]["token_ids"]  # noqa: E731
+        labeled = {0: [], 1: []}  # differ (yes), same (no)
+        for (ka, ia, pa), (kb, ib, pb) in rng.sample(cands, len(cands)):
+            if min(len(v) for v in labeled.values()) >= per_type // 2:
+                break
             var = rng.choice(steps)
-            seq = lambda kind, i: toks["prompts" if kind == "prompt" else "counterfactuals"][i]  # noqa: E731
-            ids = lambda kind, i: prompts[i]["token_ids"] if kind == "prompt" else prompts[i]["counterfactual"]["token_ids"]  # noqa: E731
             try:
                 va = algorithm.values(seq(ka, ia), [var])[var][pa]
                 vb = algorithm.values(seq(kb, ib), [var])[var][pb]
             except Exception:  # noqa: BLE001 - a variable the algorithm cannot compute on this text asks nothing
                 continue
-            out.append({**base, "type": "step", "split": "check", "variable": var, "text": decode(ids(ka, ia)[: pa + 1]), "other": decode(ids(kb, ib)[: pb + 1]),
-                        "answer": 0 if repr(va) != repr(vb) else 1, "values": [repr(va)[:80], repr(vb)[:80]]})
+            labeled[0 if repr(va) != repr(vb) else 1].append({**base, "type": "step", "split": "check", "variable": var,
+                                                              "text": decode(ids(ka, ia)[: pa + 1]), "other": decode(ids(kb, ib)[: pb + 1]),
+                                                              "answer": 0 if repr(va) != repr(vb) else 1, "values": [repr(va)[:80], repr(vb)[:80]]})
+        k = min(per_type // 2, len(labeled[0]), len(labeled[1]))  # as many yes as no
+        out += labeled[0][:k] + labeled[1][:k]
     return out
 
 
@@ -313,46 +326,34 @@ def score(backend, questions: list[dict], explanations: dict[str, str], seed: in
             rows.append({"behavior": b, "family": q["family"], "type": q["type"], "split": q.get("split", "score"), "answer": q["answer"],
                          "lp": {"own": own[k], "none": none[k], "shuffled": other[k]}, "shuffled_from": swap.get(b)})
     t = fit_temperature(rows)
-    return {"rows": rows, "temperature": t, "summary": summarize(rows, t), "summary_uncalibrated": summarize(rows, 1.0)}
+    return {"rows": rows, "temperature": t, "summary": summarize(rows, t)}
 
 
 def summarize(rows: list[dict], temperature: float = 1.0) -> dict:
-    """Bits saved per question (none - own, and none - shuffled) at `temperature`, per question type on the
-    scored questions (the step consistency check apart): mean, SE over questions and SE over behaviors
-    (behavior means as the units), accuracy; and per family."""
-    graded_rows = []
-    for r in rows:
-        g = {arm: graded(r["lp"][arm], r["answer"], temperature) for arm in ("own", "none", "shuffled")}
-        graded_rows.append({**{k: r[k] for k in ("behavior", "family", "type", "split")}, **{arm: g[arm][0] for arm in g},
-                            "right": [g[arm][1] for arm in ("own", "none", "shuffled")]})
+    """Questions answered correctly (the reader's most probable option is the true one) per question type on
+    the scored questions (the step consistency check apart), with the behavior's own explanation and with
+    another behavior's, against chance and against always giving the most common answer; the difference own
+    minus other with its SE over behaviors (behavior means as the units); per family. Accuracy does not
+    depend on the temperature, which only scales the options' probabilities."""
     out = {"temperature": temperature}
-    scored = [r for r in graded_rows if r["split"] in ("score", "check")]
-    for key in sorted({r["type"] for r in scored}) + ["next+switch"]:
-        sel = [r for r in scored if (r["type"] in ("next", "switch") if key == "next+switch" else r["type"] == key)]
-        if not sel:
-            continue
-        entry = {"questions": len(sel), "behaviors": len({r["behavior"] for r in sel})}
-        for arm in ("own", "shuffled"):
-            s = np.array([r["none"] - r[arm] for r in sel])
-            by_b = {}
-            for r, v in zip(sel, s):
-                by_b.setdefault(r["behavior"], []).append(v)
-            means = np.array([np.mean(v) for v in by_b.values()])
-            entry[f"saved_{arm}"] = float(s.mean())
-            entry[f"se_questions_{arm}"] = float(s.std(ddof=1) / math.sqrt(len(s))) if len(s) > 1 else float("nan")
-            entry[f"se_behaviors_{arm}"] = float(means.std(ddof=1) / math.sqrt(len(means))) if len(means) > 1 else float("nan")
-        d = np.array([r["shuffled"] - r["own"] for r in sel])  # own against the shuffled control, per behavior
+    scored = [r for r in rows if r["split"] in ("score", "check")]
+    right = {id(r): [graded(r["lp"][arm], r["answer"], temperature)[1] for arm in ("own", "shuffled")] for r in scored}
+    for key in sorted({r["type"] for r in scored}):
+        sel = [r for r in scored if r["type"] == key]
+        options = 4 if key == "next" else 2
+        own = np.array([right[id(r)][0] for r in sel], dtype=float)
+        other = np.array([right[id(r)][1] for r in sel], dtype=float)
         by_b = {}
-        for r, v in zip(sel, d):
+        for r, v in zip(sel, own - other):
             by_b.setdefault(r["behavior"], []).append(v)
         means = np.array([np.mean(v) for v in by_b.values()])
-        entry["own_over_shuffled"] = float(d.mean())
-        entry["se_behaviors_own_over_shuffled"] = float(means.std(ddof=1) / math.sqrt(len(means))) if len(means) > 1 else float("nan")
-        entry["bits_none"] = float(np.mean([r["none"] for r in sel]))
-        entry["bits_own"] = float(np.mean([r["own"] for r in sel]))
-        entry["accuracy"] = [float(np.mean([r["right"][k] for r in sel])) for k in range(3)]  # own, none, shuffled
-        out[key] = entry
-    out["families"] = {f: {t: float(np.mean([r["none"] - r["own"] for r in scored if r["family"] == f and r["type"] == t]))
+        n = len(sel)
+        out[key] = {"questions": n, "behaviors": len(by_b), "own": float(own.mean()), "other": float(other.mean()),
+                    "se_own": float(math.sqrt(own.mean() * (1 - own.mean()) / n)), "chance": 1 / options,
+                    "most_common": float(np.bincount([r["answer"] for r in sel]).max() / n),
+                    "own_minus_other": float((own - other).mean()),
+                    "se_behaviors_own_minus_other": float(means.std(ddof=1) / math.sqrt(len(means))) if len(means) > 1 else float("nan")}
+    out["families"] = {f: {t: [float(np.mean([right[id(r)][k] for r in scored if r["family"] == f and r["type"] == t])) for k in (0, 1)]
                            for t in sorted({r["type"] for r in scored if r["family"] == f})} for f in sorted({r["family"] for r in scored})}
     return out
 
@@ -417,7 +418,10 @@ def main():
     result = score(backend, questions, explanations, args.seed)
     result.update({"reader": backend.describe(), "seconds": time.time() - start, "questions": len(questions)})
     Path(args.out).write_text(json.dumps(result, indent=1))
-    print(json.dumps({"temperature": result["temperature"], **{k: v for k, v in result["summary"].items() if k != "families"}}, indent=1))
+    for k, e in result["summary"].items():
+        if isinstance(e, dict) and "own" in e:
+            print(f"{k:7s} n={e['questions']:4d}  own {e['own']:.0%}  other {e['other']:.0%}  chance {e['chance']:.0%}  most common {e['most_common']:.0%}  "
+                  f"own - other {e['own_minus_other']:+.1%} (SE over behaviors {e['se_behaviors_own_minus_other']:.1%})")
 
 
 if __name__ == "__main__":
