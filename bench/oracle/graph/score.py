@@ -69,7 +69,7 @@ class Checker:
         memo_dir: the server's --memo-dir (GRAPH_MEMO_DIR when unset), small per-behavior memos of the targets
         and native bit widths that later runs on the same behavior reuse (builds from a6a063a9c4 on); base: the
         shared base every program is scored with (a base IR file, or True for the model's published BASES entry;
-        GRAPH_BASE when unset; builds from 83b6a221ad on)."""
+        GRAPH_BASE when unset; builds from 880cfaa196 on)."""
         # Qwen3-0.6B's load in float64 passed 16.3 GiB and was killed under a 16 GiB lease.
         memory_gib = memory_gib or (28 if model.startswith("qwen3") else 12)
         env = dict(os.environ)
