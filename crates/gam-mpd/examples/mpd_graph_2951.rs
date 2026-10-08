@@ -18,7 +18,8 @@
 //! * `{"op": "score", "program": IR}` or `{"op": "score", "programs": [IR, ...]}` (the answer
 //!   `{"ok", "scores": [...], "seconds"}`), with `"experiments": 32, "seed": 0, "routing": "edges" |
 //!   "nodes", "N": null, "reader_top": 0, "uniform_seeds": null, "stand_in": null` ("delete" or
-//!   "counterfactual" for programs that name no `standin`; by default VPD-view checkers delete):
+//!   "counterfactual" for programs that name no `standin`; by default VPD-view checkers delete),
+//!   `"necessity": true` (false skips the necessity runs):
 //!   every score term (`graph::Score`)
 //!   per program, all programs under one seed (`Checker::score_batch`: the behavior's half of the
 //!   experiments shared, `M` once per experiment, runs on parallel threads); with `reader_top` k > 0,
@@ -341,6 +342,8 @@ fn handle(request: &Value, weights: &mut Option<Weights>, checker: &mut Option<C
             // "uniform_seeds": m draws from seed mod m (m collections of experiments recur across
             // seeds, so M's cached outcomes serve them).
             c.uniform_seeds = request["uniform_seeds"].as_u64();
+            // "necessity": false skips the necessity runs (necessity_error_bits 0).
+            c.necessity = request["necessity"].as_bool().unwrap_or(true);
             let k = request["reader_top"].as_u64().unwrap_or(0) as usize;
             let started = std::time::Instant::now();
             let scored = c.score_batch(&programs, count, seed, edges, n, k)?;

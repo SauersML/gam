@@ -3599,6 +3599,9 @@ pub struct Checker {
     /// The bytes of counterfactual runs kept across scores (each cache), newest dropped first: an
     /// experiment set's first runs are computed once per behavior and serve every later score of it.
     pub reference_bytes: usize,
+    /// Whether scores measure necessity (`Score::necessity_error_bits`; true by default): a search
+    /// ranking candidates by sufficiency alone may skip its runs.
+    pub necessity: bool,
     /// Each declared block's bit width as the search chose it (`Checker::width`), by the block.
     widths: BTreeMap<String, Option<u32>>,
     /// [`Reference::zeros`] by row count, for deleting programs' runs.
@@ -3719,6 +3722,7 @@ impl Checker {
             references: std::sync::Mutex::new(Vec::new()),
             site_references: std::sync::Mutex::new(Vec::new()),
             reference_bytes: 3 << 30,
+            necessity: true,
             widths: BTreeMap::new(),
             zeros: std::sync::Mutex::new(BTreeMap::new()),
         })
@@ -4003,7 +4007,7 @@ impl Checker {
         let widths = result?;
         // Necessity, for each program with nodes: the same complement experiments for every program.
         let complements = complements(&experiments);
-        let named: Vec<usize> = (0..parsed.len()).filter(|&i| !parsed[i].0.blocks.is_empty()).collect();
+        let named: Vec<usize> = (0..parsed.len()).filter(|&i| self.necessity && !parsed[i].0.blocks.is_empty()).collect();
         let quantized: Vec<Vec<(Block, Option<u32>)>> = named.iter().map(|&i| parsed[i].0.blocks.iter().cloned().zip(widths[i].iter().map(|w| w.bits)).collect()).collect();
         let necessity_kl = self.necessity_runs(&named.iter().map(|&i| (&parsed[i].0, &circuits[i])).collect::<Vec<_>>(), &quantized, &complements)?;
         let mut necessity = vec![(0.0, BTreeMap::new()); parsed.len()];
