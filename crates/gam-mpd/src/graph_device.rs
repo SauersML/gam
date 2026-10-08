@@ -39,7 +39,16 @@ pub(crate) struct DeviceState {
     /// whether they stack as rows; dropped whenever a weight edit drops resident copies.
     stacks: HashMap<(Vec<Key>, bool), Tensor>,
     references: Vec<(u64, BTreeMap<(Field, usize, usize), Tensor>)>,
+    /// Rotary tables by rotary and positions ([`DeviceState::rotations`]).
+    rotations: HashMap<RotationKey, (Tensor, Tensor)>,
 }
+
+/// A rotary's base, dimensions and pairing, and the positions of its table's rows.
+type RotationKey = (u32, u32, bool, Vec<u32>);
+
+/// The most rotary tables kept: a behavior's runs turn a few position layouts (its prompts and
+/// counterfactuals, by head count), each a few megabytes.
+const KEPT_ROTATIONS: usize = 32;
 
 /// An array of a [`Reference`]: the embeddings, a head's read (layer, head), a layer's MLP
 /// activations, MLP write, MLP normed input, attention normed input or its heads' reads side by side
@@ -89,7 +98,7 @@ fn on_device<T: Send>(f: impl FnOnce(&mut DeviceState) -> T + Send) -> Option<T>
 
 impl DeviceState {
     pub(crate) fn new(device: Device) -> Self {
-        Self { device, generation: 0, resident: HashMap::new(), uploaded: Vec::new(), stacks: HashMap::new(), references: Vec::new() }
+        Self { device, generation: 0, resident: HashMap::new(), uploaded: Vec::new(), stacks: HashMap::new(), references: Vec::new(), rotations: HashMap::new() }
     }
 
     fn arithmetic(&self) -> Arithmetic {
@@ -97,6 +106,22 @@ impl DeviceState {
             Storage::F64 => Arithmetic::F64,
             Storage::F32 | Storage::Bf16 => Arithmetic::F32,
         }
+    }
+
+    /// The key of `rotary`'s tables at `positions` ([`rotation_tables`]), made and uploaded on first
+    /// use and kept (read them from `self.rotations`): every run of a behavior turns the same
+    /// positions, and making the tables on the host (a power, a cosine and a sine per plane and row)
+    /// took most of a VPD-view program's run.
+    fn rotations(&mut self, rotary: Rotary, positions: &[u32]) -> Result<RotationKey, GpuError> {
+        let key = (rotary.base, rotary.dims, rotary.half_split, positions.to_vec());
+        if !self.rotations.contains_key(&key) {
+            if self.rotations.len() >= KEPT_ROTATIONS {
+                self.rotations.clear();
+            }
+            let tables = rotation_tables(&self.device, rotary, positions)?;
+            self.rotations.insert(key.clone(), tables);
+        }
+        Ok(key)
     }
 
     /// The key of host matrix `m`'s resident copy, uploaded when absent or edited since.
@@ -382,7 +407,18 @@ pub(crate) fn run(weights: &Weights, circuit: &Circuit, job: &Run) -> Option<Res
     if !circuit.units.iter().all(|u| covered(&u.block)) {
         return None;
     }
-    on_device(|s| run_on(s, weights, circuit, job))
+    // The device thread returns the logits; their log-softmax runs on the calling thread, so the
+    // runs of a batch normalize in parallel while the device serves the next one.
+    on_device(|s| logits_on_device(s, weights, circuit, job)).map(|run| run.and_then(normalized))
+}
+
+/// An execution whose `log_probabilities` hold the logits, normalized in place.
+pub(crate) fn normalized(mut execution: Execution) -> Result<Execution, String> {
+    for mut row in execution.log_probabilities.outer_iter_mut() {
+        let values = gam_math::categorical::log_softmax(row.as_slice().ok_or("a contiguous row")?).map_err(|e| e.to_string())?;
+        row.assign(&Array1::from(values));
+    }
+    Ok(execution)
 }
 
 /// A run's state on the device: `embed`'s actual and stand-in writes, every unit's stand-in and
@@ -546,8 +582,9 @@ fn normed(d: &Device, ops: &Interventions, (site, u, slot): (usize, usize, usize
     Ok(())
 }
 
-/// [`run`] on a given device state (the tests run it on the host backend).
-pub(crate) fn run_on(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, job: &Run) -> Result<Execution, String> {
+/// [`run`] on a given device state (the tests run it on the host backend), with the logits in place
+/// of the log-probabilities ([`normalized`] turns them into those).
+pub(crate) fn logits_on_device(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, job: &Run) -> Result<Execution, String> {
     let e = |e: GpuError| e.to_string();
     s.generation = weights.generation();
     let (rows, width) = (job.tokens.len(), weights.width());
@@ -605,7 +642,6 @@ pub(crate) fn run_on(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, 
         c.embed = s.device.download(&st.embed).map_err(e)?;
     }
     after(&s.device, ops, None, &mut st).map_err(e)?;
-    let mut rotations: BTreeMap<(u32, u32, bool), (Tensor, Tensor)> = BTreeMap::new();
     let mut at = 0;
     while at < order.len() {
         let site = circuit.units[order[at]].block.site();
@@ -676,11 +712,8 @@ pub(crate) fn run_on(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, 
                         let mut k = project(s, &normed_inputs[1], &*hw.key, hw.key_norm.as_ref()).map_err(e)?;
                         let v = project(s, &normed_inputs[2], &*hw.value, None).map_err(e)?;
                         if let Some(r) = hw.rotary {
-                            let tables = (r.base, r.dims, r.half_split);
-                            if !rotations.contains_key(&tables) {
-                                rotations.insert(tables, rotation_tables(&s.device, r, &positions).map_err(e)?);
-                            }
-                            let (cos, sin) = rotations.get(&tables).ok_or("rotation tables")?;
+                            let key = s.rotations(r, &positions).map_err(e)?;
+                            let (cos, sin) = s.rotations.get(&key).ok_or("rotation tables")?;
                             q = s.device.rotate(&q, cos, sin, r.half_split, false).map_err(e)?;
                             k = s.device.rotate(&k, cos, sin, r.half_split, false).map_err(e)?;
                         }
@@ -787,11 +820,7 @@ pub(crate) fn run_on(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, 
     let u = s.ensure(weights.unembedding.view()).map_err(e)?;
     let mut logits = s.device.zeros(job.scored.len(), weights.unembedding.nrows()).map_err(e)?;
     s.device.gemm(&mut logits, 1.0, &normed_last, Op::N, s.get(u).map_err(e)?, Op::T, 0.0, arithmetic).map_err(e)?;
-    let mut log_probabilities = s.device.download(&logits).map_err(e)?;
-    for mut row in log_probabilities.outer_iter_mut() {
-        let values = gam_math::categorical::log_softmax(row.as_slice().ok_or("a contiguous row")?).map_err(|e| e.to_string())?;
-        row.assign(&Array1::from(values));
-    }
+    let logits = s.device.download(&logits).map_err(e)?;
     // The units' writes come back only from a run that scores no rows: a donor run, whose writes
     // other runs read (swaps, site operations, `Checker::measure_typical`). On Qwen3-0.6B every
     // run's writes are about a gigabyte of float64.
@@ -800,7 +829,7 @@ pub(crate) fn run_on(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, 
     } else {
         vec![None; units]
     };
-    let mut execution = Execution::of(log_probabilities, writes, captured, kept);
+    let mut execution = Execution::of(logits, writes, captured, kept);
     execution.reads = reads_kept;
     Ok(execution)
 }
@@ -1022,9 +1051,10 @@ fn attend(s: &mut DeviceState, (q, k, v): (Tensor, Tensor, Tensor), (n, width): 
     }
     if let Some(r) = first.rotary {
         let positions: Vec<u32> = (0..pad.sequences * n).flat_map(|_| 0..pad.longest as u32).collect();
-        let (cos, sin) = rotation_tables(&s.device, r, &positions)?;
-        qs = s.device.rotate(&qs, &cos, &sin, r.half_split, false)?;
-        ks = s.device.rotate(&ks, &cos, &sin, r.half_split, false)?;
+        let key = s.rotations(r, &positions)?;
+        let (cos, sin) = s.rotations.get(&key).ok_or_else(|| GpuError::DriverCallFailed { reason: "rotation tables went missing".into() })?;
+        qs = s.device.rotate(&qs, cos, sin, r.half_split, false)?;
+        ks = s.device.rotate(&ks, cos, sin, r.half_split, false)?;
     }
     let segments: Vec<Segment> = (0..pad.sequences * n).map(|b| Segment { rows: b * pad.longest..(b + 1) * pad.longest, first: 0, before: Vec::new() }).collect();
     let zs = forward_segments(&s.device, (&qs, &ks, &vs), &segments, first.scale, first.causal, arithmetic)?;

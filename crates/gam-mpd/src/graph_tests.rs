@@ -12,6 +12,11 @@ use crate::{
 use gam_gpu::tensor::Device;
 use std::collections::{BTreeMap, BTreeSet};
 
+/// `graph_device::run`'s execution on a given device state: its logits normalized.
+fn run_on(s: &mut crate::graph_device::DeviceState, weights: &Weights, circuit: &crate::graph::Circuit, job: &crate::graph_device::Run) -> Result<crate::graph::Execution, String> {
+    crate::graph_device::logits_on_device(s, weights, circuit, job).and_then(crate::graph_device::normalized)
+}
+
 const LAYERS: usize = 2;
 
 struct Fixture {
@@ -521,7 +526,7 @@ fn device_path_on_the_host_backend_is_the_host_run() {
     for (name, circuit, batch) in cases {
         let host = execute(&weights, &circuit, batch, &rows, &BTreeMap::new()).expect("host");
         let job = crate::graph_device::Run { tokens: &batch.tokens, spans: &batch.spans, scored: &rows, swaps: &BTreeMap::new(), capture: false, reference: batch.reference.as_deref(), ops: &crate::graph::Interventions::default() };
-        let device = crate::graph_device::run_on(&mut state, &weights, &circuit, &job).expect("device");
+        let device = run_on(&mut state, &weights, &circuit, &job).expect("device");
         let kl = max(&kl_bits(&host.log_probabilities, &device.log_probabilities));
         assert!(kl < 1e-9, "{name}: KL(host ‖ device) = {kl:e} bits");
     }
@@ -529,7 +534,7 @@ fn device_path_on_the_host_backend_is_the_host_run() {
     let circuit = Graph::empty().model(&weights);
     let cf_batch = Batch::new(&cf).expect("cf batch");
     let job = crate::graph_device::Run { tokens: &cf_batch.tokens, spans: &cf_batch.spans, scored: &[], swaps: &BTreeMap::new(), capture: true, reference: None, ops: &crate::graph::Interventions::default() };
-    let captured = crate::graph_device::run_on(&mut state, &weights, &circuit, &job).expect("capture").captured().expect("captured");
+    let captured = run_on(&mut state, &weights, &circuit, &job).expect("capture").captured().expect("captured");
     let gap = |a: &ndarray::Array2<f64>, b: &ndarray::Array2<f64>| (a - b).iter().fold(0.0f64, |m, v| m.max(v.abs()));
     // (Normed inputs are captured only when a view reads them; none is attached here.)
     assert!(gap(&captured.active[1], &counterfactual.active[1]) < 1e-9 && gap(&captured.reads[1][0], &counterfactual.reads[1][0]) < 1e-9 && gap(&captured.mlp[0], &counterfactual.mlp[0]) < 1e-9);
@@ -577,7 +582,7 @@ fn device_site_operations_on_the_host_backend_are_the_host_run() {
         let host = execute_with(&weights, &circuit, &batch, &rows, &BTreeMap::new(), &ops).expect("host");
         let reference = if circuit.is_model() { None } else { batch.reference.as_deref() };
         let job = crate::graph_device::Run { tokens: &batch.tokens, spans: &batch.spans, scored: &rows, swaps: &BTreeMap::new(), capture: false, reference, ops: &ops };
-        let device = crate::graph_device::run_on(&mut state, &weights, &circuit, &job).expect("device");
+        let device = run_on(&mut state, &weights, &circuit, &job).expect("device");
         let kl = max(&kl_bits(&host.log_probabilities, &device.log_probabilities));
         assert!(kl < 1e-9, "{name}: KL(host ‖ device) under site operations = {kl:e} bits");
         assert_eq!(host.normed.keys().collect::<Vec<_>>(), device.normed.keys().collect::<Vec<_>>(), "{name}: recorded inputs");
@@ -617,7 +622,7 @@ fn device_path_pads_sequences_of_different_lengths() {
     let host = execute(&weights, &circuit, &batch, &rows, &BTreeMap::new()).expect("host");
     let mut state = crate::graph_device::DeviceState::new(Device::host());
     let job = crate::graph_device::Run { tokens: &batch.tokens, spans: &batch.spans, scored: &rows, swaps: &BTreeMap::new(), capture: false, reference: None, ops: &crate::graph::Interventions::default() };
-    let device = crate::graph_device::run_on(&mut state, &weights, &circuit, &job).expect("device");
+    let device = run_on(&mut state, &weights, &circuit, &job).expect("device");
     let kl = max(&kl_bits(&host.log_probabilities, &device.log_probabilities));
     assert!(kl < 1e-9, "KL(host ‖ device) over sequences of different lengths = {kl:e} bits");
 }
@@ -641,7 +646,7 @@ fn device_path_on_a_qwen3_like_model_is_the_host_run() {
     for (name, circuit) in [("model", graph.model(&weights)), ("program", graph.program(&weights, true))] {
         let host = execute(&weights, &circuit, &batch, &rows, &BTreeMap::new()).expect("host");
         let job = crate::graph_device::Run { tokens: &batch.tokens, spans: &batch.spans, scored: &rows, swaps: &BTreeMap::new(), capture: false, reference: batch.reference.as_deref(), ops: &crate::graph::Interventions::default() };
-        let device = crate::graph_device::run_on(&mut state, &weights, &circuit, &job).expect("device");
+        let device = run_on(&mut state, &weights, &circuit, &job).expect("device");
         let kl = max(&kl_bits(&host.log_probabilities, &device.log_probabilities));
         assert!(kl < 1e-9, "{name}: KL(host ‖ device) = {kl:e} bits");
     }
@@ -719,7 +724,7 @@ fn device_path_runs_vpd_views_as_the_host() {
         assert!(circuit.units.iter().any(|u| matches!(u.block, crate::graph::Block::Slices { .. })) || name == "empty", "{name}: VPD units");
         let host = execute(&weights, &circuit, batch, &rows, &BTreeMap::new()).expect("host");
         let job = crate::graph_device::Run { tokens: &batch.tokens, spans: &batch.spans, scored: &rows, swaps: &BTreeMap::new(), capture: false, reference: batch.reference.as_deref(), ops: &crate::graph::Interventions::default() };
-        let device = crate::graph_device::run_on(&mut state, &weights, &circuit, &job).expect("device");
+        let device = run_on(&mut state, &weights, &circuit, &job).expect("device");
         let kl = max(&kl_bits(&host.log_probabilities, &device.log_probabilities));
         assert!(kl < 1e-9, "{name}: KL(host ‖ device) with VPD views = {kl:e} bits");
     }
@@ -753,7 +758,7 @@ fn device_path_runs_transcoder_features_as_the_host() {
     for (name, circuit, batch) in [("model", graph.model(&weights), &plain), ("edges", graph.program(&weights, true), &with_reference), ("nodes", graph.program(&weights, false), &with_reference)] {
         let host = execute(&weights, &circuit, batch, &rows, &BTreeMap::new()).expect("host");
         let job = crate::graph_device::Run { tokens: &batch.tokens, spans: &batch.spans, scored: &rows, swaps: &BTreeMap::new(), capture: false, reference: batch.reference.as_deref(), ops: &crate::graph::Interventions::default() };
-        let device = crate::graph_device::run_on(&mut state, &weights, &circuit, &job).expect("device");
+        let device = run_on(&mut state, &weights, &circuit, &job).expect("device");
         let kl = max(&kl_bits(&host.log_probabilities, &device.log_probabilities));
         assert!(kl < 1e-9, "{name}: KL(host ‖ device) with transcoder features = {kl:e} bits");
     }
@@ -818,7 +823,7 @@ fn attention_claims_are_checked_not_executed() {
     assert_eq!(base, claimed, "a claim changes execution");
     let mut state = crate::graph_device::DeviceState::new(Device::host());
     let job = crate::graph_device::Run { tokens: &batch.tokens, spans: &batch.spans, scored: &rows, swaps: &BTreeMap::new(), capture: false, reference: batch.reference.as_deref(), ops: &crate::graph::Interventions::default() };
-    let device = crate::graph_device::run_on(&mut state, &weights, &offset.program(&weights, true), &job).expect("device").log_probabilities;
+    let device = run_on(&mut state, &weights, &offset.program(&weights, true), &job).expect("device").log_probabilities;
     assert!(max(&kl_bits(&base, &device)) < 1e-9, "device");
     assert_eq!(offset.opaque_numbers(&weights), plain.opaque_numbers(&weights), "a claim removes no weights from the price");
     let mut false_program = program.clone();
@@ -870,7 +875,7 @@ fn attention_claims_on_vpd_parts_weigh_the_heads_they_reach() {
     assert_eq!(base, execute(&weights, &offset.program(&weights, true), &with_reference, &rows, &BTreeMap::new()).expect("claimed").log_probabilities);
     let mut state = crate::graph_device::DeviceState::new(Device::host());
     let job = crate::graph_device::Run { tokens: &with_reference.tokens, spans: &with_reference.spans, scored: &rows, swaps: &BTreeMap::new(), capture: false, reference: with_reference.reference.as_deref(), ops: &crate::graph::Interventions::default() };
-    let device = crate::graph_device::run_on(&mut state, &weights, &offset.program(&weights, true), &job).expect("device").log_probabilities;
+    let device = run_on(&mut state, &weights, &offset.program(&weights, true), &job).expect("device").log_probabilities;
     assert!(max(&kl_bits(&base, &device)) < 1e-9, "device");
     // A claim on value and output subcomponents alone has no pattern to check.
     let vo = Program { nodes: vec![NodeIr { id: "VO".into(), pieces: vec![vpd("v_proj", vec![0]), vpd("o_proj", vec![0])], claim: Some(serde_json::json!({"op": "attend", "offset": 1})) }], ..program(None) };
@@ -969,7 +974,7 @@ fn device_path_runs_head_operations_on_a_vpd_attention_as_the_host() {
     let host = execute_with(&weights, &circuit, &batch, &rows, &BTreeMap::new(), &ops).expect("host");
     let mut state = crate::graph_device::DeviceState::new(Device::host());
     let job = crate::graph_device::Run { tokens: &batch.tokens, spans: &batch.spans, scored: &rows, swaps: &BTreeMap::new(), capture: false, reference: batch.reference.as_deref(), ops: &ops };
-    let device = crate::graph_device::run_on(&mut state, &weights, &circuit, &job).expect("device");
+    let device = run_on(&mut state, &weights, &circuit, &job).expect("device");
     let kl = max(&kl_bits(&host.log_probabilities, &device.log_probabilities));
     assert!(kl < 1e-9, "KL(host ‖ device) under head operations = {kl:e} bits");
     let o = 2;
