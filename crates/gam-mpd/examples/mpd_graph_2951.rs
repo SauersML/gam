@@ -27,6 +27,10 @@
 //!   k most probable clean tokens and of everything else (the reader's items); with
 //!   `uniform_seeds` m, experiments from seed mod m (`M`'s cache serves recurring seeds).
 //!   `GRAPH_CACHE_GIB` bounds `M`'s cached outcomes (2), `GRAPH_DISK_CACHE` shares them on disk.
+//! * `{"op": "complement", "program": IR, "stand_in": null}`: per scored clean token, `M`'s top
+//!   tokens on the prompt and on its counterfactual and their log-probabilities under `M(x)`,
+//!   `M(x')` and the program's clean complement run (`Checker::complement_tokens`), answered as
+//!   `{"ok", "tokens": [...]}`.
 //! * `{"op": "base", "path": FILE}` or `{"op": "base", "base": IR}` (`null` clears it): the model's
 //!   shared base (`Checker::set_base`), a program IR whose nodes join every program scored after it,
 //!   on this behavior and every later one of the model; answers `{"ok", "base_bits", "parts"}`.
@@ -338,6 +342,20 @@ fn handle(request: &Value, weights: &mut Option<Weights>, checker: &mut Option<C
             };
             let (bits, parts) = c.set_base(base)?;
             Ok(json!({"ok": true, "base_bits": bits, "parts": parts}))
+        }
+        // Per scored clean token: M's top tokens on the prompt and the counterfactual, and their
+        // log-probabilities under M(x), M(x') and the program's clean complement run
+        // (Checker::complement_tokens; the reader's checkable questions).
+        "complement" => {
+            let c = checker.as_mut().ok_or("load a behavior first")?;
+            let mut program: Program = serde_json::from_value(request["program"].clone()).map_err(error)?;
+            if let Some(standin) = request["stand_in"].as_str().filter(|s| matches!(*s, "delete" | "counterfactual")) {
+                if program.standin.is_none() {
+                    program.standin = Some(standin.into());
+                }
+            }
+            let tokens = c.complement_tokens(&program)?;
+            Ok(json!({"ok": true, "tokens": tokens}))
         }
         // One program ("program") or many ("programs", the batch answer {"ok", "scores": [...]}),
         // every program under the same seed: the behavior's half of the experiments is shared and

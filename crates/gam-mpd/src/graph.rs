@@ -3973,6 +3973,20 @@ pub struct Checker {
     claim_inputs: BTreeMap<(usize, bool), Arc<Array2<f64>>>,
 }
 
+/// One scored token of [`Checker::complement_tokens`]: its prompt and position, `M`'s top token on
+/// the prompt and on the counterfactual, and both tokens' natural log-probabilities (clean top,
+/// counterfactual top) under `M(x)`, `M(x')` and the complement run `M_c`.
+#[derive(Clone, Debug, Serialize)]
+pub struct ComplementToken {
+    pub prompt: usize,
+    pub position: usize,
+    pub clean_top: usize,
+    pub counterfactual_top: usize,
+    pub clean: [f64; 2],
+    pub counterfactual: [f64; 2],
+    pub complement: [f64; 2],
+}
+
 /// Every score term (bits) and the counts behind them.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct Score {
@@ -5304,6 +5318,45 @@ impl Checker {
     /// A swap's scored tokens as (prompt, position), in its rows' order.
     pub fn swap_targets(&self) -> Vec<(usize, usize)> {
         self.donors.iter().flat_map(|&(i, _)| self.behavior.prompts[i].target_positions.iter().map(move |&t| (i, t))).collect()
+    }
+
+    /// Per scored token of the clean prompts (the behavior's target positions in prompt order): `M`'s
+    /// top token on the prompt and on its counterfactual, and the natural log-probabilities of both
+    /// tokens under `M(x)`, `M(x')` and `M_c`, the clean complement run of necessity
+    /// ([`Checker::necessity_runs`]: the program's nodes taken out, at their counterfactual values,
+    /// every other piece computing on the prompt). The ground truth of the reader's question whether
+    /// switching an explanation's parts to their counterfactual values moves `M` to the
+    /// counterfactual's answer (bench/oracle/graph/reader_questions.py).
+    pub fn complement_tokens(&mut self, program: &Program) -> Result<Vec<ComplementToken>, String> {
+        let program = self.with_base(program);
+        let graph = Graph::parse(&program, &self.weights)?;
+        self.weights.load_features(&graph)?;
+        if self.counterfactual.is_none() {
+            return Err("the behavior has no counterfactuals".into());
+        }
+        self.set_edit(&Experiment::Clean);
+        let native = Graph::empty().model(&self.weights);
+        let prompt = self.run(&native, &Experiment::Clean)?;
+        let swapped = self.run_swapped(&native, &Experiment::Clean)?;
+        // A program of no nodes outside its base takes nothing out: M_c is M.
+        let complement = if graph.blocks.len() <= graph.base.len() { prompt.clone() } else { self.run(&graph.complement_model(&self.weights), &Experiment::Clean)? };
+        let top = |row: ndarray::ArrayView1<f64>| row.iter().enumerate().fold((0, f64::NEG_INFINITY), |b, (i, &v)| if v > b.1 { (i, v) } else { b }).0;
+        let targets: Vec<(usize, usize)> = self.behavior.prompts.iter().enumerate().flat_map(|(i, p)| p.target_positions.iter().map(move |&t| (i, t))).collect();
+        Ok((0..prompt.nrows())
+            .map(|r| {
+                let (clean, counter) = (top(prompt.row(r)), top(swapped.row(r)));
+                let (p, position) = targets.get(r).copied().unwrap_or((usize::MAX, usize::MAX));
+                ComplementToken {
+                    prompt: p,
+                    position,
+                    clean_top: clean,
+                    counterfactual_top: counter,
+                    clean: [prompt[[r, clean]], prompt[[r, counter]]],
+                    counterfactual: [swapped[[r, clean]], swapped[[r, counter]]],
+                    complement: [complement[[r, clean]], complement[[r, counter]]],
+                }
+            })
+            .collect())
     }
 
     /// The graph a program parses to (for describing its experiments), or the empty graph.
