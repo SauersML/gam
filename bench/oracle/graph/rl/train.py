@@ -480,9 +480,12 @@ class VllmSampler:
 
 
 class ValidSampler:
-    """Draws n programs per prompt and redraws each invalid one (mech.trace: syntax, unknown names, an index
-    beyond its site's size, a rule broken) up to `rounds` times, so the policy is sampled restricted to the
-    programs it can write validly; stats holds the valid share before and after the redraws."""
+    """Draws n * (rounds + 1) programs per prompt in ONE sampling call and keeps n of each prompt's: its valid ones
+    first (mech.trace: syntax, unknown names, an index beyond its site's size, a rule broken), in sampling order, then
+    invalid ones; so the policy is sampled restricted to the programs it can write validly (rejection sampling).
+    Redraw rounds in sequence each cost the longest answer's generation (round 3: 4 rounds of up to 2,048 tokens, 232 s
+    for 32 answers); one call of more sequences runs at vLLM's batched throughput. stats: the valid share of every draw
+    (validity at one draw), of the kept answers, and the tokens per second generated."""
 
     def __init__(self, inner, tok, model: str, rounds: int):
         self.inner, self.tok, self.model, self.rounds = inner, tok, model, rounds
@@ -500,30 +503,24 @@ class ValidSampler:
             return self.draw(prompts, n, adapter, version)
 
     def draw(self, prompts: list[list[int]], n: int, adapter: Path, version: int) -> list[list[list[int]]]:
-        groups = self.inner(prompts, n, adapter, version)
-        sums = list(self.inner.logprob_sums) if self.inner.logprob_sums is not None else None
-        tokens = list(self.inner.token_logprobs) if getattr(self.inner, "token_logprobs", None) is not None else None
-        flags = [self.valid(g) for g in groups]
-        first = float(np.mean([f for fs in flags for f in fs]))
-        for _ in range(self.rounds):
-            slots = [(g, j) for g in range(len(groups)) for j in range(n) if not flags[g][j]]
-            if not slots:
-                break
-            redo = self.inner([prompts[g] for g, _ in slots], 1, adapter, version)
-            redo_sums, redo_tokens = self.inner.logprob_sums, getattr(self.inner, "token_logprobs", None)
-            ok = self.valid([r[0] for r in redo])
-            for k, ((g, j), r) in enumerate(zip(slots, redo)):
-                groups[g][j], flags[g][j] = r[0], ok[k]
-                if sums is not None:
-                    sums = None if redo_sums is None else sums
-                    if sums is not None:
-                        sums[g * n + j] = redo_sums[k]
-                if tokens is not None:
-                    tokens = None if redo_tokens is None else tokens
-                    if tokens is not None:
-                        tokens[g * n + j] = redo_tokens[k]
-        self.logprob_sums, self.token_logprobs = sums, tokens
-        self.stats = {"first_valid": first, "final_valid": float(np.mean([f for fs in flags for f in fs]))}
+        m = n * (self.rounds + 1)
+        t = time.time()
+        drawn = self.inner(prompts, m, adapter, version)
+        seconds = time.time() - t
+        sums, tokens = self.inner.logprob_sums, getattr(self.inner, "token_logprobs", None)
+        flags = self.valid([c for g in drawn for c in g])
+        groups, keep_sums, keep_tokens, kept_flags = [], [], [], []
+        for g, comps in enumerate(drawn):
+            order = sorted(range(m), key=lambda j: not flags[g * m + j])[:n]  # valid first, each side in sampling order
+            groups.append([comps[j] for j in order])
+            kept_flags += [flags[g * m + j] for j in order]
+            keep_sums += [sums[g * m + j] for j in order] if sums is not None else []
+            keep_tokens += [tokens[g * m + j] for j in order] if tokens is not None else []
+        self.logprob_sums = keep_sums if sums is not None else None
+        self.token_logprobs = keep_tokens if tokens is not None else None
+        generated = sum(len(c) for g in drawn for c in g)
+        self.stats = {"first_valid": float(np.mean(flags)), "final_valid": float(np.mean(kept_flags)), "drawn": len(flags), "generated_tokens": generated,
+                      "sample_seconds": seconds, "tokens_per_second": generated / max(seconds, 1e-9)}
         return groups
 
 

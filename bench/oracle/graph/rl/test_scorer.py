@@ -22,6 +22,9 @@ class Checker:
     def request(self, message):
         self.path = message["path"]
 
+    def behavior(self, path):  # score.Checker.behavior: the server's default site-operation manifest
+        self.request({"op": "behavior", "path": path})
+
     def score_batch(self, sources, experiments=32, seed=0, uniform_seeds=None, **options):
         calls.append((self.path, seed, len(sources)))
         return [{"total_bits": len(x["source"]) + seed, "valid": True, "behavior": self.path} for x in sources]
@@ -29,7 +32,6 @@ class Checker:
 
 def main():
     sys.modules["score"] = types.SimpleNamespace(Checker=Checker)
-    sys.modules["run"] = types.SimpleNamespace(load_behavior=lambda c, path: c.request({"op": "behavior", "path": path, "manifest": None}))
     scorer.WORKERS = 3
     items = [{"source": "x" * i, "behavior": {"model": "vpd4l", "path": f"b{i % 4}"}, "seed": 1 + i % 2} for i in range(16)]
     out = scorer.checker(items)
@@ -47,7 +49,7 @@ def main():
     check_rescore()
     check_valid_sampler()
     check_redraws_share_wake()
-    print("ok: checker scorer order, behaviors and one batch per (behavior, seed); repair keeps a revision only when it lowers S; evaluation summary; SFT data uses each training behavior's best program only; rescore; validity redraws (one vLLM wake per draw)")
+    print("ok: checker scorer order, behaviors and one batch per (behavior, seed); repair keeps a revision only when it lowers S; evaluation summary; SFT data uses each training behavior's best program only; rescore; valid answers kept first from one oversampled draw (one vLLM wake)")
 
 
 def check_repair():
@@ -63,7 +65,7 @@ def check_repair():
     score = lambda items: [{"valid": True, "total_bits": float(it["source"].split("=")[1])} for it in items]  # noqa: E731
     best = [{"completion": [0], "text": "```python\nbad(\n```", "score": {"valid": False, "total_bits": 1e4, "error": "line 1: syntax error"}},
             {"completion": [0], "text": "```python\nX = 10\n```", "score": {"valid": True, "total_bits": 10.0}}]
-    args = types.SimpleNamespace(repair=1, samples=2, uniform_seeds=0, experiments=16)
+    args = types.SimpleNamespace(repair=1, samples=2, uniform_seeds=0, experiments=16, seed=0, eval_seed=1_000_003)
     replaced = train.repair([{"id": "a"}, {"id": "b"}], best, pol, sampler, score, args, Path("."), 0)
     assert replaced == {0} and best[0]["score"]["total_bits"] == 30.0 and best[0]["completion"] == [30] and best[1]["score"]["total_bits"] == 10.0, (replaced, best)
     assert "line 1: syntax error" in shown[0] and "bad(" in shown[0] and shown[0].startswith("input a")
@@ -158,30 +160,35 @@ def check_rescore():
 
 
 def check_valid_sampler():
-    """ValidSampler redraws only the invalid programs, keeps n per prompt and reports the valid share
-    before and after."""
+    """ValidSampler draws n * (rounds + 1) per prompt in one call and keeps n per prompt, valid ones first, with their
+    log-probabilities; stats report the valid share of every draw and of the kept ones."""
     import train
 
-    good = "from mech import node, edges, PD, logits\nh = node(PD[1].down_proj[3])\nedges(h >> logits)\n"
+    good = "from mech import align\n\n\ndef answer(tokens):\n    return tokens\n\n\nalign(answer, <p:3.v.5>, <p:3.o.7>)\n"
     tok = types.SimpleNamespace(decode=lambda c, skip_special_tokens=True: good if c[0] > 0 else "nonsense(")
     calls = []
 
     class Inner:
-        logprob_sums = None
-
         def __call__(self, prompts, n, adapter, version):
             calls.append((len(prompts), n))
-            return [[[1 if len(calls) > 1 else (j % 2)] for j in range(n)] for _ in prompts]
+            out = [[[j % 3 == 2 and 1 or 0, j] for j in range(n)] for _ in prompts]  # every third draw valid
+            self.logprob_sums = [float(c[1]) for g in out for c in g]
+            self.token_logprobs = [[float(c[1])] * 2 for g in out for c in g]
+            return out
 
     vs = train.ValidSampler(Inner(), tok, "vpd4l", 2)
     out = vs([[0], [0]], 4, Path("."), 0)
-    assert calls == [(2, 4), (4, 1)], calls  # 4 invalid slots redrawn once
-    assert all(len(g) == 4 for g in out) and vs.stats == {"first_valid": 0.5, "final_valid": 1.0}, vs.stats
+    assert calls == [(2, 12)], calls  # one call: 4 x (2 + 1) per prompt
+    assert all([c[1] for c in g] == [2, 5, 8, 11] for g in out), out  # the valid draws, in order
+    assert vs.logprob_sums == [2.0, 5.0, 8.0, 11.0] * 2 and vs.token_logprobs[1] == [5.0, 5.0], vs.logprob_sums
+    assert abs(vs.stats["first_valid"] - 1 / 3) < 1e-9 and vs.stats["final_valid"] == 1.0 and vs.stats["drawn"] == 24, vs.stats
+    out = train.ValidSampler(Inner(), tok, "vpd4l", 0)([[0]], 4, Path("."), 0)
+    assert [c[1] for c in out[0]] == [2, 0, 1, 3]  # too few valid: the valid one, then invalid ones in order
 
 
 def check_redraws_share_wake():
-    """With one GPU, the validity redraws run inside one vLLM wake: the trainer moves to the host and back once
-    per draw, not once per redraw round (a stand-in engine records the moves)."""
+    """With one GPU, the oversampled draw runs inside one vLLM wake: one generate call, the trainer moved to the host
+    and back once (a stand-in engine records the moves)."""
     import train
 
     events = []
@@ -194,10 +201,8 @@ def check_redraws_share_wake():
             events.append("sleep")
 
         def generate(self, prompts, params, lora_request=None, use_tqdm=False):
-            first = not any(e.startswith("generate") for e in events)
-            events.append(f"generate {len(prompts)}")
-            out = types.SimpleNamespace(token_ids=[1 if first else 0], logprobs=None)  # the first draw invalid, redraws valid
-            return [types.SimpleNamespace(outputs=[out] * params["n"]) for _ in prompts]
+            events.append(f"generate {len(prompts)}x{params['n']}")
+            return [types.SimpleNamespace(outputs=[types.SimpleNamespace(token_ids=[j % 2], logprobs=None) for j in range(params["n"])]) for _ in prompts]
 
     class Model:
         def to(self, dev):
@@ -212,17 +217,16 @@ def check_redraws_share_wake():
     try:
         inner = train.VllmSampler(types.SimpleNamespace(share_gpu=True, max_tokens=8), 4, 0)
         inner.llm, inner.policy = Engine(), types.SimpleNamespace(model=Model(), dev="cuda:0")
-        good = "from mech import node, edges, PD, logits\nh = node(PD[1].down_proj[3])\nedges(h >> logits)\n"
+        good = "from mech import align\n\n\ndef answer(tokens):\n    return tokens\n\n\nalign(answer, <p:3.v.5>, <p:3.o.7>)\n"
         tok = types.SimpleNamespace(decode=lambda c, skip_special_tokens=True: "nonsense(" if c[0] == 1 else good)
-        vs = train.ValidSampler(inner, tok, "vpd4l", 2)
-        vs([[0], [0]], 2, Path("."), 0)
+        train.ValidSampler(inner, tok, "vpd4l", 2)([[0], [0]], 2, Path("."), 0)
     finally:
         for k, v in saved.items():
             if v is None:
                 sys.modules.pop(k, None)
             else:
                 sys.modules[k] = v
-    assert events == ["to cpu", "wake", "generate 2", "generate 4", "sleep", "to cuda:0"], events
+    assert events == ["to cpu", "wake", "generate 2x6", "sleep", "to cuda:0"], events
 
 
 if __name__ == "__main__":

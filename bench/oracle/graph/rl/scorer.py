@@ -62,9 +62,6 @@ def checker(items: list[dict]) -> list[dict]:
 
     import score
 
-    sys.path.insert(0, str(GRAPH / "e2e"))
-    from run import load_behavior  # g-int's: the behavior without the site manifest, which the vpd4l export cannot serve
-
     groups = {}
     for k, it in enumerate(items):
         groups.setdefault((it["behavior"]["model"], it["behavior"]["path"]), []).append(k)
@@ -75,8 +72,8 @@ def checker(items: list[dict]) -> list[dict]:
         if c is None:
             c = _CHECKERS[(model, w)] = score.Checker(model, EXPORT, memory_gib=MEMORY_GIB, views=VIEWS, **({"device": DEVICE} if DEVICE else {}))
             c.loaded = None
-        if c.loaded != path:
-            load_behavior(c, path)
+        if c.loaded != path:  # with the checker's default site-operation manifest, as the teacher's scores (teacher_run.py, edits.py)
+            c.behavior(path)
             c.loaded = path
         def key(k):  # an item with "reader": False is scored without the reader term (an edit keeps the answer's explanation)
             return (items[k].get("seed", 0), items[k].get("uniform_seeds") or 0, items[k].get("experiments") or 32, json.dumps(items[k].get("options"), sort_keys=True),
