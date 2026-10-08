@@ -7,7 +7,9 @@ behavior outside the train split, so no held-out behavior becomes a training ans
 Assignments: the algorithm's aligned variables, in data-flow order, take the program's nodes in layer order,
 each a contiguous run of nodes that writes the residual stream (the answer takes the last run). A variable
 whose values are attention patterns (lists of positions) is claimed on the query and key parts of the
-attention nodes of the aligned variable that reads it.
+attention nodes of the aligned variable that reads it. By default only the answer is aligned and the other
+variables stay unaligned steps (the lead, 10-08 00:48: nothing in the score pays for an aligned intermediate
+variable yet), with and without its claims.
 """
 
 from __future__ import annotations
@@ -74,10 +76,11 @@ def tokens(pieces: list[dict]) -> str:
     return ", ".join(printer.address(p) for p in pieces)
 
 
-def assignments(ir: dict, algorithm: str, behavior: dict) -> list[str]:
-    """Every algorithm program aligning the search's nodes to the algorithm's variables (module doc): any
-    subset of its value variables that includes the answer is aligned (the rest stay unaligned steps); the
-    programs mech rejects (a variable's parts must write before its readers read) are left out."""
+def assignments(ir: dict, algorithm: str, behavior: dict, steps_aligned: bool = False) -> list[str]:
+    """Every algorithm program aligning the search's nodes to the algorithm's variables (module doc): the
+    answer alone, with and without its claims, or with `steps_aligned` any subset of the value variables that
+    includes the answer (the rest stay unaligned steps); the programs mech rejects (a variable's parts must
+    write before its readers read) are left out."""
     model = behavior["model"]
     traced = mech.trace_inline(algorithm + f"\nalign(answer, {ANY[model]})\n", model)
     claimed = patterns(algorithm, behavior)
@@ -85,7 +88,7 @@ def assignments(ir: dict, algorithm: str, behavior: dict) -> list[str]:
     reads = {v["name"]: set(v["reads"]) for v in traced["variables"]}
     nodes = sorted(ir["nodes"], key=site)
     out = []
-    for r in range(len(values) + 1):
+    for r in range(len(values) + 1 if steps_aligned else 1):
         for chosen in itertools.combinations(values, r):
             aligned = list(chosen) + ["answer"]
             for cuts in itertools.combinations(range(1, len(nodes)), len(aligned) - 1):
@@ -99,7 +102,9 @@ def assignments(ir: dict, algorithm: str, behavior: dict) -> list[str]:
                         qk = [p for n in run for p in n["pieces"] if p["kind"] in ("q_proj", "k_proj", "head")]
                         if qk:
                             lines.append(f"claim({c}, {tokens(qk)})")
-                source = algorithm.rstrip() + "\n\n\n" + "\n".join(lines) + "\n"
-                if mech.trace_inline(source, model, decomposition=ir.get("decomposition") or "native")["valid"]:
-                    out.append(source)
+                bare = [line for line in lines if not line.startswith("claim(")]
+                for body in ([lines, bare] if bare != lines and not steps_aligned else [lines]):
+                    source = algorithm.rstrip() + "\n\n\n" + "\n".join(body) + "\n"
+                    if mech.trace_inline(source, model, decomposition=ir.get("decomposition") or "native")["valid"]:
+                        out.append(source)
     return out

@@ -72,7 +72,12 @@ def test_teacher_assignments():
                         "va3 = node(<p:3.v.677>, <p:3.o.806>)\nedges(embed >> va1, va1 >> va2, va2 >> va3, va3 >> logits)\n"}
     ir = teacher.search_ir(search, "vpd4l")
     assert teacher.patterns(teacher.algorithm_of(behavior), behavior) == {"back", "match"}
-    found = teacher.assignments(ir, teacher.algorithm_of(behavior), behavior)
+    alone = [s.split("\n\n\n")[-1].strip() for s in teacher.assignments(ir, teacher.algorithm_of(behavior), behavior)]
+    # by default the answer alone holds every node, with and without the claim of the pattern it reads
+    assert alone == ["align(answer, <p:1.q.316>, <p:1.k.329>, <p:1.v.228>, <p:1.o.311>, <p:2.q.335>, <p:2.k.206>, "
+                     "<p:2.v.559>, <p:2.o.735>, <p:3.v.677>, <p:3.o.806>)\nclaim(match, <p:1.q.316>, <p:1.k.329>, <p:2.q.335>, "
+                     "<p:2.k.206>)", alone[0].split("\n")[0]], alone
+    found = teacher.assignments(ir, teacher.algorithm_of(behavior), behavior, steps_aligned=True)
     tails = [s.split("\n\n\n")[-1] for s in found]
     # answer alone; prev = layer 1 and answer = layers 2-3; prev = layers 1-2 and answer = layer 3
     assert len(found) == 3 and all(t.count("align(answer") == 1 for t in tails)
