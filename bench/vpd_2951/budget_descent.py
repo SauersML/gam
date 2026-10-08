@@ -387,6 +387,12 @@ SCORE_NORM = {}
 # read of the activation, |v . GELU(h)| ||u|| (toys' superposition toy: stream-side gates exact, neuron-space gates
 # at Jaccard 0.51). A c_fc slice's own read is already its direction on the stream.
 READSIDE = os.environ.get('DESCENT_READSIDE') == '1'
+# DESCENT_MEANQK=1 (rot attention): each head's q and k get a positional part, their mean (pre-RoPE, on the start's
+# calibration text), always on; the q and k blocks split q - mean and k - mean. With every q and k block off a head
+# attends by position alone (RoPE of the means), not uniformly: toys found L1H1 (previous token) keeps 97% of its
+# effect in that form and L1H2/H4/H5 nearly content-free. Each costs 2 concepts per head and map (the part, its
+# write), counted with the gates evaluated, as it runs on every token.
+MEANQK = os.environ.get('DESCENT_MEANQK') == '1'
 
 def slice_gates(read, c, un, tau, s, taun, ex):
     """A slice map's gates (hard, expected) from its own reads (read, or |c| un when None) and thresholds (tau, s and
@@ -1089,6 +1095,7 @@ def gates_evaluated(soft):
     assignment softmax), the head scores the score gates read, and the gate networks' parameters."""
     extra = sum(t_.numel() for P_ in GN.values() for t_ in P_.values()) + sum(t_.numel() for t_ in TRUNK.values())
     extra += T.n_layer * NH if SCOREGATE and ROTA else 0
+    extra += 2 * 2 * T.n_layer * NH if MEANQK and ROTA else 0
     return sum((nonempty(R, soft) * R['keep']).sum() for R in ROT_ALL) + extra
 
 def concepts_total():
@@ -1182,18 +1189,23 @@ def rot_attention_core(Rq, Rk, Ro, q, k, v, causal, Qq, Qk, Q, noise, ex, idx, o
     the heads' output at the query (ex: the gate network's terms for q, k and OV, or None); returns (the input of M's o_proj, the OV coefficients, records, block reads)."""
     B_, T_ = q.shape[0], q.shape[1]
     grp = lambda t_: t_.view(B_, T_, -1, Rq['g'])
+    mq, mk = Rq.get('mean'), Rk.get('mean')
+    if mq is not None:
+        q, k = q - mq, k - mk
     cq = qeinsum('btnk,nki->btni', grp(q), Qq); ck = qeinsum('btnk,nki->btni', grp(k), Qk)
     if noise is not None:
         cq = cq + grp(noise[0]) * Rq['ls'].exp()
         ck = ck + grp(noise[1]) * Rk['ls'].exp()
     rope = lambda t_: T._rope(t_.view(B_, T_, NH, HD).transpose(1, 2), T_)
     back = lambda c_, Q_: qeinsum('btni,nki->btnk', c_, Q_).reshape(B_, T_, -1)
+    bq = lambda c_: back(c_, Qq) if mq is None else back(c_, Qq) + mq                     # with the positional parts
+    bk = lambda c_: back(c_, Qk) if mk is None else back(c_, Qk) + mk
     recs, Rbs = [], []
     if mode != 'all':
         # The keys' per-coordinate variance over the attended keys, RoPE undone at the query: for plane c,
         # cov_rel = R_t^T cov_c(t) R_t; coordinate c (first of its plane) takes cov_rel[0, 0], c + HD/2 cov_rel[1, 1].
         with torch.no_grad():
-            qh, kh = rope(back(cq, Qq)), rope(back(ck, Qk))
+            qh, kh = rope(bq(cq)), rope(bk(ck))
             full = ((qh @ kh.transpose(-1, -2)) / math.sqrt(HD)).masked_fill(~causal, float('-inf')).softmax(-1)
         k2 = torch.stack((kh[..., :NPL], kh[..., NPL:]), -1)                                    # [B, H, T, NPL, 2]
         mk = (full @ k2.flatten(-2)).view(B_, NH, T_, NPL, 2)
@@ -1207,7 +1219,7 @@ def rot_attention_core(Rq, Rk, Ro, q, k, v, causal, Qq, Qk, Q, noise, ex, idx, o
         gq, rec, Rb = rot_gate_core(Rq, rq, rot_read_bits(Rq, Qq), idx, on, mode, ex and ex[0]); recs.append(rec); Rbs.append(Rb)
         gk, rec, Rb = rot_gate_core(Rk, ck.abs(), rot_read_bits(Rk, Qk), idx, on, mode, ex and ex[1]); recs.append(rec); Rbs.append(Rb)
         cq, ck = cq * gq, ck * gk
-    qh, kh = rope(back(cq, Qq)), rope(back(ck, Qk))
+    qh, kh = rope(bq(cq)), rope(bk(ck))
     pattern = ((qh @ kh.transpose(-1, -2)) / math.sqrt(HD)).masked_fill(~causal, float('-inf')).softmax(-1)
     a = grp((pattern @ v.view(B_, T_, NH, HD).transpose(1, 2)).transpose(1, 2).reshape(B_, T_, -1))
     c = qeinsum('btnk,nki->btni', a, Q)
@@ -1834,6 +1846,16 @@ if ARM == 'rot':
         R = ROT[l]
         comps.append((R, 'tau', 's', f'h.{l}.mlp.c_fc', lambda R=R: rot_slice_bits(R, rot_Q(R))[0].mean().item(),
                       VPD_COUNTS[f'h.{l}.mlp.c_fc'] + VPD_COUNTS[f'h.{l}.mlp.down_proj']))
+    if MEANQK and ROTA:
+        # Each head's mean q and k (pre-RoPE) on the calibration text, from the attention's inputs with all on (M's).
+        with torch.no_grad():
+            install([None]); state['dense'] = {}
+            run(ids_c, 'all')
+            for l in ROTA:
+                h_ = state['dense'][(l, 0)].reshape(-1, T.wte.shape[1])
+                for name, key in (('q', 'q_proj'), ('k', 'k_proj')):
+                    ROTA[l][name]['mean'] = (h_ @ T.site(f'h.{l}.attn.{key}').W.T).mean(0)
+            state['dense'] = None
     with torch.no_grad():
         install([None])
         state['calib'] = {}
@@ -2058,7 +2080,7 @@ def save(step):
                     # rot attention: per layer the OV groups' (consecutive value coordinates of the heads) angles,
                     # assignments, thresholds, noise scales and widths, and the QK planes' assignments, thresholds,
                     # noise scales and widths.
-                    'rota': {l: {x: {k: R[x][k].detach().float().cpu() for k in ('A', 'L', 'tau', 's', 'ls', 'ls_fc', 'ls_dn', 'Q0', 'keep', 'beta') if k in R[x]}
+                    'rota': {l: {x: {k: R[x][k].detach().float().cpu() for k in ('A', 'L', 'tau', 's', 'ls', 'ls_fc', 'ls_dn', 'Q0', 'keep', 'beta', 'mean') if k in R[x]}
                                  for x in ('q', 'k', 'ov')} for l, R in ROTA.items()},
                     # The gate networks (per layer and part for rot, per map otherwise; W1, b1, W2) and their input:
                     # 'dense' (every layer's streams from the dense pass) or the layer's own stream; the trunk if any.
