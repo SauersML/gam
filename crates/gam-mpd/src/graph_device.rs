@@ -494,6 +494,11 @@ struct Streams {
     writes: Vec<Option<Tensor>>,
     stream: Tensor,
     standin_stream: Tensor,
+    /// Every stand-in is zero (a deleting run, or `M`): nothing is added for one, and a route that
+    /// reads every writer in the stream (and no unit of its own site) reads the stream itself.
+    zero: bool,
+    /// Per unit, whether its write is in `stream` (its site is done).
+    added: Vec<bool>,
 }
 
 impl Streams {
@@ -515,6 +520,17 @@ impl Streams {
     /// A route's input: the actual stream less the cut writers' (actual − stand-in), or the
     /// stand-in stream plus the kept writers'.
     fn input(&self, d: &Device, incoming: &Incoming) -> Result<Tensor, GpuError> {
+        // With zero stand-ins the stream is the stand-in stream (what pushes added) plus every
+        // written writer's write, so reading all of those is reading the stream.
+        if self.zero {
+            let all = match incoming {
+                Incoming::AllBut(cut) => cut.iter().all(|w| self.of(*w).0.is_none()),
+                Incoming::Only(kept) => kept.contains(&Writer::Embed) && self.writes.iter().zip(&self.added).enumerate().all(|(u, (w, &added))| w.is_none() || added == kept.contains(&Writer::Unit(u))),
+            };
+            if all {
+                return d.copy(&self.stream);
+            }
+        }
         let (mut x, sign, writers) = match incoming {
             Incoming::AllBut(cut) => (d.copy(&self.stream)?, -1.0, cut),
             Incoming::Only(kept) => (d.copy(&self.standin_stream)?, 1.0, kept),
@@ -523,7 +539,9 @@ impl Streams {
             let (actual, standin) = self.of(w);
             if let Some(a) = actual {
                 d.axpy(&mut x, sign, a)?;
-                d.axpy(&mut x, -sign, standin)?;
+                if !self.zero {
+                    d.axpy(&mut x, -sign, standin)?;
+                }
             }
         }
         Ok(x)
@@ -682,6 +700,7 @@ pub(crate) fn copies_on(s: &mut DeviceState, weights: &Weights, circuit: &Circui
         None => None,
     };
     // Stand-ins: from the counterfactual run, or zeros for `M` (it reads none).
+    let zero = matches!(job.reference, Some(r) if r.zero) || (job.reference.is_none() && circuit.units.iter().all(|u| u.computes));
     let (embed_standin, standins): (Tensor, Vec<Tensor>) = match job.reference {
         Some(r) if r.embed.nrows() != rows => return Err(format!("a counterfactual run of {} tokens for a batch of {rows}", r.embed.nrows())),
         // Deletion: every stand-in is zero, nothing to upload or compute.
@@ -709,6 +728,8 @@ pub(crate) fn copies_on(s: &mut DeviceState, weights: &Weights, circuit: &Circui
         embed_standin,
         standins,
         writes: (0..units).map(|_| None).collect(),
+        zero,
+        added: vec![false; units],
     };
     let ops = job.ops;
     let mut kept = BTreeMap::new();
@@ -878,9 +899,13 @@ pub(crate) fn copies_on(s: &mut DeviceState, weights: &Weights, circuit: &Circui
         for &u in &order[at..end] {
             match &st.writes[u] {
                 Some(w) => s.device.axpy(&mut st.stream, 1.0, w).map_err(e)?,
+                None if st.zero => {}
                 None => s.device.axpy(&mut st.stream, 1.0, &st.standins[u]).map_err(e)?,
             }
-            s.device.axpy(&mut st.standin_stream, 1.0, &st.standins[u]).map_err(e)?;
+            if !st.zero {
+                s.device.axpy(&mut st.standin_stream, 1.0, &st.standins[u]).map_err(e)?;
+            }
+            st.added[u] = true;
         }
         after(&s.device, ops, Some(site), &mut st).map_err(e)?;
         at = end;
