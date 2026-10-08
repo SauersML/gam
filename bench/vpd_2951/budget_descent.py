@@ -390,9 +390,20 @@ READSIDE = os.environ.get('DESCENT_READSIDE') == '1'
 # DESCENT_MEANQK=1 (rot attention): each head's q and k get a positional part, their mean (pre-RoPE, on the start's
 # calibration text), always on; the q and k blocks split q - mean and k - mean. With every q and k block off a head
 # attends by position alone (RoPE of the means), not uniformly: toys found L1H1 (previous token) keeps 97% of its
-# effect in that form and L1H2/H4/H5 nearly content-free. Each costs 2 concepts per head and map (the part, its
-# write), counted with the gates evaluated, as it runs on every token.
+# effect in that form and L1H2/H4/H5 nearly content-free. Each costs one concept (its write) per head and map,
+# counted with the gates evaluated, as it runs on every token.
 MEANQK = os.environ.get('DESCENT_MEANQK') == '1'
+# DESCENT_MEANPARTS=1 (rot): off means typical, not zero. Each MLP gets always-on mean parts, its mean pre-activation
+# in c_fc's output and its mean activation in down_proj's input (so W_dn E[act] is written on every token), the MLP
+# blocks splitting p - E[p] and act - E[act]; each head's OV gets its mean value, the OV blocks splitting the mixed
+# value less it (the pattern's rows sum to 1, so pattern (v - E[v]) = mixed value - E[v]). A block off is then that
+# block mean-ablated, not zeroed (GELU's mean is not zero), and every part on is still M. A mean part is one
+# concept (its write) per map or head, as are MEANQK's (counted with the gates evaluated).
+MEANPARTS = os.environ.get('DESCENT_MEANPARTS') == '1'
+# DESCENT_GATE_H=1 (rot): each gate's binary entropy H(Phi(z)) at each token is charged in bits per token: the bits
+# to specify a draw the gate does not determine. Training on sampled gates (bern) then drives the gates to 0 or 1,
+# so the delivered program (on where z > 0) is the trained one.
+GATE_H = os.environ.get('DESCENT_GATE_H') == '1'
 
 def slice_gates(read, c, un, tau, s, taun, ex):
     """A slice map's gates (hard, expected) from its own reads (read, or |c| un when None) and thresholds (tau, s and
@@ -879,7 +890,9 @@ def rot_core_args():
 def rot_record(recs, Rbs, keys, Rs=None):
     """Appends a core's per-token records (bits on, blocks on, training-gate bits) and, in calibration, its blocks'
     reads to the pass's state; with the pin, each block set's reads and bits (Rs: the block sets)."""
-    for i_, ((hb, n_on, sb, Lj), Rb, key) in enumerate(zip(recs, Rbs, keys)):
+    for i_, ((hb, n_on, sb, Lj, Hs), Rb, key) in enumerate(zip(recs, Rbs, keys)):
+        if Hs is not None:
+            state['gate_H'].append(Hs)
         if state['mode'] == 'hard':
             # A hard pass's third record is its blocks' gates [B, T, ng, g], kept for the probes.
             if state.get('probe') is not None:
@@ -917,15 +930,21 @@ def rot_gate_core(R, r, bits_i, idx, on, mode, extra=None):
     Lj = qeinsum('ni,nij->nj', bits_i, M_) + rot_tau_bits(R) + idx
     hb, n_on = (hard * Lj).sum((-1, -2)).reshape(-1), hard.sum((-1, -2)).reshape(-1)
     if mode == 'hard':
-        return qeinsum('...nj,nij->...ni', hard, hot), (hb, n_on, hard, Lj), Rb
+        return qeinsum('...nj,nij->...ni', hard, hot), (hb, n_on, hard, Lj, None), Rb
     gb = rot_train_gate(hard, phi)
-    return qeinsum('...nj,nij->...ni', gb, Lsm), (hb, n_on, (gb * Lj).sum((-1, -2)).reshape(-1), Lj), Rb
+    Hs = None
+    if GATE_H:
+        # Each gate's binary entropy in bits, summed per token.
+        ph = phi.clamp(1e-7, 1 - 1e-7)
+        Hs = -(ph * ph.log2() + (1 - ph) * (1 - ph).log2()).sum((-1, -2)).reshape(-1)
+    return qeinsum('...nj,nij->...ni', gb, Lsm), (hb, n_on, (gb * Lj).sum((-1, -2)).reshape(-1), Lj, Hs), Rb
 
 def rot_fc_core(R, p, xe, Q, ex, idx, on, sc, mode):
     """A c_fc map after M's product p = x W^T: its slices' coefficients (with the read noise xe), its blocks' gates
     (ex: the gate network's term) and its output; returns (output, gates, records, block reads)."""
     sh = p.shape[:-1]
-    c = qeinsum('...nk,nki->...ni', permuted(p, R['perm'], R['inv']).view(*sh, R['ng'], ROTG), Q)
+    mean_fc, mean_dn = R.get('mean_fc'), R.get('mean_dn')
+    c = qeinsum('...nk,nki->...ni', permuted(p if mean_fc is None else p - mean_fc, R['perm'], R['inv']).view(*sh, R['ng'], ROTG), Q)
     if xe is not None:
         c = c + xe.view(*sh, R['ng'], ROTG) * R['ls_fc'].exp()
     recs, Rbs = [], []
@@ -934,10 +953,14 @@ def rot_fc_core(R, p, xe, Q, ex, idx, on, sc, mode):
     else:
         bits_i, wn = rot_slice_bits(R, Q)
         pa = p if sc is None else p * sc
-        abar = permuted(pa if READSIDE else vpd_model.gelu_tanh(pa), R['perm'], R['inv']).view(*sh, R['ng'], ROTG)
+        abar = pa if READSIDE else vpd_model.gelu_tanh(pa)
+        if mean_dn is not None and not READSIDE:
+            abar = abar - mean_dn                                                   # the block writes act - E[act]
+        abar = permuted(abar, R['perm'], R['inv']).view(*sh, R['ng'], ROTG)
         gam, rec, Rb = rot_gate_core(R, qeinsum('...nk,nki->...ni', abar, Q).abs() * wn, bits_i, idx, on, mode, ex)
         recs.append(rec); Rbs.append(Rb)
-    return permuted(qeinsum('...ni,nki->...nk', c * gam, Q).reshape(*sh, -1), R['inv'], R['perm']), gam, recs, Rbs
+    out = permuted(qeinsum('...ni,nki->...nk', c * gam, Q).reshape(*sh, -1), R['inv'], R['perm'])
+    return (out if mean_fc is None else out + mean_fc), gam, recs, Rbs
 
 def make_rot_fc(n, l):
     R = ROT[l]; W = T.site(n).W
@@ -976,14 +999,17 @@ def acts_alone(l, p, gam, Q, stride=8, n_tok=256):
     neuron and the groups partition the neurons, so blocks of different groups never interact. Returns (the score,
     the pairs, the two sums)."""
     R = ROT[l]; g = R['g']
-    P_ = permuted(p.reshape(-1, p.shape[-1])[::stride][:n_tok], R['perm'], R['inv']).view(-1, R['ng'], g)
+    grp_ = lambda t_: permuted(t_, R['perm'], R['inv']).view(-1, R['ng'], g)
+    mf = grp_(R['mean_fc'][None])[:, :, None, :] if 'mean_fc' in R else 0.0                 # the mean parts (MEANPARTS)
+    md = grp_(R['mean_dn'][None])[:, :, None, :] if 'mean_dn' in R else 0.0
+    P_ = grp_(p.reshape(-1, p.shape[-1])[::stride][:n_tok] - (R['mean_fc'] if 'mean_fc' in R else 0.0))
     c = qeinsum('tnk,nki->tni', P_, Q)                                                       # [t, ng, i] slice coordinates
     gs = gam.reshape(-1, R['ng'], g)[::stride][:n_tok]                                       # the slices' (hard) gates
     memT = (R['L'].argmax(-1) [:, None, :] == torch.arange(g, device=dev)[None, :, None]).float()[None]   # [1, ng, j, i]
     Mo = qeinsum('nki,nkm,nmj->nij', Q, R['Gdn'], Q)                                         # the output metric
     def f(m):
-        # The writes (slice coordinates) of the slices in masks m [t, ng, j, i].
-        return m * qeinsum('tnjk,nki->tnji', vpd_model.gelu_tanh(qeinsum('tnji,nki->tnjk', m * c[:, :, None, :], Q)), Q)
+        # The writes (slice coordinates) of the slices in masks m [t, ng, j, i], beside the mean parts'.
+        return m * qeinsum('tnjk,nki->tnji', vpd_model.gelu_tanh(mf + qeinsum('tnji,nki->tnjk', m * c[:, :, None, :], Q)) - md, Q)
     ctx = f(gs[:, :, None, :]) - f(gs[:, :, None, :] * (1 - memT))
     alone = f(memT.expand(gs.shape[0], -1, -1, -1))
     on = (gs[:, :, None, :] * memT).amax(-1)                                                 # [t, ng, j]: on and non-empty
@@ -994,8 +1020,10 @@ def acts_alone(l, p, gam, Q, stride=8, n_tok=256):
 def rot_dn_core(R, a, gam, Q, mode):
     """A down_proj map's slices on its input a, gated by its c_fc blocks' gates: (z before M's product, coefficients)."""
     sh = a.shape[:-1]
-    c = qeinsum('...nk,nki->...ni', permuted(a, R['perm'], R['inv']).view(*sh, R['ng'], ROTG), Q) * gam
-    return permuted(qeinsum('...ni,nki->...nk', c, Q).reshape(*sh, -1), R['inv'], R['perm']), c
+    mean_dn = R.get('mean_dn')
+    c = qeinsum('...nk,nki->...ni', permuted(a if mean_dn is None else a - mean_dn, R['perm'], R['inv']).view(*sh, R['ng'], ROTG), Q) * gam
+    z = permuted(qeinsum('...ni,nki->...nk', c, Q).reshape(*sh, -1), R['inv'], R['perm'])
+    return (z if mean_dn is None else z + mean_dn), c
 
 def make_rot_dn(n, l):
     R = ROT[l]; W = T.site(n).W
@@ -1095,7 +1123,8 @@ def gates_evaluated(soft):
     assignment softmax), the head scores the score gates read, and the gate networks' parameters."""
     extra = sum(t_.numel() for P_ in GN.values() for t_ in P_.values()) + sum(t_.numel() for t_ in TRUNK.values())
     extra += T.n_layer * NH if SCOREGATE and ROTA else 0
-    extra += 2 * 2 * T.n_layer * NH if MEANQK and ROTA else 0
+    extra += 2 * T.n_layer * NH if MEANQK and ROTA else 0
+    extra += 2 * T.n_layer + (T.n_layer * NH if ROTA else 0) if MEANPARTS else 0
     return sum((nonempty(R, soft) * R['keep']).sum() for R in ROT_ALL) + extra
 
 def concepts_total():
@@ -1189,17 +1218,17 @@ def rot_attention_core(Rq, Rk, Ro, q, k, v, causal, Qq, Qk, Q, noise, ex, idx, o
     the heads' output at the query (ex: the gate network's terms for q, k and OV, or None); returns (the input of M's o_proj, the OV coefficients, records, block reads)."""
     B_, T_ = q.shape[0], q.shape[1]
     grp = lambda t_: t_.view(B_, T_, -1, Rq['g'])
-    mq, mk = Rq.get('mean'), Rk.get('mean')
-    if mq is not None:
-        q, k = q - mq, k - mk
+    mean_q, mean_k = Rq.get('mean'), Rk.get('mean')
+    if mean_q is not None:
+        q, k = q - mean_q, k - mean_k
     cq = qeinsum('btnk,nki->btni', grp(q), Qq); ck = qeinsum('btnk,nki->btni', grp(k), Qk)
     if noise is not None:
         cq = cq + grp(noise[0]) * Rq['ls'].exp()
         ck = ck + grp(noise[1]) * Rk['ls'].exp()
     rope = lambda t_: T._rope(t_.view(B_, T_, NH, HD).transpose(1, 2), T_)
     back = lambda c_, Q_: qeinsum('btni,nki->btnk', c_, Q_).reshape(B_, T_, -1)
-    bq = lambda c_: back(c_, Qq) if mq is None else back(c_, Qq) + mq                     # with the positional parts
-    bk = lambda c_: back(c_, Qk) if mk is None else back(c_, Qk) + mk
+    bq = lambda c_: back(c_, Qq) if mean_q is None else back(c_, Qq) + mean_q             # with the positional parts
+    bk = lambda c_: back(c_, Qk) if mean_k is None else back(c_, Qk) + mean_k
     recs, Rbs = [], []
     if mode != 'all':
         # The keys' per-coordinate variance over the attended keys, RoPE undone at the query: for plane c,
@@ -1221,7 +1250,9 @@ def rot_attention_core(Rq, Rk, Ro, q, k, v, causal, Qq, Qk, Q, noise, ex, idx, o
         cq, ck = cq * gq, ck * gk
     qh, kh = rope(bq(cq)), rope(bk(ck))
     pattern = ((qh @ kh.transpose(-1, -2)) / math.sqrt(HD)).masked_fill(~causal, float('-inf')).softmax(-1)
-    a = grp((pattern @ v.view(B_, T_, NH, HD).transpose(1, 2)).transpose(1, 2).reshape(B_, T_, -1))
+    a = (pattern @ v.view(B_, T_, NH, HD).transpose(1, 2)).transpose(1, 2).reshape(B_, T_, -1)
+    mean_v = Ro.get('mean')
+    a = grp(a if mean_v is None else a - mean_v)
     c = qeinsum('btnk,nki->btni', a, Q)
     if noise is not None:
         # Each OV slice's read noise at each key, mixed by the pattern like the values.
@@ -1231,7 +1262,7 @@ def rot_attention_core(Rq, Rk, Ro, q, k, v, causal, Qq, Qk, Q, noise, ex, idx, o
         bits_i, wn = rot_slice_bits(Ro, Q)
         go, rec, Rb = rot_gate_core(Ro, c.abs() * wn, bits_i, idx, on, mode, ex and ex[2]); recs.append(rec); Rbs.append(Rb)
         c = c * go
-    return back(c, Q), c, recs, Rbs
+    return (back(c, Q) if mean_v is None else back(c, Q) + mean_v), c, recs, Rbs
 
 def rot_attention(i, h, causal):
     """Layer i's attention output under the rot arm: M's q, k, v and o products around rot_attention_core."""
@@ -1567,7 +1598,7 @@ def run(ids, mode):
         if TRUNK:
             state['gn_feats'] = gate_trunk(state['gn_feats'])
     state['mode'], state['soft'], state['hard'], state['edges_soft'], state['edges_hard'] = mode, [], [], [], []
-    state['rot'], state['rot_on'] = {}, []
+    state['rot'], state['rot_on'], state['gate_H'] = {}, [], []
     return T(ids)
 
 def example_graph(position):
@@ -1846,15 +1877,21 @@ if ARM == 'rot':
         R = ROT[l]
         comps.append((R, 'tau', 's', f'h.{l}.mlp.c_fc', lambda R=R: rot_slice_bits(R, rot_Q(R))[0].mean().item(),
                       VPD_COUNTS[f'h.{l}.mlp.c_fc'] + VPD_COUNTS[f'h.{l}.mlp.down_proj']))
-    if MEANQK and ROTA:
-        # Each head's mean q and k (pre-RoPE) on the calibration text, from the attention's inputs with all on (M's).
+    if MEANQK or MEANPARTS:
+        # The mean parts on the calibration text, from the attention's and the MLP's inputs with all on (M's): each
+        # head's mean q and k (pre-RoPE), mean value, and each MLP's mean pre-activation and activation.
         with torch.no_grad():
             install([None]); state['dense'] = {}
             run(ids_c, 'all')
-            for l in ROTA:
-                h_ = state['dense'][(l, 0)].reshape(-1, T.wte.shape[1])
-                for name, key in (('q', 'q_proj'), ('k', 'k_proj')):
-                    ROTA[l][name]['mean'] = (h_ @ T.site(f'h.{l}.attn.{key}').W.T).mean(0)
+            for l in range(T.n_layer):
+                if ROTA:
+                    h_ = state['dense'][(l, 0)].reshape(-1, T.wte.shape[1])
+                    for name, key, on_ in (('q', 'q_proj', MEANQK), ('k', 'k_proj', MEANQK), ('ov', 'v_proj', MEANPARTS)):
+                        if on_:
+                            ROTA[l][name]['mean'] = (h_ @ T.site(f'h.{l}.attn.{key}').W.T).mean(0)
+                if MEANPARTS:
+                    p_ = state['dense'][(l, 1)].reshape(-1, T.wte.shape[1]) @ T.site(f'h.{l}.mlp.c_fc').W.T
+                    ROT[l]['mean_fc'], ROT[l]['mean_dn'] = p_.mean(0), vpd_model.gelu_tanh(p_).mean(0)
             state['dense'] = None
     with torch.no_grad():
         install([None])
@@ -2069,7 +2106,7 @@ def save(step):
                     # rot: per layer the neuron order (groups of DESCENT_ROT consecutive), angles, assignments,
                     # thresholds, noise scales and the slices' log widths.
                     'rot': {l: {k: R[k].detach().float().cpu() if R[k].dtype.is_floating_point else R[k].cpu()
-                                for k in ('perm', 'A', 'L', 'tau', 's', 'ls_fc', 'ls_dn', 'Q0', 'keep') if k in R} for l, R in ROT.items()},
+                                for k in ('perm', 'A', 'L', 'tau', 's', 'ls_fc', 'ls_dn', 'Q0', 'keep', 'mean_fc', 'mean_dn') if k in R} for l, R in ROT.items()},
                     # Each group's basis: Q = Q0 (I + S)^-1 (I - S) for groups larger than 64, Q0 exp(S) otherwise (Q0 the
                     # start's basis where saved, else I), S the skew part of A's strict upper triangle; the guard reads
                     # ln R against tau (log) or R (linear); the gate also adds beta . (the heads' standardized largest
@@ -2186,6 +2223,9 @@ for step in range(steps):
         # Levin's cost on the clean tokens: log2 of the concepts on (expected gates) plus the gates evaluated.
         G_t = gates_evaluated(True)
         objective = objective + (torch.log2(torch.stack(state['soft']).sum(0) + G_t) * counted).sum() / counted.sum()
+    if GATE_H:
+        gate_H = torch.stack(state['gate_H']).sum(0).mean()
+        objective = objective + gate_H
     if step == 0 and not LEVIN:
         # lambda starts at the median over thresholds of the balance |dF/dtau| / |dE[k]/dtau|.
         taus = [mu for _, key, mu, _ in leaves if key == 'tau'] if FMODE else [cont[key] for cont, key, _ in slots if key == 'tau']
@@ -2231,6 +2271,7 @@ for step in range(steps):
         e['train_kl_edited'] = float(kl_seq[:N_EDITS].mean()) if N_EDITS else None
         step_seconds = []
         rec = {'step': step + 1, 'lambda': lam, 'K_t': K, 'train_kl': kl.item(), 'description_bits': desc.item(), 'train_edge_bits': float(edge_bits),
+               'train_gate_H': gate_H.item() if GATE_H else None,
                'train_F': objective.item(), 'train_k_soft': ek.item(), 'train_k_hard': hk, 'train_per_map': train_per_map,
                'sigma_rel': sigma_rel, **e,
                'seconds': time.time() - t0}
