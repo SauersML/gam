@@ -4125,8 +4125,10 @@ impl Checker {
         let Some(path) = self.memo_path(name) else { return };
         let (Some(dir), Ok(bytes)) = (path.parent(), serde_json::to_vec(value)) else { return };
         let tmp = path.with_extension(format!("{}.partial", std::process::id()));
-        if std::fs::create_dir_all(dir).is_ok() && std::fs::write(&tmp, bytes).is_ok() && std::fs::rename(&tmp, &path).is_err() {
-            let _ = std::fs::remove_file(&tmp);
+        if std::fs::create_dir_all(dir).is_ok() && std::fs::write(&tmp, bytes).is_ok() && std::fs::rename(&tmp, &path).is_err()
+            && let Err(e) = std::fs::remove_file(&tmp)
+        {
+            eprintln!("memo {}: {e}", tmp.display());
         }
     }
 
