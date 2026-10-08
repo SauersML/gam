@@ -228,7 +228,8 @@ def answer(a, b: str) -> None:
         def scored(sources, experiments=a.experiments, seed=0, stage="refine"):
             results = []
             for k in range(0, len(sources), a.batch):
-                results += checker.score_batch(sources[k:k + a.batch], experiments=experiments, seed=seed, reader=False)
+                results += checker.score_batch(sources[k:k + a.batch], experiments=experiments, seed=seed, reader=False,
+                                               stand_in=a.stand_in)
             for src, r in zip(sources, results):
                 trajectory.write(json.dumps({"stage": stage, "seed": seed, "experiments": experiments, "source": src,
                                              "score": {t: r.get(t) for t in TERMS}, "error": r.get("error")}) + "\n")
@@ -273,7 +274,7 @@ def answer(a, b: str) -> None:
             "assignment_score": {t: final[1].get(t) for t in TERMS}, "refine_bits": total, "parts": parts,
             "variables": [s.variable for s in refined.statements if s.kind != "claim"], "accepted": [str(e) for e in accepted],
             "search": str(found), "checker": a.checker_commit, "checker_binary": str(score_module.BINARY),
-            "base": os.environ.get("GRAPH_BASE"),
+            "base": os.environ.get("GRAPH_BASE"), "stand_in": a.stand_in or "checker default",
             "settings": {"experiments": a.experiments, "seed": 0, "rounds": a.rounds, "adds": a.adds, "drops": a.drops,
                          "final_experiments": a.final_experiments, "final_seed": 1}, "seconds": round(time.time() - t0)}
     with open(out / "manifest.jsonl", "a") as f:
@@ -309,6 +310,8 @@ def main():
     ap.add_argument("--adds", type=int, default=8, help="carrier candidates tried per variable per round")
     ap.add_argument("--drops", type=int, default=32, help="part drops sampled per round")
     ap.add_argument("--batch", type=int, default=8, help="programs per checker request")
+    ap.add_argument("--stand-in", choices=["delete", "counterfactual"], help="what unnamed parts compute (default: the "
+                    "checker's, deletion with a decomposition attached)")
     ap.add_argument("--checker-commit", help="the checker's commit (default: GRAPH_CHECKER's suffix)")
     a = ap.parse_args()
     for k in ("behaviors_dir", "export", "vpd", "rankings", "carriers", "search", "out"):
