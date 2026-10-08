@@ -70,6 +70,16 @@ def test_ir_carries_explanation():
     assert score.Checker.ir(fake, ir) is ir
 
 
+def test_answer_is_not_interchange_tested():
+    ir = {"answer": "answer", "alignments": [{"variable": "prev", "nodes": ["prev"], "pairs": [{"base": 0, "source": 1}]},
+                                             {"variable": "answer", "nodes": ["a"], "pairs": [{"base": 0, "source": 1}]}]}
+    got = score.output_aligned(ir)
+    assert [a["pairs"] for a in got["alignments"]] == [[{"base": 0, "source": 1}], []]
+    assert ir["alignments"][1]["pairs"]  # the caller's IR is left as it was
+    plain = {"answer": None, "alignments": []}
+    assert score.output_aligned(plain) is plain
+
+
 def test_shared_base_joins_every_program(tmp_path):
     """A base of two layer-3 VPD subcomponents (c_fc and down_proj): the empty program is scored as the base alone
     (its parts priced in base_bits, outside total_bits); a program naming one of them takes it over."""

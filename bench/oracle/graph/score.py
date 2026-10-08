@@ -59,6 +59,16 @@ def reader_request(address, message):
     return reply["ok"]["results"][0]
 
 
+def output_aligned(ir: dict) -> dict:
+    """`ir` without interchange pairs for its answer variable: the answer is the model's output, aligned to it by
+    construction (Geiger et al.), so only intermediate variables are interchange-tested (the lead, 10-08 00:48).
+    mech keeps emitting the answer's pairs for other uses (the teacher's carriers)."""
+    alignments = ir.get("alignments") or []
+    if not any(a.get("pairs") and a["variable"] == ir.get("answer") for a in alignments):
+        return ir
+    return {**ir, "alignments": [{**a, "pairs": []} if a["variable"] == ir.get("answer") else a for a in alignments]}
+
+
 class Checker:
     def __init__(self, model, export=None, memory_gib=None, threads=None, views=None, device=None, memo_dir=None, base=None):
         """memory_gib: the server's mem-lease (vpd4l: a batch of 8 programs at 8 threads ran under 12 GiB and
@@ -125,7 +135,7 @@ class Checker:
         options: further request keys passed to the server as they are (e.g. experiment families). stand_in:
         what the parts a program does not name carry when it names no "standin": "counterfactual" (their values
         on the prompt's counterfactual; the lead's default for every program, 10-08 01:09) or "delete"."""
-        irs = [self.ir(p) for p in programs]
+        irs = [output_aligned(self.ir(p)) for p in programs]
         request = {"op": "score", "programs": irs, "experiments": experiments, "seed": seed,
                    "routing": routing, "N": N, "reader_top": reader_top if reader else 0, "stand_in": stand_in, **(options or {})}
         if uniform_seeds:
