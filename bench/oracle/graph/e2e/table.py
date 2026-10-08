@@ -36,7 +36,10 @@ def shared(s: dict, families=SHARED) -> tuple[float, float] | None:
         return None
     mean = sum(pf[f]["mean_kl_bits"] * pf[f]["tokens"] for f in families if f in pf) / tokens
     n = s.get("N", 2**24)
-    return mean, mean + (s.get("opaque_bits", 0.0) + s.get("code_bits", 0.0) + (s.get("reader_error_bits") or 0.0)) / n
+    # every term of the total but the execution error (necessity, claims, bindings, complexity, reader, ...)
+    rest = s["total_bits"] - s["exec_error_bits"] if "total_bits" in s and "exec_error_bits" in s else \
+        s.get("opaque_bits", 0.0) + s.get("code_bits", 0.0) + (s.get("reader_error_bits") or 0.0)
+    return mean, mean + rest / n
 
 
 def row(behavior: str, program: str, s: dict, stand_in, calls, source: str) -> list[str]:

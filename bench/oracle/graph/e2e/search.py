@@ -144,7 +144,8 @@ def nodes_of(units) -> list[tuple[str, str, int, bool, bool]]:
     for l, idx in mlp.items():
         out.append((f"m{l}", f"L[{l}].mlp[{_slices(idx)}]", 2 * l + 1, True, True))
     for (l, block), sites in sub.items():
-        pieces = ", ".join(f"PD[{l}].{m}[{_slices(sites[m])}]" for m in SITES_OF[block] if m in sites)
+        # one part token per subcomponent (a part token is one Python token of the code length)
+        pieces = ", ".join(f"<p:{l}.{mech.CODES[m]}.{i}>" for m in SITES_OF[block] if m in sites for i in sorted(sites[m]))
         reads = bool(set(sites) & {"c_fc", "q_proj", "k_proj", "v_proj"})
         writes = bool(set(sites) & {"down_proj", "o_proj"})
         out.append((f"{'va' if block == 'attn' else 'vm'}{l}", pieces, 2 * l + (block == "mlp"), reads, writes))
@@ -183,10 +184,11 @@ class Pool:
     one score_batch request (the checker's parallel threads, M's run per experiment shared)."""
 
     def __init__(self, model: str, behavior: Path, workers: int, export: Path | None = None, stand_in: str | None = None,
-                 views: dict | None = None, log_path: Path | None = None, device: str | None = None):
+                 views: dict | None = None, log_path: Path | None = None, device: str | None = None, necessity: bool = True):
         """views: decomposition views for the checker (score.Checker's); log_path: every scored program is
-        appended there as a JSON line {"source", "seed", "experiments", "score"} (search's data)."""
-        self.model, self.stand_in, self.log_path = model, stand_in, log_path
+        appended there as a JSON line {"source", "seed", "experiments", "score"} (search's data); necessity:
+        False skips the checker's necessity runs (necessity_error_bits 0)."""
+        self.model, self.stand_in, self.log_path, self.necessity = model, stand_in, log_path, necessity
         self.checkers = [score.Checker(model, export, views=views, device=device) for _ in range(workers)]
         for c in self.checkers:
             e2e.load_behavior(c, behavior)
@@ -197,8 +199,11 @@ class Pool:
 
         def one(k):
             share = list(range(k, len(irs), len(self.checkers)))
-            answer = self.checkers[k].request({"op": "score_batch", "programs": [irs[i] for i in share], "experiments": experiments,
-                                               "seed": seed, "routing": "edges", "N": None, "reader_top": 0})
+            request = {"op": "score_batch", "programs": [irs[i] for i in share], "experiments": experiments,
+                       "seed": seed, "routing": "edges", "N": None, "reader_top": 0}
+            if not self.necessity:
+                request["necessity"] = False
+            answer = self.checkers[k].request(request)
             return list(zip(share, answer["scores"]))
 
         with ThreadPoolExecutor(len(self.checkers)) as ex:
@@ -208,7 +213,7 @@ class Pool:
         if self.log_path is not None:
             with self.log_path.open("a") as f:
                 for p, r in zip(programs, scored):
-                    f.write(json.dumps({"source": p, "seed": seed, "experiments": experiments, "score": r}) + "\n")
+                    f.write(json.dumps({"source": p, "seed": seed, "experiments": experiments, "necessity": self.necessity, "score": r}) + "\n")
         return scored
 
     def close(self):
@@ -246,7 +251,7 @@ def greedy(pool: Pool, model: str, mode: str, experiments: int, seed: int, min_n
     outside = [u for u in full if ((u[0], u[1]) if u[0] in ("mlp", "vpd") else u) not in touched] if mode == "addition" else []
     best = pool.score([source(current)], experiments, seed)[0]
     trajectory = [{"step": 0, "units": [name(u) for u in current], "total_bits": best["total_bits"],
-                   "exec_error_bits": best["exec_error_bits"], "opaque_bits": best["opaque_bits"], "calls": pool.calls}]
+                   "exec_error_bits": best["exec_error_bits"], "complexity_bits": best.get("complexity_bits"), "calls": pool.calls}]
     log(f"{mode} step 0: {best['total_bits']:.6g} bits")
     step = 0
     while True:
@@ -277,29 +282,82 @@ def greedy(pool: Pool, model: str, mode: str, experiments: int, seed: int, min_n
         log(f"{mode} step {step}: {len(moves)} candidates in {time.time() - t:.0f} s; best {moves[k][2][0]} "
             f"{name(moves[k][2][1])} {objective(results[k]):.6g} vs {objective(best):.6g}")
         candidates = [{"move": [m[2][0], name(m[2][1])], "total_bits": r["total_bits"], "exec_error_bits": r["exec_error_bits"],
-                       "opaque_bits": r["opaque_bits"]} for m, r in zip(moves, results)]
+                       "complexity_bits": r.get("complexity_bits")} for m, r in zip(moves, results)]
         if objective(results[k]) >= objective(best):
             trajectory.append({"step": step, "stopped": True, "candidates": candidates, "calls": pool.calls})
             break
         current, outside, best = moves[k][0], moves[k][1], results[k]
         trajectory.append({"step": step, "move": [moves[k][2][0], name(moves[k][2][1])], "units": [name(u) for u in current],
                            "total_bits": best["total_bits"], "exec_error_bits": best["exec_error_bits"],
-                           "opaque_bits": best["opaque_bits"], "calls": pool.calls, "candidates": candidates})
+                           "complexity_bits": best.get("complexity_bits"), "calls": pool.calls, "candidates": candidates})
         if checkpoint is not None:  # a job cut off by its time limit keeps every finished step
             checkpoint({"units": [name(u) for u in current], "source": source(current), "score": best, "trajectory": trajectory,
                         "partial": True})
     return {"units": current, "source": source(current), "score": best, "trajectory": trajectory}
 
 
+def prune(pool: Pool, current: list, best: dict, experiments: int, seed: int, objective, log, max_prune: int = 64,
+          cap: int = 32, trajectory: list | None = None, checkpoint=None) -> tuple[list, dict]:
+    """Removals while one lowers the objective: of a whole group (a head, a layer's native neurons, a matrix's
+    subcomponents) above max_prune units; then of runs of consecutive units of `current` (the ranking's order)
+    of n/8 units, n/16, ... down to n/cap (at most about `cap` candidates per step); then, at max_prune units or
+    fewer, of one unit at a time."""
+    trajectory = trajectory if trajectory is not None else []
+    note = lambda: checkpoint and checkpoint({"units": [name(u) for u in current], "source": source(current), "score": best,
+                                              "trajectory": trajectory, "partial": True})
+    if len(current) > max_prune:  # coarse pruning: drop a whole group (a head, a layer's native neurons, a matrix's subcomponents)
+        group = lambda u: u if u[0] == "head" else (u[0], u[1]) if u[0] == "mlp" else (u[0], u[1], u[2])
+        while True:
+            groups = sorted({group(u) for u in current}, key=str)
+            if len(groups) < 2:
+                break
+            moves = [[u for u in current if group(u) != g] for g in groups]
+            rs = pool.score([source(m) for m in moves], experiments, seed)
+            i = min(range(len(moves)), key=lambda i: objective(rs[i]))
+            log(f"group prune: {len(moves)} candidates; best drops {groups[i]} {objective(rs[i]):.6g} vs {objective(best):.6g}")
+            if objective(rs[i]) >= objective(best):
+                break
+            trajectory.append({"drop_group": str(groups[i]), "score": rs[i]})
+            current, best = moves[i], rs[i]
+            note()
+    runs = 8
+    while len(current) > max_prune and runs <= cap:
+        size = max(1, len(current) // runs)
+        moves = [current[:i] + current[i + size:] for i in range(0, len(current), size)]
+        rs = pool.score([source(m) for m in moves], experiments, seed)
+        i = min(range(len(moves)), key=lambda i: objective(rs[i]))
+        log(f"run prune: {len(moves)} runs of {size}; best drops units {i * size}-{i * size + size - 1} {objective(rs[i]):.6g} vs {objective(best):.6g}")
+        if objective(rs[i]) < objective(best):
+            trajectory.append({"drop_run": [name(u) for u in current[i * size:i * size + size]], "score": rs[i]})
+            current, best = moves[i], rs[i]
+            note()
+        elif size == 1:
+            break
+        else:
+            runs *= 2
+    while 1 < len(current) <= max_prune:
+        moves = [[v for v in current if v != u] for u in current]
+        rs = pool.score([source(m) for m in moves], experiments, seed)
+        i = min(range(len(moves)), key=lambda i: objective(rs[i]))
+        log(f"prune: {len(moves)} candidates; best removes {name(current[i])} {objective(rs[i]):.6g} vs {objective(best):.6g}")
+        if objective(rs[i]) >= objective(best):
+            break
+        trajectory.append({"remove": name(current[i]), "score": rs[i]})
+        current, best = moves[i], rs[i]
+        note()
+    return current, best
+
+
 def prefix_search(pool: Pool, model: str, experiments: int, seed: int, block: int, log, rank_experiments: int = 0,
-                  checkpoint=None, objective=None, units=None, ranked=None, max_prune: int = 64, growth: float = 1.5) -> dict:
+                  checkpoint=None, objective=None, units=None, ranked=None, max_prune: int = 64, growth: float = 1.5,
+                  cap: int = 32) -> dict:
     """Measured ranking, then prefixes, then pruning, all exact through the checker:
     1. every unit alone (heads, MLP neuron blocks of `block`) as a one-node program: under counterfactual
        stand-ins this is the unit's activation patch from x into x', and the drop in KL on the clean and
        counterfactual prompts from the empty program's is its measured effect;
     2. the programs of the k most effective units for k = 1, 2, 3, 4, 6, 8, 12, ... (pieces that pay only
        together enter together, which one-piece-at-a-time addition misses), the best kept;
-    3. greedy removal from it until no removal lowers the objective."""
+    3. pruning (prune) until no removal lowers the objective."""
     objective = objective or (lambda r: r["total_bits"])
     s_ = mech.shapes(model)
     units = units or ([("head", l, h) for l in range(s_["layers"]) for h in range(s_["heads"])]
@@ -340,33 +398,7 @@ def prefix_search(pool: Pool, model: str, experiments: int, seed: int, block: in
         i = min(range(len(fine)), key=lambda i: objective(rs[i]))
         if objective(rs[i]) < objective(best):
             current, best = ranked[:fine[i]], rs[i]
-    if len(current) > max_prune:  # coarse pruning: drop a whole group (a head, a layer's native neurons, a matrix's subcomponents)
-        group = lambda u: u if u[0] == "head" else (u[0], u[1]) if u[0] == "mlp" else (u[0], u[1], u[2])
-        while True:
-            groups = sorted({group(u) for u in current}, key=str)
-            if len(groups) < 2:
-                break
-            moves = [[u for u in current if group(u) != g] for g in groups]
-            rs = pool.score([source(m) for m in moves], experiments, seed)
-            i = min(range(len(moves)), key=lambda i: objective(rs[i]))
-            log(f"group prune: {len(moves)} candidates; best drops {groups[i]} {objective(rs[i]):.6g} vs {objective(best):.6g}")
-            if objective(rs[i]) >= objective(best):
-                break
-            trajectory.append({"drop_group": str(groups[i]), "score": rs[i]})
-            current, best = moves[i], rs[i]
-            if checkpoint:
-                checkpoint({"units": [name(u) for u in current], "source": source(current), "score": best, "trajectory": trajectory, "partial": True})
-    while 1 < len(current) <= max_prune:
-        moves = [[v for v in current if v != u] for u in current]
-        rs = pool.score([source(m) for m in moves], experiments, seed)
-        i = min(range(len(moves)), key=lambda i: objective(rs[i]))
-        log(f"prune: {len(moves)} candidates; best removes {name(current[i])} {objective(rs[i]):.6g} vs {objective(best):.6g}")
-        if objective(rs[i]) >= objective(best):
-            break
-        trajectory.append({"remove": name(current[i]), "score": rs[i]})
-        current, best = moves[i], rs[i]
-        if checkpoint:
-            checkpoint({"units": [name(u) for u in current], "source": source(current), "score": best, "trajectory": trajectory, "partial": True})
+    current, best = prune(pool, current, best, experiments, seed, objective, log, max_prune, cap, trajectory, checkpoint)
     return {"units": current, "source": source(current), "score": best, "trajectory": trajectory}
 
 
@@ -377,6 +409,10 @@ def main() -> None:
     ap.add_argument("--block", type=int, default=96, help="prefix mode: MLP neurons per unit")
     ap.add_argument("--prefix-growth", type=float, default=1.5, help="prefix mode: ratio between successive prefix sizes")
     ap.add_argument("--max-prune", type=int, default=64, help="prefix mode: prune one unit at a time only up to this many units (else refine k)")
+    ap.add_argument("--cap", type=int, default=32, help="prefix mode: the most candidates of a run-pruning step")
+    ap.add_argument("--search-necessity", action="store_true",
+                    help="prefix mode: score necessity throughout (default: only the final pruning and the result, from the "
+                         "program found without it)")
     ap.add_argument("--device", help="the checker's device (gpu: the single-precision device path)")
     ap.add_argument("--max-units", type=int, default=8192, help="prefix mode with --mlp-view vpd: the top ranked subcomponents considered")
     ap.add_argument("--rank-experiments", type=int, default=0, help="prefix mode: draws beyond clean and counterfactual per one-unit ranking program")
@@ -417,7 +453,8 @@ def main() -> None:
             load_ranking(a.ranking)
     mixed = a.ranking is not None and "mixed" in json.loads(a.ranking.read_text())
     views = {"vpd": a.vpd} if a.mlp_view == "vpd" or mixed else None
-    pool = Pool(model, path, a.workers, a.export, a.stand_in, views, out / f"{behavior['id']}{a.tag}.candidates.jsonl", a.device)
+    pool = Pool(model, path, a.workers, a.export, a.stand_in, views, out / f"{behavior['id']}{a.tag}.candidates.jsonl", a.device,
+                necessity=a.search_necessity or a.mode != "prefix")
     try:
         for mode in (["addition", "removal"] if a.mode == "both" else [a.mode]):
             start = pool.calls
@@ -436,8 +473,16 @@ def main() -> None:
                     ranked = None if data is None else ([unit_of(n) for n, _ in data["mixed"]] if "mixed" in data
                                                         else ranked_subcomponents(a.ranking) if a.mlp_view == "vpd"
                                                         else ranked_native(a.ranking, model))[: a.max_units]
+                    objective = objective_of(a.objective)
                     found = prefix_search(pool, model, a.experiments, a.seed, a.block, log, a.rank_experiments, save,
-                                          objective_of(a.objective), ranked=ranked, max_prune=a.max_prune, growth=a.prefix_growth)
+                                          objective, ranked=ranked, max_prune=a.max_prune, growth=a.prefix_growth, cap=a.cap)
+                    if not pool.necessity:  # the final pruning with necessity scored, from the program found without it
+                        pool.necessity = True
+                        best = pool.score([found["source"]], a.experiments, a.seed)[0]
+                        log(f"with necessity: {len(found['units'])} units, {objective(best):.6g} (necessity {best.get('necessity_error_bits', 0):.6g} bits)")
+                        units, best = prune(pool, found["units"], best, a.experiments, a.seed, objective, log, a.max_prune, a.cap,
+                                            found["trajectory"], save)
+                        found.update(units=units, source=source(units), score=best)
                 else:
                     found = greedy(pool, model, mode, a.experiments, a.seed, a.min_neurons, log, start_units, a.mlp_view,
                                    save, objective_of(a.objective))

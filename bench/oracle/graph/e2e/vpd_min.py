@@ -6,9 +6,10 @@ view attached (deletion: unnamed parts contribute zero); the result as {"behavio
 
 reproduced = 1 - execution error / the empty program's (fit families, the empty program scored in the same
 run: under deletion, M against the model with every part deleted); weights_share = opaque numbers / every
-head and MLP number; parts = subcomponents.
+head and MLP number; parts = subcomponents. The search scores without necessity; its final pruning and the
+result with it (search.py).
 
-  vpd_min.py BEHAVIOR_ID... [--budget 4096] [--experiments 8] [--device gpu] [--out ~/mpd-data/graph_oracle/runs/vpd_min]
+  vpd_min.py BEHAVIOR_ID... [--budget 1024] [--experiments 8] [--device gpu] [--out ~/mpd-data/graph_oracle/runs/vpd_min]
 """
 
 from __future__ import annotations
@@ -30,18 +31,18 @@ DATA = Path.home() / "mpd-data/graph_oracle"
 MODEL_NUMBERS = {"vpd4l": 28_324_608}
 
 
-def summary(behavior: str, result: dict, model: str = "vpd4l") -> dict:
+def summary(behavior: str, result: dict, model: str = "vpd4l", split: str | None = None) -> dict:
     t = result["trajectory"][0]
     empty = next(s for k, s in t["prefixes"] if k == 0)
     found = result["score"]
     fams = tuple(f for f in table.FIT if f in found.get("per_family", {}) and f in empty.get("per_family", {}))
     e, f = table.shared(empty, fams), table.shared(found, fams)
     he, hf = table.shared(empty, table.HELDOUT), table.shared(found, table.HELDOUT)
-    return {"behavior": behavior, "source": result["source"], "score": found, "empty": empty, "standin": found.get("standin"),
+    return {"behavior": behavior, "split": split, "source": result["source"], "score": found, "empty": empty, "standin": found.get("standin"),
             "reproduced": 1 - f[0] / e[0] if e[0] else 0.0,
             "reproduced_heldout": 1 - hf[0] / he[0] if he and hf and he[0] else None,
-            "weights_share": found.get("opaque_numbers", 0) / MODEL_NUMBERS[model], "parts": len(result["units"]),
-            "heads": sum(1 for u in result["units"] if u.startswith("h")), "total": f[1], "empty_total": e[1],
+            "weights_share": found.get("opaque_numbers", 0) / MODEL_NUMBERS[model], "parts": found.get("parts", len(result["units"])),
+            "necessity_bits": found.get("necessity_error_bits"), "total": f[1], "empty_total": e[1],
             "build": result.get("checker"), "calls": result.get("calls")}
 
 
@@ -49,7 +50,8 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("behaviors", nargs="+")
     ap.add_argument("--model", default="vpd4l")
-    ap.add_argument("--budget", type=int, default=4096, help="the most parts a program may declare")
+    ap.add_argument("--budget", type=int, default=1024, help="the most parts a program may declare")
+    ap.add_argument("--cap", type=int, default=32, help="the most candidates of a run-pruning step")
     ap.add_argument("--growth", type=float, default=2.0, help="ratio between successive prefix sizes")
     ap.add_argument("--device")
     ap.add_argument("--experiments", type=int, default=8, help="per score during the search (the result is rescored on a held-out seed)")
@@ -69,7 +71,7 @@ def main() -> None:
         cmd = [sys.executable, str(HERE / "search.py"), str(behaviors / f"{b}.json"), "--mode", "prefix",
                "--ranking", str(a.rankings / f"{b}.json"), "--max-units", str(a.budget), "--objective", "fit",
                "--experiments", str(a.experiments), "--max-prune", "24", "--prompt-holdout", "4", "--vpd", str(a.vpd),
-               "--prefix-growth", str(a.growth), "--tag", "_vpd_min", "--out", str(work)]
+               "--prefix-growth", str(a.growth), "--cap", str(a.cap), "--tag", "_vpd_min", "--out", str(work)]
         cmd += ["--device", a.device] if a.device else []
         cmd += ["--export", str(a.export)] if a.export else []
         with open(work / f"{b}.stdout", "w") as log:
@@ -78,9 +80,9 @@ def main() -> None:
         if not res.exists():
             print(f"{b}: no result ({work / f'{b}.stdout'})", flush=True)
             continue
-        s = summary(b, json.loads(res.read_text()), a.model)
+        s = summary(b, json.loads(res.read_text()), a.model, json.loads((behaviors / f"{b}.json").read_text()).get("split"))
         (out / f"{b}.json").write_text(json.dumps(s, indent=1))
-        print(f"{b}: {s['parts']} parts ({s['heads']} heads), reproduced {s['reproduced']:.0%} (held-out families "
+        print(f"{b}: {s['parts']} parts, reproduced {s['reproduced']:.0%} (held-out families "
               f"{s['reproduced_heldout'] if s['reproduced_heldout'] is None else round(s['reproduced_heldout'] * 100)}%), "
               f"weights {s['weights_share']:.2%}, total {s['total']:.2f} vs empty {s['empty_total']:.2f}", flush=True)
 
