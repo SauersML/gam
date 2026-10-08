@@ -65,7 +65,7 @@ fn full_program() -> Program {
             }
         }
     }
-    Program { model: "tiny".into(), nodes, edges, python_tokens: 0, token_types: 0, source: String::new(), valid: true, error: None, standin: None }
+    Program { model: "tiny".into(), nodes, edges, python_tokens: 0, token_types: 0, source: String::new(), valid: true, error: None, standin: None, base: Vec::new() }
 }
 
 fn max(values: &[f64]) -> f64 {
@@ -727,6 +727,44 @@ fn necessity_pays_for_left_out_mediators() {
     let circuit = empty_graph.program(&checker.weights, true);
     let targets = checker.targets().expect("targets");
     let experiments = sample(&checker.weights, true, 30, 3, &targets, &checker.sites);
-    let measured = checker.necessity_runs(&[(&empty_graph, &circuit)], &[Vec::new()], &complements(&experiments, true)).expect("empty necessity");
-    assert!(measured[0].len() >= 3 && measured[0].iter().all(|kl| max(kl) < f32_kl), "{:?}", measured[0].iter().map(|kl| max(kl)).collect::<Vec<_>>());
+    let measured = checker.necessity_runs(&[(&empty_graph, &circuit)], &[Vec::new()], &complements(&experiments)).expect("empty necessity");
+    assert!(measured[0].len() >= 3 && measured[0].iter().all(|kl| kl.as_ref().is_some_and(|kl| max(kl) < f32_kl)), "{:?}", measured[0].iter().map(|kl| kl.as_ref().map(|kl| max(kl))).collect::<Vec<_>>());
+}
+
+/// Deletion (the default with a VPD view attached): a program naming every VPD subcomponent and
+/// remainder of layer 0's MLP and every other piece is `M` (no sufficiency or necessity error);
+/// the empty program's error on the clean prompts is `M`'s KL to the all-deleted model (a zero
+/// stream); a program naming layer 0's heads alone pays necessity, as its heads' information
+/// reaches the logits through the later pieces it deletes; and the counterfactual semantics stay
+/// available per program.
+#[test]
+fn deleting_programs_score_named_parts_alone() {
+    let f32_kl = 64.0 / 16_777_216.0 / std::f64::consts::LN_2;
+    let (mut weights, sequences) = model("graph_sites_delete");
+    let (hidden, width) = weights.layers[0].mlp.as_ref().expect("an MLP").gate.dim();
+    let wave = |rows: usize, cols: usize, phase: f64| Array2::from_shape_fn((rows, cols), |(i, j)| 0.1 * ((i * 7 + j * 3) as f64 + phase).sin());
+    weights.vpd.insert(0, crate::graph::VpdMlp { fc_u: wave(5, hidden, 0.3), fc_v: wave(width, 5, 1.1), down_u: wave(4, width, 2.0), down_v: wave(hidden, 4, 0.7) });
+    let vpd = |kind: &str, index: crate::graph::Index| PieceIr { view: "vpd".into(), layer: 0, kind: kind.into(), index: Some(index) };
+    let mut full = full_program();
+    full.nodes.iter_mut().find(|n| n.id == "m0").expect("m0").pieces = ["c_fc", "down_proj"].iter().flat_map(|k| [vpd(k, crate::graph::Index::Many((0..if *k == "c_fc" { 5 } else { 4 }).collect())), vpd(k, crate::graph::Index::Name("rest".into()))]).collect();
+    let mut partial = Program { model: "tiny".into(), valid: true, ..Program::default() };
+    partial.nodes = vec![NodeIr { id: "a0".into(), pieces: vec![piece(0, "head")], rule: None }];
+    partial.edges = ["query", "key", "value"].iter().map(|r| EdgeIr { from: "embed".into(), to: "a0".into(), route: (*r).into() }).chain(["embed", "a0"].iter().map(|w| EdgeIr { from: (*w).into(), to: "logits".into(), route: "input".into() })).collect();
+    let counterfactual = Program { standin: Some("counterfactual".into()), ..partial.clone() };
+    let empty = Program { model: "tiny".into(), valid: true, ..Program::default() };
+    let d = weights.width();
+    let mut checker = Checker::new(weights, behavior(&sequences)).expect("checker");
+    // N large enough that every block stays exact: the semantics alone, not the precision search.
+    let scores = checker.score_batch(&[full, partial, counterfactual, empty], 24, 5, true, Some(1e15), 0).expect("scores");
+    let (full, partial, counterfactual, empty) = (&scores[0].0, &scores[1].0, &scores[2].0, &scores[3].0);
+    assert_eq!((full.standin.as_str(), counterfactual.standin.as_str(), empty.standin.as_str()), ("delete", "counterfactual", "delete"));
+    assert!(full.exec_error_bits / full.n < f32_kl && full.necessity_error_bits / full.n < f32_kl, "full program: sufficiency {:e}, necessity {:e} bits per token", full.exec_error_bits / full.n, full.necessity_error_bits / full.n);
+    assert!(partial.necessity_error_bits / partial.n > 1e-3, "partial necessity {:e} bits per token", partial.necessity_error_bits / partial.n);
+    assert!(partial.per_family.keys().all(|k| !k.starts_with("necessity_site")), "deletion measures necessity on clean prompts and weight edits");
+    assert!((partial.exec_error_bits - counterfactual.exec_error_bits).abs() > 1e-6 * partial.exec_error_bits, "the stand-ins differ");
+    let m = checker.model_outcome(&Graph::empty(), &crate::graph::Experiment::Clean).expect("M");
+    let deleted = crate::graph::log_probabilities(&checker.weights, &Array2::zeros((m.nrows(), d))).expect("all deleted");
+    let expected = kl_bits(&m, &deleted).iter().sum::<f64>() / m.nrows() as f64;
+    let clean = empty.per_family["clean"].mean_kl_bits;
+    assert!((clean - expected).abs() < 1e-9 * expected.max(1.0), "empty program on the clean prompts {clean} vs KL(M ‖ all deleted) {expected}");
 }

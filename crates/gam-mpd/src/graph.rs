@@ -65,10 +65,16 @@ pub struct Program {
     pub valid: bool,
     #[serde(default)]
     pub error: Option<String>,
-    /// What undeclared pieces and edges carry: "counterfactual", the same model's values on the
-    /// prompt's counterfactual (the one semantics; absent means it).
+    /// What undeclared pieces and edges carry: "delete", nothing (they contribute zero; the default
+    /// when the model has a VPD view attached), or "counterfactual", the same model's values on the
+    /// prompt's counterfactual (the default otherwise).
     #[serde(default)]
     pub standin: Option<String>,
+    /// Ids of nodes from a shared base library (parts every behavior's program may use): their
+    /// precision is reported as `Score::base_bits`, outside the total, for the caller to charge once
+    /// across behaviors.
+    #[serde(default)]
+    pub base: Vec<String>,
 }
 
 fn yes() -> bool {
@@ -603,6 +609,12 @@ impl Weights {
     fn neurons(&self, layer: usize) -> usize {
         self.layers[layer].mlp.as_ref().map_or(0, |m| m.gate.nrows())
     }
+
+    /// Whether a VPD view is attached: programs then delete what they leave undeclared by default
+    /// (`Program::standin`).
+    pub fn has_vpd(&self) -> bool {
+        !self.vpd.is_empty() || !self.vpd_attention.is_empty()
+    }
 }
 
 // ------------------------------------------------------------------------------ resolved graph
@@ -713,6 +725,8 @@ pub struct Circuit {
     pub units: Vec<Unit>,
     pub logits: Incoming,
     pub nodes: usize,
+    /// Stand-ins are zero ([`Graph::delete`]): `Checker::referenced` attaches [`Reference::zeros`].
+    pub delete: bool,
 }
 
 
@@ -728,6 +742,9 @@ impl Circuit {
 /// `None` for the logits.
 #[derive(Clone, Debug)]
 pub struct Graph {
+    /// Undeclared pieces and edges contribute nothing (`Program::standin` "delete"); else they carry
+    /// their values on the counterfactual.
+    pub delete: bool,
     pub ids: Vec<String>,
     pub blocks: Vec<Block>,
     /// Per node its rule (v2, `mech.attend`), heads only.
@@ -1092,15 +1109,21 @@ impl Graph {
                 }
             }
         }
-        if let Some(other) = program.standin.as_deref().filter(|s| *s != "counterfactual") {
-            return Err(format!("stand-in {other}: undeclared pieces carry their values on the counterfactual (the average stand-ins were deleted)"));
+        let delete = match program.standin.as_deref() {
+            None => weights.has_vpd(),
+            Some("delete") => true,
+            Some("counterfactual") => false,
+            Some(other) => return Err(format!("stand-in {other}: \"delete\" (undeclared pieces contribute nothing) or \"counterfactual\" (their values on the counterfactual)")),
+        };
+        if let Some(b) = program.base.iter().find(|b| !ids.contains(b)) {
+            return Err(format!("base node {b} is not a node"));
         }
-        Ok(Self { ids, blocks, rules, edges, internal })
+        Ok(Self { delete, ids, blocks, rules, edges, internal })
     }
 
     /// The empty program: every piece a stand-in.
     pub fn empty() -> Self {
-        Self { ids: Vec::new(), blocks: Vec::new(), rules: Vec::new(), edges: Vec::new(), internal: Vec::new() }
+        Self { delete: false, ids: Vec::new(), blocks: Vec::new(), rules: Vec::new(), edges: Vec::new(), internal: Vec::new() }
     }
 
     /// Every piece of `weights` not in a node, per site: the heads of each layer, then its neurons.
@@ -1194,14 +1217,16 @@ impl Graph {
             })
             .collect();
         units.extend(self.complement(weights).into_iter().map(|block| Unit { block, computes: false, routes: [Incoming::all(), Incoming::all(), Incoming::all()], hidden: Incoming::all(), rule: None }));
-        Circuit { units, logits: routed(None, Route::Input), nodes: self.blocks.len() }
+        Circuit { units, logits: routed(None, Route::Input), nodes: self.blocks.len(), delete: self.delete }
     }
 
-    /// `M` with the program's nodes writing their stand-ins (their values on the counterfactual) and
-    /// every other piece computing on the prompt, every edge kept; the logits read `embed`'s
-    /// stand-in when the program routes `embed` to them. The necessity experiments' `M`.
+    /// `M` with the program's nodes writing their stand-ins (their values on the counterfactual, or
+    /// zero when deleted) and every other piece computing on the prompt, every edge kept; the logits
+    /// read `embed`'s stand-in when the program routes `embed` to them. The necessity experiments'
+    /// `M`.
     pub fn complement_model(&self, weights: &Weights) -> Circuit {
         let mut circuit = self.model(weights);
+        circuit.delete = self.delete;
         for unit in circuit.units.iter_mut().take(self.blocks.len()) {
             unit.computes = false;
         }
@@ -1215,6 +1240,7 @@ impl Graph {
     /// edge kept.
     pub fn model(&self, weights: &Weights) -> Circuit {
         let mut circuit = self.program(weights, false);
+        circuit.delete = false;
         for unit in &mut circuit.units {
             unit.computes = true;
             unit.rule = None;
@@ -1361,6 +1387,22 @@ pub(crate) fn next_reference_id() -> u64 {
 }
 
 impl Reference {
+    /// A run of `rows` tokens where every piece is deleted: every array zero, so every stand-in
+    /// write is zero (deletion semantics, [`Graph::delete`]).
+    pub fn zeros(weights: &Weights, rows: usize) -> Self {
+        let d = weights.width();
+        let per_layer = || vec![Array2::zeros((rows, d)); weights.layers.len()];
+        Self {
+            id: next_reference_id(),
+            embed: Array2::zeros((rows, d)),
+            reads: weights.layers.iter().map(|l| l.heads.iter().map(|h| Array2::zeros((rows, h.query.nrows()))).collect()).collect(),
+            active: (0..weights.layers.len()).map(|l| Array2::zeros((rows, weights.neurons(l)))).collect(),
+            mlp: per_layer(),
+            inputs: per_layer(),
+            attention_inputs: per_layer(),
+        }
+    }
+
     /// Block `block`'s write in the run (rows × width).
     fn write(&self, weights: &Weights, block: &Block) -> Result<Array2<f64>, String> {
         let rows = self.embed.nrows();
@@ -2230,12 +2272,8 @@ const DISK_SEMANTICS: u64 = 2;
 /// an MLP's output swapped from the counterfactual at every token, a connection cut).
 /// The complement experiments of a score's experiment set (necessity, [`Checker::necessity_runs`]),
 /// the same for every program: the clean prompts, the set's first [`COMPLEMENT_EDITS`] weight edits
-/// and its first [`COMPLEMENT_SITES`] site operations that read no donor. None without
-/// counterfactuals.
-pub fn complements(experiments: &[Experiment], counterfactual: bool) -> Vec<Experiment> {
-    if !counterfactual {
-        return Vec::new();
-    }
+/// and its first [`COMPLEMENT_SITES`] site operations that read no donor.
+pub fn complements(experiments: &[Experiment]) -> Vec<Experiment> {
     let edits = experiments.iter().filter(|e| matches!(e, Experiment::Edit { .. })).take(COMPLEMENT_EDITS);
     let sites = experiments.iter().filter(|e| matches!(e, Experiment::Sites { draw } if !Interventions::needs_donor(draw))).take(COMPLEMENT_SITES);
     std::iter::once(Experiment::Clean).chain(edits.cloned()).chain(sites.cloned()).collect()
@@ -3531,6 +3569,8 @@ pub struct Checker {
     pub reference_bytes: usize,
     /// Each declared block's bit width as the search chose it (`Checker::width`), by the block.
     widths: BTreeMap<String, Option<u32>>,
+    /// [`Reference::zeros`] by row count, for deleting programs' runs.
+    zeros: std::sync::Mutex<BTreeMap<usize, Arc<Reference>>>,
 }
 
 /// Every score term (bits) and the counts behind them.
@@ -3538,16 +3578,21 @@ pub struct Checker {
 pub struct Score {
     pub total_bits: f64,
     pub exec_error_bits: f64,
-    /// `N` times the mean, over the complement experiments ([`complements`], equal weights), of
-    /// `KL(M_c ‖ P_c)` per scored token: `M` with the program's nodes at their counterfactual
-    /// values and every other piece on the prompt, against the program run with the roles swapped
-    /// ([`Checker::necessity_runs`]). Zero for a program of no nodes (it claims nothing).
+    /// `N` times the mean, over the complement experiments the program's semantics measure
+    /// ([`complements`], equal weights), of `KL(M_c ‖ P_c)` per scored token: `M` with the
+    /// program's nodes taken out (deleted, or at their counterfactual values) and every other piece
+    /// on the prompt, against the program's prediction for it ([`Checker::necessity_runs`]). Zero
+    /// for a program of no nodes (it claims nothing).
     pub necessity_error_bits: f64,
     pub reader_error_bits: f64,
     pub code_bits: f64,
     pub python_tokens: usize,
     pub opaque_numbers: usize,
     pub opaque_bits: f64,
+    /// The precision of the program's shared base nodes (`Program::base`), not in `total_bits`.
+    pub base_bits: f64,
+    /// What undeclared pieces carried: "delete" or "counterfactual" ([`Graph::delete`]).
+    pub standin: String,
     #[serde(rename = "N")]
     pub n: f64,
     pub experiments: usize,
@@ -3643,6 +3688,7 @@ impl Checker {
             site_references: std::sync::Mutex::new(Vec::new()),
             reference_bytes: 3 << 30,
             widths: BTreeMap::new(),
+            zeros: std::sync::Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -3662,6 +3708,12 @@ impl Checker {
         out.reference = None;
         self.mask(&mut out);
         if circuit.is_model() {
+            return Ok(out);
+        }
+        if circuit.delete {
+            let rows = out.tokens.len();
+            let mut zeros = self.zeros.lock().map_err(|e| e.to_string())?;
+            out.reference = Some(zeros.entry(rows).or_insert_with(|| Arc::new(Reference::zeros(&self.weights, rows))).clone());
             return Ok(out);
         }
         let partner: Vec<Vec<u32>> = batch.sequences().iter().map(|s| self.partners.get(s).cloned().ok_or("counterfactual stand-ins need each prompt's counterfactual of the same length")).collect::<Result<_, _>>()?;
@@ -3880,7 +3932,7 @@ impl Checker {
             .iter()
             .map(|program| match Graph::parse(program, &self.weights) {
                 Ok(g) => (g, true, None),
-                Err(e) => (Graph::empty(), false, Some(e)),
+                Err(e) => (Graph { delete: self.weights.has_vpd(), ..Graph::empty() }, false, Some(e)),
             })
             .collect();
         for (g, _, _) in &parsed {
@@ -3918,20 +3970,21 @@ impl Checker {
         let result = self.measure_runs(plan, &mut measured);
         let widths = result?;
         // Necessity, for each program with nodes: the same complement experiments for every program.
-        let complements = complements(&experiments, self.counterfactual.is_some());
+        let complements = complements(&experiments);
         let named: Vec<usize> = (0..parsed.len()).filter(|&i| !parsed[i].0.blocks.is_empty()).collect();
         let quantized: Vec<Vec<(Block, Option<u32>)>> = named.iter().map(|&i| parsed[i].0.blocks.iter().cloned().zip(widths[i].iter().map(|w| w.bits)).collect()).collect();
         let necessity_kl = self.necessity_runs(&named.iter().map(|&i| (&parsed[i].0, &circuits[i])).collect::<Vec<_>>(), &quantized, &complements)?;
         let mut necessity = vec![(0.0, BTreeMap::new()); parsed.len()];
         for (&i, kls) in named.iter().zip(&necessity_kl) {
             let mut families: BTreeMap<String, Family> = BTreeMap::new();
+            let measured: Vec<(&Experiment, &Vec<f64>)> = complements.iter().zip(kls).filter_map(|(e, kl)| kl.as_ref().map(|kl| (e, kl))).collect();
             let mut mean = 0.0;
-            for (e, kl) in complements.iter().zip(kls) {
+            for &(e, kl) in &measured {
                 let entry = families.entry(format!("necessity_{}", e.family())).or_default();
                 entry.experiments += 1;
                 entry.tokens += kl.len();
                 entry.mean_kl_bits += kl.iter().sum::<f64>();
-                mean += kl.iter().sum::<f64>() / kl.len().max(1) as f64 / complements.len() as f64;
+                mean += kl.iter().sum::<f64>() / kl.len().max(1) as f64 / measured.len() as f64;
             }
             for v in families.values_mut() {
                 v.mean_kl_bits /= v.tokens.max(1) as f64;
@@ -3964,7 +4017,10 @@ impl Checker {
             let exec_error_bits = n * total.0 / total.1.max(1) as f64;
             let code_bits = if *valid && program.token_types > 1 { program.python_tokens as f64 * (program.token_types as f64).log2() } else { 0.0 };
             let opaque_numbers = graph.opaque_numbers(&self.weights);
-            let opaque_bits: f64 = widths[i].iter().map(|w| w.cost_bits).sum();
+            // A shared base library's nodes are priced apart, for the caller to charge once.
+            let in_base = |w: &Width| program.base.contains(&w.node);
+            let opaque_bits: f64 = widths[i].iter().filter(|w| !in_base(w)).map(|w| w.cost_bits).sum();
+            let base_bits: f64 = widths[i].iter().filter(|w| in_base(w)).map(|w| w.cost_bits).sum();
             let score = Score {
                 total_bits: exec_error_bits + necessity_error_bits + code_bits + opaque_bits,
                 exec_error_bits,
@@ -3974,6 +4030,8 @@ impl Checker {
                 python_tokens: if *valid { program.python_tokens } else { 0 },
                 opaque_numbers,
                 opaque_bits,
+                base_bits,
+                standin: if graph.delete { "delete" } else { "counterfactual" }.into(),
                 n,
                 experiments: outcomes.len(),
                 valid: *valid,
@@ -3986,36 +4044,57 @@ impl Checker {
         Ok(out)
     }
 
-    /// The necessity experiments' errors, per program per complement experiment: `M` with the
-    /// program's nodes at their counterfactual values and every other piece computing on the prompt
-    /// ([`Graph::complement_model`]), against the program's prediction for it, the program run with
-    /// the roles swapped (on the counterfactual, its stand-ins from the prompt) with its blocks
-    /// quantized to their widths. A program that names every part its information flows through
-    /// predicts it; a part it leaves out that carries its nodes' information moves `M` away.
-    pub(crate) fn necessity_runs(&mut self, programs: &[(&Graph, &Circuit)], quantized: &[Vec<(Block, Option<u32>)>], complements: &[Experiment]) -> Result<Vec<Vec<Vec<f64>>>, String> {
+    /// The necessity experiments' errors, per program per complement experiment (`None` where the
+    /// program's semantics have no such experiment): `M` with the program's nodes taken out and
+    /// every other piece computing on the prompt ([`Graph::complement_model`]), against the
+    /// program's prediction for it. Taken out means deleted for a deleting program ([`Graph::delete`];
+    /// clean and weight edits), whose prediction is `M`'s own run less the program's parts, nothing
+    /// recomputed ([`Checker::without_parts`]); otherwise set to their counterfactual values, the
+    /// prediction being the program run with the roles swapped (on the counterfactual, its
+    /// stand-ins from the prompt) with its blocks quantized to their widths. A program that names
+    /// every part its information flows through predicts it; a part it leaves out that carries its
+    /// nodes' information moves `M` away.
+    pub(crate) fn necessity_runs(&mut self, programs: &[(&Graph, &Circuit)], quantized: &[Vec<(Block, Option<u32>)>], complements: &[Experiment]) -> Result<Vec<Vec<Option<Vec<f64>>>>, String> {
         let mut out = vec![Vec::with_capacity(complements.len()); programs.len()];
         if programs.is_empty() {
             return Ok(out);
         }
         let standin = Graph::empty().program(&self.weights, true);
+        let counterfactual = self.counterfactual.is_some();
         for e in complements {
             let edit = match e {
                 Experiment::Edit { edit, .. } => Some(edit.clone()),
                 _ => None,
             };
+            let measured: Vec<bool> = programs.iter().map(|(g, _)| if g.delete { !matches!(e, Experiment::Sites { .. }) } else { counterfactual }).collect();
             self.set_edit(e);
             let result = (|| -> Result<(), String> {
-                // M's complement runs and the swapped runs' counterfactual runs, with M's exact
-                // weights (the experiment's edit applied).
+                // M's complement runs, deleting programs' predictions and the swapped runs'
+                // counterfactual runs, with M's exact weights (the experiment's edit applied).
                 let restore = edit.as_ref().map(|x| x.apply(&mut self.weights)).transpose()?;
-                let models: Result<Vec<Array2<f64>>, String> = programs.iter().map(|(g, _)| self.run(&g.complement_model(&self.weights), e)).collect();
-                let made = self.prewarm_swapped(&standin, e);
+                let made = (|| -> Result<Vec<Option<(Array2<f64>, Option<Array2<f64>>)>>, String> {
+                    let mut models = Vec::with_capacity(programs.len());
+                    for ((g, _), &m) in programs.iter().zip(&measured) {
+                        models.push(if m { Some((self.run(&g.complement_model(&self.weights), e)?, if g.delete { Some(self.without_parts(g)?) } else { None })) } else { None });
+                    }
+                    if programs.iter().zip(&measured).any(|((g, _), &m)| m && !g.delete) {
+                        self.prewarm_swapped(&standin, e)?;
+                    }
+                    Ok(models)
+                })();
                 if let Some(r) = restore {
                     r.restore(&mut self.weights)?;
                 }
-                let models = models?;
-                made?;
-                for (k, ((_, circuit), blocks)) in programs.iter().zip(quantized).enumerate() {
+                let models = made?;
+                for (k, (((_, circuit), blocks), model)) in programs.iter().zip(quantized).zip(models).enumerate() {
+                    let Some((model, frozen)) = model else {
+                        out[k].push(None);
+                        continue;
+                    };
+                    if let Some(predicted) = frozen {
+                        out[k].push(Some(kl_bits(&model, &predicted)));
+                        continue;
+                    }
                     let unquantize = self.weights.quantize(blocks)?;
                     let restore = match edit.as_ref().map(|x| x.apply(&mut self.weights)).transpose() {
                         Ok(r) => r,
@@ -4028,7 +4107,7 @@ impl Checker {
                     let restored = restore.map(|r| r.restore(&mut self.weights)).transpose();
                     unquantize.restore(&mut self.weights);
                     restored?;
-                    out[k].push(kl_bits(&models[k], &predicted?));
+                    out[k].push(Some(kl_bits(&model, &predicted?)));
                 }
                 Ok(())
             })();
@@ -4036,6 +4115,28 @@ impl Checker {
             result?;
         }
         Ok(out)
+    }
+
+    /// `M` on the prompts less `graph`'s parts, nothing recomputed: every other piece's write in
+    /// `M`'s own run (and `embed`'s, unless the program routes it to the logits) through the final
+    /// norm, at the scored rows. A deleting program's prediction of `M` with its parts deleted.
+    fn without_parts(&self, graph: &Graph) -> Result<Array2<f64>, String> {
+        let (batch, rows) = &self.clean;
+        let cell = cached_run(&self.references, format!("{} own", self.edit.as_deref().unwrap_or("")), self.reference_bytes)?;
+        let r = cell
+            .get_or_init(|| {
+                let mut b = batch.clone();
+                b.reference = None;
+                self.mask(&mut b);
+                reference(&self.weights, &b).map(Arc::new)
+            })
+            .clone()?;
+        let routed = graph.edges.iter().any(|(w, reader, _)| *w == Writer::Embed && reader.is_none());
+        let mut stream = if routed { Array2::zeros(r.embed.dim()) } else { r.embed.clone() };
+        for unit in graph.complement_model(&self.weights).units.iter().skip(graph.blocks.len()) {
+            stream += &r.write(&self.weights, &unit.block)?;
+        }
+        log_probabilities(&self.weights, &stream.select(Axis(0), rows))
     }
 
     /// `circuit` under `e` with the roles of prompt and counterfactual swapped: run on the
@@ -4125,7 +4226,7 @@ impl Checker {
             let mut chosen = Vec::with_capacity(graph.blocks.len());
             for (k, block) in graph.blocks.iter().enumerate() {
                 let bits = self.width(block, n)?;
-                let numbers = Graph { ids: vec![String::new()], blocks: vec![block.clone()], rules: vec![graph.rules.get(k).cloned().flatten()], edges: Vec::new(), internal: Vec::new() }.opaque_numbers(&self.weights);
+                let numbers = Graph { ids: vec![String::new()], blocks: vec![block.clone()], rules: vec![graph.rules.get(k).cloned().flatten()], ..Graph::empty() }.opaque_numbers(&self.weights);
                 let scales = quantized_rows(&self.weights, block);
                 chosen.push(Width { node: graph.ids.get(k).cloned().unwrap_or_default(), bits, numbers, scales: if bits.is_some() { scales } else { 0 }, cost_bits: width_cost(numbers, scales, bits, n) });
             }
@@ -4408,8 +4509,9 @@ impl Checker {
             self.site_batches(Interventions::needs_donor(draw))?
         };
         let (mut base, donor) = (self.referenced(circuit, &base)?, donor.map(|d| self.referenced(circuit, &d)).transpose()?);
-        // The stand-ins' run on the counterfactuals takes the same operations (reference_under).
-        if base.reference.is_some() {
+        // The stand-ins' run on the counterfactuals takes the same operations (reference_under);
+        // deleted pieces stay zero.
+        if base.reference.is_some() && !circuit.delete {
             let partner: Vec<Vec<u32>> = base.sequences().iter().map(|s| self.partners.get(s).cloned().ok_or("a prompt without a counterfactual")).collect::<Result<_, _>>()?;
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
             std::hash::Hash::hash(&partner, &mut hasher);
@@ -4457,7 +4559,7 @@ impl Checker {
             self.widths.insert(key, b);
             return Ok(b);
         }
-        let numbers = Graph { ids: vec![String::new()], blocks: vec![block.clone()], rules: vec![None], edges: Vec::new(), internal: Vec::new() }.opaque_numbers(&self.weights);
+        let numbers = Graph { ids: vec![String::new()], blocks: vec![block.clone()], rules: vec![None], ..Graph::empty() }.opaque_numbers(&self.weights);
         let scales = quantized_rows(&self.weights, block);
         let mut best = (None, width_cost(numbers, scales, None, n));
         if quantizes(block) {
@@ -4467,7 +4569,7 @@ impl Checker {
             }
             let graph = Graph::empty();
             let model = if matches!(block, Block::Features { .. }) {
-                Graph { ids: vec![String::new()], blocks: vec![block.clone()], rules: vec![None], edges: Vec::new(), internal: Vec::new() }.program(&self.weights, false)
+                Graph { ids: vec![String::new()], blocks: vec![block.clone()], rules: vec![None], ..Graph::empty() }.program(&self.weights, false)
             } else {
                 graph.model(&self.weights)
             };

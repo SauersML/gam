@@ -17,7 +17,9 @@
 //!   context). A failed request keeps the loaded model.
 //! * `{"op": "score", "program": IR}` or `{"op": "score", "programs": [IR, ...]}` (the answer
 //!   `{"ok", "scores": [...], "seconds"}`), with `"experiments": 32, "seed": 0, "routing": "edges" |
-//!   "nodes", "N": null, "reader_top": 0, "uniform_seeds": null`: every score term (`graph::Score`)
+//!   "nodes", "N": null, "reader_top": 0, "uniform_seeds": null, "stand_in": null` ("delete" or
+//!   "counterfactual" for programs that name no `standin`; by default VPD-view checkers delete):
+//!   every score term (`graph::Score`)
 //!   per program, all programs under one seed (`Checker::score_batch`: the behavior's half of the
 //!   experiments shared, `M` once per experiment, runs on parallel threads); with `reader_top` k > 0,
 //!   per experiment its words and per target token `M_e`'s and the program's probabilities of `M`'s
@@ -326,7 +328,12 @@ fn handle(request: &Value, weights: &mut Option<Weights>, checker: &mut Option<C
         "score" | "score_batch" => {
             let c = checker.as_mut().ok_or("load a behavior first")?;
             let batch = request.get("programs").is_some();
-            let programs: Vec<Program> = if batch { serde_json::from_value(request["programs"].clone()).map_err(error)? } else { vec![serde_json::from_value(request["program"].clone()).map_err(error)?] };
+            let mut programs: Vec<Program> = if batch { serde_json::from_value(request["programs"].clone()).map_err(error)? } else { vec![serde_json::from_value(request["program"].clone()).map_err(error)?] };
+            // "stand_in": "delete" or "counterfactual" for every program that names none
+            // (`Program::standin`; other values, such as score.py's old "input", leave the default).
+            if let Some(standin) = request["stand_in"].as_str().filter(|s| matches!(*s, "delete" | "counterfactual")) {
+                programs.iter_mut().filter(|p| p.standin.is_none()).for_each(|p| p.standin = Some(standin.into()));
+            }
             let count = request["experiments"].as_u64().unwrap_or(32) as usize;
             let seed = request["seed"].as_u64().unwrap_or(0);
             let edges = request["routing"].as_str().unwrap_or("edges") == "edges";
