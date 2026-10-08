@@ -324,6 +324,7 @@ def main():
         t0 = time.time()
         path = a.behaviors_dir / f"{b}.json"
         behavior = json.loads(path.read_text())
+        sha = hashlib.sha256(path.read_bytes()).hexdigest()
         table = json.loads((a.importance / f"{b}.json").read_text())["sites"]
         importance = {(site["layer"], key.split(".")[-1]): site["mean"] for key, site in table.items()}
         sizes = {k: len(v) for k, v in importance.items()}
@@ -336,10 +337,15 @@ def main():
                 log(f"done in {time.time() - t0:.0f} s")
                 continue
             if a.method == "prune":
-                chosen, rounds = prune(b, checker, sizes, a, log)
+                saved = a.out / f"{b}.prune_sets.json"
+                if saved.exists() and json.loads(saved.read_text()).get("behavior_sha256") == sha:  # a run cut off after its prune
+                    record_sets = json.loads(saved.read_text())
+                    chosen, rounds = {int(k): [search.unit_of(n) for n in v] for k, v in record_sets["sets"].items()}, record_sets["rounds"]
+                else:
+                    chosen, rounds = prune(b, checker, sizes, a, log)
+                    saved.write_text(json.dumps({"behavior": b, "behavior_sha256": sha, "rounds": rounds,
+                                                 "sets": {k: [search.name(u) for u in v] for k, v in chosen.items()}}))
                 ranked, chunks = [], rounds
-                (a.out / f"{b}.prune_sets.json").write_text(json.dumps({"behavior": b, "rounds": rounds,
-                                                                        "sets": {k: [search.name(u) for u in v] for k, v in chosen.items()}}))
             else:
                 ranked, chunks = rank(b, checker, sizes, importance, a, log)
                 units = [u for u, _ in ranked]
@@ -351,7 +357,7 @@ def main():
             log(f"k={r['k']} ({r['parts']} parts): reproduced {r['reproduced']:.1%}, total {r['score']['total_bits']:.6g} vs empty "
                 f"{empty['total_bits']:.6g} (exec {r['score']['exec_error_bits']:.4g}, necessity {r['score']['necessity_error_bits']:.4g}, "
                 f"alignment {r['score'].get('alignment_error_bits') or 0:.4g}, complexity {r['score']['complexity_bits']:.4g})")
-        record = {"behavior": b, "behavior_sha256": hashlib.sha256(path.read_bytes()).hexdigest(), "method": a.method, "drop": a.drop, "semantics": "counterfactual", "experiments": a.experiments, "rank_experiments": a.rank_experiments,
+        record = {"behavior": b, "behavior_sha256": sha, "method": a.method, "drop": a.drop, "semantics": "counterfactual", "experiments": a.experiments, "rank_experiments": a.rank_experiments,
                   "chunk": a.chunk, "leaf": a.leaf,
                   "keep": a.keep, "checker": str(score_module.BINARY), "empty": empty, "curve": rows,
                   "ranking": [[search.name(u), e] for u, e in ranked[:2048]], "chunks": chunks, "seconds": round(time.time() - t0)}
