@@ -162,6 +162,10 @@ pub fn jvp_seeded(
                 }
                 out
             }),
+            Node::Rotate { input, rotary, inverse } => match tangent_of(&dv, *input) {
+                Some(dx) => Some(crate::operator_program::rotated_rows(inputs, &dx, None, *rotary, *inverse)?.0),
+                None => None,
+            },
             Node::GroupNorm { input } => tangent_of(&dv, *input).map(|dx| {
                 let (x, interface) = (value(*input), &interfaces[*input]);
                 let norms = value(index);
@@ -486,6 +490,8 @@ pub(crate) fn vjp_seeded(
                 add(&mut g, *left, &cot * value(*right));
                 add(&mut g, *right, &cot * value(*left));
             }
+            // A rotation's transpose is its inverse.
+            Node::Rotate { input, rotary, inverse } => add(&mut g, *input, crate::operator_program::rotated_rows(inputs, &cot, None, *rotary, !*inverse)?.0),
             Node::GroupNorm { input } => {
                 let (x, interface) = (value(*input), &interfaces[*input]);
                 let norms = value(index);

@@ -934,9 +934,14 @@ pub enum Node {
     /// `Φ(z / s)` in its place, through which the gate and the scale take cotangents (a fit's
     /// training pass; `library_complexity`'s local reparameterization gives `s`).
     Gated { value: usize, gate: usize, scale: Option<usize> },
+    /// Each row of `input` (one rotary block, `rotary.dims` wide) turned to its row's position in
+    /// its sequence as an attend node turns a query or a key, or with `inverse` turned back from
+    /// it: a statistic of the rotated keys read in a query's own frame (`library_vpd`'s query
+    /// block gates).
+    Rotate { input: usize, rotary: Rotary, inverse: bool },
 }
 
-const NODE_KINDS: usize = 21;
+const NODE_KINDS: usize = 22;
 
 /// `H(z) = 1{z > 0}`, a [`Node::Gated`] gate's weight.
 pub(crate) fn gated_step(z: f64) -> f64 {
@@ -952,6 +957,23 @@ pub(crate) fn gated_cdf(z: f64, s: f64) -> f64 {
 pub(crate) fn selected_rows(inputs: &FamilyInputs, positions: &[u32]) -> Result<Vec<usize>, ProgramError> {
     let layout = inputs.layout.as_ref().ok_or_else(|| ProgramError::Input("a select node needs a sequence layout".to_string()))?;
     Ok(layout.position.iter().enumerate().filter(|(_, p)| positions.binary_search(p).is_ok()).map(|(row, _)| row).collect())
+}
+
+/// Each row of `x` turned to its position in `inputs`' layout by `rotary` (back from it with
+/// `back`), with the radius `band` turned likewise ([`Node::Rotate`]).
+pub(crate) fn rotated_rows(inputs: &FamilyInputs, x: &Array2<f64>, band: Option<&Array2<f64>>, rotary: Rotary, back: bool) -> Result<(Array2<f64>, Option<Array2<f64>>), ProgramError> {
+    let layout = inputs.layout.as_ref().ok_or_else(|| ProgramError::Input("a rotate node needs a sequence layout".to_string()))?;
+    let (mut out, mut radius) = (x.clone(), band.cloned());
+    for (row, &position) in layout.position.iter().enumerate().take(x.nrows()) {
+        let mut v = out.row(row).to_vec();
+        let mut r = radius.as_ref().map(|b| b.row(row).to_vec());
+        rotary.turn_to(&mut v, r.as_deref_mut(), position, back);
+        out.row_mut(row).assign(&ndarray::ArrayView1::from(&v));
+        if let (Some(b), Some(r)) = (radius.as_mut(), r) {
+            b.row_mut(row).assign(&ndarray::ArrayView1::from(&r));
+        }
+    }
+    Ok((out, radius))
 }
 
 /// A rotary position embedding: plane `i` of a query or key at position `m` turned by
@@ -979,9 +1001,15 @@ impl Rotary {
 
     /// `v` rotated to `position` in place, with the rotation's radius added to `radius`.
     pub(crate) fn rotate(&self, v: &mut [f64], radius: Option<&mut [f64]>, position: u32) {
+        self.turn_to(v, radius, position, false);
+    }
+
+    /// [`Rotary::rotate`], or with `back` its inverse (each plane turned by minus its angle).
+    pub(crate) fn turn_to(&self, v: &mut [f64], radius: Option<&mut [f64]>, position: u32, back: bool) {
         let mut radius = radius;
         for (plane, (a, b)) in self.pairs().into_iter().enumerate() {
             let (c, s) = self.turn(plane, position);
+            let s = if back { -s } else { s };
             let (x, y) = (v[a], v[b]);
             v[a] = c * x - s * y;
             v[b] = s * x + c * y;
@@ -1074,6 +1102,7 @@ impl Node {
             Self::Select { .. } => 18,
             Self::GroupNorm { .. } => 19,
             Self::Gated { .. } => 20,
+            Self::Rotate { .. } => 21,
         }
     }
 
@@ -1095,7 +1124,7 @@ impl Node {
             }
             Self::Pointwise { input, .. } | Self::Readout { input, .. } => vec![*input],
             Self::Select { inside, outside, .. } => vec![*inside, *outside],
-            Self::GroupNorm { input } => vec![*input],
+            Self::GroupNorm { input } | Self::Rotate { input, .. } => vec![*input],
             Self::Gated { value, gate, scale } => std::iter::once(*value).chain([*gate]).chain(*scale).collect(),
         }
     }
@@ -2075,6 +2104,7 @@ impl OperatorProgram {
                 };
                 Ok((pick(value(*inside), value(*outside)), radius))
             }
+            Node::Rotate { input, rotary, inverse } => rotated_rows(inputs, value(*input), band(*input), *rotary, *inverse),
             Node::GroupNorm { input } => {
                 let (x, interface) = (value(*input), &interfaces[*input]);
                 let groups = interface.group_count();
@@ -2735,6 +2765,12 @@ fn interface_of(index: usize, node: &Node, out: &[Interface], scope: &Scope<'_>)
             out[*inside].clone()
         }
         Node::GroupNorm { input } => Interface::uniform(out[*input].group_count(), 1, LabelKind::Unit, 0)?,
+        Node::Rotate { input, rotary, .. } => {
+            if out[*input].width() != rotary.dims as usize || rotary.dims % 2 == 1 {
+                return Err(ProgramError::Interface(format!("rotate node {index}: its input is not one rotary block")));
+            }
+            out[*input].clone()
+        }
         Node::Gated { value, gate, scale } => {
             let groups = out[*value].group_count();
             if out[*gate].width() != groups || scale.is_some_and(|s| out[s].width() != groups) {
@@ -2816,7 +2852,7 @@ pub fn remap_node(node: &mut Node, nodes: &[usize], operators: &[usize], bases: 
             *inside = nodes[*inside];
             *outside = nodes[*outside];
         }
-        Node::GroupNorm { input } => *input = nodes[*input],
+        Node::GroupNorm { input } | Node::Rotate { input, .. } => *input = nodes[*input],
         Node::Gated { value, gate, scale } => {
             *value = nodes[*value];
             *gate = nodes[*gate];
@@ -3359,6 +3395,13 @@ fn encode_node(out: &mut BitString, node: &Node, index: usize, code: &NodeCode<'
             }
         }
         Node::GroupNorm { input } => encode_fixed_index(out, *input, refs)?,
+        Node::Rotate { input, rotary, inverse } => {
+            encode_fixed_index(out, *input, refs)?;
+            encode_prefix_integer(out, u64::from(rotary.base))?;
+            encode_prefix_integer(out, u64::from(rotary.dims))?;
+            out.push_bit(rotary.half_split);
+            out.push_bit(*inverse);
+        }
         Node::Gated { value, gate, scale } => {
             encode_fixed_index(out, *value, refs)?;
             encode_fixed_index(out, *gate, refs)?;
@@ -3476,6 +3519,13 @@ fn decode_node(reader: &mut BitReader<'_>, index: usize, code: &NodeCode<'_>, in
             Node::Select { inside, outside, positions }
         }
         19 => Node::GroupNorm { input: decode_fixed_index(reader, refs)? },
+        21 => {
+            let input = decode_fixed_index(reader, refs)?;
+            let base = u32::try_from(decode_prefix_integer(reader)?).map_err(|e| ProgramError::Code(e.to_string()))?;
+            let dims = u32::try_from(decode_prefix_integer(reader)?).map_err(|e| ProgramError::Code(e.to_string()))?;
+            let rotary = Rotary { base, dims, half_split: reader.read_bit()? };
+            Node::Rotate { input, rotary, inverse: reader.read_bit()? }
+        }
         20 => {
             let (value, gate) = (decode_fixed_index(reader, refs)?, decode_fixed_index(reader, refs)?);
             let scale = match decode_prefix_integer(reader)? {

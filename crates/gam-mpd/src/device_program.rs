@@ -155,6 +155,8 @@ enum Step {
     /// `value`'s group `b` (`blocks`; `of` the group of each column) times `H(gate_b)`, or
     /// `Φ(gate_b / scale_b)` with a scale (`Node::Gated`).
     Gated { value: usize, gate: usize, scale: Option<usize>, blocks: ColumnBlocks, of: Arc<Indices> },
+    /// Each row turned to its position, or back from it (`Node::Rotate`).
+    Rotate { input: usize, rotary: Rotary, inverse: bool },
     /// `inside`'s rows at `positions`, `outside`'s elsewhere (`Node::Select`).
     Select {
         inside: usize,
@@ -218,7 +220,7 @@ fn step_arguments(step: &Step) -> Vec<usize> {
         Step::Pointwise { input, .. } | Step::Gain { input, .. } | Step::RmsNorm { input, .. } | Step::Readout { input } | Step::Transposed { input, .. } => vec![*input],
         Step::Hadamard { left, right } => vec![*left, *right],
         Step::Select { inside, outside, .. } => vec![*inside, *outside],
-        Step::GroupNorm { input, .. } => vec![*input],
+        Step::GroupNorm { input, .. } | Step::Rotate { input, .. } => vec![*input],
         Step::Gated { value, gate, scale, .. } => std::iter::once(*value).chain([*gate]).chain(*scale).collect(),
         Step::Attend { query, key, value, .. } => vec![*query, *key, *value],
         Step::Concat { parts } => parts.clone(),
@@ -870,6 +872,7 @@ impl DeviceProgram {
                     Step::Gated { value: *value, gate: *gate, scale: *scale, blocks, of }
                 }
                 Node::Select { inside, outside, positions } => Step::Select { inside: *inside, outside: *outside, positions: positions.clone() },
+                Node::Rotate { input, rotary, inverse } => Step::Rotate { input: *input, rotary: *rotary, inverse: *inverse },
                 Node::RmsNorm { input, epsilon } => Step::RmsNorm { input: *input, epsilon: *epsilon },
                 Node::Attend { query, key, value, scale, rotary, causal } => {
                     if let Some(r) = rotary
@@ -1493,7 +1496,7 @@ impl DeviceProgram {
         let rotaries: Vec<Rotary> = {
             let mut list: Vec<Rotary> = Vec::new();
             for step in &self.steps {
-                if let Step::Attend { rotary: Some(r), .. } = step
+                if let Step::Attend { rotary: Some(r), .. } | Step::Rotate { rotary: r, .. } = step
                     && !list.contains(r)
                 {
                     list.push(*r);
@@ -1503,8 +1506,8 @@ impl DeviceProgram {
         };
         let attends = self.steps.iter().any(|s| matches!(s, Step::Attend { .. }));
         let Some(layout) = &family.layout else {
-            if attends {
-                return Err("device: attention needs a sequence layout".to_string());
+            if attends || !rotaries.is_empty() {
+                return Err("device: attention or a rotation needs a sequence layout".to_string());
             }
             return Ok((1, Vec::new()));
         };
@@ -2322,6 +2325,10 @@ impl DeviceProgram {
                     let chosen = selected(&trace, positions)?;
                     value(select_rows(d, &chosen, Some(trace.value(*inside)?), trace.value(*outside)?)?)
                 }
+                Step::Rotate { input, rotary, inverse } => {
+                    let (cos, sin) = rotations_of(&trace, *rotary)?;
+                    value(d.rotate(trace.value(*input)?, cos, sin, rotary.half_split, *inverse).map_err(error)?)
+                }
                 Step::RmsNorm { input, epsilon } if !hook && trace.value(*input).is_ok_and(|x| self.rounds_on_write(index, x)) => {
                     let (values, half) = d.rms_norm_both(trace.value(*input)?, *epsilon).map_err(error)?;
                     trace.keep_rounded(index, half)?;
@@ -3017,6 +3024,11 @@ impl DeviceProgram {
                     let zero = d.zeros(trace.rows, cot.cols()).map_err(error)?;
                     add(&mut g, *inside, select_rows(d, &chosen, Some(&cot), &zero)?)?;
                     add(&mut g, *outside, select_rows(d, &chosen, None, &cot)?)?;
+                }
+                // A rotation's transpose is its inverse.
+                Step::Rotate { input, rotary, inverse } => {
+                    let (cos, sin) = rotations_of(trace, *rotary)?;
+                    add(&mut g, *input, d.rotate(&cot, cos, sin, rotary.half_split, !*inverse).map_err(error)?)?;
                 }
                 Step::RmsNorm { input, epsilon } => {
                     let term = d
@@ -3729,6 +3741,13 @@ impl DeviceProgram {
                         let zero = d.zeros(rows, width).map_err(error)?;
                         Some(select_rows(d, &chosen, di, dout.unwrap_or(&zero))?)
                     }
+                },
+                Step::Rotate { input, rotary, inverse } => match dv[*input].as_ref() {
+                    Some(dx) => {
+                        let (cos, sin) = rotations_of(trace, *rotary)?;
+                        Some(d.rotate(dx, cos, sin, rotary.half_split, *inverse).map_err(error)?)
+                    }
+                    None => None,
                 },
                 Step::GroupNorm { input, blocks, .. } => match dv[*input].as_ref() {
                     Some(dx) => {
@@ -4752,6 +4771,85 @@ mod gated_tests {
             let cot = crate::derivatives::vjp_seeded(&program, &family, &host, BTreeMap::from([(program.output, seed)]), None).unwrap();
             let back: f64 = raws.iter().map(|&n| cot[n].as_ref().map_or(0.0, |c| c.iter().zip(&tangents[&n]).map(|(a, b)| a * b).sum::<f64>())).sum();
             assert!((along - back).abs() <= 1e-12 * along.abs().max(1.0), "direction {direction} soft {soft}: {along} against {back}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod rotate_tests {
+    use super::*;
+    use crate::operator_program::{Declarations, FamilyInputs, Interface, SequenceLayout, Slot, SlotValues, exact_precision};
+    use ndarray::Array2;
+    use rand::{RngExt, SeedableRng, rngs::StdRng};
+
+    /// A rotate node turns each row's planes by its position's angles (two sequences, positions
+    /// from 0), its inverse turns them back, and on every device the forward, the input's
+    /// cotangent and the tangent along the read equal the host's; the code keeps the nodes.
+    #[test]
+    fn a_rotation_is_its_definition_on_every_device() {
+        let mut devices = crate::device_program_tests::devices();
+        devices.extend(Device::single_precision(gam_gpu::GpuPolicy::Auto).unwrap());
+        let mut rng = StdRng::seed_from_u64(5);
+        let mut normal = |r: usize, c: usize| Array2::from_shape_fn((r, c), |_| rng.random::<f64>() - 0.5);
+        let (d, dims, rows) = (5, 8, 14);
+        let v = normal(dims, d);
+        let read = Arc::new(Operator::dense("V", Interface::native(dims).unwrap(), Interface::native(d).unwrap(), v.clone(), exact_precision(v.iter().copied()).unwrap(), Default::default()).unwrap());
+        let x = normal(rows, d);
+        let layout = SequenceLayout { sequence: (0..rows as u32).map(|r| r / 9).collect(), position: (0..rows as u32).map(|r| if r < 9 { r } else { r - 9 }).collect() };
+        let family = FamilyInputs { rows, slots: vec![SlotValues::Raw(x)], layout: Some(layout.clone()) };
+        for half_split in [true, false] {
+            let rotary = Rotary { base: 10_000, dims: dims as u32, half_split };
+            let nodes = vec![
+                Node::Raw { slot: 0 },
+                Node::Affine { terms: vec![(0, 0)], bias: None },
+                Node::Rotate { input: 1, rotary, inverse: false },
+                Node::Rotate { input: 2, rotary, inverse: true },
+                Node::Hadamard { left: 2, right: 1 },
+                Node::Rotate { input: 4, rotary, inverse: true },
+            ];
+            let program = OperatorProgram { declarations: Declarations { domains: vec![], slots: vec![Slot::Raw { width: d }], parameters: 0 }, operators: vec![Arc::clone(&read)], bases: vec![], rules: vec![], nodes, output: 5 };
+            let host = program.execute(&family, false).unwrap();
+            let a = &host.values[1];
+            for row in 0..rows {
+                for (plane, (i, j)) in rotary.pairs().into_iter().enumerate() {
+                    let (c, s) = rotary.turn(plane, layout.position[row]);
+                    let turned = host.values[2].row(row);
+                    assert!((turned[i] - (c * a[[row, i]] - s * a[[row, j]])).abs() < 1e-15 && (turned[j] - (s * a[[row, i]] + c * a[[row, j]])).abs() < 1e-15);
+                }
+            }
+            let back = (&host.values[3] - a).iter().fold(0.0_f64, |m, e| m.max(e.abs()));
+            assert!(back < 1e-14, "the inverse turns back: {back}");
+            let artifact = crate::artifact::Artifact::native(&program).unwrap();
+            let decoded = crate::artifact::Artifact::from_bytes(&artifact.to_bytes().unwrap(), &program.declarations).unwrap();
+            assert_eq!(decoded.program.nodes, program.nodes, "the code keeps the rotate nodes");
+            let seed = normal(rows, dims);
+            let host_cot = crate::derivatives::vjp_seeded(&program, &family, &host, BTreeMap::from([(program.output, seed.clone())]), None).unwrap();
+            let tangents = BTreeMap::from([(0, normal(dims, d))]);
+            let host_tangent = crate::derivatives::jvp(&program, &family, &host, &tangents).unwrap();
+            // The cotangent is the tangent's adjoint: ⟨seed, J t⟩ = ⟨Jᵀ seed, t⟩ along the input.
+            let input_tangent = BTreeMap::from([(0, normal(rows, d))]);
+            let along = crate::derivatives::jvp_seeded(&program, &family, &host, &BTreeMap::new(), &input_tangent).unwrap();
+            let forward = (&along * &seed).sum();
+            let backward = (host_cot[0].as_ref().unwrap() * &input_tangent[&0]).sum();
+            assert!((forward - backward).abs() < 1e-12 * forward.abs().max(1.0), "{forward} against {backward}");
+            for device in &devices {
+                let tolerance = if device.float64() { 1e-12 } else { 1e-4 };
+                let close = |what: &str, got: &Array2<f64>, want: &Array2<f64>| {
+                    let scale = want.iter().fold(1.0_f64, |m, v| m.max(v.abs()));
+                    let err = (got - want).iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+                    assert!(err <= tolerance * scale, "{} half split {half_split}: {what} differs by {err}", device.name());
+                };
+                let arithmetic = if device.float64() { Arithmetic::F64 } else { Arithmetic::F32 };
+                let mut lowered = DeviceProgram::compile_values(device, &program).unwrap();
+                lowered.set_arithmetic(arithmetic);
+                let trace = lowered.forward(&family).unwrap();
+                close("the output", &device.download(trace.value(program.output).unwrap()).unwrap(), &host.values[program.output]);
+                let seeds = BTreeMap::from([(program.output, device.upload(seed.view()).unwrap())]);
+                let (nodes, _) = lowered.vjp_values_dense(&trace, seeds, &[0], &[0], arithmetic).unwrap();
+                close("the input's cotangent", &device.download(&nodes[&0]).unwrap(), host_cot[0].as_ref().unwrap());
+                let tangent = lowered.jvp_span(&trace, None, program.output, &tangents, arithmetic, |_, _, _| Ok(())).unwrap().unwrap();
+                close("the tangent", &device.download(&tangent).unwrap(), &host_tangent);
+            }
         }
     }
 }

@@ -347,6 +347,7 @@ impl Structure {
                 | Node::RmsNorm { .. }
                 | Node::Select { .. }
                 | Node::GroupNorm { .. }
+                | Node::Rotate { .. }
                 | Node::Gated { .. } => {}
             }
         }
@@ -503,6 +504,8 @@ impl Structure {
                 Node::Select { .. } => vec![Kill::none(); w],
                 // A norm of a group is zero only where its whole group is; claimed for none.
                 Node::GroupNorm { .. } => vec![Kill::none(); w],
+                // A turn mixes each plane's two coordinates; claimed for none.
+                Node::Rotate { .. } => vec![Kill::none(); w],
                 // Zero where its value is (the gate only multiplies).
                 Node::Gated { value, .. } => zero[*value].clone(),
                 Node::Param { .. } | Node::Call { .. } => return Err(error("a call in the flat program")),
@@ -644,9 +647,9 @@ impl Structure {
                         unread[*input][i].meet(ui, &Kill::none(), None);
                     }
                 }
-                Node::GroupNorm { input } => {
-                    // Every input coordinate reaches every norm through its group: read wherever
-                    // any norm is.
+                Node::GroupNorm { input } | Node::Rotate { input, .. } => {
+                    // Every input coordinate reaches every norm through its group (a turn's output
+                    // through its plane): read wherever any output is.
                     let k = every(&u, None);
                     for i in 0..self.widths[*input] {
                         unread[*input][i].meet(&k, &Kill::none(), None);

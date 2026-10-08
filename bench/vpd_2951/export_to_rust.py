@@ -24,7 +24,16 @@ upper triangle: c_fc slice i of a group reads W_fc,G^T Q_i and writes Q_i, its d
 and writes W_dn,G Q_i (rescaled to Q_i ||W_dn,G Q_i||, W_dn,G Q_i / ||W_dn,G Q_i||); each block
 (the slices whose argmax over L is it) is one component of its c_fc and down slices, gated on the
 norm of its down reads on the layer's all-on activations (library_vpd's Read::Active, c5ebe92bc2),
-which is the arm's own read sqrt(sum_i (|abar_G . Q_i| ||W_dn,G Q_i||)^2).
+which is the arm's own read sqrt(sum_i (|abar_G . Q_i| ||W_dn,G Q_i||)^2). A group's basis is
+Q0 (I + S)^-1 (I - S) above 64 slices (Q0 the start's basis where saved, else I), exp(S) otherwise
+(the save's 'rot_basis'; a float32 Q0 taken to its nearest orthogonal matrix); a log guard ('guard': 'log') reads ln R against tau, so its threshold on R
+is exp(tau).
+A whole-model rot save ('rota': per layer the q, k and OV groups of the heads' coordinates) gives
+q and k each map's own weights in its groups' bases (slice i reads W_G^T Q_i, writes Q_i): a k block
+gated on its own read, a q block on its logits' spread over the keys (library_vpd's Read::Logits:
+sum_i c_i^2 sum_k Q_ki^2 D_k / d_h, D_k the keys' coordinate variance in the query's frame under the
+all-on pattern); v is M's map, always on (identity slices); an OV slice reads Q_i of the heads'
+outputs and writes W_o,G Q_i (rescaled as the down slices), its block gated on its own read.
 
 usage: export_to_rust.py STATE.pt ATTN_DIR OUT_DIR ARM [--all-on] [--model MODEL]"""
 import sys, json, os, shutil
@@ -40,23 +49,73 @@ index = {n: i for i, n in enumerate(sites)}
 os.makedirs(out, exist_ok=False)
 attn_record = json.load(open(os.path.join(attn_dir, 'export.json')))
 heads = S.get('attn') or {}
-rot = S.get('rot') or {}
-rot_maps, rot_blocks = {}, {}
-if rot:
+rot, rota = S.get('rot') or {}, S.get('rota') or {}
+basis_rule = S.get('rot_basis') or {'cayley_above': 64, 'guard': 'linear'}
+guard = (lambda t: np.exp(t)) if basis_rule['guard'] == 'log' else (lambda t: t)
+
+
+def bases(R):
+    """Each group's basis [g, g] (columns Q_i), as budget_descent.py's rot_Q builds it."""
+    A = R['A'].double().numpy()
+    g = A.shape[-1]
+    out = []
+    for n in range(A.shape[0]):
+        S_ = A[n] * np.triu(np.ones((g, g)), 1)
+        S_ = S_ - S_.T
+        if g > basis_rule['cayley_above']:
+            Q = np.linalg.solve(np.eye(g) + S_, np.eye(g) - S_)
+            if 'Q0' in R:
+                # Q0 is saved in float32, orthogonal to 1e-8 only: its nearest orthogonal matrix
+                # (the polar factor), so the slices sum to M's map to rounding.
+                u_, _, vt = np.linalg.svd(R['Q0'][n].double().numpy())
+                Q = (u_ @ vt) @ Q
+            out.append(Q)
+        else:
+            out.append(sl.expm(S_))
+    return out
+
+
+def blocks_of(R):
+    """Per block (the slices whose argmax over L is it): its slices (n g + i), threshold on R and width."""
+    block = R['L'].double().argmax(-1).numpy()                                           # [ng, g]: each slice's block
+    tau, s_ = guard(R['tau'].double().numpy()), R['s'].double().numpy()
+    ng, g = block.shape
+    return [([n * g + i for i in range(g) if block[n, i] == j], float(tau[n, j]), float(s_[n, j])) for n in range(ng) for j in range(g) if (block[n] == j).any()]
+
+
+rot_maps, rot_blocks, rota_blocks = {}, {}, {}
+if rot or rota:
     record = json.load(open(os.path.join(model, 'export.json')))
     weight = lambda name: np.fromfile(os.path.join(model, f'{name}.f64'), dtype='<f8').reshape(record['files'][name]['shape'])
+    for l, R in rota.items():
+        l = int(l)
+        for x in ('q', 'k'):
+            W = weight(f'blocks.{l}.attn.{x}_proj')                                       # [out, in]
+            Qs = bases(R[x]); g = Qs[0].shape[0]
+            V, U = np.zeros((W.shape[1], len(Qs) * g)), np.zeros((len(Qs) * g, W.shape[0]))
+            for n, Q in enumerate(Qs):
+                G = slice(n * g, (n + 1) * g)
+                V[:, G], U[G, G] = W[G].T @ Q, Q.T
+            rot_maps[f'h.{l}.attn.{x}_proj'] = (V, U)
+        Wv, Wo = weight(f'blocks.{l}.attn.v_proj'), weight(f'blocks.{l}.attn.o_proj')
+        rot_maps[f'h.{l}.attn.v_proj'] = (Wv.T.copy(), np.eye(Wv.shape[0]))
+        Qs = bases(R['ov']); g = Qs[0].shape[0]
+        V, U = np.zeros((Wo.shape[1], len(Qs) * g)), np.zeros((len(Qs) * g, Wo.shape[0]))
+        for n, Q in enumerate(Qs):
+            G = slice(n * g, (n + 1) * g)
+            V[G, G], U[G] = Q, (Wo[:, G] @ Q).T
+        norm = np.maximum(np.linalg.norm(U, axis=1), 1e-30)
+        rot_maps[f'h.{l}.attn.o_proj'] = (V * norm[None, :], U / norm[:, None])           # |v'.a| = |Q_i . a_G| ||W_o,G Q_i||
+        rota_blocks[l] = {x: blocks_of(R[x]) for x in ('q', 'k', 'ov')}
     for l, R in rot.items():
         l = int(l)
         Wf, Wd = weight(f'blocks.{l}.mlp.c_fc'), weight(f'blocks.{l}.mlp.down_proj')       # [3072, 768], [768, 3072]
-        perm, A = R['perm'].long().numpy(), R['A'].double().numpy()
-        ng, g = A.shape[0], A.shape[1]
-        upper = np.triu(np.ones((g, g)), 1)
+        perm, Qs = R['perm'].long().numpy(), bases(R)
+        ng, g = len(Qs), Qs[0].shape[0]
         Vf, Uf = np.zeros((Wf.shape[1], ng * g)), np.zeros((ng * g, Wf.shape[0]))
         Vd, Ud = np.zeros((Wd.shape[1], ng * g)), np.zeros((ng * g, Wd.shape[0]))
-        for n in range(ng):
+        for n, Q in enumerate(Qs):                                                        # [g, g], columns Q_i
             G = perm[n * g:(n + 1) * g]
-            S_ = A[n] * upper
-            Q = sl.expm(S_ - S_.T)                                                        # [g, g], columns Q_i
             k = slice(n * g, (n + 1) * g)
             Vf[:, k] = Wf[G].T @ Q
             Uf[k][:, G] = Q.T
@@ -65,9 +124,7 @@ if rot:
         norm = np.maximum(np.linalg.norm(Ud, axis=1), 1e-30)
         Vd, Ud = Vd * norm[None, :], Ud / norm[:, None]                                  # |v'.a| = |Q_i . a_G| ||W_dn,G Q_i||
         rot_maps[f'h.{l}.mlp.c_fc'], rot_maps[f'h.{l}.mlp.down_proj'] = (Vf, Uf), (Vd, Ud)
-        block = R['L'].double().argmax(-1).numpy()                                        # [ng, g]: each slice's block
-        tau, s_ = R['tau'].double().numpy(), R['s'].double().numpy()
-        rot_blocks[l] = [(n, j, [n * g + i for i in range(g) if block[n, i] == j], float(tau[n, j]), float(s_[n, j])) for n in range(ng) for j in range(g) if (block[n] == j).any()]
+        rot_blocks[l] = blocks_of(R)
 files = {}
 
 
@@ -89,6 +146,11 @@ def head_slices(n):
 
 
 for n in sites:
+    if n in rot_maps:
+        for w, t in (('U', rot_maps[n][1]), ('V', rot_maps[n][0])):
+            t.astype('<f8').tofile(os.path.join(out, f'{n}.{w}.f64'))
+            files[f'{n}.{w}'] = {'shape': list(t.shape)}
+        continue
     if '.attn.' in n and n in heads:
         V, U = head_slices(n)
         norm = U.norm(dim=1).clamp_min(1e-30)
@@ -102,11 +164,6 @@ for n in sites:
             shutil.copyfile(os.path.join(attn_dir, f'{n}.{w}.f64'), os.path.join(out, f'{n}.{w}.f64'))
             files[f'{n}.{w}'] = {'shape': attn_record['files'][f'{n}.{w}']['shape']}
         continue
-    if n in rot_maps:
-        for w, t in (('U', rot_maps[n][1]), ('V', rot_maps[n][0])):
-            t.astype('<f8').tofile(os.path.join(out, f'{n}.{w}.f64'))
-            files[f'{n}.{w}'] = {'shape': list(t.shape)}
-        continue
     m = S['maps'][n]
     V, U = m['V'].double(), m['U'].double()                                   # [d_in, C], [C, d_out]
     norm = U.norm(dim=1).clamp_min(1e-30)
@@ -115,14 +172,22 @@ for n in sites:
     for w, t in (('U', U), ('V', V)):
         t.numpy().astype('<f8').tofile(os.path.join(out, f'{n}.{w}.f64'))
         files[f'{n}.{w}'] = {'shape': list(t.shape)}
-json.dump({'source': {'descent': state_path, 'step': S['step'], 'attention': 'trained' if heads else attn_dir},
+json.dump({'source': {'descent': state_path, 'step': S['step'], 'attention': 'trained' if heads or rota else attn_dir},
            'config': {'sites': sites, 'subcomponents': {n: files[f'{n}.U']['shape'][0] for n in sites}},
            'files': files}, open(os.path.join(out, 'export.json'), 'w'), indent=1)
 
 components = []
 # library_vpd needs a component at every stage of every layer: each attention map is one component of
 # all its slices, always on (the MLP-scoped run uses M's attention there anyway).
+for l, by_map in rota_blocks.items():
+    q, k, v, o = (index[f'h.{l}.attn.{x}_proj'] for x in ('q', 'k', 'v', 'o'))
+    for site, read, blocks in ((q, lambda m: {'logits': {'site': q}}, by_map['q']), (k, lambda m: {'own': [k, m[0]]}, by_map['k']), (o, lambda m: {'own': [o, m[0]]}, by_map['ov'])):
+        for members, tau, s_ in blocks:
+            components.append({'read': read(members), 'tau': -1e9 if all_on else tau, 'width': s_, 'slices': [[site, i] for i in members]})
+    components.append({'read': {'own': [v, 0]}, 'tau': -1e9, 'width': 1.0, 'slices': [[v, i] for i in range(files[f'h.{l}.attn.v_proj.U']['shape'][0])]})
 for n in sites:
+    if '.attn.' in n and n in rot_maps:
+        continue
     if '.attn.' in n and n in heads:
         tau, s = heads[n]['tau'].double().reshape(-1), heads[n]['s'].double().reshape(-1)
         for i in range(tau.numel()):
@@ -133,7 +198,7 @@ for n in sites:
         components.append({'read': read, 'tau': -1e9, 'width': 1.0, 'slices': [[index[n], i] for i in range(C)]})
 for l, blocks in rot_blocks.items():
     fc, dn = index[f'h.{l}.mlp.c_fc'], index[f'h.{l}.mlp.down_proj']
-    for _, _, members, tau, s_ in blocks:
+    for members, tau, s_ in blocks:
         components.append({'read': {'active': {'site': fc}}, 'tau': -1e9 if all_on else tau, 'width': s_, 'slices': [[fc, i] for i in members] + [[dn, i] for i in members]})
 tied = {fc: (dn, own) for dn, (fc, own) in S['tied'].items()}
 for n in sites:
