@@ -96,7 +96,7 @@
 # caps (only on request: the budget check runs again).
 #
 # Money. The API key is read from the macOS Keychain (service runpod-api-key) at each request and
-# handed to curl on a file descriptor: never in argv, the environment, a file or a log. The $150 cap
+# handed to curl on a file descriptor: never in argv, the environment, a file or a log. The $250 cap
 # counts everything the team account has spent since the credit was $750 (750 minus
 # myself.clientBalance), whoever spent it, plus what every pod running on the account may still
 # cost (its price for the time left to its cap; 4 h for a pod made outside the runner, which every
@@ -128,7 +128,7 @@
 # (RP_OWNER=AGENT when the run was launched), GPU and cloud, $/h, the GPU's mean utilization over the
 # last 10 minutes, hours up, $ so far, hours left to its cap, flags (IDLE: GPU under 20%; FLAT: a
 # run's log and synced outputs unchanged for 15 minutes) and the last line of its run's log; then the account's spend,
-# its rate, the rate paid for GPUs under 20%, and the hours until the $150 cap at that rate.
+# its rate, the rate paid for GPUs under 20%, and the hours until the $250 cap at that rate.
 #
 # Binaries: the examples and test binaries (RP_TESTS="PACKAGE:TEST ...", run as $MPD_BIN/test-TEST;
 # TEST lib is the package's library unit tests, so one package's per run) a
@@ -175,10 +175,10 @@ CUDA_OK=$(jq -nc --arg t "$TOOLKIT" '["11.8","12.0","12.1","12.2","12.3","12.4",
 # A run replaces a pod its host lost at most RELAUNCHES times, and discards at most DISCARDS pods on
 # hosts that fail its checks (no SSH, no CUDA, recorded as failing) before it gives up.
 RELAUNCHES=3 DISCARDS=5
-# The budget: at most $150 of the team account's credit, which stood at $750 on 2026-10-05 11:10.
+# The budget: at most $250 of the team account's credit, which stood at $750 on 2026-10-05 11:10 (raised from $150 on 2026-10-07 by the user, for compute that unblocks or speeds results).
 # A pod made outside the runner has no cap it knows; it is counted as running 4 h more, the default
 # cap of a dev pod.
-CAP_DOLLARS=150 START_BALANCE=750 UNCAPPED_HOURS=4
+CAP_DOLLARS=250 START_BALANCE=750 UNCAPPED_HOURS=4
 # The benchmark table GPU_TYPE auto ranks cards by (gpu_bench_table.py's output for the latest
 # gpu_bench.sh runs).
 TABLE=$MAC_DATA/runpod/gpu_bench.tsv
