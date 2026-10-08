@@ -2208,7 +2208,20 @@ if RESUME:
                 if k in src and torch.is_tensor(cont[k]) and k != 'F':
                     START_VAL[(id(cont), k)] = cont[k].detach().clone()
                     cont[k] = src[k].to(dev).clone().requires_grad_(k != 's')
-    print('resumed from', RESUME, 'step', S_['step'], flush=True)
+        if EXACT:
+            # The frames: saved, or rebuilt as the duals of the saved reads (the canonical dual is an involution): an
+            # MLP map's F = V^T (V V^T)^-1; a head's q, k or v frame is its writes U, an o frame the dual of its reads.
+            dual = lambda G_: G_ @ torch.linalg.inv(G_.transpose(-1, -2) @ G_)
+            for n in mlp:
+                src = S_['maps'][n]
+                P[n]['F'] = (src['F'].to(dev) if 'F' in src else dual(src['V'].double().T.to(dev)).float()).requires_grad_()
+            for n in sliced:
+                src = S_['attn'][n]
+                F_ = src['F'] if 'F' in src else src['U'] if not A[n]['o'] else dual(src['V'].double().transpose(1, 2)).float()
+                A[n]['F'] = F_.to(dev).clone().requires_grad_()
+    RESUME_STEP = int(S_['step'])
+    lam = float(S_.get('mu') or os.environ.get('DESCENT_MU0', '0') or 0.0)
+    print('resumed from', RESUME, 'step', S_['step'], 'mu', lam, flush=True)
 if start in ('vpd', 'neuron') and not (SHARE or SHARE_A or EXACT or ARM in ('dir', 'rot') or RESUME):
     # A neuron part counts its two slices: its layer's neurons on match the mean of VPD's two counts.
     vc = lambda n: (VPD_COUNTS[n] if start == 'vpd' else
@@ -2392,7 +2405,8 @@ else:
     # DESCENT_PART_LR multiplies the parts' step sizes (frames F, reads V and writes U) beside the gates': the parts
     # adapting to the gates (toys: VPD's parts were shaped for its own gates).
     PART_LR = float(os.environ.get('DESCENT_PART_LR', '1'))
-    groups = [{'params': [cont[key]], 'lr': LR * 3e-3 * scale * (PART_LR if key in ('F', 'V', 'U') else 1.0)} for cont, key, scale in slots]
+    groups = [{'params': [cont[key]], 'lr': LR * 3e-3 * scale * (PART_LR if key in ('F', 'V', 'U') else 1.0), 'part': key in ('F', 'V', 'U')}
+              for cont, key, scale in slots]
 # Edge gates by 0.01 per step (from the start's 3, 300 steps to drop an edge the data never defends).
 groups += [{'params': [E['eta']], 'lr': LR * 1e-2} for E in EDGE.values()]
 if FMODE:
@@ -2506,17 +2520,22 @@ if DUAL not in ('logint', 'pin', 'loghard'):
 # |dF/dtau| / |dE[k]/dtau| (edits' rule in the Rust fitter); B_H, the horizon in steps, is a tenth of the
 # evaluation interval (about 0.5M tokens), as a whole pass over the training rows is never reached here.
 B_H = max(1, EVAL // 10)
-lam, rng = 0.0, np.random.default_rng(0)
+lam = lam if RESUME else 0.0
+rng = np.random.default_rng(0)
 log = {'start': start, 'K': K, 'steps': steps, 'gate': gate, 'arm': ARM, 'dual': DUAL, 'train_rows': train_rows, 'F': FMODE, 'edges': EDGES, 'trace': []}
 # DESCENT_SAVE=PATH: after every evaluation, the maps' slices and gates at the posterior mean
 # (reads V [d_in, C], writes U [C, d_out], thresholds tau [C] and noise scales s [C] per map, and the
 # neuron start's tied down slices), for export_to_rust.py (library_vpd's importer).
 def save(step):
+    if os.environ.get('DESCENT_SAVE') and not all(torch.isfinite(q).all() for q in trainable):
+        # A non-finite state is never saved over the last good one.
+        print('save skipped at step', step, ': non-finite parameters', flush=True)
+        return
     if os.environ.get('DESCENT_SAVE'):
-        torch.save({'step': step, 'start': start, 'arm': ARM, 'gate': gate,
-                    'maps': {n: {k: P[n][k].detach().float().cpu() for k in ('V', 'U', 'tau', 's')} for n in mlp},
+        torch.save({'step': step, 'start': start, 'arm': ARM, 'gate': gate, 'mu': lam,
+                    'maps': {n: {k: P[n][k].detach().float().cpu() for k in ('V', 'U', 'tau', 's', 'F') if k in P[n]} for n in mlp},
                     # The heads' slices (DESCENT_SITES=all): reads V [H, d_in_h, C], writes U [H, C, d_out_h].
-                    'attn': {n: {k: A[n][k].detach().float().cpu() for k in ('V', 'U', 'tau', 's', 'beta') if k in A[n]} for n in sliced},
+                    'attn': {n: {k: A[n][k].detach().float().cpu() for k in ('V', 'U', 'tau', 's', 'beta', 'F') if k in A[n] and torch.is_tensor(A[n][k])} for n in sliced},
                     'tied': {dn: (fc, own.cpu()) for dn, (fc, own) in GROUP.items()},
                     # rot: per layer the neuron order (groups of DESCENT_ROT consecutive), angles, assignments,
                     # thresholds, noise scales and the slices' log widths.
@@ -2608,7 +2627,12 @@ with open(out.replace('.json', '.tsv'), 'w') as f_:
 FRESH = os.environ.get('DESCENT_FRESH', '1' if CONCEPTS else '0') == '1'
 if FRESH:
     order = np.random.default_rng(1).permutation(tok.shape[0] - EVAL_N); order = np.where(order >= 1024, order + EVAL_N, order)
-for step in range(steps):
+# The non-finite guard: the trained tensors are kept every LOG_EVERY steps while finite; a step whose objective or
+# gradients are not finite is skipped, the tensors and the multiplier go back to the kept ones, the optimizer's moments
+# are cleared and the parts' step size halves (skc-long's parameters went to NaN at step 9432 of 10,986 with
+# DESCENT_PART_LR=3).
+KEPT = None
+for step in range(RESUME_STEP if RESUME else 0, steps):
     rows = rng.integers(0, train_rows, batch); rows = np.where(rows >= 1024, rows + EVAL_N, rows); offs = rng.integers(0, 513 - seq, batch)
     if FRESH:
         rows = order[np.arange(step * batch, (step + 1) * batch) % len(order)]
@@ -2678,7 +2702,24 @@ for step in range(steps):
     if LR_DECAY:
         for g_ in opt.param_groups:
             g_['lr'] = g_['lr0'] * (1 - 0.9 * step / max(1, steps - 1))
-    opt.zero_grad(); (conc + lam * objective if CONCEPTS else objective + lam * (ek - K)).backward(); opt.step()
+    opt.zero_grad(); (conc + lam * objective if CONCEPTS else objective + lam * (ek - K)).backward()
+    gn = torch.stack([q.grad.norm() for q in trainable if q.grad is not None])
+    if not (torch.isfinite(gn).all() and torch.isfinite(objective)):
+        print('non-finite at step', step, ': back to the tensors kept at step', KEPT and KEPT[0], ', parts\' step halved', flush=True)
+        if KEPT is not None:
+            with torch.no_grad():
+                for q, v in zip(trainable, KEPT[1]):
+                    q.copy_(v)
+            lam = KEPT[2]
+        opt.state.clear()
+        for g_ in opt.param_groups:
+            if g_.get('part'):
+                g_['lr0'] *= 0.5; g_['lr'] *= 0.5
+        opt.zero_grad()
+        continue
+    opt.step()
+    if step % LOG_EVERY == 0 and all(torch.isfinite(q).all() for q in trainable):
+        KEPT = (step, [q.detach().clone() for q in trainable], lam)
     if CONCEPTS:
         # mu: log-integral ascent on the delivered KL's relative excess over kappa (capped at +1, as below).
         lam = lam * math.exp(min((kl_dl - KAPPA) / KAPPA, 1.0) / B_H)
