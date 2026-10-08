@@ -2619,6 +2619,9 @@ struct Scorer {
     /// Per shared stage (its assignment operator) the concept term's derivative in its assignment
     /// at the step's relaxed assignment ([`complexity_terms`]): the term's pull on it.
     assignment_pull: Vec<(usize, Array2<f64>)>,
+    /// Per layer its always-on mean parts (`library_vpd`'s `LayerMeans`), one concept each (its
+    /// write) on every token.
+    mean_parts: Vec<f64>,
     /// Whether relaxed passes draw their gates (`DeviceProgram::set_sampled`), as every fit's do;
     /// off, they take the expected gate `Φ(z / w)` (a test of a derivative through it).
     sample_gates: bool,
@@ -2673,6 +2676,9 @@ impl Scorer {
             return Err("an operator holding both mixed reads and mixed writes".into());
         }
         let differentiated: Vec<usize> = explanation.trainable.iter().copied().chain(assignments.iter().map(|a| a.operator)).collect();
+        let mean_parts: Vec<f64> = (0..explanation.layers.len())
+            .map(|l| ["mlp.fc_mean", "mlp.dn_mean"].iter().filter(|part| operator_named(&explanation.artifact.program, &format!("library.l{l}.{part}")).is_some()).count() as f64)
+            .collect();
         let mut experiments =
             Interchange::new(device, native, &sites, &explanation.artifact, &differentiated, reads, settings.numeric_bytes, settings.head_tile_rows)?;
         // Every scoring of the fit (its steps, held-out evaluations and removal comparisons) is of
@@ -2693,7 +2699,7 @@ impl Scorer {
         let hard_gates = stages.iter().flatten().filter(|s| !position.contains_key(&s.width)).map(|s| (s.width, s.threshold, program.operators[s.width].rows.width())).collect();
         let scoring = explanation.scoring;
         let thresholds = stages.iter().flatten().map(|s| (s.threshold, program.operators[s.threshold].rows.width())).collect();
-        let mut scorer = Self { experiments, mlps, stages, hard_gates, scoring, thresholds, position, scope, families: settings.families.clone(), edits: std::cell::RefCell::new(BTreeMap::new()), assignments, written: None, version: 0, assignment_step: None, mixings, mixed, mixed_writes: BTreeMap::new(), mix_step: None, mix_tokens: 0.0, bits_back: settings.bits_back, concept_unit: 1.0, seen_on: BTreeMap::new(), assignment_pull: Vec::new(), sample_gates: true };
+        let mut scorer = Self { experiments, mlps, stages, hard_gates, scoring, thresholds, position, scope, families: settings.families.clone(), edits: std::cell::RefCell::new(BTreeMap::new()), assignments, written: None, version: 0, assignment_step: None, mixings, mixed, mixed_writes: BTreeMap::new(), mix_step: None, mix_tokens: 0.0, bits_back: settings.bits_back, concept_unit: 1.0, seen_on: BTreeMap::new(), assignment_pull: Vec::new(), mean_parts, sample_gates: true };
         scorer.train_gates(None)?;
         Ok(scorer)
     }
@@ -3467,6 +3473,7 @@ fn count_terms(
         // A head with a surviving value runs on every token: its gate and three per surviving value
         // coordinate.
         always += layer.heads.iter().map(|(_, values)| values.iter().filter(|g| alive(g)).count() as f64).filter(|r| *r > 0.0).map(|r| GATE_CONCEPTS + SLICE_CONCEPTS * r).sum::<f64>();
+        always += scorer.mean_parts.get(l).copied().unwrap_or(0.0);
         let Some(mlp) = mlp else {
             // Gated components (`library_vpd`), on the device (`gated_expected`). The previous
             // stage's per-component pre-activations and variances, which a stage whose components

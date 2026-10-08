@@ -164,6 +164,23 @@ struct ArmRecord {
     /// The stages' shared detectors (`Read::Detectors`).
     #[serde(default)]
     detectors: Vec<DetectorSet>,
+    /// Per layer the means its mean parts are made of ([`LayerMeans`]); with them every MLP has
+    /// always-on mean parts and its components' parts are deviations from the means.
+    #[serde(default)]
+    means: Vec<LayerMeans>,
+}
+
+/// A layer's means over a calibration text with every part on (`M`'s): of the normed stream into
+/// its MLP (`mlp`, `E[x]`) and of the MLP's activations (`activation`, `E[act]`). With them the
+/// MLP's c_fc slices read `x − E[x]` and its down slices `act − E[act]`, and two always-on mean
+/// parts write `E[p] = W_fc E[x]` into the pre-activations and `W_dn E[act]` into the output, so
+/// every part on is still `M` and a part off is that part mean-ablated (the activation law's mean
+/// is not zero), as descent's mean parts (`DESCENT_MEANPARTS`).
+#[derive(Clone, Debug, Deserialize)]
+struct LayerMeans {
+    layer: usize,
+    mlp: Vec<f64>,
+    activation: Vec<f64>,
 }
 
 /// Where a slice's read row or write column is in the built explanation, by operator name.
@@ -288,6 +305,7 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
         Read::Direction { site, .. } | Read::Active { site } | Read::Logits { site } | Read::Detectors { site, .. } => *site,
     };
     let detector_sets = record.detectors;
+    let layer_means = record.means;
     // The detectors of `layer`'s stage `stage`, where a stage gates on them.
     let detector_set = |layer: usize, stage: usize| detector_sets.iter().find(|d| d.layer == layer && d.stage == stage);
     let mut artifact = Artifact::native(native)?;
@@ -629,7 +647,9 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
         // reads their logs (`groups` of them, [`log_threshold`]).
         // A detector stage's gate reads its detectors' outputs `ln max(|Gx|, t₀) − θ` (`detectors`:
         // their operators and count, [`Read::Detectors`]) in place of `input`.
-        let stage_nodes = |nodes: &mut Vec<Node>, input: usize, (read, gate_a, gate_b, soft): (usize, usize, usize, usize), assign: Option<usize>, direction: bool, own: Option<usize>, extra: Option<(Vec<usize>, Vec<usize>)>, groups: usize, detectors: Option<(usize, usize, usize, usize)>| -> (Option<usize>, usize, usize) {
+        // `reads`: the node the stage's slices read (`input` less its mean with mean parts,
+        // [`LayerMeans`]); direction and detector gates read `input` itself.
+        let stage_nodes = |nodes: &mut Vec<Node>, (input, reads): (usize, usize), (read, gate_a, gate_b, soft): (usize, usize, usize, usize), assign: Option<usize>, direction: bool, own: Option<usize>, extra: Option<(Vec<usize>, Vec<usize>)>, groups: usize, detectors: Option<(usize, usize, usize, usize)>| -> (Option<usize>, usize, usize) {
             let gate_input = match detectors {
                 Some((g, identity, thresholds, k)) => {
                     nodes.push(Node::Affine { terms: vec![(input, g)], bias: None });
@@ -648,7 +668,7 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
                     nodes.push(Node::Affine { terms: vec![(gate_input, gate_a)], bias: Some(gate_b) });
                     (None, nodes.len() - 1)
                 } else {
-                    nodes.push(Node::Affine { terms: vec![(input, read)], bias: None });
+                    nodes.push(Node::Affine { terms: vec![(reads, read)], bias: None });
                     let a = nodes.len() - 1;
                     nodes.push(Node::GroupNorm { input: a });
                     nodes.push(Node::Hadamard { left: a + 1, right: a + 1 });
@@ -661,7 +681,7 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
                 nodes.push(Node::Transposed { input: w, operator: assign });
                 let (zb, wb) = (nodes.len() - 2, nodes.len() - 1);
                 let a = a.unwrap_or_else(|| {
-                    nodes.push(Node::Affine { terms: vec![(input, read)], bias: None });
+                    nodes.push(Node::Affine { terms: vec![(reads, read)], bias: None });
                     nodes.len() - 1
                 });
                 let gated = extra.map(|_| {
@@ -675,10 +695,10 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
             let (a, z, s) = if direction {
                 nodes.push(Node::Affine { terms: vec![(gate_input, gate_a)], bias: Some(gate_b) });
                 nodes.push(Node::Constant { operator: soft });
-                nodes.push(Node::Affine { terms: vec![(input, read)], bias: None });
+                nodes.push(Node::Affine { terms: vec![(reads, read)], bias: None });
                 (nodes.len() - 1, nodes.len() - 3, nodes.len() - 2)
             } else {
-                nodes.push(Node::Affine { terms: vec![(input, read)], bias: None });
+                nodes.push(Node::Affine { terms: vec![(reads, read)], bias: None });
                 let a = nodes.len() - 1;
                 nodes.push(Node::GroupNorm { input: a });
                 nodes.push(Node::Pointwise { input: a + 1, laws: vec![Law::Log; groups] });
@@ -819,7 +839,7 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
                 nodes.push(Node::Gated { value: a, gate: z, scale: Some(w) });
                 (Some(nodes.len() - 1), z, w)
             } else {
-                stage_nodes(&mut nodes, 0, (read_op, gate_a, gate_b, soft), assign, a_direction, own, Some(parts), widths.len(), detector_ops(&artifact, &operators, base, &format!("{name}.attn")))
+                stage_nodes(&mut nodes, (0, 0), (read_op, gate_a, gate_b, soft), assign, a_direction, own, Some(parts), widths.len(), detector_ops(&artifact, &operators, base, &format!("{name}.attn")))
             };
             let gated = gated.ok_or("the gated reads")?;
             let mut projections = Vec::new();
@@ -917,7 +937,7 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
                     nodes.push(Node::Constant { operator: stage_ops.3 });
                     (None, z, nodes.len() - 1)
                 } else {
-                    stage_nodes(&mut nodes, heads, stage_ops, assign, a_direction, own, None, widths.len(), detector_ops(&artifact, &[], 0, &format!("{name}.attn")))
+                    stage_nodes(&mut nodes, (heads, heads), stage_ops, assign, a_direction, own, None, widths.len(), detector_ops(&artifact, &[], 0, &format!("{name}.attn")))
                 };
                 operators.push(dense(&format!("{name}.o.select_gate"), units(carried.len())?, units(a_comps.len())?, selection(&carried, a_comps.len()))?);
                 nodes.push(Node::Affine { terms: vec![(z, base + operators.len() - 1)], bias: None });
@@ -1018,6 +1038,32 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
         let d_inputs = extra_inputs(&d_cross, &inputs);
         inputs.extend(d_inputs);
         let mut nodes: Vec<Node> = (0..inputs.len()).map(|index| Node::Param { index }).collect();
+        // With mean parts (`LayerMeans`): the c_fc slices read `x − E[x]`, the down slices
+        // `act − E[act]`, and `E[p]` and `W_dn E[act]` are written on every token.
+        let means = match layer_means.iter().find(|m| m.layer == l) {
+            Some(m) => {
+                if m.mlp.len() != d2 || m.activation.len() != hidden || f_active {
+                    return Err(error(format!("layer {l}: means of {} and {} for an MLP of {d2} and {hidden}, or beside all-on activation reads", m.mlp.len(), m.activation.len())));
+                }
+                let Node::Affine { terms, bias } = &native.nodes[pre] else { return Err(error(format!("layer {l}: the MLP's input map is not one affine map"))) };
+                let (w_fc, b_fc) = (native.operators[terms[0].1].matrix(), bias.map(|b| native.operators[b].matrix().column(0).to_owned()));
+                let w_dn = native.operators[mlp_down(native, layer)?].matrix();
+                let (ex, eact) = (Array1::from(m.mlp.clone()), Array1::from(m.activation.clone()));
+                let ep = w_fc.dot(&ex) + b_fc.unwrap_or_else(|| Array1::zeros(hidden));
+                let column = |v: Array1<f64>| v.insert_axis(Axis(1));
+                let first = base + operators.len();
+                operators.push(Operator::identity(format!("{name}.mlp.fc_center"), h2_interface.clone()));
+                operators.push(dense(&format!("{name}.mlp.fc_center_bias"), h2_interface.clone(), Interface::constant(), column(-&ex))?);
+                operators.push(dense(&format!("{name}.mlp.fc_mean"), up_rows.clone(), Interface::constant(), column(ep))?);
+                operators.push(Operator::identity(format!("{name}.mlp.dn_center"), up_rows.clone()));
+                operators.push(dense(&format!("{name}.mlp.dn_center_bias"), up_rows.clone(), Interface::constant(), column(-&eact))?);
+                operators.push(dense(&format!("{name}.mlp.dn_mean"), out_rows.clone(), Interface::constant(), column(w_dn.dot(&eact)))?);
+                nodes.push(Node::Affine { terms: vec![(0, first)], bias: Some(first + 1) });
+                Some((nodes.len() - 1, first))
+            }
+            None => None,
+        };
+        let fc_reads = means.map_or(0, |(centered, _)| centered);
         let fc_parts = cross_parts(&artifact, &mut nodes, (&mut operators, base), &format!("{name}.mlp.fc"), &f_cross, &inputs)?;
         let fc_own = (f_carried > 0 && !f_direction).then(|| {
             let groups = f_carried + f_comps.len();
@@ -1067,15 +1113,23 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
                 (nodes.len() - 1, z, s)
             }
         } else {
-            let (gated, z, s) = stage_nodes(&mut nodes, 0, (base, base + 4, base + 5, base + 6), fc_assign, f_direction, fc_own, Some(fc_parts), fc_widths.len(), detector_ops(&artifact, &operators, base, &format!("{name}.mlp.fc")));
+            let (gated, z, s) = stage_nodes(&mut nodes, (0, fc_reads), (base, base + 4, base + 5, base + 6), fc_assign, f_direction, fc_own, Some(fc_parts), fc_widths.len(), detector_ops(&artifact, &operators, base, &format!("{name}.mlp.fc")));
             (gated.ok_or("the gated reads")?, z, s)
         };
-        nodes.push(Node::Affine { terms: vec![(gated, base + 1)], bias: None });
+        nodes.push(Node::Affine { terms: vec![(gated, base + 1)], bias: means.map(|(_, first)| first + 2) });
         nodes.push(Node::Pointwise { input: nodes.len() - 1, laws: laws.clone() });
         let act = nodes.len() - 1;
+        // The down slices' reads: of `act − E[act]` with mean parts.
+        let dn_reads = match means {
+            Some((_, first)) => {
+                nodes.push(Node::Affine { terms: vec![(act, first + 3)], bias: Some(first + 4) });
+                nodes.len() - 1
+            }
+            None => act,
+        };
         // The down reads after their gate when the gate does not read them (as the o reads').
         let late = (!d_own.is_empty() && !d_direction).then(|| {
-            nodes.push(Node::Affine { terms: vec![(act, base + 2)], bias: None });
+            nodes.push(Node::Affine { terms: vec![(dn_reads, base + 2)], bias: None });
             nodes.len() - 1
         });
         let (mut gate_parts, mut soft_parts) = cross_parts(&artifact, &mut nodes, (&mut operators, base), &format!("{name}.mlp.dn"), &d_cross, &inputs)?;
@@ -1150,11 +1204,11 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
         }
         let (z, s) = joined(&mut nodes, gate_parts, soft_parts);
         let a_dn = late.unwrap_or_else(|| {
-            nodes.push(Node::Affine { terms: vec![(act, base + 2)], bias: None });
+            nodes.push(Node::Affine { terms: vec![(dn_reads, base + 2)], bias: None });
             nodes.len() - 1
         });
         nodes.push(Node::Gated { value: a_dn, gate: z, scale: Some(s) });
-        nodes.push(Node::Affine { terms: vec![(nodes.len() - 1, base + 3)], bias: None });
+        nodes.push(Node::Affine { terms: vec![(nodes.len() - 1, base + 3)], bias: means.map(|(_, first)| first + 5) });
         let rule = Rule { name: format!("{name}.mlp"), inputs: inputs.iter().map(|&n| node_interface(n)).collect::<Result<_, _>>()?, output: nodes.len() - 1, nodes };
         artifact = artifact.replace_block(&format!("{name}.mlp"), Callee::New(rule), inputs.iter().map(|&n| Argument::Native(n)).collect(), layer.mlp, operators)?;
     }
@@ -1506,6 +1560,14 @@ fn concat_interface(parts: &[Interface]) -> Result<Interface, String> {
     Interface::new(parts.iter().flat_map(|p| p.groups().to_vec()).collect()).map_err(error)
 }
 
+/// `M`'s down map of `layer`'s MLP: the affine map from its activations to its output.
+fn mlp_down(native: &OperatorProgram, layer: &LayerNodes) -> Result<usize, String> {
+    match &native.nodes[layer.mlp] {
+        Node::Affine { terms, .. } if terms.len() == 1 && terms[0].0 == layer.active => Ok(terms[0].1),
+        other => Err(error(format!("the MLP's output is {other:?}, not one map of its activations"))),
+    }
+}
+
 /// A score stage's heads' largest scores, one column each (`Node::MaxScore`, concatenated).
 fn score_heads(heads: usize) -> Result<Interface, String> {
     concat_interface(&vec![units(1)?; heads])
@@ -1795,7 +1857,11 @@ fn set_gate(part: &mut Dumped, read: String, (on, tau, g): StageGate) {
 /// taken to own their k and v (no grouped-query sharing). Returns the number of parts.
 pub fn dump_parts(native: &OperatorProgram, layers: &[LayerNodes], artifact: &Artifact, start: &Path, arm: &str, inputs: &FamilyInputs, dir: &Path) -> Result<usize, String> {
     let records: Vec<ArmRecord> = serde_json::from_slice(&std::fs::read(start).map_err(|e| error(format!("{}: {e}", start.display())))?).map_err(error)?;
-    let components = records.into_iter().find(|r| r.arm == arm).ok_or_else(|| error(format!("{}: no arm {arm}", start.display())))?.components;
+    let record = records.into_iter().find(|r| r.arm == arm).ok_or_else(|| error(format!("{}: no arm {arm}", start.display())))?;
+    if !record.means.is_empty() {
+        return Err(error("dump_parts: mean parts are not dumped"));
+    }
+    let components = record.components;
     if components.iter().any(|c| matches!(c.read, Read::Active { .. } | Read::Logits { .. } | Read::Detectors { .. }) || c.score.is_some()) {
         return Err(error("dump_parts: all-on activation, logit, detector and score reads are not dumped"));
     }
@@ -2320,6 +2386,69 @@ mod tests {
         assert!(own > 1e-3 && (own - detected).abs() <= 1e-9 * own, "detector gates {detected} bits against own gates {own}");
         let mixed = super::explanation(&native, &layers, &factors, &start, "mixed");
         assert!(mixed.as_ref().is_err_and(|e| e.contains("gates one way")), "a stage with both kinds of read is refused: {:?}", mixed.err());
+        std::fs::remove_dir_all(&factors).expect("the factors are removed");
+    }
+
+    /// Mean parts (`LayerMeans`, from `M`'s run on the text itself): with every part on the
+    /// explanation is `M` (under 1e-5 bits); with every MLP part off each MLP writes its mean
+    /// output `W_dn E[act]` on every token and its pre-activations are `E[p] = W_fc E[x]`, its parts
+    /// mean-ablated.
+    #[test]
+    fn mean_parts_keep_m_and_turn_off_to_the_mean() {
+        use crate::operator_program::Node;
+        let tag = "library_vpd_means";
+        let dir = crate::test_support::tiny_export(tag, 2);
+        let factors = std::env::temp_dir().join(format!("gam_mpd_{tag}_factors_{}", std::process::id()));
+        let frames = exact_frames(&dir, &factors, 13);
+        let imported = import_language_model(&dir, 6, 12).expect("the tiny export imports");
+        std::fs::remove_dir_all(dir).expect("the tiny export is removed");
+        let native = split_sites(&imported.program).expect("the native sites");
+        let layers = layer_nodes(&native, 2).expect("the layers");
+        let count = |site: usize| frames[site].0.ncols();
+        let trace = native.execute(&imported.family, false).expect("M's trace");
+        let mean = |node: usize| trace.values[node].mean_axis(ndarray::Axis(0)).expect("rows").to_vec();
+        let means: Vec<serde_json::Value> = (0..2).map(|l| serde_json::json!({"layer": l, "mlp": mean(layers[l].normed), "activation": mean(layers[l].active)})).collect();
+        let arm = |name: &str, tau: f64| {
+            let mut components = Vec::new();
+            for l in 0..2 {
+                let (q, o, fc, dn) = (6 * l, 6 * l + 3, 6 * l + 4, 6 * l + 5);
+                let slices: Vec<[usize; 2]> = (q..=o).flat_map(|s| (0..count(s)).map(move |i| [s, i])).collect();
+                components.push(serde_json::json!({"read": {"own": [q, 0]}, "tau": -1.0, "slices": slices}));
+                components.extend((0..count(fc)).map(|i| serde_json::json!({"read": {"own": [fc, i]}, "tau": tau, "slices": [[fc, i], [dn, i]]})));
+                components.extend((count(fc)..count(dn)).map(|i| serde_json::json!({"read": {"own": [dn, i]}, "tau": tau, "slices": [[dn, i]]})));
+            }
+            serde_json::json!({"arm": name, "components": components, "means": means})
+        };
+        let start = factors.join("start.json");
+        std::fs::write(&start, serde_json::Value::Array(vec![arm("on", -1.0), arm("off", 1e9)]).to_string()).expect("the start");
+        let SlotValues::Tokens(tokens) = &imported.family.slots[0] else { panic!("a token slot") };
+        let sequences: Vec<Vec<u32>> = tokens.chunks(12).map(<[u32]>::to_vec).collect();
+        let batch = Batch::new(sequences[..3].to_vec(), sequences[3..6].to_vec()).expect("the batch");
+        let device = Device::host();
+        let clean: Vec<Experiment> = (0..3).map(|base| Experiment { base, source: base, explained: vec![true; 4], patch: None, position: 0 }).collect();
+        let on = super::explanation(&native, &layers, &factors, &start, "on").expect("the explanation");
+        let blocks: Vec<_> = on.layers.iter().map(|l| l.sites.clone()).collect();
+        let bits: f64 = Interchange::new(&device, &native, &blocks, &on.artifact, &on.trainable, Vec::new(), 1 << 30, 64).expect("the experiments").evaluate(&batch, &clean, false).expect("evaluate").bits.iter().flatten().sum();
+        assert!(bits.abs() < 1e-5, "every part on with mean parts: KL(M ‖ P) = {bits} bits");
+        let off = super::explanation(&native, &layers, &factors, &start, "off").expect("the explanation");
+        let (flat, _, _) = crate::interchange::sites(&off.artifact, &layers).expect("the flat program");
+        let p_trace = flat.execute(&imported.family, false).expect("P's trace");
+        for l in 0..2 {
+            for (part, want) in [("fc_mean", None), ("dn_mean", Some(()))] {
+                let bias = super::index_of(&flat, &format!("library.l{l}.mlp.{part}")).expect("the mean part");
+                let node = flat.nodes.iter().position(|n| matches!(n, Node::Affine { bias: Some(b), .. } if *b == bias)).expect("its node");
+                let value = &p_trace.values[node];
+                let row = flat.operators[bias].matrix().column(0).to_owned();
+                let gap = value.rows().into_iter().map(|r| (&r - &row).iter().fold(0.0_f64, |m, e| m.max(e.abs()))).fold(0.0_f64, f64::max);
+                assert!(gap <= 1e-12 * row.iter().fold(1.0_f64, |m, e| m.max(e.abs())), "layer {l} {part}: every token writes the mean, off by {gap}");
+                if want.is_some() {
+                    let w_dn = native.operators[super::mlp_down(&native, &layers[l]).expect("the down map")].matrix();
+                    let expected = w_dn.dot(&Array1::from(mean(layers[l].active)));
+                    let err = (&row - &expected).iter().fold(0.0_f64, |m, e| m.max(e.abs()));
+                    assert!(err <= 1e-12 * expected.iter().fold(1.0_f64, |m, e| m.max(e.abs())), "layer {l}: the mean write is W_dn E[act], off by {err}");
+                }
+            }
+        }
         std::fs::remove_dir_all(&factors).expect("the factors are removed");
     }
 
