@@ -115,7 +115,8 @@ def carriers(a) -> None:
 
 def base_units(model: str) -> set[str]:
     """The ranking names (s<layer>_<site>_<i>) of the subcomponents in the model's shared base (GRAPH_BASE, as
-    score.Checker takes it), which every program is scored with: the search ranks only the parts outside it."""
+    score.Checker takes it), which every program is scored with: the search ranks only the parts outside it. A whole
+    site in the base gives its prefix s<layer>_<site>."""
     import score as score_module
 
     base = os.environ.get("GRAPH_BASE")
@@ -126,6 +127,8 @@ def base_units(model: str) -> set[str]:
     for n in ir["nodes"]:
         for p in n["pieces"]:
             idx = p["index"]
+            if idx is None:
+                out.add(f"s{p['layer']}_{p['kind']}")
             out |= {f"s{p['layer']}_{p['kind']}_{i}" for i in (idx if isinstance(idx, list) else [idx]) if isinstance(i, int)}
     return out
 
@@ -149,8 +152,9 @@ def answer(a, b: str) -> None:
             rankings = a.search / "rankings"
             rankings.mkdir(parents=True, exist_ok=True)
             ranked = json.loads((a.rankings / f"{b}.json").read_text())
-            ranked["mixed"] = [u for u in ranked["mixed"] if u[0] not in base]
-            ranked["source"] += f"; the {len(base)} parts of the shared base left out"
+            kept = [u for u in ranked["mixed"] if u[0] not in base and u[0].rsplit("_", 1)[0] not in base]
+            ranked["source"] += f"; the shared base's {len(ranked['mixed']) - len(kept)} subcomponents left out"
+            ranked["mixed"] = kept
             (rankings / f"{b}.json").write_text(json.dumps(ranked))
         cmd = [sys.executable, str(HERE / "vpd_min.py"), b, "--out", str(a.search), "--behaviors-dir", str(a.behaviors_dir),
                "--vpd", str(a.vpd), "--rankings", str(rankings), "--export", str(a.export)]
