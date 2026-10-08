@@ -75,6 +75,29 @@ pub struct Program {
     /// across behaviors.
     #[serde(default)]
     pub base: Vec<String>,
+    /// The algorithm's variables bound to parts ([`BindingIr`]), checked by interchange.
+    #[serde(default)]
+    pub bindings: Vec<BindingIr>,
+}
+
+/// A binding (design_v2 section 2, "Bindings"): the variable `variable` of the program's algorithm
+/// is held by the parts of nodes `nodes`; per prompt pair, `answer` is the algorithm's output at the
+/// base prompt's targets (one token each) when the variable takes the source prompt's value.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct BindingIr {
+    pub variable: String,
+    pub nodes: Vec<String>,
+    #[serde(default)]
+    pub pairs: Vec<PairIr>,
+}
+
+/// One interchange of a binding: prompts `base` and `source` (indices into the behavior, of one
+/// length) and the algorithm's answer token at each of the base's targets.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PairIr {
+    pub base: usize,
+    pub source: usize,
+    pub answer: Vec<u32>,
 }
 
 fn yes() -> bool {
@@ -771,6 +794,8 @@ pub struct Graph {
     /// Edges within one MLP site, (writer node, reader node): `c_fc` subcomponents to `down_proj`
     /// subcomponents through the hidden pre-activation.
     pub internal: Vec<(usize, usize)>,
+    /// The program's bindings with their nodes as indices ([`Checker::binding_error`]).
+    pub bindings: Vec<(BindingIr, Vec<usize>)>,
 }
 
 /// A built-in attention rule (design.txt section 5, "Rules"): uniform over the positions `j ≤ t` it
@@ -1268,12 +1293,25 @@ impl Graph {
         if let Some(b) = program.base.iter().find(|b| !ids.contains(b)) {
             return Err(format!("base node {b} is not a node"));
         }
-        Ok(Self { delete, ids, blocks, claims, edges, internal })
+        // A bound variable is read from its nodes' writes into the residual stream (an interchange
+        // swaps them).
+        let mut bindings = Vec::with_capacity(program.bindings.len());
+        for b in &program.bindings {
+            let nodes: Vec<usize> = b.nodes.iter().map(|id| ids.iter().position(|i| i == id).ok_or_else(|| format!("binding {}: unknown node {id}", b.variable))).collect::<Result<_, _>>()?;
+            if nodes.is_empty() {
+                return Err(format!("binding {}: no nodes", b.variable));
+            }
+            if let Some(&n) = nodes.iter().find(|&&n| !blocks[n].writes_residual()) {
+                return Err(format!("binding {}: node {} writes no residual stream (an interchange swaps a node's write)", b.variable, ids[n]));
+            }
+            bindings.push((b.clone(), nodes));
+        }
+        Ok(Self { delete, ids, blocks, claims, edges, internal, bindings })
     }
 
     /// The empty program: every piece a stand-in.
     pub fn empty() -> Self {
-        Self { delete: false, ids: Vec::new(), blocks: Vec::new(), claims: Vec::new(), edges: Vec::new(), internal: Vec::new() }
+        Self { delete: false, ids: Vec::new(), blocks: Vec::new(), claims: Vec::new(), edges: Vec::new(), internal: Vec::new(), bindings: Vec::new() }
     }
 
     /// Every piece of `weights` not in a node, per site: the heads of each layer, then its neurons.
@@ -3725,6 +3763,9 @@ pub struct Score {
     /// `N` times the program's attention-claim error ([`Checker::claim_error`]): zero for true
     /// claims and for a program that makes none.
     pub claim_error_bits: f64,
+    /// `N` times the program's binding error ([`Checker::binding_error`]): zero where every
+    /// interchange gives the algorithm's answer, and for a program that binds nothing.
+    pub binding_error_bits: f64,
     pub reader_error_bits: f64,
     pub code_bits: f64,
     pub python_tokens: usize,
@@ -3886,6 +3927,54 @@ impl Checker {
         let x = Arc::new(run.normed.get(&(unit, 0)).cloned().ok_or("an unrecorded attention input")?);
         self.claim_inputs.insert((layer, counterfactual), x.clone());
         Ok(x)
+    }
+
+    /// The error of `graph`'s bindings, bits per target: for each binding the mean, over its pairs'
+    /// base targets, of how much less likely `M` finds the algorithm's answer than its own top token
+    /// (`max log2 p − log2 p(answer)`) when the bound nodes' writes come from the source prompt and
+    /// every other piece computes on the base (`M`'s circuit, [`Graph::model`]); summed over
+    /// bindings. An answer `M`'s interchanged run ranks first costs nothing.
+    pub fn binding_error(&mut self, graph: &Graph) -> Result<f64, String> {
+        let mut total = 0.0;
+        let circuit = graph.model(&self.weights);
+        for (binding, nodes) in graph.bindings.iter().filter(|(b, _)| !b.pairs.is_empty()) {
+            let prompts = &self.behavior.prompts;
+            let mut bases = Vec::with_capacity(binding.pairs.len());
+            let mut sources = Vec::with_capacity(binding.pairs.len());
+            for pair in &binding.pairs {
+                let (Some(base), Some(source)) = (prompts.get(pair.base), prompts.get(pair.source)) else {
+                    return Err(format!("binding {}: prompt {} or {} outside the behavior", binding.variable, pair.base, pair.source));
+                };
+                if base.token_ids.len() != source.token_ids.len() {
+                    return Err(format!("binding {}: prompts {} and {} differ in length", binding.variable, pair.base, pair.source));
+                }
+                if pair.answer.len() != base.target_positions.len() {
+                    return Err(format!("binding {}: {} answers for prompt {}'s {} targets", binding.variable, pair.answer.len(), pair.base, base.target_positions.len()));
+                }
+                bases.push(base.token_ids.clone());
+                sources.push(source.token_ids.clone());
+            }
+            let (mut base, mut source) = (Batch::new(&bases)?, Batch::new(&sources)?);
+            self.mask(&mut base);
+            self.mask(&mut source);
+            let mut rows = Vec::new();
+            let mut answers = Vec::new();
+            for (pair, &(start, _)) in binding.pairs.iter().zip(&base.spans) {
+                rows.extend(prompts[pair.base].target_positions.iter().map(|&t| start + t));
+                answers.extend(pair.answer.iter().copied());
+            }
+            let written = execute(&self.weights, &circuit, &source, &[], &BTreeMap::new())?.writes;
+            let swaps: BTreeMap<usize, Array2<f64>> = nodes.iter().map(|&u| written.get(u).cloned().flatten().map(|w| (u, w)).ok_or_else(|| format!("binding {}: a bound node wrote nothing", binding.variable))).collect::<Result<_, _>>()?;
+            let swapped = execute(&self.weights, &circuit, &base, &rows, &swaps)?.log_probabilities;
+            let mut cost = 0.0;
+            for (row, &answer) in swapped.outer_iter().zip(&answers) {
+                let top = row.iter().fold(f64::NEG_INFINITY, |m, &x| m.max(x));
+                let p = row.get(answer as usize).copied().ok_or_else(|| format!("binding {}: answer token {answer} outside the vocabulary", binding.variable))?;
+                cost += (top - p) / std::f64::consts::LN_2;
+            }
+            total += cost / answers.len().max(1) as f64;
+        }
+        Ok(total)
     }
 
     /// Attaches the behavior's attention blocks to every sequence of `b`. Every native batch goes
@@ -4218,11 +4307,13 @@ impl Checker {
             let opaque_bits: f64 = widths[i].iter().filter(|w| !in_base(w)).map(|w| w.cost_bits).sum();
             let base_bits: f64 = widths[i].iter().filter(|w| in_base(w)).map(|w| w.cost_bits).sum();
             let claim_error_bits = n * self.claim_error(graph)?;
+            let binding_error_bits = n * self.binding_error(graph)?;
             let score = Score {
-                total_bits: exec_error_bits + necessity_error_bits + claim_error_bits + code_bits + opaque_bits,
+                total_bits: exec_error_bits + necessity_error_bits + claim_error_bits + binding_error_bits + code_bits + opaque_bits,
                 exec_error_bits,
                 necessity_error_bits,
                 claim_error_bits,
+                binding_error_bits,
                 reader_error_bits: 0.0,
                 code_bits,
                 python_tokens: if *valid { program.python_tokens } else { 0 },

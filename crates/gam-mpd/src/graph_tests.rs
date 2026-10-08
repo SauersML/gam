@@ -58,7 +58,7 @@ fn full_program() -> Program {
             }
         }
     }
-    Program { model: "tiny".into(), nodes, edges, python_tokens: 0, token_types: 0, source: String::new(), valid: true, error: None, standin: None, base: Vec::new() }
+    Program { model: "tiny".into(), nodes, edges, python_tokens: 0, token_types: 0, source: String::new(), valid: true, error: None, standin: None, base: Vec::new(), bindings: Vec::new() }
 }
 
 /// The Checker keeps `M`'s log-probabilities in float32 (relative rounding `2^-24`): on
@@ -881,4 +881,45 @@ fn attention_claims_on_vpd_parts_weigh_the_heads_they_reach() {
     // A claim on value and output subcomponents alone has no pattern to check.
     let vo = Program { nodes: vec![NodeIr { id: "VO".into(), pieces: vec![vpd("v_proj", vec![0]), vpd("o_proj", vec![0])], claim: Some(serde_json::json!({"op": "attend", "offset": 1})) }], ..program(None) };
     assert!(Graph::parse(&vo, &weights).is_err());
+}
+
+#[test]
+fn bindings_are_checked_by_interchange() {
+    use crate::graph::{BindingIr, PairIr};
+    let f = fixture("graph_bindings");
+    let library = Library::new(&f.device, &f.device, &f.native, &f.layers, &f.artifact, 1 << 28, 64).expect("library");
+    let weights = Weights::of(&library);
+    let cf = counterfactuals(&f.sequences);
+    let program = full_program();
+    let graph = Graph::parse(&program, &weights).expect("parse");
+    let m0 = program.nodes.iter().position(|n| n.id == "m0").expect("m0");
+    // M's own answers at each base's last token with layer 0's MLP write taken from the next prompt.
+    let n = f.sequences.len();
+    let pairs: Vec<(usize, usize)> = (0..n).map(|i| (i, (i + 1) % n)).collect();
+    let circuit = graph.model(&weights);
+    let bases = Batch::new(&pairs.iter().map(|&(i, _)| f.sequences[i].clone()).collect::<Vec<_>>()).expect("bases");
+    let sources = Batch::new(&pairs.iter().map(|&(_, j)| f.sequences[j].clone()).collect::<Vec<_>>()).expect("sources");
+    let written = execute(&weights, &circuit, &sources, &[], &BTreeMap::new()).expect("sources").writes;
+    let rows: Vec<usize> = bases.spans.iter().map(|&(start, length)| start + length - 1).collect();
+    let swapped = execute(&weights, &circuit, &bases, &rows, &[(m0, written[m0].clone().expect("m0 writes"))].into()).expect("swapped").log_probabilities;
+    let top: Vec<u32> = swapped.outer_iter().map(|r| r.iter().enumerate().fold((0, f64::NEG_INFINITY), |best, (k, &x)| if x > best.1 { (k, x) } else { best }).0 as u32).collect();
+    let vocabulary = weights.embedding.nrows() as u32;
+    let bound = |answers: &[u32]| {
+        let mut p = program.clone();
+        p.bindings = vec![BindingIr { variable: "v".into(), nodes: vec!["m0".into()], pairs: pairs.iter().zip(answers).map(|(&(base, source), &a)| PairIr { base, source, answer: vec![a] }).collect() }];
+        p
+    };
+    let wrong: Vec<u32> = top.iter().map(|t| (t + 1) % vocabulary).collect();
+    let mut checker = Checker::new(weights.clone(), claims_behavior(&f.sequences, &cf)).expect("checker");
+    let true_error = checker.binding_error(&Graph::parse(&bound(&top), &weights).expect("parse")).expect("binding");
+    let false_error = checker.binding_error(&Graph::parse(&bound(&wrong), &weights).expect("parse")).expect("binding");
+    assert!(true_error < 1e-6, "M's own interchanged answers cost {true_error:e} bits per target");
+    assert!(false_error > 1e-3, "wrong answers cost {false_error:e} bits per target");
+    assert_eq!(checker.binding_error(&graph).expect("no binding"), 0.0);
+    let (score, _) = checker.score(&bound(&wrong), 4, 1, true, None).expect("score");
+    assert!((score.binding_error_bits - score.n * false_error).abs() <= 1e-6 * score.binding_error_bits, "the score charges N times the error");
+    // A binding names nodes of the program.
+    let mut unknown = bound(&top);
+    unknown.bindings[0].nodes = vec!["nowhere".into()];
+    assert!(Graph::parse(&unknown, &weights).is_err());
 }
