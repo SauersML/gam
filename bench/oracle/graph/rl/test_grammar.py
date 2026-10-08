@@ -82,3 +82,18 @@ def test_free_text_is_exactly_its_language():
             got = all(m.accept_token(t) for t in tok.encode(s + "!", add_special_tokens=False)) and m.is_terminated() is False and m.accept_token(tok.convert_tokens_to_ids("<|im_end|>"))
             assert got == free_text(s), repr(s)
             assert not got or ("<p:" not in s and "```" not in s)
+
+
+@pytest.mark.skipif(importlib.util.find_spec("xgrammar") is None, reason="xgrammar is not installed")
+def test_no_tabs_in_code():
+    import xgrammar as xgr
+    from transformers import AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
+    compiled = xgr.GrammarCompiler(xgr.TokenizerInfo.from_huggingface(tok)).compile_grammar(grammar.model_grammar("vpd4l"))
+
+    def accepts(text):
+        m = xgr.GrammarMatcher(compiled)
+        return all(m.accept_token(t) for t in tok.encode(text, add_special_tokens=False)) and m.accept_token(tok.convert_tokens_to_ids("<|im_end|>"))
+
+    assert accepts(GOOD) and not accepts(GOOD.replace("    return tokens", "\treturn tokens"))

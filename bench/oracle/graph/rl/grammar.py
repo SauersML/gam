@@ -27,7 +27,7 @@ SITE_CODES = {"q_proj": "q", "k_proj": "k", "v_proj": "v", "o_proj": "o", "c_fc"
 
 def free(n: str, x: str) -> str:
     """Rule n for free text in which "<" is never followed by "p", "<" or "`" and "`" never by "`" or "<" (and without
-    the characters x; a code line: "\\n"). This is slightly narrower than "no <p: and no three backticks" (it also
+    the characters x; code: a tab). This is slightly narrower than "no <p: and no three backticks" (it also
     excludes x<p..., <<, double backticks and <`): the exact language needs a two-character exit after "<p", and runs
     "<"+, for which xgrammar checks every token against the parser stack (16-100 ms per mask on the Mac); this one
     stays within single character classes (0.07 ms)."""
@@ -85,8 +85,8 @@ def answer_grammar(tokens: list[str]) -> str:
         'root ::= text "```python\\n" code "```" text',
         free("text", ""),
         "code ::= free_code (statement free_code)*",
-        free("free_code", ""),
-        'statement ::= ("align" | "claim") "(" [ \\t]* name [ \\t]* ("," [ \\t]* part [ \\t]*)+ ")"',
+        free("free_code", "\\t"),  # no tabs in code: the teacher answers indent with spaces, and tab runs were a runaway
+        'statement ::= ("align" | "claim") "(" [ ]* name [ ]* ("," [ ]* part [ ]*)+ ")"',
         "name ::= [A-Za-z_] [A-Za-z0-9_]*",
         "part ::= " + part_rule(tokens),
     ])
