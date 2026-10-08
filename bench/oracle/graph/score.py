@@ -11,6 +11,7 @@ a JSON-lines server); the reader term from reader_score.py (g-reader), fed the c
 """
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -21,7 +22,8 @@ EXPORTS = {
 }
 # The latest checker build (g-exec2 copies each release build there), else g-exec's first build.
 PUBLISHED = Path.home() / "mpd-data/graph_oracle/bin/mpd_graph_2951"
-BINARY = Path(os.environ.get("GRAPH_CHECKER") or (PUBLISHED if PUBLISHED.exists() else Path.home() / "mpd-data/scratch/g-exec/bin/mpd_graph_2951"))
+# On MATS (mats-run with MATS_BUILD=1) the job's commit's build: $MPD_BIN/mpd_graph_2951 (Linux, CUDA with device "gpu").
+BINARY = Path(os.environ.get("GRAPH_CHECKER") or (Path(os.environ["MPD_BIN"]) / "mpd_graph_2951" if os.environ.get("MPD_BIN") else PUBLISHED if PUBLISHED.exists() else Path.home() / "mpd-data/scratch/g-exec/bin/mpd_graph_2951"))
 HERE = Path(__file__).resolve().parent
 # Each model's published shared base (g-exec2): generic machinery declared once per model, a program IR whose nodes
 # the checker adds to every scored program (always on, connected to every node, priced apart in base_bits).
@@ -90,7 +92,8 @@ class Checker:
         memo_dir = memo_dir or os.environ.get("GRAPH_MEMO_DIR")
         if memo_dir:
             command += ["--memo-dir", str(Path(memo_dir).expanduser())]
-        if not os.environ.get("MEM_LEASE_GIB"):
+        # The Mac's memory guard where it exists (MATS jobs have Slurm's limit instead).
+        if not os.environ.get("MEM_LEASE_GIB") and shutil.which("mem-lease"):
             command = ["mem-lease", str(memory_gib)] + command
         self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1, env=env)
         self.request({"op": "load", "export": str(export), **{k: str(Path(v).expanduser()) for k, v in (views or {}).items()}, **({"device": device} if device else {})})
