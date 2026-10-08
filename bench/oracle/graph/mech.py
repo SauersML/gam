@@ -736,7 +736,7 @@ def _evaluate(program: _Program, algorithm: _Algorithm, answer: str, behavior: d
         return out
 
     n = len(prompts)
-    for b in ir["bindings"]:
+    for b in ir["alignments"]:
         v = b["variable"]
         for i, ts in enumerate(targets):
             # the source: the first later prompt of i's length (cyclically) under which the answer is
@@ -847,7 +847,7 @@ def _validate(program: _Program, namespace: dict, ir: dict, behavior: dict | Non
                 if o != n.id:
                     raise MechError(f"{Piece(p.view, p.layer, p.kind, (i,), rest=p.rest).name()} is in nodes {o} and "
                                     f"{n.id}; a part belongs to one node")
-    ir["bindings"], ir["variables"], ir["answer"] = [], [], None
+    ir["alignments"], ir["variables"], ir["answer"] = [], [], None
 
     def connect(src, dst) -> bool:
         if src is dst or not _connects(src, dst, "input"):
@@ -890,7 +890,7 @@ def _validate(program: _Program, namespace: dict, ir: dict, behavior: dict | Non
                             "nodes": [n.id for n in held.get(v, [])],
                             "pieces": [p.ir() for p in _merged(aligned.get(v) or claimed.get(v) or [])]}
                            for v in sorted(algorithm.params, key=line.get)]
-        ir["bindings"] = [{"variable": v, "nodes": [n.id for n in held[v]], "pairs": []} for v in aligned]
+        ir["alignments"] = [{"variable": v, "nodes": [n.id for n in held[v]], "pairs": []} for v in aligned]
         if behavior is not None:
             _evaluate(program, algorithm, answer, behavior, ir)
     ir["nodes"] = [{"id": n.id, "pieces": [p.ir() for p in n.pieces],
@@ -1020,7 +1020,7 @@ def quote_parts(source: str) -> str:
 
 
 def _empty(source: str, model: str, decomposition: str | None) -> dict:
-    return {"model": model, "decomposition": decomposition, "nodes": [], "edges": [], "bindings": [],
+    return {"model": model, "decomposition": decomposition, "nodes": [], "edges": [], "alignments": [],
             "variables": [], "answer": None, "claims": {}, "python_tokens": 0, "token_types": 0,
             "source": source, "valid": False, "error": None}
 
@@ -1075,7 +1075,7 @@ def _trace(source: str, model: str, behavior: dict | None = None, decomposition:
         line = _line_of(e)
         ir["error"] = (f"line {line}: " if line else "") + f"{type(e).__name__}: {e}"
     if not ir["valid"]:
-        ir.update(nodes=[], edges=[], bindings=[], variables=[], answer=None, claims={})
+        ir.update(nodes=[], edges=[], alignments=[], variables=[], answer=None, claims={})
     return ir
 
 
@@ -1154,13 +1154,13 @@ def _answer_ids(ir: dict, model: str, known: dict | None) -> dict:
     if clean is not None:
         hits = [a is not None and n is not None and _token_id(model, n, known) in ids(a) for _, _, a, n in clean]
         ir["algorithm_accuracy"] = sum(hits) / len(hits) if hits else None
-    for b in ir.get("bindings") or []:
+    for b in ir.get("alignments") or []:
         for pair in b["pairs"]:
             sets = []
             for text in pair["answer_text"]:
                 found = ids(text)
                 if None in found:
-                    ir.update(nodes=[], edges=[], bindings=[], variables=[], answer=None, claims={}, valid=False,
+                    ir.update(nodes=[], edges=[], alignments=[], variables=[], answer=None, claims={}, valid=False,
                               error=f"the answer {text!r} (variable {ir.get('answer')}, interchanging {b['variable']}, "
                                     f"prompt {pair['base']}) starts with no token of {model}")
                     return ir

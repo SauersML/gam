@@ -87,7 +87,7 @@ def test_algorithm_ir():
                      ("answer.2.attn", "answer.3.attn"), ("answer.2.attn", "logits"), ("answer.3.attn", "logits"),
                      ("embed", "logits")}
     assert all(e["route"] == "input" for e in ir["edges"])
-    assert ir["bindings"] == [{"variable": "prev", "nodes": ["prev"], "pairs": []},
+    assert ir["alignments"] == [{"variable": "prev", "nodes": ["prev"], "pairs": []},
                               {"variable": "answer", "nodes": ["answer.2.attn", "answer.3.attn"], "pairs": []}]
     assert [(v["name"], v["role"], v["reads"]) for v in ir["variables"]] == [
         ("back", "claimed", ["tokens"]), ("prev", "aligned", ["tokens", "back"]),
@@ -99,7 +99,7 @@ def test_algorithm_on_a_behavior():
     ir = toy_trace(INDUCTION)
     assert ir["valid"], ir["error"]
     assert ir["algorithm_accuracy"] == 1.0
-    pairs = {b["variable"]: b["pairs"] for b in ir["bindings"]}
+    pairs = {b["variable"]: b["pairs"] for b in ir["alignments"]}
     # the source is the next prompt of the base's length under which the answer changes (prompt 1's t6 is
     # prompt 2's answer too, so prompt 1 takes prompt 0's)
     assert pairs["answer"] == [{"base": 0, "source": 1, "answer_text": ["t6"], "answer": [6]},
@@ -124,7 +124,7 @@ def test_algorithm_on_a_real_behavior():
     assert ir["algorithm_accuracy"] == 1.0
     assert ir == mech.trace_inline(INDUCTION, "vpd4l", behavior=json.loads(BEHAVIOR.read_text()))
     record = json.loads(BEHAVIOR.read_text())
-    for b in ir["bindings"]:
+    for b in ir["alignments"]:
         assert len(b["pairs"]) > 48
         for pair in b["pairs"]:
             assert len(record["prompts"][pair["base"]]["token_ids"]) == len(record["prompts"][pair["source"]]["token_ids"])
@@ -147,10 +147,10 @@ def test_answer_sets():
                              "return [[tokens[js[-1]], 't9'] if js else None for js in match]")
     ir = toy_trace(sets)
     assert ir["valid"] and ir["algorithm_accuracy"] == 1.0, ir["error"]
-    pair = next(b for b in ir["bindings"] if b["variable"] == "answer")["pairs"][0]
+    pair = next(b for b in ir["alignments"] if b["variable"] == "answer")["pairs"][0]
     assert pair["answers"] == [[6, 9]] and pair["answer"] == [6] and pair["answer_text"] == [["t6", "t9"]]
     plain = toy_trace(INDUCTION)
-    assert all("answers" not in p for b in plain["bindings"] for p in b["pairs"])
+    assert all("answers" not in p for b in plain["alignments"] for p in b["pairs"])
     assert "collection of them" in toy_trace(INDUCTION.replace("return [tokens[js[-1]] if js else None",
                                                                 "return [[1, 2] if js else None"))["error"]
 
@@ -316,7 +316,7 @@ def test_low_level_ir():
     ]
     assert ir["edges"] == [{"from": "a", "to": "b", "route": "input"}, {"from": "embed", "to": "a", "route": "query"},
                            {"from": "b", "to": "logits", "route": "input"}, {"from": "node0", "to": "a", "route": "input"}]
-    assert ir["bindings"] == [] and ir["answer"] is None
+    assert ir["alignments"] == [] and ir["answer"] is None
 
 
 def test_tracer_speed():
@@ -441,7 +441,7 @@ def test_base():
     edges = {(e["from"], e["to"]) for e in ir["edges"]}
     assert {("embed", "base.0.attn"), ("base.0.attn", "base.0.mlp"), ("base.0.mlp", "prev"), ("base.0.attn", "match"),
             ("base.0.mlp", "answer.3.attn"), ("base.0.mlp", "logits")} <= edges
-    assert [b["variable"] for b in ir["bindings"]] == ["prev", "answer"]  # base parts hold no variable
+    assert [b["variable"] for b in ir["alignments"]] == ["prev", "answer"]  # base parts hold no variable
     one = mech.trace_inline("from mech import node, edges, base, logits\nbase(<p:1.fc.3>, <p:1.down.4>)\n"
                             "n = node(<p:2.v.1>, <p:2.o.1>)\nedges(n >> logits)\n", "vpd4l")
     assert one["valid"] and one["base"] == ["base"] and {"from": "base", "to": "n", "route": "input"} in one["edges"]

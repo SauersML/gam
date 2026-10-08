@@ -40,7 +40,7 @@ import mech  # noqa: E402
 import teacher  # noqa: E402
 
 DATA = Path.home() / "mpd-data/graph_oracle"
-TERMS = ("total_bits", "exec_error_bits", "necessity_error_bits", "binding_error_bits", "claim_error_bits", "code_bits",
+TERMS = ("total_bits", "exec_error_bits", "necessity_error_bits", "alignment_error_bits", "claim_error_bits", "code_bits",
          "opaque_bits", "base_bits", "reader_error_bits", "N", "experiments", "python_tokens", "opaque_numbers", "valid")
 
 
@@ -69,9 +69,9 @@ def variable_prompts(behavior: dict) -> dict[str, list[dict]]:
         if not ir.get("valid", True):
             print(f"{behavior['id']}: variable {v} does not trace aligned ({ir.get('error')})", file=sys.stderr)
             continue
-        binding = next(b for b in ir["bindings"] if b["variable"] == v)
+        alignment = next(b for b in ir["alignments"] if b["variable"] == v)
         rows = []
-        for pair in binding["pairs"]:
+        for pair in alignment["pairs"]:
             i, j = pair["base"], pair["source"]
             last = max(payload["targets"][i])
             vi = values_of(algorithm, [v], payload["prompts"][i][: last + 1])[v]
@@ -184,8 +184,8 @@ def answer(a, b: str) -> None:
     with open(out / "manifest.jsonl", "a") as f:
         f.write(json.dumps(line) + "\n")
     s = final[0]
-    print(f"{b}: answer {parts} parts, total {s['total_bits']:.6g} bits (exec {s.get('exec_error_bits', 0):.4g}, binding "
-          f"{s.get('binding_error_bits', 0):.4g}, necessity {s.get('necessity_error_bits', 0):.4g}) vs assignment "
+    print(f"{b}: answer {parts} parts, total {s['total_bits']:.6g} bits (exec {s.get('exec_error_bits', 0):.4g}, alignment "
+          f"{s.get('alignment_error_bits', 0):.4g}, necessity {s.get('necessity_error_bits', 0):.4g}) vs assignment "
           f"{final[1]['total_bits']:.6g}; {len(accepted)} edits, {time.time() - t0:.0f} s", flush=True)
 
 

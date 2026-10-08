@@ -398,7 +398,7 @@ def source_of(ir: dict, behavior: dict, facts_of: dict[str, dict], score: dict |
         lines += ["", *textwrap.wrap(
             f"Score: {score['total_bits']:.4g} bits in total (execution error {score['exec_error_bits']:.4g}, "
             f"opaque numbers {score.get('opaque_bits', 0):.4g}, code {score.get('code_bits', 0):.4g}).", 100)]
-    if ir.get("bindings") or any(n.get("claim") or n.get("rule") for n in ir["nodes"]):
+    if ir.get("alignments") or any(n.get("claim") or n.get("rule") for n in ir["nodes"]):
         raise ValueError("the printer prints node-and-edge programs; this one has alignments or claims")
     used = {"node"} | ({"edges"} if ir["edges"] else set())
     texts = [address(p) for n in ir["nodes"] for p in n["pieces"]]
@@ -660,7 +660,7 @@ def printed(ir: dict, behavior: dict, score: dict | None = None, measured: dict 
         measured = measured if measured is not None else facts(engine_for(ir["model"]), variable_ir(ir), behavior)
         src = algorithm_source(ir, behavior, measured, score)
         check = mech.trace_inline(src, ir["model"], behavior=behavior, decomposition=ir.get("decomposition") or "native")
-        if not check["valid"] or {k: check[k] for k in ("nodes", "edges", "bindings")} != {k: ir[k] for k in ("nodes", "edges", "bindings")}:
+        if not check["valid"] or {k: check[k] for k in ("nodes", "edges", "alignments")} != {k: ir[k] for k in ("nodes", "edges", "alignments")}:
             raise ValueError(f"the printed program does not trace back to the same IR: {check['error']}")
         explanation = algorithm_explanation(ir, behavior, measured)
         return src, {"behavior": behavior["id"], "model": ir["model"], "description": behavior["description"],

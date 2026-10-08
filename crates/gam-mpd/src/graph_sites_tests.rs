@@ -65,7 +65,7 @@ fn full_program() -> Program {
             }
         }
     }
-    Program { model: "tiny".into(), nodes, edges, python_tokens: 0, token_types: 0, source: String::new(), valid: true, error: None, standin: None, base: Vec::new(), explanation_tokens: 0, explanation_token_types: 0, bindings: Vec::new() }
+    Program { model: "tiny".into(), nodes, edges, python_tokens: 0, token_types: 0, source: String::new(), valid: true, error: None, standin: None, base: Vec::new(), explanation_tokens: 0, explanation_token_types: 0, alignments: Vec::new() }
 }
 
 fn max(values: &[f64]) -> f64 {
@@ -604,7 +604,7 @@ fn necessity_pays_for_left_out_mediators() {
     assert!(families.iter().any(|k| *k == "necessity_clean") && families.iter().any(|k| k.starts_with("necessity_edit") || k.starts_with("necessity_rank")) && families.iter().any(|k| k.starts_with("necessity_site")), "{families:?}");
     assert!(full.necessity_error_bits / full.n < f32_kl, "full program necessity {:e} bits per token", full.necessity_error_bits / full.n);
     assert!(partial.necessity_error_bits / partial.n > 1e-3 && partial.necessity_error_bits > 100.0 * full.necessity_error_bits, "partial {:e}, full {:e} bits per token", partial.necessity_error_bits / partial.n, full.necessity_error_bits / full.n);
-    assert!((partial.total_bits - partial.exec_error_bits - partial.necessity_error_bits - partial.claim_error_bits - partial.binding_error_bits - partial.complexity_bits).abs() < 1e-6 * partial.total_bits);
+    assert!((partial.total_bits - partial.exec_error_bits - partial.necessity_error_bits - partial.claim_error_bits - partial.alignment_error_bits - partial.complexity_bits).abs() < 1e-6 * partial.total_bits);
     assert_eq!(none.necessity_error_bits, 0.0);
     assert!(none.exec_error_bits > full.exec_error_bits && none.exec_error_bits / none.n > 1e-3);
     let empty_graph = Graph::empty();
@@ -683,7 +683,7 @@ fn complexity_is_what_a_reader_takes_in() {
     assert_eq!(plain.base_bits, 0.0);
     // The base node f, its edges and the edge into it are charged apart.
     assert!((based.base_bits - ((2 + width.min(hidden)) as f64 * name + 2.0 * edge)).abs() < 1e-9 && (based.structure_bits - (name + edge)).abs() < 1e-9);
-    assert!((plain.total_bits - plain.exec_error_bits - plain.necessity_error_bits - plain.claim_error_bits - plain.binding_error_bits - plain.complexity_bits).abs() < 1e-6 * plain.total_bits);
+    assert!((plain.total_bits - plain.exec_error_bits - plain.necessity_error_bits - plain.claim_error_bits - plain.alignment_error_bits - plain.complexity_bits).abs() < 1e-6 * plain.total_bits);
     assert!(plain.opaque_numbers > 0);
     let scored: usize = scores[0].1.iter().map(|m| m.1.len()).sum();
     assert_eq!(plain.n, scored as f64, "N is the tokens the experiments score");

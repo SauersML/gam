@@ -54,7 +54,7 @@ def check(behavior, model, answer, low):
     source = (HERE / "algorithms" / f"{INDEX[behavior['family']]}.py").read_text() + f"\nalign(answer, {answer})\n"
     ir = mech.trace(source, model, behavior=behavior)
     assert ir["valid"], (model, behavior["id"], ir["error"])
-    assert ir["bindings"][0]["pairs"], (model, behavior["id"])
+    assert ir["alignments"][0]["pairs"], (model, behavior["id"])
     if ir["algorithm_accuracy"] < 0.95:
         low[(model, behavior["id"])] = ir["algorithm_accuracy"]
 
@@ -78,4 +78,4 @@ def test_teacher_assignments():
     assert len(found) == 3 and all(t.count("align(answer") == 1 for t in tails)
     assert "align(prev, <p:1.q.316>, <p:1.k.329>, <p:1.v.228>, <p:1.o.311>)\nclaim(back, <p:1.q.316>, <p:1.k.329>)" in tails[1]
     traced = mech.trace_inline(found[1], "vpd4l", behavior=behavior)
-    assert traced["valid"] and [b["variable"] for b in traced["bindings"]] == ["prev", "answer"]
+    assert traced["valid"] and [b["variable"] for b in traced["alignments"]] == ["prev", "answer"]

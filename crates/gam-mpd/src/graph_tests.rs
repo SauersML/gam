@@ -63,7 +63,7 @@ fn full_program() -> Program {
             }
         }
     }
-    Program { model: "tiny".into(), nodes, edges, python_tokens: 0, token_types: 0, source: String::new(), valid: true, error: None, standin: None, base: Vec::new(), explanation_tokens: 0, explanation_token_types: 0, bindings: Vec::new() }
+    Program { model: "tiny".into(), nodes, edges, python_tokens: 0, token_types: 0, source: String::new(), valid: true, error: None, standin: None, base: Vec::new(), explanation_tokens: 0, explanation_token_types: 0, alignments: Vec::new() }
 }
 
 /// The Checker keeps `M`'s log-probabilities in float32 (relative rounding `2^-24`): on
@@ -883,9 +883,9 @@ fn attention_claims_on_vpd_parts_weigh_the_heads_they_reach() {
 }
 
 #[test]
-fn bindings_are_checked_by_interchange() {
-    use crate::graph::{BindingIr, PairIr};
-    let f = fixture("graph_bindings");
+fn alignments_are_checked_by_interchange() {
+    use crate::graph::{AlignmentIr, PairIr};
+    let f = fixture("graph_alignments");
     let library = Library::new(&f.device, &f.device, &f.native, &f.layers, &f.artifact, 1 << 28, 64).expect("library");
     let weights = Weights::of(&library);
     let cf = counterfactuals(&f.sequences);
@@ -905,32 +905,32 @@ fn bindings_are_checked_by_interchange() {
     let vocabulary = weights.embedding.nrows() as u32;
     let bound = |answers: &[u32]| {
         let mut p = program.clone();
-        p.bindings = vec![BindingIr { variable: "v".into(), nodes: vec!["m0".into()], pairs: pairs.iter().zip(answers).map(|(&(base, source), &a)| PairIr { base, source, answer: vec![a], ..PairIr::default() }).collect() }];
+        p.alignments = vec![AlignmentIr { variable: "v".into(), nodes: vec!["m0".into()], pairs: pairs.iter().zip(answers).map(|(&(base, source), &a)| PairIr { base, source, answer: vec![a], ..PairIr::default() }).collect() }];
         p
     };
     let wrong: Vec<u32> = top.iter().map(|t| (t + 1) % vocabulary).collect();
     let mut checker = Checker::new(weights.clone(), claims_behavior(&f.sequences, &cf)).expect("checker");
-    let true_error = checker.binding_error(&Graph::parse(&bound(&top), &weights).expect("parse")).expect("binding");
-    let false_error = checker.binding_error(&Graph::parse(&bound(&wrong), &weights).expect("parse")).expect("binding");
+    let true_error = checker.alignment_error(&Graph::parse(&bound(&top), &weights).expect("parse")).expect("alignment");
+    let false_error = checker.alignment_error(&Graph::parse(&bound(&wrong), &weights).expect("parse")).expect("alignment");
     assert!(true_error < 1e-6, "M's own interchanged answers cost {true_error:e} bits per target");
     assert!(false_error > 1e-3, "wrong answers cost {false_error:e} bits per target");
-    assert_eq!(checker.binding_error(&graph).expect("no binding"), 0.0);
+    assert_eq!(checker.alignment_error(&graph).expect("no alignment"), 0.0);
     // A set of answers that holds M's top token costs nothing; a set without it pays.
     let with_sets = |sets: Vec<Vec<u32>>| {
         let mut p = bound(&top);
-        for (pair, set) in p.bindings[0].pairs.iter_mut().zip(sets) {
+        for (pair, set) in p.alignments[0].pairs.iter_mut().zip(sets) {
             pair.answers = vec![set];
         }
         Graph::parse(&p, &weights).expect("parse")
     };
-    let holding = checker.binding_error(&with_sets(top.iter().zip(&wrong).map(|(t, w)| vec![*w, *t]).collect())).expect("sets");
-    let missing = checker.binding_error(&with_sets(wrong.iter().map(|w| vec![*w]).collect())).expect("sets");
+    let holding = checker.alignment_error(&with_sets(top.iter().zip(&wrong).map(|(t, w)| vec![*w, *t]).collect())).expect("sets");
+    let missing = checker.alignment_error(&with_sets(wrong.iter().map(|w| vec![*w]).collect())).expect("sets");
     assert!(holding == 0.0 && (missing - false_error).abs() < 1e-9, "sets: holding {holding:e}, missing {missing:e} vs {false_error:e}");
     let (score, _) = checker.score(&bound(&wrong), 4, 1, true, None).expect("score");
-    assert!((score.binding_error_bits - score.n * false_error).abs() <= 1e-6 * score.binding_error_bits, "the score charges N times the error");
-    // A binding names nodes of the program.
+    assert!((score.alignment_error_bits - score.n * false_error).abs() <= 1e-6 * score.alignment_error_bits, "the score charges N times the error");
+    // A alignment names nodes of the program.
     let mut unknown = bound(&top);
-    unknown.bindings[0].nodes = vec!["nowhere".into()];
+    unknown.alignments[0].nodes = vec!["nowhere".into()];
     assert!(Graph::parse(&unknown, &weights).is_err());
 }
 

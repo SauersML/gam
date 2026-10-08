@@ -149,6 +149,8 @@ class Checker:
 
     def finish(self, ir, answer, reader):
         """Adds the reader term to one program's checker answer."""
+        if "binding_error_bits" in answer:  # it would score no alignment: the IR's "alignments" key is new to it
+            raise RuntimeError(f"the checker {BINARY} predates the alignment rename (binding -> alignment); use a build that reads \"alignments\"")
         items = answer.pop("items", None)
         answer["reader_error_bits"] = None
         if reader and items:
