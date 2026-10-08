@@ -2219,7 +2219,10 @@ if FMODE:
         # log sigma by 1% per step
         groups += [{'params': [mu], 'lr': LR * 3e-3 * scale}, {'params': [ls], 'lr': LR * 1e-2}]
 else:
-    groups = [{'params': [cont[key]], 'lr': LR * 3e-3 * scale} for cont, key, scale in slots]
+    # DESCENT_PART_LR multiplies the parts' step sizes (frames F, reads V and writes U) beside the gates': the parts
+    # adapting to the gates (toys: VPD's parts were shaped for its own gates).
+    PART_LR = float(os.environ.get('DESCENT_PART_LR', '1'))
+    groups = [{'params': [cont[key]], 'lr': LR * 3e-3 * scale * (PART_LR if key in ('F', 'V', 'U') else 1.0)} for cont, key, scale in slots]
 # Edge gates by 0.01 per step (from the start's 3, 300 steps to drop an edge the data never defends).
 groups += [{'params': [E['eta']], 'lr': LR * 1e-2} for E in EDGE.values()]
 if FMODE:
