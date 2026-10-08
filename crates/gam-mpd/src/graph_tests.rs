@@ -237,6 +237,28 @@ fn checker_counterfactual_default_scores_the_empty_program_at_the_behavior_signa
     assert!(full.exec_error_bits / full.n < F32_KL, "full program error {:e} bits per token", full.exec_error_bits / full.n);
 }
 
+/// Two items with one prompt text and different counterfactuals keep their own: under
+/// counterfactual stand-ins the empty program's clean error on each is KL(M(x) ‖ M(its x')).
+#[test]
+fn duplicate_prompts_keep_their_own_counterfactuals() {
+    let f = fixture("graph_cf_duplicates");
+    let library = Library::new(&f.device, &f.device, &f.native, &f.layers, &f.artifact, 1 << 28, 64).expect("library");
+    let weights = Weights::of(&library);
+    let (x, partners) = (f.sequences[0].clone(), vec![counterfactuals(&f.sequences)[0].clone(), f.sequences[1].clone()]);
+    assert!(partners[0] != partners[1] && partners.iter().all(|c| c.len() == x.len()));
+    let clean = library.log_probabilities(&library.run(&[x.clone(), x.clone()], &BTreeMap::new()).expect("run").last).expect("log p");
+    let target = library.log_probabilities(&library.run(&partners, &BTreeMap::new()).expect("run").last).expect("log p");
+    let rows = [x.len() - 1, 2 * x.len() - 1];
+    let signal = kl_bits(&clean.select(ndarray::Axis(0), &rows), &target.select(ndarray::Axis(0), &rows));
+    assert!((signal[0] - signal[1]).abs() > 1e-6, "the two counterfactuals move M alike");
+    let prompts = partners.iter().map(|c| Prompt { text: String::new(), token_ids: x.clone(), target_positions: vec![x.len() - 1], counterfactual: Some(crate::graph::Counterfactual { text: String::new(), token_ids: c.clone() }), attention_block: Vec::new() }).collect();
+    let behavior = Behavior { id: "tiny".into(), model: "tiny".into(), family: String::new(), description: String::new(), frequency: None, prompts, split: "train".into(), model_accuracy: None };
+    let mut checker = Checker::new(weights, behavior).expect("checker");
+    let (_, outcomes) = checker.score(&Program { model: "tiny".into(), valid: true, ..Program::default() }, 0, 3, true, None).expect("score");
+    let measured = outcomes.iter().find(|o| o.0 == Experiment::Clean).map(|o| o.1.clone()).expect("clean");
+    assert!(max(&signal.iter().zip(&measured).map(|(a, b)| a - b).collect::<Vec<_>>()) < F32_KL, "empty program clean error {measured:?} vs each item's KL(M(x) ‖ M(x')) {signal:?}");
+}
+
 #[test]
 fn transcoder_features_write_the_transcoder_and_the_rest_is_exact() {
     let f = fixture("graph_transcoder");

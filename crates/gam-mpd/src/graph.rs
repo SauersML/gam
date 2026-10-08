@@ -1671,6 +1671,11 @@ pub struct Batch {
     pub reference: Option<std::sync::Arc<Reference>>,
     /// Per sequence its attention blocks ([`Prompt::attention_block`]), positions within it.
     pub blocks: Vec<Vec<[usize; 4]>>,
+    /// Per sequence, a batch made from a behavior's items: its partner (a prompt's counterfactual,
+    /// a counterfactual's prompt; empty where it has none), whose run its stand-ins read. Empty:
+    /// partners by the sequences' tokens (`Checker::partners`). Two items with one prompt text and
+    /// different counterfactuals keep their own.
+    pub partners: Vec<Vec<u32>>,
 }
 
 impl Batch {
@@ -1688,7 +1693,13 @@ impl Batch {
             return Err("no sequences".into());
         }
         let blocks = vec![Vec::new(); spans.len()];
-        Ok(Self { tokens, spans, reference: None, blocks })
+        Ok(Self { tokens, spans, reference: None, blocks, partners: Vec::new() })
+    }
+
+    /// The batch with each sequence's partner ([`Batch::partners`]).
+    pub fn with_partners(mut self, partners: Vec<Vec<u32>>) -> Self {
+        self.partners = partners;
+        self
     }
 
     /// The batch's sequences.
@@ -2062,7 +2073,7 @@ impl Stacked {
     /// The batch of every copy's rows (no counterfactual run attached, no attention blocks): where
     /// site operations land ([`Interventions::resolve`]).
     fn batch(&self) -> Batch {
-        Batch { tokens: self.tokens.clone(), spans: self.spans.clone(), reference: None, blocks: vec![Vec::new(); self.spans.len()] }
+        Batch { tokens: self.tokens.clone(), spans: self.spans.clone(), reference: None, blocks: vec![Vec::new(); self.spans.len()], partners: Vec::new() }
     }
 }
 
@@ -3813,6 +3824,14 @@ pub struct Prompt {
     pub attention_block: Vec<[usize; 4]>,
 }
 
+impl Prompt {
+    /// Its counterfactual's tokens where that is as long as the prompt (stand-ins read the
+    /// partner's run position by position), else none.
+    fn partner(&self) -> Vec<u32> {
+        self.counterfactual.as_ref().filter(|c| c.token_ids.len() == self.token_ids.len()).map(|c| c.token_ids.clone()).unwrap_or_default()
+    }
+}
+
 /// A behavior file (`~/mpd-data/graph_oracle/behaviors/<model>/<id>.json`).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Behavior {
@@ -4001,13 +4020,13 @@ impl Checker {
             return Err("a behavior of no prompts".into());
         }
         let sequences: Vec<Vec<u32>> = behavior.prompts.iter().map(|p| p.token_ids.clone()).collect();
-        let batch = Batch::new(&sequences)?;
+        let batch = Batch::new(&sequences)?.with_partners(behavior.prompts.iter().map(Prompt::partner).collect());
         let targets: Vec<(usize, &[usize])> = behavior.prompts.iter().enumerate().map(|(i, p)| (i, p.target_positions.as_slice())).collect();
         let rows = scored_rows(&batch, &targets)?;
         // A counterfactual's targets: the prompt's, counted from the end of the sequence.
         let counterfactual = if behavior.prompts.iter().all(|p| p.counterfactual.is_some()) {
             let cf: Vec<Vec<u32>> = behavior.prompts.iter().map(|p| p.counterfactual.as_ref().map(|c| c.token_ids.clone()).unwrap_or_default()).collect();
-            let b = Batch::new(&cf)?;
+            let b = Batch::new(&cf)?.with_partners(behavior.prompts.iter().zip(&cf).map(|(p, c)| if c.len() == p.token_ids.len() { p.token_ids.clone() } else { Vec::new() }).collect());
             let shifted: Vec<Vec<usize>> = behavior.prompts.iter().zip(&cf).map(|(p, c)| p.target_positions.iter().filter_map(|&t| (t + c.len()).checked_sub(p.token_ids.len())).collect()).collect();
             if shifted.iter().zip(&behavior.prompts).any(|(s, p)| s.len() != p.target_positions.len()) {
                 return Err("a counterfactual too short for its prompt's targets".into());
@@ -4322,7 +4341,7 @@ impl Checker {
             out.reference = Some(zeros.entry(rows).or_insert_with(|| Arc::new(Reference::zeros(&self.weights, rows))).clone());
             return Ok(out);
         }
-        let partner: Vec<Vec<u32>> = batch.sequences().iter().map(|s| self.partners.get(s).cloned().ok_or("counterfactual stand-ins need each prompt's counterfactual of the same length")).collect::<Result<_, _>>()?;
+        let partner = self.partners_of(batch)?;
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         std::hash::Hash::hash(&partner, &mut hasher);
         let key = format!("{} {}", self.edit.as_deref().unwrap_or(""), std::hash::Hasher::finish(&hasher));
@@ -4337,6 +4356,19 @@ impl Checker {
         out.reference = Some(r);
         Ok(out)
     }
+
+    /// Each sequence's partner: the batch's own ([`Batch::partners`], by item), else by its tokens.
+    fn partners_of(&self, batch: &Batch) -> Result<Vec<Vec<u32>>, String> {
+        let missing = || "counterfactual stand-ins need each prompt's counterfactual of the same length".to_string();
+        if !batch.partners.is_empty() {
+            if batch.partners.len() != batch.spans.len() {
+                return Err(format!("{} partners for {} sequences", batch.partners.len(), batch.spans.len()));
+            }
+            return batch.partners.iter().map(|p| if p.is_empty() { Err(missing()) } else { Ok(p.clone()) }).collect();
+        }
+        batch.sequences().iter().map(|s| self.partners.get(s).cloned().ok_or_else(missing)).collect()
+    }
+
 
     /// Sets the weight edit applied now (`None` after restoring): part of a counterfactual run's
     /// key, so each edit's runs are kept apart.
@@ -5130,17 +5162,21 @@ impl Checker {
     fn site_batches(&self, donor: bool) -> Result<(Batch, Vec<usize>, Option<Batch>), String> {
         let prompts = &self.behavior.prompts;
         let all: Vec<Vec<u32>> = prompts.iter().map(|p| p.token_ids.clone()).collect();
+        // Each sequence's partner by item (`Batch::partners`): a prompt's counterfactual, a
+        // counterfactual's prompt.
+        let mine = |i: usize| prompts[i].partner();
+        let theirs = |i: usize| if prompts[i].partner().is_empty() { Vec::new() } else { prompts[i].token_ids.clone() };
         if !donor || self.counterfactual_donors() {
-            let base = Batch::new(&all)?;
+            let base = Batch::new(&all)?.with_partners((0..prompts.len()).map(mine).collect());
             let rows = self.clean.1.clone();
-            let donor = if donor { Some(Batch::new(&prompts.iter().map(|p| p.counterfactual.as_ref().map(|c| c.token_ids.clone()).unwrap_or_default()).collect::<Vec<_>>())?) } else { None };
+            let donor = if donor { Some(Batch::new(&prompts.iter().map(|p| p.counterfactual.as_ref().map(|c| c.token_ids.clone()).unwrap_or_default()).collect::<Vec<_>>())?.with_partners((0..prompts.len()).map(theirs).collect())) } else { None };
             return Ok((base, rows, donor));
         }
         if self.donors.is_empty() {
             return Err("site operations with a donor need same-length counterfactuals or two prompts of one length".into());
         }
-        let base = Batch::new(&self.donors.iter().map(|(i, _)| prompts[*i].token_ids.clone()).collect::<Vec<_>>())?;
-        let donors = Batch::new(&self.donors.iter().map(|(_, j)| prompts[*j].token_ids.clone()).collect::<Vec<_>>())?;
+        let base = Batch::new(&self.donors.iter().map(|(i, _)| prompts[*i].token_ids.clone()).collect::<Vec<_>>())?.with_partners(self.donors.iter().map(|&(i, _)| mine(i)).collect());
+        let donors = Batch::new(&self.donors.iter().map(|(_, j)| prompts[*j].token_ids.clone()).collect::<Vec<_>>())?.with_partners(self.donors.iter().map(|&(_, j)| mine(j)).collect());
         let targets: Vec<(usize, &[usize])> = self.donors.iter().enumerate().map(|(k, (i, _))| (k, prompts[*i].target_positions.as_slice())).collect();
         let rows = scored_rows(&base, &targets)?;
         Ok((base, rows, Some(donors)))
@@ -5172,7 +5208,7 @@ impl Checker {
         // The stand-ins' run on the counterfactuals takes the same operations (reference_under);
         // deleted pieces stay zero.
         if base.reference.is_some() && !circuit.delete {
-            let partner: Vec<Vec<u32>> = base.sequences().iter().map(|s| self.partners.get(s).cloned().ok_or("a prompt without a counterfactual")).collect::<Result<_, _>>()?;
+            let partner = self.partners_of(&base)?;
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
             std::hash::Hash::hash(&partner, &mut hasher);
             let key = format!("{} {}", serde_json::to_string(draw).map_err(|e| e.to_string())?, std::hash::Hasher::finish(&hasher));
