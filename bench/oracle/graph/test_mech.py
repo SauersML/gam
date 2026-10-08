@@ -432,22 +432,8 @@ def test_explanation_length():
     assert mech.explanation_length("")[0] == 0
 
 
-def test_base():
-    src = (INDUCTION.replace("from mech import align, claim", "from mech import align, claim, base")
-           + "base(<p:0.fc.53>, <p:0.down.4>, <p:0.v.1>, <p:0.o.2>)\n")
-    ir = mech.trace_inline(src, "vpd4l")
-    assert ir["valid"], ir["error"]
-    assert ir["base"] == ["base.0.attn", "base.0.mlp"]
-    edges = {(e["from"], e["to"]) for e in ir["edges"]}
-    assert {("embed", "base.0.attn"), ("base.0.attn", "base.0.mlp"), ("base.0.mlp", "prev"), ("base.0.attn", "match"),
-            ("base.0.mlp", "answer.3.attn"), ("base.0.mlp", "logits")} <= edges
-    assert [b["variable"] for b in ir["alignments"]] == ["prev", "answer"]  # base parts hold no variable
-    one = mech.trace_inline("from mech import node, edges, base, logits\nbase(<p:1.fc.3>, <p:1.down.4>)\n"
-                            "n = node(<p:2.v.1>, <p:2.o.1>)\nedges(n >> logits)\n", "vpd4l")
-    assert one["valid"] and one["base"] == ["base"] and {"from": "base", "to": "n", "route": "input"} in one["edges"]
-    assert "a part belongs to one node" in mech.trace_inline(src + "base(<p:1.v.228>)\n", "vpd4l")["error"]
-    assert "decomposed by vpd" in mech.trace_inline("from mech import base, L\nbase(L[0].mlp)\n", "vpd4l")["error"]
-
+def test_shared_base_names():
+    assert "belong to the model's shared base" in invalid(HEAD + "base_a0 = node(<p:1.v.1>, <p:1.o.1>)\n")
 
 def test_english():
     source = '"""Module doc."""\n# first comment\nx = 1  # trailing\ndef f():\n    """Function\n    doc."""\n'

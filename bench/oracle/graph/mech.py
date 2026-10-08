@@ -101,7 +101,7 @@ CODES = {"q_proj": "q", "k_proj": "k", "v_proj": "v", "o_proj": "o", "c_fc": "fc
 SITE_OF = {code: site for site, code in CODES.items()}
 PART = re.compile(r"<p:(\d+)\.(?:(q|k|v|o|fc|down|attn|mlp)\.(\d+|rest)|h\.(\d+)|(a|m))>")
 ROUTES = ("query", "key", "value", "input")
-EXPORTS = ("align", "claim", "base", "node", "edges", "L", "PD", "embed", "logits")
+EXPORTS = ("align", "claim", "node", "edges", "L", "PD", "embed", "logits")
 ATTRIBUTES = ("head", "attn", "mlp", "rest", "query", "key", "value", "input") + SITES
 LIBRARY_ARM = "grouped_own"  # the arm of decomp's start that the library view addresses
 
@@ -194,7 +194,6 @@ class _Program:
         self.edges: dict[tuple, Edge] = {}
         self.aligned: dict[str, list[Piece]] = {}
         self.claimed: dict[str, list[Piece]] = {}
-        self.base: list[Piece] = []
 
 
 def _shape() -> dict | None:
@@ -595,15 +594,6 @@ def align(variable, *parts) -> None:
     _PROGRAM.aligned.setdefault(name, []).extend(_pieces(parts, f"align({name}, ...)"))
 
 
-def base(*parts) -> None:
-    """Generic machinery the program runs without explaining it (the model's shared base library): one node
-    per layer's attention or MLP, reading the embedding and the earlier base nodes and feeding every later
-    node and the logits; its structure is charged once across behaviors, outside the program's total."""
-    if _PROGRAM is None:
-        raise MechError("base() runs inside a program")
-    _PROGRAM.base.extend(_pieces(parts, "base(...)"))
-
-
 def claim(pattern, *parts) -> None:
     """The attention of `parts` (q_proj and k_proj parts, or native heads, in each of their layers)
     follows the pattern variable `pattern`: at query t, the positions its value lists (uniformly) or
@@ -829,17 +819,11 @@ def _validate(program: _Program, namespace: dict, ir: dict, behavior: dict | Non
                 if n.id in taken:
                     raise MechError(f"node {n.id} of variable {name} is also a node the program names; rename one")
                 program.nodes.append(n)
-    sites = sorted({(p.layer, p.block()) for p in program.base})
-    machinery = []
-    for layer, block in sites:  # base nodes: one per layer's attention or MLP
-        made = Node(_merged(p for p in program.base if (p.layer, p.block()) == (layer, block)))
-        made.id = "base" if len(sites) == 1 else f"base.{layer}.{block}"
-        if made.id in taken:
-            raise MechError(f"node {made.id} of base() is also a node the program names; rename it")
-        machinery.append(made)
-    ir["base"] = [n.id for n in machinery]
+    for n in program.nodes:
+        if n.id.startswith("base_"):  # the checker merges the model's shared base, nodes base_*, into every program
+            raise MechError(f"node {n.id}: names starting with base_ belong to the model's shared base; rename it")
     owner = {}
-    for n in program.nodes + machinery:
+    for n in program.nodes:
         for p in n.pieces:
             if p.view == "library":
                 continue  # library parts may overlap; the checker takes the union per node
@@ -856,15 +840,6 @@ def _validate(program: _Program, namespace: dict, ir: dict, behavior: dict | Non
         program.edges.setdefault((id(src), id(dst), "input"), Edge(src, dst, "input"))
         return True
 
-    for b in machinery:  # base nodes read the embedding and earlier base nodes, and feed everything later
-        connect(embed, b)
-        for n in program.nodes:
-            if n not in machinery:
-                connect(b, n)
-        for c in machinery:
-            connect(b, c)
-        connect(b, logits)
-    program.nodes.extend(machinery)
     if algorithm is not None:
         sinks = [v for v in aligned if not algorithm.readers[v]]
         if len(sinks) != 1:
