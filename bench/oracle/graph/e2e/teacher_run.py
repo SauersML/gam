@@ -161,10 +161,11 @@ def closed(units: list, ranked: list) -> list:
     return list(dict.fromkeys(out))
 
 
-def answer_search(algorithm: str, ranked: list, scored, budget: int, log=print) -> list:
+def answer_search(algorithm: str, ranked: list, scored, budget: int, log=print, nonempty: bool = False) -> list:
     """The ranked-prefix search in the answer format itself: the family algorithm with every part on the answer,
     align(answer, top k subcomponents) (closed()), for k = 1, 2, 4, ... up to the budget, then 8 steps between the
-    best k's neighbours; the best prefix's units ([] when no prefix beats the algorithm without parts)."""
+    best k's neighbours; the best prefix's units ([] when no prefix beats the algorithm without parts, unless
+    `nonempty`: then the best prefix that names parts, though the program without parts scores lower)."""
     def program(units):
         return algorithm.rstrip() + "\n\n\n" + (f"align(answer, {', '.join(map(token_of, units))})\n" if units else "")
 
@@ -176,7 +177,7 @@ def answer_search(algorithm: str, ranked: list, scored, budget: int, log=print) 
     sets = {k: closed(ranked[:k], ranked) if k else [] for k in ks}
     totals = dict(zip(ks, edits.totals(scored([program(sets[k]) for k in ks], stage="prefix"))))
     log("prefixes: " + ", ".join(f"{k}:{totals[k]:.6g}" for k in ks))
-    best = min(ks, key=lambda k: totals[k])
+    best = min((k for k in ks if k or not nonempty), key=lambda k: totals[k])
     if best:
         i = ks.index(best)
         lo, hi = ks[max(i - 1, 0)], ks[min(i + 1, len(ks) - 1)]
@@ -184,7 +185,7 @@ def answer_search(algorithm: str, ranked: list, scored, budget: int, log=print) 
         sets.update({k: closed(ranked[:k], ranked) for k in steps})
         totals.update(zip(steps, edits.totals(scored([program(sets[k]) for k in steps], stage="prefix"))))
         log("refine: " + ", ".join(f"{k}:{totals[k]:.6g}" for k in steps))
-        best = min(totals, key=lambda k: totals[k])
+        best = min((k for k in totals if k or not nonempty), key=lambda k: totals[k])
     log(f"best k = {best}: {len(sets[best])} parts, {totals[best]:.6g} bits")
     return sets[best]
 
@@ -240,7 +241,7 @@ def answer(a, b: str) -> None:
             ir = teacher.search_ir(json.loads(found.read_text()), behavior["model"])
         else:
             units = answer_search(teacher.algorithm_of(behavior), [search.unit_of(n) for n, _ in ranked["mixed"]], scored,
-                                  a.budget, log=lambda m: print(f"{b}: {m}", flush=True))
+                                  a.budget, log=lambda m: print(f"{b}: {m}", flush=True), nonempty=a.nonempty)
             if not units:
                 print(f"{b}: no prefix beats the program without parts", flush=True)
                 return
@@ -259,7 +260,8 @@ def answer(a, b: str) -> None:
         pool = {v: [p for p in order if p not in named] for v, order in table.items()}
         refined, total, accepted = edits.refine(start, scored, pool, a.rounds, a.adds, max_drops=a.drops,
                                                 log=lambda m: print(f"{b}: {m}", flush=True))
-        final = scored([refined.source(), candidates[best]], experiments=a.final_experiments, seed=1, stage="held-out seed")
+        empty = teacher.algorithm_of(behavior).rstrip() + "\n"
+        final = scored([refined.source(), candidates[best], empty], experiments=a.final_experiments, seed=1, stage="held-out seed")
         traced = mech.trace_inline(refined.source(), behavior["model"], behavior, mech.DEFAULT_DECOMPOSITION.get(behavior["model"]))
         src, graph = printer.printed(traced, behavior, final[0])
     finally:
@@ -271,18 +273,20 @@ def answer(a, b: str) -> None:
     parts = sum(len(s.parts) for s in refined.statements)
     line = {"behavior": b, "family": behavior["family"], "model": behavior["model"], "answer": str(out / f"{b}.answer.txt"),
             "program": str(out / f"{b}.py"), "score": {t: final[0].get(t) for t in TERMS},
-            "assignment_score": {t: final[1].get(t) for t in TERMS}, "refine_bits": total, "parts": parts,
+            "assignment_score": {t: final[1].get(t) for t in TERMS}, "empty_score": {t: final[2].get(t) for t in TERMS},
+            "refine_bits": total, "parts": parts,
             "variables": [s.variable for s in refined.statements if s.kind != "claim"], "accepted": [str(e) for e in accepted],
             "search": str(found), "checker": a.checker_commit, "checker_binary": str(score_module.BINARY),
             "base": os.environ.get("GRAPH_BASE"), "stand_in": a.stand_in or "checker default",
-            "settings": {"experiments": a.experiments, "seed": 0, "rounds": a.rounds, "adds": a.adds, "drops": a.drops,
+            "settings": {"mode": a.mode, "nonempty": a.nonempty, "budget": a.budget, "experiments": a.experiments, "seed": 0,
+                         "rounds": a.rounds, "adds": a.adds, "drops": a.drops,
                          "final_experiments": a.final_experiments, "final_seed": 1}, "seconds": round(time.time() - t0)}
     with open(out / "manifest.jsonl", "a") as f:
         f.write(json.dumps(line) + "\n")
     s = final[0]
     print(f"{b}: answer {parts} parts, total {s['total_bits']:.6g} bits (exec {s.get('exec_error_bits', 0):.4g}, alignment "
           f"{s.get('alignment_error_bits', 0):.4g}, necessity {s.get('necessity_error_bits', 0):.4g}) vs assignment "
-          f"{final[1]['total_bits']:.6g}; {len(accepted)} edits, {time.time() - t0:.0f} s", flush=True)
+          f"{final[1]['total_bits']:.6g}, no parts {final[2]['total_bits']:.6g}; {len(accepted)} edits, {time.time() - t0:.0f} s", flush=True)
 
 
 def main():
@@ -300,6 +304,8 @@ def main():
     ap.add_argument("--mode", choices=["answer", "nodes"], default="answer",
                     help="answer: the prefix search in the answer format (answer_search); nodes: vpd_min.py's node search")
     ap.add_argument("--budget", type=int, default=2048, help="answer mode: the most ranked subcomponents a prefix takes")
+    ap.add_argument("--nonempty", action="store_true", help="answer mode: keep the best prefix that names parts even when "
+                    "the program without parts scores lower (its manifest line carries both totals)")
     ap.add_argument("--search", type=Path, default=DATA / "runs/vpd_min_delete", help="nodes mode: vpd_min.py's --out (and the "
                     "base-filtered rankings)")
     ap.add_argument("--out", type=Path, default=DATA / "teacher")
