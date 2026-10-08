@@ -341,8 +341,10 @@ fn cayley_gradient(skew: &Array2<f64>, rotation: &Array2<f64>, g: &Array2<f64>) 
 }
 
 /// A group's mixing in a fit ([`Mix`]): per place of its slices (in [`Mix::slices`]' order) the
-/// slices' start values there (entries × slices), its skew `S`, `S` before the pending move, and
-/// the gradient in `S` of the step's data term gathered over its passes (bits).
+/// slices' start values there (entries × slices), its skew `S`, `S` before the pending move, the
+/// gradient in `S` of the step's data term gathered over its passes (bits), and the curvature per
+/// token of `F` in each entry of `S`, a running average over one pass of the step's factor draws
+/// chained to `S` ([`Scorer::mixing_curvature`]).
 #[derive(Clone, Debug)]
 struct Mixing {
     mix: Mix,
@@ -350,7 +352,12 @@ struct Mixing {
     skew: Array2<f64>,
     previous: Option<Array2<f64>>,
     gradient: Array2<f64>,
+    curvature: Array2<f64>,
 }
+
+/// The prior variance of a mixing's skew entry `s = tan(θ/2)` of its plane's rotation `θ`
+/// (`Cayley`): unit scale, a right angle at one standard deviation, the same for every group.
+const MIX_PRIOR: f64 = 1.0;
 
 impl Mixing {
     fn of(program: &OperatorProgram, mix: &Mix) -> Result<Self, String> {
@@ -373,7 +380,7 @@ impl Mixing {
                 base
             })
             .collect();
-        Ok(Self { mix: mix.clone(), bases, skew: Array2::zeros((n, n)), previous: None, gradient: Array2::zeros((n, n)) })
+        Ok(Self { mix: mix.clone(), bases, skew: Array2::zeros((n, n)), previous: None, gradient: Array2::zeros((n, n)), curvature: Array2::zeros((n, n)) })
     }
 
     #[cfg(test)]
@@ -397,10 +404,34 @@ impl Mixing {
         Ok(())
     }
 
-    /// Adds the gradient in `S` of a pass whose gradients in the mixed operators are `gradients`:
-    /// per place `∂/∂Q = Xᵀ G` (`X` the start values, `G` the place's gradient, entries × slices),
-    /// chained through `Cayley`.
+    /// Adds the gradient in `S` of a pass whose gradients in the mixed operators are `gradients`
+    /// ([`Mixing::chained`]).
     fn gather(&mut self, gradients: &BTreeMap<usize, Array2<f64>>) -> Result<(), String> {
+        let g = self.chained(gradients)?;
+        self.gradient += &g;
+        Ok(())
+    }
+
+    /// Each free entry `(i < j)` of `S` with its description in nats: `KL(N(s, σ²) ‖ N(0, v))`,
+    /// `v` [`MIX_PRIOR`] and `σ² = 1 / (N h + 1/v)` its Laplace variance at the curvature `h` per
+    /// token over `tokens` (`N`) scored tokens.
+    fn entry_nats(&self, tokens: f64) -> Vec<((usize, usize), f64)> {
+        let n = self.skew.nrows();
+        let mut out = Vec::with_capacity(n * n.saturating_sub(1) / 2);
+        for i in 0..n {
+            for j in i + 1..n {
+                let variance = 1.0 / (tokens * self.curvature[[i, j]].max(0.0) + 1.0 / MIX_PRIOR);
+                let s = self.skew[[i, j]];
+                out.push(((i, j), 0.5 * ((MIX_PRIOR / variance).ln() + (s * s + variance) / MIX_PRIOR - 1.0)));
+            }
+        }
+        out
+    }
+
+    /// The gradient in `S` (a skew matrix) of a pass whose gradients in the mixed operators are
+    /// `gradients`: per place `∂/∂Q = Xᵀ G` (`X` the start values, `G` the place's gradient,
+    /// entries × slices), chained through `Cayley`.
+    fn chained(&self, gradients: &BTreeMap<usize, Array2<f64>>) -> Result<Array2<f64>, String> {
         let n = self.mix.slices.len();
         let mut in_rotation = Array2::zeros((n, n));
         for (p, base) in self.bases.iter().enumerate() {
@@ -415,8 +446,7 @@ impl Mixing {
             in_rotation += &base.t().dot(&g);
         }
         let rotation = cayley(&self.skew)?;
-        self.gradient += &cayley_gradient(&self.skew, &rotation, &in_rotation)?;
-        Ok(())
+        cayley_gradient(&self.skew, &rotation, &in_rotation)
     }
 }
 
@@ -2493,6 +2523,10 @@ struct Scorer {
     mixings: Vec<Mixing>,
     mixed: BTreeMap<usize, Array2<f64>>,
     mix_step: Option<f64>,
+    /// Per mixing, each slice's read group (its bits share of the group's angles in a budget in
+    /// bits), and the fit's scored tokens `N` (the skews' Laplace code, [`Mixing::entry_nats`]).
+    mix_reads: Vec<Vec<usize>>,
+    mix_tokens: f64,
     /// With a budget in bits (`Settings::budget_bits`), each group's description in bits at the
     /// posterior as the step found it, which the step's counts weigh their parts by.
     group_bits: Option<Vec<f64>>,
@@ -2538,6 +2572,31 @@ impl Scorer {
             return Err("a mixed operator outside the posterior: its slices' means are pinned there".into());
         }
         let differentiated: Vec<usize> = explanation.trainable.iter().copied().chain(assignments.iter().map(|a| a.operator)).collect();
+        let read_group: BTreeMap<(usize, usize), usize> = explanation
+            .groups
+            .iter()
+            .enumerate()
+            .filter(|(_, g)| g.name.ends_with(".read") && g.cells.len() == 1 && g.cells[0].rows.len() == 1)
+            .map(|(i, g)| ((g.cells[0].operator, g.cells[0].rows[0]), i))
+            .collect();
+        let mix_reads = explanation
+            .mixes
+            .iter()
+            .map(|mix| {
+                mix.slices
+                    .iter()
+                    .map(|places| {
+                        places
+                            .iter()
+                            .find_map(|p| match p {
+                                Place::Read { operator, row } => read_group.get(&(*operator, *row)).copied(),
+                                Place::Write { .. } => None,
+                            })
+                            .ok_or_else(|| "a mixed slice without a read group".to_string())
+                    })
+                    .collect::<Result<Vec<_>, String>>()
+            })
+            .collect::<Result<Vec<_>, String>>()?;
         let mut experiments =
             Interchange::new(device, native, &sites, &explanation.artifact, &differentiated, reads, settings.numeric_bytes, settings.head_tile_rows)?;
         // Every scoring of the fit (its steps, held-out evaluations and removal comparisons) is of
@@ -2558,7 +2617,7 @@ impl Scorer {
         let hard_gates = stages.iter().flatten().filter(|s| !position.contains_key(&s.width)).map(|s| (s.width, s.threshold, program.operators[s.width].rows.width())).collect();
         let scoring = explanation.scoring;
         let thresholds = stages.iter().flatten().map(|s| (s.threshold, program.operators[s.threshold].rows.width())).collect();
-        let mut scorer = Self { experiments, mlps, stages, hard_gates, scoring, thresholds, position, scope, families: settings.families.clone(), edits: std::cell::RefCell::new(BTreeMap::new()), assignments, written: None, version: 0, assignment_step: None, assignment_budget: Vec::new(), mixings, mixed, mix_step: None, group_bits: None };
+        let mut scorer = Self { experiments, mlps, stages, hard_gates, scoring, thresholds, position, scope, families: settings.families.clone(), edits: std::cell::RefCell::new(BTreeMap::new()), assignments, written: None, version: 0, assignment_step: None, assignment_budget: Vec::new(), mixings, mixed, mix_step: None, mix_reads, mix_tokens: 0.0, group_bits: None };
         scorer.train_gates(None)?;
         Ok(scorer)
     }
@@ -2891,6 +2950,57 @@ impl Scorer {
         Ok(())
     }
 
+    /// The mixings' curvature per token: the step's factor draws in the mixed operators (`factor`,
+    /// weighed by `weight` as the posterior weighs them) chained to each skew, squared, into a
+    /// running average over one pass (`β₂`).
+    fn mixing_curvature(&mut self, factor: &BTreeMap<usize, Tensor>, weight: f64, beta2: f64) -> Result<(), String> {
+        if self.mixings.is_empty() {
+            return Ok(());
+        }
+        let device = self.experiments.models().1.program.device().clone();
+        let mut host = BTreeMap::new();
+        for op in self.mixed.keys() {
+            if let Some(u) = factor.get(op) {
+                host.insert(*op, device.download(u).map_err(error)?);
+            }
+        }
+        for m in &mut self.mixings {
+            let u = m.chained(&host)?;
+            m.curvature = &m.curvature * beta2 + &(&u * &u * (weight * (1.0 - beta2)));
+        }
+        Ok(())
+    }
+
+    /// The mixings' description in nats: every skew entry's Laplace code ([`Mixing::entry_nats`]),
+    /// a term of `F` as every parameter's description is.
+    fn mixing_nats(&self) -> f64 {
+        self.mixings.iter().flat_map(|m| m.entry_nats(self.mix_tokens)).map(|(_, nats)| nats).sum()
+    }
+
+    /// The change of the mixings' description by the pending move of their skews, in nats: at the
+    /// same deviations, the means' term `Σ (s² − s_prev²) / 2v`.
+    fn mixing_change(&self) -> f64 {
+        self.mixings
+            .iter()
+            .filter_map(|m| m.previous.as_ref().map(|p| (m, p)))
+            .map(|(m, p)| {
+                let n = m.skew.nrows();
+                (0..n).flat_map(|i| (i + 1..n).map(move |j| (i, j))).map(|(i, j)| (m.skew[[i, j]].powi(2) - p[[i, j]].powi(2)) / (2.0 * MIX_PRIOR)).sum::<f64>()
+            })
+            .sum()
+    }
+
+    /// Adds each mixed slice's share of its group's angles to its read group's bits (`bits`, per
+    /// group): half of each skew entry's description it shares (descent's rot arm, 489cf5e569).
+    fn add_mixing_bits(&self, bits: &mut [f64]) {
+        for (m, reads) in self.mixings.iter().zip(&self.mix_reads) {
+            for ((i, j), nats) in m.entry_nats(self.mix_tokens) {
+                bits[reads[i]] += 0.5 * nats / LN_2;
+                bits[reads[j]] += 0.5 * nats / LN_2;
+            }
+        }
+    }
+
     fn clear_mixing_gradients(&mut self) {
         for m in &mut self.mixings {
             m.gradient.fill(0.0);
@@ -2904,6 +3014,13 @@ impl Scorer {
     /// within its plane) and, as the assignments' step, doubles at each accepted move and halves
     /// at each rejected one.
     fn step_mixings(&mut self, scale: f64) {
+        // The description's pull `s / v` (nats over the collection), in the gathered gradient's
+        // units: `F`'s per token is `scale` times them.
+        let tokens = self.mix_tokens;
+        for m in &mut self.mixings {
+            let pull = m.skew.mapv(|s| s / (MIX_PRIOR * tokens * scale));
+            m.gradient += &pull;
+        }
         let largest = self.mixings.iter().flat_map(|m| m.gradient.iter()).fold(0.0f64, |m, g| m.max((g * scale).abs()));
         if largest == 0.0 {
             return;
@@ -3573,7 +3690,7 @@ fn step_accepted(
         Some(moved) if lambda > 0.0 => lambda * (moved - complexity_terms(scorer, device_posterior, explanation, active, batch, (key, true))?.0),
         _ => 0.0,
     };
-    let change = (scale * LN_2 * total + divergence + budget) / tokens as f64;
+    let change = (scale * LN_2 * total + divergence + budget + scorer.mixing_change()) / tokens as f64;
     if !change.is_finite() {
         return Err(format!("a nonfinite change of the objective at the move's test ({change})"));
     }
@@ -3759,7 +3876,7 @@ fn held_out_on(
         Some(prior) => prior_term(prior, posterior, noise_seed(settings.seed, 0, 0), false)?.0,
         None => 0.0,
     };
-    let description = gaussian + explanation.fixed_nats + prior_nats;
+    let description = gaussian + explanation.fixed_nats + prior_nats + scorer.mixing_nats();
     Ok(HeldOut {
         objective_bits_per_token: data + description / LN_2 / tokens as f64,
         data_bits_per_token: data,
@@ -4716,6 +4833,7 @@ pub fn fit_from(
         }
     }
     log::info!("library training collection: {tokens} scored tokens, families {families:?}");
+    scorer.mix_tokens = tokens as f64;
     let mut posterior = Posterior::new(explanation, tokens)?;
     let parameters = posterior.mean.iter().map(|m| m.len()).sum();
     let mut progress = Progress {
@@ -5011,7 +5129,9 @@ pub fn fit_from(
             // (3a279507d3) moved it from 69 to 2,813 within three steps of a tiny vpd4l fit.
             let mut parts_note = String::new();
             if settings.budget_bits {
-                scorer.group_bits = Some(device_posterior.divergences()?.iter().map(|d| d / LN_2).collect());
+                let mut bits: Vec<f64> = device_posterior.divergences()?.iter().map(|d| d / LN_2).collect();
+                scorer.add_mixing_bits(&mut bits);
+                scorer.group_bits = Some(bits);
             }
             let budget = match settings.budget.filter(|k| k.is_finite()) {
                 Some(limit) => Some((limit, complexity_terms(&mut scorer, &device_posterior, explanation, &posterior.active, &batch, (key, false))?)),
@@ -5172,6 +5292,7 @@ pub fn fit_from(
             // sums (one antithetic half's, `antithetic_step`).
             let factor_weight = weight * scored as f64 / factor.tokens as f64;
             let posterior_started = Instant::now();
+            scorer.mixing_curvature(&factor.gradient, factor_weight, ivon.beta2)?;
             device_posterior.step(&gradients, weight * LN_2, (&factor.gradient, factor_weight), &prior_curvature, &ivon)?;
             scorer.step_assignments(weight * LN_2);
             scorer.step_mixings(weight * LN_2);
@@ -5680,7 +5801,7 @@ fn snapshot_estimates(
     log::info!("library snapshot: {} batches, experiments {preparing:.2} s, targets {targeting:.2} s, scoring {scoring:.2} s", draws.len());
     // Summed as a removal round's objective sums it (`remove`), so the evaluation it takes over is
     // the one the round would have made, to the last bit.
-    let rest = evaluation.rest + (posterior.description() + explanation.fixed_nats);
+    let rest = evaluation.rest + (posterior.description() + explanation.fixed_nats + scorer.mixing_nats());
     if !rest.is_finite() {
         return Err("a nonfinite posterior divergence".into());
     }
@@ -5713,7 +5834,7 @@ fn remove(
     log: Option<&Path>,
 ) -> Result<Removal, String> {
     let mut prior = prior;
-    let (fixed, Evidence { draws, sequences, settings }) = (explanation.fixed_nats, evidence);
+    let (fixed, Evidence { draws, sequences, settings }) = (explanation.fixed_nats + scorer.mixing_nats(), evidence);
     let timed = Instant::now();
     let compensation = Compensation::new(&mut scorer.experiments, explanation, posterior, sequences, settings.batch_sequences)?;
     let compensated = timed.elapsed().as_secs_f64();
@@ -6814,6 +6935,30 @@ mod tests {
         let reference = scorer_b.pass(&device_b, (&batch, &experiments, &targets), (Values::Mean, Gates::Hard, false), (false, None)).unwrap().bits;
         let gap = shut.iter().flatten().zip(reference.iter().flatten()).fold(0.0f64, |m, (a, b)| m.max((a - b).abs()));
         assert!(gap <= 1e-10, "the shut block against no block: {gap}");
+    }
+
+    /// A mixing's skew is priced as any parameter is ([`Mixing::entry_nats`]): each free entry's
+    /// `KL(N(s, σ²) ‖ N(0, v))` with `σ² = 1 / (N h + 1/v)`, zero at `s = 0` and `h = 0`, and in a
+    /// budget in bits each slice carries half of each entry it shares (the slices' read groups gain
+    /// the whole description between them).
+    #[test]
+    fn a_mixings_skew_is_priced_by_its_laplace_code() {
+        let (native, explanation, _) = learned_tiny_mixed("library_mixing_price", true);
+        let (device, settings) = (Device::host(), settings());
+        let mut scorer = Scorer::new(&device, &native, &explanation, &settings).unwrap();
+        scorer.mix_tokens = 1000.0;
+        assert_eq!(scorer.mixing_nats(), 0.0, "an unrotated, uncurved mixing costs nothing");
+        let k = scorer.mixings.iter().position(|m| m.skew.nrows() == 3).unwrap();
+        let m = &mut scorer.mixings[k];
+        m.skew = Array2::from_shape_fn((3, 3), |(i, j)| [[0.0, 0.3, -0.2], [-0.3, 0.0, 0.4], [0.2, -0.4, 0.0]][i][j]);
+        m.curvature = Array2::from_elem((3, 3), 0.01);
+        let variance = 1.0 / (1000.0 * 0.01 + 1.0 / MIX_PRIOR);
+        let expected: f64 = [0.3_f64, -0.2, 0.4].iter().map(|s| 0.5 * ((MIX_PRIOR / variance).ln() + (s * s + variance) / MIX_PRIOR - 1.0)).sum();
+        assert!((scorer.mixing_nats() - expected).abs() <= 1e-12, "{} against {expected}", scorer.mixing_nats());
+        let mut bits = vec![0.0; explanation.groups.len()];
+        scorer.add_mixing_bits(&mut bits);
+        assert!((bits.iter().sum::<f64>() - expected / LN_2).abs() <= 1e-12, "the slices carry the whole description");
+        assert_eq!(scorer.mix_reads[k].iter().filter(|g| bits[**g] > 0.0).count(), 3, "each slice of the group carries a share");
     }
 
     /// A budget that never binds (`K = ∞`, or `K` far above any count, where `λ` stays 0) leaves
