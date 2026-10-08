@@ -100,8 +100,12 @@ attn = [n for n in site_names() if '.attn.' in n] if os.environ.get('DESCENT_SIT
 # The attention maps gated as slices (all of them, except under the rot arm, whose attention blocks are below).
 sliced = [] if os.environ.get('DESCENT_ARM') == 'rot' else attn
 tok = np.memmap(TOKENS, dtype=np.uint16 if TOKENS.endswith('.u16') else np.float64, mode='r').reshape(-1, 513)
-ev = torch.tensor(tok[1024:1032, :512].astype(np.int64), device=dev)
-# Training rows: DESCENT_TRAIN_ROWS rows of the file, skipping the held-out rows 1024..1031 (default 1024).
+# DESCENT_EVAL_N: the held-out sequences, rows 1024..1024 + N - 1 (default 8, VPD's fair bar's rows). Eight fixed
+# sequences read about 0.05 bits per token above the same program's KL on fresh training text (skc-src2: 0.59-0.61
+# held-out while its multiplier held the training text's at 0.553), so comparisons at the limit use more.
+EVAL_N = int(os.environ.get('DESCENT_EVAL_N', '8'))
+ev = torch.tensor(tok[1024:1024 + EVAL_N, :512].astype(np.int64), device=dev)
+# Training rows: DESCENT_TRAIN_ROWS rows of the file, skipping the held-out rows (default 1024).
 # DESCENT_BATCH sequences of DESCENT_SEQ tokens per step (default 32 x 512, the largest that fits an A40 on the whole
 # model: 33 GB, 16,179 tokens/s against 14,911 at 16 x 512 and 8,660 at 8 x 256, compiled).
 train_rows = int(os.environ.get('DESCENT_TRAIN_ROWS', '1024'))
@@ -2427,12 +2431,12 @@ LOG_EVERY = max(1, 400_000 // (batch * seq))
 with open(out.replace('.json', '.tsv'), 'w') as f_:
     f_.write('step\ttokens\ttrain_kl\ttrain_F\tbits_train_gates\tbits_hard\tlambda' + ('\tgates_evaluated\tkl_delivered' if CONCEPTS else '') + '\n')
 # DESCENT_FRESH=1 (default under CONCEPTS): the training sequences are the token file's rows in a fixed random order,
-# each used once (none repeated before the file's 134M tokens are used), the held-out rows 1024..1031 left out.
+# each used once (none repeated before the file's 134M tokens are used), the held-out rows left out.
 FRESH = os.environ.get('DESCENT_FRESH', '1' if CONCEPTS else '0') == '1'
 if FRESH:
-    order = np.random.default_rng(1).permutation(tok.shape[0] - 8); order = np.where(order >= 1024, order + 8, order)
+    order = np.random.default_rng(1).permutation(tok.shape[0] - EVAL_N); order = np.where(order >= 1024, order + EVAL_N, order)
 for step in range(steps):
-    rows = rng.integers(0, train_rows, batch); rows = np.where(rows >= 1024, rows + 8, rows); offs = rng.integers(0, 513 - seq, batch)
+    rows = rng.integers(0, train_rows, batch); rows = np.where(rows >= 1024, rows + EVAL_N, rows); offs = rng.integers(0, 513 - seq, batch)
     if FRESH:
         rows = order[np.arange(step * batch, (step + 1) * batch) % len(order)]
     ids = torch.tensor(np.stack([tok[r, o:o + seq] for r, o in zip(rows, offs)]).astype(np.int64), device=dev)
