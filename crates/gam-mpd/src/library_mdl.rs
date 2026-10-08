@@ -228,7 +228,7 @@
 use crate::{
     artifact::{Argument, Artifact, Callee, Owner},
     device_posterior::{DevicePosterior, Ivon, State},
-    device_program::{gelu_tanh_constant, law_of},
+    device_program::{DeviceTrace, gelu_tanh_constant, law_of},
     interchange::{self, Batch, Experiment, Interchange, Patch, ReadVariable, Targets},
     library_compensation::Compensation,
     library_removal::{self, Evaluation},
@@ -354,6 +354,10 @@ struct Mixing {
     gradient: Array2<f64>,
     curvature: Array2<f64>,
 }
+
+/// The key a relaxed pass's sampled gates are drawn under, against its weight sample's key: they
+/// draw on the gate nodes' streams, the weight noise on the operators'.
+const GATE_DRAWS: u64 = 0x6761_7465_7364_7261;
 
 /// The prior variance of a mixing's skew entry `s = tan(θ/2)` of its plane's rotation `θ`
 /// (`Cayley`): unit scale, a right angle at one standard deviation, the same for every group.
@@ -2530,6 +2534,9 @@ struct Scorer {
     /// With a budget in bits (`Settings::budget_bits`), each group's description in bits at the
     /// posterior as the step found it, which the step's counts weigh their parts by.
     group_bits: Option<Vec<f64>>,
+    /// Whether relaxed passes draw their gates (`DeviceProgram::set_sampled`), as every fit's do;
+    /// off, they take the expected gate `Φ(z / w)` (a test of a derivative through it).
+    sample_gates: bool,
 }
 
 impl Scorer {
@@ -2617,7 +2624,7 @@ impl Scorer {
         let hard_gates = stages.iter().flatten().filter(|s| !position.contains_key(&s.width)).map(|s| (s.width, s.threshold, program.operators[s.width].rows.width())).collect();
         let scoring = explanation.scoring;
         let thresholds = stages.iter().flatten().map(|s| (s.threshold, program.operators[s.threshold].rows.width())).collect();
-        let mut scorer = Self { experiments, mlps, stages, hard_gates, scoring, thresholds, position, scope, families: settings.families.clone(), edits: std::cell::RefCell::new(BTreeMap::new()), assignments, written: None, version: 0, assignment_step: None, assignment_budget: Vec::new(), mixings, mixed, mix_step: None, mix_reads, mix_tokens: 0.0, group_bits: None };
+        let mut scorer = Self { experiments, mlps, stages, hard_gates, scoring, thresholds, position, scope, families: settings.families.clone(), edits: std::cell::RefCell::new(BTreeMap::new()), assignments, written: None, version: 0, assignment_step: None, assignment_budget: Vec::new(), mixings, mixed, mix_step: None, mix_reads, mix_tokens: 0.0, group_bits: None, sample_gates: true };
         scorer.train_gates(None)?;
         Ok(scorer)
     }
@@ -2631,6 +2638,9 @@ impl Scorer {
     /// law the explanation is scored by ([`Gates::Hard`]): every hard stage at `library_vpd::HARD`
     /// (the hard gate `H(z_b)`), and a learned width's gate by its scoring ([`GateScoring`]).
     fn train_gates(&mut self, posterior: Option<(&DevicePosterior, Center)>) -> Result<(), String> {
+        if posterior.is_none() {
+            self.experiments.explanation_mut().set_sampled(None);
+        }
         if self.scoring == GateScoring::Hard {
             self.experiments.explanation_mut().set_hard(posterior.is_none());
         }
@@ -2687,6 +2697,15 @@ impl Scorer {
                 Values::Mean | Values::Rounded | Values::Sample(_) => Center::Average,
             };
             self.train_gates(Some((posterior, center)))?;
+            // Each gate drawn on with probability Φ(z / w) (`DeviceProgram::set_sampled`), under the
+            // pass's key: the move's two sides draw alike.
+            let key = match values {
+                Values::Iterate(k) | Values::Previous(k) | Values::Sample(k) => k,
+                Values::Mean | Values::Rounded => 0,
+            };
+            if self.sample_gates {
+                self.experiments.explanation_mut().set_sampled(Some(gam_linalg::utils::splitmix64_hash(key ^ GATE_DRAWS)));
+            }
         }
         Ok(())
     }
@@ -3238,43 +3257,86 @@ fn part_targets(scorer: &Scorer, batch: &Batch, experiments: Vec<Experiment>) ->
     Ok((parts.into_iter().flatten().collect(), targets))
 }
 
-/// The budget's feasible start (`Settings::budget`): every gated stage's thresholds (`library_vpd`)
-/// lowered by one shift `Δ` times each gate's unit (its learned width, or its threshold's posterior
-/// deviation for a hard gate), the posterior's means pinned there ([`DevicePosterior::pin`]), with
-/// `Δ` bisected until the batch's count ([`complexity_terms`]) is at `limit`. Returns `Δ`.
-fn calibrate(scorer: &mut Scorer, device_posterior: &mut DevicePosterior, explanation: &Explanation, active: &[bool], batch: &Batch, key: u64, limit: f64) -> Result<f64, String> {
-    let mut stages = Vec::new();
-    for stage in scorer.stages.iter().flatten() {
-        let i = scorer.at(stage.threshold)?;
-        let start = device_posterior.iterate(i)?;
-        let unit: Vec<f64> = match scorer.at(stage.width) {
-            Ok(w) => device_posterior.iterate(w)?.column(0).iter().map(|v| v.abs()).collect(),
-            Err(_) => device_posterior.values(i)?.1.column(0).iter().map(|s| s.exp()).collect(),
-        };
-        stages.push((i, start, unit));
+/// Per gate row of the budget's terms, F's push against the count per part and the row's weight:
+/// `(max(0, −⟨∂F, ∂Ê⟩) / |∂Ê|², |∂Ê|²)` along the row's parameters (a threshold's entry, a
+/// direction's row), `∂F` the step's gradient `gradients` in bits times `scale ln 2`; ascending.
+fn balance_rates(terms: &[(usize, Tensor, Tensor)], gradients: &BTreeMap<usize, Tensor>, (device, explanation): (&Device, &Explanation), scale: f64) -> Result<Vec<(f64, f64)>, String> {
+    let mut ratios = Vec::new();
+    for (i, mean, _) in terms {
+        let Some(g) = gradients.get(&explanation.trainable[*i]) else { continue };
+        let (data, count) = (device.download(g).map_err(error)?, device.download(mean).map_err(error)?);
+        if data.dim() != count.dim() {
+            continue;
+        }
+        for (f, k) in data.rows().into_iter().zip(count.rows()) {
+            let (along, square) = (f.dot(&k) * scale * LN_2, k.dot(&k));
+            if square > 0.0 && along.is_finite() {
+                ratios.push(((-along).max(0.0) / square, square));
+            }
+        }
     }
-    let mut count_at = |shift: f64| -> Result<f64, String> {
-        let pinned: Vec<(usize, Array2<f64>)> = stages.iter().map(|(i, start, unit)| (*i, Array2::from_shape_fn(start.dim(), |(b, c)| start[[b, c]] - shift * unit[b]))).collect();
-        device_posterior.pin(&pinned)?;
-        Ok(complexity_terms(scorer, device_posterior, explanation, active, batch, (key, false))?.0)
-    };
-    let (mut low, mut high) = (0.0, 1.0);
-    while count_at(high)? > limit {
-        (low, high) = (high, 2.0 * high);
-        if high > 1e6 {
-            return Err(format!("library budget: no threshold shift brings the count to K {limit}"));
+    ratios.sort_by(|a, b| a.0.total_cmp(&b.0));
+    Ok(ratios)
+}
+
+/// Each component's unit of a gated stage's threshold shift ([`project`]): its learned width, or
+/// for a hard gate its threshold's posterior deviation.
+fn gate_units(scorer: &Scorer, device_posterior: &DevicePosterior, stage: &GatedStage) -> Result<Vec<f64>, String> {
+    Ok(match scorer.at(stage.width) {
+        Ok(w) => device_posterior.iterate(w)?.column(0).iter().map(|v| v.abs()).collect(),
+        Err(_) => device_posterior.values(scorer.at(stage.threshold)?)?.1.column(0).iter().map(|s| s.exp()).collect(),
+    })
+}
+
+/// The budget as a projection (`Settings::budget`): where the count at the step's sample on the
+/// batch's forward exceeds `limit`, every gated stage's thresholds (`library_vpd`) rise by one
+/// shift `Δ` times each gate's unit ([`gate_units`]) and every ReLU function's gate bias falls by
+/// `Δ` times its posterior deviation, `Δ` bisected
+/// until the count is at `limit`, the posterior's means pinned there ([`DevicePosterior::pin`]):
+/// projected descent onto the constraint set `E[k] ≤ K`, run after every step, so the count never
+/// exceeds `K` and λ only steers which gates trade. A count below `K` is left as it is: the budget
+/// is an inequality, and a fit whose free count is below it is not pushed up to it. Returns `Δ`
+/// and the hard count before and after it.
+fn project(scorer: &mut Scorer, device_posterior: &mut DevicePosterior, explanation: &Explanation, active: &[bool], batch: &Batch, key: u64, limit: f64) -> Result<(f64, f64, f64), String> {
+    let (family, trace) = count_trace(scorer, device_posterior, batch, (key, false))?;
+    let mut count_at = |shift: f64| -> Result<f64, String> { Ok(count_terms(scorer, device_posterior, explanation, active, (&family, &trace), (false, shift, false))?.0) };
+    // A bracket by doubling toward the budget, then bisection.
+    let at_zero = count_at(0.0)?;
+    if at_zero <= limit {
+        return Ok((0.0, at_zero, at_zero));
+    }
+    let direction = 1.0;
+    let (mut near, mut far) = (0.0, direction);
+    while (count_at(far)? > limit) == (direction > 0.0) {
+        (near, far) = (far, 2.0 * far);
+        if far.abs() > 1e6 {
+            return Err(format!("library budget: no threshold shift brings the count to K {limit} (at no shift {at_zero})"));
         }
     }
     for _ in 0..40 {
-        let middle = 0.5 * (low + high);
-        if count_at(middle)? > limit {
-            low = middle;
+        let middle = 0.5 * (near + far);
+        if (count_at(middle)? > limit) == (direction > 0.0) {
+            near = middle;
         } else {
-            high = middle;
+            far = middle;
         }
     }
-    count_at(high)?;
-    Ok(high)
+    let shift = far;
+    let count = count_at(shift)?;
+    let mut pinned = Vec::new();
+    for stage in scorer.stages.iter().flatten() {
+        let i = scorer.at(stage.threshold)?;
+        let start = device_posterior.iterate(i)?;
+        let unit = gate_units(scorer, device_posterior, stage)?;
+        pinned.push((i, Array2::from_shape_fn(start.dim(), |(b, c)| start[[b, c]] - shift * unit[b])));
+    }
+    for b in scorer.mlps.iter().flatten().filter(|m| m.law == Law::Relu && m.up.is_none()).filter_map(|m| m.gate.bias) {
+        let j = scorer.at(b)?;
+        let (start, log_sd) = (device_posterior.iterate(j)?, device_posterior.values(j)?.1);
+        pinned.push((j, &start - &log_sd.mapv(|s| shift * s.exp())));
+    }
+    device_posterior.pin(&pinned)?;
+    Ok((shift, at_zero, count))
 }
 
 /// The batch's expected parts executed per token under the posterior (`library_complexity`) and,
@@ -3286,18 +3348,36 @@ fn calibrate(scorer: &mut Scorer, device_posterior: &mut DevicePosterior, explan
 /// counts one; a gated layer's fixed positions (where its block's output is not its functions',
 /// `library_transcoder`'s first token) count nothing of it.
 fn complexity_terms(scorer: &mut Scorer, device_posterior: &DevicePosterior, explanation: &Explanation, active: &[bool], batch: &Batch, (key, previous): (u64, bool)) -> Result<(f64, Vec<(usize, Tensor, Tensor)>), String> {
-    // A training pass at the iterate's sample, or with `previous` around the iterate before the
-    // pending move (its test, `step_accepted`): the gates' inputs, and every gate's own means
-    // (thresholds, widths, directions) on the same side of the move.
+    let (family, trace) = count_trace(scorer, device_posterior, batch, (key, previous))?;
+    count_terms(scorer, device_posterior, explanation, active, (&family, &trace), (previous, 0.0, true))
+}
+
+/// The forward the budget's count reads its gates' inputs from: a training pass at the iterate's
+/// sample of `key`, or with `previous` around the iterate before the pending move (its test,
+/// `step_accepted`), on the batch's bases.
+fn count_trace(scorer: &mut Scorer, device_posterior: &DevicePosterior, batch: &Batch, (key, previous): (u64, bool)) -> Result<(FamilyInputs, DeviceTrace), String> {
     let values = if previous { Values::Previous(key) } else { Values::Iterate(key) };
-    let center = |i: usize| if previous { device_posterior.previous_iterate(i) } else { device_posterior.iterate(i) };
     scorer.set(device_posterior, values, Gates::Relaxed)?;
     let family = sequence_family(&batch.base.iter().map(Vec::as_slice).collect::<Vec<_>>())?;
     // The count's derivatives are a step's, so its forward and products run in the reverse passes'
     // arithmetic, as every evaluation of P with a gradient does (`Scorer::reversed`, b290535ec5).
     let trace = scorer.reversed(|experiments| experiments.models().1.program.forward(&family));
     scorer.rest(Gates::Relaxed)?;
-    let trace = trace?;
+    Ok((family, trace?))
+}
+
+/// [`complexity_terms`] on the forward `trace` of `family` ([`count_trace`]), every gated stage's
+/// thresholds lowered by `shift` times each gate's unit ([`project`]); every gate's own means
+/// (thresholds, widths, directions) on the side of the move `previous` names.
+fn count_terms(
+    scorer: &mut Scorer,
+    device_posterior: &DevicePosterior,
+    explanation: &Explanation,
+    active: &[bool],
+    (family, trace): (&FamilyInputs, &DeviceTrace),
+    (previous, shift, relaxed): (bool, f64, bool),
+) -> Result<(f64, Vec<(usize, Tensor, Tensor)>), String> {
+    let center = |i: usize| if previous { device_posterior.previous_iterate(i) } else { device_posterior.iterate(i) };
     let (_, p) = scorer.experiments.models();
     let (program, d) = (p.program, p.program.device());
     let arithmetic = interchange::factor_arithmetic(d, program.arithmetic());
@@ -3322,7 +3402,8 @@ fn complexity_terms(scorer: &mut Scorer, device_posterior: &DevicePosterior, exp
                     None => stage.ranks(active),
                 };
                 let j = scorer.at(stage.threshold)?;
-                let bias = (center(j)?.column(0).to_vec(), device_posterior.values(j)?.1.column(0).mapv(|s| (2.0 * s).exp()).to_vec());
+                let unit = gate_units(scorer, device_posterior, stage)?;
+                let bias = (center(j)?.column(0).iter().zip(&unit).map(|(m, u)| m - shift * u).collect::<Vec<f64>>(), device_posterior.values(j)?.1.column(0).mapv(|s| (2.0 * s).exp()).to_vec());
                 // A direction gate's means and variances stay on the device (the posterior's iterate
                 // and `e^{2s}`); its count's derivatives come back as device tensors.
                 let direction = match stage.direction {
@@ -3344,12 +3425,17 @@ fn complexity_terms(scorer: &mut Scorer, device_posterior: &DevicePosterior, exp
                 // The gates' widths enter the count (what the pass executes) but take no pull from
                 // it: nothing keeps a width positive.
                 // A hard gate has no width (`library_vpd::Gate::Hard`): its count is `Φ(m / σ)`.
-                // The count is the hard gate's under the posterior, E_q[H(z)] = Φ(μ_z / sd_q(z)): what
-                // the explanation executes when it is evaluated (hard), with the posterior's own noise
-                // and no learned width (with `s² = w² + σ²` the count followed the widths the data
-                // widened as the budget raised the thresholds: on toys' TMS at its true K it held near
-                // 52 while the hard count fell from 62 to 44). It reaches σ through `∂Ê/∂σ²`.
-                let width = vec![0.0; explanation.artifact.program.operators[stage.width].rows.width()];
+                // The count the budget holds (`relaxed` false) is the hard gate's under the posterior,
+                // E_q[H(z)] = Φ(μ_z / sd_q(z)): what the explanation executes when it is evaluated
+                // (hard), with the posterior's own noise and no learned width. The count the step
+                // descends (`relaxed`) reads the learned widths too, `Φ(μ_z / √(w² + σ²))`: the
+                // hard count's derivative vanishes on every gate a few deviations from its
+                // threshold, so a gate the data leaves free to close but firmly on took no pull
+                // (toys' gated copy under a budget in bits: no gate closed while λ reached 4e5).
+                let width = match scorer.at(stage.width) {
+                    Ok(w) if relaxed => center(w)?.column(0).iter().map(|v| v.abs()).collect(),
+                    _ => vec![0.0; explanation.artifact.program.operators[stage.width].rows.width()],
+                };
                 let extra = followed.as_ref().map(|(m, s2, w)| (m, s2, w.as_slice()));
                 let (expected, gate_terms, assigned, components) = gated_expected(d, arithmetic, trace.value(stage.input)?, gate, (&bias.0, &bias.1, &width), &rank, (assign.as_ref(), extra))?;
                 followed = Some(components);
@@ -3390,7 +3476,10 @@ fn complexity_terms(scorer: &mut Scorer, device_posterior: &DevicePosterior, exp
         let bias = match mlp.gate.bias {
             Some(b) => {
                 let j = scorer.at(b)?;
-                Some((j, center(j)?.column(0).to_owned(), device_posterior.values(j)?.1.column(0).mapv(|s| (2.0 * s).exp())))
+                let log_sd = device_posterior.values(j)?.1.column(0).to_owned();
+                // A function's bias moves by `shift` of its posterior deviation ([`project`]).
+                let mean = &center(j)?.column(0) - &log_sd.mapv(|s| shift * s.exp());
+                Some((j, mean, log_sd.mapv(|s| (2.0 * s).exp())))
             }
             None => None,
         };
@@ -5029,6 +5118,14 @@ pub fn fit_from(
     // The best epoch's snapshot evaluation, the removal round's start (not checkpointed: a resumed
     // fit scores it again).
     let mut best_evaluation: Option<Evaluation> = None;
+    // A budget is held by projection after every step ([`project`]) on gated components' thresholds
+    // and ReLU functions' gate biases; an explanation with neither (functions whose gates have no
+    // bias, the tiny decoder's) keeps the multiplier's integral rule.
+    let projected = scorer.stages.iter().any(|s| !s.is_empty()) || scorer.mlps.iter().flatten().any(|m| m.law == Law::Relu && m.up.is_none() && m.gate.bias.is_some());
+    // Whether the last projection bound (the count at its target), where λ steers, and the first
+    // projected step's count and step, from which the target eases to `K`.
+    let mut bound = false;
+    let mut eased: Option<(f64, i32)> = None;
     let best_path = checkpoint.map_or_else(
         || std::env::temp_dir().join(format!("library_best_{}_{}.bin", std::process::id(), FITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed))),
         |path| path.with_extension("best.bin"),
@@ -5047,6 +5144,8 @@ pub fn fit_from(
         let (mut clean, mut patched) = (Mean::default(), Mean::default());
         // The steps' expected parts executed per token and their count (`Settings::budget`).
         let mut parts = (0.0, 0usize);
+        // With a projected budget, the hard counts before each step's projection.
+        let mut hard = (0.0, 0usize);
         for (b, draw) in draws.iter().enumerate() {
             let step_started = Instant::now();
             scorer.next_batch();
@@ -5164,7 +5263,7 @@ pub fn fit_from(
                     continue;
                 }
             }
-            if let Some((limit, (mut expected, mut terms))) = budget {
+            if let Some((limit, (expected, terms))) = budget {
                 parts.0 += expected;
                 parts.1 += 1;
                 // The multiplier: from the first step whose count exceeds the budget, λ starts at
@@ -5199,52 +5298,33 @@ pub fn fit_from(
                 // −⟨g_F, g_k⟩ / |g_k|² (560f12d2d3's λ̄ Ê / K) explodes where most gates are
                 // saturated and |g_k| is tiny: a toy fit (resid_mlp_1l, K = 55) took λ to 8,000 and
                 // diverged with the count flat.
-                if !progress.engaged && limit > 0.0 && expected > limit {
-                    // An explanation of gated components starts feasible: every stage's thresholds rise
-                    // by one shift in units of their gates' widths until the batch's count is `K`
-                    // ([`calibrate`]; descent's start at the budget, 12fe763ced). From a start far
-                    // above `K` the pull closed gates en masse once it outweighed F: on the learned
-                    // tiny library the count fell from 76 to 9–18 parts within an epoch against K near
-                    // 65 and climbed back to 25–80 over 25 epochs (GHA, seeds 3–7).
-                    let calibrated = scorer.stages.iter().any(|s| !s.is_empty());
-                    if calibrated {
-                        let shift = calibrate(&mut scorer, &mut device_posterior, explanation, &posterior.active, &batch, key, limit)?;
-                        (expected, terms) = complexity_terms(&mut scorer, &device_posterior, explanation, &posterior.active, &batch, (key, false))?;
-                        log::info!("library budget: every threshold raised by {shift:.4e} of its gate's width, the count at {expected:.4} (K {limit})");
-                    }
-                    // λ starts where a pull would remove the count's excess to first order: each gate's
-                    // exchange rate r_b = max(0, −⟨∂F, ∂Ê⟩) / |∂Ê|² along its row of parameters (F's push
-                    // against the count per part; zero where F lowers the count itself), weighted by its
-                    // share of the count's response to a pull along ∂Ê, |∂Ê|². A pull λ moves the
-                    // count off the gates whose rate is below it, so λ₀ is the smallest positive rate
-                    // below which the weights carry at least the excess share (Ê − K) / Ê. A start
-                    // above the multiplier that holds the count at `K` closes gates that do not reopen:
-                    // the median of the unsigned balances |⟨∂F, ∂Ê⟩| / |∂Ê|² (2456421177) started λ at
-                    // 64–140 on the tiny decoder, the count fell from 15–18 to 7–9 parts within an
-                    // epoch against K near 11 and stayed below it while λ fell to 2 (GHA, seeds 4–7).
-                    let mut ratios = Vec::new();
-                    for (i, mean, _) in &terms {
-                        let Some(g) = gradients.get(&explanation.trainable[*i]) else { continue };
-                        let (data, count) = (device.download(g).map_err(error)?, device.download(mean).map_err(error)?);
-                        if data.dim() != count.dim() {
-                            continue;
-                        }
-                        for (f, k) in data.rows().into_iter().zip(count.rows()) {
-                            let (along, square) = (f.dot(&k) * scale * LN_2, k.dot(&k));
-                            if square > 0.0 && along.is_finite() {
-                                ratios.push(((-along).max(0.0) / square, square));
-                            }
-                        }
-                    }
-                    ratios.sort_by(|a, b| a.0.total_cmp(&b.0));
-                    // At a calibrated (feasible) start there is no excess: λ holds the count where it
-                    // is at the slope-weighted median of the positive rates, F's push on the gates the
-                    // pull reaches against it (269b6645c2's rule).
-                    if calibrated {
-                        ratios.retain(|r| r.0 > 0.0);
-                    }
-                    let share = if calibrated { 0.5 } else { (expected - limit) / expected };
-                    let excess = ratios.iter().map(|r| r.1).sum::<f64>() * share;
+                if projected {
+                    // The count is held at `K` by the projection after every step ([`project`]); λ
+                    // steers which gates trade: the slope-weighted median of the positive rates
+                    // max(0, −⟨∂F, ∂Ê⟩) / |∂Ê|², F's push against the count where the projection holds
+                    // it (269b6645c2's rule), measured at every step. An integral rule on λ with a
+                    // projection only at the start (8ed727551e) let every MLP gate close within
+                    // epochs and none reopen (the learned tiny library, GHA seeds 3–7), and on toys'
+                    // gated copy under a budget in bits λ reached 4e5 while no gate closed.
+                    // Where the constraint is slack (the last projection did not bind), λ is zero: the
+                    // pull kept on below `K` closed every MLP gate of the learned tiny library and then
+                    // the always-on parts (GHA, seeds 3–6).
+                    let mut ratios = balance_rates(&terms, &gradients, (device, explanation), scale)?;
+                    ratios.retain(|r| r.0 > 0.0);
+                    let half = 0.5 * ratios.iter().map(|r| r.1).sum::<f64>();
+                    let mut below = 0.0;
+                    progress.engaged = true;
+                    progress.multiplier = if bound {
+                        ratios.iter().find(|r| {
+                            below += r.1;
+                            below >= half
+                        }).map_or(0.0, |r| r.0)
+                    } else {
+                        0.0
+                    };
+                } else if !progress.engaged && limit > 0.0 && expected > limit {
+                    let ratios = balance_rates(&terms, &gradients, (device, explanation), scale)?;
+                    let excess = ratios.iter().map(|r| r.1).sum::<f64>() * (expected - limit) / expected;
                     let mut below = 0.0;
                     let start = ratios.iter().find(|r| {
                         below += r.1;
@@ -5297,6 +5377,25 @@ pub fn fit_from(
             scorer.step_assignments(weight * LN_2);
             scorer.step_mixings(weight * LN_2);
             scorer.pin_mixings(&mut device_posterior)?;
+            if let Some(limit) = settings.budget.filter(|k| k.is_finite() && projected) {
+                // The target eases from the first step's count to `K` with the horizon `H` of the
+                // step's averages, `K + (C₀ − K) e^{−t/H}`: a projection of the whole excess at once
+                // shut gates regardless of their worth (toys' gated copy at its true K, 32,100 bits
+                // per token at the start against 7,850: its held-out KL went from 0.13 bits per token
+                // without the budget to 1,100).
+                let horizon = (draws.len() as f64).max(1.0 / (1.0 - ivon.beta1));
+                let target = match eased {
+                    // The first step measures the count it eases from.
+                    None => f64::INFINITY,
+                    Some((start, at)) => limit + (start - limit).max(0.0) * (-f64::from(progress.step - at) / horizon).exp(),
+                };
+                let (shift, before, count) = project(&mut scorer, &mut device_posterior, explanation, &posterior.active, &batch, key, target)?;
+                eased.get_or_insert((before, progress.step));
+                bound = shift > 0.0;
+                hard.0 += before;
+                hard.1 += 1;
+                parts_note.push_str(&format!(", hard {before:.4} projected by {shift:.3e} widths to {count:.4}"));
+            }
             let posterior_seconds = posterior_started.elapsed().as_secs_f64();
             let (eta, rho, draws_averaged, ratio) = device_posterior.step_state();
             log::info!("library line step {epoch}.{b}: η {eta:.4e}, ρ̄ {rho:.4e} over {draws_averaged} draws, r̄ {ratio:.4e}, trust {:.3e}; posterior step {posterior_seconds:.3} s", device_posterior.trust());
@@ -5354,7 +5453,7 @@ pub fn fit_from(
                 None
             },
             budget: settings.budget,
-            expected_parts: settings.budget.map(|_| parts.0 / parts.1.max(1) as f64),
+            expected_parts: settings.budget.map(|_| if hard.1 > 0 { hard.0 / hard.1 as f64 } else { parts.0 / parts.1.max(1) as f64 }),
             multiplier: settings.budget.map(|_| progress.multiplier),
         };
         log::info!("library fit epoch {epoch}: {record:?}");
@@ -6840,6 +6939,7 @@ mod tests {
         let batch = draws[0].batch(&sequences).unwrap();
         let experiments = scorer.experiments(&draws[0], &sequences).unwrap();
         let targets = scorer.experiments.targets(&batch, &experiments).unwrap();
+        scorer.sample_gates = false;
         // A group of the second layer's c_fc slices, at a skew away from zero.
         let k = scorer.mixings.iter().rposition(|m| m.slices_len() == 3).unwrap();
         let start = Array2::from_shape_fn((3, 3), |(i, j)| [[0.0, 0.3, -0.2], [-0.3, 0.0, 0.4], [0.2, -0.4, 0.0]][i][j]);
@@ -6961,6 +7061,32 @@ mod tests {
         assert_eq!(scorer.mix_reads[k].iter().filter(|g| bits[**g] > 0.0).count(), 3, "each slice of the group carries a share");
     }
 
+    /// A block across blocks with every block on takes every drawn weight edit as `M` does (the gap
+    /// `KL(M_e ‖ P_e)` under 1e-9 bits per token, `Interchange::weight_scores`): the carried gate's
+    /// recompute reads its home's input under the edit as the home block does (compare's check).
+    #[test]
+    fn a_block_across_blocks_with_every_block_on_takes_weight_edits_as_m() {
+        let (native, explanation, sequences) = cross_tiny("library_cross_weights", true);
+        let (device, settings) = (Device::host(), settings());
+        let mut scorer = Scorer::new(&device, &native, &explanation, &settings).unwrap();
+        let screen = Batch::new(sequences[..2].to_vec(), sequences[..2].to_vec()).unwrap();
+        let drawn = scorer.experiments.draw_weight_edits(&native, &screen, 3, (64, 16)).unwrap();
+        let posterior = Posterior::new(&explanation, 72).unwrap();
+        let device_posterior = DevicePosterior::new(&device, &explanation, &posterior, 72.0, None, 0).unwrap();
+        device_posterior.mean_into(scorer.experiments.explanation_mut()).unwrap();
+        for (t, rows) in scorer.thresholds.clone() {
+            let on = device.upload(Array2::from_elem((rows, 1), 1e30).view()).unwrap();
+            scorer.experiments.explanation_mut().replace_dense_parameter(t, on).unwrap();
+        }
+        scorer.experiments.explanation_mut().refresh_fused().unwrap();
+        let scores = scorer.experiments.weight_scores(&screen, &(0..drawn.len()).collect::<Vec<_>>()).unwrap();
+        let taken: Vec<&interchange::WeightScores> = scores.iter().flatten().collect();
+        assert!(!taken.is_empty() && taken.iter().any(|s| s.effect > 1e-6), "edits that move M");
+        for s in taken {
+            assert!(s.gap.abs() <= 1e-9, "every block on: gap {} (effect {})", s.gap, s.effect);
+        }
+    }
+
     /// A budget that never binds (`K = ∞`, or `K` far above any count, where `λ` stays 0) leaves
     /// the fit bit for bit; a finite one records `K`, `Ê[k]` and `λ` in every epoch.
     #[test]
@@ -7032,6 +7158,45 @@ mod tests {
         let trace: Vec<String> = bound.report.epochs.iter().map(|e| format!("{:.2} at λ {:.3e}", e.expected_parts.unwrap_or(f64::NAN), e.multiplier.unwrap_or(f64::NAN))).collect();
         assert!(last.multiplier.is_some_and(|l| l > 0.0), "the multiplier stayed at zero over the budget: {trace:?}");
         assert!(mean <= limit + spread && mean >= 0.8 * limit, "the last 6 epochs' mean {mean} ± {spread} parts per token against the budget {limit} (free {free_parts}): {trace:?}");
+    }
+
+    /// The main line's budget (`library_vpd` with learned widths, its gates drawn on/off in training,
+    /// the count projected to `K` after every step): on the learned tiny library trained on 256
+    /// sequences of its tokens drawn uniformly (B = 128 batches of 2), with `K` three quarters of the
+    /// free fit's count, the expected parts per token over the last 6 of 30 epochs are at most `K`
+    /// plus their standard error and at least 0.8 `K` on seeds 3–7.
+    #[test]
+    fn a_learned_gate_library_meets_its_budget() {
+        let (native, explanation, sequences) = learned_tiny("library_budget_learned_binds");
+        let held = &sequences[..2];
+        let mut symbols: Vec<u32> = sequences.iter().flatten().copied().collect();
+        symbols.sort_unstable();
+        symbols.dedup();
+        let mut rng = StdRng::seed_from_u64(17);
+        let train: Vec<Vec<u32>> = (0..256).map(|_| (0..sequences[0].len()).map(|_| symbols[rng.random_range(0..symbols.len())]).collect()).collect();
+        let mut failures = Vec::new();
+        for seed in [3u64, 4, 5, 6, 7] {
+            let run = |budget: f64, epochs: usize| {
+                let mut settings = settings();
+                settings.seed = seed;
+                settings.epochs = Some(epochs);
+                settings.budget = Some(budget);
+                fit(&Device::host(), &native, &explanation, &train, held, &settings, "tiny", None, None).unwrap()
+            };
+            let free = run(1e9, 3);
+            let free_parts = free.report.epochs.last().and_then(|e| e.expected_parts).unwrap();
+            let limit = 0.75 * free_parts;
+            let bound = run(limit, 30);
+            let tail: Vec<f64> = bound.report.epochs.iter().rev().take(6).map(|e| e.expected_parts.unwrap()).collect();
+            let mean = tail.iter().sum::<f64>() / tail.len() as f64;
+            let spread = (tail.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (tail.len() - 1) as f64 / tail.len() as f64).sqrt();
+            let trace: Vec<String> = bound.report.epochs.iter().map(|e| format!("{:.2} at λ {:.3e}", e.expected_parts.unwrap_or(f64::NAN), e.multiplier.unwrap_or(f64::NAN))).collect();
+            eprintln!("SEED {seed} mean {mean:.3} ± {spread:.3} K {limit:.3} free {free_parts:.2}: {}", trace.join(" | "));
+            if mean > limit + spread || mean < 0.8 * limit {
+                failures.push(format!("seed {seed}: the last 6 epochs' mean {mean} ± {spread} against K {limit} (free {free_parts}): {trace:?}"));
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
     }
 
     fn settings() -> Settings {

@@ -287,6 +287,8 @@ pub struct DeviceProgram {
     /// Gated nodes with a scale take the hard gate `H(gate)`, the scale unread
     /// ([`DeviceProgram::set_hard`]).
     hard: bool,
+    /// With a key, gated nodes with a scale take a sampled hard gate ([`DeviceProgram::set_sampled`]).
+    sampled: Option<u64>,
     /// Per node, an earlier node of the same value: the same node over the same arguments (each
     /// argument taken as the earliest node of its value) and the same operators, a common
     /// subexpression. library_vpd's head rules each recompute their layer's attention-input reads
@@ -483,6 +485,8 @@ pub struct DeviceTrace {
     /// differentiate, and whether it gated hard ([`DeviceProgram::set_hard`]).
     ramp: bool,
     hard: bool,
+    /// The key of the pass's sampled gates ([`DeviceProgram::set_sampled`]).
+    sampled: Option<u64>,
     /// Bfloat16 copies of node values a bfloat16 forward pass's and the reverse passes' products read
     /// ([`DeviceTrace::rounded_value`]), kept until [`DeviceTrace::release_rounded`].
     rounded: Mutex<BTreeMap<usize, Arc<Tensor>>>,
@@ -1013,7 +1017,7 @@ impl DeviceProgram {
                 _ => None,
             })
             .collect();
-        Ok(Self { device: device.clone(), steps, widths, head, edited_head_nodes, operators, batch: Mutex::new(None), rotary_tables: Mutex::new(Vec::new()), bf16: false, arithmetic: Arithmetic::F64, fused, grouped, revisions: BTreeMap::new(), rounded: Mutex::new(BTreeMap::new()), exact_zeros, dead, sole, listed, gated_reads, list_choices: Mutex::new(std::collections::HashMap::new()), always_listed: false, ramp: false, hard: false, aliases })
+        Ok(Self { device: device.clone(), steps, widths, head, edited_head_nodes, operators, batch: Mutex::new(None), rotary_tables: Mutex::new(Vec::new()), bf16: false, arithmetic: Arithmetic::F64, fused, grouped, revisions: BTreeMap::new(), rounded: Mutex::new(BTreeMap::new()), exact_zeros, dead, sole, listed, gated_reads, list_choices: Mutex::new(std::collections::HashMap::new()), always_listed: false, ramp: false, hard: false, sampled: None, aliases })
     }
 
     /// Operator `op`'s device copy changed: every group reading it runs node by node until
@@ -1340,6 +1344,33 @@ impl DeviceProgram {
         self.hard
     }
 
+    /// From now on (with `key`) every gated node with a scale gates by a sampled hard gate: on with
+    /// probability `Φ(gate / scale)`, as `H(gate + scale ε)` with `ε` standard normal, drawn under
+    /// `key` on the gate node's stream (`Device::reparameterize_block`, so its reverse regenerates
+    /// it), each entry its own draw; or by its mode as before (`None`). The reverse passes the
+    /// expected gate's derivatives (`Φ`'s, a straight-through gradient): the gate and the scale take
+    /// the cotangents they take under `Φ(gate / scale)`, the value its sampled gate's. A fit's
+    /// training passes gate this way, the expected loss of the explanation's on/off programs, and
+    /// a closed gate is still drawn on now and then, so it keeps a data gradient. A hard pass
+    /// ([`DeviceProgram::set_hard`]) takes precedence.
+    pub fn set_sampled(&mut self, key: Option<u64>) {
+        self.sampled = key;
+    }
+
+    /// `H(gate + scale ε)` under `key` ([`DeviceProgram::set_sampled`]).
+    fn sampled_gate(&self, gate: usize, z: &Tensor, s: &Tensor, key: u64) -> Result<Tensor, String> {
+        let d = &self.device;
+        let (rows, cols) = (z.rows(), z.cols());
+        let zeros = d.zeros(rows, cols).map_err(error)?;
+        let mut epsilon = d.zeros(rows, cols).map_err(error)?;
+        d.reparameterize_block(&mut epsilon, (0, 0), (&zeros, &zeros), (key, gate as u64)).map_err(error)?;
+        let mut noisy = d.copy(z).map_err(error)?;
+        let mut moved = d.zeros(rows, cols).map_err(error)?;
+        d.hadamard(&mut moved, s, &epsilon, false).map_err(error)?;
+        d.axpy(&mut noisy, 1.0, &moved).map_err(error)?;
+        d.gate_function(GateFunction::Step, &noisy, None).map_err(error)
+    }
+
     /// How many entries of gated node `gated`'s value the pass that made `trace` listed, its rows'
     /// components on (`DeviceProgram::row_lists`); `None` when it listed none (a dense pass).
     #[must_use]
@@ -1640,6 +1671,14 @@ impl DeviceProgram {
         Ok(Some(match scale {
             None => d.gate_function(GateFunction::Step, z, None).map_err(error)?,
             Some(_) if trace.hard => d.gate_function(GateFunction::Step, z, None).map_err(error)?,
+            // The reverse's gate cotangent reads the value wherever `Φ`'s slope is not zero, the
+            // gate drawn off or on.
+            Some(s) if let Some(key) = trace.sampled => {
+                let s = trace.value(*s)?;
+                let mut mask = self.sampled_gate(*gate, z, s, key)?;
+                d.axpy(&mut mask, 1.0, &d.gate_function(GateFunction::CdfSlope, z, Some(s)).map_err(error)?).map_err(error)?;
+                mask
+            }
             Some(s) if trace.ramp => d.gate_function(GateFunction::Ramp, z, Some(trace.value(*s)?)).map_err(error)?,
             Some(s) => {
                 let s = trace.value(*s)?;
@@ -1735,7 +1774,7 @@ impl DeviceProgram {
     }
 
     fn list_key(&self, node: usize) -> ListKey {
-        (node, std::mem::discriminant(&self.arithmetic), self.ramp || self.hard)
+        (node, std::mem::discriminant(&self.arithmetic), self.ramp || self.hard || self.sampled.is_some())
     }
 
     /// Affine node `node`'s first term `(argument, operator)` from `listed` (its product on per-row
@@ -1832,6 +1871,7 @@ impl DeviceProgram {
         let d = &self.device;
         match scale {
             Some(_) if trace.hard => d.gate_function(GateFunction::Step, trace.value(gate)?, None),
+            Some(s) if let Some(key) = trace.sampled => return self.sampled_gate(gate, trace.value(gate)?, trace.value(s)?, key),
             Some(s) => d.gate_function(if trace.ramp { GateFunction::Ramp } else { GateFunction::Cdf }, trace.value(gate)?, Some(trace.value(s)?)),
             None => d.gate_function(GateFunction::Step, trace.value(gate)?, None),
         }
@@ -2129,6 +2169,7 @@ impl DeviceProgram {
             aliased: BTreeMap::new(),
             ramp: self.ramp,
             hard: self.hard,
+            sampled: self.sampled,
             rounded: Mutex::new(BTreeMap::new()),
         };
         // The nodes an edit replaced: a later node of the same value computes its own.
