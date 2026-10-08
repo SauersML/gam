@@ -672,7 +672,7 @@ fn attend_rules_pick_their_positions() {
 /// Inexact VPD views of `layer`'s MLP and attention, as in device_path_runs_vpd_views_as_the_host:
 /// `U` scaled rows of the identity and `V` the matching columns of `Wᵀ`, some directions left out,
 /// so every remainder is nonzero.
-fn inexact_vpd_views(weights: &mut Weights, layer: usize) {
+pub(crate) fn inexact_vpd_views(weights: &mut Weights, layer: usize) {
     use ndarray::{Array2, Axis, s};
     let partial = |w: &Array2<f64>, count: usize, scale: f64| (Array2::<f64>::eye(w.nrows()).slice(s![..count, ..]).to_owned() * scale, w.t().slice(s![.., ..count]).to_owned());
     let lw = &weights.layers[layer];
@@ -693,7 +693,7 @@ fn inexact_vpd_views(weights: &mut Weights, layer: usize) {
 /// missing; each node reads the embedding and every earlier node, the logits read all) with stand-in
 /// semantics `standin`: q/k/v/o and c_fc/down_proj subcomponents, remainders named by some programs
 /// only, a program without an attention node and one with o_proj and v_proj alone.
-fn stacking_programs(weights: &Weights, standin: &str) -> Vec<Graph> {
+pub(crate) fn stacking_programs(weights: &Weights, standin: &str) -> Vec<Graph> {
     let piece = |kind: &str, index: Index| PieceIr { view: "vpd".into(), layer: 1, kind: kind.into(), index: Some(index) };
     let rest = || Index::Name("rest".into());
     let many = |v: &[usize]| Index::Many(v.to_vec());

@@ -384,6 +384,48 @@ pub(crate) struct Run<'a> {
 /// The stand-ins (`embed`'s and each unit's write in the counterfactual run `r`, rows × width),
 /// assembled on the device with the current weights as `Reference::write` does on the host; `r`'s
 /// arrays stay uploaded for the next runs that read it.
+/// A stacked counterfactual run's stand-ins (`copies`' rows): `embed`'s, the counterfactual
+/// embedding on every copy, and each stand-in unit's (a VPD unit with `rest`, not computing), on
+/// each copy's rows the counterfactual write of the `down_proj` or `o_proj` parts the copy does not
+/// name, as [`standins`] makes a remainder unit's; zero for computing units.
+fn copy_standins(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, r: &Reference, (c, copy_of_row, within): (&Copies, &gam_gpu::tensor::Indices, &gam_gpu::tensor::Indices)) -> Result<(Tensor, Vec<Tensor>), String> {
+    let e = |e: GpuError| e.to_string();
+    let (rows, width) = (c.count * c.rows, weights.width());
+    let tiled = |s: &mut DeviceState, field: Field, layer: usize| -> Result<Tensor, String> {
+        s.ensure_reference(r, (field, layer, 0))?;
+        s.device.gather_rows(s.reference(r, (field, layer, 0))?, within).map_err(e)
+    };
+    let embed = tiled(s, Field::Embed, 0)?;
+    let mut out = Vec::with_capacity(circuit.units.len());
+    for (u, unit) in circuit.units.iter().enumerate() {
+        let w = match &unit.block {
+            Block::Slices { layer, down, rest: true, .. } if !unit.computes => {
+                let mlp = weights.layers[*layer].mlp.as_ref().ok_or("a VPD view of a layer without an MLP")?;
+                let vpd = weights.vpd.get(layer).ok_or_else(|| format!("layer {layer} has no VPD view"))?;
+                let active = tiled(s, Field::Active, *layer)?;
+                let named = sliced(s, (&vpd.down_u, &vpd.down_v), Matrix::Host(&mlp.out), down, false, &active, c.masks.get(&(u, 1)).map(|m| (m, copy_of_row, c.rows))).map_err(e)?;
+                let full = s.reference_product(r, (Field::Active, *layer), PRODUCT_MLP_OUT, Matrix::Host(&mlp.out))?;
+                let full = s.device.gather_rows(&full, within).map_err(e)?;
+                less_named(s, full, named, down, vpd.down_u.nrows()).map_err(e)?
+            }
+            Block::AttnSlices { layer, o, rest: true, .. } if !unit.computes => {
+                let a = weights.vpd_attention.get(layer).ok_or_else(|| format!("layer {layer}'s attention has no VPD view"))?;
+                let lw = &weights.layers[*layer];
+                let z = tiled(s, Field::Reads, *layer)?;
+                let outputs = s.stacked(&lw.heads.iter().map(|h| &h.output).collect::<Vec<_>>(), false).map_err(e)?;
+                let named = sliced(s, (&a.o.0, &a.o.1), Matrix::Device(&outputs), o, false, &z, c.masks.get(&(u, 3)).map(|m| (m, copy_of_row, c.rows))).map_err(e)?;
+                let full = s.reference_product(r, (Field::Reads, *layer), PRODUCT_ATTENTION_OUT, Matrix::Device(&outputs))?;
+                let full = s.device.gather_rows(&full, within).map_err(e)?;
+                less_named(s, full, named, o, a.o.0.nrows()).map_err(e)?
+            }
+            _ if unit.computes => s.device.zeros(rows, width).map_err(e)?,
+            _ => return Err("a stacked stand-in of a block other than a VPD remainder unit".into()),
+        };
+        out.push(w);
+    }
+    Ok((embed, out))
+}
+
 fn standins(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, r: &Reference) -> Result<(Tensor, Vec<Tensor>), String> {
     let e = |e: GpuError| e.to_string();
     let (rows, width, arithmetic) = (r.embed.nrows(), weights.width(), s.arithmetic());
@@ -476,9 +518,10 @@ pub(crate) struct Copies {
     /// `k_proj` 1, `v_proj` 2 and `o_proj` 3).
     pub masks: BTreeMap<(usize, usize), CopyMask>,
     /// The counterfactual run (of one copy's rows) whose values the parts a copy does not name
-    /// carry; `None`: they are deleted. With it the merged circuit has a unit at every site, and
-    /// each unit's write adds the counterfactual write of the `down_proj` or `o_proj` parts its copy
-    /// does not name: the full counterfactual write less the named ones'.
+    /// carry; `None`: they are deleted. With it the merged circuit has at every site a computing
+    /// unit and a stand-in unit (`rest`, not computing) whose stand-in on each copy's rows is the
+    /// counterfactual write of the `down_proj` or `o_proj` parts the copy does not name: the full
+    /// counterfactual write less the named ones' (by the copy's counts).
     pub standin: Option<std::sync::Arc<Reference>>,
 }
 
@@ -486,6 +529,7 @@ pub(crate) struct Copies {
 type CopyRows<'a> = Option<(&'a Copies, &'a gam_gpu::tensor::Indices, &'a gam_gpu::tensor::Indices)>;
 
 /// What each copy names of one slot of a merged VPD unit.
+#[derive(Clone)]
 pub(crate) struct CopyMask {
     /// `counts[[j, i]]`: how many of copy `j`'s units name the slot's `i`-th listed subcomponent
     /// (the unit's list in order, its remainder left out).
@@ -506,23 +550,29 @@ type Masked<'a> = Option<(&'a CopyMask, &'a gam_gpu::tensor::Indices, usize)>;
 /// copy's log-probabilities at its scored rows; `None` without a device or for a view it does not
 /// cover.
 pub(crate) fn run_stacked(weights: &Weights, circuit: &Circuit, job: &Run, copies: &Copies) -> Option<Result<Vec<Array2<f64>>, String>> {
+    // The copies' log-softmax runs on the calling thread, as in `run`.
+    execute_copies(weights, circuit, job, copies).map(|out| out.and_then(|execution| per_copy(execution, copies.count)))
+}
+
+/// [`run_stacked`]'s execution as the device returns it: the logits at the scored rows of every
+/// copy in turn, and for a run scoring no rows (a donor run) every unit's write, the kept normed
+/// inputs and heads' reads, over all the copies' rows.
+pub(crate) fn execute_copies(weights: &Weights, circuit: &Circuit, job: &Run, copies: &Copies) -> Option<Result<Execution, String>> {
     if !stack_covered(weights, circuit, job, copies) {
         return None;
     }
-    // The copies' log-softmax runs on the calling thread, as in `run`.
-    let out = on_device(|s| copies_on(s, weights, circuit, job, Some(copies)))?;
-    Some(out.and_then(|execution| per_copy(execution, copies.count)))
+    on_device(|s| copies_on(s, weights, circuit, job, Some(copies)))
 }
 
-/// Whether the device runs `circuit` stacked: VPD units alone, without `rest`, attentions of heads
-/// alike, and the same number of scored rows per copy.
+/// Whether the device runs `circuit` stacked: VPD units alone, computing ones without `rest`
+/// (stand-in units with), attentions of heads alike, and the same number of scored rows per copy.
 pub(crate) fn stack_covered(weights: &Weights, circuit: &Circuit, job: &Run, copies: &Copies) -> bool {
-    let covered = |b: &Block| match b {
-        Block::Slices { rest, .. } => !rest,
-        Block::AttnSlices { layer, rest, .. } => !rest && weights.layers.get(*layer).is_some_and(|lw| lw.heads.first().is_some_and(|first| lw.heads.iter().all(|h| alike(h, first, false)))),
+    let covered = |u: &crate::graph::Unit| match &u.block {
+        Block::Slices { rest, .. } => *rest != u.computes,
+        Block::AttnSlices { layer, rest, .. } => *rest != u.computes && weights.layers.get(*layer).is_some_and(|lw| lw.heads.first().is_some_and(|first| lw.heads.iter().all(|h| alike(h, first, false)))),
         _ => false,
     };
-    copies.count > 0 && job.scored.len() % copies.count == 0 && circuit.units.iter().all(|u| covered(&u.block))
+    copies.count > 0 && job.scored.len() % copies.count == 0 && circuit.units.iter().all(covered)
 }
 
 /// A stacked run's logits split into its copies' (each copy's scored rows in turn), each
@@ -778,14 +828,19 @@ pub(crate) fn copies_on(s: &mut DeviceState, weights: &Weights, circuit: &Circui
         None => None,
     };
     // Stand-ins: from the counterfactual run, or zeros for `M` (it reads none).
-    let zero = matches!(job.reference, Some(r) if r.zero) || (job.reference.is_none() && circuit.units.iter().all(|u| u.computes));
-    let (embed_standin, standins): (Tensor, Vec<Tensor>) = match job.reference {
+    let stacked_standin = copy_rows.as_ref().and_then(|(c, ..)| c.standin.as_deref()).filter(|r| !r.zero);
+    let zero = stacked_standin.is_none() && (matches!(job.reference, Some(r) if r.zero) || (job.reference.is_none() && circuit.units.iter().all(|u| u.computes)));
+    let (embed_standin, standins): (Tensor, Vec<Tensor>) = match (job.reference, stacked_standin, copy_rows.as_ref()) {
+        // A stacked counterfactual run: each stand-in unit's per-copy stand-in ([`copy_standins`]).
+        (None, Some(r), Some((c, copy_of_row, within))) => copy_standins(s, weights, circuit, r, (c, copy_of_row, within))?,
+        _ => match job.reference {
         Some(r) if r.embed.nrows() != rows => return Err(format!("a counterfactual run of {} tokens for a batch of {rows}", r.embed.nrows())),
         // Deletion: every stand-in is zero, nothing to upload or compute.
         Some(r) if r.zero => (s.device.zeros(rows, width).map_err(e)?, (0..units).map(|_| s.device.zeros(rows, width)).collect::<Result<_, _>>().map_err(e)?),
         Some(r) => standins(s, weights, circuit, r)?,
         None if circuit.units.iter().all(|u| u.computes) => (s.device.zeros(rows, width).map_err(e)?, (0..units).map(|_| s.device.zeros(rows, width)).collect::<Result<_, _>>().map_err(e)?),
         None => return Err("a program's undeclared pieces take their values from the counterfactual run, which this batch lacks".into()),
+        },
     };
     let mut captured = job.capture.then(|| Reference {
         id: crate::graph::next_reference_id(),
@@ -1071,17 +1126,6 @@ fn vpd_site(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, job: &Run
             None => Ok(None),
         }
     };
-    // A stacked counterfactual run's stand-in of the `down_proj` or `o_proj` parts unit `u`'s copies
-    // do not name (slot `slot`): the full counterfactual write `x_ref Wᵀ` less the named parts' on
-    // the counterfactual input, as `standins` makes a remainder unit's.
-    let unnamed = |s: &mut DeviceState, u: usize, slot: usize, (field, layer, product): (Field, usize, usize), (factors, w, picked): ((&Array2<f64>, &Array2<f64>), Matrix, &[usize])| -> Result<Option<Tensor>, String> {
-        let (Some(r), Some(_)) = (cf, copies) else { return Ok(None) };
-        let full = s.reference_product(r, (field, layer), product, w)?;
-        let full = tiled(s, full).map_err(e)?;
-        let x = reference(s, field, layer)?.ok_or("a counterfactual array went missing")?;
-        let named = sliced(s, factors, w, picked, false, &x, mask(u, slot)).map_err(e)?;
-        less_named(s, full, named, picked, factors.0.nrows()).map(Some).map_err(e)
-    };
     let slices: Vec<usize> = units.iter().copied().filter(|&u| matches!(circuit.units[u].block, Block::Slices { .. })).collect();
     if let Some(&first) = slices.first() {
         let Block::Slices { layer, .. } = circuit.units[first].block else { return Err("a VPD-view unit of another block".into()) };
@@ -1109,12 +1153,8 @@ fn vpd_site(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, job: &Run
         for &u in slices.iter().filter(|u| computing(u)) {
             let unit = &circuit.units[u];
             let Block::Slices { down, rest, .. } = &unit.block else { return Err("a VPD-view unit of another block".into()) };
-            let standin = unnamed(s, u, 1, (Field::Active, layer, PRODUCT_MLP_OUT), ((&vpd.down_u, &vpd.down_v), Matrix::Host(&mlp.out), down))?;
             if down.is_empty() && !rest {
-                writes.insert(u, match standin {
-                    Some(w) => w,
-                    None => s.device.zeros(rows, width).map_err(e)?,
-                });
+                writes.insert(u, s.device.zeros(rows, width).map_err(e)?);
                 continue;
             }
             let mut pre = s.device.copy(&pre_ref).map_err(e)?;
@@ -1122,11 +1162,7 @@ fn vpd_site(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, job: &Run
                 s.device.axpy(&mut pre, 1.0, delta).map_err(e)?;
             }
             let h = s.device.law_values(&pre, &codes, gelu_tanh_constant()).map_err(e)?;
-            let mut w = sliced(s, (&vpd.down_u, &vpd.down_v), Matrix::Host(&mlp.out), down, *rest, &h, mask(u, 1)).map_err(e)?;
-            if let Some(standin) = standin {
-                s.device.axpy(&mut w, 1.0, &standin).map_err(e)?;
-            }
-            writes.insert(u, w);
+            writes.insert(u, sliced(s, (&vpd.down_u, &vpd.down_v), Matrix::Host(&mlp.out), down, *rest, &h, mask(u, 1)).map_err(e)?);
         }
     }
     let attention: Vec<usize> = units.iter().copied().filter(|&u| matches!(circuit.units[u].block, Block::AttnSlices { .. })).collect();
@@ -1168,12 +1204,8 @@ fn vpd_site(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, job: &Run
         for &u in attention.iter().filter(|u| computing(u)) {
             let unit = &circuit.units[u];
             let Block::AttnSlices { o, rest, .. } = &unit.block else { return Err("a VPD-view unit of another block".into()) };
-            let standin = unnamed(s, u, 3, (Field::Reads, layer, PRODUCT_ATTENTION_OUT), ((&a.o.0, &a.o.1), Matrix::Device(&maps[3]), o))?;
             if o.is_empty() && !rest {
-                writes.insert(u, match standin {
-                    Some(w) => w,
-                    None => s.device.zeros(rows, width).map_err(e)?,
-                });
+                writes.insert(u, s.device.zeros(rows, width).map_err(e)?);
                 continue;
             }
             let mut qkv = refs.iter().map(|x| s.device.copy(x)).collect::<Result<Vec<_>, _>>().map_err(e)?;
@@ -1190,11 +1222,7 @@ fn vpd_site(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, job: &Run
                 ops.head_reads_of(site, u, lw, &mut host, reads_kept);
                 z = s.device.upload(host.view()).map_err(e)?;
             }
-            let mut w = sliced(s, (&a.o.0, &a.o.1), Matrix::Device(&maps[3]), o, *rest, &z, mask(u, 3)).map_err(e)?;
-            if let Some(standin) = standin {
-                s.device.axpy(&mut w, 1.0, &standin).map_err(e)?;
-            }
-            writes.insert(u, w);
+            writes.insert(u, sliced(s, (&a.o.0, &a.o.1), Matrix::Device(&maps[3]), o, *rest, &z, mask(u, 3)).map_err(e)?);
         }
     }
     Ok(writes)

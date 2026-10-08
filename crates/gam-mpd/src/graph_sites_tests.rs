@@ -96,6 +96,54 @@ impl Setup {
     }
 }
 
+/// Programs that stack (dense VPD programs over views of every layer) run a site experiment as one
+/// batch of copies (`graph::stacked_sites`), and each copy is its program's own `run_sites`,
+/// deleting or with counterfactual stand-ins, under every family of operation: zeroed, swapped
+/// (writes, inputs, a VPD head's read), pushed, scaled and cut.
+#[test]
+fn stacked_site_runs_are_each_programs_own() {
+    let mut s = setup("graph_sites_stacked");
+    crate::graph_tests::inexact_vpd_views(&mut s.weights, 0);
+    crate::graph_tests::inexact_vpd_views(&mut s.weights, 1);
+    let heads = s.weights.layers[0].heads.len();
+    let push = |direction: usize| Operation::Push { direction, size: 1 };
+    let draws = [
+        draw(Family::Zero, &[(SharedSite::Head(1), Operation::Scale(0)), (SharedSite::Mlp(0), Operation::Scale(0))], 0, true),
+        draw(Family::Swap, &[(SharedSite::Mlp(0), Operation::Swap), (SharedSite::Input(2), Operation::Swap), (SharedSite::Head(heads + 1), Operation::Swap)], 3, true),
+        draw(Family::Push, &[(SharedSite::Stream(1), push(0)), (SharedSite::Embedding, push(1))], 5, false),
+        draw(Family::Scale, &[(SharedSite::Attention(1), Operation::Scale(3)), (SharedSite::Head(heads), Operation::Scale(1))], 6, true),
+        draw(Family::Cut, &[(SharedSite::Attention(0), Operation::Cut { to: 3 }), (SharedSite::Mlp(0), Operation::Cut { to: 2 })], 2, true),
+    ];
+    let mut state = crate::graph_device::DeviceState::new(Device::host());
+    for standin in ["delete", "counterfactual"] {
+        let circuits: Vec<Circuit> = crate::graph_tests::stacking_programs(&s.weights, standin).iter().map(|g| g.program(&s.weights, true)).collect();
+        let refs: Vec<&Circuit> = circuits.iter().collect();
+        for d in &draws {
+            // The inputs as Checker::site_inputs makes them: the base with M's run on its partners
+            // (the donors) under the operations, the donor with M's run on its partners (the base).
+            let (mut base, mut donor) = (s.base.clone(), s.donor.clone());
+            if standin == "delete" {
+                base.reference = Some(std::sync::Arc::new(crate::graph::Reference::zeros(&s.weights, base.tokens.len())));
+                donor.reference = Some(std::sync::Arc::new(crate::graph::Reference::zeros(&s.weights, donor.tokens.len())));
+            } else {
+                base.reference = Some(std::sync::Arc::new(reference_under(&s.weights, &s.donor, d, &s.units).expect("reference under")));
+                donor.reference = Some(std::sync::Arc::new(reference(&s.weights, &s.base).expect("donor's reference")));
+            }
+            let weights = &s.weights;
+            let mut runner = |c: &Circuit, job: &crate::graph_device::Run, copies: &crate::graph_device::Copies| {
+                assert!(crate::graph_device::stack_covered(weights, c, job, copies), "the device stacks the merged circuit");
+                Some(crate::graph_device::copies_on(&mut state, weights, c, job, Some(copies)))
+            };
+            let copies = crate::graph::stacked_sites_with(weights, &refs, (&base, &s.rows), Some(&donor), (d, &s.units), &mut runner).expect("the programs stack").expect("stacked site run");
+            for (j, (circuit, copy)) in circuits.iter().zip(&copies).enumerate() {
+                let own = run_sites(weights, circuit, (&base, &s.rows), Some(&donor), d, &s.units).expect("own site run");
+                let kl = max(&kl_bits(&own, copy));
+                assert!(kl < 1e-9, "{standin}, {:?}, program {j}: KL(own ‖ stacked copy) = {kl:e} bits", d.family);
+            }
+        }
+    }
+}
+
 /// Every family at every kind of site: the program that declares every piece and keeps every edge
 /// responds as `M` does, routed by its edges or node by node.
 #[test]
