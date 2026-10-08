@@ -1672,7 +1672,10 @@ slots = [(P[n], w, rms(P[n][w])) for n in mlp for w in (('F',) if EXACT else ('V
          if not (EXACT and NEURON_DOWN and n.endswith('down_proj') and w == 'F') and not (FREEZE and w in ('V', 'U', 'F')) and ARM != 'rot']
 # rot: rotation angles by 1e-3 per step, thresholds by a tenth of their noise scale, assignment logits by 0.02.
 slots += [x for R in ROT_ALL for x in ((R, 'A', 1 / 3), (R, 'tau', 100 / 3 * R['s'].mean().item()), (R, 'L', 20 / 3))]
-slots += [x for P_ in GN.values() for x in ((P_, 'W1', rms(P_['W1'])), (P_, 'b1', 0.1), (P_, 'W2', 1 / math.sqrt(GATENET)))]
+# DESCENT_GN_LR multiplies the gate networks' step sizes (at 1, H = 256 moved the gates too little to matter in 15M
+# tokens: the whole model at 3.09 bits per token against 3.00 without the network).
+GN_LR = float(os.environ.get('DESCENT_GN_LR', '1'))
+slots += [x for P_ in GN.values() for x in ((P_, 'W1', GN_LR * rms(P_['W1'])), (P_, 'b1', GN_LR * 0.1), (P_, 'W2', GN_LR / math.sqrt(GATENET)))]
 slots += [(A[n], w, rms(A[n][w])) for n in sliced for w in (('V', 'U') if ATTN_FREE else ('F',))] + [(A[n], 'tau', 100 / 3 * A[n]['s'].mean().item()) for n in sliced]
 for l, S in SHARE_A.items():
     slots += [(S, 't', 100 / 3 * S['s'].mean().item()), (S, 'L_v', 20 / 3), (S, 'L_o', 20 / 3)]
