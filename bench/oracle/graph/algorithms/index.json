@@ -28,6 +28,7 @@
  "key_value_lookup": "key_value",
  "list_copy": "list_first",
  "lowercase": "case",
+ "mc_letter": "multiple_choice",
  "min_of_list": "extreme",
  "name_repeat": "induction",
  "number_pattern": "number_pattern",

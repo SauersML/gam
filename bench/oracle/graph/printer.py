@@ -523,11 +523,9 @@ def explanation_of(ir: dict, behavior: dict, facts_of: dict[str, dict]) -> str:
 
 
 def variable_ir(ir: dict) -> dict:
-    """An algorithm program's IR as one node per bound or claimed variable (the pieces of all its nodes),
-    for facts(): a variable's parts are removed together."""
-    nodes = {n["id"]: n for n in ir["nodes"]}
-    return {"model": ir["model"], "nodes": [{"id": v["name"], "pieces": [p for i in v["nodes"] for p in nodes[i]["pieces"]]}
-                                           for v in ir["variables"] if v["nodes"]]}
+    """An algorithm program's IR as one node per bound or claimed variable (the parts its bind or claim
+    names), for facts(): a variable's parts are removed together."""
+    return {"model": ir["model"], "nodes": [{"id": v["name"], "pieces": v["pieces"]} for v in ir["variables"] if v["pieces"]]}
 
 
 def described(source: str) -> dict[str, str]:
@@ -593,15 +591,14 @@ def algorithm_source(ir: dict, behavior: dict, facts_of: dict[str, dict], score:
 def algorithm_explanation(ir: dict, behavior: dict, facts_of: dict[str, dict]) -> str:
     """An algorithm program's plain-English explanation: per variable, what it is (its author's words),
     which parts hold it or produce its attention pattern, what removing them does, and what it reads."""
-    nodes = {n["id"]: n for n in ir["nodes"]}
     says = described(ir["source"])
     lines = [behavior["description"].rstrip(".") + "."]
     for v in ir["variables"]:
         name, what = v["name"], says.get(v["name"], "")
         reads = [r if r != "tokens" else "the tokens" for r in v["reads"]]
         sentence = f"{name}" + (f" ({what.rstrip('.')})" if what else "") + f" is computed from {' and '.join(reads)}"
-        if v["nodes"]:
-            pieces = [p for i in v["nodes"] for p in nodes[i]["pieces"]]
+        if v["pieces"]:
+            pieces = v["pieces"]
             parts = part_words({"pieces": pieces})
             many = sum(1 if not isinstance(p["index"], list) else len(p["index"]) for p in pieces) > 1
             sentence += (f"; {parts} hold{'' if many else 's'} it" if v["role"] == "bound"

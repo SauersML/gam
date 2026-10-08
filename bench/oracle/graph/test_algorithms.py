@@ -40,3 +40,25 @@ def check(behavior, model, answer, low):
     assert ir["bindings"][0]["pairs"], (model, behavior["id"])
     if behavior["family"] != "greater_than" and ir["algorithm_accuracy"] < 0.95:
         low[(model, behavior["id"])] = ir["algorithm_accuracy"]
+
+
+def test_teacher_assignments():
+    import teacher
+
+    path = BEHAVIORS / "vpd4l/induction_random.words8.json"
+    if not path.exists():
+        return
+    behavior = json.loads(path.read_text())
+    search = {"source": "from mech import node, edges, PD, embed, logits\n"
+                        "va1 = node(<p:1.q.316>, <p:1.k.329>, <p:1.v.228>, <p:1.o.311>)\n"
+                        "va2 = node(<p:2.q.335>, <p:2.k.206>, <p:2.v.559>, <p:2.o.735>)\n"
+                        "va3 = node(<p:3.v.677>, <p:3.o.806>)\nedges(embed >> va1, va1 >> va2, va2 >> va3, va3 >> logits)\n"}
+    ir = teacher.search_ir(search, "vpd4l")
+    assert teacher.patterns(teacher.algorithm_of(behavior), behavior) == {"back", "match"}
+    found = teacher.assignments(ir, teacher.algorithm_of(behavior), behavior)
+    tails = [s.split("\n\n\n")[-1] for s in found]
+    # answer alone; prev = layer 1 and answer = layers 2-3; prev = layers 1-2 and answer = layer 3
+    assert len(found) == 3 and all(t.count("bind(answer") == 1 for t in tails)
+    assert "bind(prev, <p:1.q.316>, <p:1.k.329>, <p:1.v.228>, <p:1.o.311>)\nclaim(back, <p:1.q.316>, <p:1.k.329>)" in tails[1]
+    traced = mech.trace_inline(found[1], "vpd4l", behavior=behavior)
+    assert traced["valid"] and [b["variable"] for b in traced["bindings"]] == ["prev", "answer"]

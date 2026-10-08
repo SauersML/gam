@@ -855,7 +855,8 @@ def _validate(program: _Program, namespace: dict, ir: dict, behavior: dict | Non
         connect(embed, logits)
         ir["variables"] = [{"name": v, "reads": list(algorithm.params[v]),
                             "role": "bound" if v in bound else "claimed" if v in claimed else "step",
-                            "nodes": [n.id for n in held.get(v, [])]}
+                            "nodes": [n.id for n in held.get(v, [])],
+                            "pieces": [p.ir() for p in _merged(bound.get(v) or claimed.get(v) or [])]}
                            for v in sorted(algorithm.params, key=line.get)]
         ir["bindings"] = [{"variable": v, "nodes": [n.id for n in held[v]], "pairs": []} for v in bound]
         if behavior is not None:
