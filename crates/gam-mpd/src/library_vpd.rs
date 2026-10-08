@@ -23,14 +23,16 @@
 //! the heads' rows of those slices' writes. A write-side slice (o, down_proj) of a component gated
 //! at the block's input takes that gate's column (a fixed selection of the gate's columns).
 //!
-//! Orthogonal mixing (an arm's `mixing`, groups of slices of one map each): a group's slices
-//! `(u_i, v_i)` become `U Q`, `V Q` with `Q` orthogonal (`library_mdl::Mix`, `Q = Cayley(S)`, `S`
-//! skew, which the fit trains), so their sum is the same at every `Q` and a component's slices
-//! rotate within their groups. With any mixing group the explanation is exact by construction:
-//! every slice's mean is pinned (`library_mdl` sets the means of the read and write operators to
-//! the slices rotated by their groups' `Q`, unmixed slices at their start; their deviations, and
-//! so their description, still follow the data), the parts change only by their groups' rotations
-//! and their gates, and with slices summing to `M`'s maps every part on at the mean is `M`.
+//! Exact frames (an arm's `mixing`, groups of slices of one map each): a group's `n` start slices
+//! `(u_j, v_j)` and its extra slices (an arm's `extra`: per site a count of zero slices appended to
+//! its factors, listed after the start slices) become reads `V₀ Aᵀ` and writes `U₀ A⁺ + N` with
+//! `A` (`C × n`) and `N A = 0` free (`library_mdl::Mix`, which the fit trains), so their sum is the
+//! same at every `A` and `N` and a component's slices change within their groups. With any mixing
+//! group the explanation is exact by construction: every slice's mean is pinned (`library_mdl` sets
+//! the means of the read and write operators to the groups' frames, unmixed slices at their start;
+//! their deviations, and so their description, still follow the data), the parts change only within
+//! their groups and by their gates, and with slices summing to `M`'s maps every part on at the mean
+//! is `M`.
 //!
 //! The gate ([`Gate`](crate::library_vpd::Gate)). Every Gated node's scale is its stage's operator `{stage}.width` (one
 //! entry per component), read as a constant:
@@ -102,10 +104,14 @@ struct Component {
 struct ArmRecord {
     arm: String,
     components: Vec<Component>,
-    /// Groups of slices `[site, index]` mixed orthogonally (module note): with any, the explanation
-    /// is exact by construction, its slices fixed and only rotated within their groups.
+    /// Groups of slices `[site, index]` in exact frames (module note): with any, the explanation is
+    /// exact by construction, its slices changing only within their groups.
     #[serde(default)]
     mixing: Vec<Vec<[usize; 2]>>,
+    /// Extra slices `[site, count]`: `count` zero slices appended to the site's factors (indices
+    /// from the site's slice count on), for the mixing groups' extra slices (module note).
+    #[serde(default)]
+    extra: Vec<[usize; 2]>,
 }
 
 /// Where a slice's read row or write column is in the built explanation, by operator name.
@@ -188,10 +194,17 @@ pub fn explanation(native: &OperatorProgram, layers: &[LayerNodes], decompositio
 
 /// [`explanation`] with the gate law `gate`.
 pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], decomposition: &Path, start: &Path, arm: &str, gate: Gate) -> Result<Explanation, String> {
-    let factors = load_factors(decomposition)?;
+    let mut factors = load_factors(decomposition)?;
     let records: Vec<ArmRecord> = serde_json::from_slice(&std::fs::read(start).map_err(|e| error(format!("{}: {e}", start.display())))?).map_err(error)?;
     let record = records.into_iter().find(|r| r.arm == arm).ok_or_else(|| error(format!("{}: no arm {arm}", start.display())))?;
     let (components, mixing) = (record.components, record.mixing);
+    // Each site's start slices, before its extra slices.
+    let starts: Vec<usize> = factors.iter().map(|f| f.u.nrows()).collect();
+    for &[site, count] in &record.extra {
+        let f = factors.get_mut(site).ok_or_else(|| error(format!("extra slices at site {site}, of {}", starts.len())))?;
+        f.u.append(Axis(0), Array2::zeros((count, f.u.ncols())).view()).map_err(error)?;
+        f.v.append(Axis(1), Array2::zeros((f.v.nrows(), count)).view()).map_err(error)?;
+    }
     // Per slice `(site, index)`, where the built explanation holds its read and its write.
     let mut held: BTreeMap<(usize, usize), Vec<(String, Held)>> = BTreeMap::new();
     if factors.len() != KINDS.len() * layers.len() {
@@ -862,7 +875,7 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
     }
     // Each shared component's gate is a choice among its candidates: ln K nats to send.
     let choices: f64 = shares.iter().flat_map(|s| s.candidates.iter()).map(|c| (c.len() as f64).ln()).sum();
-    let mixes = mixing.iter().map(|group| mix_of(&artifact.program, &held, group)).collect::<Result<Vec<_>, String>>()?;
+    let mixes = mixing.iter().map(|group| mix_of(&artifact.program, &held, group, &starts)).collect::<Result<Vec<_>, String>>()?;
     let built = groups_of(artifact, layers, gate)?;
     let scoring = match gate {
         Gate::Hard => crate::library_mdl::GateScoring::Compiled,
@@ -871,16 +884,22 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
     Ok(Explanation { shares, fixed_nats: built.fixed_nats + choices, scoring, mixes, ..built })
 }
 
-/// The mixing of one group of slices `group` (`[site, index]`, every slice of one map): per slice
-/// its places ([`Held`], resolved to `program`'s operators), in one order for every slice, so the
-/// group's reads stack into one matrix and each of its write blocks into another.
-fn mix_of(program: &OperatorProgram, held: &BTreeMap<(usize, usize), Vec<(String, Held)>>, group: &[[usize; 2]]) -> Result<crate::library_mdl::Mix, String> {
+/// The frame of one group of slices `group` (`[site, index]`, every slice of one map, its start
+/// slices, those below the site's count in `starts`, before its extra slices): per slice its places
+/// ([`Held`], resolved to `program`'s operators), in one order for every slice, so the group's
+/// reads stack into one matrix and each of its write blocks into another.
+fn mix_of(program: &OperatorProgram, held: &BTreeMap<(usize, usize), Vec<(String, Held)>>, group: &[[usize; 2]], starts: &[usize]) -> Result<crate::library_mdl::Mix, String> {
     let site = group.first().ok_or_else(|| error("an empty mixing group"))?[0];
+    let start = *starts.get(site).ok_or_else(|| error(format!("a mixing group at site {site}, of {}", starts.len())))?;
+    let base = group.iter().take_while(|s| s[1] < start).count();
+    if group[base..].iter().any(|s| s[1] < start) {
+        return Err(error(format!("a mixing group of site {site} with a start slice after an extra slice")));
+    }
     let mut slices = Vec::with_capacity(group.len());
     let mut shape: Option<Vec<(usize, bool, usize)>> = None;
     for &[s, i] in group {
         if s != site {
-            return Err(error(format!("a mixing group across sites {site} and {s}: a group rotates one map's slices")));
+            return Err(error(format!("a mixing group across sites {site} and {s}: a group's frame is one map's")));
         }
         let places = held.get(&(s, i)).ok_or_else(|| error(format!("slice {i} of site {s} is in no component")))?;
         let mut resolved = places
@@ -906,7 +925,7 @@ fn mix_of(program: &OperatorProgram, held: &BTreeMap<(usize, usize), Vec<(String
     if !slices.iter().flatten().all(|p| seen.insert(p.clone())) {
         return Err(error(format!("a slice listed twice in a mixing group of site {site}")));
     }
-    Ok(crate::library_mdl::Mix { slices })
+    Ok(crate::library_mdl::Mix { slices, base })
 }
 
 /// The prior groups, trainable operators and layers of the built artifact (module note).
