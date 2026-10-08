@@ -681,17 +681,20 @@ def qeinsum(eq, *ops):
     with full_float32():
         return torch.einsum(eq, *ops)
 
-def rot_hi(A_):
-    """The angles in float64 (float32 on MPS, which has none): in float32 the series and squarings drift off
-    orthogonal as the angles grow (the whole model's all-on error with groups of 128 rose from 5e-3 to 1e-2 bits
-    per token between 5M and 10M tokens)."""
-    return A_ if A_.device.type == 'mps' else A_.double()
-
+# The bases are computed in full float32 (TF32 off), the Taylor series after scaling S by its infinity norm (its
+# largest row sum; the sum of all |S| entries took about 5 more squarings, each doubling the rounding error): on
+# descent's trained angles the 32-groups are orthogonal to 1e-5 (2e-4 with the entry sum) and 768-group Cayley
+# bases to 2e-6. Float64 ran at 1/64 of an A40's float32 rate (343 ms of a 1.5 s whole-model step); the float32
+# drift that moved the bases to float64 had its products in TF32.
 def rot_Q_all(As):
     """rot_Q of each angle tensor in As, the products batched (each group set squared as often as rot_Q
     squares it alone)."""
-    Ss = [A_ - A_.transpose(1, 2) for A_ in (rot_hi(a_ * mask_of(a_.shape[-1])) for a_ in As)]
-    ks = [max(0, math.ceil(math.log2(max(v, 1e-12) / 0.25))) for v in torch.stack([S_.detach().abs().sum((1, 2)).max() for S_ in Ss]).tolist()]
+    with full_float32():
+        return rot_Q_products(As)
+
+def rot_Q_products(As):
+    Ss = [A_ - A_.transpose(1, 2) for A_ in (a_ * mask_of(a_.shape[-1]) for a_ in As)]
+    ks = [max(0, math.ceil(math.log2(max(v, 1e-12) / 0.25))) for v in torch.stack([S_.detach().abs().sum(-1).amax() for S_ in Ss]).tolist()]
     order = sorted(range(len(As)), key=lambda i: -ks[i])
     sizes = [As[i].shape[0] for i in order]
     X_ = torch.cat([Ss[i] / 2 ** ks[i] for i in order])
@@ -707,13 +710,14 @@ def rot_Q_all(As):
     return out
 
 def rot_cayley_all(Rs):
-    """The Cayley bases (I + S)^-1 (I - S) of each (angles, start basis Q0 or None) in Rs, in one batched solve; a
-    start basis multiplies in float64 (in TF32 the product was orthogonal only to 1e-3)."""
+    """The Cayley bases (I + S)^-1 (I - S) of each (angles, start basis Q0 or None) in Rs, in one batched solve, in
+    full float32 (a start basis's product under TF32 was orthogonal only to 1e-3)."""
     g = Rs[0][0].shape[-1]
-    A_ = rot_hi(torch.cat([a * mask_of(g) for a, _ in Rs])); S_ = A_ - A_.transpose(1, 2)
-    I_ = torch.eye(g, device=S_.device, dtype=S_.dtype).expand_as(S_)
-    Q = torch.linalg.solve(I_ + S_, I_ - S_)
-    return [(Q0.to(q.dtype) @ q if Q0 is not None else q).float() for q, (_, Q0) in zip(Q.split([a.shape[0] for a, _ in Rs]), Rs)]
+    with full_float32():
+        A_ = torch.cat([a * mask_of(g) for a, _ in Rs]); S_ = A_ - A_.transpose(1, 2)
+        I_ = torch.eye(g, device=S_.device, dtype=S_.dtype).expand_as(S_)
+        Q = torch.linalg.solve(I_ + S_, I_ - S_)
+        return [Q0 @ q if Q0 is not None else q for q, (_, Q0) in zip(Q.split([a.shape[0] for a, _ in Rs]), Rs)]
 
 def rot_Q(R):
     """The groups' bases Q = exp(S), S the skew part of A's strict upper triangle (Taylor series after
@@ -1629,6 +1633,12 @@ rms = lambda q: q.detach().pow(2).mean().sqrt().item()
 # train: whether the gap to VPD is the gates or the parts (VPD's own causal gates on these parts: 0.80 bits per
 # token at 190 active, whole model).
 GATES_ONLY = os.environ.get('DESCENT_GATES_ONLY') == '1'
+if GATES_ONLY:
+    # The fixed parts take no gradient: no backward products for their reads and writes, no optimizer state.
+    for cont in [P[n] for n in mlp] + [A[n] for n in sliced]:
+        for w in ('V', 'U', 'F', 'G'):
+            if torch.is_tensor(cont.get(w)) and cont[w].is_leaf:
+                cont[w].requires_grad_(False)
 # DESCENT_SIGNED=1 (slice arms): a slice's guard reads its signed own write, on when c ||u|| > tau or -c ||u|| > tau_neg,
 # each sign its own threshold (both started at the calibrated |c| ||u|| threshold, so the start is unchanged):
 # the read |c| ||u|| fires on a large negative pre-activation that GELU discards, and VPD's own gates on its parts
