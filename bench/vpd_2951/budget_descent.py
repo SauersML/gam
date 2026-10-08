@@ -19,9 +19,8 @@ Starts:
        trained per slice
   vpdgroup  as vpd, with each down_proj slice tied to the gate of the c_fc slice of its layer whose
        firing is nearest its own (below)
-Gate arms (DESCENT_ARM): own (above); dir, a separate signed gate direction per slice; router, a
-small causal router per layer added to the own read; router_pure, the router alone; share, learned
-gate sharing across the slices of a layer (below).
+Gate arms (DESCENT_ARM): own (above); dir, a separate signed gate direction per slice; share, learned
+gate sharing across the slices of a layer (below); rot (below).
 Objective (DESCENT_F=1): F, the bits-back code length per training token (below); otherwise KL alone.
 Exactness (DESCENT_EXACT=1): each map's slices are parametrized by a read frame F and its canonical
 dual, so they sum to M's weight at every step whatever F becomes (frame(), below); training moves
@@ -37,9 +36,7 @@ Training rows 0..1023 of tokens.f64, held-out evaluation rows 1024..1031 (4096 t
 causal-importance masks give KL 0.737 at 129 active MLP slices per token.
 Usage: budget_descent.py START K STEPS OUT.json GATE EVAL SECONDS GAM TARGET VPD TOKENS
   GATE     mf = expected gate forward and derivative; st = hard gate forward, expected gate derivative;
-           ramp = a continuous gate clamp((r - tau)/w, 0, 1) with a learned width w per slice, as VPD's
-           masks are continuous at evaluation: trained as its expectation under the threshold noise
-           (scale s), evaluated as the ramp itself (not binarized), active where r > tau
+           bern = (rot) a hard gate drawn on with probability Phi(z), Phi(z)'s derivative
   EVAL     steps between held-out evaluations; SECONDS: wall-clock limit of the training loop
   GAM      bench/vpd_2951 (vpd_model), TARGET the target run (t-9d2b8f02), VPD the decomposition
            export's export.json (engine/vpd4l_decomposition), TOKENS engine/vpd4l_pile2p27/tokens.f64"""
@@ -155,7 +152,7 @@ for n in mlp:
     else:
         V, U = load(n + '.V'), load(n + '.U')
     if EXACT and start == 'neuron':
-        raise SystemExit('the neuron start is exact without frames (DESCENT_FREEZE=1 keeps it exact)')
+        raise SystemExit('the neuron start is exact without frames')
     if EXACT:
         # The start's reads kept (the canonical dual is an involution: the frame R (R^T R)^-1 has dual
         # R), its writes replaced by the exact ones. The SVD start's down_proj has fewer slices than
@@ -217,28 +214,6 @@ if start == 'vpdgroup':
             GROUP[dn] = (fc, owner)
             MULT[fc] = 1 + torch.bincount(owner[owner >= 0], minlength=gf.shape[1]).float()
             print(dn, 'tied', int((owner >= 0).sum()), 'of', owner.numel(), 'to', int((MULT[fc] > 1).sum()), 'c_fc slices', flush=True)
-# DESCENT_ARM=router: each MLP layer gets a small causal router on the layer's own input x (the c_fc
-# input at that position only): z_i = (r_i + [G2 relu(G1 x)]_i - tau_i) / s_i for every slice of the
-# layer's two maps, G1 of shape d x 64 shared by the layer, G2 of shape 64 x C per map, started at
-# zero (so the start is the own-read gate's).
-# DESCENT_ARM=router_pure: the router alone, z_i = ([G2 relu(G1 x)]_i - tau_i) / s_i, with G2 started
-# at the least-squares fit of the own reads r on M's fit tokens from the 64 router features.
-ROUTER = {}
-if ARM in ('router', 'router_pure'):
-    for l in range(T.n_layer):
-        fc, dn = f'h.{l}.mlp.c_fc', f'h.{l}.mlp.down_proj'
-        d = P[fc]['V'].shape[0]
-        G1 = torch.randn(d, 64, device=dev) / math.sqrt(d)
-        R = {'G1': G1.requires_grad_()}
-        for n in (fc, dn):
-            if ARM == 'router':
-                R[n] = torch.zeros(64, P[n]['V'].shape[1], device=dev, requires_grad=True)
-            else:
-                with torch.no_grad():
-                    H = torch.relu(X[fc] @ G1)
-                    r = (X[n] @ P[n]['V']).abs() * P[n]['U'].norm(dim=1)
-                    R[n] = torch.linalg.lstsq(H.cpu().double(), r.cpu().double()).solution.float().to(dev).requires_grad_()
-        ROUTER[l] = R
 # DESCENT_ARM=share: parts of any rank across a layer's two maps, one gate each, the grouping learned
 # in both directions. Part m of layer l is gated at its input side by the norm of its c_fc members'
 # own reads, sqrt(sum_j r_j^2) > t_m (rotation-invariant within the part); each down_proj slice
@@ -349,8 +324,7 @@ def head_output(c, U, o, swaps=()):
 
 
 # DESCENT_ATTN_FREE=1: the heads' slices start at the exact frames' reads and writes and then train
-# freely (no dual to recompute); with DESCENT_RESID each attention map's leftover keeps every part on
-# equal to M.
+# freely (no dual to recompute).
 ATTN_FREE = os.environ.get('DESCENT_ATTN_FREE') == '1'
 A = {}
 for n in sliced:
@@ -380,71 +354,20 @@ for n in sliced:
         A[n]['V'], A[n]['U'] = V.clone().requires_grad_(), U.clone().requires_grad_()
     print(n, 'slices', NH * V.shape[-1], 'all-on error', err, 'worst head frame cond', round(cond, 1), flush=True)
 SHARE_A = {}
-# DESCENT_RESID=1 (MLP maps): a priced residual part per map. R = W^T - V U, recomputed from the current
-# slices, is one more part, so every part on is M exactly by construction whatever the slices become.
-# It is gated on its own read ||x R|| (the norm of its output on the map's own input): Phi((||x R|| -
-# tau_R)/s_R) in training, hard at evaluation, with s_R = 0.1 x the root mean square of ||x W^T|| on
-# M's fit tokens (the map's output scale; R starts at 0 for an exact start) and tau_R started at 3 s_R
-# (off). On, it counts its rank-one equivalent, min(d_in, d_out) (a full-rank residual is that many
-# rank-one units). Under DESCENT_F its entries are described like any part's (below), so a large
-# residual costs bits and budget and a small one is cheap: F decides how far the slices drift.
-RESID = os.environ.get('DESCENT_RESID') == '1'
 # Typical input and output norms of every map on M's fit tokens (random weight edits are sized by them).
 with torch.no_grad():
     TYPICAL = {n: (X[n].norm(dim=-1).pow(2).mean().sqrt().item(), (X[n] @ T.site(n).W.T).norm(dim=-1).pow(2).mean().sqrt().item())
                for n in X}
-RES = {}
-def assembled(n):
-    """Map n's slices summed into one matrix [d_in, d_out] (an attention map's heads in place)."""
-    if n in P:
-        return P[n]['V'] @ P[n]['U']
-    p = A[n]; blocks = p['V'] @ p['U']                                           # [H, d_in_h, d_out_h]
-    return blocks.reshape(-1, blocks.shape[-1]) if p['o'] else blocks.permute(1, 0, 2).reshape(blocks.shape[1], -1)
-if RESID:
-    with torch.no_grad():
-        for n in mlp + (attn if ATTN_FREE else []):
-            W = T.site(n).W
-            s_R = 0.1 * (X[n] @ W.T).norm(dim=-1).pow(2).mean().sqrt()
-            RES[n] = {'tau': (3 * s_R).clone().requires_grad_(), 's': s_R, 'rank': float(min(W.shape)),
-                      'ls': torch.full((W.shape[1], W.shape[0]), math.log(1e-3 * W.abs().mean().item()), device=dev).requires_grad_()}
-def residual(n, x):
-    """Map n's residual part on its input x: R = W^T - V U (or its posterior sample), gated on ||x R||."""
-    R = RES[n]['sample'] if RES[n].get('sample') is not None else T.site(n).W.T - assembled(n)
-    out = x @ R
-    for b, kind, G, a in state['entry'].get(n, ()):
-        idx = torch.tensor([b], device=out.device)
-        if kind == 'noop':
-            continue
-        if kind == 'swap':
-            c1, c2 = (torch.arange(h * HD, (h + 1) * HD, device=out.device) for h in G)
-            out = out.index_add(0, idx, (x[b][..., c2] @ R[c2] - x[b][..., c1] @ R[c1])[None])
-        elif kind == 'in':
-            out = out.index_add(0, idx, (a * (x[b][..., G] @ R[G]))[None])
-        else:
-            out = out.index_add(0, idx, (a * (x[b] @ R[:, G]) @ torch.eye(out.shape[-1], device=out.device)[G])[None])
-    if state['drop_R']:
-        out = out.index_fill(0, torch.tensor(state['drop_R'], device=out.device), 0.0)
-    if state['mode'] == 'all':
-        return out * 0.0 if state.get('drop_leftover') else out
-    z = (out.norm(dim=-1) - RES[n]['tau']) / RES[n]['s']
-    hard = (z > 0).float()
-    state['hard'].append(hard.reshape(-1) * RES[n]['rank'])
-    state['resid_on'].setdefault(n, []).append(hard.mean().item())
-    if state['mode'] == 'hard':
-        return out * hard[..., None]
-    phi = 0.5 * (1 + torch.erf(z / SQ2))
-    state['soft'].append(phi.reshape(-1) * RES[n]['rank'])
-    return out * phi[..., None]
 
 # The rot arm's neuron grouping reads M's c_fc inputs.
 X_FC = {n: X[n] for n in mlp if n.endswith('c_fc')} if ARM == 'rot' else {}
 del X
 
-state = {'mode': 'M', 'soft': [], 'hard': [], 'gates': {}, 'route': {}, 'share': {}, 'r': {}, 'writers': {}, 'on': {}, 'gate': {}, 'edges_soft': [], 'edges_hard': [], 'share_a': {}, 'resid_on': {}, 'wedits_M': {}, 'wedits_P': {}, 'entry': {}, 'force_on': [], 'drop_R': []}
+state = {'mode': 'M', 'soft': [], 'hard': [], 'gates': {}, 'share': {}, 'r': {}, 'writers': {}, 'on': {}, 'gate': {}, 'edges_soft': [], 'edges_hard': [], 'share_a': {}, 'wedits_M': {}, 'wedits_P': {}, 'entry': {}, 'force_on': []}
 SQ2 = math.sqrt(2)
 def make(n):
     st = T.site(n); p = P[n]; grp = GROUP.get(n); mult = MULT.get(n)
-    layer = int(n.split('.')[1]); router = ROUTER.get(layer)
+    layer = int(n.split('.')[1])
     if grp is not None:
         tied, own = grp[1] >= 0, grp[1].clamp_min(0)
     cur = {}
@@ -457,7 +380,7 @@ def make(n):
             if kind == 'out':
                 # Output coordinates G of every part's write scaled by 1 + a.
                 y = y.index_add(0, torch.tensor([b], device=y.device), (a * (coef[b] @ p['U'][:, G]) @ torch.eye(y.shape[-1], device=y.device)[G])[None])
-        return y + residual(n, cur['x']) if RESID else y
+        return y
     def fwd(x):
         cur['x'] = x
         if state['mode'] == 'M':
@@ -518,10 +441,6 @@ def make(n):
         read = x @ p['G'] if ARM == 'dir' else c if start == 'neuron' else c.abs() * un
         if state.get('calib') is not None:
             state['calib'].setdefault(n, []).append(read.detach().reshape(-1))
-        if router is not None:
-            if n.endswith('c_fc'):
-                state['route'][layer] = torch.relu(x @ router['G1'])
-            read = state['route'][layer] @ router[n] if ARM == 'router_pure' else read + state['route'][layer] @ router[n]
         z = (read - p['tau']) / p['s']
         hard = (z > 0).float()
         phi = 0.5 * (1 + torch.erf(z / SQ2))
@@ -547,18 +466,6 @@ def make(n):
                 if state['mode'] != 'hard':
                     pw = torch.cat([state['gate'][f'h.{k}.mlp.down_proj'][1] for k in range(layer)], -1)
                     state['edges_soft'].append(((pw @ keep) * phi).sum(-1).reshape(-1))
-        if gate == 'ramp':
-            a, width = read - p['tau'], p['lw'].exp()
-            if state['mode'] == 'hard':
-                state['on'][n] = (a > 0).float()
-                return emit(c * (a / width).clamp(0, 1))
-            state['soft'].append((phi * w).sum(-1).reshape(-1))
-            # E[clamp((a + s e)/width, 0, 1)] for e ~ N(0, 1): (g(a) - g(a - width)) / width with
-            # g(y) = E[(y + s e)^+] = y Phi(y/s) + s phi(y/s).
-            def g(y):
-                t = y / p['s']
-                return y * 0.5 * (1 + torch.erf(t / SQ2)) + p['s'] * torch.exp(-0.5 * t * t) / math.sqrt(2 * math.pi)
-            return emit(c * (g(a) - g(a - width)) / width)
         if state['mode'] == 'hard':
             state['on'][n] = hard
             return emit(c * hard)
@@ -621,8 +528,7 @@ def make_attn(n):
             else:
                 state['soft'].append(soft.sum((0, 2)))
                 g = soft
-            y = head_output(c * g, p['U'], p['o'], swaps_of(n, x.shape[1])).view(x.shape[0], x.shape[1], -1)
-            return y + residual(n, x) if n in RES else y
+            return head_output(c * g, p['U'], p['o'], swaps_of(n, x.shape[1])).view(x.shape[0], x.shape[1], -1)
         if state['mode'] == 'all':
             g = 1.0
         else:
@@ -636,8 +542,7 @@ def make_attn(n):
             else:
                 state['soft'].append(phi.sum((0, 2)))
                 g = phi if gate == 'mf' else hard + phi - phi.detach()
-        y = head_output(c * g, p['U'], p['o'], swaps_of(n, x.shape[1])).view(x.shape[0], x.shape[1], -1)
-        return y + residual(n, x) if n in RES else y
+        return head_output(c * g, p['U'], p['o'], swaps_of(n, x.shape[1])).view(x.shape[0], x.shape[1], -1)
     return fwd
 for n in sliced: T.site(n)._forward = make_attn(n)
 
@@ -1193,19 +1098,15 @@ def draw_edit(g, family):
                 torch.tensor(g.standard_normal((d_in, r)), dtype=torch.float32, device=dev) * math.sqrt(c))}
 
 def install(edits):
-    """edits: per sequence of the batch, None, 'allon' (every part's gate on, the leftover off, against M),
-    'lrm' (the leftover removed from both: M becomes its parts all on, P runs without the leftover), or
+    """edits: per sequence of the batch, None, 'allon' (every part's gate on, against M), or
     {map: (A, B), '_entry': {map: (kind, G, a)}}: a weight edit, additive Delta W = A B^T on M, and on P
     entry-wise where '_entry' gives it (kind 'in': input coordinates G of the map scaled by 1 + a, in
-    every part's read and the leftover; 'out': output coordinates G, in every part's write and the
-    leftover), additive otherwise."""
+    every part's read; 'out': output coordinates G, in every part's write), additive otherwise."""
     state['wedits_M'], state['wedits_P'], state['entry'] = {}, {}, {}
-    state['force_on'], state['drop_R'] = [], []
+    state['force_on'] = []
     for b, e in enumerate(edits):
         if e == 'allon':
-            state['force_on'].append(b); state['drop_R'].append(b); continue
-        if e == 'lrm':
-            state['drop_R'].append(b); continue
+            state['force_on'].append(b); continue
         entry = (e or {}).get('_entry', {})
         for n, v in (e or {}).items():
             if n == '_entry':
@@ -1218,12 +1119,9 @@ def install(edits):
 
 # DESCENT_WEDITS edited sequences per 8 of the batch (the same fraction at every batch size).
 N_EDITS = int(os.environ.get('DESCENT_WEDITS', '0')) * batch // 8
-# DESCENT_ALLON=1: one sequence per 8 of the batch runs with every part's gate on and the leftover off,
-# against M (ties the parts' sum to M). DESCENT_LRM=1 (with DESCENT_RESID): one sequence per 8 runs the
-# leftover-removal experiment, Delta W = -R on both models (M becomes its parts all on; P runs without
-# its leftover), tying P's sparse run to its own dense run.
+# DESCENT_ALLON=1: one sequence per 8 of the batch runs with every part's gate on, against M (ties the parts'
+# sum to M).
 ALLON = int(os.environ.get('DESCENT_ALLON', '0') == '1') * max(1, batch // 8)
-LRM = int(os.environ.get('DESCENT_LRM', '0') == '1' and RESID) * max(1, batch // 8)
 # Held-out weight edits: a fixed set, 4 per held-out sequence (32 in all), families in turn, seed 7.
 _g = np.random.default_rng(7)
 EVAL_EDITS = [(i, FAMILIES[(4 * i + k) % len(FAMILIES)]) for i in range(ev.shape[0]) for k in range(4)]
@@ -1302,10 +1200,6 @@ def attn_v(l, h, pattern):
             state['soft'].append(soft.sum((1, 3)).reshape(-1))
             g = soft if gate == 'mf' or SHARE_A else hard + soft - soft.detach()
     y = (m * g) @ p['U'][None]                                                 # [B, H, T, HD]
-    if n in RES:
-        # v_proj's leftover, gated on its own read at the key position, mixed by the pattern like any value.
-        dv = residual(n, h).view(B_, T_, NH, HD).transpose(1, 2)                 # [B, H, T, HD]
-        y = y + pattern @ dv
     for b, Ae, Be in state['wedits_P'].get(n, ()):
         # A weight edit of v_proj adds Delta W x to the values, which the pattern mixes like any value.
         dv = ((h[b] @ Be) @ Ae.T).view(T_, NH, HD).transpose(0, 1)               # [H, T, HD]
@@ -1475,7 +1369,6 @@ def evaluate(final=False):
     for n in sliced if not ATTN_FREE else ():
         A[n]['V'], A[n]['U'] = head_frame(A[n]['F'], T.site(n).W, A[n]['o'])
     state['collect'] = {} if SHARE else None
-    state['resid_on'] = {}
     install([None])
     r = {'kl': [], 'kl_soft': [], 'kl_all_on': [], 'active': [], 'active_soft': [], 'per_map': [], 'edges_on': [], 'edges_on_soft': []}
     graph = None
@@ -1500,19 +1393,8 @@ def evaluate(final=False):
                 state['allon_family'] = fam
                 lp = run(ids, 'hard'); r.setdefault(key, []).append(kl_bits(lm, lp).mean().item())
             state['allon_family'] = None
-        if RES:
-            # M with its leftover removed: every part on, the leftover off (= W - R in every map).
-            state['drop_leftover'] = True
-            lp = run(ids, 'all'); r.setdefault('kl_parts_on', []).append(kl_bits(lm, lp).mean().item())
-            state['drop_leftover'] = False
     out = {k: float(np.mean(v)) for k, v in r.items() if k != 'per_map' and v}
     out['per_map'] = [round(float(x), 2) for x in np.mean(r['per_map'], 0)]
-    if RES:
-        out['residual'] = {n: {'norm_rel_W': round(((T.site(n).W.T - assembled(n)).norm() / T.site(n).W.norm()).item(), 4),
-                               'fires': round(float(np.mean(state['resid_on'].get(n, [0.0]))), 4)} for n in RES}
-        if FMODE:
-            out['residual_bits'] = residual_bits()
-    state['resid_on'] = {}
     if EDGES:
         # Kept edges per layer, and the distribution of each reader part's inputs (its kept edges).
         out['edges'] = {}
@@ -1581,7 +1463,7 @@ if RESUME:
                     START_VAL[(id(cont), k)] = cont[k].detach().clone()
                     cont[k] = src[k].to(dev).clone().requires_grad_(k != 's')
     print('resumed from', RESUME, 'step', S_['step'], flush=True)
-if start in ('vpd', 'neuron') and not (SHARE or SHARE_A or ROUTER or EXACT or ARM in ('dir', 'rot') or RESUME):
+if start in ('vpd', 'neuron') and not (SHARE or SHARE_A or EXACT or ARM in ('dir', 'rot') or RESUME):
     # A neuron part counts its two slices: its layer's neurons on match the mean of VPD's two counts.
     vc = lambda n: (VPD_COUNTS[n] if start == 'vpd' else
                     (VPD_COUNTS[n.rsplit('.', 1)[0] + '.c_fc'] + VPD_COUNTS[n.rsplit('.', 1)[0] + '.down_proj']) / 2)
@@ -1656,16 +1538,12 @@ if ARM == 'rot':
               round(torch.stack(state['rot_on']).sum(0).mean().item(), 1), flush=True)
 
 # Every trained tensor as (container, key, scale): Adam steps of 0.3% of the scale per step, the
-# scale a weight tensor's root mean square (a router G2 started at zero: its map's noise scale) and a
-# threshold's its map's noise scale x 33. DESCENT_LR multiplies every step size (default 1), and every step
+# scale a weight tensor's root mean square and a threshold's its map's noise scale x 33. DESCENT_LR multiplies every step size (default 1), and every step
 # size scales with the square root of the tokens per step against 8 x 256 (the batch's gradient noise).
 LR = float(os.environ.get('DESCENT_LR', '1')) * math.sqrt(batch * seq / (8 * 256))
 rms = lambda q: q.detach().pow(2).mean().sqrt().item()
-# DESCENT_FREEZE=1: the slices stay as they start (M's own, for the neuron start) and only the gates
-# train, so every part on is M exactly at every step.
-FREEZE = os.environ.get('DESCENT_FREEZE') == '1'
 slots = [(P[n], w, rms(P[n][w])) for n in mlp for w in (('F',) if EXACT else ('V', 'U')) + (('G',) if ARM == 'dir' else ())
-         if not (EXACT and NEURON_DOWN and n.endswith('down_proj') and w == 'F') and not (FREEZE and w in ('V', 'U', 'F')) and ARM != 'rot']
+         if not (EXACT and NEURON_DOWN and n.endswith('down_proj') and w == 'F') and ARM != 'rot']
 # rot: rotation angles by 1e-3 per step, thresholds by a tenth of their noise scale, assignment logits by 0.02.
 slots += [x for R in ROT_ALL for x in ((R, 'A', 1 / 3), (R, 'tau', 100 / 3 * R['s'].mean().item()), (R, 'L', 20 / 3))]
 slots += [x for P_ in GN.values() for x in ((P_, 'W1', rms(P_['W1'])), (P_, 'b1', 0.1), (P_, 'W2', 1 / math.sqrt(GATENET)))]
@@ -1673,17 +1551,9 @@ slots += [(A[n], w, rms(A[n][w])) for n in sliced for w in (('V', 'U') if ATTN_F
 for l, S in SHARE_A.items():
     slots += [(S, 't', 100 / 3 * S['s'].mean().item()), (S, 'L_v', 20 / 3), (S, 'L_o', 20 / 3)]
 slots += [(P[n], 'tau', 100 / 3 * P[n]['s'].mean().item()) for n in mlp if ARM != 'rot']
-# The ramp's log width, started at log s (a ramp as wide as the threshold noise), by 1% per step.
-if gate == 'ramp':
-    for n in mlp:
-        P[n]['lw'] = P[n]['s'].log().clone().requires_grad_()
-    slots += [(P[n], 'lw', 10 / 3) for n in mlp]
 for l, S in SHARE.items():
     # part thresholds by 1% of their noise scale x 10, assignment logits by 0.02 per step
     slots += [(S, 't', 100 / 3 * S['s'].mean().item()), (S, 'L_fc', 20 / 3), (S, 'L_dn', 20 / 3)]
-for l, R in ROUTER.items():
-    slots.append((R, 'G1', rms(R['G1'])))
-    slots += [(R, n, rms(R[n]) or P[n]['s'].mean().item()) for n in R if n != 'G1']
 # DESCENT_F=1: the objective is F, the bits-back code length per training token: E_q[KL(M || P)] on
 # the training tokens plus KL(q || p) / N, N the training tokens (train_rows x 512). q is a Gaussian
 # per entry, N(mu, sigma^2), mu started at the tensor and sigma at 1% of its scale; p is a Gaussian
@@ -1705,9 +1575,7 @@ else:
     groups = [{'params': [cont[key]], 'lr': LR * 3e-3 * scale} for cont, key, scale in slots]
 # Edge gates by 0.01 per step (from the start's 3, 300 steps to drop an edge the data never defends).
 groups += [{'params': [E['eta']], 'lr': LR * 1e-2} for E in EDGE.values()]
-groups += [{'params': [Rn['tau']], 'lr': LR * 0.1 * Rn['s'].item()} for Rn in RES.values()]
 if FMODE:
-    groups += [{'params': [Rn['ls']], 'lr': LR * 1e-2} for Rn in RES.values()]
     # rot: each slice's dense widths (log sigma by 1% per step), and the leaves its cost reads.
     groups += [{'params': [R[w] for w in ('ls_fc', 'ls_dn', 'ls') if w in R], 'lr': LR * 1e-2} for R in ROT_ALL]
     for cont, key, mu, ls in leaves:
@@ -1752,10 +1620,6 @@ def draw(mean):
     for cont, key, mu, ls in leaves:
         cont[key] = mu if mean else mu + ls.exp() * torch.randn_like(mu)
     state['noise'] = FMODE and not mean and ARM == 'rot'
-    for n, Rn in RES.items():
-        mu_R = T.site(n).W.T - assembled(n)
-        Rn['mean'] = mu_R
-        Rn['sample'] = mu_R if mean or not FMODE else mu_R + Rn['ls'].exp() * torch.randn_like(mu_R)
     if EXACT:
         for n in mlp:
             if not (NEURON_DOWN and n.endswith('down_proj')):
@@ -1791,7 +1655,7 @@ def description_bits():
             v = (e * M_).sum() / (M_.sum() * mu.shape[0])
             total = total + 0.5 * ((torch.log(v) - 2 * ls + e / v - 1) * M_).sum()
             continue
-        if key in ('tau', 't', 'lw'):
+        if key in ('tau', 't'):
             # Thresholds and widths are locations, not zero-centred: their prior N(m, v) has its mean m fitted
             # too (described in (1/2) ln n nats), v = mean((mu - m)^2 + sigma^2) at its optimum. Under
             # N(0, v) a tensor's thresholds, all near one value tau_0, had v ~ tau_0^2, which pushed every
@@ -1802,18 +1666,6 @@ def description_bits():
             continue
         v = e.mean()
         total = total + 0.5 * (mu.numel() * torch.log(v) - 2 * ls.sum())
-    for Rn in RES.values():
-        # The residual's entries under their own prior group N(0, v_R), posterior N(R, sigma_R^2).
-        v = (Rn['mean'].pow(2) + (2 * Rn['ls']).exp()).mean()
-        total = total + 0.5 * (Rn['mean'].numel() * torch.log(v) - 2 * Rn['ls'].sum())
-    return total / math.log(2)
-
-def residual_bits():
-    """The residual parts' share of the description, in bits (F only)."""
-    total = 0.0
-    for Rn in RES.values():
-        v = (Rn['mean'].pow(2) + (2 * Rn['ls']).exp()).mean()
-        total += 0.5 * (Rn['mean'].numel() * torch.log(v) - 2 * Rn['ls'].sum()).item()
     return total / math.log(2)
 # The budget: each step descends F + lam (E[k] - K); DESCENT_DUAL picks how lam (and the thresholds) follow it.
 DUAL = os.environ.get('DESCENT_DUAL', 'logint')
@@ -1901,21 +1753,10 @@ for step in range(steps):
     kinds = [draw_edit(g_edits, FAMILIES[(step * N_EDITS + b) % len(FAMILIES)]) if b < N_EDITS else None for b in range(batch)]
     for b in range(N_EDITS, N_EDITS + ALLON):
         kinds[b] = 'allon'
-    for b in range(N_EDITS + ALLON, N_EDITS + ALLON + LRM):
-        kinds[b] = 'lrm'
     install(kinds)
     with torch.no_grad():
         lm = run(ids, 'M')
     draw(False)
-    if LRM:
-        # The leftover-removal experiment: M with Delta W = -R is the parts all on; its target is computed
-        # at this step's parts (no gradient), and P runs the same sequence without its leftover.
-        b_ = N_EDITS + ALLON
-        with torch.no_grad():
-            install([None] * LRM); state['drop_leftover'] = True
-            lm = lm.index_copy(0, torch.arange(b_, b_ + LRM, device=dev), run(ids[b_:b_ + LRM], 'all'))
-            state['drop_leftover'] = False
-        install(kinds)
     state['pin'] = None
     lp = run(ids, 'soft')
     kl_seq = kl_bits(lm, lp).mean(-1)
