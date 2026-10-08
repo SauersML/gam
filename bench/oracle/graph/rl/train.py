@@ -1003,7 +1003,7 @@ def exit_update(pol: Policy, prompts, improved, sampled, beta: float, micro: int
     return {"exit_sft_loss": s["loss"], "exit_dpo_loss": d["loss"], "exit_dpo_margin": d["margin"]}
 
 
-def rl2_step(step: int, args, pol, sampler, score, scales: Scales, pool: list[dict], adapter: Path, optimizer, warmup, candidates: dict, logs: dict, started: float) -> dict:
+def rl2_step(step: int, args, pol, sampler, score, scales: Scales, pool: list[dict], adapter: Path, learner: Learner, candidates: dict, logs: dict, started: float) -> dict:
     """One RL v2 step. --behaviors-per-step behaviors drawn uniformly (by the step's seed), a group each (rl2_groups);
     groups without signal are dropped and refilled (5) by behaviors drawn by gap to the teacher, up to --refill more
     sampling rounds; expert iteration (2, --refine > 0) from each group's best valid answer; --ppo-epochs clipped
@@ -1023,10 +1023,10 @@ def rl2_step(step: int, args, pol, sampler, score, scales: Scales, pool: list[di
         groups += rl2_groups(extra, step, args, pol, sampler, score, scales, adapter, clock)
         refills += 1
     improved = expert_iteration(groups, step, args, pol, score, candidates, clock) if args.refine else []
-    return rl2_update(step, groups, improved, refills, score.hits[0], clock, args, pol, sampler, scales, optimizer, warmup, logs, started)
+    return rl2_update(step, groups, improved, refills, score.hits[0], clock, args, pol, sampler, scales, learner, logs, started)
 
 
-def rl2_update(step: int, groups: list[dict], improved: list[dict], refills: int, repeated: int, clock: dict, args, pol, sampler, scales: Scales, optimizer, warmup,
+def rl2_update(step: int, groups: list[dict], improved: list[dict], refills: int, repeated: int, clock: dict, args, pol, sampler, scales: Scales, learner: Learner,
                logs: dict, started: float) -> dict:
     """The update of an rl2 step on its scored groups: every answer, its score and its credit to samples.jsonl, every
     improved answer to improved.jsonl; --ppo-epochs clipped updates (4) on the groups with signal, then one
@@ -1042,18 +1042,12 @@ def rl2_update(step: int, groups: list[dict], improved: list[dict], refills: int
         logs["improved"].write(json.dumps({"step": step, "seed": step_seed(args, step), **{k: v for k, v in x.items() if k not in ("prompt", "improved", "sampled")}}) + "\n")
     logs["improved"].flush()
     t = time.time()
-    pol.train_mode(True)
-    optimizer.zero_grad(set_to_none=True)
     flat = [(grp["prompt"], c, a, b) for grp in kept for c, a, b in zip(grp["completions"], grp["token_advantages"], grp["behavior_logprobs"])]
-    stats = ppo_update(pol, [x[0] for x in flat], [x[1] for x in flat], [x[2] for x in flat], args.beta, args.micro, args.ppo_epochs, clip_of(args),
-                       optimizer, warmup, [x[3] for x in flat]) if flat else {}
+    stats = learner.ppo([x[0] for x in flat], [x[1] for x in flat], [x[2] for x in flat], args.beta, args.micro, args.ppo_epochs, clip_of(args),
+                        [x[3] for x in flat]) if flat else {}
     stats.pop("logprob_sums", None)
     if improved:
-        stats.update(exit_update(pol, [x["prompt"] for x in improved], [x["improved"] for x in improved], [x["sampled"] for x in improved], args.exit_beta, args.micro))
-        stats["exit_grad_norm"] = float(torch.nn.utils.clip_grad_norm_(pol.params, 1.0))
-        optimizer.step()
-        warmup.step()
-        optimizer.zero_grad(set_to_none=True)
+        stats.update(learner.exit([x["prompt"] for x in improved], [x["improved"] for x in improved], [x["sampled"] for x in improved], args.exit_beta, args.micro))
     clock["train"] = time.time() - t
     best = [scales.relative(g["behavior"]["id"], float(g["S"][g["valid"]].min())) for g in groups if g["valid"].any()]
     S = np.concatenate([g["S"] for g in groups])
@@ -1067,7 +1061,7 @@ def rl2_update(step: int, groups: list[dict], improved: list[dict], refills: int
     return row
 
 
-def rl2_async(args, pol, sampler, score, scales: Scales, pool: list[dict], adapter: Path, optimizer, warmup, candidates: dict, logs: dict, started: float, stop) -> None:
+def rl2_async(args, pol, sampler, score, scales: Scales, pool: list[dict], adapter: Path, learner: Learner, candidates: dict, logs: dict, started: float, stop) -> None:
     """rl2 with the checker overlapped (--async): while a thread scores, credits and refines step t's groups, vLLM
     samples step t + 1's with the policy not yet updated on step t, so those answers lag the trained policy by one
     step (ppo_update's importance weight corrects it, as AReaL's decoupled PPO and verl's rollout correction do). A step
@@ -1094,7 +1088,7 @@ def rl2_async(args, pol, sampler, score, scales: Scales, pool: list[dict], adapt
 
     carry = 0
     clock = {"sample": 0.0, "score": 0.0, "credit": 0.0, "refine": 0.0, "train": 0.0}
-    pol.save(adapter)
+    learner.save(adapter)
     groups = rl2_sample(draw(0, carry), 0, args, pol, sampler, adapter, clock)
     with ThreadPoolExecutor(1) as pool_thread:
         for step in range(args.steps):
@@ -1106,12 +1100,61 @@ def rl2_async(args, pol, sampler, score, scales: Scales, pool: list[dict], adapt
             upcoming = rl2_sample(draw(step + 1, carry), step + 1, args, pol, sampler, adapter, nxt) if step + 1 < args.steps else None
             improved, repeated = future.result()
             clock["overlap_wait"] = time.time() - t - nxt["sample"]  # checker time not hidden behind sampling
-            row = rl2_update(step, groups, improved, 0, repeated, clock, args, pol, sampler, scales, optimizer, warmup, logs, started)
+            row = rl2_update(step, groups, improved, 0, repeated, clock, args, pol, sampler, scales, learner, logs, started)
             carry = min(args.behaviors_per_step, row["groups"] - row["kept"]) if args.refill else 0
-            pol.save(adapter)
+            learner.save(adapter)
             if upcoming is None:
                 break
             groups, clock = upcoming, nxt
+
+
+class Learner:
+    """The trainer behind one interface: every update the RL logic makes (SFT, DPO, GRPO, PPO epochs, expert iteration)
+    and the adapter it saves for the sampler. This one is local (the PEFT LoRA policy, AdamW with warmup, gradient norm
+    clipped at 1); a managed backend (e.g. Tinker: sampling and training served, the checker local) replaces it and the
+    samplers (callables (prompts, n, adapter, version) -> completions, with token_logprobs and stats) without touching
+    rl2_step, rl2_update or the GRPO / DPO / best-of-N loop."""
+
+    def __init__(self, pol: Policy, optimizer, warmup):
+        self.pol, self.optimizer, self.warmup = pol, optimizer, warmup
+
+    def step(self) -> float:
+        norm = float(torch.nn.utils.clip_grad_norm_(self.pol.params, 1.0))
+        self.optimizer.step()
+        self.warmup.step()
+        self.optimizer.zero_grad(set_to_none=True)
+        return norm
+
+    def begin(self):
+        self.pol.train_mode(True)
+        self.optimizer.zero_grad(set_to_none=True)
+
+    def sft(self, prompts, completions, micro: int) -> dict:
+        self.begin()
+        stats = sft_update(self.pol, prompts, completions, micro)
+        return {**stats, "grad_norm": self.step()}
+
+    def dpo(self, prompts, winners, losers, beta: float, micro: int) -> dict:
+        self.begin()
+        stats = dpo_update(self.pol, prompts, winners, losers, beta, micro)
+        return {**stats, "grad_norm": self.step()}
+
+    def grpo(self, prompts, completions, advantage, beta: float, micro: int) -> dict:
+        self.begin()
+        stats = grpo_update(self.pol, prompts, completions, advantage, beta, micro)
+        return {**stats, "grad_norm": self.step()}
+
+    def ppo(self, prompts, completions, token_adv, beta: float, micro: int, epochs: int, clip: dict, behavior=None) -> dict:
+        self.begin()
+        return ppo_update(self.pol, prompts, completions, token_adv, beta, micro, epochs, clip, self.optimizer, self.warmup, behavior)
+
+    def exit(self, prompts, improved, sampled, beta: float, micro: int) -> dict:
+        self.begin()
+        stats = exit_update(self.pol, prompts, improved, sampled, beta, micro)
+        return {**stats, "exit_grad_norm": self.step()}
+
+    def save(self, path: Path):
+        self.pol.save(path)
 
 
 def repair_prompt(behavior: dict, source: str, result: dict) -> str:
@@ -1192,7 +1235,7 @@ def sft_examples(args, pol, pool: list[dict]) -> tuple[list, list]:
     return keep(programs), keep(questions)
 
 
-def sft(args, pol, pool, optimizer, warmup, log) -> dict:
+def sft(args, pol, pool, learner: Learner, log) -> dict:
     """--sft-steps steps of SFT: each batch draws --batch examples, a program example with probability
     --program-share and a question otherwise; loss = -(1/B) sum_e sum_t log pi(y_et) (sft_update)."""
     programs, questions = sft_examples(args, pol, pool)
@@ -1206,12 +1249,7 @@ def sft(args, pol, pool, optimizer, warmup, log) -> dict:
         if args.hours and time.time() - started > 3600 * args.hours:
             break
         batch = [rng.choice(programs) if programs and (not questions or rng.random() < args.program_share) else rng.choice(questions) for _ in range(args.batch)]
-        pol.train_mode(True)
-        stats = sft_update(pol, [p for p, _ in batch], [c for _, c in batch], args.micro)
-        stats["grad_norm"] = float(torch.nn.utils.clip_grad_norm_(pol.params, 1.0))
-        optimizer.step()
-        warmup.step()
-        optimizer.zero_grad(set_to_none=True)
+        stats = learner.sft([p for p, _ in batch], [c for _, c in batch], args.micro)
         tokens = sum(len(c) for _, c in batch)
         log.write(json.dumps({"step": step, "loss_nats_per_example": stats["loss"], "bits_per_token": stats["loss"] * len(batch) / tokens / np.log(2), **{k: v for k, v in stats.items() if k != "loss"},
                               "programs": sum(1 for x in batch if x in programs), "elapsed": time.time() - started}) + "\n")
@@ -1555,9 +1593,10 @@ def main():
         raise SystemExit(f"no train behaviors under {root / args.model}")
     optimizer = torch.optim.AdamW(pol.param_groups(lr), weight_decay=0.0)
     warmup = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda s: min(1.0, (s + 1) / args.warmup))  # linear over --warmup optimizer steps
+    learner = Learner(pol, optimizer, warmup)  # every update goes through it (a managed backend would replace it and the sampler)
     if args.mode == "sft":
-        sft(args, pol, pool, optimizer, warmup, open(out / "train.jsonl", "a"))
-        pol.save(adapter)
+        sft(args, pol, pool, learner, open(out / "train.jsonl", "a"))
+        learner.save(adapter)
         print(json.dumps(evaluate(sets, pol, sampler, score, args, adapter, 1, open(out / "eval.jsonl", "a"), args.sft_steps)))
         return
     log = open(out / "train.jsonl", "a")
@@ -1573,17 +1612,17 @@ def main():
             break
         if args.checker_hours and TOTALS["checker_seconds"] > 3600 * args.checker_hours:  # the A/B's budget: equal checker time per arm
             break
-        pol.save(adapter)
+        learner.save(adapter)
         if args.materialize_every and step and step % args.materialize_every == 0:
             refresh_parts(pol, sampler, out, args)
         if args.eval_every and step % args.eval_every == 0 and not (step == 0 and args.skip_first_eval):
             evaluate(sets, pol, sampler, score, args, adapter, step, eval_log, step)
         if args.mode == "rl2" and args.async_rollouts:  # its own loop: the checker overlaps the next step's sampling
-            rl2_async(args, pol, sampler, score, scales, pool, adapter, optimizer, warmup, candidates, logs, started,
+            rl2_async(args, pol, sampler, score, scales, pool, adapter, learner, candidates, logs, started,
                       lambda: bool((args.hours and time.time() - started > 3600 * args.hours) or (args.checker_hours and TOTALS["checker_seconds"] > 3600 * args.checker_hours)))
             break
         if args.mode == "rl2":
-            rl2_step(step, args, pol, sampler, score, scales, pool, adapter, optimizer, warmup, candidates, logs, started)
+            rl2_step(step, args, pol, sampler, score, scales, pool, adapter, learner, candidates, logs, started)
             continue
         t0 = time.time()
         chosen = random.Random(step_seed(args, step)).sample(pool, min(args.behaviors_per_step, len(pool)))  # the behaviors rl2 draws at this step
@@ -1602,8 +1641,6 @@ def main():
         samples_log.flush()
         flat_p = [p for p in prompts for _ in range(args.samples)]
         flat_c = [c for g in groups for c in g]
-        pol.train_mode(True)
-        optimizer.zero_grad(set_to_none=True)
         # An invalid program is infeasible: the checker scores it as the empty program, which can beat valid programs
         # that lose to the empty one, so for preferences and advantages it counts as no better than the group's worst
         # valid program (a group with no valid program gives no signal).
@@ -1612,11 +1649,11 @@ def main():
             r = -S_feasible
             std = r.std(1, keepdims=True)
             adv = np.where(std > 0, (r - r.mean(1, keepdims=True)) / np.where(std > 0, std, 1.0), 0.0).reshape(-1)
-            stats = grpo_update(pol, flat_p, flat_c, adv.tolist(), beta, args.micro)
+            stats = learner.grpo(flat_p, flat_c, adv.tolist(), beta, args.micro)
         elif args.mode == "dpo":
             pairs = [(g, int(np.where(valid[g], S[g], np.inf).argmin()), int(np.where(valid[g], S[g], np.inf).argmax()) if valid[g].all() else int((~valid[g]).argmax()))
                      for g in range(len(chosen)) if valid[g].any() and (not valid[g].all() or S[g].max() > S[g].min())]
-            stats = dpo_update(pol, [prompts[g] for g, _, _ in pairs], [groups[g][w] for g, w, _ in pairs], [groups[g][l] for g, _, l in pairs], beta, args.micro) if pairs else {}
+            stats = learner.dpo([prompts[g] for g, _, _ in pairs], [groups[g][w] for g, w, _ in pairs], [groups[g][l] for g, _, l in pairs], beta, args.micro) if pairs else {}
             stats["pairs"] = len(pairs)
         else:
             best = [(int(np.where(valid[g], S[g], np.inf).argmin()) if valid[g].any() else int(S[g].argmin())) for g in range(len(chosen))]
@@ -1628,19 +1665,11 @@ def main():
             best_log.flush()
             stats = {}
             for _ in range(args.sft_epochs if keep else 0):  # the kept program answers the ORIGINAL input: experiments never reach the oracle's input
-                stats = sft_update(pol, [prompts[g] for g in keep], [best[g]["completion"] for g in keep], args.micro)
-                torch.nn.utils.clip_grad_norm_(pol.params, 1.0)
-                optimizer.step()
-                warmup.step()
-                optimizer.zero_grad(set_to_none=True)
+                stats = learner.sft([prompts[g] for g in keep], [best[g]["completion"] for g in keep], args.micro)
             stats.update({"kept": len(keep), "repaired": len(repaired), "kept_mean_bits": float(np.mean([best[g]["score"]["total_bits"] for g in keep])) if keep else None})
         sums = stats.pop("logprob_sums", None)
         if sums is not None and sampler.logprob_sums is not None:  # on-policy check: the sampler's log pi(y) against the trainer's, per token
             stats["sampler_trainer_logprob_gap_per_token"] = float(np.sum(np.abs(np.array(sums) - np.array(sampler.logprob_sums))) / max(1, sum(len(c) for c in flat_c)))
-        if args.mode != "bestofn":
-            stats["grad_norm"] = float(torch.nn.utils.clip_grad_norm_(pol.params, 1.0))
-            optimizer.step()
-            warmup.step()
         t3 = time.time()
         tokens = [len(c) for c in flat_c]
         log.write(json.dumps({"step": step, "mode": args.mode, "behaviors": len(chosen), "programs": len(items), "mean_bits": float(S.mean()), "best_bits": float(S.min(1).mean()),
@@ -1649,7 +1678,7 @@ def main():
                               "checker_seconds_total": TOTALS["checker_seconds"], "elapsed": time.time() - started,
                               "example": items[int(np.where(valid, S, np.inf).reshape(-1).argmin())]["source"][:2000]}) + "\n")
         log.flush()
-    pol.save(adapter)
+    learner.save(adapter)
     if args.eval_every:
         evaluate(sets, pol, sampler, score, args, adapter, args.steps, eval_log, args.steps)
 

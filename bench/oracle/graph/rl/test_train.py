@@ -461,7 +461,7 @@ def check_rl2_step(pol):
             first = {}
             for step in range(64):  # the first step that draws x and y
                 if set(random_pick(pool, args, step)) == {"x", "y"}:
-                    first = train.rl2_step(step, args, pol, sampler, stand_in, scales, pool, Path(d), rec, NoWarmup(), {"x": {"answer": ["<p:2.v.9>", "<p:2.o.735>"]}}, logs, 0.0)
+                    first = train.rl2_step(step, args, pol, sampler, stand_in, scales, pool, Path(d), train.Learner(pol, rec, NoWarmup()), {"x": {"answer": ["<p:2.v.9>", "<p:2.o.735>"]}}, logs, 0.0)
                     break
             assert first, "no step draws x and y"
             assert first["groups"] == 3 and first["kept"] == 2 and first["refills"] == 1 and asked[-1] == "z", (first, asked)
@@ -488,7 +488,7 @@ def check_rl2_step(pol):
             assert np.isfinite(first["mean_bits"])
             logs2 = {k: open(Path(d) / f"async_{k}.jsonl", "w") for k in ("train", "samples", "improved")}
             asked.clear()
-            train.rl2_async(argparse.Namespace(**{**vars(args), "steps": 3, "async_rollouts": True}), pol, sampler, stand_in, scales, pool, Path(d), rec, NoWarmup(),
+            train.rl2_async(argparse.Namespace(**{**vars(args), "steps": 3, "async_rollouts": True}), pol, sampler, stand_in, scales, pool, Path(d), train.Learner(pol, rec, NoWarmup()),
                             {"x": {"answer": ["<p:2.v.9>", "<p:2.o.735>"]}}, logs2, 0.0, lambda: False)
             for f in logs2.values():
                 f.close()
