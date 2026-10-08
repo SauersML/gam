@@ -78,9 +78,10 @@ def main():
         check_pack(pol)
         check_left_padding(pol)
         check_init_adapter(Path(d))
+        check_part_vocab(Path(d))
     check_split_prompts()
     print("ok: token log-probabilities, KL 0 and DPO ln 2 at the reference, GRPO gradient = summed log-probability policy gradient, "
-          "packed groups = separate sequences, left-padded batched generation, g-predict's adapters = their PEFT conversion, prompt split")
+          "packed groups = separate sequences, left-padded batched generation, g-predict's adapters = their PEFT conversion, prompt split, part tokens")
 
 
 def check_pack(pol):
@@ -128,6 +129,58 @@ def check_left_padding(pol):
             assert both[r].tolist() == one.tolist(), (r, both[r], one)
     out = train.HfSampler(pol, 5, batch=3)(prompts, 2, Path("."), 0)
     assert len(out) == 2 and all(len(x) == 2 and all(len(c) <= 5 for c in x) for x in out)
+
+
+def check_part_vocab(base: Path):
+    """Part tokens (part_vocab.py): base tokens' logits are unchanged, a part token's input embedding and
+    logit come from the projections, gradients reach the projections, and the materialized checkpoint
+    reproduces the wrapped model's logits."""
+    import part_vocab
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    class Parts(torch.nn.Module):
+        def __init__(self, d):
+            super().__init__()
+            g = torch.Generator().manual_seed(5)
+            self.register_buffer("read", torch.randn(3, 6, generator=g))
+            self.register_buffer("write", torch.randn(3, 6, generator=g))
+            self.p_in, self.p_out = torch.nn.Linear(6, d), torch.nn.Linear(6, d)
+
+        def tokens(self):
+            return ["<part:a>", "<part:b>", "<part:c>"]
+
+        def input_rows(self):
+            return self.p_in(self.read)
+
+        def output_rows(self):
+            return self.p_out(self.write)
+
+    model = AutoModelForCausalLM.from_pretrained(base, dtype=torch.float32)
+    tok = AutoTokenizer.from_pretrained(base)
+    ids = torch.randint(0, 1000, (1, 9))
+    with torch.no_grad():
+        before = model(input_ids=ids).logits
+    parts = Parts(model.config.hidden_size)
+    first = part_vocab.install(model, tok, parts)
+    with torch.no_grad():
+        after = model(input_ids=ids).logits
+    outside = lambda x: torch.cat([x[..., :first], x[..., first + 3 :]], -1)  # noqa: E731  every column but the part tokens'
+    assert torch.allclose(outside(before), outside(after), atol=1e-6)
+    assert torch.allclose(model.model.embed_tokens(torch.tensor([first + 1])), parts.input_rows()[1:2], atol=1e-6)
+    mixed = torch.cat([ids, torch.tensor([[first, first + 2]])], 1)
+    out = model(input_ids=mixed, output_hidden_states=True)
+    h = out.hidden_states[-1][0, -1]
+    assert torch.allclose(out.logits[0, -1, first : first + 3], parts.output_rows() @ h, atol=1e-4)
+    out.logits[0, -1, first + 1].backward()
+    assert parts.p_out.weight.grad.abs().sum() > 0 and parts.p_in.weight.grad.abs().sum() > 0
+    with tempfile.TemporaryDirectory() as d:
+        part_vocab.materialize(model, tok, parts, first, str(base), Path(d))
+        plain = AutoModelForCausalLM.from_pretrained(d, dtype=torch.float32)
+        with torch.no_grad():
+            want = model(input_ids=mixed).logits
+            got = plain(input_ids=mixed).logits
+        assert got.shape == want.shape and torch.allclose(got, want, atol=1e-4), float((got - want).abs().max())
+        assert len(AutoTokenizer.from_pretrained(d)) == first + 3
 
 
 def check_init_adapter(base: Path):

@@ -68,6 +68,7 @@ HERE = Path(__file__).resolve().parent
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")  # CUDA may be initialized here (torch.cuda.is_available) before vLLM starts its engine process
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent))
+sys.path.insert(0, str(HERE.parent / "predict"))  # g-predict's part_tokens
 import prompt  # noqa: E402
 from prompt import program_of, render, split_answer  # noqa: E402
 import scorer  # noqa: E402
@@ -150,6 +151,17 @@ def baselines(b: dict) -> dict[str, str]:
     return out
 
 
+def load_parts(spec: str, init: str | None):
+    """The part-token module (g-predict's part_tokens.load(spec)), with projections resumed from an --init
+    adapter's part_tokens.pt when it has one."""
+    import part_tokens
+
+    parts = part_tokens.load(spec)
+    if init and (Path(init) / "part_tokens.pt").exists():
+        parts.load_state_dict(torch.load(Path(init) / "part_tokens.pt", map_location="cpu"))
+    return parts
+
+
 class Policy:
     """The trainable LoRA policy (adapter "default") and its frozen reference (adapter "ref" = the
     --init adapter, or the base with the adapter disabled)."""
@@ -162,6 +174,12 @@ class Policy:
         self.tok = AutoTokenizer.from_pretrained(args.base)
         dtype = torch.float32 if dev.type == "cpu" else torch.bfloat16
         base = AutoModelForCausalLM.from_pretrained(args.base, dtype=dtype).to(dev)
+        self.parts, self.first_part = None, None
+        if getattr(args, "part_tokens", None):  # part tokens: rows from the parts' read/write vectors (part_vocab.py)
+            import part_vocab
+
+            self.parts = load_parts(args.part_tokens, args.init).to(dev)
+            self.first_part = part_vocab.install(base, self.tok, self.parts)
         if args.init:
             self.model = PeftModel.from_pretrained(base, args.init, adapter_name="default", is_trainable=True)
             self.model.load_adapter(args.init, adapter_name="ref", is_trainable=False)
@@ -174,6 +192,8 @@ class Policy:
         self.has_ref = bool(args.init)
         self.pack = getattr(args, "pack", False)
         self.params = [p for n, p in self.model.named_parameters() if ".default." in n]
+        if self.parts is not None:  # the projections train with the LoRA
+            self.params += list(self.parts.parameters())
         for p in self.params:
             p.requires_grad_(True)
         self.end = self.tok.convert_tokens_to_ids("<|im_end|>")
@@ -184,6 +204,14 @@ class Policy:
 
     def save(self, path: Path):
         self.model.save_pretrained(str(path), selected_adapters=["default"])
+        if self.parts is not None:
+            torch.save(self.parts.state_dict(), Path(path) / "part_tokens.pt")
+
+    def materialize(self, out_dir: Path, base_name: str) -> Path:
+        """A base checkpoint carrying the current part rows (vLLM samples from it)."""
+        import part_vocab
+
+        return part_vocab.materialize(self.model.base_model.model, self.tok, self.parts, self.first_part, base_name, out_dir)
 
     def token_logprobs(self, prompts: list[list[int]], completions: list[list[int]], ref: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
         """log pi(y_t | x, y_<t) at every completion token: (B, T) log-probabilities and a 0/1 mask. The
@@ -311,13 +339,33 @@ class VllmSampler:
     def __init__(self, args, rank: int, end: int):
         from vllm import LLM
 
-        self.share = args.share_gpu
-        self.llm = LLM(model=args.base, dtype="bfloat16", enable_lora=True, max_lora_rank=rank, max_loras=1, enable_prefix_caching=True,
-                       gpu_memory_utilization=args.gpu_memory, max_model_len=args.max_model_len, seed=args.seed, enable_sleep_mode=self.share)
+        self.share, self.args, self.rank = args.share_gpu, args, rank
         self.max_tokens, self.end = args.max_tokens, end
         self.policy = None  # with --share-gpu: the trainer, moved to the host while vLLM samples
+        self.start(args.base)
+
+    def start(self, model: str):
+        from vllm import LLM
+
+        a = self.args
+        self.llm = LLM(model=model, dtype="bfloat16", enable_lora=True, max_lora_rank=self.rank, max_loras=1, enable_prefix_caching=True,
+                       gpu_memory_utilization=a.gpu_memory, max_model_len=a.max_model_len, seed=a.seed, enable_sleep_mode=self.share)
         if self.share:
             self.llm.sleep(level=1)  # weights to host memory, KV cache freed: the trainer loads next
+
+    def reload(self, model: Path):
+        """Restarts vLLM on a materialized checkpoint (part tokens' current rows)."""
+        import gc
+
+        del self.llm
+        gc.collect()
+        torch.cuda.empty_cache()
+        if self.share and self.policy is not None:
+            self.policy.model.to("cpu")
+            torch.cuda.empty_cache()
+        self.start(str(model))
+        if self.share and self.policy is not None:
+            self.policy.model.to(self.policy.dev)
 
     def __call__(self, prompts: list[list[int]], n: int, adapter: Path, version: int) -> list[list[list[int]]]:
         from vllm import SamplingParams
@@ -692,6 +740,13 @@ def rescore(args, score) -> dict:
     return summary
 
 
+def refresh_parts(pol, sampler, out: Path, args):
+    """With part tokens and vLLM: rewrite the checkpoint with the current part rows and restart vLLM on it."""
+    inner = sampler.inner if isinstance(sampler, ValidSampler) else sampler
+    if pol.parts is not None and isinstance(inner, VllmSampler):
+        inner.reload(pol.materialize(out / "vocab", args.base))
+
+
 def views_of(args) -> dict | None:
     return {"vpd": args.vpd_view} if getattr(args, "vpd_view", None) else None
 
@@ -729,6 +784,8 @@ def main():
     ap.add_argument("--pack", action="store_true", help="GRPO / DPO: one sequence per group (the shared prompt once; see Policy.token_logprobs); sets GRPO's micro-batch to the group")
     ap.add_argument("--sampler", choices=["auto", "vllm", "hf"], default="auto")
     ap.add_argument("--resample", type=int, default=0, help="redraw each invalid program (mech.trace) up to R times at sampling time")
+    ap.add_argument("--part-tokens", help="part tokens: g-predict's part_tokens.load(SPEC) module; its projections train with the LoRA and vLLM samples from a materialized checkpoint")
+    ap.add_argument("--materialize-every", type=int, default=0, help="GRPO/DPO/bestofn with --part-tokens: rewrite the checkpoint and restart vLLM every K steps (0: at the start only)")
     ap.add_argument("--share-gpu", action="store_true", help="one GPU for vLLM and the trainer: vLLM sleeps (weights to host) while training and the trainer moves to the host while sampling, so --gpu-memory can be 0.8")
     ap.add_argument("--execution-only", action="store_true", help="score without the reader term (required when GRAPH_READER is unset and the checker scores)")
     ap.add_argument("--hf-batch", type=int, default=16, help="sequences per transformers generate call (the Mac / CPU sampler)")
@@ -782,6 +839,8 @@ def main():
     pol = Policy(args, dev)
     if isinstance(sampler, VllmSampler):
         sampler.policy = pol
+        if pol.parts is not None:  # vLLM samples from a checkpoint carrying the part rows
+            sampler.reload(pol.materialize(out / "vocab", args.base))
     if sampler is None:
         sampler = HfSampler(pol, args.max_tokens, args.hf_batch)
     if args.resample:
@@ -806,6 +865,7 @@ def main():
     if args.mode == "sft":
         sft(args, pol, pool, optimizer, open(out / "train.jsonl", "a"))
         pol.save(adapter)
+        refresh_parts(pol, sampler, out, args)
         print(json.dumps(evaluate(sets, pol, sampler, score, args, adapter, 1, open(out / "eval.jsonl", "a"), args.sft_steps)))
         return
     log = open(out / "train.jsonl", "a")
@@ -817,6 +877,8 @@ def main():
         if args.hours and time.time() - started > 3600 * args.hours:
             break
         pol.save(adapter)
+        if args.materialize_every and step and step % args.materialize_every == 0:
+            refresh_parts(pol, sampler, out, args)
         if args.eval_every and step % args.eval_every == 0:
             evaluate(sets, pol, sampler, score, args, adapter, step, eval_log, step)
         t0 = time.time()
