@@ -1906,11 +1906,21 @@ step_seconds = []
 t0 = time.time()
 # DESCENT_DUAL=pin (toys, cd27062d48): lambda stays at the balance rate it starts at, and after every step every
 # threshold moves by one common shift, the least for which the hard program's bits per clean token are at most K
-# (bisection over the step's recorded block reads, a sample of the clean tokens; no shift where the budget never
-# binds). Pinning the expected (soft) count instead drove toys' hard KL to 158 bits per token, and the multiplier
-# alone left the MLP 16% under budget.
-def pin_shift(kinds):
-    pins, state['pin'] = state.get('pin'), None
+# (bisection over the block reads of a hard pass at the posterior mean, the program delivered, on up to four of the
+# step's clean sequences; no shift where the budget never binds). Pinning the expected (soft) count instead drove
+# toys' hard KL to 158 bits per token, and the multiplier alone left the MLP 16% under budget; pinning the training
+# pass's own count (sampled parameters and gates, upstream blocks drawn off) let the held-out hard program run
+# 7.0M bits per token at 5M tokens against K = 4.2M.
+def pin_shift(ids, kinds):
+    rows = [b for b, k_ in enumerate(kinds) if k_ is None][:4]
+    if not rows:
+        return
+    draw(True)
+    install([None] * len(rows))
+    state['pin'], state['pin_rows'] = [], torch.arange(len(rows), device=dev)
+    with torch.no_grad():
+        run(ids[rows], 'hard')
+    pins, state['pin'] = state['pin'], None
     if not pins:
         return
     sets = [(R, (Rb.log() if LOGGATE else Rb).reshape(-1, *Lj.shape), Lj) for R, Rb, Lj in pins]
@@ -1956,8 +1966,7 @@ for step in range(steps):
             lm = lm.index_copy(0, torch.arange(b_, b_ + LRM, device=dev), run(ids[b_:b_ + LRM], 'all'))
             state['drop_leftover'] = False
         install(kinds)
-    state['pin'] = [] if DUAL == 'pin' else None
-    state['pin_rows'] = torch.tensor([b for b, k_ in enumerate(kinds) if k_ is None] or [0], device=dev)
+    state['pin'] = None
     lp = run(ids, 'soft')
     kl_seq = kl_bits(lm, lp).mean(-1)
     kl = kl_seq.mean()
@@ -1999,7 +2008,7 @@ for step in range(steps):
             lam = max(ratio.median().item(), 1e-12) if ratio.numel() else 1e-3
         opt.zero_grad(); (objective + lam * (ek - K)).backward(); opt.step()
         if DUAL == 'pin':
-            pin_shift(kinds)
+            pin_shift(ids, kinds)
         else:
             # The relative violation, capped at +1 as it is bounded by -1 below, so lambda rises no faster than
             # it can fall (an uncapped rise ran away at K = 64 while the count started at 3.7 K).
