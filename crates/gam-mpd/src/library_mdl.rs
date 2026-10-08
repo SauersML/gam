@@ -3121,6 +3121,45 @@ fn part_targets(scorer: &Scorer, batch: &Batch, experiments: Vec<Experiment>) ->
     Ok((parts.into_iter().flatten().collect(), targets))
 }
 
+/// The budget's feasible start (`Settings::budget`): every gated stage's thresholds (`library_vpd`)
+/// lowered by one shift `Δ` times each gate's unit (its learned width, or its threshold's posterior
+/// deviation for a hard gate), the posterior's means pinned there ([`DevicePosterior::pin`]), with
+/// `Δ` bisected until the batch's count ([`complexity_terms`]) is at `limit`. Returns `Δ`.
+fn calibrate(scorer: &mut Scorer, device_posterior: &mut DevicePosterior, explanation: &Explanation, active: &[bool], batch: &Batch, key: u64, limit: f64) -> Result<f64, String> {
+    let mut stages = Vec::new();
+    for stage in scorer.stages.iter().flatten() {
+        let i = scorer.at(stage.threshold)?;
+        let start = device_posterior.iterate(i)?;
+        let unit: Vec<f64> = match scorer.at(stage.width) {
+            Ok(w) => device_posterior.iterate(w)?.column(0).iter().map(|v| v.abs()).collect(),
+            Err(_) => device_posterior.values(i)?.1.column(0).iter().map(|s| s.exp()).collect(),
+        };
+        stages.push((i, start, unit));
+    }
+    let mut count_at = |shift: f64| -> Result<f64, String> {
+        let pinned: Vec<(usize, Array2<f64>)> = stages.iter().map(|(i, start, unit)| (*i, Array2::from_shape_fn(start.dim(), |(b, c)| start[[b, c]] - shift * unit[b]))).collect();
+        device_posterior.pin(&pinned)?;
+        Ok(complexity_terms(scorer, device_posterior, explanation, active, batch, (key, false))?.0)
+    };
+    let (mut low, mut high) = (0.0, 1.0);
+    while count_at(high)? > limit {
+        (low, high) = (high, 2.0 * high);
+        if high > 1e6 {
+            return Err(format!("library budget: no threshold shift brings the count to K {limit}"));
+        }
+    }
+    for _ in 0..40 {
+        let middle = 0.5 * (low + high);
+        if count_at(middle)? > limit {
+            low = middle;
+        } else {
+            high = middle;
+        }
+    }
+    count_at(high)?;
+    Ok(high)
+}
+
 /// The batch's expected parts executed per token under the posterior (`library_complexity`) and,
 /// per gated MLP (a ReLU law without an up map), its gate's and its threshold's derivatives of
 /// that mean `(trainable index, ∂Ê/∂μ, ∂Ê/∂σ²)`. The layers' inputs come from one forward of `P`
@@ -5005,7 +5044,7 @@ pub fn fit_from(
                     continue;
                 }
             }
-            if let Some((limit, (expected, terms))) = budget {
+            if let Some((limit, (mut expected, mut terms))) = budget {
                 parts.0 += expected;
                 parts.1 += 1;
                 // The multiplier: from the first step whose count exceeds the budget, λ starts at
@@ -5041,6 +5080,18 @@ pub fn fit_from(
                 // saturated and |g_k| is tiny: a toy fit (resid_mlp_1l, K = 55) took λ to 8,000 and
                 // diverged with the count flat.
                 if !progress.engaged && limit > 0.0 && expected > limit {
+                    // An explanation of gated components starts feasible: every stage's thresholds rise
+                    // by one shift in units of their gates' widths until the batch's count is `K`
+                    // ([`calibrate`]; descent's start at the budget, 12fe763ced). From a start far
+                    // above `K` the pull closed gates en masse once it outweighed F: on the learned
+                    // tiny library the count fell from 76 to 9–18 parts within an epoch against K near
+                    // 65 and climbed back to 25–80 over 25 epochs (GHA, seeds 3–7).
+                    let calibrated = scorer.stages.iter().any(|s| !s.is_empty());
+                    if calibrated {
+                        let shift = calibrate(&mut scorer, &mut device_posterior, explanation, &posterior.active, &batch, key, limit)?;
+                        (expected, terms) = complexity_terms(&mut scorer, &device_posterior, explanation, &posterior.active, &batch, (key, false))?;
+                        log::info!("library budget: every threshold raised by {shift:.4e} of its gate's width, the count at {expected:.4} (K {limit})");
+                    }
                     // λ starts where a pull would remove the count's excess to first order: each gate's
                     // exchange rate r_b = max(0, −⟨∂F, ∂Ê⟩) / |∂Ê|² along its row of parameters (F's push
                     // against the count per part; zero where F lowers the count itself), weighted by its
@@ -5066,7 +5117,14 @@ pub fn fit_from(
                         }
                     }
                     ratios.sort_by(|a, b| a.0.total_cmp(&b.0));
-                    let excess = ratios.iter().map(|r| r.1).sum::<f64>() * (expected - limit) / expected;
+                    // At a calibrated (feasible) start there is no excess: λ holds the count where it
+                    // is at the slope-weighted median of the positive rates, F's push on the gates the
+                    // pull reaches against it (269b6645c2's rule).
+                    if calibrated {
+                        ratios.retain(|r| r.0 > 0.0);
+                    }
+                    let share = if calibrated { 0.5 } else { (expected - limit) / expected };
+                    let excess = ratios.iter().map(|r| r.1).sum::<f64>() * share;
                     let mut below = 0.0;
                     let start = ratios.iter().find(|r| {
                         below += r.1;
@@ -5370,7 +5428,7 @@ fn laplace_start(
     }
     let variance = posterior.variances();
     let n = tokens as f64;
-    let gate: Vec<bool> = explanation.groups.iter().map(|g| g.name.ends_with(".thresholds") || g.name.ends_with(".widths")).collect();
+    let gate: Vec<bool> = explanation.groups.iter().map(|g| g.name.ends_with(".widths")).collect();
     // A gated component's slice (`library_vpd`'s `.read` and `.write` groups) starts its deviation
     // at a hundredth of the slice's own scale (the root mean square of its group at the start,
     // `Explanation::reference`), and the step's curvature at the value that holds it there,
@@ -5380,11 +5438,18 @@ fn laplace_start(
     // part on (the all-on experiment) the sample's noise summed over every slice: the all-on KL at
     // the first step's sample was 11.3 bits per token where the mean's is 1.32 (vpd4l tiny fit,
     // grouped own gates, 14985361f0). descent's prototype starts its slices this way.
+    // A gate's threshold and its direction's row (`.thresholds`, `.g{b}`) start the same way: the
+    // budget counts the hard gate under the posterior, `Φ(μ_z / sd_q(z))`, and from the thresholds'
+    // prior deviations it counted 3,822 parts per token at the start where the hard gates at the
+    // mean execute 364 (vpd4l grouped direction gates with learned widths, decomp-vpd4l-i at
+    // c55f1fadd8); the count then fell as the curvature shrank the deviations over the first pass,
+    // whatever λ (the learned tiny library: from K to 33–37 parts against K near 65 at λ under 1).
+    let direction = |name: &str| name.rsplit_once(".g").is_some_and(|(_, b)| !b.is_empty() && b.bytes().all(|c| c.is_ascii_digit()));
     let slice: Vec<Option<f64>> = explanation
         .groups
         .iter()
         .zip(&explanation.reference)
-        .map(|(g, r)| (g.name.ends_with(".read") || g.name.ends_with(".write")).then(|| 0.01 * r.sqrt()))
+        .map(|(g, r)| (g.name.ends_with(".read") || g.name.ends_with(".write") || g.name.ends_with(".thresholds") || direction(&g.name)).then(|| 0.01 * r.sqrt()))
         .collect();
     for i in 0..posterior.mean.len() {
         let mut h = match at.remove(&i) {
