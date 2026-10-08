@@ -854,7 +854,7 @@ def rot_slice_bits(R, Q):
     di, do = R['di'], R['do']
     vf = (nf.sum() + di * sf.sum()) / (di * nf.numel()); vd = (nd.sum() + do * sd.sum()) / (do * nd.numel())
     if CONCEPTS:
-        return torch.full_like(nd, 4.0), nd.clamp_min(0).sqrt()
+        return torch.full_like(nd, 4.0), (nd.clamp_min(0) + 1e-30).sqrt()
     bits = 0.5 * (di * torch.log(vf / sf) + (nf + di * sf) / vf - di) + 0.5 * (do * torch.log(vd / sd) + (nd + do * sd) / vd - do)
     return bits / math.log(2) + rot_angle_bits(R), nd.clamp_min(0).sqrt()
 
@@ -956,10 +956,17 @@ def rot_gate_core(R, r, bits_i, idx, on, mode, extra=None):
     hot = (R['L'].argmax(-1, keepdim=True) == torch.arange(g, device=r.device)).float(); Lsm = torch.softmax(R['L'], -1)
     # Every pass runs the one-hot assignment (the delivered program's), with the softmax's gradient in training: the
     # expected assignment mixed blocks' gates per slice, so lev-st's training pass (hard gates) scored 3.3 bits per
-    # token against its delivered program's 6.2.
-    M_ = hot if mode == 'hard' else hot + Lsm - Lsm.detach()
-    Rb = (qeinsum('...ni,nij->...nj', r.pow(2), M_) + 1e-20).sqrt()
-    z = ((Rb.log() if LOGGATE else Rb) - R['tau']) / R['s']
+    # token against its delivered program's 6.2. The guard's value is the one-hot read's and its gradient the
+    # expected read's: at the one-hot read an empty block's read is 1e-10, whose gradient overflowed to NaN.
+    guard = lambda R_: ((R_.log() if LOGGATE else R_) - R['tau']) / R['s']
+    Rb = (qeinsum('...ni,nij->...nj', r.pow(2), hot) + 1e-20).sqrt()
+    if mode == 'hard':
+        M_ = hot
+        z = guard(Rb)
+    else:
+        M_ = hot + Lsm - Lsm.detach()
+        zs = guard((qeinsum('...ni,nij->...nj', r.pow(2), Lsm) + 1e-20).sqrt())
+        z = guard(Rb.detach()).detach() + zs - zs.detach()
     if extra is not None:
         z = z + extra
     hard, phi = (z > 0).float() * R['keep'], 0.5 * (1 + torch.erf(z / SQ2)) * R['keep']
