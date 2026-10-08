@@ -6,7 +6,8 @@ the form
   ``` [the English explanation]
 
 in which a part (<p:L.S.I>) appears only as an argument of a one-line align(variable, part, ...) or claim(variable,
-part, ...) statement and only as a part of the attached decomposition (the registry's part tokens, plus each
+part, ...) statement, at least one align statement is written (an answer that aligns nothing is valid to mech and
+scores as the empty program plus its code: the loophole the 10-08 SFT fell into) and only as a part of the attached decomposition (the registry's part tokens, plus each
 site's remainder <p:L.S.rest>). Every other line and the prose around the block are free text with neither "<p:"
 nor three backticks in a row, so split_answer finds this block and mech reads every part where it can. The
 grammar is xgrammar's EBNF; a part token and its spelling in ordinary tokens both match (a part token's text is
@@ -84,9 +85,11 @@ def answer_grammar(tokens: list[str]) -> str:
     return "\n".join([
         'root ::= text "```python\\n" code "```" text',
         free("text", ""),
-        "code ::= free_code (statement free_code)*",
+        "code ::= free_code (claim free_code)* align free_code (statement free_code)*",  # at least one align with a part
         free("free_code", "\\t"),  # no tabs in code: the teacher answers indent with spaces, and tab runs were a runaway
-        'statement ::= ("align" | "claim") "(" [ ]* name [ ]* ("," [ ]* part [ ]*)+ ")"',
+        "statement ::= align | claim",
+        'align ::= "align(" [ ]* name [ ]* ("," [ ]* part [ ]*)+ ")"',
+        'claim ::= "claim(" [ ]* name [ ]* ("," [ ]* part [ ]*)+ ")"',
         "name ::= [A-Za-z_] [A-Za-z0-9_]*",
         "part ::= " + part_rule(tokens),
     ])

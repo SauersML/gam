@@ -97,3 +97,20 @@ def test_no_tabs_in_code():
         return all(m.accept_token(t) for t in tok.encode(text, add_special_tokens=False)) and m.accept_token(tok.convert_tokens_to_ids("<|im_end|>"))
 
     assert accepts(GOOD) and not accepts(GOOD.replace("    return tokens", "\treturn tokens"))
+
+
+@pytest.mark.skipif(importlib.util.find_spec("xgrammar") is None, reason="xgrammar is not installed")
+def test_an_answer_must_align_something():
+    import xgrammar as xgr
+    from transformers import AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
+    compiled = xgr.GrammarCompiler(xgr.TokenizerInfo.from_huggingface(tok)).compile_grammar(grammar.model_grammar("vpd4l"))
+
+    def accepts(text):
+        m = xgr.GrammarMatcher(compiled)
+        return all(m.accept_token(t) for t in tok.encode(text, add_special_tokens=False)) and m.accept_token(tok.convert_tokens_to_ids("<|im_end|>"))
+
+    assert accepts(GOOD)
+    assert not accepts(GOOD.replace("align(answer, <p:2.v.559>, <p:2.o.735>)\n", ""))  # only a claim: aligns nothing
+    assert not accepts(GOOD.replace("align(answer, <p:2.v.559>, <p:2.o.735>)\nclaim(answer, <p:1.q.3>, <p:1.k.rest>)\n", ""))  # code only

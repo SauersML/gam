@@ -386,6 +386,10 @@ def check_rl2_pieces():
     assert abs(sc.gap["a"] - 1.1) < 1e-12 and sc.gap["b"] == sc.FLOOR
     import random
 
+    wrapped = train.with_alignment(lambda items: [{"valid": True, "total_bits": 1.0} for _ in items])
+    out = wrapped([{"source": "def answer(t):\n    return t\n", "require_align": True}, {"source": "def answer(t):\n    return t\n"},
+                   {"source": "align(answer, <p:2.v.5>)\n", "require_align": True}, {"source": "claim(answer, <p:1.q.3>)\n", "require_align": True}])
+    assert [r["valid"] for r in out] == [False, True, True, False], out  # an oracle answer must align something; baselines are exempt
     picks = [sc.draw([{"id": "a"}, {"id": "b"}], 1, random.Random(i))[0]["id"] for i in range(400)]
     assert picks.count("a") > 300, picks.count("a")
     import json

@@ -89,12 +89,31 @@ TEACHER: dict[str, str] = {}  # --teacher's answers by behavior id (teacher_answ
 HELDOUT_TEACHER: dict[str, str] = {}  # --teacher-heldout's: evaluation baselines only, never SFT or RL
 
 
-def item(answer: str, behavior: dict, seed: int, uniform_seeds: int, experiments: int) -> dict:
+def aligned(source: str) -> bool:
+    """Whether a program aligns some variable to at least one part (an align statement with a part token)."""
+    return any(st.kind != "claim" and st.parts for st in edits.Answer.parse(source).statements)
+
+
+def with_alignment(score):
+    """score, with an oracle answer (an item with "require_align") that aligns nothing marked invalid: such an answer
+    is valid to mech and scores as the empty program plus its code, so without this rule an oracle that writes no
+    alignment looks like an answer (the 10-08 SFT's valid held-out answers were all part-less). Baselines (the empty
+    program, the teacher) carry no flag."""
+    def run(items):
+        out = score(items)
+        return [dict(r, valid=False, error="no align statement with a part: an answer must align something")
+                if it.get("require_align") and r.get("valid") and not aligned(it["source"]) else r for it, r in zip(items, out)]
+
+    return run
+
+
+def item(answer: str, behavior: dict, seed: int, uniform_seeds: int, experiments: int, require_align: bool = True) -> dict:
     """A scoring item from an oracle answer: prompt.split_answer's program (the last python block that
     parses) and explanation (the plain English after it, which alone the reader reads). Part tokens stay as
     written: mech parses them, and each counts as one Python token of the program's size."""
     source, explanation = split_answer(answer)
-    return {"source": source, "explanation": explanation, "behavior": behavior, "seed": seed, "uniform_seeds": uniform_seeds, "experiments": experiments}
+    return {"source": source, "explanation": explanation, "behavior": behavior, "seed": seed, "uniform_seeds": uniform_seeds, "experiments": experiments,
+            "require_align": require_align}
 
 
 def behaviors(root: Path, model: str, split: str) -> list[dict]:
@@ -495,8 +514,12 @@ class ValidSampler:
         import mech
         from concurrent.futures import ThreadPoolExecutor
 
+        def ok(c):
+            source = program_of(self.tok.decode(c, skip_special_tokens=True))
+            return bool(mech.trace(source, self.model)["valid"]) and aligned(source)  # an answer must align something (with_alignment)
+
         with ThreadPoolExecutor(8) as ex:  # each trace is a fork of a tracer server
-            return list(ex.map(lambda c: bool(mech.trace(program_of(self.tok.decode(c, skip_special_tokens=True)), self.model)["valid"]), completions))
+            return list(ex.map(ok, completions))
 
     def __call__(self, prompts: list[list[int]], n: int, adapter: Path, version: int) -> list[list[list[int]]]:
         with self.inner.hold() if hasattr(self.inner, "hold") else contextlib.nullcontext():
@@ -637,8 +660,8 @@ class Scales:
             if b["id"] in self.scale:
                 continue
             if b["id"] in self.teacher:
-                out.append((b["id"], "teacher", item(self.teacher[b["id"]], b, seed, 0, experiments)))
-            out.append((b["id"], "empty", item(programs.empty(b["model"]), b, seed, 0, experiments)))
+                out.append((b["id"], "teacher", item(self.teacher[b["id"]], b, seed, 0, experiments, require_align=False)))
+            out.append((b["id"], "empty", item(programs.empty(b["model"]), b, seed, 0, experiments, require_align=False)))
         return out
 
     def take(self, entries: list[tuple[str, str, dict]], scores: list[dict]):
@@ -758,7 +781,7 @@ def credit_advantages(tok, completion: list[int], text: str, source: str, episod
 
 def edit_item(source: str, behavior: dict, seed: int, experiments: int) -> dict:
     """A scoring item of an edited answer: the reader off, since an edit keeps the answer's explanation."""
-    return {"source": source, "explanation": "", "behavior": behavior, "seed": seed, "experiments": experiments, "reader": False}
+    return {"source": source, "explanation": "", "behavior": behavior, "seed": seed, "experiments": experiments, "reader": False, "require_align": True}
 
 
 def memo(score):
@@ -768,7 +791,7 @@ def memo(score):
 
     def key(it):
         return (it["behavior"].get("path", it["behavior"]["id"]), it["source"], it.get("explanation", ""), it.get("seed"), it.get("uniform_seeds") or 0, it.get("experiments"),
-                it.get("reader", True), json.dumps(it.get("options"), sort_keys=True))
+                it.get("reader", True), json.dumps(it.get("options"), sort_keys=True), it.get("require_align", False))
 
     def run(items):
         keys = [key(it) for it in items]
@@ -1261,7 +1284,7 @@ def evaluate(sets: dict[str, list[dict]], pol, sampler, score, args, adapter: Pa
             answers = [(b, pol.tok.decode(c, skip_special_tokens=True)) for b, g in zip(pool, groups) for c in g]
             items = [item(t, b, args.eval_seed, 0, args.eval_experiments) for b, t in answers]
             base = [(b, n, src) for b in pool for n, src in (baselines(b).items() if args.baselines else [])]
-            scores = score(items + [item(src, b, args.eval_seed, 0, args.eval_experiments) for b, _, src in base])  # a bare source is its own program
+            scores = score(items + [item(src, b, args.eval_seed, 0, args.eval_experiments, require_align=False) for b, _, src in base])  # a bare source is its own program
             per_base = {}
             for (b, n, src), x in zip(base, scores[len(items) :]):
                 per_base.setdefault(b["id"], {})[n] = x
@@ -1330,7 +1353,7 @@ def rescore(args, score) -> dict:
             firsts.setdefault(j, i)
         unique = [todo[firsts[j]] for j in range(len(reps))]
         scored = score([{"source": r["source"], "explanation": r.get("explanation", ""), "behavior": behaviors_by_path[bpath], "seed": args.eval_seed, "experiments": args.eval_experiments,
-                         "options": options} for r in unique])
+                         "options": options, "require_align": r["program"] == "oracle"} for r in unique])
         scores = [scored[j] for j in rep_of]
         with open(done_path, "a") as f:
             for r, x in zip(todo, scores):
@@ -1483,7 +1506,7 @@ def main():
         if args.checker:
             os.environ["GRAPH_CHECKER"] = str(Path(args.checker).resolve())
         scorer.WORKERS, scorer.EXPORT, scorer.MEMORY_GIB, scorer.VIEWS, scorer.DEVICE, scorer.BATCH, scorer.ITEMS_EVERY, scorer.ITEM_STRIDE = args.score_workers, args.export, args.checker_gib, views_of(args), args.checker_device, args.score_batch, args.reader_items, args.reader_item_stride
-        print(json.dumps(rescore(args, SCORERS[args.scorer])))
+        print(json.dumps(rescore(args, with_alignment(SCORERS[args.scorer]))))
         return
     if args.part_tokens:  # in-process vLLM engine: part rows are copied into its weights before each sampling call
         os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
@@ -1516,7 +1539,7 @@ def main():
         sampler = ValidSampler(sampler, pol.tok, args.model, args.resample)
     if args.checker:
         os.environ["GRAPH_CHECKER"] = str(Path(args.checker).resolve())
-    score = SCORERS[args.scorer]
+    score = with_alignment(SCORERS[args.scorer])
     scorer.WORKERS, scorer.EXPORT, scorer.MEMORY_GIB, scorer.VIEWS, scorer.DEVICE, scorer.BATCH, scorer.ITEMS_EVERY, scorer.ITEM_STRIDE = args.score_workers, args.export, args.checker_gib, views_of(args), args.checker_device, args.score_batch, args.reader_items, args.reader_item_stride
     root = Path(args.behaviors)
     pool, heldout_prompts = split_prompts(behaviors(root, args.model, "train"), args.prompt_holdout, out / "behaviors")
