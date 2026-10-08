@@ -1199,18 +1199,22 @@ def sft(args, pol, pool, optimizer, warmup, log) -> dict:
 ORACLE_RUNS = Path.home() / "mpd-data/graph_oracle/runs/oracle"
 
 
-def recovered(x: dict, empty: dict | None) -> float | None:
-    """The share of the behavior's signal a program recovers: 1 - its execution error / the empty
-    program's, on the same experiments."""
-    if not empty or not empty.get("exec_error_bits"):
-        return None
-    return 1.0 - x["exec_error_bits"] / empty["exec_error_bits"]
+def shares(x: dict, empty: dict | None) -> dict:
+    """An answer in the user's reporting terms (10-08): reproduces = 1 - its execution error / the empty program's (the
+    share of the behavior kept when every other subcomponent takes counterfactual values), removes = 1 - its necessity
+    error / the empty program's (the share lost when only its subcomponents take counterfactual values), size = its
+    subcomponents; both errors on the same experiments. The empty program is the denominator only, never a bar."""
+    def share(key):
+        return 1.0 - x[key] / empty[key] if empty and empty.get(key) and x.get(key) is not None else None
+
+    return {"reproduces": share("exec_error_bits"), "removes": share("necessity_error_bits"), "size": x.get("parts")}
 
 
 def summarize(name: str, step: int, groups: list[tuple[dict, list, dict]], log) -> dict:
-    """Rows per behavior and the set's summary from groups of (behavior, [(source, score)] of the oracle,
-    {baseline name: score}): mean single-sample S, best of N, validity, the share of programs below the
-    empty program's S, the signal the best recovers, and each baseline's S and recovered signal."""
+    """Rows per behavior and the set's summary from groups of (behavior, [(source, score)] of the oracle, {baseline
+    name: score}): the share of answers the checker accepts, the best valid answer by the score (lowest total) and the
+    mean over valid answers in reproduces / removes / size (shares), the total score, and the same for each baseline
+    (the teacher answer where one exists)."""
 
     def mean(xs):
         xs = [x for x in xs if x is not None]
@@ -1220,25 +1224,23 @@ def summarize(name: str, step: int, groups: list[tuple[dict, list, dict]], log) 
     for b, mine, base in groups:
         S = np.array([x["total_bits"] for _, x in mine], dtype=float)
         valid = np.array([bool(x["valid"]) for _, x in mine])
-        # the best VALID program (an invalid one is scored as the empty program without its code, so it would
-        # "beat" the empty program by the empty program's code bits); none valid: the first program
-        j = int(np.where(valid, S, np.inf).argmin()) if valid.any() else 0
-        empty, teacher = base.get("empty"), base.get("teacher")
-        T = teacher["total_bits"] if teacher and teacher.get("valid") and teacher["total_bits"] > 0 else None
-        row = {"set": name, "step": step, "behavior": b["id"], "mean_bits": float(S.mean()), "best_bits": float(S[j]), "valid_fraction": float(valid.mean()),
-               "below_empty_fraction": float(np.mean(valid & (S < empty["total_bits"]))) if empty else None, "best_recovered": recovered(mine[j][1], empty),
-               "best_relative_to_teacher": (float(S[j]) - T) / T if T and valid.any() else None,
-               "mean_valid_relative_to_teacher": (float(S[valid].mean()) - T) / T if T and valid.any() else None,
-               "baselines": {n: x["total_bits"] for n, x in base.items()}, "baselines_recovered": {n: recovered(x, empty) for n, x in base.items()}, "best_source": mine[j][0]}
+        # the best VALID answer (an invalid one is scored as the empty program without its code); none valid: none
+        j = int(np.where(valid, S, np.inf).argmin()) if valid.any() else None
+        empty = base.get("empty")
+        per = [shares(x, empty) for (_, x), ok in zip(mine, valid) if ok]
+        row = {"set": name, "step": step, "behavior": b["id"], "valid_fraction": float(valid.mean()), "mean_bits": float(S.mean()),
+               "best_bits": float(S[j]) if j is not None else None, "best": shares(mine[j][1], empty) if j is not None else None,
+               "mean_valid": {k: mean([q[k] for q in per]) for k in ("reproduces", "removes", "size")} if per else None,
+               "baselines": {n: {"total_bits": x["total_bits"], **shares(x, empty)} for n, x in base.items()}, "best_source": mine[j][0] if j is not None else None}
         rows.append(row)
         log.write(json.dumps(row) + "\n")
     names = sorted({n for _, _, base in groups for n in base})
-    return {"behaviors": len(rows), "mean_bits": mean([r["mean_bits"] for r in rows]), "best_of_n_bits": mean([r["best_bits"] for r in rows]),
-            "valid_fraction": mean([r["valid_fraction"] for r in rows]), "below_empty_fraction": mean([r["below_empty_fraction"] for r in rows]),
-            "best_recovered": mean([r["best_recovered"] for r in rows]), "best_relative_to_teacher": mean([r["best_relative_to_teacher"] for r in rows]),
-            "mean_valid_relative_to_teacher": mean([r["mean_valid_relative_to_teacher"] for r in rows]), "baselines": {n: mean([r["baselines"].get(n) for r in rows]) for n in names},
-            "baselines_recovered": {n: mean([r["baselines_recovered"].get(n) for r in rows]) for n in names},
-            "oracle_mean_bits_on_baseline_behaviors": {n: mean([r["mean_bits"] for r in rows if n in r["baselines"]]) for n in names}}
+    keys = ("reproduces", "removes", "size")
+    return {"behaviors": len(rows), "valid_fraction": mean([r["valid_fraction"] for r in rows]), "mean_bits": mean([r["mean_bits"] for r in rows]),
+            "best_of_n_bits": mean([r["best_bits"] for r in rows]), "behaviors_with_a_valid_answer": sum(r["best"] is not None for r in rows),
+            "best": {k: mean([r["best"][k] for r in rows if r["best"]]) for k in keys},
+            "mean_valid": {k: mean([r["mean_valid"][k] for r in rows if r["mean_valid"]]) for k in keys},
+            "baselines": {n: {k: mean([r["baselines"][n][k] for r in rows if n in r["baselines"]]) for k in ("total_bits",) + keys} for n in names}}
 
 
 def evaluate(sets: dict[str, list[dict]], pol, sampler, score, args, adapter: Path, version: int, log, step: int) -> dict:

@@ -97,12 +97,12 @@ def check_evaluate():
     log = io.StringIO()
     out = train.evaluate({"heldout_behaviors": [{"id": "a"}, {"id": "b"}], "heldout_prompts": []}, pol, sampler, score, args, Path("."), 0, log, 3)
     s = out["heldout_behaviors"]
-    assert s["mean_bits"] == 20.0 and s["best_of_n_bits"] == 10.0 and s["baselines"] == {"empty": 100.0}, s
-    assert s["below_empty_fraction"] == 1.0 and abs(s["best_recovered"] - 0.9) < 1e-12, s  # behavior a: 1 - 10/100
+    assert s["mean_bits"] == 20.0 and s["best_of_n_bits"] == 10.0 and s["baselines"]["empty"]["total_bits"] == 100.0, s
+    assert abs(s["best"]["reproduces"] - 0.9) < 1e-12 and s["valid_fraction"] == 1.0, s  # 1 - 10 / 100
     best = json.loads((train.ORACLE_RUNS / "a.t.json").read_text())
     assert best["score"]["total_bits"] == 10.0 and best["experiments"] == 16 and best["seed"] == 7
     assert sum(1 for _ in open(Path(args.out) / "eval_samples.jsonl")) == 5  # 4 oracle programs + 1 baseline
-    assert s["oracle_mean_bits_on_baseline_behaviors"] == {"empty": 20.0} and "heldout_prompts" not in out
+    assert "heldout_prompts" not in out
     assert set(seen) == {(7, 16)}, seen
     rows = [json.loads(line) for line in log.getvalue().splitlines()]
     assert [r.get("behavior") for r in rows[:2]] == ["a", "b"] and rows[-1]["step"] == 3
@@ -153,7 +153,7 @@ def check_rescore():
     args = types.SimpleNamespace(samples_from=[str(d / "eval_samples.jsonl")], score_options='{"families": ["swap"]}', eval_seed=5, eval_experiments=16, out=str(d), rescore_tag="t",
                                  behaviors=str(d), model="vpd4l", summary_only=False)
     s = train.rescore(args, score)["heldout_behaviors/r"]
-    assert s["best_of_n_bits"] == 20.0 and s["baselines"] == {"empty": 100.0} and abs(s["best_recovered"] - 0.8) < 1e-12, s
+    assert s["best_of_n_bits"] == 20.0 and s["baselines"]["empty"]["total_bits"] == 100.0 and abs(s["best"]["reproduces"] - 0.8) < 1e-12, s
     assert set(seen) == {(5, 16, '{"families": ["swap"]}')}, seen
     assert sum(1 for _ in open(d / "rescore_t.jsonl")) == 3
 
