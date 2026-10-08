@@ -2,14 +2,15 @@
 from mech import bind, claim
 
 SECOND = {
-    'Abraham': ' Lincoln', 'Air': ' Force', 'Albert': ' Einstein', 'Angela': ' Merkel',
-    'Atlantic': ' Ocean', 'Bank': ' of', 'Barack': ' Obama', 'Bill': ' Gates', 'Bob': ' Dylan',
-    'Buenos': ' Aires', 'Burger': ' King', 'Charles': ' Darwin', 'Coca': ' Cola', 'Costa': ' Rica',
-    'Donald': ' Trump', 'Elvis': ' Presley', 'George': ' Washington', 'Harry': ' Potter',
-    'Hillary': ' Clinton', 'Hong': ' Kong', 'Isaac': ' Newton', 'Lady': ' Gaga', 'Las': ' Vegas',
-    'Los': ' Angeles', 'Manchester': ' United', 'Martin': ' Luther', 'Michael': ' Jackson',
-    'Middle': ' East', 'Mother': ' Teresa', 'Mount': ' Everest', 'Nelson': ' Mandela',
-    'New': ' York', 'Notre': ' Dame', 'Pacific': ' Ocean', 'Pearl': ' Harbor', 'Pink': ' Floyd',
+    'Abraham': ' Lincoln', 'Abu': ' Dhabi', 'Air': ' Force', 'Albert': ' Einstein',
+    'Angela': ' Merkel', 'Atlantic': ' Ocean', 'Bank': ' of', 'Barack': ' Obama', 'Bill': ' Gates',
+    'Bob': ' Dylan', 'Buenos': ' Aires', 'Burger': ' King', 'Charles': ' Darwin', 'Coca': ' Cola',
+    'Costa': ' Rica', 'Donald': ' Trump', 'Elon': ' Musk', 'Elvis': ' Presley',
+    'George': ' Washington', 'Harry': ' Potter', 'Hillary': ' Clinton', 'Hong': ' Kong',
+    'Isaac': ' Newton', 'Kuala': ' Lumpur', 'Lady': ' Gaga', 'Las': ' Vegas', 'Los': ' Angeles',
+    'Manchester': ' United', 'Martin': ' Luther', 'Michael': ' Jackson', 'Middle': ' East',
+    'Mother': ' Teresa', 'Mount': ' Everest', 'Nelson': ' Mandela', 'New': ' York',
+    'Notre': ' Dame', 'Pacific': ' Ocean', 'Pearl': ' Harbor', 'Pink': ' Floyd',
     'Prime': ' Minister', 'Puerto': ' Rico', 'Real': ' Madrid', 'Red': ' Cross', 'Rio': ' de',
     'Rolling': ' Stones', 'San': ' Francisco', 'Saudi': ' Arabia', 'Silicon': ' Valley',
     'Sri': ' Lanka', 'Star': ' Wars', 'Steve': ' Jobs', 'Supreme': ' Court', 'Taylor': ' Swift',

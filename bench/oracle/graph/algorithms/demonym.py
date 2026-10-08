@@ -17,10 +17,10 @@ DEMONYM = {
     'Norway': ' Norwegian', 'Pakistan': ' Pakistani', 'Peru': ' Peruvian',
     'Philippines': ' Filipino', 'Poland': ' Polish', 'Portugal': ' Portuguese',
     'Romania': ' Romanian', 'Russia': ' Russian', 'Scotland': ' Scottish', 'Serbia': ' Serbian',
-    'Spain': ' Spanish', 'Sudan': ' Sudanese', 'Sweden': ' Swedish', 'Switzerland': ' Swiss',
-    'Syria': ' Syrian', 'Tanzania': ' Tanzanian', 'Thailand': ' Thai', 'Turkey': ' Turkish',
-    'Uganda': ' Ugandan', 'Ukraine': ' Ukrainian', 'Venezuela': ' Venezuelan',
-    'Vietnam': ' Vietnamese', 'Wales': ' Welsh',
+    'Slovakia': ' Slovak', 'Spain': ' Spanish', 'Sudan': ' Sudanese', 'Sweden': ' Swedish',
+    'Switzerland': ' Swiss', 'Syria': ' Syrian', 'Tanzania': ' Tanzanian', 'Thailand': ' Thai',
+    'Turkey': ' Turkish', 'Uganda': ' Ugandan', 'Ukraine': ' Ukrainian', 'Uruguay': ' Uruguayan',
+    'Venezuela': ' Venezuelan', 'Vietnam': ' Vietnamese', 'Wales': ' Welsh',
 }
 
 

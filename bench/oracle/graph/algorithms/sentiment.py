@@ -6,8 +6,8 @@ LABEL = {
     'brilliant': ' positive', 'delightful': ' positive', 'disappointing': ' negative',
     'disgusting': ' negative', 'dreadful': ' negative', 'excellent': ' positive',
     'fantastic': ' positive', 'great': ' positive', 'horrible': ' negative', 'lovely': ' positive',
-    'perfect': ' positive', 'poor': ' negative', 'superb': ' positive', 'terrible': ' negative',
-    'wonderful': ' positive',
+    'mediocre': ' negative', 'perfect': ' positive', 'poor': ' negative', 'superb': ' positive',
+    'terrible': ' negative', 'wonderful': ' positive',
 }
 
 

@@ -1,20 +1,26 @@
-"""Ordinal succession: in a run of ordinal words the next word is the next ordinal."""
+"""Word succession: in a run of ordinal ("fourth, fifth") or cardinal ("four, five") words the next word is
+the next one of the same list."""
 from mech import bind, claim
 
-ORDINALS = ["first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth", "ninth", "tenth",
-            "eleventh", "twelfth"]
+LISTS = [["first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth", "ninth", "tenth",
+          "eleventh", "twelfth"],
+         ["one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven", "twelve",
+          "thirteen", "fourteen", "fifteen", "sixteen", "seventeen", "eighteen", "nineteen", "twenty"]]
 
 
-def ordinal(tokens):
-    # the rank of the latest ordinal word
+def word(tokens):
+    # the latest number word: (its list, its rank)
     out, last = [], None
-    for tok in tokens:
-        if tok.strip() in ORDINALS:
-            last = ORDINALS.index(tok.strip())
+    for t, tok in enumerate(tokens):
+        w = tok.strip().lower()
+        pronoun = w == "one" and t and tokens[t - 1].strip() in ("next", "the", "this")  # "the next one"
+        for k, words in enumerate(LISTS):
+            if w in words and not pronoun:
+                last = (k, words.index(w))
         out.append(last)
     return out
 
 
-def answer(tokens, ordinal):
-    # the next ordinal, after a space
-    return [None if k is None or k + 1 >= len(ORDINALS) else " " + ORDINALS[k + 1] for k in ordinal]
+def answer(tokens, word):
+    # the next word of that list, after a space
+    return [None if w is None or w[1] + 1 >= len(LISTS[w[0]]) else " " + LISTS[w[0]][w[1] + 1] for w in word]

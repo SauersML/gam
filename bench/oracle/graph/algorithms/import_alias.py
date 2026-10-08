@@ -3,10 +3,11 @@ from mech import bind, claim
 
 ALIAS = {
     'altair': ' alt', 'dask.dataframe': ' dd', 'datetime': ' dt', 'geopandas': ' gpd',
-    'multiprocessing': ' mp', 'networkx': ' nx', 'numpy': ' np', 'numpy.typing': ' npt',
-    'pandas': ' pd', 'plotly.express': ' px', 'polars': ' pl', 'scipy.stats': ' stats',
-    'seaborn': ' sns', 'statsmodels.api': ' sm', 'tensorflow': ' tf', 'tkinter': ' tk',
-    'torch.nn': ' nn', 'torch.nn.functional': ' F', 'xarray': ' xr',
+    'jax.numpy': ' jnp', 'matplotlib.pyplot': ' plt', 'multiprocessing': ' mp', 'networkx': ' nx',
+    'numpy': ' np', 'numpy.typing': ' npt', 'pandas': ' pd', 'plotly.express': ' px',
+    'plotly.graph_objects': ' go', 'polars': ' pl', 'scipy.stats': ' stats', 'seaborn': ' sns',
+    'statsmodels.api': ' sm', 'tensorflow': ' tf', 'tkinter': ' tk', 'torch.nn': ' nn',
+    'torch.nn.functional': ' F', 'xarray': ' xr',
 }
 
 

@@ -1095,7 +1095,7 @@ def behavior_tokens(behavior, model: str) -> tuple[dict, dict]:
     prompts = [p["token_ids"] for p in behavior["prompts"]]
     counterfactuals = [p["counterfactual"]["token_ids"] for p in behavior["prompts"] if p.get("counterfactual")]
     ids = sorted({i for row in prompts + counterfactuals for i in row})
-    strings = dict(zip(ids, tk.decode_batch([[i] for i in ids], skip_special_tokens=False)))
+    strings = dict(zip(ids, tk.decode_batch([[i] for i in ids], skip_special_tokens=True)))  # BOS: ""
     known: dict[str, int] = {}
     for i in ids:
         known.setdefault(strings[i], i)

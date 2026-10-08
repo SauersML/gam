@@ -3,19 +3,25 @@ from mech import bind, claim
 
 
 def open_tags(tokens):
-    # the stack of open elements: a tag name after "<" opens, after "</" closes
-    out, stack = [], []
-    for t, tok in enumerate(tokens):
-        before = tokens[t - 1] if t else ""
-        if before.endswith("</"):
-            if stack and stack[-1] == tok.strip():
-                stack.pop()
-        elif before.endswith("<") and tok.strip().isalpha():
-            stack.append(tok.strip())
-        out.append(list(stack))
+    # the stack of open elements in the text: "<name" opens, "</name" closes
+    out = []
+    for t in range(len(tokens)):
+        stack = []
+        for piece in "".join(tokens[: t + 1]).split("<")[1:]:
+            name = ""
+            for c in piece.lstrip("/"):
+                if not c.isalnum():
+                    break
+                name += c
+            if piece.startswith("/"):
+                if stack and stack[-1] == name:
+                    stack.pop()
+            elif name:
+                stack.append(name)
+        out.append(stack)
     return out
 
 
 def answer(tokens, open_tags):
     # after "</", the innermost open element
-    return [open_tags[t][-1] if tokens[t].endswith("</") and open_tags[t] else None for t in range(len(tokens))]
+    return [s[-1] if "".join(tokens[: t + 1]).endswith("</") and s else None for t, s in enumerate(open_tags)]

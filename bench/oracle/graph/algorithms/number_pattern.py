@@ -4,16 +4,17 @@ from mech import bind, claim
 
 
 def numbers(tokens):
-    # the numbers written so far (digit tokens joined)
-    out, nums, cur = [], [], ""
-    for tok in tokens:
-        s = tok.strip()
-        if s.isdigit():
-            cur = cur + s if cur and not tok.startswith(" ") else s
-        elif cur:
-            nums.append(int(cur))
-            cur = ""
-        out.append(list(nums))
+    # the complete numbers so far: runs of digits in the text that something other than a digit follows
+    out = []
+    for t in range(len(tokens)):
+        text, nums, cur = "".join(tokens[: t + 1]), [], ""
+        for c in text:
+            if c.isdigit():
+                cur += c
+            elif cur:
+                nums.append(int(cur))
+                cur = ""
+        out.append(nums)
     return out
 
 
@@ -24,14 +25,19 @@ def root(n):
     return r if r * r == n else None
 
 
+def rest(full, text):
+    # what is left of `full` after the longest beginning of it that the text ends with
+    return full[max(n for n in range(len(full)) if text.endswith(full[:n])):]
+
+
 def answer(tokens, numbers):
-    # after a comma, the next square or triangular number
+    # the next square or triangular number, or what is left of it once its first digits are written
     out = []
     for t, n in enumerate(numbers):
-        if len(n) < 2 or tokens[t] != ",":
+        if len(n) < 2:
             out.append(None)
-        elif root(n[-1]) is not None and root(n[-2]) == root(n[-1]) - 1:
-            out.append(" " + str((root(n[-1]) + 1) ** 2))
-        else:
-            out.append(" " + str(n[-1] + (n[-1] - n[-2]) + 1))
+            continue
+        square = root(n[-1]) is not None and root(n[-2]) == root(n[-1]) - 1
+        nxt = (root(n[-1]) + 1) ** 2 if square else n[-1] + (n[-1] - n[-2]) + 1
+        out.append(rest(" " + str(nxt), "".join(tokens[: t + 1])))
     return out
