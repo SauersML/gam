@@ -940,7 +940,8 @@ def make_rot_fc(n, l):
         Q = rot_Q(R)
         xe = x @ torch.randn(R['ng'] * ROTG, x.shape[-1], device=x.device).T if state.get('noise') else None
         ex = gate_net(l, 'mlp', x).view(*p.shape[:-1], R['ng'], R['g']) if GN and state['mode'] != 'all' else None
-        out, gam, recs, Rbs = rot_run(rot_fc_core, R, p, xe, Q, ex, rot_index_bits_t(), *rot_core_args(), sc, state['mode'])
+        mode = 'all' if state.get('allon_family') == 'mlp' else state['mode']
+        out, gam, recs, Rbs = rot_run(rot_fc_core, R, p, xe, Q, ex, rot_index_bits_t(), *rot_core_args(), sc, mode)
         if sc is not None:
             out = out * sc
         rot_record(recs, Rbs, [n], [R])
@@ -1121,7 +1122,7 @@ def rot_attention(i, h, causal):
             m_ = R_['ng'] * R_['g']; ex.append(gn[..., o_:o_ + m_].view(B_, T_, R_['ng'], R_['g'])); o_ += m_
         ex = tuple(ex)
     z, c, recs, Rbs = rot_run(rot_attention_core, Rq, Rk, Ro, q, k, v, causal, Qq, Qk, Q, noise, ex, rot_index_bits_t(),
-                              *rot_core_args(), state['mode'])
+                              *rot_core_args(), 'all' if state.get('allon_family') == 'attn' else state['mode'])
     rot_record(recs, Rbs, [f'h.{i}.attn.q_proj', f'h.{i}.attn.k_proj', f'h.{i}.attn.o_proj'], [Rq, Rk, Ro])
     y = site('o_proj')(z)
     if state.get('noise'):
@@ -1493,6 +1494,12 @@ def evaluate(final=False):
         if EDGES:
             r['edges_on_soft'].append(torch.stack(state['edges_soft']).sum(0).mean().item())
         lp = run(ids, 'all'); r['kl_all_on'].append(kl_bits(lm, lp).mean().item())
+        if ROTA:
+            # The hard error split: the attention blocks gated with every MLP block on, and the reverse.
+            for fam, key in (('mlp', 'kl_attn_gated'), ('attn', 'kl_mlp_gated')):
+                state['allon_family'] = fam
+                lp = run(ids, 'hard'); r.setdefault(key, []).append(kl_bits(lm, lp).mean().item())
+            state['allon_family'] = None
         if RES:
             # M with its leftover removed: every part on, the leftover off (= W - R in every map).
             state['drop_leftover'] = True
