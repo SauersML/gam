@@ -269,7 +269,9 @@ fn transcoder_features_write_the_transcoder_and_the_rest_is_exact() {
     let file = crate::safetensors::SafetensorsFile::open(&dir.join("layer_1.safetensors")).expect("file");
     let b = file.vector("b_dec", 8).expect("b_dec");
     let expected = t.reconstruction(&x_hat).expect("reconstruction") - &b.view().insert_axis(ndarray::Axis(0));
-    let got = run.writes[0].clone().expect("the node computes");
+    // Writes come back from a run that scores no rows (on the device path as well).
+    let writes = execute(&weights, &graph.model(&weights), &batch, &[], &BTreeMap::new()).expect("execute").writes;
+    let got = writes[0].clone().expect("the node computes");
     let gap = (&got - &expected).iter().fold(0.0f64, |a, v| a.max(v.abs()));
     // The checker stores weights in float32; the start library's come from float64 arithmetic.
     assert!(gap < 1e-6, "feature writes differ from the transcoder by {gap:e}");
@@ -832,4 +834,86 @@ fn device_path_runs_transcoder_features_as_the_host() {
         let kl = max(&kl_bits(&host.log_probabilities, &device.log_probabilities));
         assert!(kl < 1e-9, "{name}: KL(host ‖ device) with transcoder features = {kl:e} bits");
     }
+}
+
+#[test]
+fn a_ruled_node_over_vpd_parts_attends_by_its_rule() {
+    use ndarray::{Array2, Axis, s};
+    let f = fixture("graph_vpd_rule");
+    let library = Library::new(&f.device, &f.device, &f.native, &f.layers, &f.artifact, 1 << 28, 64).expect("library");
+    let mut weights = Weights::of(&library);
+    // An inexact view of layer 1's attention (nonzero remainders).
+    let partial = |w: &Array2<f64>, count: usize, scale: f64| (Array2::<f64>::eye(w.nrows()).slice(s![..count, ..]).to_owned() * scale, w.t().slice(s![.., ..count]).to_owned());
+    let lw = &weights.layers[1];
+    let stack = |m: &dyn Fn(&crate::graph::HeadWeights) -> &crate::graph::Stored| crate::graph::wide(ndarray::concatenate(Axis(0), &lw.heads.iter().map(|h| m(h).view()).collect::<Vec<_>>()).expect("stack").view());
+    let (wq, wk, wv) = (stack(&|h| &h.query), stack(&|h| &*h.key), stack(&|h| &*h.value));
+    let wo = crate::graph::wide(ndarray::concatenate(Axis(1), &lw.heads.iter().map(|h| h.output.view()).collect::<Vec<_>>()).expect("hstack").view());
+    let o = (wo.t().slice(s![..wo.ncols() - 3, ..]).to_owned() * 0.5, Array2::<f64>::eye(wo.ncols()).slice(s![.., ..wo.ncols() - 3]).to_owned());
+    let view = crate::graph::VpdAttention { q: partial(&wq, wq.nrows() - 2, 0.8), k: partial(&wk, wk.nrows() - 3, 0.9), v: partial(&wv, wv.nrows() - 1, 0.6), o };
+    weights.vpd_attention.insert(1, view.clone());
+    let lw = &weights.layers[1];
+    let native = |id: &str, layer: usize, kind: &str| NodeIr { id: id.into(), pieces: vec![PieceIr { view: "native".into(), layer, kind: kind.into(), index: None }], rule: None };
+    let vpd = |kind: &str, index: Index| PieceIr { view: "vpd".into(), layer: 1, kind: kind.into(), index: Some(index) };
+    let (v_list, o_list) = (vec![0, 2, 5], vec![1, 3]);
+    let ruled = NodeIr { id: "R".into(), pieces: vec![vpd("v_proj", Index::Many(v_list.clone())), vpd("v_proj", Index::Name("rest".into())), vpd("o_proj", Index::Many(o_list.clone()))], rule: Some(serde_json::json!({"op": "attend", "offset": 1})) };
+    let nodes = vec![native("a0", 0, "head"), native("m0", 0, "mlp"), ruled, native("m1", 1, "mlp")];
+    let edge = |from: &str, to: &str, route: &str| EdgeIr { from: from.into(), to: to.into(), route: route.into() };
+    let mut edges = Vec::new();
+    for (to, writers) in [("a0", vec!["embed"]), ("m0", vec!["embed", "a0"]), ("R", vec!["embed", "a0", "m0"]), ("m1", vec!["embed", "a0", "m0", "R"]), ("logits", vec!["embed", "a0", "m0", "R", "m1"])] {
+        edges.extend(writers.into_iter().map(|w| edge(w, to, "input")));
+    }
+    let program = Program { model: "tiny".into(), valid: true, nodes, edges, ..Program::default() };
+    let graph = Graph::parse(&program, &weights).expect("parse");
+    let cf = counterfactuals(&f.sequences);
+    let plain = Batch::new(&f.sequences).expect("batch");
+    let mut with_reference = plain.clone();
+    with_reference.reference = Some(std::sync::Arc::new(reference(&weights, &Batch::new(&cf).expect("cf batch")).expect("reference")));
+    let rows: Vec<usize> = (0..plain.tokens.len()).collect();
+    // R reads M's stream into layer 1 (every writer before it declared): its write is the rule's
+    // pattern times its v_proj subcomponents (with the remainder) on the normed stream, written
+    // through its o_proj subcomponents.
+    let stream = library.run(&f.sequences, &BTreeMap::new()).expect("run").streams[2].clone();
+    let mut x_hat = stream.clone();
+    for mut row in x_hat.outer_iter_mut() {
+        let r = crate::operator_program::rms_scale(row.view(), lw.attention.epsilon);
+        row.zip_mut_with(&lw.attention.gain, |v, g| *v *= r * g);
+    }
+    let (vu, vv) = &view.v;
+    let values = x_hat.dot(&vv.select(Axis(1), &v_list)).dot(&vu.select(Axis(0), &v_list)) + (x_hat.dot(&wv.t()) - x_hat.dot(vv).dot(vu));
+    let mut z = Array2::<f64>::zeros(values.dim());
+    for (n, seq) in f.sequences.iter().enumerate() {
+        let span = n * seq.len()..(n + 1) * seq.len();
+        z.slice_mut(s![span.clone(), ..]).assign(&crate::graph::HeadRule::Offset(1).pattern(seq).dot(&values.slice(s![span, ..])));
+    }
+    let (ou, ov) = &view.o;
+    let expected = z.dot(&ov.select(Axis(1), &o_list)).dot(&ou.select(Axis(0), &o_list));
+    // Writes come back from a run that scores no rows (on the device path as well).
+    let writes = execute(&weights, &graph.program(&weights, true), &with_reference, &[], &BTreeMap::new()).expect("program").writes;
+    let got = writes[2].clone().expect("R computes");
+    let gap = (&got - &expected).iter().fold(0.0f64, |a, v| a.max(v.abs()));
+    // The checker stores weights in float32; the start library's come from float64 arithmetic.
+    assert!(gap < 1e-6, "the ruled node's write is off by {gap:e}");
+    // M ignores the rule.
+    let clean = library.log_probabilities(&library.run(&f.sequences, &BTreeMap::new()).expect("run").last).expect("log p");
+    assert!(max(&kl_bits(&clean, &execute(&weights, &graph.model(&weights), &plain, &rows, &BTreeMap::new()).expect("M").log_probabilities)) < 1e-9, "M");
+    // The device runs it as the host.
+    let mut state = crate::graph_device::DeviceState::new(Device::host());
+    for (name, circuit, batch) in [("model", graph.model(&weights), &plain), ("edges", graph.program(&weights, true), &with_reference), ("nodes", graph.program(&weights, false), &with_reference)] {
+        let host = execute(&weights, &circuit, batch, &rows, &BTreeMap::new()).expect("host");
+        let job = crate::graph_device::Run { tokens: &batch.tokens, spans: &batch.spans, scored: &rows, swaps: &BTreeMap::new(), capture: false, reference: batch.reference.as_deref(), ops: &crate::graph::Interventions::default() };
+        let device = crate::graph_device::run_on(&mut state, &weights, &circuit, &job).expect("device");
+        let kl = max(&kl_bits(&host.log_probabilities, &device.log_probabilities));
+        assert!(kl < 1e-9, "{name}: KL(host ‖ device) with a ruled VPD node = {kl:e} bits");
+    }
+    // Refused: a query route into it, a q_proj piece in it, a hidden edge into it.
+    let mut bad = program.clone();
+    bad.edges.push(edge("embed", "R", "query"));
+    assert!(Graph::parse(&bad, &weights).is_err(), "query route into a ruled node");
+    let mut bad = program.clone();
+    bad.nodes[2].pieces.push(vpd("q_proj", Index::One(0)));
+    assert!(Graph::parse(&bad, &weights).is_err(), "q_proj piece in a ruled node");
+    let mut bad = program.clone();
+    bad.nodes.push(NodeIr { id: "K".into(), pieces: vec![vpd("k_proj", Index::One(0))], rule: None });
+    bad.edges.push(edge("K", "R", "input"));
+    assert!(Graph::parse(&bad, &weights).is_err(), "hidden edge into a ruled node");
 }

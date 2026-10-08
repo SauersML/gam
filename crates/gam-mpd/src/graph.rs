@@ -1050,8 +1050,14 @@ impl Graph {
             if block.is_empty() {
                 return Err(format!("{}: a node of no pieces", node.id));
             }
-            if rule.is_some() && !matches!(block, Block::Heads { .. }) {
-                return Err(format!("{}: only a node of native heads carries a rule", node.id));
+            // A rule replaces queries and keys: it sits on native heads or on one layer's attention
+            // parts (its v_proj subcomponents give the values, its o_proj ones write); a library
+            // part's own q/k subcomponents go unused.
+            if rule.is_some() && !matches!(block, Block::Heads { .. } | Block::AttnSlices { .. }) {
+                return Err(format!("{}: a rule sits on a node of native heads or of one layer's attention parts", node.id));
+            }
+            if rule.is_some() && node.pieces.iter().any(|p| p.view == "vpd" && matches!(p.kind.as_str(), "q_proj" | "k_proj")) {
+                return Err(format!("{}: the rule replaces its queries and keys; declare v_proj and o_proj subcomponents", node.id));
             }
             ids.push(node.id.clone());
             blocks.push(block);
@@ -1082,6 +1088,9 @@ impl Graph {
                 };
                 if !joins || route != Route::Input {
                     return Err(format!("edge {} >> {}: within one site only c_fc subcomponents feed down_proj subcomponents and q/k/v subcomponents feed o_proj subcomponents", e.from, e.to));
+                }
+                if rules[w].is_some() || rules[r].is_some() {
+                    return Err(format!("edge {} >> {}: a ruled node's values feed only its own o_proj subcomponents", e.from, e.to));
                 }
                 if !internal.contains(&(w, r)) {
                     internal.push((w, r));
@@ -1301,6 +1310,10 @@ impl Graph {
                 Block::AttnSlices { layer, q, k, v, o, .. } => {
                     let width: usize = weights.layers[*layer].heads.iter().map(|h| h.query.nrows()).sum();
                     let counts = weights.vpd_attention.get(layer).map_or([0; 4], |a| [a.q.0.nrows(), a.k.0.nrows(), a.v.0.nrows(), a.o.0.nrows()]);
+                    // A ruled node's queries and keys are its rule's.
+                    let ruled = self.rules.get(n).is_some_and(Option::is_some);
+                    let none = Vec::new();
+                    let (q, k) = if ruled { (&none, &none) } else { (q, k) };
                     for (list, n) in [q, k, v, o].into_iter().zip(counts) {
                         count += list.iter().map(|&i| if i == n { width * d } else { d + width }).sum::<usize>();
                     }
@@ -1779,21 +1792,40 @@ fn run(weights: &Weights, circuit: &Circuit, batch: &Batch, scored: &[usize], sw
                 if !unit.computes || swaps.contains_key(&u) {
                     continue;
                 }
-                let Block::AttnSlices { q, k, v, rest, .. } = &unit.block else { return Err("a VPD-view unit of another block".into()) };
+                let Block::AttnSlices { q, k, v, o, rest, .. } = &unit.block else { return Err("a VPD-view unit of another block".into()) };
                 let routes = unit.block.routes();
                 let mut inputs: Vec<Array2<f64>> = routes.iter().map(|r| input(&unit.routes[r.slot()], &st)).collect();
                 ops.cut_inputs(site, unit, routes, &mut inputs, &st)?;
-                let mut ds = Vec::with_capacity(3);
-                for (m, list) in [q, k, v].into_iter().enumerate() {
-                    let mut x_hat = lw.attention.apply(&inputs[m]);
+                let mut normed: Vec<Array2<f64>> = Vec::with_capacity(3);
+                for (m, x) in inputs.iter().enumerate() {
+                    let mut x_hat = lw.attention.apply(x);
                     ops.normed(site, u, m, &mut x_hat, &mut normed_kept);
-                    ds.push(sliced(factors[m], &maps[m], list, *rest, &x_hat) - sliced(factors[m], &maps[m], list, *rest, &x_ref));
+                    normed.push(x_hat);
                 }
+                // A ruled node attends by its rule with its own values (its v_proj subcomponents on
+                // its value input) and writes through its o_proj subcomponents; its values feed no
+                // other node.
+                if let Some(rule) = &unit.rule {
+                    let values = sliced(factors[2], &maps[2], v, *rest, &normed[2]);
+                    let mut z = Array2::<f64>::zeros(values.dim());
+                    for (n, &(start, length)) in batch.spans.iter().enumerate() {
+                        let span = start..start + length;
+                        let mut a = rule.pattern(&batch.tokens[span.clone()]);
+                        if let Some(b) = batch.blocks.get(n).filter(|b| !b.is_empty()) {
+                            block_attention(&mut a, b);
+                        }
+                        z.slice_mut(s![span.clone(), ..]).assign(&a.dot(&values.slice(s![span, ..])));
+                    }
+                    ops.head_reads_of(site, u, lw, &mut z, &mut reads_kept);
+                    slice_writes.insert(u, sliced(&vpd.o, &maps[3], o, *rest, &z));
+                    continue;
+                }
+                let ds = [q, k, v].into_iter().enumerate().map(|(m, list)| sliced(factors[m], &maps[m], list, *rest, &normed[m]) - sliced(factors[m], &maps[m], list, *rest, &x_ref)).collect();
                 deltas.insert(u, ds);
             }
             for &u in &attention {
                 let unit = &circuit.units[u];
-                if !unit.computes || swaps.contains_key(&u) {
+                if !unit.computes || swaps.contains_key(&u) || unit.rule.is_some() {
                     continue;
                 }
                 let Block::AttnSlices { o, rest, .. } = &unit.block else { return Err("a VPD-view unit of another block".into()) };
