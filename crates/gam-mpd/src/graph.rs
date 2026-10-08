@@ -1909,14 +1909,16 @@ pub fn execute(weights: &Weights, circuit: &Circuit, batch: &Batch, scored: &[us
 /// MLP's width, and vpd4l's behaviors hold about a thousand rows.
 const STACKED_ROWS: usize = 1 << 14;
 
-/// Whether `circuit` computes as the model's stream with every part it leaves out deleted, so that
-/// it can run stacked with others ([`execute_stacked`]): it deletes, its computing units are VPD
-/// units without `rest`, each reads (on every route its parts read) the embedding and every
-/// earlier computing unit's write, each MLP or attention unit with `down_proj` or `o_proj`
-/// subcomponents reads the hidden writes of every computing unit of its site, and the logits read
-/// every write.
-pub(crate) fn stacks(circuit: &Circuit) -> bool {
-    if !circuit.delete {
+/// Whether `circuit` computes as the model's stream with every part it leaves out deleted or at its
+/// counterfactual value, so that it can run stacked with others ([`execute_stacked`]): its
+/// computing units are VPD units without `rest`, each reads (on every route its parts read) the
+/// embedding and every earlier computing unit's write, each MLP or attention unit with `down_proj`
+/// or `o_proj` subcomponents reads the hidden writes of every computing unit of its site, and the
+/// logits read every write; with counterfactual stand-ins every layer has both VPD views (the
+/// stand-ins are then the counterfactual writes of the parts it does not name) and no transcoder
+/// features stand in. Under these routes a unit's input is the stream itself either way.
+pub(crate) fn stacks(weights: &Weights, circuit: &Circuit) -> bool {
+    if !circuit.delete && ((0..weights.layers.len()).any(|l| !weights.vpd.contains_key(&l) || !weights.vpd_attention.contains_key(&l)) || circuit.units.iter().any(|u| matches!(u.block, Block::Features { .. }))) {
         return false;
     }
     let computing: Vec<usize> = (0..circuit.units.len()).filter(|&u| circuit.units[u].computes).collect();
@@ -1934,12 +1936,14 @@ pub(crate) fn stacks(circuit: &Circuit) -> bool {
     }) && all_read(&circuit.logits, usize::MAX)
 }
 
-/// The runs of `circuits` (each one that [`stacks`]) on `batch` at rows `scored`, as one batch of
-/// copies ([`crate::graph_device::run_stacked`]): per site one unit naming the union of the
-/// circuits' subcomponents, each copy weighing them by how many of its units name them. Each
-/// copy's log-probabilities equal its own run's ([`execute`]). `None` when there is no device, a
-/// circuit does not stack, the batch has attention blocks or the copies would pass
-/// [`STACKED_ROWS`].
+/// The runs of `circuits` (each one that [`stacks`], all deleting or all with counterfactual
+/// stand-ins) on `batch` (with its counterfactual run attached for the latter, as
+/// `Checker::referenced` attaches it) at rows `scored`, as one batch of copies
+/// ([`crate::graph_device::run_stacked`]): per site one unit naming the union of the circuits'
+/// subcomponents (every site with counterfactual stand-ins), each copy weighing them by how many of
+/// its units name them. Each copy's log-probabilities equal its own run's ([`execute`]) up to
+/// summation order. `None` when there is no device, a circuit does not stack, the stand-ins differ,
+/// the batch has attention blocks or the copies would pass [`STACKED_ROWS`].
 pub(crate) fn execute_stacked(weights: &Weights, circuits: &[&Circuit], batch: &Batch, scored: &[usize]) -> Option<Result<Vec<Array2<f64>>, String>> {
     let stacked = stack(weights, circuits, batch, scored)?;
     crate::graph_device::run_stacked(weights, &stacked.merged, &stacked.job(), &stacked.copies)
@@ -1967,9 +1971,18 @@ impl Stacked {
 /// [`execute_stacked`]'s merged circuit and copies, `None` where it returns `None` before the device.
 pub(crate) fn stack(weights: &Weights, circuits: &[&Circuit], batch: &Batch, scored: &[usize]) -> Option<Stacked> {
     let rows = batch.tokens.len();
-    if circuits.is_empty() || circuits.len() * rows > STACKED_ROWS || !batch.blocks.iter().all(Vec::is_empty) || !circuits.iter().all(|c| stacks(c)) {
+    if circuits.is_empty() || circuits.len() * rows > STACKED_ROWS || !batch.blocks.iter().all(Vec::is_empty) || !circuits.iter().all(|c| stacks(weights, c)) {
         return None;
     }
+    let delete = circuits[0].delete;
+    if circuits.iter().any(|c| c.delete != delete) {
+        return None;
+    }
+    let standin = match &batch.reference {
+        Some(r) if !delete && !r.zero && r.embed.nrows() == rows => Some(r.clone()),
+        _ if delete => None,
+        _ => return None,
+    };
     // Per site and slot, each copy's subcomponents (with repeats) and remainder.
     let mut lists: BTreeMap<(usize, usize), Vec<(Vec<usize>, bool)>> = BTreeMap::new();
     let slots = |block: &Block| -> Vec<(usize, Vec<usize>)> {
@@ -1979,7 +1992,9 @@ pub(crate) fn stack(weights: &Weights, circuits: &[&Circuit], batch: &Batch, sco
             _ => Vec::new(),
         }
     };
-    let mut layers: BTreeMap<usize, usize> = BTreeMap::new();
+    // Deleting copies need a unit where some copy names parts; counterfactual ones at every site,
+    // each adding the counterfactual write of the parts its copy leaves out.
+    let mut layers: BTreeMap<usize, usize> = if delete { BTreeMap::new() } else { (0..2 * weights.layers.len()).map(|site| (site, site / 2)).collect() };
     for (j, circuit) in circuits.iter().enumerate() {
         for unit in circuit.units.iter().filter(|u| u.computes) {
             let site = unit.block.site();
@@ -2030,7 +2045,7 @@ pub(crate) fn stack(weights: &Weights, circuits: &[&Circuit], batch: &Batch, sco
         units.push(Unit { block, computes: true, routes: [Incoming::all(), Incoming::all(), Incoming::all()], hidden: Incoming::all() });
     }
     let merged = Circuit { nodes: units.len(), units, logits: Incoming::all(), delete: true };
-    let copies = crate::graph_device::Copies { count: circuits.len(), rows, masks };
+    let copies = crate::graph_device::Copies { count: circuits.len(), rows, masks, standin };
     let tokens: Vec<u32> = (0..circuits.len()).flat_map(|_| batch.tokens.iter().copied()).collect();
     let spans: Vec<(usize, usize)> = (0..circuits.len()).flat_map(|j| batch.spans.iter().map(move |&(start, n)| (j * rows + start, n))).collect();
     let scored: Vec<usize> = (0..circuits.len()).flat_map(|j| scored.iter().map(move |&r| j * rows + r)).collect();
@@ -4201,9 +4216,11 @@ impl Checker {
             Experiment::Counterfactual => self.counterfactual.as_ref()?,
             _ => &self.clean,
         };
-        let mut batch = batch.clone();
-        batch.reference = None;
-        self.mask(&mut batch);
+        let first = circuits.first()?;
+        let batch = match self.referenced(first, batch) {
+            Ok(b) => b,
+            Err(e) => return Some(Err(e)),
+        };
         execute_stacked(&self.weights, circuits, &batch, rows)
     }
 
@@ -4589,7 +4606,7 @@ impl Checker {
         let mut seconds = [0.0f64; 3];
         // M's outcomes come from its native circuit, the same for every program whatever its views.
         let native = Graph::empty().model(&self.weights);
-        let stacking: Vec<bool> = circuits.iter().map(stacks).collect();
+        let stacking: Vec<bool> = circuits.iter().map(|c| stacks(&self.weights, c)).collect();
         // M's outcomes of this score, held until it ends: the cache's byte budget may drop some
         // while later groups add theirs.
         let mut outcomes: BTreeMap<String, Arc<Array2<f64>>> = BTreeMap::new();
@@ -4694,10 +4711,10 @@ impl Checker {
                     // The programs that stack ([`stacks`]) run each experiment as one batch of copies
                     // (`run_stacked`, at most `STACKED_ROWS` rows), the others one by one.
                     let mut jobs: Vec<Vec<usize>> = Vec::new();
-                    let mut stacked: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+                    let mut stacked: BTreeMap<(&str, bool), Vec<usize>> = BTreeMap::new();
                     for &r in &mine {
                         if stacking[runs[r].0] && !matches!(runs[r].1, Experiment::Sites { .. }) {
-                            stacked.entry(runs[r].2.as_str()).or_default().push(r);
+                            stacked.entry((runs[r].2.as_str(), circuits[runs[r].0].delete)).or_default().push(r);
                         } else {
                             jobs.push(vec![r]);
                         }

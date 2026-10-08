@@ -457,7 +457,15 @@ pub(crate) struct Copies {
     /// By merged unit and slot (an MLP's `c_fc` 0 and `down_proj` 1; an attention's `q_proj` 0,
     /// `k_proj` 1, `v_proj` 2 and `o_proj` 3).
     pub masks: BTreeMap<(usize, usize), CopyMask>,
+    /// The counterfactual run (of one copy's rows) whose values the parts a copy does not name
+    /// carry; `None`: they are deleted. With it the merged circuit has a unit at every site, and
+    /// each unit's write adds the counterfactual write of the `down_proj` or `o_proj` parts its copy
+    /// does not name: the full counterfactual write less the named ones'.
+    pub standin: Option<std::sync::Arc<Reference>>,
 }
+
+/// A stacked run's rows by copy: each row's copy and its row within the copy.
+type CopyRows<'a> = Option<(&'a Copies, &'a gam_gpu::tensor::Indices, &'a gam_gpu::tensor::Indices)>;
 
 /// What each copy names of one slot of a merged VPD unit.
 pub(crate) struct CopyMask {
@@ -745,9 +753,9 @@ pub(crate) fn copies_on(s: &mut DeviceState, weights: &Weights, circuit: &Circui
     let ids = s.device.upload_indices(job.tokens).map_err(e)?;
     let embed = s.device.gather_rows(s.get(table).map_err(e)?, &ids).map_err(e)?;
     let units = circuit.units.len();
-    // A stacked run's copy of each row.
+    // A stacked run's copy of each row and its row within the copy.
     let copy_rows = match copies {
-        Some(c) if c.count * c.rows == rows => Some((c, s.device.upload_indices(&(0..rows).map(|r| (r / c.rows) as u32).collect::<Vec<_>>()).map_err(e)?)),
+        Some(c) if c.count * c.rows == rows => Some((c, s.device.upload_indices(&(0..rows).map(|r| (r / c.rows) as u32).collect::<Vec<_>>()).map_err(e)?, s.device.upload_indices(&(0..rows).map(|r| (r % c.rows) as u32).collect::<Vec<_>>()).map_err(e)?)),
         Some(c) => return Err(format!("{} copies of {} rows for a batch of {rows}", c.count, c.rows)),
         None => None,
     };
@@ -795,7 +803,7 @@ pub(crate) fn copies_on(s: &mut DeviceState, weights: &Weights, circuit: &Circui
         let site = circuit.units[order[at]].block.site();
         let end = order[at..].iter().position(|&u| circuit.units[u].block.site() != site).map_or(order.len(), |k| at + k);
         let pad_job = Padding { places: padded.as_ref(), sequences, longest };
-        let mut slice_writes = vpd_site(s, weights, circuit, job, (site, &order[at..end]), &st, &pad_job, (&mut kept, &mut reads_kept), copy_rows.as_ref().map(|(c, r)| (*c, r)))?;
+        let mut slice_writes = vpd_site(s, weights, circuit, job, (site, &order[at..end]), &st, &pad_job, (&mut kept, &mut reads_kept), copy_rows.as_ref().map(|(c, r, t)| (*c, r, t)))?;
         for &u in &order[at..end] {
             let unit = &circuit.units[u];
             if !unit.computes {
@@ -993,10 +1001,22 @@ pub(crate) fn copies_on(s: &mut DeviceState, weights: &Weights, circuit: &Circui
 /// of the queries, keys and values (a unit with `o_proj` subcomponents) takes the counterfactual
 /// ones plus the q/k/v writes it reads, runs the heads' attention on them (no head norms, as on the
 /// host) and writes through its `o_proj` subcomponents.
-fn vpd_site(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, job: &Run, (site, units): (usize, &[usize]), st: &Streams, pad: &Padding, (kept, reads_kept): (&mut BTreeMap<(usize, usize), Array2<f64>>, &mut BTreeMap<usize, Array2<f64>>), copies: Option<(&Copies, &gam_gpu::tensor::Indices)>) -> Result<BTreeMap<usize, Tensor>, String> {
+fn vpd_site(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, job: &Run, (site, units): (usize, &[usize]), st: &Streams, pad: &Padding, (kept, reads_kept): (&mut BTreeMap<(usize, usize), Array2<f64>>, &mut BTreeMap<usize, Array2<f64>>), copies: CopyRows) -> Result<BTreeMap<usize, Tensor>, String> {
     let e = |e: GpuError| e.to_string();
     // A slot's per-copy counts in a stacked run.
-    let mask = |u: usize, slot: usize| -> Masked<'_> { copies.and_then(|(c, rows)| c.masks.get(&(u, slot)).map(|m| (m, rows, c.rows))) };
+    let mask = |u: usize, slot: usize| -> Masked<'_> { copies.and_then(|(c, rows, _)| c.masks.get(&(u, slot)).map(|m| (m, rows, c.rows))) };
+    // The counterfactual run the stand-ins come from (a stacked run's is one copy's, its arrays
+    // tiled over the copies), `None` for `M` or a deleting run.
+    let cf: Option<&Reference> = match copies {
+        Some((c, ..)) => c.standin.as_deref().filter(|r| !r.zero),
+        None => job.reference.filter(|r| !r.zero),
+    };
+    let tiled = |s: &DeviceState, t: Tensor| -> Result<Tensor, GpuError> {
+        match copies {
+            Some((_, _, within)) => s.device.gather_rows(&t, within),
+            None => Ok(t),
+        }
+    };
     let (rows, width, ops) = (job.tokens.len(), weights.width(), job.ops);
     let mut writes = BTreeMap::new();
     let computing = |u: &usize| circuit.units[*u].computes && !job.swaps.contains_key(u);
@@ -1022,15 +1042,27 @@ fn vpd_site(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, job: &Run
         Ok(out)
     };
     let reference = |s: &mut DeviceState, field: Field, layer: usize| -> Result<Option<Tensor>, String> {
-        match job.reference {
-            Some(r) if !r.zero => {
+        match cf {
+            Some(r) => {
                 s.ensure_reference(r, (field, layer, 0))?;
-                Ok(Some(s.device.copy(s.reference(r, (field, layer, 0))?).map_err(e)?))
+                let x = s.device.copy(s.reference(r, (field, layer, 0))?).map_err(e)?;
+                Ok(Some(tiled(s, x).map_err(e)?))
             }
             // `M` (every unit computing and read) needs no reference: the deltas sum to its own; a
             // deleting run's reference is zero.
-            _ => Ok(None),
+            None => Ok(None),
         }
+    };
+    // A stacked counterfactual run's stand-in of the `down_proj` or `o_proj` parts unit `u`'s copies
+    // do not name (slot `slot`): the full counterfactual write `x_ref Wᵀ` less the named parts' on
+    // the counterfactual input, as `standins` makes a remainder unit's.
+    let unnamed = |s: &mut DeviceState, u: usize, slot: usize, (field, layer, product): (Field, usize, usize), (factors, w, picked): ((&Array2<f64>, &Array2<f64>), Matrix, &[usize])| -> Result<Option<Tensor>, String> {
+        let (Some(r), Some(_)) = (cf, copies) else { return Ok(None) };
+        let full = s.reference_product(r, (field, layer), product, w)?;
+        let full = tiled(s, full).map_err(e)?;
+        let x = reference(s, field, layer)?.ok_or("a counterfactual array went missing")?;
+        let named = sliced(s, factors, w, picked, false, &x, mask(u, slot)).map_err(e)?;
+        less_named(s, full, named, picked, factors.0.nrows()).map(Some).map_err(e)
     };
     let slices: Vec<usize> = units.iter().copied().filter(|&u| matches!(circuit.units[u].block, Block::Slices { .. })).collect();
     if let Some(&first) = slices.first() {
@@ -1041,9 +1073,12 @@ fn vpd_site(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, job: &Run
         let x_ref = reference(s, Field::Input, layer)?;
         let bias = s.ensure(row(&mlp.bias)).map_err(e)?;
         // The counterfactual pre-activation, the same for every program on this counterfactual run.
-        let mut pre_ref = match job.reference {
-            Some(r) if !r.zero => s.reference_product(r, (Field::Input, layer), PRODUCT_MLP_GATE, Matrix::Host(&mlp.gate))?,
-            _ => s.device.zeros(rows, mlp.gate.nrows()).map_err(e)?,
+        let mut pre_ref = match cf {
+            Some(r) => {
+                let p = s.reference_product(r, (Field::Input, layer), PRODUCT_MLP_GATE, Matrix::Host(&mlp.gate))?;
+                tiled(s, p).map_err(e)?
+            }
+            None => s.device.zeros(rows, mlp.gate.nrows()).map_err(e)?,
         };
         s.device.add_row(&mut pre_ref, 1.0, s.get(bias).map_err(e)?).map_err(e)?;
         let mut deltas: BTreeMap<usize, Tensor> = BTreeMap::new();
@@ -1056,8 +1091,12 @@ fn vpd_site(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, job: &Run
         for &u in slices.iter().filter(|u| computing(u)) {
             let unit = &circuit.units[u];
             let Block::Slices { down, rest, .. } = &unit.block else { return Err("a VPD-view unit of another block".into()) };
+            let standin = unnamed(s, u, 1, (Field::Active, layer, PRODUCT_MLP_OUT), ((&vpd.down_u, &vpd.down_v), Matrix::Host(&mlp.out), down))?;
             if down.is_empty() && !rest {
-                writes.insert(u, s.device.zeros(rows, width).map_err(e)?);
+                writes.insert(u, match standin {
+                    Some(w) => w,
+                    None => s.device.zeros(rows, width).map_err(e)?,
+                });
                 continue;
             }
             let mut pre = s.device.copy(&pre_ref).map_err(e)?;
@@ -1065,7 +1104,11 @@ fn vpd_site(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, job: &Run
                 s.device.axpy(&mut pre, 1.0, delta).map_err(e)?;
             }
             let h = s.device.law_values(&pre, &codes, gelu_tanh_constant()).map_err(e)?;
-            writes.insert(u, sliced(s, (&vpd.down_u, &vpd.down_v), Matrix::Host(&mlp.out), down, *rest, &h, mask(u, 1)).map_err(e)?);
+            let mut w = sliced(s, (&vpd.down_u, &vpd.down_v), Matrix::Host(&mlp.out), down, *rest, &h, mask(u, 1)).map_err(e)?;
+            if let Some(standin) = standin {
+                s.device.axpy(&mut w, 1.0, &standin).map_err(e)?;
+            }
+            writes.insert(u, w);
         }
     }
     let attention: Vec<usize> = units.iter().copied().filter(|&u| matches!(circuit.units[u].block, Block::AttnSlices { .. })).collect();
@@ -1085,9 +1128,12 @@ fn vpd_site(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, job: &Run
         // The counterfactual queries, keys and values, the same for every program on this run.
         let mut refs = Vec::with_capacity(3);
         for (m, map) in maps[..3].iter().enumerate() {
-            refs.push(match job.reference {
-                Some(r) if !r.zero => s.reference_product(r, (Field::AttentionInput, layer), PRODUCT_ATTENTION_IN + m, Matrix::Device(map))?,
-                _ => s.device.zeros(rows, map.rows()).map_err(e)?,
+            refs.push(match cf {
+                Some(r) => {
+                    let p = s.reference_product(r, (Field::AttentionInput, layer), PRODUCT_ATTENTION_IN + m, Matrix::Device(map))?;
+                    tiled(s, p).map_err(e)?
+                }
+                None => s.device.zeros(rows, map.rows()).map_err(e)?,
             });
         }
         let factors = [&a.q, &a.k, &a.v];
@@ -1104,8 +1150,12 @@ fn vpd_site(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, job: &Run
         for &u in attention.iter().filter(|u| computing(u)) {
             let unit = &circuit.units[u];
             let Block::AttnSlices { o, rest, .. } = &unit.block else { return Err("a VPD-view unit of another block".into()) };
+            let standin = unnamed(s, u, 3, (Field::Reads, layer, PRODUCT_ATTENTION_OUT), ((&a.o.0, &a.o.1), Matrix::Device(&maps[3]), o))?;
             if o.is_empty() && !rest {
-                writes.insert(u, s.device.zeros(rows, width).map_err(e)?);
+                writes.insert(u, match standin {
+                    Some(w) => w,
+                    None => s.device.zeros(rows, width).map_err(e)?,
+                });
                 continue;
             }
             let mut qkv = refs.iter().map(|x| s.device.copy(x)).collect::<Result<Vec<_>, _>>().map_err(e)?;
@@ -1122,7 +1172,11 @@ fn vpd_site(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, job: &Run
                 ops.head_reads_of(site, u, lw, &mut host, reads_kept);
                 z = s.device.upload(host.view()).map_err(e)?;
             }
-            writes.insert(u, sliced(s, (&a.o.0, &a.o.1), Matrix::Device(&maps[3]), o, *rest, &z, mask(u, 3)).map_err(e)?);
+            let mut w = sliced(s, (&a.o.0, &a.o.1), Matrix::Device(&maps[3]), o, *rest, &z, mask(u, 3)).map_err(e)?;
+            if let Some(standin) = standin {
+                s.device.axpy(&mut w, 1.0, &standin).map_err(e)?;
+            }
+            writes.insert(u, w);
         }
     }
     Ok(writes)
