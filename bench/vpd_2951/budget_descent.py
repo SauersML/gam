@@ -667,6 +667,9 @@ ROTGA = int(os.environ.get('DESCENT_ROT_ATTN', '0'))
 # DESCENT_ATTN_START=vpd (with DESCENT_ROT_ATTN=768): the attention bases start at VPD's subcomponents' directions
 # (below) instead of the maps' coordinates.
 ATTN_START = os.environ.get('DESCENT_ATTN_START', 'coord')
+# DESCENT_MLP_START=vpd (with DESCENT_ROT=3072, one group per layer): the MLP's basis starts at VPD's c_fc
+# subcomponents' write directions instead of the neurons.
+MLP_START = os.environ.get('DESCENT_MLP_START', 'neuron')
 # A slice's assignment logits start at ln(99 (g - 1)) on its own block and 0 elsewhere: 99% of its weight on its own
 # block whatever the group size (a fixed 6 gives 93% at g = 32 and 34% at g = 768).
 ASSIGN0 = lambda g: math.log(99 * (g - 1))
@@ -718,6 +721,15 @@ if ARM == 'rot':
                       'tau': torch.zeros(ng, ROTG, device=dev, requires_grad=True), 's': torch.ones(ng, ROTG, device=dev),
                       'ls_fc': torch.full((ng, ROTG), math.log(0.01 * Wf.pow(2).mean().sqrt().item()), device=dev, requires_grad=True),
                       'ls_dn': torch.full((ng, ROTG), math.log(0.01 * Wd.pow(2).mean().sqrt().item()), device=dev, requires_grad=True)}
+            if MLP_START == 'vpd' and ng == 1:
+                # VPD's c_fc subcomponents' write directions in the neuron space as the start's basis, largest
+                # ||v_i|| ||u_i|| first, orthonormalized in that order and completed by the orthogonal complement (in the
+                # group's neuron order); exact for any basis.
+                Vv_, Uv_ = load(f'{fc}.V'), load(f'{fc}.U')                                       # [768, C], [C, 3072]
+                order = torch.argsort(-(Vv_.norm(dim=0) * Uv_.norm(dim=1))).cpu().numpy()
+                D_ = (Uv_ / Uv_.norm(dim=1, keepdim=True).clamp_min(1e-12)).T.cpu().double().numpy()[:, order]
+                Q0 = sl.qr(D_, mode='full')[0][:, :ROTG]
+                ROT[l]['Q0'] = torch.tensor(Q0[perm.cpu().numpy()], dtype=torch.float32, device=dev)[None]
     MASK = torch.triu(torch.ones(ROTG, ROTG, device=dev), 1)
 ROT_ALL = list(ROT.values())
 
