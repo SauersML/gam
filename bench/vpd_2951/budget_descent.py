@@ -409,6 +409,14 @@ MEANQK = os.environ.get('DESCENT_MEANQK') == '1'
 # block mean-ablated, not zeroed (GELU's mean is not zero), and every part on is still M. A mean part is one
 # concept (its write) per map or head, as are MEANQK's (counted with the gates evaluated).
 MEANPARTS = os.environ.get('DESCENT_MEANPARTS') == '1'
+# DESCENT_DESTKV=1 (slice arms): a k slice is gated at the reading token (the query t), not where it sits: on at t
+# when its largest share of t's scores, max over u <= t of |c(u) (q_t . rope_u(u_c))| / sqrt(hd) (c(u) its
+# coefficient at the key u, u_c its write, q_t M's query from P's stream), passes its threshold; off, its term leaves
+# t's scores only. (v slices are gated at the query already: on the pattern-mixed coefficients.) A query then reads
+# only the k slices on at it. Without it a query reads every k slice on anywhere in its prefix, and the concepts per
+# token count that union (the honest count; toys: causal VPD reads 271 concepts per token on layer 0 so counted,
+# against 23 per position).
+DESTKV = os.environ.get('DESCENT_DESTKV') == '1'
 
 def slice_mean(n):
     """Whether map n's slices (slice arms) split their coefficient's deviation from its mean, the mean always on:
@@ -671,6 +679,21 @@ def make_attn(n):
                 sg = state['score'][int(n.split('.')[1])].permute(1, 0, 2).reshape(NH, -1, 1) * p['beta'][:, None, :]
                 ex = sg if ex is None else ex + sg
             args = (None, c, p['U'].norm(dim=-1)[:, None, :], p['tau'][:, None, :], p['s'][:, None, :], p['taun'][:, None, :] if 'taun' in p else None, ex)
+            if CONCEPTS and n.endswith('k_proj'):
+                # k slices gated at their keys: a query reads every one on anywhere in its prefix, so each token counts
+                # that union (straight-through: the hard union's value, the expected union's gradient).
+                hard, phi = force_rows(*slice_gates_run(*args), x.shape[1])
+                B_, T_, C_ = x.shape[0], x.shape[1], c.shape[-1]
+                hu = hard.view(NH, B_, T_, C_).cummax(2).values
+                state['hard'].append(hu.sum((0, 3)).reshape(-1))
+                if state['mode'] == 'hard':
+                    g = hard
+                    state['on'][n] = hard
+                else:
+                    pu = 1 - torch.cumsum(torch.log1p(-phi.clamp_max(1 - 1e-6)).view(NH, B_, T_, C_), 2).exp()
+                    state['soft'].append((pu if gate == 'mf' else hu + pu - pu.detach()).sum((0, 3)).reshape(-1))
+                    g = phi if gate == 'mf' else hard + phi - phi.detach()
+                return head_output(c * g if cm is None else c * g + cm, p['U'], p['o'], swaps_of(n, x.shape[1])).view(x.shape[0], x.shape[1], -1)
             if not state['force_on']:
                 cg, hb, sb, hd = slice_apply_run(*args, (0, 2), state['mode'])
                 state['hard'].append(hb)
@@ -1581,6 +1604,83 @@ def attn_v(l, h, pattern):
         y = y.index_add(0, torch.tensor([b], device=y.device), (pattern[b] @ dv)[None])
     return y.transpose(1, 2).reshape(B_, T_, -1)
 
+def rope_rot(w):
+    """rotate_half of the model's RoPE: rope_u(w) = w cos_u + rope_rot(w) sin_u."""
+    n_ = HD // 2
+    return torch.cat([-w[..., n_:], w[..., :n_]], -1)
+
+def dest_k_scores(l, h, q, causal):
+    """DESTKV: layer l's attention scores [B, H, T, T] with each k slice gated at the query: s_tu = sum over slices c
+    on at t of c(u) (q_t . rope_u(u_c)) / sqrt(hd), plus the mean key part's term (MEANQK), over each query's
+    candidates (every slice on; in training also those with z > -2, for their gradient)."""
+    n = f'h.{l}.attn.k_proj'; p = A[n]
+    B_, T_ = h.shape[0], h.shape[1]
+    c = head_coefficients(h.reshape(-1, h.shape[-1]), p['V'], False).view(NH, B_, T_, -1).permute(1, 0, 2, 3)   # [B, H, T, C]
+    U_ = p['U']                                                                  # [H, C, HD]
+    C_ = U_.shape[1]
+    kbar = None
+    if slice_mean(n):
+        cm = head_coefficients(XBAR[n][None], p['V'], False)                    # [H, 1, C]
+        c = c - cm[None]
+        kbar = cm @ U_                                                           # [H, 1, HD], the mean key part
+    Qr = q / math.sqrt(HD)
+    cos, sin = T.cos[:T_].T.contiguous(), T.sin[:T_].T.contiguous()             # [HD, T]
+    with torch.no_grad():
+        # Each slice's signal at each query: max over u <= t of |c(u) (Qr_t . rope_u(u_c))|, TF32 (gate input only).
+        sig = torch.empty(B_, NH, T_, C_, device=h.device)
+        cc = max(1, int(2e8 // (B_ * NH * T_ * T_)))
+        Kr = lambda U_c: (U_c[:, :, None, :] * cos.T[None, None] + rope_rot(U_c)[:, :, None, :] * sin.T[None, None])   # [H, cc, T, HD]
+        for c0 in range(0, C_, cc):
+            Kc = Kr(U_[:, c0:c0 + cc])
+            sc_ = torch.einsum('bhtd,hcud->bhctu', Qr.detach(), Kc) * c[:, :, :, c0:c0 + cc].detach().permute(0, 1, 3, 2)[:, :, :, None, :]
+            sig[..., c0:c0 + cc] = sc_.abs_().masked_fill_(~causal, 0).amax(-1).permute(0, 1, 3, 2)
+    if state.get('calib') is not None:
+        state['calib'].setdefault(n, []).append(sig)
+    z = (sig - p['tau'][None, :, None, :]) / p['s'][None, :, None, :]
+    hard, phi = (z > 0).float(), 0.5 * (1 + torch.erf(z / SQ2))
+    if state['force_on']:
+        on = torch.tensor(state['force_on'], device=hard.device)
+        hard, phi = hard.index_fill(0, on, 1.0), phi.index_fill(0, on, 1.0)
+        z = z.index_fill(0, on, 1e9)
+    state['hard'].append(hard.sum((1, 3)).reshape(-1))
+    if state['mode'] == 'hard':
+        g = hard
+        state['on'][n] = hard
+    else:
+        state['soft'].append(phi.sum((1, 3)).reshape(-1))
+        g = phi if gate == 'mf' else hard + phi - phi.detach()
+    n_sel = int((z > (0.0 if state['mode'] == 'hard' else -2.0)).sum(-1).max())
+    K = min(C_, 1 << max(3, math.ceil(math.log2(max(n_sel, 1)))))
+    cT = c.transpose(2, 3)                                                       # [B, H, C, T]
+    ck = lambda f, *a: torch.utils.checkpoint.checkpoint(f, *a, use_reentrant=False) if torch.is_grad_enabled() else f(*a)
+    parts = []
+    if K * 8 >= C_:
+        # Many on: every slice, by RoPE's form, s_tu = sum_d cos_ud sum_c g_c(t) Qr_td u_cd c(u) + the sin term.
+        Ut, Rt = U_.transpose(1, 2)[None, :, None], rope_rot(U_).transpose(1, 2)[None, :, None]   # [1, H, 1, HD, C]
+        def dense(Qb, gb):
+            X = Qb[..., None] * gb[..., None, :]                                 # [B, H, tb, HD, C]
+            return (((X * Ut) @ cT[:, :, None]) * cos).sum(3) + (((X * Rt) @ cT[:, :, None]) * sin).sum(3)
+        tb = max(1, int(1e8 // (B_ * NH * HD * max(C_, T_))))
+        for t0 in range(0, T_, tb):
+            parts.append(ck(dense, Qr[:, :, t0:t0 + tb], g[:, :, t0:t0 + tb]))
+    else:
+        # Few on: each query's K candidates (every slice on; in training also those with z > -2, for their gradient).
+        idx = z.detach().topk(K, -1).indices                                     # [B, H, T, K]
+        gs = g.gather(-1, idx)
+        bi = torch.arange(B_, device=h.device)[:, None, None, None]; hi = torch.arange(NH, device=h.device)[None, :, None, None]
+        def sparse(Qb, gb, ib):
+            W = U_[hi, ib]                                                       # [B, H, tb, K, HD]
+            Qt = Qb[:, :, :, None, :]
+            beta = (Qt * W) @ cos + (Qt * rope_rot(W)) @ sin                     # [B, H, tb, K, T]
+            return (beta * cT[bi, hi, ib] * gb[..., None]).sum(3)                # [B, H, tb, T]
+        tb = max(1, int(1e8 // (B_ * NH * K * T_)))
+        for t0 in range(0, T_, tb):
+            parts.append(ck(sparse, Qr[:, :, t0:t0 + tb], gs[:, :, t0:t0 + tb], idx[:, :, t0:t0 + tb]))
+    s_ = torch.cat(parts, 2)
+    if kbar is not None:
+        s_ = s_ + Qr @ T._rope(kbar[None].expand(B_, -1, T_, -1), T_).transpose(-1, -2)
+    return s_
+
 plain_hidden = T.hidden
 def hidden(ids):
     """M's forward (mode M) or P's: vpd_model's Target.hidden with the attention pattern explicit, so
@@ -1605,8 +1705,11 @@ def hidden(ids):
                         SCORE_NORM[i] = (sm.mean((0, 2))[None, :, None], sm.std((0, 2)).clamp_min(1e-6)[None, :, None])
                     state['score'][i] = (sm - SCORE_NORM[i][0]) / SCORE_NORM[i][1]
             q = T._rope(site('q_proj')(h).view(B_, T_, NH, HD).transpose(1, 2), T_)
-            k = T._rope(site('k_proj')(h).view(B_, T_, NH, HD).transpose(1, 2), T_)
-            pattern = ((q @ k.transpose(-1, -2)) / math.sqrt(HD)).masked_fill(~causal, float('-inf')).softmax(-1)
+            if DESTKV and state['mode'] != 'all':
+                pattern = dest_k_scores(i, h, q, causal).masked_fill(~causal, float('-inf')).softmax(-1)
+            else:
+                k = T._rope(site('k_proj')(h).view(B_, T_, NH, HD).transpose(1, 2), T_)
+                pattern = ((q @ k.transpose(-1, -2)) / math.sqrt(HD)).masked_fill(~causal, float('-inf')).softmax(-1)
             x = x + site('o_proj')(attn_v(i, h, pattern))
         h = vpd_model.rms(x, T.norms[2 * i + 1], T.eps)
         x = x + site('down_proj')(vpd_model.gelu_tanh(site('c_fc')(h)))
@@ -1645,6 +1748,30 @@ if sliced:
                 SHARE_A[l] = {'cand_v': cand_v, 'cand_o': cand_o, 'L_v': L_v.requires_grad_(), 'L_o': L_o.requires_grad_(),
                               't': A[v]['tau'].detach().clone().requires_grad_(), 's': A[v]['s'].clone()}
         del cap
+if DESTKV and sliced:
+    # The k slices' thresholds on their destination signal: the start's quantile of it (as the own reads' were set),
+    # the noise scale a tenth of its root mean square per slice. And a check: with every k slice on, the scores are
+    # M's.
+    with torch.no_grad():
+        ids_k = torch.tensor(tok[0:2, :512].astype(np.int64), device=dev)
+        install([None]); state['calib'] = {}
+        run(ids_k, 'soft')
+        for l in range(T.n_layer):
+            n = f'h.{l}.attn.k_proj'
+            sg = torch.stack(state['calib'][n]).view(-1, NH, 512, A[n]['tau'].shape[-1])
+            A[n]['s'] = 0.1 * sg.pow(2).mean((0, 2)).sqrt().clamp_min(1e-12)
+            flat = sg.reshape(-1); idx = torch.randperm(flat.numel(), device=dev)[:2_000_000]
+            A[n]['tau'].fill_(torch.quantile(flat[idx], start_q(1 - START_SCALE * VPD_ATTN_COUNTS.get(n, 1.0) / (NH * sg.shape[-1]))).item())
+        state['calib'] = None
+        install(['allon', 'allon']); state['mode'] = 'soft'
+        h0 = vpd_model.rms(T.wte[ids_k], T.norms[0], T.eps)
+        q0 = T._rope((h0 @ T.site('h.0.attn.q_proj').W.T).view(2, 512, NH, HD).transpose(1, 2), 512)
+        k0 = T._rope((h0 @ T.site('h.0.attn.k_proj').W.T).view(2, 512, NH, HD).transpose(1, 2), 512)
+        causal0 = torch.ones(512, 512, dtype=torch.bool, device=dev).tril()
+        s_d, s_m = dest_k_scores(0, h0, q0, causal0), (q0 @ k0.transpose(-1, -2)) / math.sqrt(HD)
+        print('destkv check: every k slice on, scores against M\'s, max |diff|', float((s_d - s_m).masked_fill(~causal0, 0).abs().max()),
+              'of', float(s_m.masked_fill(~causal0, 0).abs().max()), flush=True)
+        install([None])
 
 def kl_bits(lm, lp):
     return KLBits.apply(lm, lp)
