@@ -25,7 +25,7 @@ BINARY = Path(os.environ.get("GRAPH_CHECKER") or (PUBLISHED if PUBLISHED.exists(
 HERE = Path(__file__).resolve().parent
 # Each model's published shared base (g-exec2): generic machinery declared once per model, a program IR whose nodes
 # the checker adds to every scored program (always on, connected to every node, priced apart in base_bits).
-BASES = {"vpd4l": Path.home() / "mpd-data/graph_oracle/base/vpd4l/base_v1.json"}
+BASES = {"vpd4l": Path.home() / "mpd-data/graph_oracle/base_vpd4l.json"}
 
 
 def trace(source, model, behavior=None, decomposition=None):
