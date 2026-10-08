@@ -63,7 +63,7 @@ fn full_program() -> Program {
             }
         }
     }
-    Program { model: "tiny".into(), nodes, edges, python_tokens: 0, token_types: 0, source: String::new(), valid: true, error: None, standin: None, base: Vec::new(), explanation_tokens: 0, explanation_token_types: 0, alignments: Vec::new() }
+    Program { model: "tiny".into(), nodes, edges, python_tokens: 0, token_types: 0, source: String::new(), valid: true, error: None, standin: None, base: Vec::new(), explanation_tokens: 0, explanation_token_types: 0, alignments: Vec::new(), groups: Vec::new() }
 }
 
 /// The Checker keeps `M`'s log-probabilities in float32 (relative rounding `2^-24`): on
@@ -762,6 +762,44 @@ fn stacked_equals_own(weights: &Weights, circuits: &[crate::graph::Circuit], bat
     copies
 }
 
+/// A named group's use costs one name in the structure and its parts there none; its definition
+/// (its parts' names, a remainder its rank) is reported apart as group_bits.
+#[test]
+fn named_groups_cost_one_name_and_report_their_definition() {
+    use crate::graph::GroupIr;
+    let f = fixture("graph_groups");
+    let library = Library::new(&f.device, &f.device, &f.native, &f.layers, &f.artifact, 1 << 28, 64).expect("library");
+    let mut weights = Weights::of(&library);
+    inexact_vpd_views(&mut weights, 1);
+    let mut program = Program::default();
+    let piece = |kind: &str, index: Index| PieceIr { view: "vpd".into(), layer: 1, kind: kind.into(), index: Some(index) };
+    program.model = "tiny".into();
+    program.valid = true;
+    program.nodes = vec![NodeIr { id: "M".into(), pieces: vec![piece("c_fc", Index::Many(vec![0, 2, 7])), piece("c_fc", Index::Name("rest".into())), piece("down_proj", Index::Many(vec![1, 3]))], claim: None }];
+    program.edges = vec![EdgeIr { from: "embed".into(), to: "M".into(), route: "input".into() }, EdgeIr { from: "M".into(), to: "logits".into(), route: "input".into() }];
+    let name = (weights.vocabulary().max(2) as f64).log2();
+    let vpd = &weights.vpd[&1];
+    let rank = vpd.fc_u.ncols().min(vpd.fc_v.nrows());
+    let plain = Graph::parse(&program, &weights).expect("parse");
+    let (parts, bits, _) = plain.structure(&weights, &BTreeSet::new());
+    assert_eq!(parts, 3 + rank + 2);
+    assert_eq!(plain.group_bits(&weights), 0.0);
+    // The group names c_fc 0 and 2, the c_fc remainder and down_proj 3, all held by M.
+    program.groups = vec![GroupIr { name: "g".into(), parts: vec!["<p:1.fc.0>".into(), "<p:1.fc.2>".into(), "<p:1.fc.rest>".into(), "<p:1.down.3>".into()], nodes: vec!["M".into()] }];
+    let grouped = Graph::parse(&program, &weights).expect("parse");
+    let (grouped_parts, grouped_bits, _) = grouped.structure(&weights, &BTreeSet::new());
+    assert_eq!(grouped_parts, 2 + 1, "c_fc 7 and down_proj 1 by name, the group by one");
+    assert!((bits - grouped_bits - (rank + 3 - 1) as f64 * name).abs() < 1e-9, "the group's parts cost nothing, its use one name");
+    assert!((grouped.group_bits(&weights) - (3 + rank) as f64 * name).abs() < 1e-9, "the definition: three subcomponents and a remainder of rank {rank}");
+    // A group on an unknown node or with a part outside the views is refused.
+    let mut unknown = program.clone();
+    unknown.groups[0].nodes = vec!["nowhere".into()];
+    assert!(Graph::parse(&unknown, &weights).is_err());
+    let mut outside = program.clone();
+    outside.groups[0].parts = vec!["<p:0.fc.0>".into()];
+    assert!(Graph::parse(&outside, &weights).is_err(), "layer 0 has no VPD view here");
+}
+
 /// Deleting VPD programs that differ only in the subcomponents they name run stacked as one batch
 /// of copies (`graph::execute_stacked`), each copy giving its own program's run.
 #[test]
@@ -1017,6 +1055,8 @@ fn attention_claims_on_vpd_parts_weigh_the_heads_they_reach() {
     assert!(Graph::parse(&vo, &weights).is_err());
 }
 
+/// An alignment's error is KL(M(source) ‖ M with the aligned nodes' writes from the source) per base
+/// target, at most the signal KL(M(source) ‖ M(base)), which swapping no parts costs exactly.
 #[test]
 fn alignments_are_checked_by_interchange() {
     use crate::graph::{AlignmentIr, PairIr};
@@ -1027,46 +1067,39 @@ fn alignments_are_checked_by_interchange() {
     let program = full_program();
     let graph = Graph::parse(&program, &weights).expect("parse");
     let m0 = program.nodes.iter().position(|n| n.id == "m0").expect("m0");
-    // M's own answers at each base's last token with layer 0's MLP write taken from the next prompt.
+    // Each prompt as the base, the next as the source, at each base's last token (the behavior's target).
     let n = f.sequences.len();
     let pairs: Vec<(usize, usize)> = (0..n).map(|i| (i, (i + 1) % n)).collect();
     let circuit = graph.model(&weights);
     let bases = Batch::new(&pairs.iter().map(|&(i, _)| f.sequences[i].clone()).collect::<Vec<_>>()).expect("bases");
     let sources = Batch::new(&pairs.iter().map(|&(_, j)| f.sequences[j].clone()).collect::<Vec<_>>()).expect("sources");
     let written = execute(&weights, &circuit, &sources, &[], &BTreeMap::new()).expect("sources").writes;
-    let rows: Vec<usize> = bases.spans.iter().map(|&(start, length)| start + length - 1).collect();
-    let swapped = execute(&weights, &circuit, &bases, &rows, &[(m0, written[m0].clone().expect("m0 writes"))].into()).expect("swapped").log_probabilities;
-    let top: Vec<u32> = swapped.outer_iter().map(|r| r.iter().enumerate().fold((0, f64::NEG_INFINITY), |best, (k, &x)| if x > best.1 { (k, x) } else { best }).0 as u32).collect();
-    let vocabulary = weights.embedding.nrows() as u32;
-    let bound = |answers: &[u32]| {
+    let last = |b: &Batch| b.spans.iter().map(|&(start, length)| start + length - 1).collect::<Vec<usize>>();
+    let target = execute(&weights, &circuit, &sources, &last(&sources), &BTreeMap::new()).expect("M(source)").log_probabilities;
+    let base = execute(&weights, &circuit, &bases, &last(&bases), &BTreeMap::new()).expect("M(base)").log_probabilities;
+    let swapped = execute(&weights, &circuit, &bases, &last(&bases), &[(m0, written[m0].clone().expect("m0 writes"))].into()).expect("swapped").log_probabilities;
+    let mean = |v: Vec<f64>| v.iter().sum::<f64>() / v.len() as f64;
+    let signal = mean(kl_bits(&target, &base));
+    let expected = mean(kl_bits(&target, &swapped).into_iter().zip(kl_bits(&target, &base)).map(|(e, s)| e.min(s)).collect());
+    let aligned = |nodes: Vec<String>| {
         let mut p = program.clone();
-        p.alignments = vec![AlignmentIr { variable: "v".into(), nodes: vec!["m0".into()], pairs: pairs.iter().zip(answers).map(|(&(base, source), &a)| PairIr { base, source, answer: vec![a], ..PairIr::default() }).collect() }];
+        p.alignments = vec![AlignmentIr { variable: "v".into(), nodes, pairs: pairs.iter().map(|&(base, source)| PairIr { base, source }).collect() }];
         p
     };
-    let wrong: Vec<u32> = top.iter().map(|t| (t + 1) % vocabulary).collect();
     let mut checker = Checker::new(weights.clone(), claims_behavior(&f.sequences, &cf)).expect("checker");
-    let true_error = checker.alignment_error(&Graph::parse(&bound(&top), &weights).expect("parse")).expect("alignment");
-    let false_error = checker.alignment_error(&Graph::parse(&bound(&wrong), &weights).expect("parse")).expect("alignment");
-    assert!(true_error < 1e-6, "M's own interchanged answers cost {true_error:e} bits per target");
-    assert!(false_error > 1e-3, "wrong answers cost {false_error:e} bits per target");
+    let error = checker.alignment_error(&Graph::parse(&aligned(vec!["m0".into()]), &weights).expect("parse")).expect("alignment");
+    assert!(signal > 1e-3, "the pairs' signal {signal:e} bits per target");
+    assert!((error - expected).abs() <= 1e-9 * expected.max(1.0) && error <= signal + 1e-12, "m0: {error:e} vs {expected:e} (signal {signal:e})");
+    // Swapping no parts costs exactly the signal.
+    let mut none = Graph::parse(&aligned(vec!["m0".into()]), &weights).expect("parse");
+    none.alignments[0].1.clear();
+    let nothing = checker.alignment_error(&none).expect("no parts");
+    assert!((nothing - signal).abs() <= 1e-12 * signal, "no parts swapped: {nothing:e} vs signal {signal:e}");
     assert_eq!(checker.alignment_error(&graph).expect("no alignment"), 0.0);
-    // A set of answers that holds M's top token costs nothing; a set without it pays.
-    let with_sets = |sets: Vec<Vec<u32>>| {
-        let mut p = bound(&top);
-        for (pair, set) in p.alignments[0].pairs.iter_mut().zip(sets) {
-            pair.answers = vec![set];
-        }
-        Graph::parse(&p, &weights).expect("parse")
-    };
-    let holding = checker.alignment_error(&with_sets(top.iter().zip(&wrong).map(|(t, w)| vec![*w, *t]).collect())).expect("sets");
-    let missing = checker.alignment_error(&with_sets(wrong.iter().map(|w| vec![*w]).collect())).expect("sets");
-    assert!(holding == 0.0 && (missing - false_error).abs() < 1e-9, "sets: holding {holding:e}, missing {missing:e} vs {false_error:e}");
-    let (score, _) = checker.score(&bound(&wrong), 4, 1, true, None).expect("score");
-    assert!((score.alignment_error_bits - score.n * false_error).abs() <= 1e-6 * score.alignment_error_bits, "the score charges N times the error");
-    // A alignment names nodes of the program.
-    let mut unknown = bound(&top);
-    unknown.alignments[0].nodes = vec!["nowhere".into()];
-    assert!(Graph::parse(&unknown, &weights).is_err());
+    let (score, _) = checker.score(&aligned(vec!["m0".into()]), 4, 1, true, None).expect("score");
+    assert!((score.alignment_error_bits - score.n * error).abs() <= 1e-6 * score.alignment_error_bits, "the score charges N times the error");
+    // An alignment names nodes of the program.
+    assert!(Graph::parse(&aligned(vec!["nowhere".into()]), &weights).is_err());
 }
 
 #[test]

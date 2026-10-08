@@ -84,11 +84,56 @@ pub struct Program {
     /// The algorithm's variables aligned to parts ([`AlignmentIr`]), checked by interchange.
     #[serde(default)]
     pub alignments: Vec<AlignmentIr>,
+    /// The named groups of parts the program uses ([`GroupIr`]).
+    #[serde(default)]
+    pub groups: Vec<GroupIr>,
 }
 
-/// An alignment (design_v2 section 2): the variable `variable` of the program's algorithm
-/// is held by the parts of nodes `nodes`; per prompt pair, `answer` is the algorithm's output at the
-/// base prompt's targets (one token each) when the variable takes the source prompt's value.
+/// A named group of parts a program uses (mech's `G.<name>`, from the model's shared library of
+/// groups): its part tokens (`<p:L.S.I>`, `<p:L.S.rest>` for VPD site `S` of layer `L`) and the
+/// nodes holding them. A use costs one name in `Score::structure_bits`, its parts none there; the
+/// group's definition, its parts' names, is `Score::group_bits`, outside the total (a library is
+/// paid once per model).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct GroupIr {
+    pub name: String,
+    pub parts: Vec<String>,
+    #[serde(default)]
+    pub nodes: Vec<String>,
+}
+
+/// A VPD part a group names: layer, matrix (`q_proj` 0, `k_proj` 1, `v_proj` 2, `o_proj` 3, `c_fc`
+/// 4, `down_proj` 5) and subcomponent (the matrix's subcomponent count: its remainder).
+type GroupPart = (usize, usize, usize);
+
+/// Part token `<p:L.S.I>` or `<p:L.S.rest>` of a VPD site as a [`GroupPart`].
+fn group_part(weights: &Weights, token: &str) -> Result<GroupPart, String> {
+    let inner = token.strip_prefix("<p:").and_then(|t| t.strip_suffix('>')).ok_or_else(|| format!("group part {token}: not a part token"))?;
+    let fields: Vec<&str> = inner.split('.').collect();
+    let [layer, site, index] = fields.as_slice() else { return Err(format!("group part {token}: not a VPD part <p:L.S.I>")) };
+    let layer: usize = layer.parse().map_err(|_| format!("group part {token}: layer"))?;
+    let matrix = ["q", "k", "v", "o", "fc", "down"].iter().position(|m| m == site).ok_or_else(|| format!("group part {token}: site {site} is not a VPD site"))?;
+    let count = if matrix < 4 {
+        weights.vpd_attention.get(&layer).map(|a| [a.q.0.nrows(), a.k.0.nrows(), a.v.0.nrows(), a.o.0.nrows()][matrix])
+    } else {
+        weights.vpd.get(&layer).map(|v| if matrix == 4 { v.fc_u.nrows() } else { v.down_u.nrows() })
+    }
+    .ok_or_else(|| format!("group part {token}: layer {layer} has no VPD view of that site"))?;
+    let index = if *index == "rest" { count } else { index.parse::<usize>().ok().filter(|&i| i < count).ok_or_else(|| format!("group part {token}: index outside 0..{count}"))? };
+    Ok((layer, matrix, index))
+}
+
+/// A named group a program uses: its name, parts and the nodes (indices) holding them.
+#[derive(Clone, Debug)]
+pub struct GroupUse {
+    pub name: String,
+    pub parts: BTreeSet<GroupPart>,
+    pub nodes: Vec<usize>,
+}
+
+/// An alignment (design_v2 section 2): the variable `variable` of the program's algorithm (an
+/// intermediate one: the answer variable is aligned by construction and not tested) is held by the
+/// parts of nodes `nodes`, tested by interchange on the prompt pairs `pairs`.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct AlignmentIr {
     pub variable: String,
@@ -98,23 +143,12 @@ pub struct AlignmentIr {
 }
 
 /// One interchange of an alignment: prompts `base` and `source` (indices into the behavior, of one
-/// length) and the algorithm's answer token at each of the base's targets, or with `answers` the
-/// set of tokens it accepts at each (many right answers: any later year), used in its place.
+/// length). Its target is `M`'s own distribution on the source at the base's targets (an older IR's
+/// algorithm answer tokens, keys "answer"/"answers", are ignored).
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct PairIr {
     pub base: usize,
     pub source: usize,
-    #[serde(default)]
-    pub answer: Vec<u32>,
-    #[serde(default)]
-    pub answers: Vec<Vec<u32>>,
-}
-
-impl PairIr {
-    /// The accepted tokens at each target.
-    fn accepted(&self) -> Vec<Vec<u32>> {
-        if self.answers.is_empty() { self.answer.iter().map(|&a| vec![a]).collect() } else { self.answers.clone() }
-    }
 }
 
 fn yes() -> bool {
@@ -825,6 +859,8 @@ pub struct Graph {
     /// How many of the last `edges` and `internal` the base implies (not declared): they cost no
     /// structure bits.
     pub implied: (usize, usize),
+    /// The named groups the program uses ([`GroupIr`]).
+    pub groups: Vec<GroupUse>,
 }
 
 /// Whether a same-site edge from `writer` to `reader` joins two parts of one VPD site: c_fc
@@ -1378,12 +1414,18 @@ impl Graph {
             alignments.push((b.clone(), nodes));
         }
         let implied = (edges.len() - declared.0, internal.len() - declared.1);
-        Ok(Self { delete, ids, blocks, claims, edges, internal, alignments, base, implied })
+        let mut groups = Vec::with_capacity(program.groups.len());
+        for g in &program.groups {
+            let nodes: Vec<usize> = g.nodes.iter().map(|id| ids.iter().position(|i| i == id).ok_or_else(|| format!("group {}: unknown node {id}", g.name))).collect::<Result<_, _>>()?;
+            let parts = g.parts.iter().map(|t| group_part(weights, t)).collect::<Result<BTreeSet<_>, _>>()?;
+            groups.push(GroupUse { name: g.name.clone(), parts, nodes });
+        }
+        Ok(Self { delete, ids, blocks, claims, edges, internal, alignments, base, implied, groups })
     }
 
     /// The empty program: every piece a stand-in.
     pub fn empty() -> Self {
-        Self { delete: false, ids: Vec::new(), blocks: Vec::new(), claims: Vec::new(), edges: Vec::new(), internal: Vec::new(), alignments: Vec::new(), base: BTreeSet::new(), implied: (0, 0) }
+        Self { delete: false, ids: Vec::new(), blocks: Vec::new(), claims: Vec::new(), edges: Vec::new(), internal: Vec::new(), alignments: Vec::new(), base: BTreeSet::new(), implied: (0, 0), groups: Vec::new() }
     }
 
     /// Every piece of `weights` not in a node, per site: the heads of each layer, then its neurons.
@@ -1516,8 +1558,12 @@ impl Graph {
     /// `base`'s nodes and the declared edges that touch them.
     pub fn structure(&self, weights: &Weights, base: &BTreeSet<usize>) -> (usize, f64, f64) {
         let name = (weights.vocabulary().max(2) as f64).log2();
-        // Names in one site's list: one per subcomponent, the rank for the remainder (index `count`).
-        let names = |list: &[usize], (u, v): (&Array2<f64>, &Array2<f64>)| -> usize { list.iter().map(|&i| if i < u.nrows() { 1 } else { u.ncols().min(v.nrows()) }).sum() };
+        // Names in one site's list (matrix `m` of `layer`, at node `k`): one per subcomponent, the
+        // rank for the remainder (index `count`), none for a part a named group the node holds
+        // names.
+        let names = |k: usize, (layer, m): (usize, usize), list: &[usize], (u, v): (&Array2<f64>, &Array2<f64>)| -> usize {
+            list.iter().filter(|&&i| !self.groups.iter().any(|g| g.nodes.contains(&k) && g.parts.contains(&(layer, m, i)))).map(|&i| if i < u.nrows() { 1 } else { u.ncols().min(v.nrows()) }).sum()
+        };
         let mut parts = 0;
         let (mut bits, mut base_bits) = (0.0, 0.0);
         for (k, block) in self.blocks.iter().enumerate() {
@@ -1525,15 +1571,18 @@ impl Graph {
                 Block::Heads { heads, .. } => heads.len(),
                 Block::Neurons { neurons, .. } => neurons.len(),
                 Block::Features { features, .. } => features.len(),
-                Block::Slices { layer, fc, down, .. } => weights.vpd.get(layer).map_or(fc.len() + down.len(), |v| names(fc, (&v.fc_u, &v.fc_v)) + names(down, (&v.down_u, &v.down_v))),
-                Block::AttnSlices { layer, q, k, v, o, .. } => match weights.vpd_attention.get(layer) {
-                    Some(a) => names(q, (&a.q.0, &a.q.1)) + names(k, (&a.k.0, &a.k.1)) + names(v, (&a.v.0, &a.v.1)) + names(o, (&a.o.0, &a.o.1)),
-                    None => q.len() + k.len() + v.len() + o.len(),
+                Block::Slices { layer, fc, down, .. } => weights.vpd.get(layer).map_or(fc.len() + down.len(), |v| names(k, (*layer, 4), fc, (&v.fc_u, &v.fc_v)) + names(k, (*layer, 5), down, (&v.down_u, &v.down_v))),
+                Block::AttnSlices { layer, q, k: key, v, o, .. } => match weights.vpd_attention.get(layer) {
+                    Some(a) => names(k, (*layer, 0), q, (&a.q.0, &a.q.1)) + names(k, (*layer, 1), key, (&a.k.0, &a.k.1)) + names(k, (*layer, 2), v, (&a.v.0, &a.v.1)) + names(k, (*layer, 3), o, (&a.o.0, &a.o.1)),
+                    None => q.len() + key.len() + v.len() + o.len(),
                 },
             };
             parts += count;
             *(if base.contains(&k) { &mut base_bits } else { &mut bits }) += count as f64 * name;
         }
+        // Each named group used: one name.
+        parts += self.groups.len();
+        bits += self.groups.len() as f64 * name;
         let n = self.blocks.len() as f64;
         let edge = (3.0 * (n + 1.0) * (n + 1.0)).log2();
         let touches = |w: &Writer, r: Option<usize>| matches!(w, Writer::Unit(u) if base.contains(u)) || r.is_some_and(|r| base.contains(&r));
@@ -1544,6 +1593,17 @@ impl Graph {
             *(if base.contains(&w) || base.contains(&r) { &mut base_bits } else { &mut bits }) += edge;
         }
         (parts, bits, base_bits)
+    }
+
+    /// The definitions of the named groups the program uses: their parts' names (one per
+    /// subcomponent, the rank for a remainder), at `log2 V` bits each as in [`Graph::structure`].
+    pub fn group_bits(&self, weights: &Weights) -> f64 {
+        let name = (weights.vocabulary().max(2) as f64).log2();
+        let rank = |&(layer, m, i): &GroupPart| -> usize {
+            let factors = if m < 4 { weights.vpd_attention.get(&layer).map(|a| [&a.q, &a.k, &a.v, &a.o][m]).map(|(u, v)| (u, v)) } else { weights.vpd.get(&layer).map(|v| if m == 4 { (&v.fc_u, &v.fc_v) } else { (&v.down_u, &v.down_v) }) };
+            factors.map_or(1, |(u, v)| if i < u.nrows() { 1 } else { u.ncols().min(v.nrows()) })
+        };
+        self.groups.iter().map(|g| g.parts.iter().map(rank).sum::<usize>() as f64 * name).sum()
     }
 
     /// Opaque numbers: every weight a declared node reads (a head's query, key, value and output
@@ -3780,6 +3840,9 @@ pub struct Score {
     /// The structure bits of the program's shared base nodes (`Program::base`) and the edges that
     /// touch them, not in `total_bits`: the caller charges a base once across behaviors.
     pub base_bits: f64,
+    /// The definitions of the named groups the program uses ([`Graph::group_bits`]), not in
+    /// `total_bits`: a model's library of groups is paid once.
+    pub group_bits: f64,
     /// What undeclared pieces carried: "delete" or "counterfactual" ([`Graph::delete`]).
     pub standin: String,
     #[serde(rename = "N")]
@@ -4068,11 +4131,12 @@ impl Checker {
     }
 
     /// The error of `graph`'s alignments, bits per target: for each alignment the mean, over its pairs'
-    /// base targets, of how much less likely `M` finds the algorithm's answer (its set of answers)
-    /// than its own top token (`max log2 p − log2 Σ p(answer)`, at least zero) when the aligned nodes'
-    /// writes come from the source prompt and
-    /// every other piece computes on the base (`M`'s circuit, [`Graph::model`]); summed over
-    /// alignments. An answer `M`'s interchanged run ranks first costs nothing.
+    /// base targets, of `KL(M(source) ‖ M_swap)`, where `M_swap` is `M` on the base with the aligned
+    /// nodes' writes taken from its run on the source (every other piece computing on the base,
+    /// `M`'s circuit, [`Graph::model`]) and `M(source)` is `M`'s own distribution on the source at
+    /// the same positions (the lead, 10-08 00:48: a variable's whole carrier moves the base's output
+    /// to the source's). Each target's error is at most the signal `KL(M(source) ‖ M(base))`, what
+    /// swapping no parts costs; summed over alignments.
     pub fn alignment_error(&mut self, graph: &Graph) -> Result<f64, String> {
         let mut total = 0.0;
         let circuit = graph.model(&self.weights);
@@ -4087,35 +4151,26 @@ impl Checker {
                 if base.token_ids.len() != source.token_ids.len() {
                     return Err(format!("alignment {}: prompts {} and {} differ in length", alignment.variable, pair.base, pair.source));
                 }
-                let accepted = pair.accepted();
-                if accepted.len() != base.target_positions.len() || accepted.iter().any(Vec::is_empty) {
-                    return Err(format!("alignment {}: {} answers for prompt {}'s {} targets", alignment.variable, accepted.len(), pair.base, base.target_positions.len()));
-                }
                 bases.push(base.token_ids.clone());
                 sources.push(source.token_ids.clone());
             }
             let (mut base, mut source) = (Batch::new(&bases)?, Batch::new(&sources)?);
             self.mask(&mut base);
             self.mask(&mut source);
-            let mut rows = Vec::new();
-            let mut answers = Vec::new();
-            for (pair, &(start, _)) in alignment.pairs.iter().zip(&base.spans) {
+            // The base's targets, and the same positions in the source (prompts of one length).
+            let (mut rows, mut source_rows) = (Vec::new(), Vec::new());
+            for ((pair, &(start, _)), &(from, _)) in alignment.pairs.iter().zip(&base.spans).zip(&source.spans) {
                 rows.extend(prompts[pair.base].target_positions.iter().map(|&t| start + t));
-                answers.extend(pair.accepted());
+                source_rows.extend(prompts[pair.base].target_positions.iter().map(|&t| from + t));
             }
             let written = execute(&self.weights, &circuit, &source, &[], &BTreeMap::new())?.writes;
+            let target = execute(&self.weights, &circuit, &source, &source_rows, &BTreeMap::new())?.log_probabilities;
+            let unswapped = execute(&self.weights, &circuit, &base, &rows, &BTreeMap::new())?.log_probabilities;
             let swaps: BTreeMap<usize, Array2<f64>> = nodes.iter().map(|&u| written.get(u).cloned().flatten().map(|w| (u, w)).ok_or_else(|| format!("alignment {}: an aligned node wrote nothing", alignment.variable))).collect::<Result<_, _>>()?;
-            let swapped = execute(&self.weights, &circuit, &base, &rows, &swaps)?.log_probabilities;
-            let mut cost = 0.0;
-            for (row, set) in swapped.outer_iter().zip(&answers) {
-                let top = row.iter().fold(f64::NEG_INFINITY, |m, &x| m.max(x));
-                let mut p = 0.0;
-                for &a in set {
-                    p += row.get(a as usize).copied().ok_or_else(|| format!("alignment {}: answer token {a} outside the vocabulary", alignment.variable))?.exp();
-                }
-                cost += ((top - p.ln()) / std::f64::consts::LN_2).max(0.0);
-            }
-            total += cost / answers.len().max(1) as f64;
+            let swapped = if swaps.is_empty() { unswapped.clone() } else { execute(&self.weights, &circuit, &base, &rows, &swaps)?.log_probabilities };
+            let (errors, signal) = (kl_bits(&target, &swapped), kl_bits(&target, &unswapped));
+            let cost: f64 = errors.iter().zip(&signal).map(|(e, s)| e.min(*s)).sum();
+            total += cost / rows.len().max(1) as f64;
         }
         Ok(total)
     }
@@ -4488,6 +4543,7 @@ impl Checker {
                 python_tokens: if *valid { program.python_tokens } else { 0 },
                 opaque_numbers,
                 base_bits,
+                group_bits: graph.group_bits(&self.weights),
                 standin: if graph.delete { "delete" } else { "counterfactual" }.into(),
                 n,
                 experiments: outcomes.len(),
