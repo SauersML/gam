@@ -1021,6 +1021,17 @@ fn save(path: &Path, value: &Value) -> Result<(), String> {
     std::fs::write(path, serde_json::to_vec_pretty(value).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
 }
 
+/// `artifact`'s every change behind a measured block (`Artifact::validate_coverage`), against
+/// `native` with the literals the artifact holds: rounded to f32, every operator of `M` outside
+/// the blocks is `M`'s own rounded, not a change (a toy whose weights are not f32 numbers failed
+/// here after every fit on Metal).
+fn covered(artifact: &gam_mpd::artifact::Artifact, native: &OperatorProgram, literals: library_mdl::Literals) -> Result<(), String> {
+    match literals {
+        library_mdl::Literals::F32 => artifact.validate_coverage(&gam_mpd::artifact::Artifact::native(native)?.f32_literals()?.program),
+        library_mdl::Literals::F64 => artifact.validate_coverage(native),
+    }
+}
+
 fn main() -> Result<(), String> {
     log_to_stderr();
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -1135,7 +1146,7 @@ fn main() -> Result<(), String> {
     }
     if read_artifact {
         let artifact = library_mdl::checkpoint_artifact(&explanation, &checkpoint, library_mdl::Literals::of(&device))?;
-        artifact.validate_coverage(&native)?;
+        covered(&artifact, &native, library_mdl::Literals::of(&device))?;
         return std::fs::write(out.join("checkpoint.artifact.bin"), artifact.to_bytes()?).map_err(|e| e.to_string());
     }
     let provenance = json!({
@@ -1160,7 +1171,7 @@ fn main() -> Result<(), String> {
     // The reported artifact: the posterior mean or its rounding, whichever scores better held out,
     // with the literals its evaluation ran with.
     let artifact = fit.artifact(&explanation)?;
-    artifact.validate_coverage(&native)?;
+    covered(&artifact, &native, fit.report.literals)?;
     std::fs::write(out.join("artifact.bin"), artifact.to_bytes()?).map_err(|e| e.to_string())?;
     let summary = json!({
         "provenance": provenance,
