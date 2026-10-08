@@ -706,17 +706,29 @@ def rot_Q_all(As):
         out[i] = part.float()
     return out
 
+def rot_cayley_all(Rs):
+    """The Cayley bases (I + S)^-1 (I - S) of each (angles, start basis Q0 or None) in Rs, in one batched solve; a
+    start basis multiplies in float64 (in TF32 the product was orthogonal only to 1e-3)."""
+    g = Rs[0][0].shape[-1]
+    A_ = rot_hi(torch.cat([a * mask_of(g) for a, _ in Rs])); S_ = A_ - A_.transpose(1, 2)
+    I_ = torch.eye(g, device=S_.device, dtype=S_.dtype).expand_as(S_)
+    Q = torch.linalg.solve(I_ + S_, I_ - S_)
+    return [(Q0.to(q.dtype) @ q if Q0 is not None else q).float() for q, (_, Q0) in zip(Q.split([a.shape[0] for a, _ in Rs]), Rs)]
+
 def rot_Q(R):
     """The groups' bases Q = exp(S), S the skew part of A's strict upper triangle (Taylor series after
     scaling, then squaring: matrix products only, orthogonal to rounding), with every installed (or every
     posterior-mean) angle tensor's in one pass."""
     A = R['A']; g = A.shape[-1]
     if g > 64:
-        # Large groups: the Cayley transform (I + S)^-1 (I - S), orthogonal for any skew S, one solve.
-        A_ = rot_hi(A * mask_of(g)); S_ = A_ - A_.transpose(1, 2)
-        I_ = torch.eye(g, device=S_.device, dtype=S_.dtype).expand_as(S_)
-        Q = torch.linalg.solve(I_ + S_, I_ - S_).float()
-        return R['Q0'] @ Q if 'Q0' in R else Q
+        # Large groups: the Cayley transform (I + S)^-1 (I - S), orthogonal for any skew S, every group set of this
+        # size in one batched solve per pass.
+        for name, Rs in (('installed', [(R_['A'], R_.get('Q0')) for R_ in ROT_ALL if R_['A'].shape[-1] == g]),
+                         ('mean', [(R_['A_leaf'][0], R_.get('Q0')) for R_ in ROT_ALL if 'A_leaf' in R_ and R_['A'].shape[-1] == g])):
+            at = [i for i, (t, _) in enumerate(Rs) if t is A]
+            if at:
+                return rot_memo((name, torch.is_grad_enabled(), g), [t for t, _ in Rs], lambda: rot_cayley_all(Rs))[at[0]]
+        return rot_cayley_all([(A, R.get('Q0'))])[0]
     for name, As in (('installed', [R_['A'] for R_ in ROT_ALL if R_['A'].shape[-1] == g]),
                      ('mean', [R_['A_leaf'][0] for R_ in ROT_ALL if 'A_leaf' in R_ and R_['A'].shape[-1] == g])):
         at = [i for i, t in enumerate(As) if t is A]
