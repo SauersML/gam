@@ -2963,7 +2963,8 @@ pub fn native_weight_edit(export: &Path, draw: &Value) -> Result<(String, Vec<Ba
 /// scores an explanation (`mpd_library_mdl_2951` weight_faithfulness): each edit (`BatteryEdit`s,
 /// `native_weight_edit`) makes `M` compute with its edited weights and VPD with its subcomponents
 /// edited entry-wise where the edit scales coordinates, plus the always-on term `ΔW·x` on the map's
-/// own input otherwise, its masks recomputed from each form's own run under the edit. On `rows`, every token scored: per form
+/// own input otherwise, its masks recomputed from each form's own run under the edit, and VPD's
+/// all-on errors (every mask 1, whole and MLP-only). On `rows`, every token scored: per form
 /// the gap `KL(M_e ‖ VPD_e)`, the edit-ignoring baseline `KL(M_e ‖ VPD)`, and the edit's effect
 /// `KL(M_e ‖ M)`, in bits per token, per edit and their means; an edit of an operator VPD does not
 /// hold is not applicable.
@@ -2981,6 +2982,11 @@ pub fn vpd_weight_edits(vpd: &Vpd, export: &Path, decomposition: &Path, rows: &[
     };
     let m_clean = runs.m_run(None)?;
     let clean: Vec<DeviceTrace> = (0..FORMS.len()).map(|f| runs.form(f, &m_clean, None)).collect::<Result<_, _>>()?;
+    // The all-on errors: VPD with every mask 1 (its subcomponents summed, the remainder dropped),
+    // whole and at the MLP maps alone with M's attention.
+    let hidden = (vpd.m.hidden, vpd.e.hidden);
+    let all_on = mean_kl(&m_clean, &runs.e_run(&runs.ones, None)?, hidden)?;
+    let all_on_mlp = mean_kl(&m_clean, &runs.e_run_exact(&runs.ones, &runs.attention, None)?, hidden)?;
     let mut records = Vec::new();
     for (i, (native, edit)) in edits.iter().enumerate() {
         // Per program its steps: an entry-wise scale of a node's columns, or the additive term at a
@@ -3038,6 +3044,8 @@ pub fn vpd_weight_edits(vpd: &Vpd, export: &Path, decomposition: &Path, rows: &[
     out.insert("not_applicable".into(), json!(records.len() - applicable.len()));
     out.insert("sequences".into(), json!(rows.len()));
     out.insert("effect_mean_bits_per_token".into(), json!(average("effect_mean_bits_per_token")));
+    out.insert("all_on_mean_bits_per_token".into(), json!(all_on));
+    out.insert("all_on_mlp_mean_bits_per_token".into(), json!(all_on_mlp));
     for name in FORMS {
         out.insert(name.into(), json!({"mean_bits_per_token": average(&format!("{name}_mean_bits_per_token")), "ignoring_mean_bits_per_token": average(&format!("{name}_ignoring_mean_bits_per_token"))}));
     }
