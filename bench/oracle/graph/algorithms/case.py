@@ -1,5 +1,5 @@
 """Case conversion: after examples, the new word in lower case (UPPER -> upper) or upper case."""
-from mech import bind, claim
+from mech import align, claim
 
 
 def word(tokens):

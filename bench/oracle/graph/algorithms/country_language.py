@@ -1,5 +1,5 @@
 """Factual recall: the main language of the named country. The table is what the model recalls."""
-from mech import bind, claim
+from mech import align, claim
 
 LANGUAGE = {
     'Afghanistan': ' Pashto', 'Argentina': ' Spanish', 'Australia': ' English',

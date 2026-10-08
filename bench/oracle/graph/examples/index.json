@@ -23,7 +23,7 @@
   "family": "greater_than",
   "split": "train"
  },
- "qwen3_induction_bind": {
+ "qwen3_induction_align": {
   "model": "qwen3-0.6b",
   "behavior": "induction_random.words8",
   "family": "induction_random",
@@ -42,7 +42,7 @@
   "family": "sva",
   "split": "heldout"
  },
- "vpd4l_induction_bind": {
+ "vpd4l_induction_align": {
   "model": "vpd4l",
   "behavior": null,
   "family": "induction_text",

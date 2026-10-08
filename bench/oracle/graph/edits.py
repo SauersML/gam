@@ -28,27 +28,20 @@ import math
 import random
 import re
 import sys
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 PART = re.compile(r"<p:[^>]+>")
-STATEMENT = re.compile(r"^(\s*)(align|bind|claim)\(\s*(\w+)\s*,(.*)\)\s*$")
-
-
-def align_keyword() -> str:
-    """The alignment statement's name in mech's current answer format."""
-    import mech
-
-    return "align" if hasattr(mech, "align") else "bind"
+STATEMENT = re.compile(r"^(\s*)(align|claim)\(\s*(\w+)\s*,(.*)\)\s*$")
 
 
 @dataclass(frozen=True)
 class Statement:
     line: int  # its line in the source (-1: added by an edit, written after the last statement)
-    kind: str  # align (or bind) / claim
+    kind: str  # align / claim
     variable: str
     parts: tuple[str, ...]
 
@@ -59,18 +52,16 @@ class Answer:
 
     lines: tuple[str, ...]
     statements: tuple[Statement, ...]
-    keyword: str = field(default="align")
 
     @staticmethod
-    def parse(source: str, keyword: str | None = None) -> "Answer":
+    def parse(source: str) -> "Answer":
         lines = tuple(source.rstrip("\n").split("\n"))
         statements = []
         for i, text in enumerate(lines):
             m = STATEMENT.match(text)
             if m and PART.search(m[4]):
                 statements.append(Statement(i, m[2], m[3], tuple(PART.findall(m[4]))))
-        found = next((s.kind for s in statements if s.kind != "claim"), None)
-        return Answer(lines, tuple(statements), keyword or found or align_keyword())
+        return Answer(lines, tuple(statements))
 
     def source(self) -> str:
         by_line = {s.line: s for s in self.statements if s.line >= 0}
@@ -134,7 +125,7 @@ def adds(answer: Answer, candidates: dict[str, list[str]], per_variable: int) ->
     kinds = {s.variable: s.kind for s in answer.statements}
     out = []
     for variable, ranked in candidates.items():
-        kind = kinds.get(variable, answer.keyword)
+        kind = kinds.get(variable, "align")
         fresh = [p for p in ranked if p not in named.get((variable, kind), ())]
         out += [Edit("add", variable, kind, p) for p in fresh[:per_variable]]
     return out

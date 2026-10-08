@@ -1,6 +1,6 @@
 """Comparative and superlative: an adjective takes -er or -est: a final e takes -r/-st, a consonant and y
 become -ier/-iest, a short final consonant after one vowel doubles; good, bad and far are irregular."""
-from mech import bind, claim
+from mech import align, claim
 
 IRREGULAR = {"good": ("better", "best"), "bad": ("worse", "worst"), "far": ("farther", "farthest"),
              "many": ("more", "most"), "little": ("less", "least")}

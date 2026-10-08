@@ -1,10 +1,10 @@
 """The `mech` library of the graph oracle (#2951): the only module an oracle program may import.
 
-A program (design_v2 section 1) is an ALGORITHM in plain Python over the prompt's tokens, BINDINGS that
+A program (design_v2 section 1) is an ALGORITHM in plain Python over the prompt's tokens, ALIGNMENTS that
 name the parts of the target model M holding its variables, and optional attention CLAIMS. Induction on
 vpd4l with VPD attached ("A B ... A -> B"):
 
-    from mech import bind, claim
+    from mech import align, claim
 
     def back(tokens):
         # each position attends to the one before it
@@ -23,24 +23,24 @@ vpd4l with VPD attached ("A B ... A -> B"):
         return [tokens[js[-1]] if js else None for js in match]
 
     claim(back, <p:1.q.316>, <p:1.k.329>)
-    bind(prev, <p:1.v.228>, <p:1.v.346>, <p:1.o.311>, <p:1.o.340>)
+    align(prev, <p:1.v.228>, <p:1.v.346>, <p:1.o.311>, <p:1.o.340>)
     claim(match, <p:2.q.335>, <p:2.k.206>)
-    bind(answer, <p:2.v.559>, <p:2.o.735>, <p:3.v.677>, <p:3.o.806>)
+    align(answer, <p:2.v.559>, <p:2.o.735>, <p:3.v.677>, <p:3.o.806>)
 
 The algorithm. A variable is a top-level function, named by its name, that takes `tokens` (the prompt as
 M's token strings, such as " cat") and other variables (by parameter name) and returns one value per
 position: a string, number, bool or None, or a list or tuple of them. Its value at position t may use
 tokens 0..t only. Other functions are helpers. Comments and docstrings are free working notes.
-bind(variable, parts...): what the parts write into the residual stream holds the variable. A variable
+align(variable, parts...): what the parts write into the residual stream holds the variable. A variable
 may span layers (one node per layer's attention or MLP); a part belongs to one node.
 claim(pattern, parts...): `pattern`'s value at t lists the positions 0..t that the parts' attention at
 query t attends to, uniformly (none: position 0), or maps positions to weights; the parts are q_proj
 and k_proj parts (or native heads), in one layer or several (the pattern holds in each). A claim states
 what the parts compute; they still compute it with M's weights.
-The answer is the one bound variable that no variable reads: its value at t is the token M predicts
+The answer is the one aligned variable that no variable reads: its value at t is the token M predicts
 after position t (a longer string: its first token; a list of strings: any of them).
 Edges follow the data flow: a variable reading `tokens` reads the token embedding; one reading another
-variable reads the writes of that variable's parts (through unbound steps); a variable spanning layers
+variable reads the writes of that variable's parts (through unaligned steps); a variable spanning layers
 feeds its own later parts; the answer's parts and the embedding write the logits.
 
 Parts (layer L, index I, from 0). The oracle writes one part token per part; text spellings in brackets:
@@ -58,7 +58,7 @@ The low-level form, without an algorithm: node(*parts) makes one node; `writer >
 lists them.
 
 trace(source, model, behavior=...) checks a program, runs it in a sandboxed child process and, given
-the behavior, evaluates the algorithm on its prompts: per bound variable, interchange pairs (prompt i
+the behavior, evaluates the algorithm on its prompts: per aligned variable, interchange pairs (prompt i
 with the variable's value from prompt j, the next prompt of i's length, and the answer at each of i's
 targets), and each claim's pattern on every prompt and counterfactual. It returns the IR the checker
 reads. Parts a program leaves out are the checker's stand-ins (deleted, with a decomposition attached).
@@ -101,13 +101,13 @@ CODES = {"q_proj": "q", "k_proj": "k", "v_proj": "v", "o_proj": "o", "c_fc": "fc
 SITE_OF = {code: site for site, code in CODES.items()}
 PART = re.compile(r"<p:(\d+)\.(?:(q|k|v|o|fc|down|attn|mlp)\.(\d+|rest)|h\.(\d+)|(a|m))>")
 ROUTES = ("query", "key", "value", "input")
-EXPORTS = ("bind", "claim", "node", "edges", "L", "PD", "embed", "logits")
+EXPORTS = ("align", "claim", "node", "edges", "L", "PD", "embed", "logits")
 ATTRIBUTES = ("head", "attn", "mlp", "rest", "query", "key", "value", "input") + SITES
 LIBRARY_ARM = "grouped_own"  # the arm of decomp's start that the library view addresses
 
 
 class MechError(Exception):
-    """An invalid program: a bad address, edge, binding or construct."""
+    """An invalid program: a bad address, edge, alignment or construct."""
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -192,7 +192,7 @@ class _Program:
         self.namespace = namespace
         self.nodes: list[Node] = []
         self.edges: dict[tuple, Edge] = {}
-        self.bound: dict[str, list[Piece]] = {}
+        self.aligned: dict[str, list[Piece]] = {}
         self.claimed: dict[str, list[Piece]] = {}
 
 
@@ -586,11 +586,11 @@ def _variable(fn, what: str) -> str:
     return fn.__name__
 
 
-def bind(variable, *parts) -> None:
+def align(variable, *parts) -> None:
     """The variable `variable` (a function of the algorithm) is held by what `parts` write into the
     residual stream."""
-    name = _variable(variable, "bind")
-    _PROGRAM.bound.setdefault(name, []).extend(_pieces(parts, f"bind({name}, ...)"))
+    name = _variable(variable, "align")
+    _PROGRAM.aligned.setdefault(name, []).extend(_pieces(parts, f"align({name}, ...)"))
 
 
 def claim(pattern, *parts) -> None:
@@ -692,7 +692,7 @@ def _pattern_row(value, t: int, what: str) -> list[float]:
 
 
 def _evaluate(program: _Program, algorithm: _Algorithm, answer: str, behavior: dict, ir: dict) -> None:
-    """The algorithm on the behavior: interchange pairs per bound variable, claimed patterns, and how
+    """The algorithm on the behavior: interchange pairs per aligned variable, claimed patterns, and how
     often the answer is the prompt's next token."""
     prompts, targets = behavior["prompts"], behavior["targets"]
     cache: dict[tuple, dict] = {}
@@ -768,21 +768,21 @@ def _validate(program: _Program, namespace: dict, ir: dict, behavior: dict | Non
             if f"node{k}" not in named:
                 n.id = f"node{k}"
             k += 1
-    bound, claimed = program.bound, program.claimed
-    if set(bound) & set(claimed):
-        raise MechError(f"{', '.join(sorted(set(bound) & set(claimed)))}: a variable is bound (a value parts write) "
+    aligned, claimed = program.aligned, program.claimed
+    if set(aligned) & set(claimed):
+        raise MechError(f"{', '.join(sorted(set(aligned) & set(claimed)))}: a variable is aligned (a value parts write) "
                         "or claimed (an attention pattern), not both")
-    algorithm = _Algorithm(namespace, list(bound) + list(claimed)) if bound or claimed else None
+    algorithm = _Algorithm(namespace, list(aligned) + list(claimed)) if aligned or claimed else None
     taken = {n.id for n in program.nodes}
     held: dict[str, list[Node]] = {}
-    for name, pieces in bound.items():  # one node per layer's attention or MLP
+    for name, pieces in aligned.items():  # one node per layer's attention or MLP
         sites = sorted({(p.layer, p.block()) for p in pieces})
         for layer, block in sites:
             made = Node(_merged(p for p in pieces if (p.layer, p.block()) == (layer, block)))
             made.id = name if len(sites) == 1 else f"{name}.{layer}.{block}"
             if not made.writes_residual():
-                raise MechError(f"bind({name}, ...): its parts in layer {layer}'s {block} write no residual stream "
-                                f"(q/k/v_proj and c_fc parts write their own site's stream); bind the "
+                raise MechError(f"align({name}, ...): its parts in layer {layer}'s {block} write no residual stream "
+                                f"(q/k/v_proj and c_fc parts write their own site's stream); align the "
                                 f"{'o_proj' if block == 'attn' else 'down_proj'} parts that carry the variable, "
                                 f"or claim the attention pattern")
             held.setdefault(name, []).append(made)
@@ -802,8 +802,8 @@ def _validate(program: _Program, namespace: dict, ir: dict, behavior: dict | Non
                                 "queries and keys produce the pattern")
             homes = {owner.get((p.view, p.layer, p.kind, i)) for p in group for i in (("rest",) if p.rest else p.index)}
             if len(homes) > 1:
-                raise MechError(f"claim({name}, ...): layer {layer}'s claimed parts are bound to a variable in part; "
-                                "claim parts that are all bound to one variable in a layer, or none bound")
+                raise MechError(f"claim({name}, ...): layer {layer}'s claimed parts are aligned to a variable in part; "
+                                "claim parts that are all aligned to one variable in a layer, or none aligned")
             home = homes.pop()
             if home is None:
                 home = Node(_merged(group))
@@ -830,10 +830,10 @@ def _validate(program: _Program, namespace: dict, ir: dict, behavior: dict | Non
                                     f"{n.id}; a part belongs to one node")
     ir["bindings"], ir["variables"], ir["answer"] = [], [], None
     if algorithm is not None:
-        sinks = [v for v in bound if not algorithm.readers[v]]
+        sinks = [v for v in aligned if not algorithm.readers[v]]
         if len(sinks) != 1:
-            raise MechError("the answer is the one bound variable no variable reads; " +
-                            (f"{', '.join(sinks)} are all unread" if sinks else "bind the answer's parts"))
+            raise MechError("the answer is the one aligned variable no variable reads; " +
+                            (f"{', '.join(sinks)} are all unread" if sinks else "align the answer's parts"))
         answer = ir["answer"] = sinks[0]
 
         def connect(src, dst) -> bool:
@@ -857,11 +857,11 @@ def _validate(program: _Program, namespace: dict, ir: dict, behavior: dict | Non
             connect(n, logits)
         connect(embed, logits)
         ir["variables"] = [{"name": v, "reads": list(algorithm.params[v]),
-                            "role": "bound" if v in bound else "claimed" if v in claimed else "step",
+                            "role": "aligned" if v in aligned else "claimed" if v in claimed else "step",
                             "nodes": [n.id for n in held.get(v, [])],
-                            "pieces": [p.ir() for p in _merged(bound.get(v) or claimed.get(v) or [])]}
+                            "pieces": [p.ir() for p in _merged(aligned.get(v) or claimed.get(v) or [])]}
                            for v in sorted(algorithm.params, key=line.get)]
-        ir["bindings"] = [{"variable": v, "nodes": [n.id for n in held[v]], "pairs": []} for v in bound]
+        ir["bindings"] = [{"variable": v, "nodes": [n.id for n in held[v]], "pairs": []} for v in aligned]
         if behavior is not None:
             _evaluate(program, algorithm, answer, behavior, ir)
     ir["nodes"] = [{"id": n.id, "pieces": [p.ir() for p in n.pieces],

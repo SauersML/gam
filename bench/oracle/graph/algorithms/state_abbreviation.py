@@ -1,5 +1,5 @@
 """Factual recall: the postal abbreviation of a named US state. The table is what the model recalls."""
-from mech import bind, claim
+from mech import align, claim
 
 CODE = {
     'Alabama': ' AL', 'Alaska': ' AK', 'Arizona': ' AZ', 'Arkansas': ' AR', 'California': ' CA',

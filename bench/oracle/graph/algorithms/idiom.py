@@ -1,6 +1,6 @@
 """Fixed expression: the last word of a frequent multiword expression follows its first words. The
 table is what the model recalls."""
-from mech import bind, claim
+from mech import align, claim
 
 NEXT = {
     'a lot': ' of', 'accordance': ' with', 'according': ' to', 'again': ' again',

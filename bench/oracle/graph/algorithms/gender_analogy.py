@@ -1,5 +1,5 @@
 """Analogy: the female counterpart of a male word. The table is what the model recalls."""
-from mech import bind, claim
+from mech import align, claim
 
 FEMALE = {
     'actor': ' actress', 'boy': ' girl', 'boyfriend': ' girlfriend', 'brother': ' sister',

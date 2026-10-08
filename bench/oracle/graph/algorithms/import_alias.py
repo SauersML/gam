@@ -1,5 +1,5 @@
 """Code convention: the conventional alias of the imported module. The table is what the model recalls."""
-from mech import bind, claim
+from mech import align, claim
 
 ALIAS = {
     'altair': ' alt', 'dask.dataframe': ' dd', 'datetime': ' dt', 'geopandas': ' gpd',

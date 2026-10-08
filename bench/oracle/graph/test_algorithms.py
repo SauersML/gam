@@ -1,5 +1,5 @@
 """The family algorithms (bench/oracle/graph/algorithms/, index.json: behavior family -> algorithm) on their
-vpd4l and Qwen3-0.6B behaviors: each traces with its answer bound, and its answer (or one of its set of
+vpd4l and Qwen3-0.6B behaviors: each traces with its answer aligned, and its answer (or one of its set of
 answers) is the prompt's next token on nearly every target.
 
   ~/mpd-data/venv/bin/python -m pytest bench/oracle/graph/test_algorithms.py
@@ -34,7 +34,7 @@ def test_algorithms_predict_their_behaviors():
 
 
 def check(behavior, model, answer, low):
-    source = (HERE / "algorithms" / f"{INDEX[behavior['family']]}.py").read_text() + f"\nbind(answer, {answer})\n"
+    source = (HERE / "algorithms" / f"{INDEX[behavior['family']]}.py").read_text() + f"\nalign(answer, {answer})\n"
     ir = mech.trace(source, model, behavior=behavior)
     assert ir["valid"], (model, behavior["id"], ir["error"])
     assert ir["bindings"][0]["pairs"], (model, behavior["id"])
@@ -58,7 +58,7 @@ def test_teacher_assignments():
     found = teacher.assignments(ir, teacher.algorithm_of(behavior), behavior)
     tails = [s.split("\n\n\n")[-1] for s in found]
     # answer alone; prev = layer 1 and answer = layers 2-3; prev = layers 1-2 and answer = layer 3
-    assert len(found) == 3 and all(t.count("bind(answer") == 1 for t in tails)
-    assert "bind(prev, <p:1.q.316>, <p:1.k.329>, <p:1.v.228>, <p:1.o.311>)\nclaim(back, <p:1.q.316>, <p:1.k.329>)" in tails[1]
+    assert len(found) == 3 and all(t.count("align(answer") == 1 for t in tails)
+    assert "align(prev, <p:1.q.316>, <p:1.k.329>, <p:1.v.228>, <p:1.o.311>)\nclaim(back, <p:1.q.316>, <p:1.k.329>)" in tails[1]
     traced = mech.trace_inline(found[1], "vpd4l", behavior=behavior)
     assert traced["valid"] and [b["variable"] for b in traced["bindings"]] == ["prev", "answer"]

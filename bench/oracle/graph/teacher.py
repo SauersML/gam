@@ -1,12 +1,12 @@
 """Teacher programs (#2951 graph oracle): a search's program (nodes of decomposition parts, e2e/search.py) and
-its behavior's family algorithm (algorithms/index.json) -> algorithm programs whose variables are bound to
+its behavior's family algorithm (algorithms/index.json) -> algorithm programs whose variables are aligned to
 the search's nodes; the checker scores every assignment and the best is printed with its facts and English
 (printer.py), in the oracle's answer format.
 
-Assignments: the algorithm's bound variables, in data-flow order, take the program's nodes in layer order,
+Assignments: the algorithm's aligned variables, in data-flow order, take the program's nodes in layer order,
 each a contiguous run of nodes that writes the residual stream (the answer takes the last run). A variable
 whose values are attention patterns (lists of positions) is claimed on the query and key parts of the
-attention nodes of the bound variable that reads it.
+attention nodes of the aligned variable that reads it.
 
   teacher.py SEARCH.json BEHAVIOR.json [--out-dir DIR] [--vpd DIR]
 writes DIR/<behavior>.py, .answer.txt, .graph.json and .assignments.jsonl (every assignment's score).
@@ -49,7 +49,7 @@ def search_ir(search: dict, model: str) -> dict:
 def patterns(algorithm: str, behavior: dict) -> set[str]:
     """The algorithm's variables whose values are attention patterns: at every position a list of
     positions up to it, on the behavior's first prompt."""
-    ir = mech.trace_inline(algorithm + f"\nbind(answer, {ANY[behavior['model']]})\n", behavior["model"])
+    ir = mech.trace_inline(algorithm + f"\nalign(answer, {ANY[behavior['model']]})\n", behavior["model"])
     names = [v["name"] for v in ir["variables"]]
     payload, _ = mech.behavior_tokens(behavior, behavior["model"])
     namespace = {"__builtins__": mech.SAFE_BUILTINS}
@@ -76,11 +76,11 @@ def tokens(pieces: list[dict]) -> str:
 
 
 def assignments(ir: dict, algorithm: str, behavior: dict) -> list[str]:
-    """Every algorithm program binding the search's nodes to the algorithm's variables (module doc): any
-    subset of its value variables that includes the answer is bound (the rest stay unbound steps); the
+    """Every algorithm program aligning the search's nodes to the algorithm's variables (module doc): any
+    subset of its value variables that includes the answer is aligned (the rest stay unaligned steps); the
     programs mech rejects (a variable's parts must write before its readers read) are left out."""
     model = behavior["model"]
-    traced = mech.trace_inline(algorithm + f"\nbind(answer, {ANY[model]})\n", model)
+    traced = mech.trace_inline(algorithm + f"\nalign(answer, {ANY[model]})\n", model)
     claimed = patterns(algorithm, behavior)
     values = [v["name"] for v in traced["variables"] if v["name"] not in claimed and v["name"] != "answer"]
     reads = {v["name"]: set(v["reads"]) for v in traced["variables"]}
@@ -88,14 +88,14 @@ def assignments(ir: dict, algorithm: str, behavior: dict) -> list[str]:
     out = []
     for r in range(len(values) + 1):
         for chosen in itertools.combinations(values, r):
-            bound = list(chosen) + ["answer"]
-            for cuts in itertools.combinations(range(1, len(nodes)), len(bound) - 1):
+            aligned = list(chosen) + ["answer"]
+            for cuts in itertools.combinations(range(1, len(nodes)), len(aligned) - 1):
                 runs = [nodes[a:b] for a, b in zip((0,) + cuts, cuts + (len(nodes),))]
                 if not all(any(writes(n) for n in run) for run in runs):
                     continue
                 lines = []
-                for name, run in zip(bound, runs):
-                    lines.append(f"bind({name}, {tokens([p for n in run for p in n['pieces']])})")
+                for name, run in zip(aligned, runs):
+                    lines.append(f"align({name}, {tokens([p for n in run for p in n['pieces']])})")
                     for c in sorted(claimed & reads[name]):
                         qk = [p for n in run for p in n["pieces"] if p["kind"] in ("q_proj", "k_proj", "head")]
                         if qk:
@@ -120,7 +120,7 @@ def main():
     ir = search_ir(json.loads(a.search.read_text()), behavior["model"])
     candidates = assignments(ir, algorithm_of(behavior), behavior)
     if not candidates:
-        sys.exit("no assignment: fewer residual-writing nodes than bound variables")
+        sys.exit("no assignment: fewer residual-writing nodes than aligned variables")
     views = {"vpd": a.vpd} if behavior["model"] == "vpd4l" else None
     with score.Checker(behavior["model"], views=views) as c:
         c.behavior(a.behavior)
@@ -137,7 +137,7 @@ def main():
     (a.out_dir / f"{name}.answer.txt").write_text(printer.answer_of(src, graph["explanation"]))
     (a.out_dir / f"{name}.graph.json").write_text(json.dumps(graph, indent=1))
     print(f"{name}: {len(candidates)} assignments; best total {scores[best]['total_bits']:.4g} bits "
-          f"(binding {scores[best].get('binding_error_bits', 0):.4g})")
+          f"(alignment {scores[best].get('binding_error_bits', 0):.4g})")
 
 
 if __name__ == "__main__":

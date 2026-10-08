@@ -1,5 +1,5 @@
 """Alphabet succession: in a run of letters the next letter follows the current one."""
-from mech import bind, claim
+from mech import align, claim
 
 
 def letter(tokens):

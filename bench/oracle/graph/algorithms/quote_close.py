@@ -1,5 +1,5 @@
 """Quote closing: inside an open quotation that ends a sentence, the next token closes it with '."'."""
-from mech import bind, claim
+from mech import align, claim
 
 
 def inside(tokens):

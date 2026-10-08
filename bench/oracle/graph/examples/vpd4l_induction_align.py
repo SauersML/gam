@@ -7,7 +7,7 @@ token, and the KL(M || M_e) it costs per target token): layer 1's query 316 and 
 the induction step; layer 3's output 806 (0.35) writes the copied token again. Value subcomponents cost
 less each (0.07 to 0.25); the ones named are the largest of their layer.
 """
-from mech import bind, claim
+from mech import align, claim
 
 
 def back(tokens):
@@ -32,6 +32,6 @@ def answer(tokens, match):
 
 
 claim(back, <p:1.q.316>, <p:1.k.329>)
-bind(prev, <p:1.v.228>, <p:1.v.346>, <p:1.o.311>, <p:1.o.340>)
+align(prev, <p:1.v.228>, <p:1.v.346>, <p:1.o.311>, <p:1.o.340>)
 claim(match, <p:2.q.335>, <p:2.k.206>)
-bind(answer, <p:2.v.559>, <p:2.o.735>, <p:3.v.677>, <p:3.o.806>)
+align(answer, <p:2.v.559>, <p:2.o.735>, <p:3.v.677>, <p:3.o.806>)

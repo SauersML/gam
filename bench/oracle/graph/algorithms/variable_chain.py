@@ -1,6 +1,6 @@
 """Variable binding: a value assigned and copied along a chain of variables ("a = 21, p = a, c = p");
 printing the last variable prints the value."""
-from mech import bind, claim
+from mech import align, claim
 
 
 def values(tokens):

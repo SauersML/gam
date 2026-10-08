@@ -1,5 +1,5 @@
 """Factual recall in reverse: the country whose capital is the named city. The table is what the model recalls."""
-from mech import bind, claim
+from mech import align, claim
 
 COUNTRY = {
     'Abuja': ' Nigeria', 'Accra': ' Ghana', 'Amsterdam': ' Netherlands', 'Ankara': ' Turkey',

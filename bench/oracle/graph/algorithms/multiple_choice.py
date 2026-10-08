@@ -1,6 +1,6 @@
 """Multiple choice: the answer is the letter of the option that answers the question. The table of right
 answers is what the model recalls."""
-from mech import bind, claim
+from mech import align, claim
 
 RIGHT = {
     'How many days are in a week?': 'seven', 'How many legs does a dog have?': 'four',

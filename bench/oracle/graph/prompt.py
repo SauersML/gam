@@ -25,13 +25,13 @@ import mech  # noqa: E402
 REFERENCE = """\
 Explain how the model computes the behavior below. Answer with ONE Python program in a ```python block,
 then the explanation, in plain English, after the block. The program is an algorithm whose variables are
-bound to parts of the model; it may import only `from mech import bind, claim`.
+aligned to parts of the model; it may import only `from mech import align, claim`.
 - The algorithm: plain Python functions. Each top-level function is a variable named by its name: it
   takes `tokens` (the prompt as the model's token strings, such as " cat") and other variables (by
   parameter name) and returns a list with one value per position; its value at position t may use
-  tokens 0..t only. The answer is the bound variable no other variable reads: its value at t is the
+  tokens 0..t only. The answer is the aligned variable no other variable reads: its value at t is the
   token the model predicts after position t (None: no prediction).
-- bind(variable, parts...): what these parts write into the residual stream holds the variable. A
+- align(variable, parts...): what these parts write into the residual stream holds the variable. A
   variable may span layers.
 - claim(pattern, parts...): the attention of these query and key parts follows the variable `pattern`,
   whose value at t lists the positions 0..t attended (or maps positions to weights).
@@ -44,7 +44,7 @@ bound to parts of the model; it may import only `from mech import bind, claim`.
   it alone.
 - The score, in bits (lower is better), adds: the error of the program against the model under random
   experiments applied identically to both (prompt edits, weight edits, value swaps, edge cuts); whether
-  deleting the named parts makes the behavior collapse; each binding's error (the model with a
+  deleting the named parts makes the behavior collapse; each alignment's error (the model with a
   variable's parts taken from another prompt against the algorithm's answer with that prompt's value);
   each claim's error; the reader's error from your explanation; and the program's size (parts,
   variables, lines, explanation)."""
@@ -102,7 +102,7 @@ def examples(behavior: dict, shots: int) -> list[tuple[str, dict, str, str]]:
     """Up to `shots` example answers (name, index entry, source, explanation) for `behavior`: train-split
     examples of other families only (examples/index.json; families sharing their first word count as one),
     so a prompt never shows a program for its own behavior family or a held-out one; only algorithms with
-    bindings that have an explanation (examples/<name>.explanation.txt); the target model's first, then by
+    alignments that have an explanation (examples/<name>.explanation.txt); the target model's first, then by
     the index's "priority", then shortest."""
     index = json.loads((HERE / "examples/index.json").read_text())
     kin = (behavior.get("family") or "").split("_")[0]  # induction_random and induction_phrase are kin

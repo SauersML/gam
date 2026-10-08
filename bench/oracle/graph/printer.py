@@ -399,7 +399,7 @@ def source_of(ir: dict, behavior: dict, facts_of: dict[str, dict], score: dict |
             f"Score: {score['total_bits']:.4g} bits in total (execution error {score['exec_error_bits']:.4g}, "
             f"opaque numbers {score.get('opaque_bits', 0):.4g}, code {score.get('code_bits', 0):.4g}).", 100)]
     if ir.get("bindings") or any(n.get("claim") or n.get("rule") for n in ir["nodes"]):
-        raise ValueError("the printer prints node-and-edge programs; this one has bindings or claims")
+        raise ValueError("the printer prints node-and-edge programs; this one has alignments or claims")
     used = {"node"} | ({"edges"} if ir["edges"] else set())
     texts = [address(p) for n in ir["nodes"] for p in n["pieces"]]
     used |= ({"L"} if any(t.startswith("L[") for t in texts) else set()) | ({"PD"} if any(t.startswith("PD[") for t in texts) else set())
@@ -523,7 +523,7 @@ def explanation_of(ir: dict, behavior: dict, facts_of: dict[str, dict]) -> str:
 
 
 def variable_ir(ir: dict) -> dict:
-    """An algorithm program's IR as one node per bound or claimed variable (the parts its bind or claim
+    """An algorithm program's IR as one node per aligned or claimed variable (the parts its align or claim
     names), for facts(): a variable's parts are removed together."""
     return {"model": ir["model"], "nodes": [{"id": v["name"], "pieces": v["pieces"]} for v in ir["variables"] if v["pieces"]]}
 
@@ -556,14 +556,14 @@ def described(source: str) -> dict[str, str]:
 
 def algorithm_source(ir: dict, behavior: dict, facts_of: dict[str, dict], score: dict | None = None) -> str:
     """An algorithm program as written, with a docstring stating the behavior and what the facts are, and
-    each variable's measured facts as comments above its bind or claim."""
+    each variable's measured facts as comments above its align or claim."""
     source = ir["source"]
     tree = ast.parse(mech.quote_parts(source))
     lines = source.splitlines()
     above: dict[int, list[str]] = {}
     for st in tree.body:
         call = st.value if isinstance(st, ast.Expr) and isinstance(st.value, ast.Call) else None
-        if call and isinstance(call.func, ast.Name) and call.func.id in ("bind", "claim") and call.args \
+        if call and isinstance(call.func, ast.Name) and call.func.id in ("align", "claim") and call.args \
                 and isinstance(call.args[0], ast.Name) and call.args[0].id in facts_of and call.args[0].id not in {
                     n for rows in above.values() for n in rows}:
             above[st.lineno] = [call.args[0].id]
@@ -601,7 +601,7 @@ def algorithm_explanation(ir: dict, behavior: dict, facts_of: dict[str, dict]) -
             pieces = v["pieces"]
             parts = part_words({"pieces": pieces})
             many = sum(1 if not isinstance(p["index"], list) else len(p["index"]) for p in pieces) > 1
-            sentence += (f"; {parts} hold{'' if many else 's'} it" if v["role"] == "bound"
+            sentence += (f"; {parts} hold{'' if many else 's'} it" if v["role"] == "aligned"
                          else f"; it is the attention pattern of {parts}")
             f = facts_of.get(name)
             if f:
@@ -653,7 +653,7 @@ def wrong(measured: dict[str, dict]) -> dict[str, dict]:
 
 def printed(ir: dict, behavior: dict, score: dict | None = None, measured: dict | None = None) -> tuple[str, dict]:
     """(source, graph description) of a traced program on a behavior (`measured`: facts already taken,
-    e.g. wrong(facts) for the reader's control). An algorithm program (bindings) keeps its algorithm as
+    e.g. wrong(facts) for the reader's control). An algorithm program (alignments) keeps its algorithm as
     written; its facts are per variable."""
     SHAPE[0] = mech.shapes(ir["model"])
     if ir.get("variables"):

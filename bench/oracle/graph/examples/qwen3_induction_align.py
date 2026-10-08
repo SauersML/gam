@@ -7,7 +7,7 @@ their attention on the previous token (removing L20.H0 costs 0.26 bits); L3.H10,
 71-85% on the token after the earlier copy of the current word, and L21.H8 matters most (0.61 bits).
 Transcoders replace the MLPs; no MLP feature is named here.
 """
-from mech import bind, claim
+from mech import align, claim
 
 
 def back(tokens):
@@ -30,7 +30,7 @@ def answer(tokens, match):
     return [tokens[js[-1]] if js else None for js in match]
 
 
-bind(prev, <p:1.h.3>, <p:2.h.12>, <p:15.h.3>, <p:20.h.0>)
+align(prev, <p:1.h.3>, <p:2.h.12>, <p:15.h.3>, <p:20.h.0>)
 claim(back, <p:1.h.3>, <p:2.h.12>, <p:15.h.3>, <p:20.h.0>)
-bind(answer, <p:3.h.10>, <p:16.h.14>, <p:21.h.8>)
+align(answer, <p:3.h.10>, <p:16.h.14>, <p:21.h.8>)
 claim(match, <p:3.h.10>, <p:16.h.14>, <p:21.h.8>)

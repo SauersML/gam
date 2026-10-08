@@ -1,6 +1,6 @@
 """List indexing: after "List: a, b, c, d." the question asks for the first word, which is the word right
 after the list's colon."""
-from mech import bind, claim
+from mech import align, claim
 
 
 def first(tokens):

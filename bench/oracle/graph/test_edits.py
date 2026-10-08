@@ -10,7 +10,7 @@ sys.path.insert(0, str(HERE))
 from edits import Answer, Edit, apply, credit, refine  # noqa: E402
 
 SOURCE = '''"""doc"""
-from mech import bind, claim
+from mech import align, claim
 
 
 def prev(tokens):
@@ -23,8 +23,8 @@ def answer(tokens, prev):
 
 
 claim(prev, <p:1.q.316>, <p:1.k.329>)
-bind(prev, <p:1.v.228>, <p:1.o.311>)
-bind(answer, <p:2.v.559>, <p:2.o.735>, <p:3.o.806>)
+align(prev, <p:1.v.228>, <p:1.o.311>)
+align(answer, <p:2.v.559>, <p:2.o.735>, <p:3.o.806>)
 '''
 
 NEEDED = {"<p:1.v.228>", "<p:1.o.311>", "<p:2.v.559>", "<p:2.o.735>", "<p:2.v.9>"}
@@ -44,26 +44,25 @@ def stand_in(sources):
 def test_parse_keeps_the_source():
     a = Answer.parse(SOURCE)
     assert a.source() == SOURCE
-    assert a.keyword == "bind"
     assert [s.variable for s in a.statements] == ["prev", "prev", "answer"]
 
 
 def test_edits():
     a = Answer.parse(SOURCE)
-    dropped = apply(a, Edit("drop", "answer", "bind", "<p:3.o.806>"))
+    dropped = apply(a, Edit("drop", "answer", "align", "<p:3.o.806>"))
     assert "<p:3.o.806>" not in dropped.source() and "<p:2.o.735>" in dropped.source()
     gone = apply(a, Edit("unalign", "prev", "claim"))
-    assert "claim(" not in gone.source() and "bind(prev" in gone.source()
-    added = apply(a, Edit("add", "fresh", "bind", "<p:0.v.1>"))
-    assert added.source().rstrip().endswith("bind(fresh, <p:0.v.1>)")
+    assert "claim(" not in gone.source() and "align(prev" in gone.source()
+    added = apply(a, Edit("add", "fresh", "align", "<p:0.v.1>"))
+    assert added.source().rstrip().endswith("align(fresh, <p:0.v.1>)")
 
 
 def test_credit_signs():
     a = Answer.parse(SOURCE)
     s, dS = credit(a, stand_in, k=100, rng=random.Random(0))
-    assert dS[Edit("drop", "answer", "bind", "<p:3.o.806>")] == -1  # not needed: dropping saves its name
-    assert dS[Edit("drop", "answer", "bind", "<p:2.v.559>")] == 9  # needed
-    assert dS[Edit("unalign", "answer", "bind")] == float("inf")  # the answer must stay aligned
+    assert dS[Edit("drop", "answer", "align", "<p:3.o.806>")] == -1  # not needed: dropping saves its name
+    assert dS[Edit("drop", "answer", "align", "<p:2.v.559>")] == 9  # needed
+    assert dS[Edit("unalign", "answer", "align")] == float("inf")  # the answer must stay aligned
 
 
 def test_refine_reaches_the_optimum():

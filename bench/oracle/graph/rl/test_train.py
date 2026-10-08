@@ -214,9 +214,9 @@ def check_registry_parts(base: Path):
         with part_vocab.rows_once(causal):
             once = causal(input_ids=ids).logits
     assert torch.allclose(plain, once, atol=1e-6)
-    text = "```python\nfrom mech import bind\ndef x(tokens):\n    return tokens\nbind(x, <p:2.v.7>, <p:0.fc.12>)\n```\nThe value head."
+    text = "```python\nfrom mech import align\ndef x(tokens):\n    return tokens\nalign(x, <p:2.v.7>, <p:0.fc.12>)\n```\nThe value head."
     it = train.item(text, {}, 0, 0, 16)  # part tokens reach the checker as written (one Python token each)
-    assert "bind(x, <p:2.v.7>, <p:0.fc.12>)" in it["source"] and it["explanation"] == "The value head."
+    assert "align(x, <p:2.v.7>, <p:0.fc.12>)" in it["source"] and it["explanation"] == "The value head."
     assert pol.parts.reg.rewrite("node(PD[1].v_proj[3], PD.vpd[2].v_proj[7])") == "node(<p:1.v.3>, <p:2.v.7>)"  # either spelling
     assert pol.tok.decode([first + 4]) == "<p:0.fc.12>"
     groups = pol.param_groups(1e-4)  # the LoRA at lr, each projection at lr * rank / its feature width

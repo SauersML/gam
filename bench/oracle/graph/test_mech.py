@@ -1,4 +1,4 @@
-"""Tests of the mech tracer: the algorithm and its bindings and claims, part tokens, the generic PD
+"""Tests of the mech tracer: the algorithm and its alignments and claims, part tokens, the generic PD
 vocabulary, invalid programs, Python token counts, sandbox escapes.
 
   ~/mpd-data/venv/bin/python -m pytest bench/oracle/graph/test_mech.py
@@ -15,7 +15,7 @@ import mech  # noqa: E402
 
 HEAD = "from mech import node, edges, L, PD, embed, logits\n"
 BEHAVIOR = Path.home() / "mpd-data/graph_oracle/behaviors/vpd4l/induction_random.words8.json"
-INDUCTION = '''from mech import bind, claim
+INDUCTION = '''from mech import align, claim
 
 def back(tokens):
     return [[t - 1] if t else [0] for t in range(len(tokens))]
@@ -30,9 +30,9 @@ def answer(tokens, match):
     return [tokens[js[-1]] if js else None for js in match]
 
 claim(back, <p:1.q.316>, <p:1.k.329>)
-bind(prev, <p:1.v.228>, <p:1.v.346>, <p:1.o.311>, <p:1.o.340>)
+align(prev, <p:1.v.228>, <p:1.v.346>, <p:1.o.311>, <p:1.o.340>)
 claim(match, <p:2.q.335>, <p:2.k.206>)
-bind(answer, <p:2.v.559>, <p:2.o.735>, <p:3.v.677>, <p:3.o.806>)
+align(answer, <p:2.v.559>, <p:2.o.735>, <p:3.v.677>, <p:3.o.806>)
 '''
 TOY = {"id": "toy", "model": "vpd4l", "prompts": [  # token ids decode to themselves through a fake table
     {"token_ids": [1, 2, 3, 1, 2], "target_positions": [3], "counterfactual": {"token_ids": [1, 4, 3, 1, 4]}},
@@ -90,8 +90,8 @@ def test_algorithm_ir():
     assert ir["bindings"] == [{"variable": "prev", "nodes": ["prev"], "pairs": []},
                               {"variable": "answer", "nodes": ["answer.2.attn", "answer.3.attn"], "pairs": []}]
     assert [(v["name"], v["role"], v["reads"]) for v in ir["variables"]] == [
-        ("back", "claimed", ["tokens"]), ("prev", "bound", ["tokens", "back"]),
-        ("match", "claimed", ["tokens", "prev"]), ("answer", "bound", ["tokens", "match"])]
+        ("back", "claimed", ["tokens"]), ("prev", "aligned", ["tokens", "back"]),
+        ("match", "claimed", ["tokens", "prev"]), ("answer", "aligned", ["tokens", "match"])]
     assert ir["python_tokens"] == mech.code_length(mech.quote_parts(INDUCTION))[0]
 
 
@@ -162,53 +162,53 @@ def test_causal_answers():
     assert ir["valid"] and ir["algorithm_accuracy"] == 0.0  # the prompt is cut after the target
 
 
-def test_binding_errors():
+def test_alignment_errors():
     def bad(text):
         return toy_trace(text)["error"]
 
-    base = "from mech import bind, claim\n"
-    assert "write no residual" in bad(base + "def a(tokens):\n    return tokens\nbind(a, <p:2.q.3>)\n")
-    assert "names no variable" in bad(base + "def a(x):\n    return x\nbind(a, <p:2.o.3>)\n")
-    assert "plain parameter" in bad(base + "def a(tokens=1):\n    return tokens\nbind(a, <p:2.o.3>)\n")
-    assert "read each other" in bad(base + "def a(b):\n    return b\ndef b(a):\n    return a\nbind(a, <p:2.o.3>)\n")
-    assert "defines with def" in bad(base + "bind(lambda tokens: tokens, <p:2.o.3>)\n")
+    base = "from mech import align, claim\n"
+    assert "write no residual" in bad(base + "def a(tokens):\n    return tokens\nalign(a, <p:2.q.3>)\n")
+    assert "names no variable" in bad(base + "def a(x):\n    return x\nalign(a, <p:2.o.3>)\n")
+    assert "plain parameter" in bad(base + "def a(tokens=1):\n    return tokens\nalign(a, <p:2.o.3>)\n")
+    assert "read each other" in bad(base + "def a(b):\n    return b\ndef b(a):\n    return a\nalign(a, <p:2.o.3>)\n")
+    assert "defines with def" in bad(base + "align(lambda tokens: tokens, <p:2.o.3>)\n")
     assert "are all unread" in bad(base + "def a(tokens):\n    return tokens\ndef b(tokens):\n    return tokens\n"
-                                   "bind(a, <p:2.o.3>)\nbind(b, <p:3.o.3>)\n")
-    assert "bind the answer" in bad(base + "def a(tokens):\n    return [[0]] * len(tokens)\nclaim(a, <p:2.q.3>)\n")
-    assert "not both" in bad(base + "def a(tokens):\n    return tokens\nclaim(a, <p:2.q.3>)\nbind(a, <p:2.o.3>)\n")
+                                   "align(a, <p:2.o.3>)\nalign(b, <p:3.o.3>)\n")
+    assert "align the answer" in bad(base + "def a(tokens):\n    return [[0]] * len(tokens)\nclaim(a, <p:2.q.3>)\n")
+    assert "not both" in bad(base + "def a(tokens):\n    return tokens\nclaim(a, <p:2.q.3>)\nalign(a, <p:2.o.3>)\n")
     assert "q_proj and k_proj parts" in bad(base + "def p(tokens):\n    return [[0]] * len(tokens)\n"
-                                      "def a(tokens, p):\n    return tokens\nclaim(p, <p:2.v.3>)\nbind(a, <p:2.o.3>)\n")
+                                      "def a(tokens, p):\n    return tokens\nclaim(p, <p:2.v.3>)\nalign(a, <p:2.o.3>)\n")
     assert "already carries the claim" in bad(base + "def p(tokens):\n    return [[0]] * len(tokens)\n"
                                               "def r(tokens):\n    return [[0]] * len(tokens)\n"
-                                              "def a(tokens, p, r):\n    return tokens\nbind(a, <p:2.q.1>, <p:2.v.3>, <p:2.o.3>)\n"
+                                              "def a(tokens, p, r):\n    return tokens\nalign(a, <p:2.q.1>, <p:2.v.3>, <p:2.o.3>)\n"
                                               "claim(p, <p:2.q.1>)\nclaim(r, <p:2.q.1>)\n")
     assert "attention parts" in bad(base + "def p(tokens):\n    return [[0]] * len(tokens)\n"
-                                    "def a(tokens, p):\n    return tokens\nclaim(p, <p:2.fc.3>)\nbind(a, <p:2.o.3>)\n")
+                                    "def a(tokens, p):\n    return tokens\nclaim(p, <p:2.fc.3>)\nalign(a, <p:2.o.3>)\n")
     assert "no part of b writes" in bad(base + "def b(tokens):\n    return tokens\ndef a(tokens, b):\n    return b\n"
-                                        "bind(b, <p:3.v.1>, <p:3.o.1>)\nbind(a, <p:2.v.3>, <p:2.o.3>)\n")
-    assert "3 values for 4 positions" in bad(base + "def a(tokens):\n    return tokens[:-1]\nbind(a, <p:2.v.3>, <p:2.o.3>)\n")
-    assert "ZeroDivisionError" in bad(base + "def a(tokens):\n    return [1 / 0] * len(tokens)\nbind(a, <p:2.v.3>, <p:2.o.3>)\n")
+                                        "align(b, <p:3.v.1>, <p:3.o.1>)\nalign(a, <p:2.v.3>, <p:2.o.3>)\n")
+    assert "3 values for 4 positions" in bad(base + "def a(tokens):\n    return tokens[:-1]\nalign(a, <p:2.v.3>, <p:2.o.3>)\n")
+    assert "ZeroDivisionError" in bad(base + "def a(tokens):\n    return [1 / 0] * len(tokens)\nalign(a, <p:2.v.3>, <p:2.o.3>)\n")
     assert "not a position" in bad(base + "def p(tokens):\n    return [[t + 1] for t in range(len(tokens))]\n"
-                                   "def a(tokens, p):\n    return tokens\nclaim(p, <p:2.q.3>)\nbind(a, <p:2.v.3>, <p:2.o.3>)\n")
-    assert "a part belongs to one node" in bad("from mech import bind, node\ndef a(tokens):\n    return tokens\n"
-                                               "bind(a, <p:2.v.3>, <p:2.o.3>)\nn = node(<p:2.o.3>)\n")
+                                   "def a(tokens, p):\n    return tokens\nclaim(p, <p:2.q.3>)\nalign(a, <p:2.v.3>, <p:2.o.3>)\n")
+    assert "a part belongs to one node" in bad("from mech import align, node\ndef a(tokens):\n    return tokens\n"
+                                               "align(a, <p:2.v.3>, <p:2.o.3>)\nn = node(<p:2.o.3>)\n")
 
 
-def test_claims_on_bound_parts_and_steps():
-    # a claim on parts already bound to the answer sits on the answer's node; `copy` is an unbound step
-    src = ("from mech import bind, claim\n"
+def test_claims_on_aligned_parts_and_steps():
+    # a claim on parts already aligned to the answer sits on the answer's node; `copy` is an unaligned step
+    src = ("from mech import align, claim\n"
            "def match(tokens):\n    return [[j for j in range(t) if tokens[j] == tokens[t]] or [0] for t in range(len(tokens))]\n"
            "def copy(tokens, match):\n    return [tokens[js[-1] + 1] if js[-1] + 1 <= t else None for t, js in enumerate(match)]\n"
            "def answer(copy):\n    return copy\n"
-           "bind(answer, <p:2.q.1>, <p:2.k.2>, <p:2.v.3>, <p:2.o.4>)\nclaim(match, <p:2.q.1>, <p:2.k.2>)\n")
+           "align(answer, <p:2.q.1>, <p:2.k.2>, <p:2.v.3>, <p:2.o.4>)\nclaim(match, <p:2.q.1>, <p:2.k.2>)\n")
     ir = toy_trace(src)
     assert ir["valid"], ir["error"]
     assert [n["id"] for n in ir["nodes"]] == ["answer"] and ir["nodes"][0]["claim"]["op"] == "pattern"
     assert {(e["from"], e["to"]) for e in ir["edges"]} == {("embed", "answer"), ("answer", "logits"), ("embed", "logits")}
-    assert [v["role"] for v in ir["variables"]] == ["claimed", "step", "bound"]
-    weights = ("from mech import bind, claim\n"
+    assert [v["role"] for v in ir["variables"]] == ["claimed", "step", "aligned"]
+    weights = ("from mech import align, claim\n"
                "def p(tokens):\n    return [{0: 1, t: 3} for t in range(len(tokens))]\n"
-               "def a(tokens, p):\n    return tokens\nclaim(p, <p:2.q.3>)\nbind(a, <p:2.v.3>, <p:2.o.3>)\n")
+               "def a(tokens, p):\n    return tokens\nclaim(p, <p:2.q.3>)\nalign(a, <p:2.v.3>, <p:2.o.3>)\n")
     ir = toy_trace(weights)
     assert ir["valid"], ir["error"]
     assert ir["nodes"][1]["claim"]["prompts"][0][2] == [1.0, 0.0, 3.0]
@@ -394,7 +394,7 @@ def test_sandbox():
     assert "not allowed" in invalid("del x\n")
     assert "not allowed" in invalid("x = [s for s in ['a__b']]\n")
     assert "not allowed" in invalid("x = f'{L.__class__}'\n")
-    assert "not allowed" in invalid("from mech import bind\ndef f(tokens):\n    return tokens.__class__\n")
+    assert "not allowed" in invalid("from mech import align\ndef f(tokens):\n    return tokens.__class__\n")
     assert "NameError" in invalid("open('/etc/passwd')\n")
     assert "NameError" in invalid("getattr(1, 'real')\n")
     assert "NameError" in invalid("eval('1')\n")
@@ -443,14 +443,14 @@ def test_prompt():
     assert "' red green blue . red green' -> ' blue' 0.90, ' red' 0.05" in text
     reference = text.split("Example answer")[0]
     assert "<p:L.mlp.I>" in reference and "<p:L.h.I>" in reference and "PD" not in reference
-    assert "from mech import bind, claim" in reference and "nobody else reads them" in reference
+    assert "from mech import align, claim" in reference and "nobody else reads them" in reference
     assert "<p:L.S.rest>" in prompt.render(dict(behavior, model="vpd4l"), prompts=0, shots=0)
     induction = dict(behavior, family="induction_random")
     assert all(not e["family"].startswith("induction") and e["split"] == "train" for _, e, _, _ in prompt.examples(induction, 9))
     name, entry, source, explanation = prompt.examples(behavior, 1)[0]
-    assert name == "qwen3_induction_bind" and "```" not in explanation and explanation in text
-    answer = "notes\n```python\nfrom mech import bind\nbind(a, <p:2.h.4>)  # copies\n```\n\nExplanation: L2.H4 copies it.\n"
-    assert prompt.split_answer(answer) == ("from mech import bind\nbind(a, <p:2.h.4>)  # copies\n", "L2.H4 copies it.")
+    assert name == "qwen3_induction_align" and "```" not in explanation and explanation in text
+    answer = "notes\n```python\nfrom mech import align\nalign(a, <p:2.h.4>)  # copies\n```\n\nExplanation: L2.H4 copies it.\n"
+    assert prompt.split_answer(answer) == ("from mech import align\nalign(a, <p:2.h.4>)  # copies\n", "L2.H4 copies it.")
     assert prompt.program_of("x\n```python\nfrom mech import node\n```\n") == "from mech import node\n"
     assert prompt.explanation_of("no code") == "" and prompt.program_of("no code") == "no code"
     broken = "```python\nx = (\n```\ntext"  # no block parses: the whole answer, no explanation

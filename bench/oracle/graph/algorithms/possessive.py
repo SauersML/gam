@@ -1,5 +1,5 @@
 """Possessive pronoun: after the named person loses something, her or his by the name's gender. The names' genders are what the model recalls."""
-from mech import bind, claim
+from mech import align, claim
 
 FEMALE = {
     'Alice', 'Amy', 'Anna', 'Claire', 'Diana', 'Emily', 'Emma', 'Grace', 'Helen', 'Jane', 'Julia',

@@ -1,6 +1,6 @@
 """Gerund: the -ing form of a verb: a final e drops (not ee), ie becomes y, and a final consonant after a
 single vowel doubles in a one-syllable verb or a verb stressed on its last syllable."""
-from mech import bind, claim
+from mech import align, claim
 
 STRESSED_LAST = {"begin", "forget", "admit", "prefer", "occur", "refer", "regret", "commit", "permit", "control",
                  "upset", "submit", "omit", "transfer"}

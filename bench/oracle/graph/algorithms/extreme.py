@@ -1,6 +1,6 @@
 """Number comparison: the larger of two numbers ("Which number is larger, 67 or 52?") or the smallest of
 several ("The smallest of 71, 49 and 65 is")."""
-from mech import bind, claim
+from mech import align, claim
 
 
 def numbers(tokens):

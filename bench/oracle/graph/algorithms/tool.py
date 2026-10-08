@@ -1,5 +1,5 @@
 """Commonsense recall: the everyday tool used for a named task. The table is what the model recalls."""
-from mech import bind, claim
+from mech import align, claim
 
 TOOL = {
     'boil water': ' kettle', 'brush your teeth': ' toothbrush', 'call a friend': ' phone',

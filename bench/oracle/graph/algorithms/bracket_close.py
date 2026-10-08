@@ -1,5 +1,5 @@
 """Bracket closing: after the last item, the next token closes every bracket still open, innermost first."""
-from mech import bind, claim
+from mech import align, claim
 
 CLOSE = {"(": ")", "[": "]", "{": "}"}
 

@@ -1,6 +1,6 @@
 """Number succession: a comma-separated run of numbers with a constant step continues with the last number
 plus the step. The answer is what is left of " <next number>" after what is already written of it."""
-from mech import bind, claim
+from mech import align, claim
 
 
 def numbers(tokens):

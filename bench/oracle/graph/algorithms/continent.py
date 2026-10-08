@@ -1,5 +1,5 @@
 """Factual recall: the continent of a named country. The table is what the model recalls."""
-from mech import bind, claim
+from mech import align, claim
 
 CONTINENT = {
     'Afghanistan': ' Asia', 'Argentina': ' South America', 'Australia': ' Australia',

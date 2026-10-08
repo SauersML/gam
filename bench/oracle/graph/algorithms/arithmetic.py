@@ -1,5 +1,5 @@
 """Arithmetic: after worked examples, the result of the last "a op b =" problem."""
-from mech import bind, claim
+from mech import align, claim
 
 
 def problem(tokens):

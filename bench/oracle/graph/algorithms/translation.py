@@ -1,6 +1,6 @@
 """Word translation: after example pairs, the new English word in the language the last line names.
 The tables are what the model recalls."""
-from mech import bind, claim
+from mech import align, claim
 
 FRENCH = {
     'apple': ' pomme', 'black': ' noir', 'book': ' livre', 'bread': ' pain', 'car': ' voiture',
