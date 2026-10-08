@@ -429,6 +429,24 @@ def slice_gates_run(*a):
         _slice_compiled.append(torch.compile(slice_gates))
     return _slice_compiled[0](*a)
 
+def slice_apply(read, c, un, tau, s, taun, ex, red, mode):
+    """slice_gates' gates applied: (c times the hard gate in a hard pass, else times the training gate; the hard
+    gates' per-token sum over red; the expected gates' sum, or None in a hard pass; the hard gates in a hard pass)."""
+    hard, phi = slice_gates(read, c, un, tau, s, taun, ex)
+    if mode == 'hard':
+        return c * hard, hard.sum(red), None, hard
+    return c * (phi if gate == 'mf' else hard + phi - phi.detach()), hard.sum(red), phi.sum(red), None
+
+_apply_compiled = []
+def slice_apply_run(*a):
+    """slice_apply(*a), compiled on CUDA outside calibration (the gated coefficients, their sums and the backward
+    in the gates' own fused pass)."""
+    if dev != 'cuda' or state.get('calib') is not None:
+        return slice_apply(*a)
+    if not _apply_compiled:
+        _apply_compiled.append(torch.compile(slice_apply))
+    return _apply_compiled[0](*a)
+
 def make(n):
     st = T.site(n); p = P[n]; grp = GROUP.get(n); mult = MULT.get(n)
     layer = int(n.split('.')[1])
@@ -517,9 +535,17 @@ def make(n):
             if n.endswith('c_fc'):
                 state['gn_in'][('mlp', layer)] = x
             ex = gate_net_s(n, state['gn_in'][('mlp', layer)])
+        if grp is None and mult is None and not EDGES and not state['force_on']:
+            coef, hb, sb, hard = slice_apply_run(read, c, un, p['tau'], p['s'], p.get('taun'), ex, (-1,), state['mode'])
+            state['hard'].append(hb.reshape(-1))
+            if state['mode'] == 'hard':
+                state['on'][n] = hard
+            else:
+                state['soft'].append(sb.reshape(-1))
+            return emit(coef)
         hard, phi = slice_gates_run(read, c, un, p['tau'], p['s'], p.get('taun'), ex)
         if state['force_on']:
-            on = torch.tensor(state['force_on'], device=z.device)
+            on = torch.tensor(state['force_on'], device=c.device)
             hard = hard.index_fill(0, on, 1.0); phi = phi.index_fill(0, on, 1.0)
         w = 1.0
         if grp is not None:
@@ -621,8 +647,14 @@ def make_attn(n):
                 # The head's largest attention logit at the slice's token (the query's for q and o, the key's for k).
                 sg = state['score'][int(n.split('.')[1])].permute(1, 0, 2).reshape(NH, -1, 1) * p['beta'][:, None, :]
                 ex = sg if ex is None else ex + sg
-            hard, phi = force_rows(*slice_gates_run(None, c, p['U'].norm(dim=-1)[:, None, :], p['tau'][:, None, :], p['s'][:, None, :],
-                                                    p['taun'][:, None, :] if 'taun' in p else None, ex), x.shape[1])
+            args = (None, c, p['U'].norm(dim=-1)[:, None, :], p['tau'][:, None, :], p['s'][:, None, :], p['taun'][:, None, :] if 'taun' in p else None, ex)
+            if not state['force_on']:
+                cg, hb, sb, _ = slice_apply_run(*args, (0, 2), state['mode'])
+                state['hard'].append(hb)
+                if sb is not None:
+                    state['soft'].append(sb)
+                return head_output(cg, p['U'], p['o'], swaps_of(n, x.shape[1])).view(x.shape[0], x.shape[1], -1)
+            hard, phi = force_rows(*slice_gates_run(*args), x.shape[1])
             state['hard'].append(hard.sum((0, 2)))
             if state['mode'] == 'hard':
                 g = hard
@@ -1442,8 +1474,9 @@ def attn_v(l, h, pattern):
     B_, T_ = h.shape[0], h.shape[1]
     c = head_coefficients(h.reshape(-1, h.shape[-1]), p['V'], False)           # [H, B*T, C]
     m = pattern @ c.view(NH, B_, T_, -1).permute(1, 0, 2, 3)                   # [B, H, T, C]
+    mg = None
     if state['mode'] == 'all':
-        g = 1.0
+        g = 1.0; mg = m * g
         if state.get('capture') is not None:
             state['capture'].setdefault(n, []).append((m.abs() * p['U'].norm(dim=-1)[None, :, None, :]).permute(1, 0, 2, 3).reshape(NH, -1, m.shape[-1]))
     else:
@@ -1470,19 +1503,29 @@ def attn_v(l, h, pattern):
             if 'beta' in p:
                 sg = state['score'][l][..., None] * p['beta'][None, :, None, :]
                 ex = sg if ex is None else ex + sg
-            hard, soft = slice_gates_run(r, m, p['U'].norm(dim=-1)[None, :, None, :], p['tau'][None, :, None, :], p['s'][None, :, None, :],
-                                         p['taun'][None, :, None, :] if 'taun' in p else None, ex)
-        if state['force_on']:
-            # The all-on sequences' gates on.
-            on = torch.tensor(state['force_on'], device=hard.device)
-            hard, soft = hard.index_fill(0, on, 1.0), soft.index_fill(0, on, 1.0)
-        state['hard'].append(hard.sum((1, 3)).reshape(-1))
-        if state['mode'] == 'hard':
-            g = hard
+            args = (r, m, p['U'].norm(dim=-1)[None, :, None, :], p['tau'][None, :, None, :], p['s'][None, :, None, :],
+                    p['taun'][None, :, None, :] if 'taun' in p else None, ex)
+            if not state['force_on']:
+                mg, hb, sb, _ = slice_apply_run(*args, (1, 3), state['mode'])
+            else:
+                hard, soft = slice_gates_run(*args)
+        if mg is not None:
+            state['hard'].append(hb.reshape(-1))
+            if sb is not None:
+                state['soft'].append(sb.reshape(-1))
         else:
-            state['soft'].append(soft.sum((1, 3)).reshape(-1))
-            g = soft if gate == 'mf' or SHARE_A else hard + soft - soft.detach()
-    y = (m * g) @ p['U'][None]                                                 # [B, H, T, HD]
+            if state['force_on']:
+                # The all-on sequences' gates on.
+                on = torch.tensor(state['force_on'], device=hard.device)
+                hard, soft = hard.index_fill(0, on, 1.0), soft.index_fill(0, on, 1.0)
+            state['hard'].append(hard.sum((1, 3)).reshape(-1))
+            if state['mode'] == 'hard':
+                g = hard
+            else:
+                state['soft'].append(soft.sum((1, 3)).reshape(-1))
+                g = soft if gate == 'mf' or SHARE_A else hard + soft - soft.detach()
+            mg = m * g
+    y = mg @ p['U'][None]                                                      # [B, H, T, HD]
     for b, Ae, Be in state['wedits_P'].get(n, ()):
         # A weight edit of v_proj adds Delta W x to the values, which the pattern mixes like any value.
         dv = ((h[b] @ Be) @ Ae.T).view(T_, NH, HD).transpose(0, 1)               # [H, T, HD]
