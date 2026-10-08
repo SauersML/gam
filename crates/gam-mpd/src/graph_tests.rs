@@ -669,6 +669,88 @@ fn attend_rules_pick_their_positions() {
     assert_eq!(parsed.pattern(&tokens), induction);
 }
 
+/// Deleting VPD programs that differ only in the subcomponents they name run stacked as one batch
+/// of copies (`graph::execute_stacked`), each copy giving its own program's run: q/k/v/o and
+/// c_fc/down_proj subcomponents, remainders named by some copies only, a copy without an attention
+/// unit and one with o_proj and v_proj alone.
+#[test]
+fn stacked_vpd_programs_are_their_own_runs() {
+    use ndarray::{Array2, Axis, s};
+    let f = fixture("graph_device_stacked");
+    let library = Library::new(&f.device, &f.device, &f.native, &f.layers, &f.artifact, 1 << 28, 64).expect("library");
+    let mut weights = Weights::of(&library);
+    // Inexact views of layer 1, as in device_path_runs_vpd_views_as_the_host: every remainder nonzero.
+    let partial = |w: &Array2<f64>, count: usize, scale: f64| (Array2::<f64>::eye(w.nrows()).slice(s![..count, ..]).to_owned() * scale, w.t().slice(s![.., ..count]).to_owned());
+    let lw = &weights.layers[1];
+    let mlp = lw.mlp.as_ref().expect("an MLP");
+    let hidden = mlp.gate.nrows();
+    let (fc_u, fc_v) = partial(&crate::graph::wide(mlp.gate.view()), hidden - 5, 0.7);
+    let (down_u, down_v) = (crate::graph::wide(mlp.out.t().slice(s![..hidden - 4, ..])) * 0.6, Array2::<f64>::eye(hidden).slice(s![.., ..hidden - 4]).to_owned());
+    let stack = |m: &dyn Fn(&crate::graph::HeadWeights) -> &crate::graph::Stored| crate::graph::wide(ndarray::concatenate(Axis(0), &lw.heads.iter().map(|h| m(h).view()).collect::<Vec<_>>()).expect("stack").view());
+    let (wq, wk, wv) = (stack(&|h| &h.query), stack(&|h| &*h.key), stack(&|h| &*h.value));
+    let wo = crate::graph::wide(ndarray::concatenate(Axis(1), &lw.heads.iter().map(|h| h.output.view()).collect::<Vec<_>>()).expect("hstack").view());
+    let o = (wo.t().slice(s![..wo.ncols() - 3, ..]).to_owned() * 0.5, Array2::<f64>::eye(wo.ncols()).slice(s![.., ..wo.ncols() - 3]).to_owned());
+    let attention = crate::graph::VpdAttention { q: partial(&wq, wq.nrows() - 2, 0.8), k: partial(&wk, wk.nrows() - 3, 0.9), v: partial(&wv, wv.nrows() - 1, 0.6), o };
+    weights.vpd.insert(1, crate::graph::VpdMlp { fc_u, fc_v, down_u, down_v });
+    weights.vpd_attention.insert(1, attention);
+    let piece = |kind: &str, index: Index| PieceIr { view: "vpd".into(), layer: 1, kind: kind.into(), index: Some(index) };
+    let rest = || Index::Name("rest".into());
+    let many = |v: &[usize]| Index::Many(v.to_vec());
+    // Per program its attention node's and MLP node's pieces (none: no such node).
+    let programs: Vec<(Vec<PieceIr>, Vec<PieceIr>)> = vec![
+        (vec![piece("q_proj", many(&[0, 3])), piece("k_proj", many(&[1])), piece("k_proj", rest()), piece("v_proj", many(&[2, 5])), piece("o_proj", many(&[0, 1, 4]))], vec![piece("c_fc", many(&[0, 2, 7])), piece("c_fc", rest()), piece("down_proj", many(&[1, 3, 5]))]),
+        (vec![piece("q_proj", many(&[0])), piece("k_proj", many(&[1, 2])), piece("v_proj", many(&[2])), piece("o_proj", many(&[1])), piece("o_proj", rest())], vec![piece("c_fc", many(&[2, 9])), piece("down_proj", many(&[3, 5, 6])), piece("down_proj", rest())]),
+        (Vec::new(), vec![piece("c_fc", many(&[0, 2])), piece("down_proj", many(&[1]))]),
+        (vec![piece("v_proj", many(&[5])), piece("o_proj", many(&[4]))], Vec::new()),
+    ];
+    let edge = |from: &str, to: &str, route: &str| EdgeIr { from: from.into(), to: to.into(), route: route.into() };
+    let graphs: Vec<Graph> = programs
+        .into_iter()
+        .map(|(a, m)| {
+            let mut nodes = Vec::new();
+            let mut edges = Vec::new();
+            let mut writers = vec!["embed"];
+            if !a.is_empty() {
+                nodes.push(NodeIr { id: "A".into(), pieces: a, claim: None });
+                edges.extend(["query", "key", "value"].iter().map(|r| edge("embed", "A", r)));
+                writers.push("A");
+            }
+            if !m.is_empty() {
+                nodes.push(NodeIr { id: "M".into(), pieces: m, claim: None });
+                edges.extend(writers.iter().map(|w| edge(w, "M", "input")));
+                writers.push("M");
+            }
+            edges.extend(writers.iter().map(|w| edge(w, "logits", "input")));
+            let program = Program { model: "tiny".into(), valid: true, nodes, edges, standin: Some("delete".into()), ..Program::default() };
+            Graph::parse(&program, &weights).expect("parse")
+        })
+        .collect();
+    let circuits: Vec<crate::graph::Circuit> = graphs.iter().map(|g| g.program(&weights, true)).collect();
+    assert!(circuits.iter().all(crate::graph::stacks), "every deleting VPD program with every edge stacks");
+    let plain = Batch::new(&f.sequences).expect("batch");
+    let rows: Vec<usize> = (0..plain.tokens.len()).collect();
+    let mut deleting = plain.clone();
+    deleting.reference = Some(std::sync::Arc::new(crate::graph::Reference::zeros(&weights, plain.tokens.len())));
+    let refs: Vec<&crate::graph::Circuit> = circuits.iter().collect();
+    let stacked = crate::graph::stack(&weights, &refs, &plain, &rows).expect("the programs stack");
+    let mut state = crate::graph_device::DeviceState::new(Device::host());
+    let job = stacked.job();
+    assert!(crate::graph_device::stack_covered(&weights, &stacked.merged, &job, &stacked.copies), "the device stacks VPD units");
+    let copies = crate::graph_device::per_copy(crate::graph_device::copies_on(&mut state, &weights, &stacked.merged, &job, Some(&stacked.copies)).expect("stacked run"), stacked.copies.count).expect("copies");
+    assert_eq!(copies.len(), circuits.len());
+    for (j, (circuit, copy)) in circuits.iter().zip(&copies).enumerate() {
+        let own = execute(&weights, circuit, &deleting, &rows, &BTreeMap::new()).expect("own run").log_probabilities;
+        let kl = max(&kl_bits(&own, copy));
+        assert!(kl < 1e-9, "program {j}: KL(own run ‖ stacked copy) = {kl:e} bits");
+    }
+    // The copies differ: each names its own subcomponents.
+    assert!(max(&kl_bits(&copies[0], &copies[2])) > 1e-6, "programs 0 and 2 run alike");
+    // Counterfactual stand-ins do not stack.
+    let mut counterfactual = graphs[0].clone();
+    counterfactual.delete = false;
+    assert!(!crate::graph::stacks(&counterfactual.program(&weights, true)), "a counterfactual program stacked");
+}
+
 #[test]
 fn device_path_runs_vpd_views_as_the_host() {
     use ndarray::{Array2, Axis, s};

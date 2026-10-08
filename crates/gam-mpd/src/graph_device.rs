@@ -367,7 +367,7 @@ fn standins(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, r: &Refer
                 let vpd = weights.vpd.get(layer).ok_or_else(|| format!("layer {layer} has no VPD view"))?;
                 s.ensure_reference(r, (Field::Active, *layer, 0))?;
                 let active = s.device.copy(s.reference(r, (Field::Active, *layer, 0))?).map_err(e)?;
-                w = sliced(s, (&vpd.down_u, &vpd.down_v), Matrix::Host(&mlp.out), down, *rest, &active).map_err(e)?;
+                w = sliced(s, (&vpd.down_u, &vpd.down_v), Matrix::Host(&mlp.out), down, *rest, &active, None).map_err(e)?;
             }
             Block::AttnSlices { layer, o, rest, .. } => {
                 let a = weights.vpd_attention.get(layer).ok_or_else(|| format!("layer {layer}'s attention has no VPD view"))?;
@@ -375,7 +375,7 @@ fn standins(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, r: &Refer
                 s.ensure_reference(r, (Field::Reads, *layer, 0))?;
                 let z = s.device.copy(s.reference(r, (Field::Reads, *layer, 0))?).map_err(e)?;
                 let outputs = s.stacked(&lw.heads.iter().map(|h| &h.output).collect::<Vec<_>>(), false).map_err(e)?;
-                w = sliced(s, (&a.o.0, &a.o.1), Matrix::Device(&outputs), o, *rest, &z).map_err(e)?;
+                w = sliced(s, (&a.o.0, &a.o.1), Matrix::Device(&outputs), o, *rest, &z, None).map_err(e)?;
             }
             Block::Features { layer, features, rest } => {
                 s.ensure_reference(r, (Field::Input, *layer, 0))?;
@@ -398,6 +398,69 @@ fn standins(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, r: &Refer
 
 /// `circuit` run on the process's device ([`use_device`]), or `None` when there is none or the
 /// circuit holds a block the device path does not cover.
+/// Copies of one batch run together as one batch ([`run_stacked`]): `count` copies of `rows` rows
+/// each, copy `j` at rows `j·rows..(j + 1)·rows`, each naming its own subcomponents of the merged
+/// circuit's VPD units.
+pub(crate) struct Copies {
+    pub count: usize,
+    pub rows: usize,
+    /// By merged unit and slot (an MLP's `c_fc` 0 and `down_proj` 1; an attention's `q_proj` 0,
+    /// `k_proj` 1, `v_proj` 2 and `o_proj` 3).
+    pub masks: BTreeMap<(usize, usize), CopyMask>,
+}
+
+/// What each copy names of one slot of a merged VPD unit.
+pub(crate) struct CopyMask {
+    /// `counts[[j, i]]`: how many of copy `j`'s units name the slot's `i`-th listed subcomponent
+    /// (the unit's list in order, its remainder left out).
+    pub counts: Array2<f64>,
+    /// Per copy, whether it names the slot's remainder.
+    pub remainder: Vec<bool>,
+}
+
+/// A slot's mask with each row's copy (rows × 1 indices into the copies).
+type Masked<'a> = Option<(&'a CopyMask, &'a gam_gpu::tensor::Indices, usize)>;
+
+/// `copies.count` circuits that differ only in the VPD subcomponents they name, run as one batch:
+/// `circuit` is their merge (each unit's lists the union of the copies' lists at its site, every
+/// unit computing and reading every earlier write), `job` the batch's rows once per copy with each
+/// copy's scored rows in turn, and `copies` what each copy names. A unit's named part on a copy's
+/// rows is its subcomponents weighted by the copy's counts, so each copy computes as its own
+/// circuit, with one product per matrix and one attention call for all of them. Returns each
+/// copy's log-probabilities at its scored rows; `None` without a device or for a view it does not
+/// cover.
+pub(crate) fn run_stacked(weights: &Weights, circuit: &Circuit, job: &Run, copies: &Copies) -> Option<Result<Vec<Array2<f64>>, String>> {
+    if !stack_covered(weights, circuit, job, copies) {
+        return None;
+    }
+    // The copies' log-softmax runs on the calling thread, as in `run`.
+    let out = on_device(|s| copies_on(s, weights, circuit, job, Some(copies)))?;
+    Some(out.and_then(|execution| per_copy(execution, copies.count)))
+}
+
+/// Whether the device runs `circuit` stacked: VPD units alone, without `rest`, attentions of heads
+/// alike, and the same number of scored rows per copy.
+pub(crate) fn stack_covered(weights: &Weights, circuit: &Circuit, job: &Run, copies: &Copies) -> bool {
+    let covered = |b: &Block| match b {
+        Block::Slices { rest, .. } => !rest,
+        Block::AttnSlices { layer, rest, .. } => !rest && weights.layers.get(*layer).is_some_and(|lw| lw.heads.first().is_some_and(|first| lw.heads.iter().all(|h| alike(h, first, false)))),
+        _ => false,
+    };
+    copies.count > 0 && job.scored.len() % copies.count == 0 && circuit.units.iter().all(|u| covered(&u.block))
+}
+
+/// A stacked run's logits split into its copies' (each copy's scored rows in turn), each
+/// normalized.
+pub(crate) fn per_copy(execution: Execution, count: usize) -> Result<Vec<Array2<f64>>, String> {
+    let each = execution.log_probabilities.nrows() / count.max(1);
+    (0..count)
+        .map(|j| {
+            let logits = execution.log_probabilities.slice(ndarray::s![j * each..(j + 1) * each, ..]).to_owned();
+            normalized(Execution::of(logits, Vec::new(), None, BTreeMap::new())).map(|x| x.log_probabilities)
+        })
+        .collect()
+}
+
 pub(crate) fn run(weights: &Weights, circuit: &Circuit, job: &Run) -> Option<Result<Execution, String>> {
     // A VPD-view attention's heads attend together (alike).
     let covered = |b: &Block| match b {
@@ -585,6 +648,12 @@ fn normed(d: &Device, ops: &Interventions, (site, u, slot): (usize, usize, usize
 /// [`run`] on a given device state (the tests run it on the host backend), with the logits in place
 /// of the log-probabilities ([`normalized`] turns them into those).
 pub(crate) fn logits_on_device(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, job: &Run) -> Result<Execution, String> {
+    copies_on(s, weights, circuit, job, None)
+}
+
+/// [`logits_on_device`], with `copies` the stacked run's ([`run_stacked`]; the tests run it on the
+/// host backend, its logits split by [`per_copy`]).
+pub(crate) fn copies_on(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, job: &Run, copies: Option<&Copies>) -> Result<Execution, String> {
     let e = |e: GpuError| e.to_string();
     s.generation = weights.generation();
     let (rows, width) = (job.tokens.len(), weights.width());
@@ -606,6 +675,12 @@ pub(crate) fn logits_on_device(s: &mut DeviceState, weights: &Weights, circuit: 
     let ids = s.device.upload_indices(job.tokens).map_err(e)?;
     let embed = s.device.gather_rows(s.get(table).map_err(e)?, &ids).map_err(e)?;
     let units = circuit.units.len();
+    // A stacked run's copy of each row.
+    let copy_rows = match copies {
+        Some(c) if c.count * c.rows == rows => Some((c, s.device.upload_indices(&(0..rows).map(|r| (r / c.rows) as u32).collect::<Vec<_>>()).map_err(e)?)),
+        Some(c) => return Err(format!("{} copies of {} rows for a batch of {rows}", c.count, c.rows)),
+        None => None,
+    };
     // Stand-ins: from the counterfactual run, or zeros for `M` (it reads none).
     let (embed_standin, standins): (Tensor, Vec<Tensor>) = match job.reference {
         Some(r) if r.embed.nrows() != rows => return Err(format!("a counterfactual run of {} tokens for a batch of {rows}", r.embed.nrows())),
@@ -647,7 +722,7 @@ pub(crate) fn logits_on_device(s: &mut DeviceState, weights: &Weights, circuit: 
         let site = circuit.units[order[at]].block.site();
         let end = order[at..].iter().position(|&u| circuit.units[u].block.site() != site).map_or(order.len(), |k| at + k);
         let pad_job = Padding { places: padded.as_ref(), sequences, longest };
-        let mut slice_writes = vpd_site(s, weights, circuit, job, (site, &order[at..end]), &st, &pad_job, (&mut kept, &mut reads_kept))?;
+        let mut slice_writes = vpd_site(s, weights, circuit, job, (site, &order[at..end]), &st, &pad_job, (&mut kept, &mut reads_kept), copy_rows.as_ref().map(|(c, r)| (*c, r)))?;
         for &u in &order[at..end] {
             let unit = &circuit.units[u];
             if !unit.computes {
@@ -841,8 +916,10 @@ pub(crate) fn logits_on_device(s: &mut DeviceState, weights: &Weights, circuit: 
 /// of the queries, keys and values (a unit with `o_proj` subcomponents) takes the counterfactual
 /// ones plus the q/k/v writes it reads, runs the heads' attention on them (no head norms, as on the
 /// host) and writes through its `o_proj` subcomponents.
-fn vpd_site(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, job: &Run, (site, units): (usize, &[usize]), st: &Streams, pad: &Padding, (kept, reads_kept): (&mut BTreeMap<(usize, usize), Array2<f64>>, &mut BTreeMap<usize, Array2<f64>>)) -> Result<BTreeMap<usize, Tensor>, String> {
+fn vpd_site(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, job: &Run, (site, units): (usize, &[usize]), st: &Streams, pad: &Padding, (kept, reads_kept): (&mut BTreeMap<(usize, usize), Array2<f64>>, &mut BTreeMap<usize, Array2<f64>>), copies: Option<(&Copies, &gam_gpu::tensor::Indices)>) -> Result<BTreeMap<usize, Tensor>, String> {
     let e = |e: GpuError| e.to_string();
+    // A slot's per-copy counts in a stacked run.
+    let mask = |u: usize, slot: usize| -> Masked<'_> { copies.and_then(|(c, rows)| c.masks.get(&(u, slot)).map(|m| (m, rows, c.rows))) };
     let (rows, width, arithmetic, ops) = (job.tokens.len(), weights.width(), s.arithmetic(), job.ops);
     let mut writes = BTreeMap::new();
     let computing = |u: &usize| circuit.units[*u].computes && !job.swaps.contains_key(u);
@@ -895,7 +972,7 @@ fn vpd_site(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, job: &Run
         for &u in slices.iter().filter(|u| computing(u)) {
             let Block::Slices { fc, rest, .. } = &circuit.units[u].block else { return Err("a VPD-view unit of another block".into()) };
             let x = normed_deltas(s, u, &lw.mlp_norm, x_ref.as_ref(), kept).map_err(e)?;
-            deltas.insert(u, sliced(s, (&vpd.fc_u, &vpd.fc_v), Matrix::Host(&mlp.gate), fc, *rest, &x[0]).map_err(e)?);
+            deltas.insert(u, sliced(s, (&vpd.fc_u, &vpd.fc_v), Matrix::Host(&mlp.gate), fc, *rest, &x[0], mask(u, 0)).map_err(e)?);
         }
         let codes = s.device.upload_indices(&vec![law_of(mlp.law).code(); mlp.gate.nrows()]).map_err(e)?;
         for &u in slices.iter().filter(|u| computing(u)) {
@@ -910,7 +987,7 @@ fn vpd_site(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, job: &Run
                 s.device.axpy(&mut pre, 1.0, delta).map_err(e)?;
             }
             let h = s.device.law_values(&pre, &codes, gelu_tanh_constant()).map_err(e)?;
-            writes.insert(u, sliced(s, (&vpd.down_u, &vpd.down_v), Matrix::Host(&mlp.out), down, *rest, &h).map_err(e)?);
+            writes.insert(u, sliced(s, (&vpd.down_u, &vpd.down_v), Matrix::Host(&mlp.out), down, *rest, &h, mask(u, 1)).map_err(e)?);
         }
     }
     let attention: Vec<usize> = units.iter().copied().filter(|&u| matches!(circuit.units[u].block, Block::AttnSlices { .. })).collect();
@@ -942,7 +1019,7 @@ fn vpd_site(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, job: &Run
             let x = normed_deltas(s, u, &lw.attention, x_ref.as_ref(), kept).map_err(e)?;
             let mut ds = Vec::with_capacity(3);
             for (m, list) in [q, k, v].into_iter().enumerate() {
-                ds.push(sliced(s, (&factors[m].0, &factors[m].1), Matrix::Device(&maps[m]), list, *rest, &x[m]).map_err(e)?);
+                ds.push(sliced(s, (&factors[m].0, &factors[m].1), Matrix::Device(&maps[m]), list, *rest, &x[m], mask(u, m)).map_err(e)?);
             }
             deltas.insert(u, ds);
         }
@@ -967,7 +1044,7 @@ fn vpd_site(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, job: &Run
                 ops.head_reads_of(site, u, lw, &mut host, reads_kept);
                 z = s.device.upload(host.view()).map_err(e)?;
             }
-            writes.insert(u, sliced(s, (&a.o.0, &a.o.1), Matrix::Device(&maps[3]), o, *rest, &z).map_err(e)?);
+            writes.insert(u, sliced(s, (&a.o.0, &a.o.1), Matrix::Device(&maps[3]), o, *rest, &z, mask(u, 3)).map_err(e)?);
         }
     }
     Ok(writes)
@@ -1149,8 +1226,10 @@ enum Matrix<'a> {
 
 /// `graph::sliced_parts` on the device: subcomponents `picked` of `w` (out × in) with factors `U`
 /// (subcomponents × out) and `V` (in × subcomponents) applied to the rows of `x` (rows × in), index
-/// `U`'s row count being the remainder `W − Σ U Vᵀ`; with `rest`, `x wᵀ` less the named ones.
-fn sliced(s: &mut DeviceState, (u, v): (&Array2<f64>, &Array2<f64>), w: Matrix, picked: &[usize], rest: bool, x: &Tensor) -> Result<Tensor, GpuError> {
+/// `U`'s row count being the remainder `W − Σ U Vᵀ`; with `rest`, `x wᵀ` less the named ones. With
+/// a stacked run's `mask`, each row's subcomponents weigh as many as its copy names (zero: not
+/// named) and its remainder counts where its copy names it.
+fn sliced(s: &mut DeviceState, (u, v): (&Array2<f64>, &Array2<f64>), w: Matrix, picked: &[usize], rest: bool, x: &Tensor, mask: Masked) -> Result<Tensor, GpuError> {
     let count = u.nrows();
     let subs: Vec<u32> = picked.iter().filter(|&&i| i < count).map(|&i| i as u32).collect();
     let remainder = picked.contains(&count);
@@ -1173,13 +1252,37 @@ fn sliced(s: &mut DeviceState, (u, v): (&Array2<f64>, &Array2<f64>), w: Matrix, 
         let (vs, us) = (d.gather_columns(vf, &ids)?, d.gather_rows(uf, &ids)?);
         let mut xv = d.zeros(x.rows(), subs.len())?;
         d.gemm(&mut xv, 1.0, x, Op::N, &vs, Op::N, 0.0, arithmetic)?;
+        if let Some((m, copy_of_row, _)) = mask {
+            if m.counts.ncols() != subs.len() {
+                return Err(GpuError::DriverCallFailed { reason: format!("a copy mask of {} subcomponents for {}", m.counts.ncols(), subs.len()) });
+            }
+            let counts = d.gather_rows(&d.upload(m.counts.view())?, copy_of_row)?;
+            let mut weighed = d.zeros(x.rows(), subs.len())?;
+            d.hadamard(&mut weighed, &xv, &counts, false)?;
+            xv = weighed;
+        }
         d.gemm(&mut named, 1.0, &xv, Op::N, &us, Op::N, 0.0, arithmetic)?;
     }
     if remainder {
         let mut xv = d.zeros(x.rows(), count)?;
         d.gemm(&mut xv, 1.0, x, Op::N, vf, Op::N, 0.0, arithmetic)?;
-        d.gemm(&mut named, 1.0, x, Op::N, wt, Op::T, 1.0, arithmetic)?;
-        d.gemm(&mut named, -1.0, &xv, Op::N, uf, Op::N, 1.0, arithmetic)?;
+        match mask {
+            None => {
+                d.gemm(&mut named, 1.0, x, Op::N, wt, Op::T, 1.0, arithmetic)?;
+                d.gemm(&mut named, -1.0, &xv, Op::N, uf, Op::N, 1.0, arithmetic)?;
+            }
+            Some((m, _, rows)) => {
+                // The remainder on every row, then zero on the rows of copies that do not name it.
+                let mut left = d.zeros(x.rows(), u.ncols())?;
+                d.gemm(&mut left, 1.0, x, Op::N, wt, Op::T, 0.0, arithmetic)?;
+                d.gemm(&mut left, -1.0, &xv, Op::N, uf, Op::N, 1.0, arithmetic)?;
+                let without: Vec<u32> = m.remainder.iter().enumerate().filter(|(_, named)| !**named).flat_map(|(j, _)| (j * rows..(j + 1) * rows).map(|r| r as u32)).collect();
+                if !without.is_empty() {
+                    scale_rows(d, &mut left, &d.upload_indices(&without)?, 0.0)?;
+                }
+                d.axpy(&mut named, 1.0, &left)?;
+            }
+        }
     }
     if !rest {
         return Ok(named);

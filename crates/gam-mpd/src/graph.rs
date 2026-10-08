@@ -760,6 +760,14 @@ impl Incoming {
         Self::AllBut(BTreeSet::new())
     }
 
+    /// Whether the route reads writer `w`'s write.
+    fn reads(&self, w: &Writer) -> bool {
+        match self {
+            Self::AllBut(cut) => !cut.contains(w),
+            Self::Only(kept) => kept.contains(w),
+        }
+    }
+
 }
 
 /// One unit of a circuit: its pieces and whether it computes (else it writes its stand-in).
@@ -1895,6 +1903,148 @@ fn features_write(weights: &Weights, layer: usize, features: &[usize], rest: boo
 /// writers'), its write (actual, `swaps`' value, or its stand-in), and the logits at `scored` rows.
 pub fn execute(weights: &Weights, circuit: &Circuit, batch: &Batch, scored: &[usize], swaps: &BTreeMap<usize, Array2<f64>>) -> Result<Execution, String> {
     execute_with(weights, circuit, batch, scored, swaps, &Interventions::default())
+}
+
+/// The most rows a stacked run holds ([`execute_stacked`]): its hidden activations take rows × the
+/// MLP's width, and vpd4l's behaviors hold about a thousand rows.
+const STACKED_ROWS: usize = 1 << 14;
+
+/// Whether `circuit` computes as the model's stream with every part it leaves out deleted, so that
+/// it can run stacked with others ([`execute_stacked`]): it deletes, its computing units are VPD
+/// units without `rest`, each reads (on every route its parts read) the embedding and every
+/// earlier computing unit's write, each MLP or attention unit with `down_proj` or `o_proj`
+/// subcomponents reads the hidden writes of every computing unit of its site, and the logits read
+/// every write.
+pub(crate) fn stacks(circuit: &Circuit) -> bool {
+    if !circuit.delete {
+        return false;
+    }
+    let computing: Vec<usize> = (0..circuit.units.len()).filter(|&u| circuit.units[u].computes).collect();
+    let all_read = |incoming: &Incoming, before: usize| incoming.reads(&Writer::Embed) && computing.iter().filter(|&&w| circuit.units[w].block.site() < before).all(|&w| incoming.reads(&Writer::Unit(w)));
+    computing.iter().all(|&u| {
+        let unit = &circuit.units[u];
+        let site = unit.block.site();
+        let (vpd, writes) = match &unit.block {
+            Block::Slices { down, rest: false, .. } => (true, !down.is_empty()),
+            Block::AttnSlices { o, rest: false, .. } => (true, !o.is_empty()),
+            _ => (false, false),
+        };
+        vpd && unit.block.reads().iter().all(|r| all_read(&unit.routes[r.slot()], site))
+            && (!writes || computing.iter().filter(|&&w| circuit.units[w].block.site() == site).all(|&w| unit.hidden.reads(&Writer::Unit(w))))
+    }) && all_read(&circuit.logits, usize::MAX)
+}
+
+/// The runs of `circuits` (each one that [`stacks`]) on `batch` at rows `scored`, as one batch of
+/// copies ([`crate::graph_device::run_stacked`]): per site one unit naming the union of the
+/// circuits' subcomponents, each copy weighing them by how many of its units name them. Each
+/// copy's log-probabilities equal its own run's ([`execute`]). `None` when there is no device, a
+/// circuit does not stack, the batch has attention blocks or the copies would pass
+/// [`STACKED_ROWS`].
+pub(crate) fn execute_stacked(weights: &Weights, circuits: &[&Circuit], batch: &Batch, scored: &[usize]) -> Option<Result<Vec<Array2<f64>>, String>> {
+    let stacked = stack(weights, circuits, batch, scored)?;
+    crate::graph_device::run_stacked(weights, &stacked.merged, &stacked.job(), &stacked.copies)
+}
+
+/// A stacked run's merged circuit, copies and rows ([`stack`]).
+pub(crate) struct Stacked {
+    pub merged: Circuit,
+    pub copies: crate::graph_device::Copies,
+    tokens: Vec<u32>,
+    spans: Vec<(usize, usize)>,
+    scored: Vec<usize>,
+    /// No swaps and no site operations.
+    swaps: BTreeMap<usize, Array2<f64>>,
+    ops: Interventions,
+}
+
+impl Stacked {
+    /// The device's job: the batch's rows once per copy, each copy's scored rows in turn.
+    pub(crate) fn job(&self) -> crate::graph_device::Run<'_> {
+        crate::graph_device::Run { tokens: &self.tokens, spans: &self.spans, scored: &self.scored, swaps: &self.swaps, capture: false, reference: None, ops: &self.ops }
+    }
+}
+
+/// [`execute_stacked`]'s merged circuit and copies, `None` where it returns `None` before the device.
+pub(crate) fn stack(weights: &Weights, circuits: &[&Circuit], batch: &Batch, scored: &[usize]) -> Option<Stacked> {
+    let rows = batch.tokens.len();
+    if circuits.is_empty() || circuits.len() * rows > STACKED_ROWS || !batch.blocks.iter().all(Vec::is_empty) || !circuits.iter().all(|c| stacks(c)) {
+        return None;
+    }
+    // Per site and slot, each copy's subcomponents (with repeats) and remainder.
+    let mut lists: BTreeMap<(usize, usize), Vec<(Vec<usize>, bool)>> = BTreeMap::new();
+    let slots = |block: &Block| -> Vec<(usize, Vec<usize>)> {
+        match block {
+            Block::Slices { fc, down, .. } => vec![(0, fc.clone()), (1, down.clone())],
+            Block::AttnSlices { q, k, v, o, .. } => vec![(0, q.clone()), (1, k.clone()), (2, v.clone()), (3, o.clone())],
+            _ => Vec::new(),
+        }
+    };
+    let mut layers: BTreeMap<usize, usize> = BTreeMap::new();
+    for (j, circuit) in circuits.iter().enumerate() {
+        for unit in circuit.units.iter().filter(|u| u.computes) {
+            let site = unit.block.site();
+            layers.insert(site, site / 2);
+            for (slot, list) in slots(&unit.block) {
+                let count = counts_of(weights, site / 2, site, slot);
+                let per = lists.entry((site, slot)).or_insert_with(|| vec![(Vec::new(), false); circuits.len()]);
+                per[j].0.extend(list.iter().copied().filter(|&i| i < count));
+                per[j].1 |= list.contains(&count);
+            }
+        }
+    }
+    // The merged circuit: one unit per site, in site order, each slot's list the union (sorted) and
+    // the remainder last when any copy names it.
+    let mut units = Vec::new();
+    let mut masks = BTreeMap::new();
+    for (&site, &layer) in &layers {
+        let slots = if site % 2 == 0 { 4 } else { 2 };
+        let mut merged: Vec<Vec<usize>> = vec![Vec::new(); slots];
+        for (slot, list) in merged.iter_mut().enumerate() {
+            let Some(per) = lists.get(&(site, slot)) else { continue };
+            let mut union: Vec<usize> = per.iter().flat_map(|(l, _)| l.iter().copied()).collect();
+            union.sort_unstable();
+            union.dedup();
+            let mut counts = Array2::<f64>::zeros((circuits.len(), union.len()));
+            for (j, (l, _)) in per.iter().enumerate() {
+                for i in l {
+                    if let Ok(at) = union.binary_search(i) {
+                        counts[[j, at]] += 1.0;
+                    }
+                }
+            }
+            let remainder: Vec<bool> = per.iter().map(|(_, r)| *r).collect();
+            let total = counts_of(weights, layer, site, slot);
+            *list = union;
+            if remainder.iter().any(|&r| r) {
+                list.push(total);
+            }
+            masks.insert((units.len(), slot), crate::graph_device::CopyMask { counts, remainder });
+        }
+        let block = if site % 2 == 0 {
+            let [q, k, v, o]: [Vec<usize>; 4] = merged.try_into().ok()?;
+            Block::AttnSlices { layer, q, k, v, o, rest: false }
+        } else {
+            let [fc, down]: [Vec<usize>; 2] = merged.try_into().ok()?;
+            Block::Slices { layer, fc, down, rest: false }
+        };
+        units.push(Unit { block, computes: true, routes: [Incoming::all(), Incoming::all(), Incoming::all()], hidden: Incoming::all() });
+    }
+    let merged = Circuit { nodes: units.len(), units, logits: Incoming::all(), delete: true };
+    let copies = crate::graph_device::Copies { count: circuits.len(), rows, masks };
+    let tokens: Vec<u32> = (0..circuits.len()).flat_map(|_| batch.tokens.iter().copied()).collect();
+    let spans: Vec<(usize, usize)> = (0..circuits.len()).flat_map(|j| batch.spans.iter().map(move |&(start, n)| (j * rows + start, n))).collect();
+    let scored: Vec<usize> = (0..circuits.len()).flat_map(|j| scored.iter().map(move |&r| j * rows + r)).collect();
+    Some(Stacked { merged, copies, tokens, spans, scored, swaps: BTreeMap::new(), ops: Interventions::default() })
+}
+
+/// The number of VPD subcomponents of a slot (an MLP's `c_fc` 0 or `down_proj` 1; an attention's
+/// `q_proj` 0 to `o_proj` 3) at `layer`: the remainder's index.
+fn counts_of(weights: &Weights, layer: usize, site: usize, slot: usize) -> usize {
+    if site % 2 == 0 {
+        weights.vpd_attention.get(&layer).map_or(0, |a| [a.q.0.nrows(), a.k.0.nrows(), a.v.0.nrows(), a.o.0.nrows()][slot.min(3)])
+    } else {
+        weights.vpd.get(&layer).map_or(0, |v| if slot == 0 { v.fc_u.nrows() } else { v.down_u.nrows() })
+    }
 }
 
 /// [`execute`] under the row interventions `ops` (site operations, [`Interventions`]): after a
@@ -3999,6 +4149,20 @@ impl Checker {
         }
     }
 
+    /// [`Checker::run`] of several circuits under one experiment as one stacked batch
+    /// ([`execute_stacked`]): `None` where they do not stack, a site experiment among them.
+    fn run_stacked(&self, circuits: &[&Circuit], e: &Experiment) -> Option<Result<Vec<Array2<f64>>, String>> {
+        let (batch, rows) = match e {
+            Experiment::Sites { .. } => return None,
+            Experiment::Counterfactual => self.counterfactual.as_ref()?,
+            _ => &self.clean,
+        };
+        let mut batch = batch.clone();
+        batch.reference = None;
+        self.mask(&mut batch);
+        execute_stacked(&self.weights, circuits, &batch, rows)
+    }
+
     /// Stores `M`'s outcome under `key`, dropping the oldest past the byte budget.
     fn keep(&mut self, key: String, outcome: Arc<Array2<f64>>) {
         if self.cache.insert(key.clone(), outcome).is_none() {
@@ -4379,6 +4543,7 @@ impl Checker {
         let mut seconds = [0.0f64; 3];
         // M's outcomes come from its native circuit, the same for every program whatever its views.
         let native = Graph::empty().model(&self.weights);
+        let stacking: Vec<bool> = circuits.iter().map(stacks).collect();
         // M's outcomes of this score, held until it ends: the cache's byte budget may drop some
         // while later groups add theirs.
         let mut outcomes: BTreeMap<String, Arc<Array2<f64>>> = BTreeMap::new();
@@ -4475,7 +4640,39 @@ impl Checker {
                         let candidates = clean.map(|c| Candidates::of(c, m, &p, &this.rows_of(e), &this.rows_of(&Experiment::Clean), top));
                         Ok((r, kl, candidates))
                     };
-                    let scored: Vec<(usize, Vec<f64>, Option<Candidates>)> = if mine.len() == 1 { mine.iter().map(score_p).collect::<Result<_, _>>()? } else { mine.par_iter().map(score_p).collect::<Result<_, _>>()? };
+                    // The programs that stack ([`stacks`]) run each experiment as one batch of copies
+                    // (`run_stacked`, at most `STACKED_ROWS` rows), the others one by one.
+                    let mut jobs: Vec<Vec<usize>> = Vec::new();
+                    let mut stacked: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+                    for &r in &mine {
+                        if stacking[runs[r].0] && !matches!(runs[r].1, Experiment::Sites { .. }) {
+                            stacked.entry(runs[r].2.as_str()).or_default().push(r);
+                        } else {
+                            jobs.push(vec![r]);
+                        }
+                    }
+                    let per_stack = (STACKED_ROWS / this.clean.0.tokens.len().max(1)).max(1);
+                    jobs.extend(stacked.into_values().flat_map(|rs| rs.chunks(per_stack).map(<[usize]>::to_vec).collect::<Vec<_>>()));
+                    let run_job = |job: &Vec<usize>| -> Result<Vec<(usize, Vec<f64>, Option<Candidates>)>, String> {
+                        if job.len() > 1 {
+                            let e = &runs[job[0]].1;
+                            let group: Vec<&Circuit> = job.iter().map(|&r| &circuits[runs[r].0]).collect();
+                            if let Some(out) = this.run_stacked(&group, e) {
+                                return out?
+                                    .into_iter()
+                                    .zip(job)
+                                    .map(|(p, &r)| {
+                                        let (_, e, key) = &runs[r];
+                                        let m = outcomes.get(key).ok_or("M's outcome went missing")?;
+                                        let candidates = clean.map(|c| Candidates::of(c, m, &p, &this.rows_of(e), &this.rows_of(&Experiment::Clean), top));
+                                        Ok((r, kl_bits(m, &p), candidates))
+                                    })
+                                    .collect();
+                            }
+                        }
+                        job.iter().map(score_p).collect()
+                    };
+                    let scored: Vec<(usize, Vec<f64>, Option<Candidates>)> = if jobs.len() == 1 { jobs.iter().map(run_job).collect::<Result<Vec<_>, _>>()? } else { jobs.par_iter().map(run_job).collect::<Result<Vec<_>, _>>()? }.into_iter().flatten().collect();
                     for (r, kl, candidates) in scored {
                         measured[r] = Some((kl, candidates));
                     }
