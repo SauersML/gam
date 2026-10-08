@@ -225,6 +225,17 @@ fn metal_elementwise_maps_and_gathers_lie_inside_their_bands() {
     assert_within("law slopes", &down(&d, &d.law_slopes(&dg, &dx, &dcodes, c).expect("device slopes")), &slopes, |i, j| {
         64.0 * U * g[[i, j]].abs() * (x[[i, j]].abs() + 1.0).powi(3)
     });
+    // The log law (a log-scale gate's read) on each input's magnitude, a column of zeros at its
+    // floor: within an ulp and the input's rounding, 4u(|value| + 1); its slope 1/t within 4u/t of
+    // the gradient's size (the gradient's rounding), 0 at the floor.
+    let mut magnitude = single(&x.mapv(f64::abs));
+    magnitude.column_mut(0).fill(0.0);
+    let ((hm, dm), logs) = (both(&magnitude), vec![PointwiseLaw::Log.code(); cols]);
+    let (hl, dl) = (host.upload_indices(&logs).expect("codes"), d.upload_indices(&logs).expect("codes"));
+    let values = down(&host, &host.law_values(&hm, &hl, c).expect("host log"));
+    assert_within("log", &down(&d, &d.law_values(&dm, &dl, c).expect("device log")), &values, |i, j| 4.0 * U * (values[[i, j]].abs() + 1.0));
+    let slopes = down(&host, &host.law_slopes(&hg, &hm, &hl, c).expect("host log slopes"));
+    assert_within("log slopes", &down(&d, &d.law_slopes(&dg, &dm, &dl, c).expect("device log slopes")), &slopes, |i, j| 4.0 * U * g[[i, j]].abs() / magnitude[[i, j]].max(1e-30));
     // Root-mean-square norms: a row's reductions of `cols` terms and a dozen roundings around them,
     // of at most the largest of the values and the inputs' product.
     let scale = largest(&x) * largest(&g);

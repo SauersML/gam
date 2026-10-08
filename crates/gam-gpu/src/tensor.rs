@@ -186,7 +186,14 @@ pub enum PointwiseLaw {
     Gelu,
     /// `½ t (1 + tanh(c (t + 0.044715 t³)))`, `c` given per call.
     GeluTanh,
+    /// `ln max(t, t₀)`, `t₀` f32's smallest normal ([`LOG_FLOOR`]): a log-scale gate's read, finite
+    /// at a zero input, its slope `1/t` above `t₀` and 0 below.
+    Log,
 }
+
+/// The smallest input [`PointwiseLaw::Log`] takes the log of (f32's smallest normal, in every
+/// storage): below it the law is `ln t₀ ≈ −87.3` and its slope 0.
+pub const LOG_FLOOR: f64 = 1.175_494_350_822_287_5e-38;
 
 impl PointwiseLaw {
     #[must_use]
@@ -198,6 +205,7 @@ impl PointwiseLaw {
             Self::Silu => 3,
             Self::Gelu => 4,
             Self::GeluTanh => 5,
+            Self::Log => 6,
         }
     }
 
@@ -208,6 +216,7 @@ impl PointwiseLaw {
             2 => Self::Zero,
             3 => Self::Silu,
             4 => Self::Gelu,
+            6 => Self::Log,
             _ => Self::GeluTanh,
         }
     }
@@ -225,6 +234,7 @@ impl PointwiseLaw {
                 let inner = c * (t + 0.044715 * t * t * t);
                 0.5 * t * (1.0 + inner.tanh())
             }
+            Self::Log => t.max(LOG_FLOOR).ln(),
         }
     }
 
@@ -250,6 +260,13 @@ impl PointwiseLaw {
                 let inner = c * (t + 0.044715 * t * t * t);
                 let th = inner.tanh();
                 0.5 * (1.0 + th) + 0.5 * t * (1.0 - th * th) * c * (1.0 + 3.0 * 0.044715 * t * t)
+            }
+            Self::Log => {
+                if t > LOG_FLOOR {
+                    1.0 / t
+                } else {
+                    0.0
+                }
             }
         }
     }
@@ -4233,6 +4250,7 @@ __device__ double law_value(unsigned int code, double t, double c) {
         case 2: return 0.0;
         case 3: return t / (1.0 + exp(-t));
         case 4: return t * normcdf(t);
+        case 6: return log(fmax(t, 1.1754943508222875e-38));
         default: {
             double inner = c * (t + 0.044715 * t * t * t);
             return 0.5 * t * (1.0 + tanh(inner));
@@ -4250,6 +4268,7 @@ __device__ double law_slope(unsigned int code, double t, double c) {
             return sigma * (1.0 + t * (1.0 - sigma));
         }
         case 4: return normcdf(t) + t * (exp(-0.5 * t * t) * 0.3989422804014327);
+        case 6: return t > 1.1754943508222875e-38 ? 1.0 / t : 0.0;
         default: {
             double inner = c * (t + 0.044715 * t * t * t);
             double th = tanh(inner);
@@ -8421,6 +8440,7 @@ inline float law_value(uint code, float t, float c) {
         case 2: return 0.0f;
         case 3: return t / (1.0f + exp(-t));
         case 4: return t * (0.5f * gam_erfc(-t * 0.70710678118654752f));
+        case 6: return log(fmax(t, 1.17549435e-38f));
         default: {
             float inner = c * (t + 0.044715f * t * t * t);
             return 0.5f * t * (1.0f + tanh(inner));
@@ -8438,6 +8458,7 @@ inline float law_slope(uint code, float t, float c) {
             return sigma * (1.0f + t * (1.0f - sigma));
         }
         case 4: return 0.5f * gam_erfc(-t * 0.70710678118654752f) + t * (exp(-0.5f * t * t) * 0.39894228040143268f);
+        case 6: return t > 1.17549435e-38f ? 1.0f / t : 0.0f;
         default: {
             float inner = c * (t + 0.044715f * t * t * t);
             float th = tanh(inner);

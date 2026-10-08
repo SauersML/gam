@@ -209,6 +209,7 @@ pub(crate) fn law_of(law: Law) -> PointwiseLaw {
         Law::Silu => PointwiseLaw::Silu,
         Law::Gelu => PointwiseLaw::Gelu,
         Law::GeluTanh => PointwiseLaw::GeluTanh,
+        Law::Log => PointwiseLaw::Log,
     }
 }
 

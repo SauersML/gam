@@ -267,9 +267,11 @@ pub struct Cells {
     pub cols: Range<usize>,
 }
 
-/// A number's cost in a budget in bits (`Settings::budget_bits`): 16 bits, the fixed precision of
-/// toys' structural code, under which their copy tasks were solved.
-const NUMBER_BITS: f64 = 16.0;
+/// A rank-one slice's concepts in the per-token budget ([`GatedStage::concepts`]): its read
+/// direction, its write direction and its scale, the free number of its one-by-one core (the
+/// design's count, 10-08: a part is 1 for its gate plus its directions read and written plus its
+/// core's free numbers, so a VPD subcomponent is 4).
+const SLICE_CONCEPTS: f64 = 3.0;
 
 /// A prior group: parameters sharing one prior variance (module note).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1882,22 +1884,24 @@ pub struct Settings {
     /// `interchange::Interchange::draw_ops`). Empty (the default) is `read` alone.
     #[serde(default)]
     pub families: Vec<interchange::Family>,
-    /// The declared per-token execution budget `K`: the fit minimizes `F` subject to
-    /// `E_q[k(x)] ≤ K`, `k(x)` the parts executed on a token (`library_complexity`), by dual
-    /// ascent on its multiplier `λ`. Bits and parts per token have no derivable exchange rate (a
-    /// receiver can compute the trace, so `k` is not a code length of anything it needs), so the
-    /// budget is a declared constraint, not a term of `F`. None (the default) is no budget.
+    /// The declared per-token understanding budget `K` in concepts: the fit minimizes its objective
+    /// subject to `E[k(x)] ≤ K`, `k(x)` the concepts of the parts executed on a token (what a reader
+    /// holds in mind: a part's gate, its read and write directions and its core's free numbers,
+    /// [`GatedStage::concepts`]), held by projection after every step ([`project`]). Numeric
+    /// precision is free: it moves the KL, which the objective prices. None (the default) is no
+    /// budget.
     #[serde(default)]
     pub budget: Option<f64>,
-    /// With `budget_bits`, `k(x)` counts the description bits of the parts executed on a token in
-    /// place of their rank (`library_vpd`'s gated components, [`GatedStage::bits`]): a part's bits
-    /// are [`NUMBER_BITS`] per number of its groups (its slices' reads and writes and its direction
-    /// row), its share of its stage's thresholds and widths, and its index among the stage's parts,
-    /// `log₂ n`; `K` is in bits per token. The budget measures the parts' structure at a fixed
-    /// precision, so `K` does not move with the posterior's sharpness; `F`'s description stays its
-    /// bits-back code.
+    /// With `bits_back`, the objective is `F`, the data term plus the posterior's description
+    /// (IVON's weight noise in training, the groups' priors, the frames' and the choices' codes,
+    /// selection by `F`, removal by description). Without (the default; the design of 10-08: the
+    /// data is unlimited, so the description, a regularizer of a finite collection, goes), the
+    /// objective is the KL of the delivered explanation (hard gates, drawn on/off in training)
+    /// against `M` on text and under the edits, with the all-on experiment for exactness, and
+    /// nothing else: the posterior is a point (`DevicePosterior::set_point`: no weight noise, no
+    /// prior), the best epoch is chosen by the data term, and there is no removal round.
     #[serde(default)]
-    pub budget_bits: bool,
+    pub bits_back: bool,
 }
 
 /// [`Settings`] as configs and checkpoints hold them, unknown keys refused, and the keys of steps
@@ -1909,8 +1913,9 @@ pub struct Settings {
 /// 5759e6a350's scoring of the whole batch at both antithetic samples, which their paired A/Bs
 /// retired), and `seed_bf16` and `train_bf16` (the bfloat16 arms of fitperf-seedab: every
 /// evaluation with a gradient now runs in the reverse passes' arithmetic, `Scorer::reversed`), and
-/// `measured_beta2` (6d3f4b137d's measured curvature gains, which their paired A/B retired), so
-/// that configs and checkpoints written before still read.
+/// `measured_beta2` (6d3f4b137d's measured curvature gains, which their paired A/B retired), and
+/// `budget_bits` (the budget in bits, c48fb4a489, which the budget in concepts replaced), so that
+/// configs and checkpoints written before still read.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SettingsRecord {
@@ -1933,7 +1938,9 @@ struct SettingsRecord {
     #[serde(default)]
     budget: Option<f64>,
     #[serde(default)]
-    budget_bits: bool,
+    bits_back: bool,
+    #[serde(default)]
+    budget_bits: Option<serde::de::IgnoredAny>,
     #[serde(default)]
     measured_beta2: Option<serde::de::IgnoredAny>,
     #[serde(default)]
@@ -1966,7 +1973,7 @@ struct SettingsRecord {
 
 impl From<SettingsRecord> for Settings {
     fn from(r: SettingsRecord) -> Self {
-        let retired = [("rate", r.rate.is_some()), ("trust_rate", r.trust_rate.is_some()), ("line_search", r.line_search.is_some()), ("split_filter", r.split_filter.is_some()), ("deterministic", r.deterministic.is_some()), ("decoder", r.decoder.is_some()), ("preconditioned", r.preconditioned.is_some()), ("half_factor", r.half_factor.is_some()), ("one_sample", r.one_sample.is_some()), ("rotated", r.rotated.is_some()), ("beta1", r.beta1.is_some()), ("epoch_ratio", r.epoch_ratio.is_some()), ("momentum_rule", r.momentum_rule.is_some()), ("cross_fit", r.cross_fit.is_some()), ("full_antithetic", r.full_antithetic.is_some()), ("seed_bf16", r.seed_bf16.is_some()), ("train_bf16", r.train_bf16.is_some()), ("measured_beta2", r.measured_beta2.is_some())];
+        let retired = [("rate", r.rate.is_some()), ("trust_rate", r.trust_rate.is_some()), ("line_search", r.line_search.is_some()), ("split_filter", r.split_filter.is_some()), ("deterministic", r.deterministic.is_some()), ("decoder", r.decoder.is_some()), ("preconditioned", r.preconditioned.is_some()), ("half_factor", r.half_factor.is_some()), ("one_sample", r.one_sample.is_some()), ("rotated", r.rotated.is_some()), ("beta1", r.beta1.is_some()), ("epoch_ratio", r.epoch_ratio.is_some()), ("momentum_rule", r.momentum_rule.is_some()), ("cross_fit", r.cross_fit.is_some()), ("full_antithetic", r.full_antithetic.is_some()), ("seed_bf16", r.seed_bf16.is_some()), ("train_bf16", r.train_bf16.is_some()), ("measured_beta2", r.measured_beta2.is_some()), ("budget_bits", r.budget_bits.is_some())];
         for (key, present) in retired {
             if present {
                 log::info!("library settings: the retired key `{key}` is ignored");
@@ -1980,7 +1987,7 @@ impl From<SettingsRecord> for Settings {
             epochs: r.epochs,
             families: r.families,
             budget: r.budget,
-            budget_bits: r.budget_bits,
+            bits_back: r.bits_back,
         }
     }
 }
@@ -2094,15 +2101,12 @@ pub struct Epoch {
     /// sequence when the schedule ran it (module note).
     pub held_out: HeldOut,
     pub held_out_full: Option<HeldOut>,
-    /// With a budget (`Settings::budget`): `K`, the epoch's mean over its steps of the expected
-    /// parts executed per token `Ê[k]` (at each step's weight sample around the iterate), and the
-    /// multiplier `λ` (nats of `F` per part per token) at the epoch's end.
+    /// With a budget (`Settings::budget`): `K`, and the epoch's mean over its steps of the
+    /// delivered program's concepts per token before each step's projection ([`project`]).
     #[serde(default)]
     pub budget: Option<f64>,
     #[serde(default)]
     pub expected_parts: Option<f64>,
-    #[serde(default)]
-    pub multiplier: Option<f64>,
 }
 
 /// One removal step.
@@ -2360,10 +2364,8 @@ struct GatedStage {
     direction: Option<usize>,
     slices: Vec<Vec<usize>>,
     /// Per component its own prior groups (its slices' read and write groups and its direction
-    /// row), and the stage's groups its components share (thresholds and widths)
-    /// ([`GatedStage::account`]).
+    /// row) ([`GatedStage::account`]).
     groups: Vec<Vec<usize>>,
-    shared: Vec<usize>,
     /// The stage's operators' prefix (`library.l{l}.attn`, `.o`, `.mlp.fc`, `.mlp.dn`).
     prefix: String,
     /// The node holding each component's gate pre-activation: the gate node, or in a shared
@@ -2435,7 +2437,7 @@ impl GatedStage {
                 None => gate,
             };
             let width = index_of(flat, &format!("{prefix}.width"))?;
-            stages.push(Self { input, threshold, direction, slices, groups: Vec::new(), shared: Vec::new(), prefix: prefix.to_string(), component_gate, assign, width });
+            stages.push(Self { input, threshold, direction, slices, groups: Vec::new(), prefix: prefix.to_string(), component_gate, assign, width });
             Ok(())
         };
         // A stage's read holds the components carried in from other blocks first
@@ -2535,7 +2537,6 @@ impl GatedStage {
                 own
             })
             .collect();
-        self.shared = ["thresholds", "widths"].iter().filter_map(|s| named.get(format!("{prefix}.{s}").as_str()).copied()).collect();
     }
 
     /// Per component its active slices, its rank in rank-one equivalents.
@@ -2543,13 +2544,10 @@ impl GatedStage {
         self.slices.iter().map(|groups| groups.iter().filter(|g| active[**g]).count() as f64).collect()
     }
 
-    /// Per component its description in bits (`Settings::budget_bits`), from each group's bits
-    /// `bits`: its own active groups', an equal share of the stage's shared groups', and its index
-    /// among the stage's components, `log₂ n` (descent's rot arm, 489cf5e569).
-    fn bits(&self, active: &[bool], bits: &[f64]) -> Vec<f64> {
-        let n = self.groups.len() as f64;
-        let shared = self.shared.iter().filter(|g| active[**g]).map(|g| bits[*g]).sum::<f64>() / n;
-        self.groups.iter().map(|own| own.iter().filter(|g| active[**g]).map(|g| bits[*g]).sum::<f64>() + shared + n.log2()).collect()
+    /// Per component its concepts where it runs (`Settings::budget`): its gate and its active
+    /// rank-one slices' directions and scales, `1 + 3r` ([`SLICE_CONCEPTS`]), none without a slice.
+    fn concepts(&self, active: &[bool]) -> Vec<f64> {
+        self.ranks(active).into_iter().map(|r| if r > 0.0 { 1.0 + SLICE_CONCEPTS * r } else { 0.0 }).collect()
     }
 }
 
@@ -2583,9 +2581,6 @@ struct Scorer {
     written: Option<(Relaxation, u64)>,
     version: u64,
     assignment_step: Option<f64>,
-    /// Per shared stage (its assignment operator) the budget count's derivative per token in its
-    /// assignment at the step's relaxed assignment (`complexity_terms`).
-    assignment_budget: Vec<(usize, Array2<f64>)>,
     /// The explanation's frames ([`Mixing`]), every mixed operator's values with each group's slices
     /// at their start, the mixed writes' operators' means as [`Scorer::pin_mixings`] last pinned
     /// them, and the step size of the frames' next step ([`Scorer::step_mixings`]; none before the
@@ -2596,9 +2591,8 @@ struct Scorer {
     mix_step: Option<f64>,
     /// The fit's scored tokens `N` (the frames' Laplace code, [`Mixing::entry_nats`]).
     mix_tokens: f64,
-    /// With a budget in bits (`Settings::budget_bits`), each group's bits, [`NUMBER_BITS`] per
-    /// number, which the counts weigh their parts by.
-    group_bits: Option<Vec<f64>>,
+    /// Whether the objective is `F` with the posterior's description (`Settings::bits_back`).
+    bits_back: bool,
     /// Whether relaxed passes draw their gates (`DeviceProgram::set_sampled`), as every fit's do;
     /// off, they take the expected gate `Φ(z / w)` (a test of a derivative through it).
     sample_gates: bool,
@@ -2653,7 +2647,6 @@ impl Scorer {
             return Err("an operator holding both mixed reads and mixed writes".into());
         }
         let differentiated: Vec<usize> = explanation.trainable.iter().copied().chain(assignments.iter().map(|a| a.operator)).collect();
-        let group_bits = settings.budget_bits.then(|| explanation.groups.iter().map(|g| NUMBER_BITS * g.cells.iter().map(|c| (c.rows.len() * c.cols.len()) as f64).sum::<f64>()).collect());
         let mut experiments =
             Interchange::new(device, native, &sites, &explanation.artifact, &differentiated, reads, settings.numeric_bytes, settings.head_tile_rows)?;
         // Every scoring of the fit (its steps, held-out evaluations and removal comparisons) is of
@@ -2674,7 +2667,7 @@ impl Scorer {
         let hard_gates = stages.iter().flatten().filter(|s| !position.contains_key(&s.width)).map(|s| (s.width, s.threshold, program.operators[s.width].rows.width())).collect();
         let scoring = explanation.scoring;
         let thresholds = stages.iter().flatten().map(|s| (s.threshold, program.operators[s.threshold].rows.width())).collect();
-        let mut scorer = Self { experiments, mlps, stages, hard_gates, scoring, thresholds, position, scope, families: settings.families.clone(), edits: std::cell::RefCell::new(BTreeMap::new()), assignments, written: None, version: 0, assignment_step: None, assignment_budget: Vec::new(), mixings, mixed, mixed_writes: BTreeMap::new(), mix_step: None, mix_tokens: 0.0, group_bits, sample_gates: true };
+        let mut scorer = Self { experiments, mlps, stages, hard_gates, scoring, thresholds, position, scope, families: settings.families.clone(), edits: std::cell::RefCell::new(BTreeMap::new()), assignments, written: None, version: 0, assignment_step: None, mixings, mixed, mixed_writes: BTreeMap::new(), mix_step: None, mix_tokens: 0.0, bits_back: settings.bits_back, sample_gates: true };
         scorer.train_gates(None)?;
         Ok(scorer)
     }
@@ -2901,18 +2894,6 @@ impl Scorer {
         }
     }
 
-    /// The budget's pull on the assignments (`Settings::budget`): `factor` times the count's
-    /// derivative per token in each, chained to its logits and added to the step's gathered
-    /// gradient, in the data term's units (as the budget's pull on the posterior's operators is).
-    fn pull_assignments(&mut self, factor: f64) {
-        let pulls = std::mem::take(&mut self.assignment_budget);
-        for (op, g) in &pulls {
-            if let Some(a) = self.assignments.iter_mut().find(|a| a.operator == *op) {
-                a.gather(&g.mapv(|v| v * factor));
-            }
-        }
-        self.assignment_budget = pulls;
-    }
 
     /// Clears the step's gathered assignment gradients (before a step's passes).
     fn clear_assignment_gradients(&mut self) {
@@ -3062,12 +3043,18 @@ impl Scorer {
     /// The frames' description in nats: every entry's Laplace code ([`Mixing::entry_nats`]),
     /// a term of `F` as every parameter's description is.
     fn mixing_nats(&self) -> f64 {
+        if !self.bits_back {
+            return 0.0;
+        }
         self.mixings.iter().flat_map(|m| m.entry_nats(self.mix_tokens)).map(|(_, nats)| nats).sum()
     }
 
     /// The change of the frames' description by the pending move of their entries, in nats: at the
     /// same deviations, the means' term `Σ ((a − a₀)² − (a_prev − a₀)²) / 2v`.
     fn mixing_change(&self) -> f64 {
+        if !self.bits_back {
+            return 0.0;
+        }
         self.mixings
             .iter()
             .filter_map(|m| m.previous.as_ref().map(|p| (m, p)))
@@ -3099,7 +3086,7 @@ impl Scorer {
         // The description's pull `(a − a₀) / v` (nats over the collection), in the gathered
         // gradient's units: `F`'s per token is `scale` times them.
         let tokens = self.mix_tokens;
-        for m in &mut self.mixings {
+        for m in self.mixings.iter_mut().filter(|_| self.bits_back) {
             let pull = Array2::from_shape_fn(m.frame.dim(), |(i, j)| (m.frame[[i, j]] - Mixing::start(i, j)) / (FRAME_PRIOR * tokens * scale));
             m.gradient += &pull;
         }
@@ -3320,27 +3307,6 @@ fn part_targets(scorer: &Scorer, batch: &Batch, experiments: Vec<Experiment>) ->
     Ok((parts.into_iter().flatten().collect(), targets))
 }
 
-/// Per gate row of the budget's terms, F's push against the count per part and the row's weight:
-/// `(max(0, −⟨∂F, ∂Ê⟩) / |∂Ê|², |∂Ê|²)` along the row's parameters (a threshold's entry, a
-/// direction's row), `∂F` the step's gradient `gradients` in bits times `scale ln 2`; ascending.
-fn balance_rates(terms: &[(usize, Tensor, Tensor)], gradients: &BTreeMap<usize, Tensor>, (device, explanation): (&Device, &Explanation), scale: f64) -> Result<Vec<(f64, f64)>, String> {
-    let mut ratios = Vec::new();
-    for (i, mean, _) in terms {
-        let Some(g) = gradients.get(&explanation.trainable[*i]) else { continue };
-        let (data, count) = (device.download(g).map_err(error)?, device.download(mean).map_err(error)?);
-        if data.dim() != count.dim() {
-            continue;
-        }
-        for (f, k) in data.rows().into_iter().zip(count.rows()) {
-            let (along, square) = (f.dot(&k) * scale * LN_2, k.dot(&k));
-            if square > 0.0 && along.is_finite() {
-                ratios.push(((-along).max(0.0) / square, square));
-            }
-        }
-    }
-    ratios.sort_by(|a, b| a.0.total_cmp(&b.0));
-    Ok(ratios)
-}
 
 /// Each component's unit of a gated stage's threshold shift ([`project`]): its learned width, or
 /// for a hard gate its threshold's posterior deviation.
@@ -3351,17 +3317,22 @@ fn gate_units(scorer: &Scorer, device_posterior: &DevicePosterior, stage: &Gated
     })
 }
 
-/// The budget as a projection (`Settings::budget`): where the count at the step's sample on the
-/// batch's forward exceeds `limit`, every gated stage's thresholds (`library_vpd`) rise by one
-/// shift `Δ` times each gate's unit ([`gate_units`]) and every ReLU function's gate bias falls by
-/// `Δ` times its posterior deviation, `Δ` bisected
-/// until the count is at `limit`, the posterior's means pinned there ([`DevicePosterior::pin`]):
+/// The budget as a projection (`Settings::budget`): where the bits per token of the delivered
+/// program (the posterior mean with hard gates, as the explanation is exported and scored) on the
+/// batch exceed `limit`, every gated stage's thresholds (`library_vpd`) rise by one shift `Δ`
+/// times each gate's unit ([`gate_units`]) and every ReLU function's gate bias falls by `Δ` times
+/// its posterior deviation, `Δ` bisected to the least shift that puts the count at most at
+/// `limit`, the posterior's means pinned there ([`DevicePosterior::pin`]):
 /// projected descent onto the constraint set `E[k] ≤ K`, run after every step, so the count never
-/// exceeds `K` and λ only steers which gates trade. A count below `K` is left as it is: the budget
+/// exceeds `K`. A count below `K` is left as it is: the budget
 /// is an inequality, and a fit whose free count is below it is not pushed up to it. Returns `Δ`
 /// and the hard count before and after it.
-fn project(scorer: &mut Scorer, device_posterior: &mut DevicePosterior, explanation: &Explanation, active: &[bool], batch: &Batch, key: u64, limit: f64) -> Result<(f64, f64, f64), String> {
-    let (family, trace) = count_trace(scorer, device_posterior, batch, (key, false))?;
+fn project(scorer: &mut Scorer, device_posterior: &mut DevicePosterior, explanation: &Explanation, active: &[bool], batch: &Batch, limit: f64) -> Result<(f64, f64, f64), String> {
+    // The delivered program's count, not the training pass's: pinned on the relaxed count at the
+    // step's sample (sampled weights and gates drawn on/off upstream), descent's whole model ran its
+    // held-out hard program at 7.0M bits per token against K = 4.2M (a0418f5457), and toys' resid
+    // reached its exact gates only with the hard program pinned (cd27062d48).
+    let (family, trace) = delivered_trace(scorer, device_posterior, batch)?;
     let mut count_at = |shift: f64| -> Result<f64, String> { Ok(count_terms(scorer, device_posterior, explanation, active, (&family, &trace), (false, shift, false))?.0) };
     // A bracket by doubling toward the budget, then bisection.
     let at_zero = count_at(0.0)?;
@@ -3402,6 +3373,16 @@ fn project(scorer: &mut Scorer, device_posterior: &mut DevicePosterior, explanat
     Ok((shift, at_zero, count))
 }
 
+/// The device posterior of `posterior` (`DevicePosterior::new`), a point where the objective has no
+/// description (`Settings::bits_back` off: no weight noise, no prior, [`DevicePosterior::set_point`]).
+fn device_posterior_of(device: &Device, explanation: &Explanation, posterior: &Posterior, (tokens, settings): (f64, &Settings), (state, steps): (Option<State<'_>>, u64)) -> Result<DevicePosterior, String> {
+    let mut out = DevicePosterior::new(device, explanation, posterior, tokens, state, steps)?;
+    if !settings.bits_back {
+        out.set_point()?;
+    }
+    Ok(out)
+}
+
 /// The batch's expected parts executed per token under the posterior (`library_complexity`) and,
 /// per gated MLP (a ReLU law without an up map), its gate's and its threshold's derivatives of
 /// that mean `(trainable index, ∂Ê/∂μ, ∂Ê/∂σ²)`. The layers' inputs come from one forward of `P`
@@ -3415,9 +3396,19 @@ fn complexity_terms(scorer: &mut Scorer, device_posterior: &DevicePosterior, exp
     count_terms(scorer, device_posterior, explanation, active, (&family, &trace), (previous, 0.0, true))
 }
 
-/// The forward the budget's count reads its gates' inputs from: a training pass at the iterate's
-/// sample of `key`, or with `previous` around the iterate before the pending move (its test,
-/// `step_accepted`), on the batch's bases.
+/// The forward the delivered program's count reads its gates' inputs from ([`project`]): `P` at the
+/// posterior mean with hard gates on the batch's bases.
+fn delivered_trace(scorer: &mut Scorer, device_posterior: &DevicePosterior, batch: &Batch) -> Result<(FamilyInputs, DeviceTrace), String> {
+    scorer.set(device_posterior, Values::Mean, Gates::Hard)?;
+    let family = sequence_family(&batch.base.iter().map(Vec::as_slice).collect::<Vec<_>>())?;
+    let trace = scorer.experiments.models().1.program.forward(&family);
+    scorer.rest(Gates::Hard)?;
+    Ok((family, trace?))
+}
+
+/// The forward the budget's relaxed count reads its gates' inputs from: a training pass at the
+/// iterate's sample of `key`, or with `previous` around the iterate before the pending move (its
+/// test, `step_accepted`), on the batch's bases.
 fn count_trace(scorer: &mut Scorer, device_posterior: &DevicePosterior, batch: &Batch, (key, previous): (u64, bool)) -> Result<(FamilyInputs, DeviceTrace), String> {
     let values = if previous { Values::Previous(key) } else { Values::Iterate(key) };
     scorer.set(device_posterior, values, Gates::Relaxed)?;
@@ -3431,7 +3422,10 @@ fn count_trace(scorer: &mut Scorer, device_posterior: &DevicePosterior, batch: &
 
 /// [`complexity_terms`] on the forward `trace` of `family` ([`count_trace`]), every gated stage's
 /// thresholds lowered by `shift` times each gate's unit ([`project`]); every gate's own means
-/// (thresholds, widths, directions) on the side of the move `previous` names.
+/// (thresholds, widths, directions) on the side of the move `previous` names. With `relaxed` false
+/// the count is the delivered program's on its forward ([`delivered_trace`]): every gate hard at
+/// the posterior's mean (the thresholds at the iterate the projection pins, the directions and the
+/// assignments as the delivered program holds them), no derivatives.
 fn count_terms(
     scorer: &mut Scorer,
     device_posterior: &DevicePosterior,
@@ -3449,10 +3443,10 @@ fn count_terms(
     let alive = |g: &usize| active[*g];
     let mut count = 0.0;
     let mut terms = Vec::new();
-    // Per shared stage the count's derivative per token in its assignment.
-    let mut assignment_terms = Vec::new();
     for (l, (layer, mlp)) in explanation.layers.iter().zip(&scorer.mlps).enumerate() {
-        count += (layer.heads.iter().filter(|(_, values)| values.iter().any(alive)).count() * rows) as f64;
+        // A head with a surviving value runs on every token: its concepts as a part of rank one per
+        // surviving value coordinate.
+        count += layer.heads.iter().map(|(_, values)| values.iter().filter(|g| alive(g)).count() as f64).filter(|r| *r > 0.0).map(|r| 1.0 + SLICE_CONCEPTS * r).sum::<f64>() * rows as f64;
         let Some(mlp) = mlp else {
             // Gated components (`library_vpd`): each counts its rank where its gate is on, on the
             // device (`gated_expected`).
@@ -3460,27 +3454,39 @@ fn count_terms(
             // components follow its components reads.
             let mut followed: Option<(Tensor, Tensor, Vec<f64>)> = None;
             for stage in &scorer.stages[l] {
-                let rank = match &scorer.group_bits {
-                    Some(bits) => stage.bits(active, bits),
-                    None => stage.ranks(active),
-                };
+                let rank = stage.concepts(active);
                 let j = scorer.at(stage.threshold)?;
                 let unit = gate_units(scorer, device_posterior, stage)?;
-                let bias = (center(j)?.column(0).iter().zip(&unit).map(|(m, u)| m - shift * u).collect::<Vec<f64>>(), device_posterior.values(j)?.1.column(0).mapv(|s| (2.0 * s).exp()).to_vec());
+                let variance = if relaxed { device_posterior.values(j)?.1.column(0).mapv(|s| (2.0 * s).exp()).to_vec() } else { vec![0.0; unit.len()] };
+                let bias = (center(j)?.column(0).iter().zip(&unit).map(|(m, u)| m - shift * u).collect::<Vec<f64>>(), variance);
                 // A direction gate's means and variances stay on the device (the posterior's iterate
                 // and `e^{2s}`); its count's derivatives come back as device tensors.
+                let delivered = match stage.direction {
+                    Some(g) if !relaxed => {
+                        let mean = device_posterior.values(scorer.at(g)?)?.0;
+                        Some((d.upload(mean.view()).map_err(error)?, d.zeros(mean.nrows(), mean.ncols()).map_err(error)?))
+                    }
+                    _ => None,
+                };
                 let direction = match stage.direction {
-                    Some(g) => {
+                    Some(g) if relaxed => {
                         let i = scorer.at(g)?;
                         let (mean, log_sd) = if previous { device_posterior.previous_and_log_sd(i)? } else { device_posterior.iterate_and_log_sd(i)? };
                         Some((i, mean, d.gate_function(gam_gpu::tensor::GateFunction::Variance, log_sd, None).map_err(error)?))
                     }
-                    None => None,
+                    _ => None,
                 };
                 let per = 1.0 / rows as f64;
-                let gate = direction.as_ref().map(|(_, mean, variance)| (*mean, variance));
+                let gate = match &delivered {
+                    Some((mean, variance)) => Some((mean, variance)),
+                    None => direction.as_ref().map(|(_, mean, variance)| (*mean, variance)),
+                };
                 // A shared stage counts each component through its assignment, as the pass wrote it.
-                let relaxation = if previous { Relaxation::Previous } else { Relaxation::Soft };
+                let relaxation = match (relaxed, previous) {
+                    (false, _) => Relaxation::Hard,
+                    (true, true) => Relaxation::Previous,
+                    (true, false) => Relaxation::Soft,
+                };
                 let assign = match stage.assign {
                     Some(op) => Some(scorer.assignments.iter().find(|a| a.operator == op).ok_or("a shared stage without its assignment")?.values(relaxation)),
                     None => None,
@@ -3488,23 +3494,20 @@ fn count_terms(
                 // The gates' widths enter the count (what the pass executes) but take no pull from
                 // it: nothing keeps a width positive.
                 // A hard gate has no width (`library_vpd::Gate::Hard`): its count is `Φ(m / σ)`.
-                // The count the budget holds (`relaxed` false) is the hard gate's under the posterior,
-                // E_q[H(z)] = Φ(μ_z / sd_q(z)): what the explanation executes when it is evaluated
-                // (hard), with the posterior's own noise and no learned width. The count the step
-                // descends (`relaxed`) reads the learned widths too, `Φ(μ_z / √(w² + σ²))`: the
-                // hard count's derivative vanishes on every gate a few deviations from its
-                // threshold, so a gate the data leaves free to close but firmly on took no pull
-                // (toys' gated copy under a budget in bits: no gate closed while λ reached 4e5).
+                // The count the budget holds (`relaxed` false) is the delivered program's, `H(m)`
+                // at the posterior mean, with no learned width. The count the step descends
+                // (`relaxed`) reads the learned widths and the posterior's noise,
+                // `Φ(μ_z / √(w² + σ²))`: a hard count's derivative vanishes on every gate a few
+                // deviations from its threshold, so a gate the data leaves free to close but firmly
+                // on took no pull (toys' gated copy under a budget in bits: no gate closed while λ
+                // reached 4e5).
                 let width = match scorer.at(stage.width) {
                     Ok(w) if relaxed => center(w)?.column(0).iter().map(|v| v.abs()).collect(),
                     _ => vec![0.0; explanation.artifact.program.operators[stage.width].rows.width()],
                 };
                 let extra = followed.as_ref().map(|(m, s2, w)| (m, s2, w.as_slice()));
-                let (expected, gate_terms, assigned, components) = gated_expected(d, arithmetic, trace.value(stage.input)?, gate, (&bias.0, &bias.1, &width), &rank, (assign.as_ref(), extra))?;
+                let (expected, gate_terms, _, components) = gated_expected(d, arithmetic, trace.value(stage.input)?, gate, (&bias.0, &bias.1, &width), &rank, (assign.as_ref(), extra), !relaxed)?;
                 followed = Some(components);
-                if let (Some(op), Some(g)) = (stage.assign, assigned) {
-                    assignment_terms.push((op, g * per));
-                }
                 if let (Some((i, _, _)), Some((mean, variance))) = (&direction, gate_terms) {
                     terms.push((*i, d.scaled(per, &mean).map_err(error)?, d.scaled(per, &variance).map_err(error)?));
                 }
@@ -3516,12 +3519,11 @@ fn count_terms(
         if layer.functions.is_empty() {
             continue;
         }
-        if scorer.group_bits.is_some() {
-            return Err("a budget in bits counts gated components (library_vpd), not functions".into());
-        }
+        // A function is a part of rank one: its gate, its read, its write and its scale.
+        let concepts = 1.0 + SLICE_CONCEPTS;
         let surviving: Vec<bool> = layer.functions.iter().map(|groups| groups.iter().all(alive)).collect();
         if mlp.law != Law::Relu || mlp.up.is_some() {
-            count += (surviving.iter().filter(|s| **s).count() * rows) as f64;
+            count += concepts * (surviving.iter().filter(|s| **s).count() * rows) as f64;
             continue;
         }
         let rule = explanation.artifact.program.rules.iter().find(|r| r.name == format!("library.l{l}.mlp"));
@@ -3534,6 +3536,18 @@ fn count_terms(
         let kept: Vec<usize> = (0..rows).filter(|r| !fixed.contains(&positions[*r])).collect();
         let x = d.download(trace.value(mlp.input)?).map_err(|e| e.to_string())?.select(ndarray::Axis(0), &kept);
         let i = scorer.at(mlp.gate.operator)?;
+        if !relaxed {
+            // The delivered program: each surviving function on where its gate's pre-activation at
+            // the posterior mean (its bias at the iterate the projection pins) is positive.
+            let mut pre = x.dot(&device_posterior.values(i)?.0.t());
+            if let Some(b) = mlp.gate.bias {
+                let j = scorer.at(b)?;
+                let bias = &center(j)?.column(0) - &device_posterior.values(j)?.1.column(0).mapv(|s| shift * s.exp());
+                pre += &bias;
+            }
+            count += concepts * pre.rows().into_iter().map(|r| r.iter().zip(&surviving).filter(|(v, alive)| **alive && **v > 0.0).count()).sum::<usize>() as f64;
+            continue;
+        }
         let mean = center(i)?;
         let variance = device_posterior.values(i)?.1.mapv(|s| (2.0 * s).exp());
         let bias = match mlp.gate.bias {
@@ -3553,16 +3567,12 @@ fn count_terms(
             bias: bias.as_ref().map(|(_, m, v)| (m.view(), v.view())),
             alive: &surviving,
         })?;
-        count += expected.count;
-        let per = 1.0 / rows as f64;
+        count += concepts * expected.count;
+        let per = concepts / rows as f64;
         terms.push((i, d.upload((expected.mean * per).view()).map_err(error)?, d.upload((expected.variance * per).view()).map_err(error)?));
         if let Some((j, _, _)) = bias {
             terms.push((j, d.upload((expected.bias_mean.insert_axis(ndarray::Axis(1)) * per).view()).map_err(error)?, d.upload((expected.bias_variance.insert_axis(ndarray::Axis(1)) * per).view()).map_err(error)?));
         }
-    }
-    // The step's own (not the move's test's) for the assignment's pull ([`Scorer::pull_assignments`]).
-    if !previous {
-        scorer.assignment_budget = assignment_terms;
     }
     Ok((count / rows as f64, terms))
 }
@@ -3585,7 +3595,8 @@ fn count_terms(
 /// fourth return of the previous stage's call); the followed stage's thresholds take no pull
 /// through its followers here. The gates are soft, `Φ(z / w)` with the gates' widths `widths`
 /// (each component's `w A`), and `E[Φ(z / w)] = Φ(m / √(w² + s²))` for `z ~ N(m, s²)`: the count is
-/// of what the pass executes (with `w = 0`, a hard gate, of `s²` alone).
+/// of what the pass executes (with `w = 0`, a hard gate, of `s²` alone). With `hard` the gates are
+/// the delivered program's, `H(m)` (no variances, no widths), and the derivatives are zero.
 fn gated_expected(
     d: &Device,
     arithmetic: gam_gpu::tensor::Arithmetic,
@@ -3594,6 +3605,7 @@ fn gated_expected(
     (bias_mean, bias_variance, widths): (&[f64], &[f64], &[f64]),
     rank: &[f64],
     (assign, extra): (Option<&Array2<f64>>, Option<(&Tensor, &Tensor, &[f64])>),
+    hard: bool,
 ) -> Result<(crate::library_complexity::Expected, Option<(Tensor, Tensor)>, Option<Array2<f64>>, (Tensor, Tensor, Vec<f64>)), String> {
     use gam_gpu::tensor::GateFunction;
     let rows = input.rows();
@@ -3697,9 +3709,15 @@ fn gated_expected(
         d.scale_columns(&mut out, f, &weight, false).map_err(error)?;
         Ok(out)
     };
-    let probability = weighted(&d.gate_function(GateFunction::Cdf, &m, Some(&s)).map_err(error)?)?;
-    let slope = weighted(&d.gate_function(GateFunction::CdfSlope, &m, Some(&s)).map_err(error)?)?;
-    let spread = weighted(&d.gate_function(GateFunction::Ratio, &d.gate_function(GateFunction::CdfScaleSlope, &m, Some(&s)).map_err(error)?, Some(&s)).map_err(error)?)?;
+    let (probability, slope, spread) = if hard {
+        (weighted(&d.gate_function(GateFunction::Step, &m, None).map_err(error)?)?, d.zeros(rows, parts).map_err(error)?, d.zeros(rows, parts).map_err(error)?)
+    } else {
+        (
+            weighted(&d.gate_function(GateFunction::Cdf, &m, Some(&s)).map_err(error)?)?,
+            weighted(&d.gate_function(GateFunction::CdfSlope, &m, Some(&s)).map_err(error)?)?,
+            weighted(&d.gate_function(GateFunction::Ratio, &d.gate_function(GateFunction::CdfScaleSlope, &m, Some(&s)).map_err(error)?, Some(&s)).map_err(error)?)?,
+        )
+    };
     // The assignment's path through the components' widths, `∂(w_b²)/∂A_gb = 2 w_b w_g`:
     // `w_g w_b Σ_rows 2 ∂P/∂s²_b` (summed over the rows, half of `spread`'s doubling).
     let width_spread: ndarray::Array1<f64> = match assign {
@@ -3775,14 +3793,12 @@ fn gated_expected(
 }
 
 /// The test of the posterior's pending move (`DevicePosterior::pending_divergence`) on this step's
-/// batch: the change of the Lagrangian per token the move made, measured on the batch at the
-/// step's own weight samples on both sides (`new`: the batch's data bits and expected parts per
-/// token at the moved iterate, from the step itself; the same draws around the iterate before
-/// the move, `DevicePosterior::previous_into`), `ΔL = (B ln 2 Δbits + ΔKL + λ ΔÊ) / N` with `B`
-/// the batches, `N` the training tokens, `ΔKL` the move's change of the prior's divergence and
-/// `λ` the budget's multiplier (nats of the whole `F` per part per token, as the step's pull
-/// takes it). A batch the move was not made on, so the test is not the move's
-/// own fit. The data term's change is measured per sequence of the batch (paired: both sides on
+/// batch: the change of the objective per token the move made, measured on the batch at the
+/// step's own weight samples on both sides (`bits`: the batch's data bits at the moved iterate,
+/// from the step itself; the same draws around the iterate before the move,
+/// `DevicePosterior::previous_into`), `ΔL = (B ln 2 Δbits + ΔKL) / N` with `B` the batches, `N`
+/// the training tokens and `ΔKL` the move's change of the prior's divergence (zero for a point
+/// posterior). A batch the move was not made on, so the test is not the move's own fit. The data term's change is measured per sequence of the batch (paired: both sides on
 /// the same experiments and draws), so the batch's `ΔL` has a standard error from the spread of
 /// its sequences' changes, `B ln 2 √(n var_s) / N` over its `n` sequences. A move is rejected only
 /// when `ΔL` exceeds that standard error: a single batch cannot tell a small true gain from its
@@ -3795,12 +3811,10 @@ fn gated_expected(
 fn step_accepted(
     scorer: &mut Scorer,
     device_posterior: &DevicePosterior,
-    explanation: &Explanation,
-    active: &[bool],
     (batch, experiments, key): (&Batch, &[Experiment], u64),
-    (bits, expected): (&[Vec<f64>], Option<f64>),
+    bits: &[Vec<f64>],
     all_on: Option<&AllOn>,
-    (scale, tokens, lambda): (f64, usize, f64),
+    (scale, tokens): (f64, usize),
 ) -> Result<(bool, f64, f64), String> {
     let divergence = device_posterior.pending_divergence().ok_or("no pending move")?;
     // The same parts and draws as the step's (`antithetic_step`).
@@ -3838,11 +3852,7 @@ fn step_accepted(
     let total: f64 = by_base.values().sum();
     let spread = if n > 1.0 { by_base.values().map(|d| (d - total / n).powi(2)).sum::<f64>() / (n - 1.0) } else { 0.0 };
     let standard_error = scale * LN_2 * (n * spread).sqrt() / tokens as f64;
-    let budget = match expected {
-        Some(moved) if lambda > 0.0 => lambda * (moved - complexity_terms(scorer, device_posterior, explanation, active, batch, (key, true))?.0),
-        _ => 0.0,
-    };
-    let change = (scale * LN_2 * total + divergence + budget + scorer.mixing_change()) / tokens as f64;
+    let change = (scale * LN_2 * total + divergence + scorer.mixing_change()) / tokens as f64;
     if !change.is_finite() {
         return Err(format!("a nonfinite change of the objective at the move's test ({change})"));
     }
@@ -4022,13 +4032,13 @@ fn held_out_on(
     let per_token = |data: &Mean, on: &Mean| (data.tokens > 0).then(|| (data.bits + on.bits) / data.tokens as f64);
     let all_on = on_mean.mean();
     let data = per_token(&sampled, &on_sampled).ok_or("no held-out tokens")?;
-    let divergence: f64 = posterior.divergences().iter().sum();
-    let gaussian = posterior.description();
+    // Without bits-back the objective is the data term alone ([`Settings::bits_back`]).
+    let (divergence, gaussian, choices) = if settings.bits_back { (posterior.divergences().iter().sum(), posterior.description(), explanation.fixed_nats) } else { (0.0, 0.0, 0.0) };
     let prior_nats = match prior {
         Some(prior) => prior_term(prior, posterior, noise_seed(settings.seed, 0, 0), false)?.0,
         None => 0.0,
     };
-    let description = gaussian + explanation.fixed_nats + prior_nats + scorer.mixing_nats();
+    let description = gaussian + choices + prior_nats + scorer.mixing_nats();
     Ok(HeldOut {
         objective_bits_per_token: data + description / LN_2 / tokens as f64,
         data_bits_per_token: data,
@@ -4036,7 +4046,7 @@ fn held_out_on(
         rounded_bits_per_token: per_token(&at_rounded, &on_rounded).ok_or("no held-out tokens")?,
         divergence_bits: divergence / LN_2,
         variance_bits: (gaussian - divergence) / LN_2,
-        choice_bits: explanation.fixed_nats / LN_2,
+        choice_bits: choices / LN_2,
         prior_bits: prior_nats / LN_2,
         clean: clean.iter().map(Mean::mean).collect(),
         patched: patched.iter().map(Mean::mean).collect(),
@@ -4236,9 +4246,6 @@ struct Progress {
     best: Option<(f64, usize)>,
     epochs: Vec<Epoch>,
     removals: Vec<Removal>,
-    /// The budget's multiplier `λ` (`Settings::budget`), carried across a resume.
-    #[serde(default)]
-    multiplier: f64,
     /// The last epoch's snapshot, its per-batch estimates of `F` in nats, when convergence is being
     /// judged.
     previous: Option<Vec<f64>>,
@@ -4960,6 +4967,9 @@ pub fn fit_from(
     start: Option<Start>,
 ) -> Result<Fit, String> {
     settings.validate()?;
+    if prior.is_some() && !settings.bits_back {
+        return Err("a prior term prices a description: it needs Settings::bits_back".into());
+    }
     let mut prior = prior;
     let length = sequences.first().map_or(0, Vec::len);
     if length == 0 || held.len() < 2 || sequences.iter().chain(held).any(|s| s.len() != length) {
@@ -5000,7 +5010,6 @@ pub fn fit_from(
         best: None,
         epochs: Vec::new(),
         removals: Vec::new(),
-        multiplier: 0.0,
         previous: None,
         collection: COLLECTION,
         active: posterior.active.clone(),
@@ -5099,7 +5108,7 @@ pub fn fit_from(
     let resumed_seconds = progress.seconds;
     let fresh = resumed.is_none();
     let state = resumed.as_ref().map(|resumed| State::Saved { moments: &resumed.moments, weights: &resumed.weights });
-    let mut device_posterior = DevicePosterior::new(device, explanation, &posterior, tokens as f64, state, u64::try_from(progress.step).map_err(error)?)?;
+    let mut device_posterior = device_posterior_of(device, explanation, &posterior, (tokens as f64, settings), (state, u64::try_from(progress.step).map_err(error)?))?;
     // A resumed fit holds exactly the device's means of the checkpoint, the iterate they average
     // with the steps they span, and the line step's averages: it goes on as the fit that was not
     // stopped.
@@ -5114,7 +5123,7 @@ pub fn fit_from(
         // The unit-information start's state goes before the Laplace start's is made, which
         // takes its deviations and curvature one operator at a time.
         drop(device_posterior);
-        device_posterior = DevicePosterior::new(device, explanation, &posterior, tokens as f64, Some(State::Zero), 0)?;
+        device_posterior = device_posterior_of(device, explanation, &posterior, (tokens as f64, settings), (Some(State::Zero), 0))?;
         laplace_start(&scorer, explanation, &mut posterior, sums, tokens, |i, log_sd, h| device_posterior.set_start(i, log_sd, h))?;
         device_posterior.settle()?;
         log::info!("library Laplace start: {:.1} s", timed.elapsed().as_secs_f64());
@@ -5179,9 +5188,7 @@ pub fn fit_from(
     // The best epoch's snapshot evaluation, the removal round's start (not checkpointed: a resumed
     // fit scores it again).
     let mut best_evaluation: Option<Evaluation> = None;
-    // Whether the last projection bound (the count at its target), where λ steers, and the first
-    // projected step's count and step, from which the target eases to `K`.
-    let mut bound = false;
+    // The first projected step's count and step, from which the target eases to `K`.
     let mut eased: Option<(f64, i32)> = None;
     let best_path = checkpoint.map_or_else(
         || std::env::temp_dir().join(format!("library_best_{}_{}.bin", std::process::id(), FITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed))),
@@ -5263,26 +5270,8 @@ pub fn fit_from(
                 }
                 prior_seconds = timed.elapsed().as_secs_f64();
             }
-            // The execution budget (`Settings::budget`, `library_complexity`): the step descends
-            // the Lagrangian `F + λ (E_q[k] − K)`. `λ ∂Ê/∂μ` joins the data gradient (in its units,
-            // as the prior term's does), and by Price's theorem `∂E_q[f]/∂σ² = ½ E_q[∂²f]` the
-            // term's expected curvature per token `2 λ ∂Ê/∂σ² / N` joins the step's curvature.
-            // `λ̂ = max(0, −⟨g_F, g_k⟩) / |g_k|²` (`g_k = ∂Ê/∂μ`, both measured on the step) is the
-            // multiplier at which the term's gradient cancels F's push on the count: descending
-            // `g_F` raises `Ê` iff `⟨g_F, g_k⟩ < 0`, and where F lowers the count on its own no
-            // multiplier is needed. `λ̄` is its running mean over one pass of the `B` batches (the
-            // plain mean of the steps since the budget bound, until there are `B` of them: one
-            // step's `λ̂` is often 0 and swings 40-fold from step to step). From
-            // the first step that finds `Ê > K` on, `λ = λ̄ Ê / K`, applied on the step itself: above
-            // the budget the term outweighs F's push and the count falls, below it F's push wins
-            // and the count rises, and the only point where the descent holds the count still
-            // (`λ = λ̂`) is `Ê = K`. A budget that never binds leaves `λ = 0`, the step bit for bit
-            // the budget-free one. The multiplier follows the count at once and holds no memory of
-            // past violations. Integral rules lagged: `λ ← λ + λ̂₀ (Ê − K)/(K B)` (3732bc2c8d) rose
-            // to 4.5e7 nats per part per token on toys' resid_mlp_2l (per-slice own gates,
-            // K = 110), and with the count at 84 it had fallen only to 4.2e7 while the posterior
-            // mean's KL went from 1e-24 to 1.4e5 bits per token; re-measuring `λ̂` in its rate
-            // (3a279507d3) moved it from 69 to 2,813 within three steps of a tiny vpd4l fit.
+            // The budget (`Settings::budget`) is held by the projection after every step
+            // ([`project`]) alone; the count at the step's sample is the step's record.
             let mut parts_note = String::new();
             let budget = match settings.budget.filter(|k| k.is_finite()) {
                 Some(limit) => Some((limit, complexity_terms(&mut scorer, &device_posterior, explanation, &posterior.active, &batch, (key, false))?)),
@@ -5291,10 +5280,8 @@ pub fn fit_from(
             // The previous step's move stands only if this batch's measured objective is lower at
             // it (`step_accepted`); a rejected move is undone and this batch takes no step.
             if device_posterior.pending_divergence().is_some() {
-                let new = (bits.as_slice(), budget.as_ref().map(|(_, (expected, _))| *expected));
-                let lambda = progress.multiplier;
                 let predicted = device_posterior.pending_predicted().unwrap_or(0.0);
-                let (accepted, change, standard_error) = step_accepted(&mut scorer, &device_posterior, explanation, &posterior.active, (&batch, &experiments, key), new, all_on.as_ref(), (scale, tokens, lambda))?;
+                let (accepted, change, standard_error) = step_accepted(&mut scorer, &device_posterior, (&batch, &experiments, key), &bits, all_on.as_ref(), (scale, tokens))?;
                 // The trust region's ratio test, where the batch can test the model: the predicted
                 // decrease beyond the measurement's standard error. Below it a single batch's ratio is
                 // its noise over the prediction: tested on every resolved change, the factor fell to
@@ -5316,58 +5303,15 @@ pub fn fit_from(
                     continue;
                 }
             }
-            if let Some((limit, (expected, terms))) = budget {
+            if let Some((limit, (expected, _))) = budget {
+                // A multiplier steering which gates trade (the slope-weighted median of F's push
+                // against the count where the projection bound, 269b6645c2's rule) shut the learned
+                // tiny library's parts far below `K` within an epoch, none reopening (seeds 3, 5 and
+                // 7: 9–30 concepts per token against `K` 211–229); with the projection alone they
+                // held 201–216.
                 parts.0 += expected;
                 parts.1 += 1;
-                // The count is held at `K` by the projection after every step ([`project`]); λ
-                // steers which gates trade: the slope-weighted median of the positive rates
-                // max(0, −⟨∂F, ∂Ê⟩) / |∂Ê|², F's push against the count where the projection holds
-                // it (269b6645c2's rule), measured at every step. An integral rule on λ with a
-                // projection only at the start (8ed727551e) let every MLP gate close within
-                // epochs and none reopen (the learned tiny library, GHA seeds 3–7), and on toys'
-                // gated copy under a budget in bits λ reached 4e5 while no gate closed.
-                // Where the constraint is slack (the last projection did not bind), λ is zero: the
-                // pull kept on below `K` closed every MLP gate of the learned tiny library and then
-                // the always-on parts (GHA, seeds 3–6).
-                let mut ratios = balance_rates(&terms, &gradients, (device, explanation), scale)?;
-                ratios.retain(|r| r.0 > 0.0);
-                let half = 0.5 * ratios.iter().map(|r| r.1).sum::<f64>();
-                let mut below = 0.0;
-                progress.multiplier = if bound {
-                    ratios.iter().find(|r| {
-                        below += r.1;
-                        below >= half
-                    }).map_or(0.0, |r| r.0)
-                } else {
-                    0.0
-                };
-                let lambda = progress.multiplier;
-                for (i, mean, variance) in &terms {
-                    let op = explanation.trainable[*i];
-                    // At λ = 0 the term adds nothing, and the step is the budget-free one bit for bit.
-                    if lambda == 0.0 {
-                        continue;
-                    }
-                    // On the device, in the fit's storage: `λ/(scale ln 2)` times the count's derivative
-                    // into the gradient and `2λ/N` times its variance term into the curvature.
-                    let (pull, bend) = (device.convert(mean).map_err(error)?, device.convert(variance).map_err(error)?);
-                    match gradients.get_mut(&op) {
-                        Some(total) => device.axpy(total, lambda / (scale * LN_2), &pull).map_err(error)?,
-                        None => {
-                            gradients.insert(op, device.scaled(lambda / (scale * LN_2), &pull).map_err(error)?);
-                        }
-                    }
-                    match prior_curvature.get_mut(&op) {
-                        Some(total) => device.axpy(total, 2.0 * lambda / tokens as f64, &bend).map_err(error)?,
-                        None => {
-                            prior_curvature.insert(op, device.scaled(2.0 * lambda / tokens as f64, &bend).map_err(error)?);
-                        }
-                    }
-                }
-                if lambda != 0.0 {
-                    scorer.pull_assignments(lambda / (scale * LN_2));
-                }
-                parts_note = format!(", parts per token {expected:.4} (K {limit}), λ {:.4e}", progress.multiplier);
+                parts_note = format!(", parts per token {expected:.4} (K {limit})");
             }
             progress.step += 1;
             // The factor's scale: its square estimates the curvature per token of the tokens it
@@ -5391,9 +5335,8 @@ pub fn fit_from(
                     None => f64::INFINITY,
                     Some((start, at)) => limit + (start - limit).max(0.0) * (-f64::from(progress.step - at) / horizon).exp(),
                 };
-                let (shift, before, count) = project(&mut scorer, &mut device_posterior, explanation, &posterior.active, &batch, key, target)?;
+                let (shift, before, count) = project(&mut scorer, &mut device_posterior, explanation, &posterior.active, &batch, target)?;
                 eased.get_or_insert((before, progress.step));
-                bound = shift > 0.0;
                 hard.0 += before;
                 hard.1 += 1;
                 parts_note.push_str(&format!(", hard {before:.4} projected by {shift:.3e} widths to {count:.4}"));
@@ -5404,8 +5347,8 @@ pub fn fit_from(
             // A nonfinite step state is a failed step: it fails here, at the step that made it,
             // never later as a null in a checkpoint record (toys' TMS-id fit ran on with ρ̄ NaN for
             // epochs while its mean's KL went from 4e-4 to 2e182).
-            if !(eta.is_finite() && rho.is_finite() && ratio.is_finite() && progress.multiplier.is_finite()) {
-                return Err(format!("step {epoch}.{b}: nonfinite step state (η {eta}, ρ̄ {rho}, r̄ {ratio}, λ {})", progress.multiplier));
+            if !(eta.is_finite() && rho.is_finite() && ratio.is_finite()) {
+                return Err(format!("step {epoch}.{b}: nonfinite step state (η {eta}, ρ̄ {rho}, r̄ {ratio})"));
             }
             let prior_note = if prior.is_some() { format!(" (prior: {prior_seconds:.3} s)") } else { String::new() };
             log::info!("library step {epoch}.{b}: data {:.6} bits per scored token at the iterate's samples, {:.2} s{prior_note}{parts_note}{on_note}", bits.iter().flatten().sum::<f64>() / scored as f64, step_started.elapsed().as_secs_f64());
@@ -5456,7 +5399,6 @@ pub fn fit_from(
             },
             budget: settings.budget,
             expected_parts: settings.budget.map(|_| if hard.1 > 0 { hard.0 / hard.1 as f64 } else { parts.0 / parts.1.max(1) as f64 }),
-            multiplier: settings.budget.map(|_| progress.multiplier),
         };
         log::info!("library fit epoch {epoch}: {record:?}");
         let (log_sd, magnitude, variances) = posterior.spread();
@@ -5521,6 +5463,16 @@ pub fn fit_from(
                     }
                     device_posterior.set_values(&posterior)?;
                 }
+            }
+            if !settings.bits_back {
+                // Removal trades the description against the data: without one there is nothing to
+                // trade, and the descent's end is the fit's.
+                progress.done = true;
+                progress.prior = None;
+                progress.assignments = scorer.saved_assignments();
+                progress.frames = scorer.saved_mixings();
+                save(&mut progress, &posterior, (&device_posterior, None), &mut writer)?;
+                continue;
             }
             let log = checkpoint.map(|path| path.with_extension("removals.jsonl"));
             let evidence = Evidence { draws: &draws, sequences, settings };
@@ -5661,12 +5613,11 @@ fn laplace_start(
     // part on (the all-on experiment) the sample's noise summed over every slice: the all-on KL at
     // the first step's sample was 11.3 bits per token where the mean's is 1.32 (vpd4l tiny fit,
     // grouped own gates, 14985361f0). descent's prototype starts its slices this way.
-    // A gate's threshold and its direction's row (`.thresholds`, `.g{b}`) start the same way: the
-    // budget counts the hard gate under the posterior, `Φ(μ_z / sd_q(z))`, and from the thresholds'
-    // prior deviations it counted 3,822 parts per token at the start where the hard gates at the
-    // mean execute 364 (vpd4l grouped direction gates with learned widths, decomp-vpd4l-i at
-    // c55f1fadd8); the count then fell as the curvature shrank the deviations over the first pass,
-    // whatever λ (the learned tiny library: from K to 33–37 parts against K near 65 at λ under 1).
+    // A gate's threshold and its direction's row (`.thresholds`, `.g{b}`) start the same way: a
+    // budget counting the hard gate under the posterior, `Φ(μ_z / sd_q(z))`, counted 3,822 parts per
+    // token at the start from the thresholds' prior deviations where the hard gates at the mean
+    // execute 364 (vpd4l grouped direction gates with learned widths, decomp-vpd4l-i at
+    // c55f1fadd8).
     let direction = |name: &str| name.rsplit_once(".g").is_some_and(|(_, b)| !b.is_empty() && b.bytes().all(|c| c.is_ascii_digit()));
     let slice: Vec<Option<f64>> = explanation
         .groups
@@ -5903,7 +5854,7 @@ fn snapshot_estimates(
     log::info!("library snapshot: {} batches, experiments {preparing:.2} s, targets {targeting:.2} s, scoring {scoring:.2} s", draws.len());
     // Summed as a removal round's objective sums it (`remove`), so the evaluation it takes over is
     // the one the round would have made, to the last bit.
-    let rest = evaluation.rest + (posterior.description() + explanation.fixed_nats + scorer.mixing_nats());
+    let rest = evaluation.rest + if settings.bits_back { posterior.description() + explanation.fixed_nats + scorer.mixing_nats() } else { 0.0 };
     if !rest.is_finite() {
         return Err("a nonfinite posterior divergence".into());
     }
@@ -5982,7 +5933,7 @@ pub fn removal_step(device: &Device, native: &OperatorProgram, explanation: &Exp
         tokens += scorer.experiments(draw, sequences)?.iter().map(|e| length - e.position).sum::<usize>();
     }
     let evaluate = |scorer: &mut Scorer, posterior: &Posterior| -> Result<HeldOut, String> {
-        let device_posterior = DevicePosterior::new(device, explanation, posterior, tokens as f64, None, 0)?;
+        let device_posterior = device_posterior_of(device, explanation, posterior, (tokens as f64, settings), (None, 0))?;
         held_out(scorer, explanation, (posterior, &device_posterior), held, settings, tokens, None)
     };
     let before = evaluate(&mut scorer, posterior)?;
@@ -6015,7 +5966,7 @@ pub fn start_posterior(device: &Device, native: &OperatorProgram, explanation: &
     };
     let mut posterior = Posterior::new(explanation, tokens)?;
     lap(0, &mut timed);
-    let device_posterior = DevicePosterior::new(device, explanation, &posterior, tokens as f64, None, 0)?;
+    let device_posterior = device_posterior_of(device, explanation, &posterior, (tokens as f64, settings), (None, 0))?;
     device.synchronize().map_err(error)?;
     lap(1, &mut timed);
     let sums = laplace_sums(&mut scorer, &device_posterior, &draws, sequences, settings)?;
@@ -6049,7 +6000,7 @@ pub fn removal_replay(device: &Device, native: &OperatorProgram, explanation: &E
         tokens += scorer.experiments(draw, sequences)?.iter().map(|e| length - e.position).sum::<usize>();
     }
     let evaluate = |scorer: &mut Scorer, posterior: &Posterior| -> Result<HeldOut, String> {
-        let device_posterior = DevicePosterior::new(device, explanation, posterior, tokens as f64, None, 0)?;
+        let device_posterior = device_posterior_of(device, explanation, posterior, (tokens as f64, settings), (None, 0))?;
         held_out(scorer, explanation, (posterior, &device_posterior), held, settings, tokens, None)
     };
     let before = evaluate(&mut scorer, posterior)?;
@@ -6835,7 +6786,7 @@ mod tests {
                 moved.mean[i].mapv_inplace(|t| t + 0.3);
             }
         }
-        device_posterior.propose(&moved).unwrap();
+        crate::device_posterior::test_support::propose(&mut device_posterior, &moved).unwrap();
         let old = complexity_terms(&mut scorer, &device_posterior, &explanation, &posterior.active, &batch, (key, true)).unwrap().0;
         let new = complexity_terms(&mut scorer, &device_posterior, &explanation, &posterior.active, &batch, (key, false)).unwrap().0;
         assert_eq!(old, before, "the old side's count, at the old thresholds");
@@ -6981,38 +6932,101 @@ mod tests {
         }
     }
 
-    /// A budget in bits (`Settings::budget_bits`) weighs each part's runs by its description: a
-    /// group's bits add to the count its part's expected runs per token (the count's change when one
-    /// group's bits go from 0 to 1, the same for a slice's read and its write, and positive), and the
-    /// count is linear in the groups' bits. A fit's groups cost [`NUMBER_BITS`] per number.
+    /// An own gate reads its part's read norm on a log scale (`library_vpd`, `Law::Log`, toys'
+    /// guard): a part whose reads are zero on every token (its c_fc read removed, mean and deviation
+    /// zero) is exactly off there, so the relaxed count, with the learned widths and the posterior's
+    /// noise, is the count without the part. A linear read `‖V_bᵀx‖ − τ` kept `Φ(−τ/w)` of it, 0.16
+    /// of its rank per token at the fixture's `τ = w = 0.5`.
     #[test]
-    fn a_budget_in_bits_weighs_each_part_by_its_groups() {
-        let (native, explanation, sequences) = learned_tiny("library_budget_bits");
+    fn an_own_gate_on_its_logged_read_is_off_where_its_part_reads_nothing() {
+        let (native, explanation, sequences) = learned_tiny("library_log_guard");
         let (device, settings) = (Device::host(), settings());
         let posterior = Posterior::new(&explanation, 72).unwrap();
-        let device_posterior = DevicePosterior::new(&device, &explanation, &posterior, 72.0, None, 0).unwrap();
-        let fixed = Scorer::new(&device, &native, &explanation, &Settings { budget_bits: true, ..settings.clone() }).unwrap().group_bits.unwrap();
-        let read = explanation.groups.iter().position(|g| g.name.starts_with("library.l1.mlp.") && g.name.ends_with(".read")).unwrap();
-        let width = explanation.groups[read].cells[0].cols.len() as f64;
-        assert_eq!(fixed[read], NUMBER_BITS * width, "a slice's read costs 16 bits per entry");
+        let mut device_posterior = DevicePosterior::new(&device, &explanation, &posterior, 72.0, None, 0).unwrap();
         let mut scorer = Scorer::new(&device, &native, &explanation, &settings).unwrap();
         let draws = draws(sequences.len(), settings.batch_sequences, settings.seed).unwrap();
         let batch = draws[0].batch(&sequences).unwrap();
         let key = training_key(settings.seed, 0, 0);
-        let groups = explanation.groups.len();
-        let mut count = |bits: Vec<f64>| {
-            scorer.group_bits = Some(bits);
-            complexity_terms(&mut scorer, &device_posterior, &explanation, &posterior.active, &batch, (key, false)).unwrap().0
+        let stage = scorer.stages[1].iter().find(|s| s.prefix.ends_with(".mlp.fc")).unwrap();
+        let part: Vec<usize> = stage.slices[0].iter().chain(&stage.groups[0]).copied().collect();
+        let read = part
+            .iter()
+            .copied()
+            .find(|&g| explanation.groups[g].name.ends_with(".read") && explanation.artifact.program.operators[explanation.groups[g].cells[0].operator].name.ends_with("mlp.fc_read"))
+            .unwrap();
+        let cells = &explanation.groups[read].cells[0];
+        let width = explanation.artifact.program.operators[cells.operator].cols.width();
+        let at: Vec<u32> = cells.rows.iter().flat_map(|&r| cells.cols.clone().map(move |c| u32::try_from(r * width + c).unwrap())).collect();
+        device_posterior.remove_entries(scorer.at(cells.operator).unwrap(), &at).unwrap();
+        let with = complexity_terms(&mut scorer, &device_posterior, &explanation, &posterior.active, &batch, (key, false)).unwrap().0;
+        let mut without = posterior.active.clone();
+        for &g in &part {
+            without[g] = false;
+        }
+        let none = complexity_terms(&mut scorer, &device_posterior, &explanation, &without, &batch, (key, false)).unwrap().0;
+        assert!(with > 0.0 && (with - none).abs() <= 1e-12 * with, "the count with the silent part {with}, without it {none}");
+    }
+
+    /// The budget's projection pins the delivered program's count ([`project`]): its count before
+    /// the shift is the hard program's at the posterior mean (each component on where its gate
+    /// node's value in a hard forward is positive, weighed by its concepts), after it that program
+    /// runs at most `K` parts per token, and the shift is the least that does (half of it leaves
+    /// the count above `K`).
+    #[test]
+    fn the_projection_pins_the_delivered_programs_count() {
+        let (native, explanation, sequences) = learned_tiny("library_project_delivered");
+        let (device, settings) = (Device::host(), settings());
+        let posterior = Posterior::new(&explanation, 72).unwrap();
+        let mut device_posterior = DevicePosterior::new(&device, &explanation, &posterior, 72.0, None, 0).unwrap();
+        let mut scorer = Scorer::new(&device, &native, &explanation, &settings).unwrap();
+        let draws = draws(sequences.len(), settings.batch_sequences, settings.seed).unwrap();
+        let batch = draws[0].batch(&sequences).unwrap();
+        let delivered = |scorer: &mut Scorer, device_posterior: &DevicePosterior| -> f64 {
+            let (family, trace) = delivered_trace(scorer, device_posterior, &batch).unwrap();
+            let mut count = 0.0;
+            for stage in scorer.stages.iter().flatten() {
+                let z = device.download(trace.value(stage.component_gate).unwrap()).unwrap();
+                let concepts = stage.concepts(&posterior.active);
+                count += z.rows().into_iter().map(|r| r.iter().zip(&concepts).filter(|(z, _)| **z > 0.0).map(|(_, k)| *k).sum::<f64>()).sum::<f64>();
+            }
+            count / family.rows as f64
         };
-        let unit = |g: usize| (0..groups).map(|i| if i == g { 1.0 } else { 0.0 }).collect::<Vec<f64>>();
-        let zero = count(vec![0.0; groups]);
-        // The last MLP's first c_fc slice: its read and its write.
-        let write = explanation.groups.iter().position(|g| g.name == explanation.groups[read].name.replace(".read", ".write")).unwrap();
-        let (by_read, by_write) = (count(unit(read)) - zero, count(unit(write)) - zero);
-        assert!(by_read > 0.0, "a slice's read weighs its part's runs: {by_read}");
-        assert!((by_read - by_write).abs() <= 1e-12, "the read's {by_read} and the write's {by_write}");
-        let both: Vec<f64> = (0..groups).map(|i| if i == read || i == write { 1.0 } else { 0.0 }).collect();
-        assert!((count(both) - zero - by_read - by_write).abs() <= 1e-12, "the count is linear in the bits");
+        let start = delivered(&mut scorer, &device_posterior);
+        let limit = 0.6 * start;
+        let (shift, before, count) = project(&mut scorer, &mut device_posterior, &explanation, &posterior.active, &batch, limit).unwrap();
+        assert!((before - start).abs() <= 1e-9 * start, "the count before the shift {before} against the delivered program's {start}");
+        let after = delivered(&mut scorer, &device_posterior);
+        assert!(shift > 0.0 && after <= limit && (after - count).abs() <= 1e-9 * start, "the delivered program at {after} parts per token after the shift {shift} (counted {count}) against K {limit}");
+        let (family, trace) = delivered_trace(&mut scorer, &device_posterior, &batch).unwrap();
+        let half = count_terms(&mut scorer, &device_posterior, &explanation, &posterior.active, (&family, &trace), (false, -0.5 * shift, false)).unwrap().0;
+        assert!(half > limit, "half the shift leaves {half} parts per token against K {limit}");
+    }
+
+    /// The budget counts concepts ([`GatedStage::concepts`]): the first layer's always-on part
+    /// (its q, k, v and o slices) adds its gate and three per slice (its read, its write and its
+    /// scale), `1 + 3r` per token, each of its slices 3, and nothing once no slice is left.
+    #[test]
+    fn a_part_counts_its_gate_its_directions_and_its_scales() {
+        let (native, explanation, sequences) = learned_tiny("library_budget_concepts");
+        let (device, settings) = (Device::host(), settings());
+        let posterior = Posterior::new(&explanation, 72).unwrap();
+        let device_posterior = DevicePosterior::new(&device, &explanation, &posterior, 72.0, None, 0).unwrap();
+        let mut scorer = Scorer::new(&device, &native, &explanation, &settings).unwrap();
+        let draws = draws(sequences.len(), settings.batch_sequences, settings.seed).unwrap();
+        let batch = draws[0].batch(&sequences).unwrap();
+        let key = training_key(settings.seed, 0, 0);
+        let slices = scorer.stages[0].iter().find(|s| s.prefix.ends_with(".attn")).unwrap().slices[0].clone();
+        let mut count = |active: &[bool]| complexity_terms(&mut scorer, &device_posterior, &explanation, active, &batch, (key, false)).unwrap().0;
+        let full = count(&posterior.active);
+        let mut one = posterior.active.clone();
+        one[slices[0]] = false;
+        let mut none = posterior.active.clone();
+        for &g in &slices {
+            none[g] = false;
+        }
+        let (by_slice, by_part) = (full - count(&one), full - count(&none));
+        assert!((by_slice - SLICE_CONCEPTS).abs() <= 1e-9, "a slice of the always-on part: {by_slice} concepts per token");
+        assert!((by_part - (1.0 + SLICE_CONCEPTS * slices.len() as f64)).abs() <= 1e-9, "the always-on part of {} slices: {by_part} concepts per token", slices.len());
     }
 
     /// A block across blocks (`library_vpd`: a component gated at the first MLP's input that also
@@ -7104,8 +7118,8 @@ mod tests {
         }
     }
 
-    /// A budget that never binds (`K = ∞`, or `K` far above any count, where `λ` stays 0) leaves
-    /// the fit bit for bit; a finite one records `K`, `Ê[k]` and `λ` in every epoch.
+    /// A budget that never binds (`K = ∞`, or `K` far above any count) leaves the fit bit for bit;
+    /// a finite one records `K` and `Ê[k]` in every epoch.
     #[test]
     fn a_budget_that_never_binds_leaves_the_fit_bit_for_bit() {
         let (native, layers, _, sequences) = tiny("library_budget_free", "relu");
@@ -7126,7 +7140,6 @@ mod tests {
             if budget.is_finite() {
                 for epoch in &fitted.report.epochs {
                     assert_eq!(epoch.budget, Some(budget));
-                    assert_eq!(epoch.multiplier, Some(0.0));
                     assert!(epoch.expected_parts.is_some_and(|k| k > 0.0 && k < budget));
                 }
             }
@@ -7153,6 +7166,7 @@ mod tests {
         let train: Vec<Vec<u32>> = (0..256).map(|_| (0..sequences[0].len()).map(|_| symbols[rng.random_range(0..symbols.len())]).collect()).collect();
         let run = |budget: f64, epochs: usize| {
             let mut settings = settings();
+            settings.bits_back = false;
             settings.epochs = Some(epochs);
             settings.budget = Some(budget);
             fit(&Device::host(), &native, &explanation, &train, held, &settings, "tiny", None, None).unwrap()
@@ -7160,14 +7174,14 @@ mod tests {
         let free = run(1e9, 3);
         let free_parts = free.report.epochs.last().and_then(|e| e.expected_parts).unwrap();
         // The heads count whole; the budget asks for half of the rest.
-        let heads: usize = explanation.layers.iter().map(|l| l.heads.len()).sum();
-        let limit = heads as f64 + 0.5 * (free_parts - heads as f64);
+        let heads: f64 = explanation.layers.iter().flat_map(|l| &l.heads).map(|(_, values)| 1.0 + SLICE_CONCEPTS * values.len() as f64).sum();
+        let limit = heads + 0.5 * (free_parts - heads);
         let bound = run(limit, 30);
         let tail: Vec<f64> = bound.report.epochs.iter().rev().take(6).map(|e| e.expected_parts.unwrap()).collect();
         let mean = tail.iter().sum::<f64>() / tail.len() as f64;
         let spread = (tail.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (tail.len() - 1) as f64 / tail.len() as f64).sqrt();
-        // Every epoch's count and multiplier, for a failure's message.
-        let trace: Vec<String> = bound.report.epochs.iter().map(|e| format!("{:.2} at λ {:.3e}", e.expected_parts.unwrap_or(f64::NAN), e.multiplier.unwrap_or(f64::NAN))).collect();
+        // Every epoch's count, for a failure's message.
+        let trace: Vec<String> = bound.report.epochs.iter().map(|e| format!("{:.2}", e.expected_parts.unwrap_or(f64::NAN))).collect();
         assert!(mean <= limit + spread && mean >= 0.8 * limit, "the last 6 epochs' mean {mean} ± {spread} parts per token against the budget {limit} (free {free_parts}): {trace:?}");
     }
 
@@ -7189,6 +7203,7 @@ mod tests {
         for seed in [3u64, 4, 5, 6, 7] {
             let run = |budget: f64, epochs: usize| {
                 let mut settings = settings();
+                settings.bits_back = false;
                 settings.seed = seed;
                 settings.epochs = Some(epochs);
                 settings.budget = Some(budget);
@@ -7201,7 +7216,7 @@ mod tests {
             let tail: Vec<f64> = bound.report.epochs.iter().rev().take(6).map(|e| e.expected_parts.unwrap()).collect();
             let mean = tail.iter().sum::<f64>() / tail.len() as f64;
             let spread = (tail.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (tail.len() - 1) as f64 / tail.len() as f64).sqrt();
-            let trace: Vec<String> = bound.report.epochs.iter().map(|e| format!("{:.2} at λ {:.3e}", e.expected_parts.unwrap_or(f64::NAN), e.multiplier.unwrap_or(f64::NAN))).collect();
+            let trace: Vec<String> = bound.report.epochs.iter().map(|e| format!("{:.2}", e.expected_parts.unwrap_or(f64::NAN))).collect();
             eprintln!("SEED {seed} mean {mean:.3} ± {spread:.3} K {limit:.3} free {free_parts:.2}: {}", trace.join(" | "));
             if mean > limit + spread || mean < 0.8 * limit {
                 failures.push(format!("seed {seed}: the last 6 epochs' mean {mean} ± {spread} against K {limit} (free {free_parts}): {trace:?}"));
@@ -7219,8 +7234,41 @@ mod tests {
             epochs: None,
             families: Vec::new(),
             budget: None,
-            budget_bits: false,
+            // The tests of the description's machinery run it; the default objective's own tests
+            // and the budget's set it off.
+            bits_back: true,
         }
+    }
+
+    /// Without bits-back (the default objective, `Settings::bits_back` off) a fit's held-out
+    /// objective is its data term, with no description in it, and its device posterior is a
+    /// point: a weight sample of it is its means, bit for bit.
+    #[test]
+    fn the_default_objective_is_the_data_term_alone() {
+        let (native, explanation, sequences) = learned_tiny("library_default_objective");
+        let settings = Settings { bits_back: false, epochs: Some(1), ..settings() };
+        let held = &sequences[..2];
+        let mut symbols: Vec<u32> = sequences.iter().flatten().copied().collect();
+        symbols.sort_unstable();
+        symbols.dedup();
+        let mut rng = StdRng::seed_from_u64(17);
+        let train: Vec<Vec<u32>> = (0..32).map(|_| (0..sequences[0].len()).map(|_| symbols[rng.random_range(0..symbols.len())]).collect()).collect();
+        let device = Device::host();
+        let fitted = fit(&device, &native, &explanation, &train, held, &settings, "tiny", None, None).unwrap();
+        let record = &fitted.report.epochs.last().unwrap().held_out;
+        assert_eq!(record.objective_bits_per_token, record.data_bits_per_token, "the held-out objective is the data term");
+        assert_eq!((record.divergence_bits, record.choice_bits), (0.0, 0.0), "no description");
+        let posterior = Posterior::new(&explanation, 72).unwrap();
+        let device_posterior = device_posterior_of(&device, &explanation, &posterior, (72.0, &settings), (None, 0)).unwrap();
+        let mut scorer = Scorer::new(&device, &native, &explanation, &settings).unwrap();
+        let draws = draws(sequences.len(), settings.batch_sequences, settings.seed).unwrap();
+        let batch = draws[0].batch(&sequences).unwrap();
+        let experiments = scorer.experiments(&draws[0], &sequences).unwrap();
+        let targets = scorer.experiments.targets(&batch, &experiments).unwrap();
+        let mut bits = |values: Values| scorer.pass(&device_posterior, (&batch, &experiments, &targets), (values, Gates::Hard, false), (false, None)).unwrap().bits;
+        let mean = bits(Values::Mean);
+        assert_eq!(bits(Values::Sample(1)), mean, "a weight sample of the point posterior is its mean");
+        assert_eq!(bits(Values::Iterate(2)), mean, "and so is the iterate's");
     }
 
     #[test]
@@ -7860,8 +7908,7 @@ mod tests {
             best: Some((7.0, 3)),
             epochs: Vec::new(),
             removals: Vec::new(),
-            multiplier: 0.0,
-                previous: Some(vec![1.0, 2.0]),
+                    previous: Some(vec![1.0, 2.0]),
             collection: COLLECTION,
             active: vec![false, true],
             done: false,

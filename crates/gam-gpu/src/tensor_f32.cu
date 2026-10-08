@@ -240,6 +240,7 @@ __device__ float law_value(unsigned int code, float t, float c) {
         case 2: return 0.0f;
         case 3: return t / (1.0f + expf(-t));
         case 4: return t * normcdff(t);
+        case 6: return logf(fmaxf(t, 1.17549435e-38f));
         default: {
             float inner = c * (t + 0.044715f * t * t * t);
             return 0.5f * t * (1.0f + tanhf(inner));
@@ -257,6 +258,7 @@ __device__ float law_slope(unsigned int code, float t, float c) {
             return sigma * (1.0f + t * (1.0f - sigma));
         }
         case 4: return normcdff(t) + t * (expf(-0.5f * t * t) * 0.398942280401432678f);
+        case 6: return t > 1.17549435e-38f ? 1.0f / t : 0.0f;
         default: {
             float inner = c * (t + 0.044715f * t * t * t);
             float th = tanhf(inner);

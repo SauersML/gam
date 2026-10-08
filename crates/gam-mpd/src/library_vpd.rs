@@ -5,8 +5,9 @@
 //! The start is `vpd_start`'s: per arm, components of VPD's rank-one slices (site, index), each with
 //! one gate that reads only its own model's input at its own row, so the explanation is causal and
 //! autonomous: no gating network, no all-on pass. A component is on at a row iff its gate's
-//! pre-activation is positive, `‖V_bᵀx‖ − τ_b` (its own read) or `g_bᵀx + c_b − τ_b` (a separate
-//! direction), and then all its slices run (`Node::GroupNorm`, `Node::Gated`). Its rank, the slices
+//! pre-activation is positive, `ln ‖V_bᵀx‖ − ln τ_b` (its own read, on the log scale: a part whose
+//! reads are zero is off; shared own gates read the squared norm, below) or `g_bᵀx + c_b − τ_b` (a
+//! separate direction), and then all its slices run (`Node::GroupNorm`, `Law::Log`, `Node::Gated`). Its rank, the slices
 //! it runs, counts against the per-token budget. The remainder `W − Σ U_i V_iᵀ` is dropped: the
 //! explanation does not use it, so it is not charged.
 //!
@@ -65,7 +66,7 @@ use crate::{
     artifact::{Argument, Artifact, Callee, Owner},
     explanation_battery::{KINDS, Kind, load_factors},
     library_mdl::{Cells, Explanation, Group, Layer, Share, mean_squares},
-    operator_program::{FamilyInputs, Interface, LabelKind, Node, Operator, OperatorProgram, Provenance, Rotary, Rule, Scale, Trace, exact_precision},
+    operator_program::{FamilyInputs, Interface, LabelKind, Law, Node, Operator, OperatorProgram, Provenance, Rotary, Rule, Scale, Trace, exact_precision},
     run_check::LayerNodes,
 };
 use ndarray::{Array1, Array2, Axis, s};
@@ -159,6 +160,20 @@ fn dense(name: &str, rows: Interface, cols: Interface, values: Array2<f64>) -> R
 /// Rows grouped by component: one group per entry of `widths` (all positive).
 fn grouped(widths: &[usize]) -> Result<Interface, String> {
     Interface::new(widths.iter().enumerate().map(|(b, &width)| crate::operator_program::Group { width, label: crate::operator_program::Label::new(LabelKind::Unit, b as u32) }).collect()).map_err(error)
+}
+
+/// An unshared own gate's threshold on the log scale of its read norm (toys' guard, cd27062d48): the
+/// gate is `ln max(n, t₀) − ln τ` (`Law::Log`, `t₀` its floor), so a part whose reads are zero on a
+/// token is off there by `ln τ − ln t₀` (about 87 e-folds at `τ = 1`), and its gate's training noise
+/// is relative. A start's `τ ≤ 0` (on everywhere) is one e-fold past every read's log, `1 − ln t₀`.
+fn log_threshold(tau: f64) -> f64 {
+    if tau > 0.0 { -tau.ln() } else { 1.0 - gam_gpu::tensor::LOG_FLOOR.ln() }
+}
+
+/// A learned own gate's width on the log scale, in e-folds: the start's width `w` over its threshold
+/// (`d ln n = dn / n` at `n = τ`), one e-fold where `τ ≤ 0`.
+fn log_width(width: f64, tau: f64) -> f64 {
+    if tau > 0.0 { width / tau } else { 1.0 }
 }
 
 fn units(width: usize) -> Result<Interface, String> {
@@ -456,7 +471,7 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
                 false => {
                     let tau = |b: usize| components[comps[b]].tau;
                     ops.push(Operator::identity(format!("{prefix}.gate_identity"), units(count)?));
-                    ops.push(dense(&format!("{prefix}.threshold"), units(count)?, Interface::constant(), Array2::from_shape_fn((count, 1), |(b, _)| if squared { -tau(b) * tau(b).abs() } else { -tau(b) }))?);
+                    ops.push(dense(&format!("{prefix}.threshold"), units(count)?, Interface::constant(), Array2::from_shape_fn((count, 1), |(b, _)| if squared { -tau(b) * tau(b).abs() } else { log_threshold(tau(b)) }))?);
                 }
                 true => {
                     let w = cols.width();
@@ -477,8 +492,13 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
                 Gate::Learned => comps.iter().map(|&b| components[b].width.filter(|w| w.is_finite() && *w > 0.0).ok_or_else(|| error(format!("component {b}: no positive gate width in the start file (rerun mpd_battery_2951 start)")))).collect::<Result<Vec<f64>, String>>()?,
             };
             // A shared own gate's width on the squared norm has the norm's slope at the threshold:
-            // d‖·‖²/d‖·‖ = 2τ there (2w for a threshold below one width).
-            let width = |b: usize| if (share || squared) && !direction && gate != Gate::Hard { 2.0 * widths[b] * components[comps[b]].tau.max(widths[b]) } else { widths[b] };
+            // d‖·‖²/d‖·‖ = 2τ there (2w for a threshold below one width); an unshared own gate's
+            // is on the log scale ([`log_width`]).
+            let width = |b: usize| match (share || squared, direction, gate) {
+                (_, _, Gate::Hard) | (_, true, _) => widths[b],
+                (true, false, Gate::Learned) => 2.0 * widths[b] * components[comps[b]].tau.max(widths[b]),
+                (false, false, Gate::Learned) => log_width(widths[b], components[comps[b]].tau),
+            };
             ops.push(dense(&format!("{prefix}.width"), units(count)?, Interface::constant(), Array2::from_shape_fn((count, 1), |(b, _)| width(b)))?);
             if share && direction {
                 ops.push(dense(&format!("{prefix}.assign"), units(count)?, units(count)?, Array2::eye(count))?);
@@ -490,8 +510,9 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
         // gate node, width node).
         // With `extra` (the carried components' gate parts), the gated reads, gated by the carried
         // gates then the stage's own; without, its own gates alone. `own` selects the own
-        // components' read norms where carried rows come first in the read.
-        let stage_nodes = |nodes: &mut Vec<Node>, input: usize, (read, gate_a, gate_b, soft): (usize, usize, usize, usize), assign: Option<usize>, direction: bool, own: Option<usize>, extra: Option<(Vec<usize>, Vec<usize>)>| -> (Option<usize>, usize, usize) {
+        // components' read norms where carried rows come first in the read; an unshared own gate
+        // reads their logs (`groups` of them, [`log_threshold`]).
+        let stage_nodes = |nodes: &mut Vec<Node>, input: usize, (read, gate_a, gate_b, soft): (usize, usize, usize, usize), assign: Option<usize>, direction: bool, own: Option<usize>, extra: Option<(Vec<usize>, Vec<usize>)>, groups: usize| -> (Option<usize>, usize, usize) {
             // A shared stage (`assign`, gates × components): the gates' pre-activations and widths,
             // then each component's own, z_b = Σ_m A_mb z_m and w_b = Σ_m A_mb w_m (a 0/1
             // assignment gives each component its gate's), before the reads.
@@ -533,6 +554,7 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
                 nodes.push(Node::Affine { terms: vec![(input, read)], bias: None });
                 let a = nodes.len() - 1;
                 nodes.push(Node::GroupNorm { input: a });
+                nodes.push(Node::Pointwise { input: a + 1, laws: vec![Law::Log; groups] });
                 if let Some(select) = own {
                     nodes.push(Node::Affine { terms: vec![(nodes.len() - 1, select)], bias: None });
                 }
@@ -651,7 +673,7 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
                 nodes.push(Node::Gated { value: a, gate: z, scale: Some(w) });
                 (Some(nodes.len() - 1), z, w)
             } else {
-                stage_nodes(&mut nodes, 0, (read_op, gate_a, gate_b, soft), assign, a_direction, own, Some(parts))
+                stage_nodes(&mut nodes, 0, (read_op, gate_a, gate_b, soft), assign, a_direction, own, Some(parts), widths.len())
             };
             let gated = gated.ok_or("the gated reads")?;
             let mut projections = Vec::new();
@@ -739,7 +761,7 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
                 );
                 let assign = if attn_shared { Some(index_of(&artifact.program, &format!("{name}.attn.assign"))?) } else { None };
                 let own = if a_own { Some(index_of(&artifact.program, &format!("{name}.attn.select_own"))?) } else { None };
-                let (_, z, s) = stage_nodes(&mut nodes, heads, stage_ops, assign, a_direction, own, None);
+                let (_, z, s) = stage_nodes(&mut nodes, heads, stage_ops, assign, a_direction, own, None, widths.len());
                 operators.push(dense(&format!("{name}.o.select_gate"), units(carried.len())?, units(a_comps.len())?, selection(&carried, a_comps.len()))?);
                 nodes.push(Node::Affine { terms: vec![(z, base + operators.len() - 1)], bias: None });
                 gate_parts.push(nodes.len() - 1);
@@ -761,6 +783,7 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
                     nodes.push(Node::Affine { terms: vec![(c, first)], bias: Some(first + 1) });
                 } else {
                     nodes.push(Node::GroupNorm { input: late.ok_or_else(|| error(format!("layer {l}: own o gates without the o reads")))? });
+                    nodes.push(Node::Pointwise { input: nodes.len() - 1, laws: vec![Law::Log; o_carriers.len()] });
                     nodes.push(Node::Affine { terms: vec![(nodes.len() - 1, select)], bias: None });
                     nodes.push(Node::Affine { terms: vec![(nodes.len() - 1, first)], bias: Some(first + 1) });
                 }
@@ -878,6 +901,7 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
                 nodes.push(Node::Gated { value: a, gate: z, scale: Some(s) });
                 (nodes.len() - 1, z, s)
             } else {
+                nodes.push(Node::Pointwise { input: nodes.len() - 1, laws: vec![Law::Log; f_comps.len()] });
                 nodes.push(Node::Affine { terms: vec![(nodes.len() - 1, base + 4)], bias: Some(base + 5) });
                 let z = nodes.len() - 1;
                 nodes.push(Node::Constant { operator: base + 6 });
@@ -886,7 +910,7 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
                 (nodes.len() - 1, z, s)
             }
         } else {
-            let (gated, z, s) = stage_nodes(&mut nodes, 0, (base, base + 4, base + 5, base + 6), fc_assign, f_direction, fc_own, Some(fc_parts));
+            let (gated, z, s) = stage_nodes(&mut nodes, 0, (base, base + 4, base + 5, base + 6), fc_assign, f_direction, fc_own, Some(fc_parts), fc_widths.len());
             (gated.ok_or("the gated reads")?, z, s)
         };
         nodes.push(Node::Affine { terms: vec![(gated, base + 1)], bias: None });
@@ -921,6 +945,7 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
                 nodes.push(Node::Affine { terms: vec![(act, first)], bias: Some(first + 1) });
             } else {
                 nodes.push(Node::GroupNorm { input: late.ok_or_else(|| error(format!("layer {l}: own down gates without the down reads")))? });
+                nodes.push(Node::Pointwise { input: nodes.len() - 1, laws: vec![Law::Log; dn_carriers.len()] });
                 nodes.push(Node::Affine { terms: vec![(nodes.len() - 1, select)], bias: None });
                 nodes.push(Node::Affine { terms: vec![(nodes.len() - 1, first)], bias: Some(first + 1) });
             }
@@ -1539,8 +1564,8 @@ fn set_gate(part: &mut Dumped, read: String, (on, tau, g): StageGate) {
 /// `artifact`'s values (a checkpoint's posterior mean, or the start's): a part per gate with its
 /// member components (each component of an unshared stage; components that share a gate, gate
 /// sharing, one part of their summed rank), per part its slices' writes `U` and reads `V` on each of `M`'s operators it
-/// spans (export names, `W = U Vᵀ`), its gate (own: `z = ‖V_bᵀx‖ − τ_b` over its reads at its
-/// stage; direction: `z = g_bᵀx − τ_b`, the threshold's constant folded into `τ_b`), and its hard
+/// spans (export names, `W = U Vᵀ`), its gate (own: on where `‖V_bᵀx‖ > τ_b` over its reads at
+/// its stage, the gate `ln ‖V_bᵀx‖ − ln τ_b`; direction: `z = g_bᵀx − τ_b`, the threshold's constant folded into `τ_b`), and its hard
 /// gate `z > 0` on every row of `inputs` in `P`'s own run (`artifact` executed on the host; a down
 /// gate on its own read reads the MLP's activations recomputed from the gated `c_fc` reads, as the
 /// MLP's rule computes them). Written to `dir`: `parts.json`, each slice set's `U` (out × r) and
@@ -1611,9 +1636,15 @@ pub fn dump_parts(native: &OperatorProgram, layers: &[LayerNodes], artifact: &Ar
                     })
                     .collect()
             }
-            (None, _) => spans.iter().zip(threshold.column(0)).map(|(r, t)| a.slice(s![.., r.clone()]).map_axis(Axis(1), |row| row.dot(&row).sqrt()) + *t).collect(),
+            (None, _) => spans.iter().zip(threshold.column(0)).map(|(r, t)| a.slice(s![.., r.clone()]).map_axis(Axis(1), |row| row.dot(&row).sqrt().max(gam_gpu::tensor::LOG_FLOOR).ln()) + *t).collect(),
         };
-        let tau = |m: usize| if pooled && directions.is_none() { -threshold[[m, 0]].signum() * threshold[[m, 0]].abs().sqrt() } else { -threshold[[m, 0]] };
+        // An own gate's τ in its read norm's units: the pooled gate's on the squared norm, the
+        // unpooled one's on its log.
+        let tau = |m: usize| match (&directions, pooled) {
+            (Some(_), _) => -threshold[[m, 0]],
+            (None, true) => -threshold[[m, 0]].signum() * threshold[[m, 0]].abs().sqrt(),
+            (None, false) => (-threshold[[m, 0]]).exp(),
+        };
         let out = gate_of
             .iter()
             .map(|&m| if m < own { (z[m].iter().map(|v| *v > 0.0).collect(), tau(m), directions.as_ref().map(|g| g.row(m).to_vec())) } else { (vec![false; x.nrows()], f64::NAN, None) })

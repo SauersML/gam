@@ -341,9 +341,12 @@ pub enum Law {
     /// The tanh GELU `½ t (1 + tanh(√(2/π) (t + 0.044715 t³)))`, with the constants as the
     /// architecture declares them.
     GeluTanh,
+    /// `ln max(t, t₀)`, `t₀` f32's smallest normal (`gam_gpu::tensor::LOG_FLOOR`): a log-scale
+    /// gate's read of a norm (`library_vpd`), finite where the norm is zero.
+    Log,
 }
 
-pub const LAWS: [Law; 6] = [Law::Relu, Law::Identity, Law::Zero, Law::Silu, Law::Gelu, Law::GeluTanh];
+pub const LAWS: [Law; 7] = [Law::Relu, Law::Identity, Law::Zero, Law::Silu, Law::Gelu, Law::GeluTanh, Law::Log];
 
 /// The largest slope of the tanh GELU is below this (it peaks at about 1.1289 near `t ≈ 1.5`).
 const GELU_TANH_LIPSCHITZ: f64 = 1.13;
@@ -376,6 +379,7 @@ impl Law {
             Self::Silu => silu(t),
             Self::Gelu => t * normal_cdf_and_pdf(t).0,
             Self::GeluTanh => gelu_tanh(t),
+            Self::Log => t.max(gam_gpu::tensor::LOG_FLOOR).ln(),
         }
     }
 
@@ -405,10 +409,18 @@ impl Law {
                 let th = inner.tanh();
                 0.5 * (1.0 + th) + 0.5 * t * (1.0 - th * th) * c * (1.0 + 3.0 * 0.044715 * t * t)
             }
+            Self::Log => {
+                if t > gam_gpu::tensor::LOG_FLOOR {
+                    1.0 / t
+                } else {
+                    0.0
+                }
+            }
         }
     }
 
-    /// A bound on the law's slope: its Lipschitz constant on the reals.
+    /// A bound on the law's slope: its Lipschitz constant on the reals (none for the log, whose
+    /// slope `1/t` is unbounded above its floor).
     pub fn lipschitz(self) -> f64 {
         match self {
             Self::Relu | Self::Identity => 1.0,
@@ -416,6 +428,7 @@ impl Law {
             Self::Silu => SILU_LIPSCHITZ,
             Self::Gelu => GELU_LIPSCHITZ,
             Self::GeluTanh => GELU_TANH_LIPSCHITZ,
+            Self::Log => f64::INFINITY,
         }
     }
 
@@ -447,6 +460,13 @@ impl Law {
                 + input.abs() * NORMAL_CDF_UNDERFLOW_FLOOR
                 + UNIT_ROUNDOFF * value.abs())
             .next_up(),
+            // On `[t − r, t + r]` the log moves by `r / (t − r)` where that stays above the floor,
+            // and otherwise spans `[ln t₀, ln(t + r)]`; libm's log adds an ulp (`2u` of the value).
+            Self::Log => {
+                let floor = gam_gpu::tensor::LOG_FLOOR;
+                let moved = if input - r > floor { r / (input - r) } else { (value - floor.ln()).max((input + r).max(floor).ln() - value) };
+                (moved + 2.0 * UNIT_ROUNDOFF * value.abs()).next_up()
+            }
         }
     }
 }
@@ -1988,7 +2008,7 @@ impl OperatorProgram {
             Node::Pointwise { laws, input } => {
                 let (out, radius) = self.evaluate_node(index, node, inputs, values, Some(bands), interfaces, frame)?;
                 let lipschitz = laws.iter().map(|law| law.lipschitz()).fold(0.0_f64, f64::max);
-                let rho = ball(*input).mapv(|v| (lipschitz * v).next_up());
+                let rho = ball(*input).mapv(|v| if v == 0.0 { 0.0 } else { (lipschitz * v).next_up() });
                 Ok((out, radius.unwrap_or_else(|| Array2::zeros((rows, 0))), rho))
             }
             Node::RmsNorm { input, epsilon } => {

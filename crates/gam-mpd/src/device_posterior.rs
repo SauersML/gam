@@ -134,6 +134,8 @@ pub struct DevicePosterior {
     /// The trust factor on the line step's length ([`DevicePosterior::trust_update`]), in `(0, 1]`.
     trust: f64,
     hold: bool,
+    /// A point posterior ([`DevicePosterior::set_point`]).
+    point: bool,
     /// Per group `(n, Σ μ² + σ², Σ 2s)` being summed, its variance, its divergence in nats with
     /// its variance's scale bits (groups × 2), and its reference variance when its code has a scale
     /// ([`Device::group_divergence`]).
@@ -345,6 +347,7 @@ impl DevicePosterior {
             last_eta: 0.0,
             trust: 1.0,
             hold: false,
+            point: false,
             operators: parts.operators.to_vec(),
             fitting: fitting.clone(),
             wide,
@@ -364,7 +367,22 @@ impl DevicePosterior {
         for ((mean, log_sd), groups) in self.average.iter().zip(&self.log_sd).zip(&self.groups) {
             self.fitting.group_moments((mean, log_sd), groups, &mut self.sums).map_err(error)?;
         }
-        self.wide.group_divergence(&mut self.sums, self.reference.as_ref(), &mut self.variance, &mut self.divergence).map_err(error)
+        self.wide.group_divergence(&mut self.sums, self.reference.as_ref(), &mut self.variance, &mut self.divergence).map_err(error)?;
+        if self.point {
+            self.divergence = self.wide.zeros(self.divergence.rows(), self.divergence.cols()).map_err(error)?;
+        }
+        Ok(())
+    }
+
+    /// Makes the posterior a point (`library_mdl` without bits-back, the default objective): every
+    /// sample of it is its means (the iterate's or the average's, no weight noise) and its groups'
+    /// divergences are zero, so no description enters a move's test or a snapshot. The deviations
+    /// stay IVON's curvature `σ² = 1 / (N (h + 1/(N v)))`, and the step keeps the groups'
+    /// empirical-Bayes precision `1 / (N v)` as its damping: it vanishes as the data grows, and
+    /// without it an entry the data leaves flat (`h = 0`) would take an unbounded step.
+    pub fn set_point(&mut self) -> Result<(), String> {
+        self.point = true;
+        self.refresh()
     }
 
     /// The iterate set to the posterior's mean, the average restarted there, and the groups'
@@ -477,6 +495,9 @@ impl DevicePosterior {
     /// The operators held in place and the stacks' blocks are gathered and written together
     /// ([`Device::run_samples`]); an operator replaced (a bias's column copy) is written first.
     fn sample_of(&self, program: &mut DeviceProgram, key: u64, means: &[Tensor]) -> Result<(), String> {
+        if self.point {
+            return self.means_into(program, means);
+        }
         let mut samples = self.fitting.samples(key);
         for (i, &op) in self.operators.iter().enumerate() {
             let parts = (&means[i], &self.log_sd[i]);
@@ -876,19 +897,6 @@ impl DevicePosterior {
         Ok((pending.means.get(i).ok_or_else(|| error("no such trainable operator"))?, self.log_sd.get(i).ok_or_else(|| error("no such trainable operator"))?))
     }
 
-    /// A pending move of the iterate to `posterior`'s means from where it is, for a test of the
-    /// move's old side.
-    #[cfg(test)]
-    pub(crate) fn propose(&mut self, posterior: &Posterior) -> Result<(), String> {
-        let means = self.mean.iter().map(|m| self.fitting.copy(m)).collect::<Result<Vec<_>, _>>().map_err(error)?;
-        let averages = self.average.iter().map(|m| self.fitting.copy(m)).collect::<Result<Vec<_>, _>>().map_err(error)?;
-        for (i, values) in posterior.mean.iter().enumerate() {
-            self.mean[i] = self.fitting.upload(values.view()).map_err(error)?;
-        }
-        self.pending = Some(Pending { means, averages, divergence_nats: 0.0, predicted: 0.0 });
-        Ok(())
-    }
-
     /// Trainable operator `i`'s iterate `μ` on the host, whose Polyak average is the posterior's
     /// mean.
     pub fn iterate(&self, i: usize) -> Result<Array2<f64>, String> {
@@ -1021,6 +1029,24 @@ impl DevicePosterior {
         self.refresh()
     }
 
+}
+
+/// Test support for other modules' tests.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::{DevicePosterior, Pending, Posterior, error};
+
+    /// A pending move of `device`'s iterate to `posterior`'s means from where it is, for a test of
+    /// the move's old side.
+    pub(crate) fn propose(device: &mut DevicePosterior, posterior: &Posterior) -> Result<(), String> {
+        let means = device.mean.iter().map(|m| device.fitting.copy(m)).collect::<Result<Vec<_>, _>>().map_err(error)?;
+        let averages = device.average.iter().map(|m| device.fitting.copy(m)).collect::<Result<Vec<_>, _>>().map_err(error)?;
+        for (i, values) in posterior.mean.iter().enumerate() {
+            device.mean[i] = device.fitting.upload(values.view()).map_err(error)?;
+        }
+        device.pending = Some(Pending { means, averages, divergence_nats: 0.0, predicted: 0.0 });
+        Ok(())
+    }
 }
 
 #[cfg(test)]
