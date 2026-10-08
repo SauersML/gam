@@ -1635,10 +1635,18 @@ def dest_k_scores(l, h, q, causal):
         kbar = cm @ U_                                                           # [H, 1, HD], the mean key part
     Qr = q / math.sqrt(HD)
     cos, sin = T.cos[:T_].T.contiguous(), T.sin[:T_].T.contiguous()             # [HD, T]
+    # The bound skip (descent, 10-08): |c(u) (Qr_t . rope_u(u_c))| <= max over u <= t of |c(u)| ||Qr_t|| ||u_c|| (RoPE keeps
+    # norms). Where that bound is below tau - 2 s the slice's z is below -2: its signal is not computed and its gate is
+    # off with Phi 0 (z set to -1e4). Such a slice is off in the forward and outside the z > -2 candidates either way;
+    # only its Phi <= 0.023 leaves the soft concept count and the straight-through gradient. Not in calibration.
+    skip = state.get('calib') is None
     with torch.no_grad():
+        if skip:
+            ub = c.detach().abs().cummax(2).values * Qr.detach().norm(dim=-1)[..., None] * U_.detach().norm(dim=-1)[None, :, None, :]
+            thr = (p['tau'] - 2 * p['s']).detach()
         # Each slice's signal at each query: max over u <= t of |c(u) (Qr_t . rope_u(u_c))|, TF32 (gate input only).
         if dev == 'cuda':
-            sig = dest_kernels.dest_signal(Qr.detach(), c.detach(), U_.detach(), T.cos[:T_], T.sin[:T_])
+            sig = dest_kernels.dest_signal(Qr.detach(), c.detach(), U_.detach(), T.cos[:T_], T.sin[:T_], *((ub, thr) if skip else ()))
         else:
             sig = torch.empty(B_, NH, T_, C_, device=h.device)
             cc = max(1, int(2e8 // (B_ * NH * T_ * T_)))
@@ -1650,6 +1658,8 @@ def dest_k_scores(l, h, q, causal):
     if state.get('calib') is not None:
         state['calib'].setdefault(n, []).append(sig)
     z = (sig - p['tau'][None, :, None, :]) / p['s'][None, :, None, :]
+    if skip:
+        z = torch.where(ub < thr[None, :, None, :], torch.full_like(z, -1e4), z)
     hard, phi = (z > 0).float(), 0.5 * (1 + torch.erf(z / SQ2))
     if state['force_on']:
         on = torch.tensor(state['force_on'], device=hard.device)

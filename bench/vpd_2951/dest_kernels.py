@@ -32,9 +32,9 @@ TILES = ((64, 64), (32, 32), (16, 16))
 
 
 @triton.jit
-def _dest_signal(Q, Cf, U, COS, SIN, OUT, T, C,
+def _dest_signal(Q, Cf, U, COS, SIN, OUT, UB, THR, T, C,
                  sq_bh, sq_t, sc_bh, sc_t, su_h, su_c, so_bh, so_t,
-                 NH: tl.constexpr, HD: tl.constexpr, BT: tl.constexpr, BU: tl.constexpr, CB: tl.constexpr):
+                 NH: tl.constexpr, HD: tl.constexpr, BT: tl.constexpr, BU: tl.constexpr, CB: tl.constexpr, SKIP: tl.constexpr):
     bh = tl.program_id(0); tb = tl.program_id(1); cb = tl.program_id(2)
     h = bh % NH
     t = tb * BT + tl.arange(0, BT)
@@ -47,7 +47,15 @@ def _dest_signal(Q, Cf, U, COS, SIN, OUT, T, C,
     t_end = tl.minimum(tb * BT + BT, T)
     for ci in range(CB):
         c = cb * CB + ci
-        if c < C:
+        # SKIP: a slice whose bound UB (>= the signal) is below THR at every query of the block is not computed (OUT -1).
+        need = c < C
+        if SKIP:
+            ubt = tl.load(UB + bh * so_bh + t * so_t + tl.minimum(c, C - 1), mask=t < T, other=float('-inf'))
+            live = tl.max(ubt, axis=0) >= tl.load(THR + h * C + tl.minimum(c, C - 1))
+            if (c < C) & (live == 0):
+                tl.store(OUT + bh * so_bh + t * so_t + c, tl.full([BT], -1.0, tl.float32), mask=t < T)
+            need = need & live
+        if need:
             u_c = tl.load(U + h * su_h + c * su_c + d)                                                      # [HD]
             r_c = tl.load(U + h * su_h + c * su_c + dr) * sg
             best = tl.zeros([BT], dtype=tl.float32)
@@ -64,14 +72,21 @@ def _dest_signal(Q, Cf, U, COS, SIN, OUT, T, C,
             tl.store(OUT + bh * so_bh + t * so_t + c, best, mask=t < T)
 
 
-def dest_signal(Qr, c, U, cos, sin, CB=16):
-    """Qr [B, H, T, HD], c [B, H, T, C], U [H, C, HD], cos/sin [T, HD] (float32, CUDA): sig [B, H, T, C]."""
+def dest_signal(Qr, c, U, cos, sin, ub=None, thr=None, CB=16):
+    """Qr [B, H, T, HD], c [B, H, T, C], U [H, C, HD], cos/sin [T, HD] (float32, CUDA): sig [B, H, T, C]. With a bound
+    ub [B, H, T, C] (>= sig) and thresholds thr [H, C], a slice's block of queries where ub < thr everywhere is not
+    computed (sig -1 there)."""
     B, H, T_, HD = Qr.shape; C = c.shape[-1]
     Qf = Qr.reshape(B * H, T_, HD).contiguous(); cf = c.reshape(B * H, T_, C).contiguous(); Uc = U.contiguous()
     out = torch.empty(B * H, T_, C, device=Qr.device, dtype=torch.float32)
+    skip = ub is not None
+    if skip:
+        ub = ub.reshape(B * H, T_, C).contiguous(); thr = thr.contiguous()
+    else:
+        ub, thr = out, out
     _launch(_dest_signal, lambda BT, BU: (B * H, triton.cdiv(T_, BT), triton.cdiv(C, CB)),
-            (Qf, cf, Uc, cos.contiguous(), sin.contiguous(), out, T_, C, Qf.stride(0), Qf.stride(1), cf.stride(0), cf.stride(1),
-             Uc.stride(0), Uc.stride(1), out.stride(0), out.stride(1)), dict(NH=H, HD=HD, CB=CB, num_stages=1), TILES)
+            (Qf, cf, Uc, cos.contiguous(), sin.contiguous(), out, ub, thr, T_, C, Qf.stride(0), Qf.stride(1), cf.stride(0), cf.stride(1),
+             Uc.stride(0), Uc.stride(1), out.stride(0), out.stride(1)), dict(NH=H, HD=HD, CB=CB, SKIP=skip, num_stages=1), TILES)
     return out.view(B, H, T_, C)
 
 
