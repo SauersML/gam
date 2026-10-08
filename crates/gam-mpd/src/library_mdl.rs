@@ -7175,6 +7175,40 @@ mod tests {
         assert!(full.iter().zip(&none).all(|(a, b)| (a - b - whole).abs() <= 1e-9), "the always-on part of {} slices: {full:?} against {none:?}", slices.len());
     }
 
+    /// The constrained objective's argmin is the same in any unit of concepts
+    /// ([`Settings::kl_limit`]): the concept term enters the step, the assignments' pull and the
+    /// move's test only as `C / μ`, and with every count `s` times larger the multiplier starts `s`
+    /// times larger ([`multiplier_start`]) and its dual step keeps the factor ([`dual_step`]), so
+    /// every step is the same. The multiplier rises while the delivered KL is above `κ`, falls
+    /// below it, and stays at it.
+    #[test]
+    fn the_constrained_argmin_is_the_same_in_any_unit_of_concepts() {
+        let (native, explanation, sequences) = learned_tiny("library_concept_unit");
+        let (device, settings) = (Device::host(), settings());
+        let posterior = Posterior::new(&explanation, 72).unwrap();
+        let device_posterior = DevicePosterior::new(&device, &explanation, &posterior, 72.0, None, 0).unwrap();
+        let mut scorer = Scorer::new(&device, &native, &explanation, &settings).unwrap();
+        let draws = draws(sequences.len(), settings.batch_sequences, settings.seed).unwrap();
+        let batch = draws[0].batch(&sequences).unwrap();
+        let experiments = scorer.experiments(&draws[0], &sequences).unwrap();
+        let key = training_key(settings.seed, 0, 0);
+        let (_, mut data) = antithetic_step(&mut scorer, (&device, &device_posterior), &batch, experiments, key).unwrap();
+        data.combine(&device).unwrap();
+        let (_, terms) = complexity_terms(&mut scorer, &device_posterior, &explanation, &posterior.active, &batch, (key, false)).unwrap();
+        let s = 3.0;
+        let scaled: Vec<(usize, Tensor, Tensor)> = terms.iter().map(|(i, m, v)| (*i, device.upload((device.download(m).unwrap() * s).view()).unwrap(), device.upload((device.download(v).unwrap() * s).view()).unwrap())).collect();
+        let one = multiplier_start(&device, &scorer, &explanation, &terms, &data.gradient).unwrap();
+        let other = multiplier_start(&device, &scorer, &explanation, &scaled, &data.gradient).unwrap();
+        assert!(one > 0.0 && one != 1.0, "a start from the thresholds' balance: {one}");
+        assert!((other - s * one).abs() <= 1e-12 * other, "the start in the unit {s}: {other} against {}", s * one);
+        let limit = 0.553;
+        for kl in [0.0, 0.2, limit, 1.0, 50.0] {
+            let (a, b) = (dual_step(one, (kl, limit)), dual_step(s * one, (kl, limit)));
+            assert!((b - s * a).abs() <= 1e-12 * b, "the dual step at KL {kl} keeps the unit: {b} against {}", s * a);
+        }
+        assert!(dual_step(one, (1.0, limit)) > one && dual_step(one, (0.2, limit)) < one && dual_step(one, (limit, limit)) == one, "the multiplier follows the delivered KL");
+    }
+
     /// The concept term pulls a shared stage's assignment (its gradient, the expected concepts
     /// under the assignment's softmax, [`complexity_terms`]): its derivative in the second
     /// layer's MLP assignment logits, chained through the softmax (`Assignment::gather`), is nonzero
