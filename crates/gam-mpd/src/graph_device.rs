@@ -396,9 +396,13 @@ fn copy_standins(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, r: &
         s.device.gather_rows(s.reference(r, (field, layer, 0))?, within).map_err(e)
     };
     let embed = tiled(s, Field::Embed, 0)?;
+    // Sites a resumed or halted run does not compute need none.
+    let (from, until) = (c.resume.as_ref().map_or(0, |(site, _)| *site), c.halt.unwrap_or(usize::MAX));
     let mut out = Vec::with_capacity(circuit.units.len());
     for (u, unit) in circuit.units.iter().enumerate() {
+        let site = unit.block.site();
         let w = match &unit.block {
+            _ if site < from || site >= until => s.device.zeros(rows, width).map_err(e)?,
             Block::Slices { layer, down, rest: true, .. } if !unit.computes => {
                 let mlp = weights.layers[*layer].mlp.as_ref().ok_or("a VPD view of a layer without an MLP")?;
                 let vpd = weights.vpd.get(layer).ok_or_else(|| format!("layer {layer} has no VPD view"))?;
@@ -508,7 +512,7 @@ fn standins(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, r: &Refer
     Ok((embed, out))
 }
 
-/// Copies of one batch run together as one batch ([`run_stacked`]): `count` copies of `rows` rows
+/// Copies of one batch run together as one batch ([`execute_copies`]): `count` copies of `rows` rows
 /// each, copy `j` at rows `j·rows..(j + 1)·rows`, each naming its own subcomponents of the merged
 /// circuit's VPD units.
 pub(crate) struct Copies {
@@ -523,6 +527,17 @@ pub(crate) struct Copies {
     /// counterfactual write of the `down_proj` or `o_proj` parts the copy does not name: the full
     /// counterfactual write less the named ones' (by the copy's counts).
     pub standin: Option<std::sync::Arc<Reference>>,
+    /// Start at this site with this stream (one copy's rows, tiled over the copies): the copies
+    /// agree before it, so a one-copy run made that prefix ([`Copies::halt`]).
+    pub resume: Option<(usize, Array2<f64>)>,
+    /// Stop before this site: the run's execution holds the stream entering it in place of
+    /// log-probabilities ([`prefix_stream`]).
+    pub halt: Option<usize>,
+}
+
+/// The stream entering site `halt` of a stacked run halted there ([`Copies::halt`]).
+pub(crate) fn prefix_stream(execution: Execution) -> Array2<f64> {
+    execution.log_probabilities
 }
 
 /// A stacked run's rows by copy: each row's copy and its row within the copy.
@@ -547,16 +562,10 @@ type Masked<'a> = Option<(&'a CopyMask, &'a gam_gpu::tensor::Indices, usize)>;
 /// copy's scored rows in turn, and `copies` what each copy names. A unit's named part on a copy's
 /// rows is its subcomponents weighted by the copy's counts, so each copy computes as its own
 /// circuit, with one product per matrix and one attention call for all of them. Returns each
-/// copy's log-probabilities at its scored rows; `None` without a device or for a view it does not
-/// cover.
-pub(crate) fn run_stacked(weights: &Weights, circuit: &Circuit, job: &Run, copies: &Copies) -> Option<Result<Vec<Array2<f64>>, String>> {
-    // The copies' log-softmax runs on the calling thread, as in `run`.
-    execute_copies(weights, circuit, job, copies).map(|out| out.and_then(|execution| per_copy(execution, copies.count)))
-}
-
-/// [`run_stacked`]'s execution as the device returns it: the logits at the scored rows of every
-/// copy in turn, and for a run scoring no rows (a donor run) every unit's write, the kept normed
-/// inputs and heads' reads, over all the copies' rows.
+/// copy's execution as the device returns it: the logits at the scored rows of every copy in turn
+/// (split and normalized on the calling thread by [`per_copy`]), and for a run scoring no rows (a
+/// donor run) every unit's write, the kept normed inputs and heads' reads over all the copies'
+/// rows; `None` without a device or for a view it does not cover.
 pub(crate) fn execute_copies(weights: &Weights, circuit: &Circuit, job: &Run, copies: &Copies) -> Option<Result<Execution, String>> {
     if !stack_covered(weights, circuit, job, copies) {
         return None;
@@ -797,7 +806,7 @@ pub(crate) fn logits_on_device(s: &mut DeviceState, weights: &Weights, circuit: 
     copies_on(s, weights, circuit, job, None)
 }
 
-/// [`logits_on_device`], with `copies` the stacked run's ([`run_stacked`]; the tests run it on the
+/// [`logits_on_device`], with `copies` the stacked run's ([`execute_copies`]; the tests run it on the
 /// host backend, its logits split by [`per_copy`]).
 pub(crate) fn copies_on(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, job: &Run, copies: Option<&Copies>) -> Result<Execution, String> {
     let e = |e: GpuError| e.to_string();
@@ -871,10 +880,30 @@ pub(crate) fn copies_on(s: &mut DeviceState, weights: &Weights, circuit: &Circui
         c.embed = s.device.download(&st.embed).map_err(e)?;
     }
     after(&s.device, ops, None, &mut st).map_err(e)?;
+    // A stacked run resumed after the copies' shared prefix starts from its stream.
+    let (resume_at, halt_at) = match copy_rows.as_ref() {
+        Some((c, _, within)) => {
+            if let Some((site, prefix)) = &c.resume {
+                let one = s.device.upload(prefix.view()).map_err(e)?;
+                st.stream = s.device.gather_rows(&one, within).map_err(e)?;
+                (*site, c.halt)
+            } else {
+                (0, c.halt)
+            }
+        }
+        None => (0, None),
+    };
     let mut at = 0;
     while at < order.len() {
         let site = circuit.units[order[at]].block.site();
         let end = order[at..].iter().position(|&u| circuit.units[u].block.site() != site).map_or(order.len(), |k| at + k);
+        if halt_at.is_some_and(|h| site >= h) {
+            break;
+        }
+        if site < resume_at {
+            at = end;
+            continue;
+        }
         let pad_job = Padding { places: padded.as_ref(), sequences, longest };
         let mut slice_writes = vpd_site(s, weights, circuit, job, (site, &order[at..end]), &st, &pad_job, (&mut kept, &mut reads_kept), copy_rows.as_ref().map(|(c, r, t)| (*c, r, t)))?;
         for &u in &order[at..end] {
@@ -1042,6 +1071,9 @@ pub(crate) fn copies_on(s: &mut DeviceState, weights: &Weights, circuit: &Circui
         }
         after(&s.device, ops, Some(site), &mut st).map_err(e)?;
         at = end;
+    }
+    if halt_at.is_some() {
+        return Ok(Execution::of(s.device.download(&st.stream).map_err(e)?, Vec::new(), None, BTreeMap::new()));
     }
     let last = st.input(&s.device, &circuit.logits).map_err(e)?;
     let picked = s.device.upload_indices(&job.scored.iter().map(|&r| r as u32).collect::<Vec<_>>()).map_err(e)?;

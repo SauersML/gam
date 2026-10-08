@@ -2000,14 +2000,32 @@ pub(crate) fn stacks(weights: &Weights, circuit: &Circuit) -> bool {
 /// The runs of `circuits` (each one that [`stacks`], all deleting or all with counterfactual
 /// stand-ins) on `batch` (with its counterfactual run attached for the latter, as
 /// `Checker::referenced` attaches it) at rows `scored`, as one batch of copies
-/// ([`crate::graph_device::run_stacked`]): per site one unit naming the union of the circuits'
+/// ([`crate::graph_device::execute_copies`]): per site one unit naming the union of the circuits'
 /// subcomponents (every site with counterfactual stand-ins), each copy weighing them by how many of
 /// its units name them. Each copy's log-probabilities equal its own run's ([`execute`]) up to
 /// summation order. `None` when there is no device, a circuit does not stack, the stand-ins differ,
 /// the batch has attention blocks or the copies would pass [`STACKED_ROWS`].
 pub(crate) fn execute_stacked(weights: &Weights, circuits: &[&Circuit], batch: &Batch, scored: &[usize]) -> Option<Result<Vec<Array2<f64>>, String>> {
-    let stacked = stack(weights, circuits, batch, scored)?;
-    crate::graph_device::run_stacked(weights, &stacked.merged, &stacked.job(), &stacked.copies)
+    execute_stacked_with(weights, circuits, (batch, scored), &mut |c, job, copies| crate::graph_device::execute_copies(weights, c, job, copies))
+}
+
+/// [`execute_stacked`] with the stacked runs made by `run`.
+pub(crate) fn execute_stacked_with(weights: &Weights, circuits: &[&Circuit], (batch, scored): (&Batch, &[usize]), run: &mut CopiesRun) -> Option<Result<Vec<Array2<f64>>, String>> {
+    let mut stacked = stack(weights, circuits, batch, scored)?;
+    // Sites before the first where the copies' parts differ compute alike on every copy: one copy's
+    // run makes that prefix's stream, and the copies resume from it (one-part neighbours of an
+    // answer share every site before the edited one).
+    if let Some(site) = stacked.shared_prefix() {
+        let one = crate::graph_device::Copies { count: 1, rows: stacked.copies.rows, masks: stacked.copies.masks.iter().map(|(&k, m)| (k, crate::graph_device::CopyMask { counts: m.counts.slice(ndarray::s![0..1, ..]).to_owned(), remainder: m.remainder.iter().take(1).copied().collect() })).collect(), standin: stacked.copies.standin.clone(), resume: None, halt: Some(site) };
+        let (swaps, ops) = (BTreeMap::new(), Interventions::default());
+        let job = crate::graph_device::Run { tokens: &batch.tokens, spans: &batch.spans, scored: &[], swaps: &swaps, capture: false, reference: None, ops: &ops };
+        match run(&stacked.merged, &job, &one)? {
+            Ok(prefix) => stacked.copies.resume = Some((site, crate::graph_device::prefix_stream(prefix))),
+            Err(e) => return Some(Err(e)),
+        }
+    }
+    let count = stacked.copies.count;
+    run(&stacked.merged, &stacked.job(), &stacked.copies).map(|out| out.and_then(|execution| crate::graph_device::per_copy(execution, count)))
 }
 
 /// A stacked run's merged circuit, copies and rows ([`stack`]).
@@ -2026,6 +2044,19 @@ impl Stacked {
     /// The device's job: the batch's rows once per copy, each copy's scored rows in turn.
     pub(crate) fn job(&self) -> crate::graph_device::Run<'_> {
         crate::graph_device::Run { tokens: &self.tokens, spans: &self.spans, scored: &self.scored, swaps: &self.swaps, capture: false, reference: None, ops: &self.ops }
+    }
+
+    /// The first site where the copies' parts differ, when some site before it has units (the
+    /// copies compute alike up to it); `None` for one copy or copies that differ at the first site.
+    fn shared_prefix(&self) -> Option<usize> {
+        if self.copies.count < 2 {
+            return None;
+        }
+        let alike = |u: usize| self.copies.masks.iter().filter(|((v, _), _)| *v == u).all(|(_, m)| m.counts.outer_iter().all(|row| row == m.counts.row(0)) && m.remainder.iter().all(|&r| r == m.remainder[0]));
+        let mut sites: Vec<usize> = self.merged.units.iter().map(|u| u.block.site()).collect();
+        sites.dedup();
+        let differs = (0..self.merged.units.len()).find(|&u| !alike(u)).map(|u| self.merged.units[u].block.site())?;
+        (sites.first().is_some_and(|&first| first < differs)).then_some(differs)
     }
 
     /// The batch of every copy's rows (no counterfactual run attached, no attention blocks): where
@@ -2187,11 +2218,21 @@ fn stack_sites(weights: &Weights, circuits: &[&Circuit], batch: &Batch, scored: 
         }
     }
     let merged = Circuit { nodes: units.len(), units, logits: Incoming::all(), delete: true };
-    let copies = crate::graph_device::Copies { count: circuits.len(), rows, masks, standin };
+    let copies = crate::graph_device::Copies { count: circuits.len(), rows, masks, standin, resume: None, halt: None };
     let tokens: Vec<u32> = (0..circuits.len()).flat_map(|_| batch.tokens.iter().copied()).collect();
     let spans: Vec<(usize, usize)> = (0..circuits.len()).flat_map(|j| batch.spans.iter().map(move |&(start, n)| (j * rows + start, n))).collect();
     let scored: Vec<usize> = (0..circuits.len()).flat_map(|j| scored.iter().map(move |&r| j * rows + r)).collect();
     Some(Stacked { merged, copies, tokens, spans, scored, swaps: BTreeMap::new(), ops: Interventions::default() })
+}
+
+/// Per site, the computing units' blocks of `circuit` (as text): two circuits whose signatures agree
+/// at every site before one compute alike up to it.
+fn site_signatures(circuit: &Circuit) -> BTreeMap<usize, String> {
+    let mut out: BTreeMap<usize, String> = BTreeMap::new();
+    for unit in circuit.units.iter().filter(|u| u.computes) {
+        out.entry(unit.block.site()).or_default().push_str(&format!("{:?};", unit.block));
+    }
+    out
 }
 
 /// The number of VPD subcomponents of a slot (an MLP's `c_fc` 0 or `down_proj` 1; an attention's
@@ -4868,7 +4909,25 @@ impl Checker {
                         }
                     }
                     let per_stack = (STACKED_ROWS / this.clean.0.tokens.len().max(1)).max(1);
-                    jobs.extend(stacked.into_values().flat_map(|rs| rs.chunks(per_stack).map(<[usize]>::to_vec).collect::<Vec<_>>()));
+                    // Each experiment's programs ordered by the first site where their units differ
+                    // from the most common ones there, latest first: a stack's copies then share long
+                    // prefixes, computed once (`execute_stacked`).
+                    jobs.extend(stacked.into_values().flat_map(|mut rs| {
+                        let signatures: Vec<BTreeMap<usize, String>> = rs.iter().map(|&r| site_signatures(&circuits[runs[r].0])).collect();
+                        let sites: BTreeSet<usize> = signatures.iter().flat_map(|m| m.keys().copied()).collect();
+                        let common: BTreeMap<usize, &str> = sites.iter().filter_map(|&site| {
+                            let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+                            for m in &signatures {
+                                *counts.entry(m.get(&site).map_or("", String::as_str)).or_default() += 1;
+                            }
+                            counts.into_iter().max_by_key(|&(_, n)| n).map(|(sig, _)| (site, sig))
+                        }).collect();
+                        let first: Vec<usize> = signatures.iter().map(|m| sites.iter().copied().find(|site| m.get(site).map_or("", String::as_str) != common.get(site).copied().unwrap_or("")).unwrap_or(usize::MAX)).collect();
+                        let mut order: Vec<usize> = (0..rs.len()).collect();
+                        order.sort_by_key(|&k| std::cmp::Reverse(first[k]));
+                        rs = order.iter().map(|&k| rs[k]).collect();
+                        rs.chunks(per_stack).map(<[usize]>::to_vec).collect::<Vec<_>>()
+                    }));
                     let run_job = |job: &Vec<usize>| -> Result<Vec<(usize, Vec<f64>, Option<Candidates>)>, String> {
                         if job.len() > 1 {
                             let e = &runs[job[0]].1;

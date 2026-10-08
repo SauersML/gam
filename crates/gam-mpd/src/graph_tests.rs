@@ -743,11 +743,17 @@ fn stacked_equals_own(weights: &Weights, circuits: &[crate::graph::Circuit], bat
     let rows: Vec<usize> = (0..batch.tokens.len()).collect();
     assert!(circuits.iter().all(|c| crate::graph::stacks(weights, c)), "every program stacks");
     let refs: Vec<&crate::graph::Circuit> = circuits.iter().collect();
-    let stacked = crate::graph::stack(weights, &refs, batch, &rows).expect("the programs stack");
     let mut state = crate::graph_device::DeviceState::new(Device::host());
-    let job = stacked.job();
-    assert!(crate::graph_device::stack_covered(weights, &stacked.merged, &job, &stacked.copies), "the device stacks VPD units");
-    let copies = crate::graph_device::per_copy(crate::graph_device::copies_on(&mut state, weights, &stacked.merged, &job, Some(&stacked.copies)).expect("stacked run"), stacked.copies.count).expect("copies");
+    // The stacked runs as execute_stacked makes them (a shared prefix halted and resumed where the
+    // copies agree on the first sites), on the host backend.
+    let mut runs = 0;
+    let mut runner = |c: &crate::graph::Circuit, job: &crate::graph_device::Run, copies: &crate::graph_device::Copies| {
+        assert!(crate::graph_device::stack_covered(weights, c, job, copies), "the device stacks VPD units");
+        runs += 1;
+        Some(crate::graph_device::copies_on(&mut state, weights, c, job, Some(copies)))
+    };
+    let copies = crate::graph::execute_stacked_with(weights, &refs, (batch, &rows), &mut runner).expect("the programs stack").expect("stacked run");
+    assert_eq!(runs, if circuits.iter().all(|c| c.delete) { 1 } else { 2 }, "counterfactual programs of layer 1 share layer 0's sites, run once");
     assert_eq!(copies.len(), circuits.len());
     for (j, (circuit, copy)) in circuits.iter().zip(&copies).enumerate() {
         let mine = execute(weights, circuit, own, &rows, &BTreeMap::new()).expect("own run").log_probabilities;
