@@ -203,13 +203,14 @@ def refine(answer: Answer, score, candidates: dict[str, list[str]] | None = None
     return answer, current, accepted
 
 
-def checker_score(behavior_path: Path, vpd: Path, experiments: int, seed: int):
-    """A Checker on the behavior and its score function (the caller closes the checker)."""
+def checker_score(behavior_path: Path, vpd: Path, experiments: int, seed: int, device: str | None = "gpu"):
+    """A Checker on the behavior and its score function (the caller closes the checker); device "gpu" runs on
+    the single-precision device (None: the host, float64)."""
     import score as score_module
 
     behavior = json.loads(behavior_path.read_text())
     views = {"vpd": vpd} if behavior["model"] == "vpd4l" else None
-    c = score_module.Checker(behavior["model"], views=views)
+    c = score_module.Checker(behavior["model"], views=views, device=device)
     c.behavior(behavior_path)
     return c, lambda sources: c.score_batch(sources, experiments=experiments, seed=seed, reader=False)
 
@@ -226,10 +227,11 @@ def main():
     ap.add_argument("--experiments", type=int, default=16)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--vpd", type=Path, default=Path.home() / "mpd-data/engine/vpd4l_decomposition")
+    ap.add_argument("--device", default="gpu", help="gpu (the single-precision device) or host")
     ap.add_argument("--out", type=Path, help="refine: where the refined program goes")
     a = ap.parse_args()
     answer = Answer.parse(a.answer.read_text())
-    checker, score = checker_score(a.behavior, a.vpd, a.experiments, a.seed)
+    checker, score = checker_score(a.behavior, a.vpd, a.experiments, a.seed, None if a.device == "host" else a.device)
     try:
         if a.command == "credit":
             s, dS = credit(answer, score, a.k)
