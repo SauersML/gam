@@ -80,7 +80,8 @@ enum Read {
     Direction { site: usize, coefficients: Vec<f64> },
     /// `‖V_bᵀā‖` at the MLP's input (`site` its c_fc map): the norm of the component's down-slice
     /// reads on the activations `ā` of the layer with every c_fc slice on (a gate on the layer's
-    /// own all-on activation, which no linear read of the input gives).
+    /// own all-on activation, which no linear read of the input gives). Shared (candidates), as a
+    /// shared own read: gate `m` on `Σ_b A_mb ‖V_bᵀā‖² − τ_m|τ_m|`.
     Active { site: usize },
 }
 
@@ -314,7 +315,7 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
         Ok(directions != 0)
     };
     // Per stage whether its gates read the all-on activations (`Read::Active`: every component of
-    // an MLP input stage, unshared, each carrying down slices, or none).
+    // an MLP input stage, each carrying down slices, or none).
     let active_of = |comps: &[usize]| -> Result<bool, String> {
         let active = comps.iter().filter(|&&b| matches!(components[b].read, Read::Active { .. })).count();
         if active != 0 && active != comps.len() {
@@ -324,8 +325,8 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
     };
     for (&(_, stage_index), comps) in &at {
         direction_of(comps)?;
-        if active_of(comps)? && (stage_index != 2 || comps.iter().any(|&b| !components[b].candidates.is_empty())) {
-            return Err(error("all-on activation reads gate unshared components at the MLP's input only"));
+        if active_of(comps)? && stage_index != 2 {
+            return Err(error("all-on activation reads gate components at the MLP's input only"));
         }
     }
     let interfaces = native.interfaces().map_err(error)?;
@@ -762,7 +763,8 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
             // The all-on activations ā: every c_fc read, written with every slice on, through the
             // activation law (the c_fc map's second use); per component the norm of its down reads
             // on ā (`{name}.mlp.fc.active`, a copy of those reads held by the gate), less its
-            // threshold; then the c_fc reads gated.
+            // threshold, or in a shared stage the gates on the squared norms through the assignment
+            // (as shared own gates, `stage_nodes`); then the c_fc reads gated.
             let widths: Vec<usize> = f_comps.iter().map(|&b| slices_on(b, dn).len()).collect();
             if widths.contains(&0) {
                 return Err(error(format!("layer {l}: an all-on activation read of a component with no down slice")));
@@ -776,12 +778,24 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
             nodes.push(Node::Pointwise { input: nodes.len() - 1, laws: laws.clone() });
             nodes.push(Node::Affine { terms: vec![(nodes.len() - 1, active)], bias: None });
             nodes.push(Node::GroupNorm { input: nodes.len() - 1 });
-            nodes.push(Node::Affine { terms: vec![(nodes.len() - 1, base + 4)], bias: Some(base + 5) });
-            let z = nodes.len() - 1;
-            nodes.push(Node::Constant { operator: base + 6 });
-            let s = nodes.len() - 1;
-            nodes.push(Node::Gated { value: a, gate: z, scale: Some(s) });
-            (nodes.len() - 1, z, s)
+            if let Some(assign) = fc_assign {
+                let norm = nodes.len() - 1;
+                nodes.push(Node::Hadamard { left: norm, right: norm });
+                nodes.push(Node::Affine { terms: vec![(norm + 1, assign)], bias: Some(base + 5) });
+                nodes.push(Node::Constant { operator: base + 6 });
+                nodes.push(Node::Transposed { input: norm + 2, operator: assign });
+                nodes.push(Node::Transposed { input: norm + 3, operator: assign });
+                let (z, s) = (nodes.len() - 2, nodes.len() - 1);
+                nodes.push(Node::Gated { value: a, gate: z, scale: Some(s) });
+                (nodes.len() - 1, z, s)
+            } else {
+                nodes.push(Node::Affine { terms: vec![(nodes.len() - 1, base + 4)], bias: Some(base + 5) });
+                let z = nodes.len() - 1;
+                nodes.push(Node::Constant { operator: base + 6 });
+                let s = nodes.len() - 1;
+                nodes.push(Node::Gated { value: a, gate: z, scale: Some(s) });
+                (nodes.len() - 1, z, s)
+            }
         } else {
             let (gated, z, s) = stage_nodes(&mut nodes, 0, (base, base + 4, base + 5, base + 6), fc_assign, f_direction, fc_own, Some(fc_parts));
             (gated.ok_or("the gated reads")?, z, s)
@@ -1707,7 +1721,7 @@ mod tests {
         // Component reads: own (threshold −1 below a norm) or a direction (g small, c = 10).
         let mut direction = |site: usize| serde_json::json!({"direction": {"site": site, "coefficients": (0..=inputs[site]).map(|j| if j < inputs[site] { 0.01 * (rng.random::<f64>() - 0.5) } else { 10.0 }).collect::<Vec<f64>>()}});
         let mut arms = Vec::new();
-        for (arm, [attention, up, down]) in [("own", [false; 3]), ("direction", [true; 3]), ("stages", [false, true, false]), ("mixed", [false, true, true]), ("active", [false; 3]), ("active_gated", [false; 3])] {
+        for (arm, [attention, up, down]) in [("own", [false; 3]), ("direction", [true; 3]), ("stages", [false, true, false]), ("mixed", [false, true, true]), ("active", [false; 3]), ("active_gated", [false; 3]), ("active_shared", [false; 3])] {
             let mut components = Vec::new();
             for l in 0..2 {
                 let (q, o, fc, dn) = (6 * l, 6 * l + 3, 6 * l + 4, 6 * l + 5);
@@ -1719,9 +1733,11 @@ mod tests {
                 for i in 0..count[fc] {
                     let own = !up || (arm == "mixed" && i == 0);
                     let r = if arm.starts_with("active") { serde_json::json!({"active": {"site": fc}}) } else if own { serde_json::json!({"own": [fc, i]}) } else { direction(fc) };
-                    // "active_gated": thresholds that turn about half of the parts off.
-                    let tau = if arm == "active_gated" { 0.05 } else { -1.0 };
-                    components.push(serde_json::json!({"read": r, "tau": tau, "slices": [[fc, i], [dn, i]]}));
+                    // "active_gated" and "active_shared": thresholds that turn about half of the parts
+                    // off; "active_shared" lets each move to the next part's gate.
+                    let tau = if arm == "active_gated" || arm == "active_shared" { 0.05 } else { -1.0 };
+                    let candidates: Vec<usize> = if arm == "active_shared" { vec![components.len() - i + (i + 1) % count[fc]] } else { Vec::new() };
+                    components.push(serde_json::json!({"read": r, "tau": tau, "slices": [[fc, i], [dn, i]], "candidates": candidates}));
                 }
                 for i in count[fc]..count[dn] {
                     let r = if down { direction(dn) } else { serde_json::json!({"own": [dn, i]}) };
@@ -1785,6 +1801,12 @@ mod tests {
             let direct: f64 = Interchange::new(&device, &m, &blocks, &p, &explanation.trainable, Vec::new(), 1 << 30, 64).expect("the experiments").evaluate(&batch, &clean, false).expect("evaluate").bits.iter().flatten().sum();
             assert!((training - direct).abs() <= 1e-9 * direct.abs().max(1.0), "edit {i}: training {training} bits, direct mutation {direct}");
         }
+        // Shared gates on the all-on activations: at the identity assignment each gate is its own
+        // component's (`‖·‖² > τ²` where `‖·‖ > τ`), so the hard explanation scores as the unshared.
+        let shared = super::explanation(&native, &layers, &factors, &start, "active_shared").expect("the explanation");
+        assert!(shared.shares.len() == 2, "one shared stage per layer");
+        let bits: f64 = Interchange::new(&device, &native, &blocks, &shared.artifact, &shared.trainable, Vec::new(), 1 << 30, 64).expect("the experiments").evaluate(&batch, &clean, false).expect("evaluate").bits.iter().flatten().sum();
+        assert!((bits - open).abs() <= 1e-9 * open.max(1.0), "shared all-on gates {bits} bits against unshared {open}");
         let mixed = super::explanation(&native, &layers, &factors, &start, "mixed");
         assert!(mixed.as_ref().is_err_and(|e| e.contains("gates one way")), "a stage with both kinds of read is refused: {:?}", mixed.err());
         std::fs::remove_dir_all(&factors).expect("the factors are removed");

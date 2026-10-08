@@ -267,6 +267,10 @@ pub struct Cells {
     pub cols: Range<usize>,
 }
 
+/// A number's cost in a budget in bits (`Settings::budget_bits`): 16 bits, the fixed precision of
+/// toys' structural code, under which their copy tasks were solved.
+const NUMBER_BITS: f64 = 16.0;
+
 /// A prior group: parameters sharing one prior variance (module note).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Group {
@@ -1880,9 +1884,11 @@ pub struct Settings {
     pub budget: Option<f64>,
     /// With `budget_bits`, `k(x)` counts the description bits of the parts executed on a token in
     /// place of their rank (`library_vpd`'s gated components, [`GatedStage::bits`]): a part's bits
-    /// are its groups' `KL(q ‖ p)` (its slices' reads and writes and its direction row), its share of
-    /// its stage's thresholds and widths, and its index among the stage's parts, `log₂ n`; `K` is in
-    /// bits per token.
+    /// are [`NUMBER_BITS`] per number of its groups (its slices' reads and writes and its direction
+    /// row), its share of its stage's thresholds and widths, and its index among the stage's parts,
+    /// `log₂ n`; `K` is in bits per token. The budget measures the parts' structure at a fixed
+    /// precision, so `K` does not move with the posterior's sharpness; `F`'s description stays its
+    /// bits-back code.
     #[serde(default)]
     pub budget_bits: bool,
 }
@@ -2581,12 +2587,10 @@ struct Scorer {
     mixed: BTreeMap<usize, Array2<f64>>,
     mixed_writes: BTreeMap<usize, Array2<f64>>,
     mix_step: Option<f64>,
-    /// Per mixing, each slice's read group (its bits share of the group's frame in a budget in
-    /// bits), and the fit's scored tokens `N` (the frames' Laplace code, [`Mixing::entry_nats`]).
-    mix_reads: Vec<Vec<usize>>,
+    /// The fit's scored tokens `N` (the frames' Laplace code, [`Mixing::entry_nats`]).
     mix_tokens: f64,
-    /// With a budget in bits (`Settings::budget_bits`), each group's description in bits at the
-    /// posterior as the step found it, which the step's counts weigh their parts by.
+    /// With a budget in bits (`Settings::budget_bits`), each group's bits, [`NUMBER_BITS`] per
+    /// number, which the counts weigh their parts by.
     group_bits: Option<Vec<f64>>,
     /// Whether relaxed passes draw their gates (`DeviceProgram::set_sampled`), as every fit's do;
     /// off, they take the expected gate `Φ(z / w)` (a test of a derivative through it).
@@ -2642,31 +2646,7 @@ impl Scorer {
             return Err("an operator holding both mixed reads and mixed writes".into());
         }
         let differentiated: Vec<usize> = explanation.trainable.iter().copied().chain(assignments.iter().map(|a| a.operator)).collect();
-        let read_group: BTreeMap<(usize, usize), usize> = explanation
-            .groups
-            .iter()
-            .enumerate()
-            .filter(|(_, g)| g.name.ends_with(".read") && g.cells.len() == 1 && g.cells[0].rows.len() == 1)
-            .map(|(i, g)| ((g.cells[0].operator, g.cells[0].rows[0]), i))
-            .collect();
-        let mix_reads = explanation
-            .mixes
-            .iter()
-            .map(|mix| {
-                mix.slices
-                    .iter()
-                    .map(|places| {
-                        places
-                            .iter()
-                            .find_map(|p| match p {
-                                Place::Read { operator, row } => read_group.get(&(*operator, *row)).copied(),
-                                Place::Write { .. } => None,
-                            })
-                            .ok_or_else(|| "a mixed slice without a read group".to_string())
-                    })
-                    .collect::<Result<Vec<_>, String>>()
-            })
-            .collect::<Result<Vec<_>, String>>()?;
+        let group_bits = settings.budget_bits.then(|| explanation.groups.iter().map(|g| NUMBER_BITS * g.cells.iter().map(|c| (c.rows.len() * c.cols.len()) as f64).sum::<f64>()).collect());
         let mut experiments =
             Interchange::new(device, native, &sites, &explanation.artifact, &differentiated, reads, settings.numeric_bytes, settings.head_tile_rows)?;
         // Every scoring of the fit (its steps, held-out evaluations and removal comparisons) is of
@@ -2687,7 +2667,7 @@ impl Scorer {
         let hard_gates = stages.iter().flatten().filter(|s| !position.contains_key(&s.width)).map(|s| (s.width, s.threshold, program.operators[s.width].rows.width())).collect();
         let scoring = explanation.scoring;
         let thresholds = stages.iter().flatten().map(|s| (s.threshold, program.operators[s.threshold].rows.width())).collect();
-        let mut scorer = Self { experiments, mlps, stages, hard_gates, scoring, thresholds, position, scope, families: settings.families.clone(), edits: std::cell::RefCell::new(BTreeMap::new()), assignments, written: None, version: 0, assignment_step: None, assignment_budget: Vec::new(), mixings, mixed, mixed_writes: BTreeMap::new(), mix_step: None, mix_reads, mix_tokens: 0.0, group_bits: None, sample_gates: true };
+        let mut scorer = Self { experiments, mlps, stages, hard_gates, scoring, thresholds, position, scope, families: settings.families.clone(), edits: std::cell::RefCell::new(BTreeMap::new()), assignments, written: None, version: 0, assignment_step: None, assignment_budget: Vec::new(), mixings, mixed, mixed_writes: BTreeMap::new(), mix_step: None, mix_tokens: 0.0, group_bits, sample_gates: true };
         scorer.train_gates(None)?;
         Ok(scorer)
     }
@@ -3095,16 +3075,6 @@ impl Scorer {
                     .sum::<f64>()
             })
             .sum()
-    }
-
-    /// Adds each mixed slice's share of its group's frame to its read group's bits (`bits`, per
-    /// group): its row of `A`, which sets its read.
-    fn add_mixing_bits(&self, bits: &mut [f64]) {
-        for (m, reads) in self.mixings.iter().zip(&self.mix_reads) {
-            for ((i, _), nats) in m.entry_nats(self.mix_tokens) {
-                bits[reads[i]] += nats / LN_2;
-            }
-        }
     }
 
     fn clear_mixing_gradients(&mut self) {
@@ -5316,11 +5286,6 @@ pub fn fit_from(
             // mean's KL went from 1e-24 to 1.4e5 bits per token; re-measuring `λ̂` in its rate
             // (3a279507d3) moved it from 69 to 2,813 within three steps of a tiny vpd4l fit.
             let mut parts_note = String::new();
-            if settings.budget_bits {
-                let mut bits: Vec<f64> = device_posterior.divergences()?.iter().map(|d| d / LN_2).collect();
-                scorer.add_mixing_bits(&mut bits);
-                scorer.group_bits = Some(bits);
-            }
             let budget = match settings.budget.filter(|k| k.is_finite()) {
                 Some(limit) => Some((limit, complexity_terms(&mut scorer, &device_posterior, explanation, &posterior.active, &batch, (key, false))?)),
                 None => None,
@@ -7072,13 +7037,17 @@ mod tests {
     /// A budget in bits (`Settings::budget_bits`) weighs each part's runs by its description: a
     /// group's bits add to the count its part's expected runs per token (the count's change when one
     /// group's bits go from 0 to 1, the same for a slice's read and its write, and positive), and the
-    /// count is linear in the groups' bits.
+    /// count is linear in the groups' bits. A fit's groups cost [`NUMBER_BITS`] per number.
     #[test]
     fn a_budget_in_bits_weighs_each_part_by_its_groups() {
         let (native, explanation, sequences) = learned_tiny("library_budget_bits");
         let (device, settings) = (Device::host(), settings());
         let posterior = Posterior::new(&explanation, 72).unwrap();
         let device_posterior = DevicePosterior::new(&device, &explanation, &posterior, 72.0, None, 0).unwrap();
+        let fixed = Scorer::new(&device, &native, &explanation, &Settings { budget_bits: true, ..settings.clone() }).unwrap().group_bits.unwrap();
+        let read = explanation.groups.iter().position(|g| g.name.starts_with("library.l1.mlp.") && g.name.ends_with(".read")).unwrap();
+        let width = explanation.groups[read].cells[0].cols.len() as f64;
+        assert_eq!(fixed[read], NUMBER_BITS * width, "a slice's read costs 16 bits per entry");
         let mut scorer = Scorer::new(&device, &native, &explanation, &settings).unwrap();
         let draws = draws(sequences.len(), settings.batch_sequences, settings.seed).unwrap();
         let batch = draws[0].batch(&sequences).unwrap();
@@ -7091,7 +7060,6 @@ mod tests {
         let unit = |g: usize| (0..groups).map(|i| if i == g { 1.0 } else { 0.0 }).collect::<Vec<f64>>();
         let zero = count(vec![0.0; groups]);
         // The last MLP's first c_fc slice: its read and its write.
-        let read = explanation.groups.iter().position(|g| g.name.starts_with("library.l1.mlp.") && g.name.ends_with(".read")).unwrap();
         let write = explanation.groups.iter().position(|g| g.name == explanation.groups[read].name.replace(".read", ".write")).unwrap();
         let (by_read, by_write) = (count(unit(read)) - zero, count(unit(write)) - zero);
         assert!(by_read > 0.0, "a slice's read weighs its part's runs: {by_read}");
@@ -7142,8 +7110,7 @@ mod tests {
 
     /// A frame is priced as any parameter is ([`Mixing::entry_nats`]): each entry's
     /// `KL(N(a, σ²) ‖ N(a₀, v))` about its start `a₀` with `σ² = 1 / (N h + 1/v)`, zero at the start
-    /// and `h = 0`, and in a budget in bits each slice carries its row of `A` (the slices' read groups
-    /// gain the whole description between them).
+    /// and `h = 0`.
     #[test]
     fn a_frame_is_priced_by_its_laplace_code() {
         let (native, explanation, _) = learned_tiny_mixed("library_mixing_price", true);
@@ -7162,10 +7129,6 @@ mod tests {
         let variance = 1.0 / (1000.0 * 0.01 + 1.0 / FRAME_PRIOR);
         let expected: f64 = offsets.iter().map(|d| 0.5 * ((FRAME_PRIOR / variance).ln() + (d * d + variance) / FRAME_PRIOR - 1.0)).sum();
         assert!((scorer.mixing_nats() - expected).abs() <= 1e-12, "{} against {expected}", scorer.mixing_nats());
-        let mut bits = vec![0.0; explanation.groups.len()];
-        scorer.add_mixing_bits(&mut bits);
-        assert!((bits.iter().sum::<f64>() - expected / LN_2).abs() <= 1e-12, "the slices carry the whole description");
-        assert_eq!(scorer.mix_reads[k].iter().filter(|g| bits[**g] > 0.0).count(), 4, "each slice of the group carries its row");
     }
 
     /// A block across blocks with every block on takes every drawn weight edit as `M` does (the gap
