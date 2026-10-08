@@ -697,8 +697,8 @@ def exact_if_gated(rep, run, ms, on):
 
 def candidates(rep, st):
     """Merges, from short lists (no pairs over a whole bucket): a block with the blocks its read edges feed, or
-    that feed its neurons, or that read the atoms its neurons write; all blocks reading one atom; all blocks
-    firing on the same tokens, and each with the next one."""
+    that feed its neurons, or that read the atoms its neurons write (at most GROUP of them); all blocks reading one
+    atom; all blocks firing on the same tokens, and each with the next one."""
     where = {j: b for b, ms in st.members.items() for j in ms}
     writer_block, reader_blocks, feed_blocks = {}, {}, {}
     for j, b in where.items():
@@ -719,7 +719,7 @@ def candidates(rep, st):
         feed = set().union(*[feed_blocks.get(u, set()) for u in neurons]) if neurons else set()
         fan = set().union(*[reader_blocks.get(int(k), set()) for k in rep.atom[ms][rep.kind[ms]]]) if neurons else set()
         for grp in (fed, feed, fan, feed | fan):
-            if grp - {b}:
+            if grp - {b} and len(grp | {b}) <= GROUP + 1:   # a closure is local: at most a group of blocks
                 out.add(frozenset(grp | {b}))
     for bs in reader_blocks.values():
         if len(bs) > 1:
@@ -761,7 +761,7 @@ def splits(rep, st):
 def transfers(rep, st):
     """A block's read edges into neurons another block writes for, or reading atoms another block's neurons write,
     moved into that block, where the target's guard is on wherever the moved edges write (the move can stay exact;
-    a bit test, before any scoring)."""
+    a bit test, before any scoring); per block only the TRANSFERS targets nearest by their guards' tokens."""
     writer_block, atom_block = {}, {}
     for b, ms in st.members.items():
         for j in ms:
@@ -779,16 +779,23 @@ def transfers(rep, st):
                 x = atom_block.get(int(rep.atom[j]))
             if x is not None and x != b:
                 to.setdefault(x, []).append(j)
+        near = []
         for x, js in to.items():
             live = np.zeros(st.run.T, bool)
             for k in set(rep.atom[js].tolist()):
                 live |= st.run.live(int(rep.layer[js[0]]), k)
             if (live & ~st.on[x]).any():
                 continue
+            near.append((float((live & st.on[x]).sum() / max((live | st.on[x]).sum(), 1)), x, js))
+        # the short list: the TRANSFERS targets whose guards' tokens are nearest the moved edges' (Jaccard)
+        for _, x, js in sorted(near, key=lambda t: -t[0])[:TRANSFERS]:
             moved = set(js)
             rest = [j for j in ms if j not in moved]
             out.append((frozenset([b, x]), ([rest] if rest else []) + [st.members[x] + js]))
     return out
+
+
+TRANSFERS = 2
 
 
 def block_signature(rep, ms):
