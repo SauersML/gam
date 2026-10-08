@@ -688,3 +688,49 @@ fn complexity_is_what_a_reader_takes_in() {
     let scored: usize = scores[0].1.iter().map(|m| m.1.len()).sum();
     assert_eq!(plain.n, scored as f64, "N is the tokens the experiments score");
 }
+
+/// A shared base (`Checker::set_base`): its nodes join every program, connected to every node by
+/// implied edges that cost nothing, so a base of every piece with no declared edge is `M`; its
+/// parts are priced apart; necessity keeps it (the empty program pays none); a program naming some
+/// of its parts takes them over and still runs `M`; an id the base holds makes a program invalid,
+/// and an invalid program is scored as the base alone; a base that does not parse is refused and
+/// the previous one kept.
+#[test]
+fn a_shared_base_joins_every_program() {
+    let f32_kl = 64.0 / 16_777_216.0 / std::f64::consts::LN_2;
+    let (mut weights, sequences) = model("graph_sites_base");
+    let (hidden, width) = weights.layers[0].mlp.as_ref().expect("an MLP").gate.dim();
+    let wave = |rows: usize, cols: usize, phase: f64| Array2::from_shape_fn((rows, cols), |(i, j)| 0.1 * ((i * 7 + j * 3) as f64 + phase).sin());
+    weights.vpd.insert(0, crate::graph::VpdMlp { fc_u: wave(5, hidden, 0.3), fc_v: wave(width, 5, 1.1), down_u: wave(4, width, 2.0), down_v: wave(hidden, 4, 0.7) });
+    let name = (weights.vocabulary() as f64).log2();
+    let vpd = |kind: &str, index: crate::graph::Index| PieceIr { view: "vpd".into(), layer: 0, kind: kind.into(), index: Some(index) };
+    let mut base = full_program();
+    base.edges.clear();
+    base.nodes.iter_mut().find(|n| n.id == "m0").expect("m0").pieces = ["c_fc", "down_proj"].iter().flat_map(|k| [vpd(k, crate::graph::Index::Many((0..if *k == "c_fc" { 5 } else { 4 }).collect())), vpd(k, crate::graph::Index::Name("rest".into()))]).collect();
+    let empty = Program { model: "tiny".into(), valid: true, ..Program::default() };
+    // Two c_fc subcomponents the base also holds, fed by embed (the base's earlier nodes feed it by implication).
+    let mut taking = empty.clone();
+    taking.nodes = vec![NodeIr { id: "p".into(), pieces: vec![vpd("c_fc", crate::graph::Index::Many(vec![0, 1]))], claim: None }];
+    taking.edges = vec![EdgeIr { from: "embed".into(), to: "p".into(), route: "input".into() }];
+    let mut clash = empty.clone();
+    clash.nodes = vec![NodeIr { id: "a1".into(), pieces: vec![piece(1, "head")], claim: None }];
+    let invalid = Program { valid: false, error: Some("untraceable".into()), ..empty.clone() };
+    let mut checker = Checker::new(weights, behavior(&sequences)).expect("checker");
+    let (bits, parts) = checker.set_base(Some(base.clone())).expect("base");
+    assert!(parts > 0 && (bits - parts as f64 * name).abs() < 1e-9 * bits, "a base of no declared edges costs its part names: {bits} bits, {parts} parts");
+    let scores = checker.score_batch(&[empty, taking, clash, invalid], 12, 4, true, None, 0).expect("scores");
+    let (none, taking, clash, invalid) = (&scores[0].0, &scores[1].0, &scores[2].0, &scores[3].0);
+    assert!(none.valid && none.exec_error_bits / none.n < f32_kl, "the base of every piece is M: {:e} bits per token", none.exec_error_bits / none.n);
+    assert_eq!((none.necessity_error_bits, none.structure_bits), (0.0, 0.0));
+    assert!((none.base_bits - bits).abs() < 1e-9 * bits);
+    assert!(taking.valid && taking.exec_error_bits / taking.n < f32_kl, "the program and the rest of the base are M: {:e}", taking.exec_error_bits / taking.n);
+    assert!(taking.necessity_error_bits > 0.0, "deleting the program's c_fc subcomponents moves M");
+    assert!((taking.base_bits - (bits - 2.0 * name)).abs() < 1e-9 * bits, "the program's two parts leave the base's price");
+    assert!(!clash.valid && clash.error.as_deref().is_some_and(|e| e.contains("a1")));
+    assert!(!invalid.valid && (invalid.exec_error_bits - none.exec_error_bits).abs() <= 1e-12 * none.exec_error_bits.max(1.0));
+    // A base that does not parse is refused; the previous one stays.
+    let mut broken = base;
+    broken.nodes[0].pieces[0].layer = 9;
+    assert!(checker.set_base(Some(broken)).is_err());
+    assert!(checker.base.as_ref().is_some_and(|b| b.nodes[0].pieces[0].layer == 0));
+}

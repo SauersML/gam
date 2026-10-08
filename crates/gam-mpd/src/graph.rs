@@ -811,6 +811,22 @@ pub struct Graph {
     pub internal: Vec<(usize, usize)>,
     /// The program's bindings with their nodes as indices ([`Checker::binding_error`]).
     pub bindings: Vec<(BindingIr, Vec<usize>)>,
+    /// The shared base's nodes (`Program::base`): always on, connected to every node, kept by
+    /// necessity's deletion, priced apart.
+    pub base: BTreeSet<usize>,
+    /// How many of the last `edges` and `internal` the base implies (not declared): they cost no
+    /// structure bits.
+    pub implied: (usize, usize),
+}
+
+/// Whether a same-site edge from `writer` to `reader` joins two parts of one VPD site: c_fc
+/// subcomponents feeding down_proj subcomponents, or q/k/v subcomponents feeding o_proj ones.
+fn joins(writer: &Block, reader: &Block) -> bool {
+    match (writer, reader) {
+        (Block::Slices { fc, .. }, Block::Slices { down, .. }) => !fc.is_empty() && !down.is_empty(),
+        (Block::AttnSlices { q, k, v, .. }, Block::AttnSlices { o, .. }) => !(q.is_empty() && k.is_empty() && v.is_empty()) && !o.is_empty(),
+        _ => false,
+    }
 }
 
 /// A built-in attention rule (design.txt section 5, "Rules"): uniform over the positions `j ≤ t` it
@@ -1266,12 +1282,7 @@ impl Graph {
             if let (Writer::Unit(w), Some(r)) = (writer, reader)
                 && blocks[w].site() == read_site
             {
-                let joins = match (&blocks[w], &blocks[r]) {
-                    (Block::Slices { fc, .. }, Block::Slices { down, .. }) => !fc.is_empty() && !down.is_empty(),
-                    (Block::AttnSlices { q, k, v, .. }, Block::AttnSlices { o, .. }) => !(q.is_empty() && k.is_empty() && v.is_empty()) && !o.is_empty(),
-                    _ => false,
-                };
-                if !joins || route != Route::Input {
+                if !joins(&blocks[w], &blocks[r]) || route != Route::Input {
                     return Err(format!("edge {} >> {}: within one site only c_fc subcomponents feed down_proj subcomponents and q/k/v subcomponents feed o_proj subcomponents", e.from, e.to));
                 }
                 if !internal.contains(&(w, r)) {
@@ -1308,6 +1319,39 @@ impl Graph {
         if let Some(b) = program.base.iter().find(|b| !ids.contains(b)) {
             return Err(format!("base node {b} is not a node"));
         }
+        // A shared base's nodes are generic machinery, always on: each reads every earlier write
+        // (`embed` and every residual writer before its site), every later node and the logits read
+        // its write, and within its site it joins every other node either way (c_fc to down_proj,
+        // q/k/v to o_proj). These edges are implied by the base, not declared.
+        let base: BTreeSet<usize> = ids.iter().enumerate().filter(|(_, id)| program.base.contains(id)).map(|(k, _)| k).collect();
+        let declared = (edges.len(), internal.len());
+        for &b in &base {
+            let site = blocks[b].site();
+            let mut implied: Vec<(Writer, Option<usize>, Route)> = blocks[b].reads().into_iter().map(|route| (Writer::Embed, Some(b), route)).collect();
+            if blocks[b].writes_residual() {
+                implied.push((Writer::Unit(b), None, Route::Input));
+            }
+            for (w, block) in blocks.iter().enumerate().filter(|&(w, _)| w != b) {
+                if block.site() == site {
+                    for pair in [(w, b), (b, w)] {
+                        if joins(&blocks[pair.0], &blocks[pair.1]) && !internal.contains(&pair) {
+                            internal.push(pair);
+                        }
+                    }
+                }
+                if block.site() < site && block.writes_residual() {
+                    implied.extend(blocks[b].reads().into_iter().map(|route| (Writer::Unit(w), Some(b), route)));
+                }
+                if block.site() > site && blocks[b].writes_residual() {
+                    implied.extend(block.reads().into_iter().map(|route| (Writer::Unit(b), Some(w), route)));
+                }
+            }
+            for e in implied {
+                if !edges.contains(&e) {
+                    edges.push(e);
+                }
+            }
+        }
         // A bound variable is read from its nodes' writes into the residual stream (an interchange
         // swaps them).
         let mut bindings = Vec::with_capacity(program.bindings.len());
@@ -1321,12 +1365,13 @@ impl Graph {
             }
             bindings.push((b.clone(), nodes));
         }
-        Ok(Self { delete, ids, blocks, claims, edges, internal, bindings })
+        let implied = (edges.len() - declared.0, internal.len() - declared.1);
+        Ok(Self { delete, ids, blocks, claims, edges, internal, bindings, base, implied })
     }
 
     /// The empty program: every piece a stand-in.
     pub fn empty() -> Self {
-        Self { delete: false, ids: Vec::new(), blocks: Vec::new(), claims: Vec::new(), edges: Vec::new(), internal: Vec::new(), bindings: Vec::new() }
+        Self { delete: false, ids: Vec::new(), blocks: Vec::new(), claims: Vec::new(), edges: Vec::new(), internal: Vec::new(), bindings: Vec::new(), base: BTreeSet::new(), implied: (0, 0) }
     }
 
     /// Every piece of `weights` not in a node, per site: the heads of each layer, then its neurons.
@@ -1430,8 +1475,9 @@ impl Graph {
     pub fn complement_model(&self, weights: &Weights) -> Circuit {
         let mut circuit = self.model(weights);
         circuit.delete = self.delete;
-        for unit in circuit.units.iter_mut().take(self.blocks.len()) {
-            unit.computes = false;
+        // The shared base stays: necessity takes out the program's own nodes.
+        for (k, unit) in circuit.units.iter_mut().take(self.blocks.len()).enumerate() {
+            unit.computes = self.base.contains(&k);
         }
         if self.edges.iter().any(|(w, r, _)| *w == Writer::Embed && r.is_none()) {
             circuit.logits = Incoming::AllBut([Writer::Embed].into());
@@ -1453,8 +1499,9 @@ impl Graph {
     /// What a reader takes in from the program's structure (design_v2 section 2): each part a node
     /// lists costs `log2 V` bits to name (`V` = [`Weights::vocabulary`]), a VPD remainder its
     /// matrix's rank in names (it holds that many directions), and each edge `log2(3 (n + 1)²)`
-    /// bits for `n` nodes (its writer, reader and route). Returns the part names, the bits of every
-    /// part and edge outside `base`, and the bits of `base`'s nodes and the edges that touch them.
+    /// bits for `n` nodes (its writer, reader and route); the edges a base implies cost nothing.
+    /// Returns the part names, the bits of every part and edge outside `base`, and the bits of
+    /// `base`'s nodes and the declared edges that touch them.
     pub fn structure(&self, weights: &Weights, base: &BTreeSet<usize>) -> (usize, f64, f64) {
         let name = (weights.vocabulary().max(2) as f64).log2();
         // Names in one site's list: one per subcomponent, the rank for the remainder (index `count`).
@@ -1478,10 +1525,10 @@ impl Graph {
         let n = self.blocks.len() as f64;
         let edge = (3.0 * (n + 1.0) * (n + 1.0)).log2();
         let touches = |w: &Writer, r: Option<usize>| matches!(w, Writer::Unit(u) if base.contains(u)) || r.is_some_and(|r| base.contains(&r));
-        for (w, r, _) in &self.edges {
+        for (w, r, _) in &self.edges[..self.edges.len() - self.implied.0] {
             *(if touches(w, *r) { &mut base_bits } else { &mut bits }) += edge;
         }
-        for &(w, r) in &self.internal {
+        for &(w, r) in &self.internal[..self.internal.len() - self.implied.1] {
             *(if base.contains(&w) || base.contains(&r) { &mut base_bits } else { &mut bits }) += edge;
         }
         (parts, bits, base_bits)
@@ -3519,6 +3566,9 @@ pub struct Checker {
     /// Whether scores measure necessity (`Score::necessity_error_bits`; true by default): a search
     /// ranking candidates by sufficiency alone may skip its runs.
     pub necessity: bool,
+    /// The model's shared base (generic machinery, design_v2 section 2): its nodes join every scored
+    /// program ([`Checker::with_base`]), always on and priced apart (`Score::base_bits`).
+    pub base: Option<Program>,
     /// [`Reference::zeros`] by row count, for deleting programs' runs.
     zeros: std::sync::Mutex<BTreeMap<usize, Arc<Reference>>>,
     /// `M`'s normed attention input per (layer, on the counterfactuals?), for attention claims
@@ -3535,7 +3585,7 @@ pub struct Score {
     /// ([`complements`], equal weights), of `KL(M_c ‖ P_c)` per scored token: `M` with the
     /// program's nodes taken out (deleted, or at their counterfactual values) and every other piece
     /// on the prompt, against the program's prediction for it ([`Checker::necessity_runs`]). Zero
-    /// for a program of no nodes (it claims nothing).
+    /// for a program of no nodes outside its shared base (it claims nothing).
     pub necessity_error_bits: f64,
     /// `N` times the program's attention-claim error ([`Checker::claim_error`]): zero for true
     /// claims and for a program that makes none.
@@ -3656,9 +3706,99 @@ impl Checker {
             site_references: std::sync::Mutex::new(Vec::new()),
             reference_bytes: 3 << 30,
             necessity: true,
+            base: None,
             zeros: std::sync::Mutex::new(BTreeMap::new()),
             claim_inputs: BTreeMap::new(),
         })
+    }
+
+    /// `program` with the checker's shared base ([`Checker::base`]) added: the base's nodes, less
+    /// the parts the program names itself (a part belongs to one node; a base node left empty is
+    /// dropped), listed in `Program::base`, with the base's declared edges among the nodes kept. A
+    /// program that reuses a base node's id is marked invalid.
+    pub fn with_base(&self, program: &Program) -> Program {
+        let Some(base) = &self.base else { return program.clone() };
+        let mut out = program.clone();
+        if !out.valid {
+            return out;
+        }
+        if let Some(n) = base.nodes.iter().find(|n| program.nodes.iter().any(|m| m.id == n.id)) {
+            out.valid = false;
+            out.error = Some(format!("node id {} is the shared base's", n.id));
+            return out;
+        }
+        // Each (view, layer, kind) the program names, with its units ("rest" as None), or every unit.
+        let mut named: BTreeMap<(String, usize, String), Option<BTreeSet<Option<usize>>>> = BTreeMap::new();
+        for p in program.nodes.iter().flat_map(|n| &n.pieces) {
+            let key = (p.view.clone(), p.layer, p.kind.clone());
+            let units: Option<Vec<Option<usize>>> = match &p.index {
+                None => None,
+                Some(Index::One(i)) => Some(vec![Some(*i)]),
+                Some(Index::Many(v)) => Some(v.iter().map(|&i| Some(i)).collect()),
+                Some(Index::Name(_)) => Some(vec![None]),
+            };
+            let entry = named.entry(key).or_insert_with(|| Some(BTreeSet::new()));
+            match units {
+                None => *entry = None,
+                Some(units) => {
+                    if let Some(set) = entry.as_mut() {
+                        set.extend(units);
+                    }
+                }
+            }
+        }
+        let mut kept = Vec::new();
+        for node in &base.nodes {
+            let mut pieces = Vec::new();
+            for p in &node.pieces {
+                let piece = match (named.get(&(p.view.clone(), p.layer, p.kind.clone())), &p.index) {
+                    (None, _) => Some(p.clone()),
+                    (Some(None), _) => None,
+                    (Some(Some(set)), Some(Index::One(i))) => (!set.contains(&Some(*i))).then(|| p.clone()),
+                    (Some(Some(set)), Some(Index::Many(v))) => {
+                        let left: Vec<usize> = v.iter().copied().filter(|&i| !set.contains(&Some(i))).collect();
+                        (!left.is_empty()).then(|| PieceIr { index: Some(Index::Many(left)), ..p.clone() })
+                    }
+                    (Some(Some(set)), Some(Index::Name(_))) => (!set.contains(&None)).then(|| p.clone()),
+                    // A base piece of every unit the program also names: the program's parts move.
+                    (Some(Some(_)), None) => None,
+                };
+                pieces.extend(piece);
+            }
+            if !pieces.is_empty() {
+                kept.push(node.id.clone());
+                out.nodes.push(NodeIr { id: node.id.clone(), pieces, claim: None });
+            }
+        }
+        let present = |id: &str| id == "embed" || id == "logits" || kept.iter().any(|k| k == id) || program.nodes.iter().any(|n| n.id == id);
+        out.edges.extend(base.edges.iter().filter(|e| present(&e.from) && present(&e.to)).cloned());
+        out.base.extend(kept);
+        out
+    }
+
+    /// Sets (or with `None` clears) the shared base, checked by parsing it alone; returns its
+    /// structure bits (`Score::base_bits` of the empty program) and its part count.
+    pub fn set_base(&mut self, base: Option<Program>) -> Result<(f64, usize), String> {
+        let previous = std::mem::replace(&mut self.base, base);
+        match self.empty_graph() {
+            Ok(g) => {
+                let (parts, _, bits) = g.structure(&self.weights, &g.base);
+                Ok((bits, parts))
+            }
+            Err(e) => {
+                self.base = previous;
+                Err(e)
+            }
+        }
+    }
+
+    /// The empty program's graph: the shared base alone when the checker has one.
+    fn empty_graph(&self) -> Result<Graph, String> {
+        if self.base.is_none() {
+            return Ok(Graph { delete: self.weights.has_vpd(), ..Graph::empty() });
+        }
+        let empty = Program { model: self.behavior.model.clone(), valid: true, ..Program::default() };
+        Graph::parse(&self.with_base(&empty), &self.weights).map_err(|e| format!("the shared base: {e}"))
     }
 
     /// The error of `graph`'s attention claims, bits per row: for each claimed node the mean, over
@@ -4002,13 +4142,16 @@ impl Checker {
     /// experiment and cached; runs go in parallel threads, experiments that edit weights grouped
     /// by their edit (the edit applied once, then every run that needs it).
     pub fn score_batch(&mut self, programs: &[Program], count: usize, seed: u64, edges: bool, n: Option<f64>, top: usize) -> Result<Vec<(Score, Vec<Measured>)>, String> {
+        let merged: Vec<Program> = programs.iter().map(|p| self.with_base(p)).collect();
+        let programs = merged.as_slice();
+        let empty = self.empty_graph()?;
         let seed = self.uniform_seeds.map_or(seed, |m| seed % m.max(1));
         let targets = self.targets()?;
         let parsed: Vec<(Graph, bool, Option<String>)> = programs
             .iter()
             .map(|program| match Graph::parse(program, &self.weights) {
                 Ok(g) => (g, true, None),
-                Err(e) => (Graph { delete: self.weights.has_vpd(), ..Graph::empty() }, false, Some(e)),
+                Err(e) => (empty.clone(), false, Some(e)),
             })
             .collect();
         for (g, _, _) in &parsed {
@@ -4048,7 +4191,7 @@ impl Checker {
         self.measure_runs(plan, &mut measured)?;
         // Necessity, for each program with nodes: the same complement experiments for every program.
         let complements = complements(&experiments);
-        let named: Vec<usize> = (0..parsed.len()).filter(|&i| self.necessity && !parsed[i].0.blocks.is_empty()).collect();
+        let named: Vec<usize> = (0..parsed.len()).filter(|&i| self.necessity && parsed[i].0.blocks.len() > parsed[i].0.base.len()).collect();
         let necessity_kl = self.necessity_runs(&named.iter().map(|&i| (&parsed[i].0, &circuits[i])).collect::<Vec<_>>(), &complements)?;
         let mut necessity = vec![(0.0, BTreeMap::new()); parsed.len()];
         for (&i, kls) in named.iter().zip(&necessity_kl) {
@@ -4095,8 +4238,7 @@ impl Checker {
             let explanation_bits = if *valid && program.explanation_token_types > 1 { program.explanation_tokens as f64 * (program.explanation_token_types as f64).log2() } else { 0.0 };
             let opaque_numbers = graph.opaque_numbers(&self.weights);
             // A shared base library's nodes are priced apart, for the caller to charge once.
-            let base: BTreeSet<usize> = graph.ids.iter().enumerate().filter(|(_, id)| program.base.contains(id)).map(|(k, _)| k).collect();
-            let (parts, structure_bits, base_bits) = graph.structure(&self.weights, &base);
+            let (parts, structure_bits, base_bits) = graph.structure(&self.weights, &graph.base);
             let complexity_bits = structure_bits + code_bits + explanation_bits;
             let claim_error_bits = n * self.claim_error(graph)?;
             let binding_error_bits = n * self.binding_error(graph)?;
@@ -4195,7 +4337,7 @@ impl Checker {
         let r = r.select_rows(rows);
         let routed = graph.edges.iter().any(|(w, reader, _)| *w == Writer::Embed && reader.is_none());
         let mut stream = if routed { Array2::zeros(r.embed.dim()) } else { r.embed.clone() };
-        for unit in graph.complement_model(&self.weights).units.iter().skip(graph.blocks.len()) {
+        for unit in graph.complement_model(&self.weights).units.iter().filter(|u| u.computes) {
             stream += &r.write(&self.weights, &unit.block)?;
         }
         log_probabilities(&self.weights, &stream)

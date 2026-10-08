@@ -27,6 +27,9 @@
 //!   k most probable clean tokens and of everything else (the reader's items); with
 //!   `uniform_seeds` m, experiments from seed mod m (`M`'s cache serves recurring seeds).
 //!   `GRAPH_CACHE_GIB` bounds `M`'s cached outcomes (2), `GRAPH_DISK_CACHE` shares them on disk.
+//! * `{"op": "base", "path": FILE}` or `{"op": "base", "base": IR}` (`null` clears it): the model's
+//!   shared base (`Checker::set_base`), a program IR whose nodes join every program scored after it,
+//!   on this behavior and every later one of the model; answers `{"ok", "base_bits", "parts"}`.
 //! * `{"op": "draw_manifest", "out": FILE, "seed": 1, "count": 1024, "length": 512, "sequences": 8,
 //!   "families": [...]}`: an immutable manifest of site operations for a model without one
 //!   (`graph::SiteUnits::write_manifest` on the export's first token rows), made the pool.
@@ -304,6 +307,8 @@ fn handle(request: &Value, weights: &mut Option<Weights>, checker: &mut Option<C
             let named = manifest(request, dir);
             // A manifest stating its own context (draw_manifest's) needs none from the export (0).
             let units = named.as_ref().map(|path| SiteUnits::manifest(path, context(dir).unwrap_or(0), width)).transpose()?;
+            // The model's shared base carries over to its next behavior.
+            let base = checker.as_ref().and_then(|c| c.base.clone());
             let w = match (weights.take(), checker.take()) {
                 (Some(w), _) => w,
                 (None, Some(c)) => c.weights,
@@ -311,6 +316,7 @@ fn handle(request: &Value, weights: &mut Option<Weights>, checker: &mut Option<C
             };
             let (id, prompts) = (behavior.id.clone(), behavior.prompts.len());
             let mut c = Checker::new(w, behavior)?;
+            c.base = base;
             if let Some(bytes) = caches.bytes {
                 c.cache_bytes = bytes;
             }
@@ -322,6 +328,16 @@ fn handle(request: &Value, weights: &mut Option<Weights>, checker: &mut Option<C
             let pool = c.sites.pool.len();
             *checker = Some(c);
             Ok(json!({"ok": true, "id": id, "prompts": prompts, "manifest": named.map(|p| p.display().to_string()), "site_experiments": pool}))
+        }
+        "base" => {
+            let c = checker.as_mut().ok_or("load a behavior first")?;
+            let base: Option<Program> = match (request.get("path"), request.get("base")) {
+                (Some(Value::String(path)), _) => Some(serde_json::from_slice(&std::fs::read(path).map_err(|e| format!("{path}: {e}"))?).map_err(|e| format!("{path}: {e}"))?),
+                (_, Some(b)) if !b.is_null() => Some(serde_json::from_value(b.clone()).map_err(error)?),
+                _ => None,
+            };
+            let (bits, parts) = c.set_base(base)?;
+            Ok(json!({"ok": true, "base_bits": bits, "parts": parts}))
         }
         // One program ("program") or many ("programs", the batch answer {"ok", "scores": [...]}),
         // every program under the same seed: the behavior's half of the experiments is shared and
