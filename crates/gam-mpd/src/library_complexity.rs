@@ -39,6 +39,8 @@ pub struct Gate<'a> {
 pub struct Expected {
     pub count: f64,
     pub rows: usize,
+    /// Each row's count, `Σ_i w_i P_ti` ([`weighted`]; empty for [`own`]).
+    pub per_row: Array1<f64>,
     pub mean: Array2<f64>,
     pub variance: Array2<f64>,
     pub bias_mean: Array1<f64>,
@@ -60,13 +62,18 @@ pub fn normal_pdf(z: f64) -> f64 {
 /// The expected count of `gate`'s surviving parts on its rows, `Σ_t Σ_i Φ(m_ti / s_ti)`, and its
 /// exact derivatives (module note).
 pub fn expected(gate: &Gate<'_>) -> Result<Expected, String> {
-    weighted(gate, &vec![1.0; gate.mean.nrows()])
+    weighted(gate, &vec![1.0; gate.mean.nrows()], None)
 }
 
-/// [`expected`] with part `i` counting `weight[i]` when on: a gated component of rank `r` runs `r`
-/// rank-one slices (`library_vpd`).
-pub fn weighted(gate: &Gate<'_>, weight: &[f64]) -> Result<Expected, String> {
+/// [`expected`] with part `i` counting `weight[i]` when on (a gated component of rank `r` runs `r`
+/// rank-one slices, `library_vpd`), and with `rows` the derivatives of `Σ_t rows_t Σ_i w_i P_ti`,
+/// each row weighed (the log count's `1 / (c_t ln 2)`, `library_mdl::complexity_terms`).
+pub fn weighted(gate: &Gate<'_>, weight: &[f64], rows: Option<&[f64]>) -> Result<Expected, String> {
+    let row_weight = rows;
     let (rows, d) = gate.x.dim();
+    if row_weight.is_some_and(|w| w.len() != rows) {
+        return Err("library complexity: row weights of another count than the rows".into());
+    }
     let parts = gate.mean.nrows();
     if gate.mean.ncols() != d || gate.variance.dim() != (parts, d) || gate.alive.len() != parts || weight.len() != parts {
         return Err("library complexity: a gate of other shapes than its input".into());
@@ -86,8 +93,9 @@ pub fn weighted(gate: &Gate<'_>, weight: &[f64]) -> Result<Expected, String> {
     // Per row and part, ∂P/∂m and ∂P/∂s² (zero for a removed part).
     let mut slope = Array2::<f64>::zeros((rows, parts));
     let mut spread = Array2::<f64>::zeros((rows, parts));
-    let mut count = 0.0;
+    let mut per_row = Array1::<f64>::zeros(rows);
     for t in 0..rows {
+        let r = row_weight.map_or(1.0, |w| w[t]);
         for i in 0..parts {
             if !gate.alive[i] {
                 continue;
@@ -97,17 +105,18 @@ pub fn weighted(gate: &Gate<'_>, weight: &[f64]) -> Result<Expected, String> {
                 let s = var.sqrt();
                 let z = mean / s;
                 let density = normal_pdf(z);
-                count += w * normal_cdf(z);
-                slope[[t, i]] = w * density / s;
-                spread[[t, i]] = -w * density * mean / (2.0 * var * s);
+                per_row[t] += w * normal_cdf(z);
+                slope[[t, i]] = r * w * density / s;
+                spread[[t, i]] = -r * w * density * mean / (2.0 * var * s);
             } else if mean > 0.0 {
-                count += w;
+                per_row[t] += w;
             }
         }
     }
     Ok(Expected {
-        count,
+        count: per_row.sum(),
         rows,
+        per_row,
         mean: slope.t().dot(&gate.x),
         variance: spread.t().dot(&squares),
         bias_mean: slope.sum_axis(Axis(0)),
@@ -146,7 +155,7 @@ pub fn own(norms: ArrayView2<'_, f64>, bias: (ArrayView1<'_, f64>, ArrayView1<'_
             }
         }
     }
-    Ok(Expected { count, rows, mean: Array2::zeros((parts, 0)), variance: Array2::zeros((parts, 0)), bias_mean, bias_variance })
+    Ok(Expected { count, rows, per_row: Array1::zeros(0), mean: Array2::zeros((parts, 0)), variance: Array2::zeros((parts, 0)), bias_mean, bias_variance })
 }
 
 #[cfg(test)]
