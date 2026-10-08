@@ -578,6 +578,8 @@ pub(crate) fn run_on(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, 
     // Stand-ins: from the counterfactual run, or zeros for `M` (it reads none).
     let (embed_standin, standins): (Tensor, Vec<Tensor>) = match job.reference {
         Some(r) if r.embed.nrows() != rows => return Err(format!("a counterfactual run of {} tokens for a batch of {rows}", r.embed.nrows())),
+        // Deletion: every stand-in is zero, nothing to upload or compute.
+        Some(r) if r.zero => (s.device.zeros(rows, width).map_err(e)?, (0..units).map(|_| s.device.zeros(rows, width)).collect::<Result<_, _>>().map_err(e)?),
         Some(r) => standins(s, weights, circuit, r)?,
         None if circuit.units.iter().all(|u| u.computes) => (s.device.zeros(rows, width).map_err(e)?, (0..units).map(|_| s.device.zeros(rows, width)).collect::<Result<_, _>>().map_err(e)?),
         None => return Err("a program's undeclared pieces take their values from the counterfactual run, which this batch lacks".into()),
@@ -590,6 +592,7 @@ pub(crate) fn run_on(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, 
         mlp: vec![Array2::zeros((0, 0)); weights.layers.len()],
         inputs: vec![Array2::zeros((0, 0)); weights.layers.len()],
         attention_inputs: vec![Array2::zeros((0, 0)); weights.layers.len()],
+        zero: false,
     });
     let mut order: Vec<usize> = (0..units).collect();
     order.sort_by_key(|&u| circuit.units[u].block.site());
@@ -843,12 +846,13 @@ fn vpd_site(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, job: &Run
     };
     let reference = |s: &mut DeviceState, field: Field, layer: usize| -> Result<Option<Tensor>, String> {
         match job.reference {
-            Some(r) => {
+            Some(r) if !r.zero => {
                 s.ensure_reference(r, (field, layer, 0))?;
                 Ok(Some(s.device.copy(s.reference(r, (field, layer, 0))?).map_err(e)?))
             }
-            // `M` (every unit computing and read) needs no reference: the deltas sum to its own.
-            None => Ok(None),
+            // `M` (every unit computing and read) needs no reference: the deltas sum to its own; a
+            // deleting run's reference is zero.
+            _ => Ok(None),
         }
     };
     let slices: Vec<usize> = units.iter().copied().filter(|&u| matches!(circuit.units[u].block, Block::Slices { .. })).collect();

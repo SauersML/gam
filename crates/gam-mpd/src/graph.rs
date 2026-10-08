@@ -1553,6 +1553,8 @@ pub struct Reference {
     pub inputs: Vec<Array2<f64>>,
     /// Per layer its attention's normed input (rows × width): VPD q, k, v subcomponents read it.
     pub attention_inputs: Vec<Array2<f64>>,
+    /// Every array is zero ([`Reference::zeros`]): every stand-in is zero, without computing it.
+    pub zero: bool,
 }
 
 /// A fresh [`Reference::id`].
@@ -1575,6 +1577,7 @@ impl Reference {
             mlp: per_layer(),
             inputs: per_layer(),
             attention_inputs: per_layer(),
+            zero: true,
         }
     }
 
@@ -1792,6 +1795,7 @@ pub(crate) fn standins_of(weights: &Weights, circuit: &Circuit, batch: &Batch) -
     Ok(match &batch.reference {
         None if circuit.units.iter().all(|u| u.computes) => (Array2::zeros((rows, d)), vec![Array2::zeros((rows, d)); units]),
         None => return Err("a program's undeclared pieces take their values from the counterfactual run, which this batch lacks".into()),
+        Some(r) if r.zero && r.embed.nrows() == rows => (Array2::zeros((rows, d)), vec![Array2::zeros((rows, d)); units]),
         Some(r) => {
             if r.embed.nrows() != rows {
                 return Err(format!("a counterfactual run of {} tokens for a batch of {rows}", r.embed.nrows()));
@@ -1829,6 +1833,7 @@ fn run(weights: &Weights, circuit: &Circuit, batch: &Batch, scored: &[usize], sw
         mlp: vec![Array2::zeros((0, 0)); weights.layers.len()],
         inputs: vec![Array2::zeros((0, 0)); weights.layers.len()],
         attention_inputs: vec![Array2::zeros((0, 0)); weights.layers.len()],
+        zero: false,
     });
     let mut order: Vec<usize> = (0..circuit.units.len()).collect();
     order.sort_by_key(|&u| circuit.units[u].block.site());
