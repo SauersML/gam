@@ -1623,7 +1623,7 @@ def share_parts(l, S):
     return out
 
 @torch.no_grad()
-def evaluate(final=False):
+def evaluate(final=False, start_eval=False):
     if EXACT:
         for n in mlp:
             if not (NEURON_DOWN and n.endswith('down_proj')):
@@ -1717,7 +1717,8 @@ def evaluate(final=False):
         out['levin'] = out['kl'] + out['log2_concepts']
         out['gates_evaluated'] = G_ev
         cut_n = 0
-        for R_, anyon in seen.values():
+        for R_, anyon in (seen.values() if not start_eval else ()):
+            # (none at the start's evaluation: the start's thresholds are a calibration, not a trained choice)
             cut = (anyon == 0) & (nonempty(R_) > 0) & (R_['keep'] > 0)
             R_['keep'][cut] = 0.0; cut_n += int(cut.sum())
         out['pruned_now'] = cut_n
@@ -2066,7 +2067,7 @@ def save(step):
                    os.environ['DESCENT_SAVE'])
 
 draw(True)
-e = evaluate(); e['weight_edits'] = evaluate_edits(); print('start', e, flush=True); log['trace'].append({'step': 0, **e}); save(0)
+e = evaluate(start_eval=True); e['weight_edits'] = evaluate_edits(); print('start', e, flush=True); log['trace'].append({'step': 0, **e}); save(0)
 g_edits = np.random.default_rng(11)
 step_seconds = []
 t0 = time.time()
