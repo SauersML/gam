@@ -664,6 +664,9 @@ ROT, ROTG = {}, int(os.environ.get('DESCENT_ROT', '32'))
 # VPD's q and k subcomponents do: with groups inside a head the budget's one to four q slices per layer reached
 # one to four heads, and the rest attended uniformly).
 ROTGA = int(os.environ.get('DESCENT_ROT_ATTN', '0'))
+# DESCENT_ATTN_START=vpd (with DESCENT_ROT_ATTN=768): the attention bases start at VPD's subcomponents' directions
+# (below) instead of the maps' coordinates.
+ATTN_START = os.environ.get('DESCENT_ATTN_START', 'coord')
 # A slice's assignment logits start at ln(99 (g - 1)) on its own block and 0 elsewhere: 99% of its weight on its own
 # block whatever the group size (a fixed 6 gives 93% at g = 32 and 34% at g = 768).
 ASSIGN0 = lambda g: math.log(99 * (g - 1))
@@ -797,7 +800,8 @@ def rot_Q(R):
         # Large groups: the Cayley transform (I + S)^-1 (I - S), orthogonal for any skew S, one solve.
         A_ = rot_hi(A * mask_of(g)); S_ = A_ - A_.transpose(1, 2)
         I_ = torch.eye(g, device=S_.device, dtype=S_.dtype).expand_as(S_)
-        return torch.linalg.solve(I_ + S_, I_ - S_).float()
+        Q = torch.linalg.solve(I_ + S_, I_ - S_).float()
+        return R['Q0'] @ Q if 'Q0' in R else Q
     for name, As in (('installed', [R_['A'] for R_ in ROT_ALL if R_['A'].shape[-1] == g]),
                      ('mean', [R_['A_leaf'][0] for R_ in ROT_ALL if 'A_leaf' in R_ and R_['A'].shape[-1] == g])):
         at = [i for i, t in enumerate(As) if t is A]
@@ -943,9 +947,21 @@ if ARM == 'rot' and attn:
                 ROTA[l][name] = {**sub(), 'G': G_ @ G_.transpose(1, 2), 'di': W.shape[1],
                                  'ls': torch.full((ng, GA), math.log(0.01 * W.pow(2).mean().sqrt().item()), device=dev, requires_grad=True)}
             Gv = Wv.view(ng, GA, -1); Go = Wo.T.reshape(ng, GA, -1)
+            Q0s = {}
+            if ATTN_START == 'vpd' and ng == 1:
+                # VPD's subcomponents' directions as the start's basis: q's, k's and v's writes (in the map's output
+                # space), largest ||v_i|| ||u_i|| first, orthonormalized in that order (completed by the orthogonal
+                # complement), so the first slices start as VPD's largest subcomponents' directions; exact for any Q0.
+                for name, n_ in (('q', 'q_proj'), ('k', 'k_proj'), ('ov', 'v_proj')):
+                    Vv_, Uv_ = load(f'h.{l}.attn.{n_}.V'), load(f'h.{l}.attn.{n_}.U')          # [d_in, C], [C, d_out]
+                    order = torch.argsort(-(Vv_.norm(dim=0) * Uv_.norm(dim=1))).cpu().numpy()
+                    D_ = (Uv_ / Uv_.norm(dim=1, keepdim=True).clamp_min(1e-12)).T.cpu().double().numpy()[:, order]
+                    Q0s[name] = torch.tensor(sl.qr(D_, mode='full')[0][:, :GA], dtype=torch.float32, device=dev)[None]
             ROTA[l]['ov'] = {**sub(), 'Gfc': Gv @ Gv.transpose(1, 2), 'Gdn': Go @ Go.transpose(1, 2), 'di': Wv.shape[1], 'do': Wo.shape[0],
                              'ls_fc': torch.full((ng, GA), math.log(0.01 * Wv.pow(2).mean().sqrt().item()), device=dev, requires_grad=True),
                              'ls_dn': torch.full((ng, GA), math.log(0.01 * Wo.pow(2).mean().sqrt().item()), device=dev, requires_grad=True)}
+            for name, Q0 in Q0s.items():
+                ROTA[l][name]['Q0'] = Q0
 ROT_ALL = list(ROT.values()) + [R[x] for R in ROTA.values() for x in ('q', 'k', 'ov')]
 
 def rot_read_bits(R, Q):
@@ -1655,14 +1671,14 @@ def description_bits():
         if 'ls' in R:
             # A q or k slice's dense read.
             s2 = (2 * R['ls']).exp(); d_ = R['di']
-            Q = rot_Q({'A': R['A_leaf'][0]}) if 'A_leaf' in R else rot_Q(R)
+            Q = rot_Q({'A': R['A_leaf'][0], **({'Q0': R['Q0']} if 'Q0' in R else {})}) if 'A_leaf' in R else rot_Q(R)
             nr = qeinsum('nki,nkm,nmi->ni', Q, R['G'], Q)
             v = (nr.sum() + d_ * s2.sum()) / (d_ * nr.numel())
             total = total + 0.5 * (d_ * torch.log(v / s2) + (nr + d_ * s2) / v - d_).sum()
             continue
         # rot: every slice's dense read and write (the angles and thresholds are leaves below).
         sf, sd = (2 * R['ls_fc']).exp(), (2 * R['ls_dn']).exp()
-        Q = rot_Q({'A': R['A_leaf'][0]}) if 'A_leaf' in R else rot_Q(R)
+        Q = rot_Q({'A': R['A_leaf'][0], **({'Q0': R['Q0']} if 'Q0' in R else {})}) if 'A_leaf' in R else rot_Q(R)
         nf = qeinsum('nki,nkm,nmi->ni', Q, R['Gfc'], Q); nd = qeinsum('nki,nkm,nmi->ni', Q, R['Gdn'], Q)
         for nn_, s2, d_ in ((nf, sf, R['di']), (nd, sd, R['do'])):
             v = (nn_.sum() + d_ * s2.sum()) / (d_ * nn_.numel())
