@@ -256,6 +256,19 @@ pub struct Weights {
     /// parts in file order, each the VPD subcomponents it holds per matrix (attention: q, k, v, o;
     /// MLP: c_fc, down_proj). Parts execute through VPD's factors.
     pub library: BTreeMap<(usize, bool), Vec<[Vec<usize>; 4]>>,
+    /// The device's resident copies of these weights are keyed by this (with each matrix's address
+    /// and shape) and dropped when the last clone goes.
+    generation: Arc<Generation>,
+}
+
+/// A `Weights`' identity on the device ([`crate::graph_device::forget`] on drop).
+#[derive(Debug)]
+struct Generation(u64);
+
+impl Drop for Generation {
+    fn drop(&mut self) {
+        crate::graph_device::forget(self.0);
+    }
 }
 
 /// VPD's subcomponents of one attention's four matrices, each `U` (subcomponents × out) and `V`
@@ -366,10 +379,11 @@ impl Weights {
     /// `M`'s blocks with no decomposition views attached; a tied unembedding (equal to the
     /// embedding) is kept once.
     pub fn new(layers: Vec<LayerWeights>, final_norm: Norm, unembedding: Stored, embedding: Stored) -> Self {
-        crate::graph_device::forget();
         let embedding = Arc::new(embedding);
         let unembedding = if unembedding == *embedding { embedding.clone() } else { Arc::new(unembedding) };
-        Self { layers, final_norm, unembedding, embedding, transcoders: BTreeMap::new(), vpd: BTreeMap::new(), vpd_attention: BTreeMap::new(), library: BTreeMap::new() }
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let generation = Arc::new(Generation(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+        Self { layers, final_norm, unembedding, embedding, transcoders: BTreeMap::new(), vpd: BTreeMap::new(), vpd_attention: BTreeMap::new(), library: BTreeMap::new(), generation }
     }
 
     /// Attaches the transcoder view: `dir/layer_{l}.safetensors` per layer that has one.
@@ -600,6 +614,11 @@ impl Weights {
     /// The blocks of `library` (the start library of `M` equals `M`).
     pub fn of(library: &Library) -> Self {
         library.graph_weights()
+    }
+
+    /// The device's key for these weights.
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation.0
     }
 
     pub(crate) fn width(&self) -> usize {
@@ -1960,7 +1979,7 @@ pub use crate::graph_device::use_device;
 /// RMS, its gain) and the unembedding, normalized in float64.
 pub fn log_probabilities(weights: &Weights, last: &Array2<f64>) -> Result<Array2<f64>, String> {
     let gained = last * &weights.final_norm.gain.view().insert_axis(Axis(0));
-    let mut logits = match crate::graph_device::logits(&gained, &weights.unembedding) {
+    let mut logits = match crate::graph_device::logits(weights, &gained) {
         Some(l) => l,
         None => {
             // Widened a block of the vocabulary at a time (Qwen3's whole unembedding is 1.2 GB in

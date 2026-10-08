@@ -24,13 +24,17 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Mutex, OnceLock};
 
-/// The device, its resident copies of host matrices (by address and shape), and the uploaded
-/// arrays of the counterfactual runs used last ([`Reference::id`], most recent last).
+/// The device, its resident copies of host matrices (by their `Weights`' generation, address and
+/// shape), and the uploaded arrays of the counterfactual runs used last ([`Reference::id`], most
+/// recent last).
 pub(crate) struct DeviceState {
     device: Device,
-    resident: HashMap<(usize, usize, usize), Tensor>,
+    /// The generation of the `Weights` the current call reads ([`Weights::generation`]): copies of
+    /// two models never share a key, even where one's freed matrix sits at the other's address.
+    generation: u64,
+    resident: HashMap<Key, Tensor>,
     /// The resident copies' keys, oldest first (past [`RESIDENT_BYTES`] the oldest go).
-    uploaded: Vec<(usize, usize, usize)>,
+    uploaded: Vec<Key>,
     /// Heads' maps stacked into one matrix ([`DeviceState::stacked`]), by the maps' keys and
     /// whether they stack as rows; dropped whenever a weight edit drops resident copies.
     stacks: HashMap<(Vec<Key>, bool), Tensor>,
@@ -85,7 +89,7 @@ fn on_device<T: Send>(f: impl FnOnce(&mut DeviceState) -> T + Send) -> Option<T>
 
 impl DeviceState {
     pub(crate) fn new(device: Device) -> Self {
-        Self { device, resident: HashMap::new(), uploaded: Vec::new(), stacks: HashMap::new(), references: Vec::new() }
+        Self { device, generation: 0, resident: HashMap::new(), uploaded: Vec::new(), stacks: HashMap::new(), references: Vec::new() }
     }
 
     fn arithmetic(&self) -> Arithmetic {
@@ -97,7 +101,7 @@ impl DeviceState {
 
     /// The key of host matrix `m`'s resident copy, uploaded when absent or edited since.
     fn ensure<A: Element>(&mut self, m: ArrayView2<A>) -> Result<Key, GpuError> {
-        let key = (m.as_ptr() as usize, m.nrows(), m.ncols());
+        let key = (self.generation, m.as_ptr() as usize, m.nrows(), m.ncols());
         if !self.resident.contains_key(&key) {
             let t = A::upload(&self.device, m)?;
             self.resident.insert(key, t);
@@ -161,7 +165,7 @@ impl DeviceState {
     /// joined on the host and uploaded once (no per-head copies on the device), kept by the maps'
     /// addresses until a weight edit drops every stack.
     fn stacked(&mut self, maps: &[&Stored], along_rows: bool) -> Result<Tensor, GpuError> {
-        let keys: Vec<Key> = maps.iter().map(|m| (m.as_ptr() as usize, m.nrows(), m.ncols())).collect();
+        let keys: Vec<Key> = maps.iter().map(|m| (self.generation, m.as_ptr() as usize, m.nrows(), m.ncols())).collect();
         if let Some(t) = self.stacks.get(&(keys.clone(), along_rows)) {
             return self.device.copy(t);
         }
@@ -173,7 +177,8 @@ impl DeviceState {
     }
 }
 
-type Key = (usize, usize, usize);
+/// A resident copy's key: its `Weights`' generation, the host matrix's address and shape.
+type Key = (u64, usize, usize, usize);
 
 /// A host element type the device uploads: float64 (vectors, VPD factors, runs' arrays) or float32
 /// (stored weights, sent as they are).
@@ -223,20 +228,23 @@ pub(crate) fn edited_row(v: &Array1<f64>) {
     dropped((v.as_ptr() as usize, 1, v.len()));
 }
 
-fn dropped(key: Key) {
+/// Drops the copies of the host array at `(address, rows, cols)`, of every generation (an edit
+/// does not say whose weights it changes; another generation's copy merely uploads again).
+fn dropped(at: (usize, usize, usize)) {
+    let same = move |k: &Key| (k.1, k.2, k.3) == at;
     on_device(|s| {
-        s.resident.remove(&key);
-        s.stacks.retain(|(keys, _), _| !keys.contains(&key));
+        s.resident.retain(|k, _| !same(k));
+        s.stacks.retain(|(keys, _), _| !keys.iter().any(same));
     });
 }
 
-/// Drops every resident copy and stack: a newly loaded model's matrices may sit at addresses an
-/// earlier model's copies are keyed by.
-pub(crate) fn forget() {
+/// Drops generation `generation`'s copies and stacks: its `Weights` are gone (the last clone
+/// dropped), and their freed matrices' addresses may be reused.
+pub(crate) fn forget(generation: u64) {
     on_device(|s| {
-        s.resident.clear();
-        s.uploaded.clear();
-        s.stacks.clear();
+        s.resident.retain(|k, _| k.0 != generation);
+        s.uploaded.retain(|k| k.0 != generation);
+        s.stacks.retain(|(keys, _), _| keys.first().is_none_or(|k| k.0 != generation));
     });
 }
 
@@ -263,9 +271,13 @@ fn dot_on(s: &mut DeviceState, a: &Array2<f64>, b: ArrayView2<f64>) -> Option<Ar
     result.ok()
 }
 
-/// `last · Uᵀ` on the device with `U` (the unembedding, never edited) resident.
-pub(crate) fn logits(last: &Array2<f64>, unembedding: &Stored) -> Option<Array2<f64>> {
-    on_device(|s| logits_on(s, last, unembedding)).flatten()
+/// `last · Uᵀ` on the device with `U` (the unembedding of `weights`, never edited) resident.
+pub(crate) fn logits(weights: &Weights, last: &Array2<f64>) -> Option<Array2<f64>> {
+    on_device(|s| {
+        s.generation = weights.generation();
+        logits_on(s, last, &weights.unembedding)
+    })
+    .flatten()
 }
 
 fn logits_on(s: &mut DeviceState, last: &Array2<f64>, unembedding: &Stored) -> Option<Array2<f64>> {
@@ -544,6 +556,7 @@ fn normed(d: &Device, ops: &Interventions, (site, u, slot): (usize, usize, usize
 /// [`run`] on a given device state (the tests run it on the host backend).
 pub(crate) fn run_on(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, job: &Run) -> Result<Execution, String> {
     let e = |e: GpuError| e.to_string();
+    s.generation = weights.generation();
     let (rows, width) = (job.tokens.len(), weights.width());
     let arithmetic = s.arithmetic();
     // Attention runs on every sequence padded at its end to the longest one's length, all at once
