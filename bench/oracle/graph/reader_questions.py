@@ -96,17 +96,23 @@ class Encoder:
 
 def log_loss(backend, enc: Encoder, explanation: str | None, questions: list[dict]) -> np.ndarray:
     """Bits per question: -log2 of the reader's probability of the true option, normalized over the options."""
+    return read(backend, enc, explanation, questions)[0]
+
+
+def read(backend, enc: Encoder, explanation: str | None, questions: list[dict]) -> tuple[np.ndarray, np.ndarray]:
+    """(bits per question, whether the reader's most probable option is the true one)."""
     if not questions:
-        return np.zeros(0)
+        return np.zeros(0), np.zeros(0, dtype=bool)
     suffixes = [enc.question(q) for q in questions]
     reads = [[(len(s) - 1, enc.options(q))] for s, q in zip(suffixes, questions)]
     got = backend.read(enc.prefix(explanation), suffixes, reads)
-    out = []
+    bits, right = [], []
     for q, r in zip(questions, got):
         lp = np.asarray(r[0], dtype=np.float64)
         lp = lp - np.logaddexp.reduce(lp)
-        out.append(-lp[q["answer"]] / LN2)
-    return np.array(out)
+        bits.append(-lp[q["answer"]] / LN2)
+        right.append(int(np.argmax(lp)) == q["answer"])
+    return np.array(bits), np.array(right)
 
 
 def derangement(n: int, seed: int) -> list[int]:
@@ -215,13 +221,13 @@ def score(backend, questions: list[dict], explanations: dict[str, str], seed: in
     for b in names:
         qs = [q for q in questions if q["behavior"] == b]
         t0 = time.time()
-        own = log_loss(backend, enc, explanations.get(b), qs)
-        none = log_loss(backend, enc, None, qs)
-        other = log_loss(backend, enc, explanations.get(swap.get(b, b)), qs) if swap else none
+        own, own_r = read(backend, enc, explanations.get(b), qs)
+        none, none_r = read(backend, enc, None, qs)
+        other, other_r = read(backend, enc, explanations.get(swap.get(b, b)), qs) if swap else (none, none_r)
         print(f"reader questions: {b} {len(qs)} questions {time.time() - t0:.1f} s", file=sys.stderr, flush=True)
-        for q, a, n, o in zip(qs, own, none, other):
-            rows.append({"behavior": b, "family": q["family"], "type": q["type"], "own": float(a), "none": float(n), "shuffled": float(o),
-                         "shuffled_from": swap.get(b)})
+        for k, q in enumerate(qs):
+            rows.append({"behavior": b, "family": q["family"], "type": q["type"], "own": float(own[k]), "none": float(none[k]), "shuffled": float(other[k]),
+                         "right": [bool(own_r[k]), bool(none_r[k]), bool(other_r[k])], "shuffled_from": swap.get(b)})
     return {"rows": rows, "summary": summarize(rows)}
 
 
@@ -245,6 +251,8 @@ def summarize(rows: list[dict]) -> dict:
             entry[f"se_behaviors_{arm}"] = float(means.std(ddof=1) / math.sqrt(len(means))) if len(means) > 1 else float("nan")
         entry["bits_none"] = float(np.mean([r["none"] for r in sel]))
         entry["bits_own"] = float(np.mean([r["own"] for r in sel]))
+        if all("right" in r for r in sel):  # the reader's most probable option right: own, none, shuffled
+            entry["accuracy"] = [float(np.mean([r["right"][k] for r in sel])) for k in range(3)]
         out[key] = entry
     out["families"] = {f: {t: float(np.mean([r["none"] - r["own"] for r in rows if r["family"] == f and r["type"] == t]))
                            for t in sorted({r["type"] for r in rows if r["family"] == f})} for f in sorted({r["family"] for r in rows})}
