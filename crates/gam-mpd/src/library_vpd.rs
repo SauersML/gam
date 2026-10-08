@@ -183,6 +183,13 @@ fn grouped(widths: &[usize]) -> Result<Interface, String> {
     Interface::new(widths.iter().enumerate().map(|(b, &width)| crate::operator_program::Group { width, label: crate::operator_program::Label::new(LabelKind::Unit, b as u32) }).collect()).map_err(error)
 }
 
+/// A squared own gate's threshold `−τ|τ|` against `‖V_bᵀx‖²`, the same hard gate as `‖V_bᵀx‖ − τ`;
+/// an always-on threshold (`τ < 0`) holds 1, since `−τ|τ|` at an export's `τ = −10⁹` shares an
+/// operator's exact lattice with thresholds of order one and rounds them to zero.
+fn squared_threshold(tau: f64) -> f64 {
+    if tau < 0.0 { 1.0 } else { -tau * tau }
+}
+
 /// An unshared own gate's threshold on the log scale of its read norm (toys' guard, cd27062d48): the
 /// gate is `ln max(n, t₀) − ln τ` (`Law::Log`, `t₀` its floor), so a part whose reads are zero on a
 /// token is off there by `ln τ − ln t₀` (about 87 e-folds at `τ = 1`), and its gate's training noise
@@ -517,12 +524,12 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
                     // pre-activation Σ_b A_mb ‖V_bᵀx‖² − τ_m|τ_m|, which at a 0/1 assignment is on
                     // exactly where the norm of its members' reads exceeds τ_m.
                     ops.push(dense(&format!("{prefix}.assign"), units(count)?, units(count)?, Array2::eye(count))?);
-                    ops.push(dense(&format!("{prefix}.threshold"), units(count)?, Interface::constant(), Array2::from_shape_fn((count, 1), |(b, _)| -components[comps[b]].tau * components[comps[b]].tau.abs()))?);
+                    ops.push(dense(&format!("{prefix}.threshold"), units(count)?, Interface::constant(), Array2::from_shape_fn((count, 1), |(b, _)| squared_threshold(components[comps[b]].tau)))?);
                 }
                 false => {
                     let tau = |b: usize| components[comps[b]].tau;
                     ops.push(Operator::identity(format!("{prefix}.gate_identity"), units(count)?));
-                    ops.push(dense(&format!("{prefix}.threshold"), units(count)?, Interface::constant(), Array2::from_shape_fn((count, 1), |(b, _)| if squared { -tau(b) * tau(b).abs() } else { log_threshold(tau(b)) }))?);
+                    ops.push(dense(&format!("{prefix}.threshold"), units(count)?, Interface::constant(), Array2::from_shape_fn((count, 1), |(b, _)| if squared { squared_threshold(tau(b)) } else { log_threshold(tau(b)) }))?);
                 }
                 true if detectors.is_some() => {
                     let k = detectors.map_or(0, |d| d.directions.len());
@@ -2249,8 +2256,11 @@ mod tests {
                 let mut stage: Vec<(serde_json::Value, Vec<[usize; 2]>)> = (0..count(q)).step_by(3).map(|i| (serde_json::json!({"logits": {"site": q}}), (i..(i + 3).min(count(q))).map(|j| [q, j]).collect())).collect();
                 stage.extend((0..count(k)).map(|i| (serde_json::json!({"own": [k, i]}), vec![[k, i]])));
                 stage.push((serde_json::json!({"own": [v, 0]}), (0..count(v)).map(|i| [v, i]).collect()));
+                let last = stage.len() - 1;
                 for (b, (read, slices)) in stage.into_iter().enumerate() {
-                    components.push(serde_json::json!({"read": read, "tau": taus.get(l).map_or(-1.0, |t| t[b]), "slices": slices}));
+                    // The v slices always on at an export's threshold (export_to_rust.py's −10⁹).
+                    let tau = if b == last && !taus.is_empty() { -1e9 } else { taus.get(l).map_or(-1.0, |t| t[b]) };
+                    components.push(serde_json::json!({"read": read, "tau": tau, "slices": slices}));
                 }
                 for i in 0..count(o) {
                     components.push(serde_json::json!({"read": {"own": [o, i]}, "tau": -1.0, "slices": [[o, i]]}));
@@ -2356,11 +2366,13 @@ mod tests {
             close(&format!("open layer {l}"), got, want);
             assert!(want.column(0).iter().filter(|v| **v > 1e-6).count() > want.nrows() / 2, "layer {l}: a logit read's spread is not zero");
         }
-        // Thresholds at each component's median gate input (`τ|τ|` against the squared read).
+        // Thresholds between each component's two middle distinct gate inputs (`τ|τ|` against the
+        // squared read): the tiny vocabulary repeats inputs, and no token may sit on its threshold.
         let taus: Vec<Vec<f64>> = inputs.iter().map(|(got, _)| got.columns().into_iter().map(|col| {
             let mut v = col.to_vec();
             v.sort_by(f64::total_cmp);
-            v[v.len() / 2].sqrt()
+            v.dedup_by(|a, b| (*a - *b).abs() <= 1e-9 * b.abs().max(1e-12));
+            (0.5 * (v[v.len() / 2] + v[(v.len() / 2).saturating_sub(1)])).sqrt()
         }).collect()).collect();
         let gated = build("logits_gated", &taus);
         for (l, (got, want)) in gate_inputs(&gated).iter().enumerate() {
@@ -2370,6 +2382,12 @@ mod tests {
         }
         let shut_bits = score(&native, &gated, &gated.artifact);
         assert!(shut_bits > 1e-3, "some components shut: KL(M ‖ P) = {shut_bits} bits");
+        // The single-precision device (Metal on the Mac) shuts the same gates.
+        if let Some(f32_device) = Device::single_precision(gam_gpu::GpuPolicy::Auto).expect("the device query") {
+            let blocks: Vec<_> = gated.layers.iter().map(|l| l.sites.clone()).collect();
+            let bits: f64 = Interchange::new(&f32_device, &native, &blocks, &gated.artifact, &gated.trainable, Vec::new(), 1 << 30, 64).expect("the experiments").evaluate(&batch, &clean, false).expect("evaluate").bits.iter().flatten().sum();
+            assert!((bits - shut_bits).abs() <= 1e-3 * shut_bits.max(1.0), "{}: KL(M ‖ P) = {bits} bits against the host's {shut_bits}", f32_device.name());
+        }
         // Head edits: every head's q, k, v rows and o columns scaled, through the training path and
         // by direct mutation of M's maps and P's writes and o reads.
         let edits: Vec<crate::weight_edit::Drawn> = crate::weight_edit::candidates(&native, 3, 60).expect("the edits").into_iter().filter(|d| d.kind == crate::weight_edit::Kind::Head).take(4).collect();
