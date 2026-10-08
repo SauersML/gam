@@ -178,7 +178,7 @@ RELAUNCHES=3 DISCARDS=5
 # The budget: at most $150 of the team account's credit, which stood at $750 on 2026-10-05 11:10.
 # A pod made outside the runner has no cap it knows; it is counted as running 4 h more, the default
 # cap of a dev pod.
-CAP_DOLLARS=150 START_BALANCE=750 UNCAPPED_HOURS=4
+CAP_DOLLARS=300 START_BALANCE=750 UNCAPPED_HOURS=4
 # The benchmark table GPU_TYPE auto ranks cards by (gpu_bench_table.py's output for the latest
 # gpu_bench.sh runs).
 TABLE=$MAC_DATA/runpod/gpu_bench.tsv
