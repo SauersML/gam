@@ -1633,6 +1633,21 @@ impl Reference {
         }
     }
 
+    /// The run at rows `rows` alone (arrays it did not record stay empty).
+    fn select_rows(&self, rows: &[usize]) -> Self {
+        let pick = |a: &Array2<f64>| if a.nrows() == 0 { a.clone() } else { a.select(Axis(0), rows) };
+        Self {
+            id: next_reference_id(),
+            embed: pick(&self.embed),
+            reads: self.reads.iter().map(|l| l.iter().map(pick).collect()).collect(),
+            active: self.active.iter().map(pick).collect(),
+            mlp: self.mlp.iter().map(pick).collect(),
+            inputs: self.inputs.iter().map(pick).collect(),
+            attention_inputs: self.attention_inputs.iter().map(pick).collect(),
+            zero: self.zero,
+        }
+    }
+
     /// Block `block`'s write in the run (rows × width).
     fn write(&self, weights: &Weights, block: &Block) -> Result<Array2<f64>, String> {
         let rows = self.embed.nrows();
@@ -4176,12 +4191,14 @@ impl Checker {
                 reference(&self.weights, &b).map(Arc::new)
             })
             .clone()?;
+        // The writes at the scored rows alone: nothing is recomputed, so no other row enters.
+        let r = r.select_rows(rows);
         let routed = graph.edges.iter().any(|(w, reader, _)| *w == Writer::Embed && reader.is_none());
         let mut stream = if routed { Array2::zeros(r.embed.dim()) } else { r.embed.clone() };
         for unit in graph.complement_model(&self.weights).units.iter().skip(graph.blocks.len()) {
             stream += &r.write(&self.weights, &unit.block)?;
         }
-        log_probabilities(&self.weights, &stream.select(Axis(0), rows))
+        log_probabilities(&self.weights, &stream)
     }
 
     /// `circuit` under `e` with the roles of prompt and counterfactual swapped: run on the
