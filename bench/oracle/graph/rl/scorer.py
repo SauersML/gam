@@ -88,7 +88,8 @@ def checker(items: list[dict]) -> list[dict]:
                 chunk = batch[s : s + BATCH]
                 # without a reader server the reader items (13 MB per vpd4l score) are kept only for every
                 # ITEMS_EVERY-th program (g-reader scores those offline), dropped otherwise
-                for k, r in zip(chunk, c.score_batch([items[k]["source"] for k in chunk], experiments=experiments, seed=seed, uniform_seeds=uniform or None, **extra)):
+                programs = [{"source": items[k]["source"], "explanation": items[k].get("explanation", "")} for k in chunk]  # the reader reads the explanation alone
+                for k, r in zip(chunk, c.score_batch(programs, experiments=experiments, seed=seed, uniform_seeds=uniform or None, **extra)):
                     if not os.environ.get("GRAPH_READER") and not (ITEMS_EVERY and k % ITEMS_EVERY == 0):
                         r.pop("items", None)
                     elif ITEM_STRIDE > 1 and r.get("items"):  # every ITEM_STRIDE-th item: the reader term's mean stays unbiased

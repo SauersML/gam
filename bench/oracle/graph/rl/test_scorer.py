@@ -24,7 +24,7 @@ class Checker:
 
     def score_batch(self, sources, experiments=32, seed=0, uniform_seeds=None, **options):
         calls.append((self.path, seed, len(sources)))
-        return [{"total_bits": len(x) + seed, "valid": True, "behavior": self.path} for x in sources]
+        return [{"total_bits": len(x["source"]) + seed, "valid": True, "behavior": self.path} for x in sources]
 
 
 def main():

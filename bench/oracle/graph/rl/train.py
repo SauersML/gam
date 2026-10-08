@@ -69,7 +69,7 @@ os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")  # CUDA may be in
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent))
 import prompt  # noqa: E402
-from prompt import program_of, render  # noqa: E402
+from prompt import explanation_of, program_of, render  # noqa: E402
 import scorer  # noqa: E402
 from scorer import SCORERS  # noqa: E402
 
@@ -452,7 +452,7 @@ def repair(chosen: list[dict], best: list[dict], pol, sampler, score, args, adap
         prompts = [pol.prompt_ids(repair_prompt(b, program_of(x["text"]), x["score"])) for b, x in zip(chosen, best)]
         groups = sampler(prompts, args.samples, adapter, step)
         texts = [[pol.tok.decode(c, skip_special_tokens=True) for c in g] for g in groups]
-        scores = score([{"source": program_of(t), "behavior": b, "seed": step, "uniform_seeds": args.uniform_seeds, "experiments": args.experiments} for b, ts in zip(chosen, texts) for t in ts])
+        scores = score([{"source": program_of(t), "explanation": explanation_of(t), "behavior": b, "seed": step, "uniform_seeds": args.uniform_seeds, "experiments": args.experiments} for b, ts in zip(chosen, texts) for t in ts])
         for g in range(len(chosen)):
             for j in range(args.samples):
                 r = scores[g * args.samples + j]
@@ -465,7 +465,8 @@ def repair(chosen: list[dict], best: list[dict], pol, sampler, score, args, adap
 def sft_examples(args, pol, pool: list[dict]) -> tuple[list, list]:
     """--mode sft's data as token ids (prompt, completion): program examples, the oracle's input for a
     TRAINING behavior -> the best program of that behavior among scored --programs files (g-int's
-    {"behavior", "source", "score"} layout) plus every unscored one (printed examples); behaviors outside
+    {"behavior", "source", "score"} layout; the target is the record's "answer" text (or "answer_path"), else its
+    source as a python block followed by its "explanation") plus every unscored one (printed examples); behaviors outside
     the training pool are never used; and
     --data examples (JSONL of {"messages": [user, assistant]} or {"prompt", "completion"}, e.g.
     g-predict's prediction questions). The completion ends with <|im_end|>."""
@@ -484,7 +485,16 @@ def sft_examples(args, pol, pool: list[dict]) -> tuple[list, list]:
             elif r["behavior"] not in best or r["score"]["total_bits"] < best[r["behavior"]]["score"]["total_bits"]:
                 best[r["behavior"]] = r
     end = [pol.end]
-    programs = [(pol.prompt_ids(render(by_id[r["behavior"]])), pol.tok.encode("```python\n" + r["source"].strip() + "\n```", add_special_tokens=False) + end) for _, r in sorted(best.items())]
+
+    def answer(r: dict) -> str:  # the oracle's whole answer: one python block, then the plain-English explanation
+        if r.get("answer"):
+            return r["answer"]
+        if r.get("answer_path"):
+            return Path(r["answer_path"]).expanduser().read_text()
+        text = "```python\n" + r["source"].strip() + "\n```"
+        return text + ("\n\n" + r["explanation"].strip() if r.get("explanation") else "")
+
+    programs = [(pol.prompt_ids(render(by_id[r["behavior"]])), pol.tok.encode(answer(r).strip(), add_special_tokens=False) + end) for _, r in sorted(best.items())]
     questions = []
     for path in args.data or []:
         for line in open(os.path.expanduser(path)):
@@ -577,7 +587,8 @@ def evaluate(sets: dict[str, list[dict]], pol, sampler, score, args, adapter: Pa
                 continue
             prompts = [pol.prompt_ids(render(b)) for b in pool]
             groups = sampler(prompts, args.samples, adapter, version)
-            items = [{"source": program_of(pol.tok.decode(c, skip_special_tokens=True)), "behavior": b, "seed": args.eval_seed, "experiments": args.eval_experiments} for b, g in zip(pool, groups) for c in g]
+            answers = [(b, pol.tok.decode(c, skip_special_tokens=True)) for b, g in zip(pool, groups) for c in g]
+            items = [{"source": program_of(t), "explanation": explanation_of(t), "behavior": b, "seed": args.eval_seed, "experiments": args.eval_experiments} for b, t in answers]
             base = [(b, n, src) for b in pool for n, src in (baselines(b).items() if args.baselines else [])]
             scores = score(items + [{"source": src, "behavior": b, "seed": args.eval_seed, "experiments": args.eval_experiments} for b, _, src in base])
             per_base = {}
@@ -587,8 +598,9 @@ def evaluate(sets: dict[str, list[dict]], pol, sampler, score, args, adapter: Pa
             out = []
             for g, b in enumerate(pool):
                 mine = [(it["source"], x) for it, x in zip(items[g * args.samples : (g + 1) * args.samples], scores[g * args.samples : (g + 1) * args.samples])]
-                for src, x in mine:
-                    samples.write(json.dumps({"set": name, "step": step, "run": run, "behavior": b["id"], "behavior_path": b.get("path"), "program": "oracle", "source": src, "score": x}) + "\n")
+                for it, (src, x) in zip(items[g * args.samples : (g + 1) * args.samples], mine):
+                    samples.write(json.dumps({"set": name, "step": step, "run": run, "behavior": b["id"], "behavior_path": b.get("path"), "program": "oracle", "source": src,
+                                              "explanation": it["explanation"], "score": x}) + "\n")
                 if getattr(args, "scorer", None) == "none":  # sampled and saved only: rescore summarizes
                     continue
                 src, x = min(mine, key=lambda m: m[1]["total_bits"])
@@ -646,7 +658,8 @@ def rescore(args, score) -> dict:
         for i, j in enumerate(rep_of):
             firsts.setdefault(j, i)
         unique = [todo[firsts[j]] for j in range(len(reps))]
-        scored = score([{"source": r["source"], "behavior": behaviors_by_path[bpath], "seed": args.eval_seed, "experiments": args.eval_experiments, "options": options} for r in unique])
+        scored = score([{"source": r["source"], "explanation": r.get("explanation", ""), "behavior": behaviors_by_path[bpath], "seed": args.eval_seed, "experiments": args.eval_experiments,
+                         "options": options} for r in unique])
         scores = [scored[j] for j in rep_of]
         with open(done_path, "a") as f:
             for r, x in zip(todo, scores):
@@ -805,13 +818,13 @@ def main():
         groups = sampler(prompts, args.samples, adapter, step)
         t1 = time.time()
         texts = [[pol.tok.decode(c, skip_special_tokens=True) for c in g] for g in groups]
-        items = [{"source": program_of(t), "behavior": b, "seed": step, "uniform_seeds": args.uniform_seeds, "experiments": args.experiments} for b, ts in zip(chosen, texts) for t in ts]
+        items = [{"source": program_of(t), "explanation": explanation_of(t), "behavior": b, "seed": step, "uniform_seeds": args.uniform_seeds, "experiments": args.experiments} for b, ts in zip(chosen, texts) for t in ts]
         scores = score(items)
         t2 = time.time()
         S = np.array([s["total_bits"] for s in scores], dtype=float).reshape(len(chosen), args.samples)
         valid = np.array([bool(s["valid"]) for s in scores]).reshape(len(chosen), args.samples)
         for (b, it, s, c) in zip([b for b in chosen for _ in range(args.samples)], items, scores, [c for g in groups for c in g]):
-            samples_log.write(json.dumps({"step": step, "behavior": b["id"], "source": it["source"], "completion_tokens": len(c), "score": s}) + "\n")
+            samples_log.write(json.dumps({"step": step, "behavior": b["id"], "source": it["source"], "explanation": it["explanation"], "completion_tokens": len(c), "score": s}) + "\n")
         samples_log.flush()
         flat_p = [p for p in prompts for _ in range(args.samples)]
         flat_c = [c for g in groups for c in g]
