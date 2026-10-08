@@ -134,9 +134,11 @@ def _algorithm(program_source: str):
                                                and getattr(s.value.func, "id", "") in ("align", "claim")))]
     namespace: dict = {}
     exec(compile(tree, "<algorithm>", "exec"), namespace)  # the teacher's own program, trusted
-    roots = [n for n, v in namespace.items() if isinstance(v, types.FunctionType) and v.__name__ == n]
-    algorithm = mech._Algorithm(namespace, roots)
-    return algorithm, [n for n in roots if n != "answer" and n in algorithm.params and n not in ("tokens",)]
+    # The variables: `answer` and the functions it reads by name (helpers taking other arguments are not variables).
+    if not isinstance(namespace.get("answer"), types.FunctionType):
+        return None, []
+    algorithm = mech._Algorithm(namespace, ["answer"])
+    return algorithm, [n for n in algorithm.params if n != "answer"]
 
 
 def build_behavior(entry: dict, per_type: int, seed: int, checker=None) -> list[dict]:
