@@ -734,3 +734,22 @@ fn a_shared_base_joins_every_program() {
     assert!(checker.set_base(Some(broken)).is_err());
     assert!(checker.base.as_ref().is_some_and(|b| b.nodes[0].pieces[0].layer == 0));
 }
+
+/// A behavior without counterfactuals (generic text) scores deleting programs: their runs read no
+/// counterfactual run.
+#[test]
+fn deleting_programs_need_no_counterfactuals() {
+    let (weights, sequences) = model("graph_sites_delete_alone");
+    let mut plain = behavior(&sequences);
+    for p in &mut plain.prompts {
+        p.counterfactual = None;
+    }
+    let mut checker = Checker::new(weights, plain).expect("checker");
+    let mut partial = Program { model: "tiny".into(), valid: true, standin: Some("delete".into()), ..Program::default() };
+    partial.nodes = vec![NodeIr { id: "a0".into(), pieces: vec![piece(0, "head")], claim: None }];
+    partial.edges = ["query", "key", "value"].iter().map(|r| EdgeIr { from: "embed".into(), to: "a0".into(), route: (*r).into() }).chain(["embed", "a0"].iter().map(|w| EdgeIr { from: (*w).into(), to: "logits".into(), route: "input".into() })).collect();
+    let full = Program { standin: Some("delete".into()), ..full_program() };
+    let scores = checker.score_batch(&[partial, full], 4, 1, true, None, 0).expect("scores");
+    assert!(scores.iter().all(|(s, _)| s.valid && s.standin == "delete"));
+    assert!(scores[1].0.exec_error_bits < scores[0].0.exec_error_bits);
+}

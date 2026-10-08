@@ -4596,6 +4596,9 @@ impl Checker {
         }
         seconds[0] = started.elapsed().as_secs_f64();
         let mut made_bytes = 0usize;
+        // Deleting programs read no counterfactual run (Reference::zeros), so a batch of them makes
+        // none, and a behavior without counterfactuals scores them.
+        let counterfactual = circuits.iter().any(|c| !c.delete && !c.is_model());
         // The programs' runs, per edit group in chunks of experiments: a chunk's counterfactual runs
         // are made first (on this thread: made inside parallel runs, a run waiting on one could be
         // stolen by the thread making it while that thread waits on the device's pool, and neither
@@ -4625,7 +4628,9 @@ impl Checker {
                     let prewarm = std::time::Instant::now();
                     // Deleting programs read no counterfactual run (their stand-ins are zero).
                     if parsed.iter().any(|(g, _, _)| !g.delete) {
+                        if counterfactual {
                         chunk.iter().try_for_each(|&r| self.prewarm(&runs[r].1))?;
+                    }
                     }
                     seconds[1] += prewarm.elapsed().as_secs_f64();
                     made_bytes += self.held_references().saturating_sub(before);
