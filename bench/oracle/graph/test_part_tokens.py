@@ -76,3 +76,15 @@ def test_tokenizer_ids_are_contiguous():
     ids = tok("scale(<p:2.h.6>, 0)", add_special_tokens=False)["input_ids"]
     assert base + reg.index["L[2].head[6]"] in ids
     assert tok.decode([base + reg.index["PD.vpd[2].v_proj[559]"]]) == "<p:2.v.559>"
+
+
+def test_sites_and_two_level_choice():
+    reg = registry()
+    m = PT.PartTokens(reg, hidden=16, emb_rms=1.0, base_vocab=100)
+    assert reg.sites == sorted(set(reg.sites)) and len(reg.site) == len(ADDRESSES)
+    h = torch.randn(16)
+    site = reg.site[reg.index["PD.vpd[2].v_proj[559]"]]
+    idx, logits = m.part_logits_in(h, site)
+    assert reg.index["PD.vpd[2].v_proj[559]"] in idx and logits.shape == (len(idx),)
+    assert m.site_logits(h).shape == (len(reg.sites),)
+    assert m.input_rows().shape == (len(ADDRESSES), 16) and m.tokens() == reg.tokens

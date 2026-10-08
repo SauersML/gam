@@ -66,6 +66,16 @@ def address_of(token: str) -> str:
     raise ValueError(f"not a part token: {token!r}")
 
 
+def site_of(address: str) -> str:
+    """The site a part sits in (the first level of the site -> part hierarchy): a VPD site of a layer, or a
+    layer's native attention or MLP."""
+    if m := re.fullmatch(r"PD\.vpd\[(\d+)\]\.(\w+)\[\d+\]", address):
+        return f"{m[1]}.{SITES[m[2]]}"
+    if m := re.fullmatch(r"L\[(\d+)\]\.(head|mlp)\[.*\]", address):
+        return f"{m[1]}.{'attn' if m[2] == 'head' else 'mlp'}"
+    raise ValueError(address)
+
+
 def kind_of(address: str) -> str:
     """The feature kind: one map per kind (VPD site, native head, MLP or attention)."""
     if m := re.fullmatch(r"PD\.vpd\[\d+\]\.(\w+)\[\d+\]", address):
@@ -87,6 +97,8 @@ class Registry:
         self.tokens = [token_of(a) for a in self.addresses]
         self.index = {a: i for i, a in enumerate(self.addresses)}
         self.by_kind = {k: [i for i, kk in enumerate(self.kinds) if kk == k] for k in features}
+        self.sites = sorted({site_of(a) for a in self.addresses})
+        self.site = [self.sites.index(site_of(a)) for a in self.addresses]  # site index per part
 
     @staticmethod
     def load(path) -> "Registry":
@@ -120,7 +132,12 @@ class Registry:
 
 
 class PartTokens(nn.Module):
-    """P_in and P_out per kind; rows in registry order; embed and logits next to the base vocabulary."""
+    """P_in and P_out per kind; rows in registry order; embed and logits next to the base vocabulary.
+
+    Site -> part: a part's input embedding and output row are its own map plus its site's, where a site is
+    represented by the mean feature of its parts through a per-kind site map (so the rows share a site
+    component and site_logits / part_logits_in give the two-level choice for views too large to score at
+    once). Still permutation-invariant: a site's mean does not depend on the parts' order."""
 
     def __init__(self, reg: Registry, hidden: int, emb_rms: float, base_vocab: int, dev=None):
         super().__init__()
@@ -129,25 +146,63 @@ class PartTokens(nn.Module):
         self.names = names
         self.p_in = nn.ModuleDict({names[k]: nn.Linear(f.shape[1], hidden) for k, f in reg.features.items()})
         self.p_out = nn.ModuleDict({names[k]: nn.Linear(f.shape[1], hidden, bias=False) for k, f in reg.features.items()})
-        for m in self.p_out.values():
+        self.s_in = nn.ModuleDict({names[k]: nn.Linear(f.shape[1], hidden, bias=False) for k, f in reg.features.items()})
+        self.s_out = nn.ModuleDict({names[k]: nn.Linear(f.shape[1], hidden, bias=False) for k, f in reg.features.items()})
+        for m in list(self.p_out.values()) + list(self.s_out.values()):
             nn.init.normal_(m.weight, std=0.02 / m.weight.shape[1] ** 0.5)  # parts start improbable
         if dev is not None:
             self.to(dev)
         self.feats = {k: f.to(dev) if dev is not None else f for k, f in reg.features.items()}
         self.idx = {k: torch.tensor(reg.by_kind[k], device=dev) for k in reg.features}
+        # Per kind: each part's site (within the kind's sites) and the sites' mean features.
+        self.site_local, self.site_feats, self.site_global = {}, {}, {}
+        for k, f in self.feats.items():
+            sites = [reg.site[i] for i in reg.by_kind[k]]
+            uniq = sorted(set(sites))
+            local = torch.tensor([uniq.index(x) for x in sites], device=f.device)
+            self.site_local[k] = local
+            self.site_feats[k] = torch.zeros(len(uniq), f.shape[1], device=f.device).index_add(0, local, f.float()) / torch.bincount(local)[:, None].float()
+            self.site_global[k] = torch.tensor(uniq, device=f.device)
 
     def rows(self, which: str) -> torch.Tensor:
-        """[parts, hidden]: input embeddings (which = "in", RMS of the token embeddings) or output rows."""
-        maps = self.p_in if which == "in" else self.p_out
+        """[parts, hidden]: input embeddings (which = "in", RMS of the token embeddings) or output rows; each
+        the part's map plus its site's."""
+        maps, smaps = (self.p_in, self.s_in) if which == "in" else (self.p_out, self.s_out)
         out = None
         for k, f in self.feats.items():
-            y = maps[self.names[k]](f.float())
+            y = maps[self.names[k]](f.float()) + smaps[self.names[k]](self.site_feats[k])[self.site_local[k]]
             if which == "in":
                 y = self.emb_rms * y / y.pow(2).mean(-1, keepdim=True).add(1e-6).sqrt()
             if out is None:
                 out = torch.zeros(len(self.reg.addresses), y.shape[1], device=y.device, dtype=y.dtype)
             out = out.index_copy(0, self.idx[k], y)
         return out
+
+    def site_rows(self) -> torch.Tensor:
+        """[sites, hidden]: the output rows of the sites (the first level of the two-level choice)."""
+        out = torch.zeros(len(self.reg.sites), next(iter(self.s_out.values())).weight.shape[0], device=next(self.parameters()).device)
+        for k in self.feats:
+            out = out.index_copy(0, self.site_global[k], self.s_out[self.names[k]](self.site_feats[k]))
+        return out
+
+    def site_logits(self, h):
+        """Logits of the sites after hidden state h."""
+        return h.float() @ self.site_rows().T
+
+    def part_logits_in(self, h, site: int):
+        """(registry indices, logits) of the parts of one site: the second level."""
+        idx = [i for i, s in enumerate(self.reg.site) if s == site]
+        return idx, h.float() @ self.rows("out")[idx].T
+
+    # The interface rl/train.py uses.
+    def tokens(self) -> list[str]:
+        return self.reg.tokens
+
+    def input_rows(self) -> torch.Tensor:
+        return self.rows("in")
+
+    def output_rows(self) -> torch.Tensor:
+        return self.rows("out")
 
     def embed(self, model, ids: torch.Tensor) -> torch.Tensor:
         base = model.get_input_embeddings()
