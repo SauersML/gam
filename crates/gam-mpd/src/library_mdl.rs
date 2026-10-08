@@ -274,7 +274,7 @@ pub struct Cells {
 const SLICE_CONCEPTS: f64 = 3.0;
 
 /// A gate's concepts, evaluated on every token ([`count_terms`]): its read and its threshold, one
-/// rule.
+/// rule; a detector gate adds the detectors it reads, and its stage's detectors count once each.
 const GATE_CONCEPTS: f64 = 1.0;
 
 /// A prior group: parameters sharing one prior variance (module note).
@@ -2368,6 +2368,10 @@ struct GatedStage {
     /// Per component its own prior groups (its slices' read and write groups and its direction
     /// row) ([`GatedStage::account`]).
     groups: Vec<Vec<usize>>,
+    /// A detector stage's detectors, evaluated on every token, and per component the detectors its
+    /// gate reads (`library_vpd`'s `Read::Detectors`; none elsewhere, [`GatedStage::account`]).
+    detectors: f64,
+    gate_reads: Vec<f64>,
     /// The stage's operators' prefix (`library.l{l}.attn`, `.o`, `.mlp.fc`, `.mlp.dn`).
     prefix: String,
     /// The node holding each component's gate pre-activation: the gate node, or in a shared
@@ -2439,7 +2443,7 @@ impl GatedStage {
                 None => gate,
             };
             let width = index_of(flat, &format!("{prefix}.width"))?;
-            stages.push(Self { input, threshold, direction, slices, groups: Vec::new(), prefix: prefix.to_string(), component_gate, assign, width });
+            stages.push(Self { input, threshold, direction, slices, groups: Vec::new(), detectors: 0.0, gate_reads: Vec::new(), prefix: prefix.to_string(), component_gate, assign, width });
             Ok(())
         };
         // A stage's read holds the components carried in from other blocks first
@@ -2537,6 +2541,13 @@ impl GatedStage {
                 }
                 own.extend(named.get(format!("{prefix}.g{b}").as_str()).copied());
                 own
+            })
+            .collect();
+        self.detectors = (0..).take_while(|j| named.contains_key(format!("{prefix}.det{j}").as_str())).count() as f64;
+        self.gate_reads = (0..self.slices.len())
+            .map(|b| match named.get(format!("{prefix}.g{b}").as_str()) {
+                Some(&g) if self.detectors > 0.0 => explanation.groups[g].cells.iter().map(|c| c.rows.len() * c.cols.len()).sum::<usize>() as f64,
+                _ => 0.0,
             })
             .collect();
     }
@@ -3456,7 +3467,9 @@ fn count_terms(
             let mut followed: Option<(Tensor, Tensor, Vec<f64>)> = None;
             for stage in &scorer.stages[l] {
                 let body = stage.concepts(active);
-                always += GATE_CONCEPTS * body.iter().filter(|c| **c > 0.0).count() as f64;
+                // Its detectors, evaluated once per token, and each surviving component's gate with
+                // the detectors it reads.
+                always += stage.detectors + body.iter().zip(&stage.gate_reads).filter(|(c, _)| **c > 0.0).map(|(_, m)| GATE_CONCEPTS + m).sum::<f64>();
                 let body: Vec<f64> = body.iter().map(|c| c * unit).collect();
                 let j = scorer.at(stage.threshold)?;
                 let variance = if relaxed { device_posterior.values(j)?.1.column(0).mapv(|s| (2.0 * s).exp()).to_vec() } else { vec![0.0; body.len()] };

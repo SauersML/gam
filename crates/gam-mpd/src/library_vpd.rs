@@ -99,6 +99,24 @@ enum Read {
     /// squared norms `‖V_bᵀx‖² − τ_b|τ_b|` beside it, the same hard gates as `‖V_bᵀx‖ − τ_b`. The
     /// weights `u_ik²` are the start's writes (a fit that moves the writes leaves them there).
     Logits { site: usize },
+    /// `Σ_j a_j (ln |g_jᵀx| − θ_j)` over the detectors `j` of `terms` (`(j, a_j)`, a sparse
+    /// combination) at `site`'s input stage, against `ln τ_b`: a detector gate. The stage's
+    /// detectors ([`DetectorSet`]) are shared directions with thresholds, computed once on the
+    /// stage's input (causal: the token's own input), and each part's gate reads a few of them.
+    /// With one detector, `a = 1`, `θ = 0` and the detector the part's own rank-one read, it is the
+    /// part's own gate `ln |vᵀx| − ln τ`.
+    Detectors { site: usize, terms: Vec<(usize, f64)> },
+}
+
+/// One stage's shared detectors (`Read::Detectors`): at `layer`'s stage `stage` (0 the attention's
+/// input, 2 the MLP's input), per detector its direction `g_j` (over the stage's input) and its
+/// threshold `θ_j`, its output `ln max(|g_jᵀx|, t₀) − θ_j`.
+#[derive(Clone, Debug, Deserialize)]
+struct DetectorSet {
+    layer: usize,
+    stage: usize,
+    directions: Vec<Vec<f64>>,
+    thresholds: Vec<f64>,
 }
 
 /// One component of a start file.
@@ -129,6 +147,9 @@ struct ArmRecord {
     /// from the site's slice count on), for the mixing groups' extra slices (module note).
     #[serde(default)]
     extra: Vec<[usize; 2]>,
+    /// The stages' shared detectors (`Read::Detectors`).
+    #[serde(default)]
+    detectors: Vec<DetectorSet>,
 }
 
 /// Where a slice's read row or write column is in the built explanation, by operator name.
@@ -243,8 +264,11 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
     }
     let read_site = |c: &Component| match &c.read {
         Read::Own([site, _]) => *site,
-        Read::Direction { site, .. } | Read::Active { site } | Read::Logits { site } => *site,
+        Read::Direction { site, .. } | Read::Active { site } | Read::Logits { site } | Read::Detectors { site, .. } => *site,
     };
+    let detector_sets = record.detectors;
+    // The detectors of `layer`'s stage `stage`, where a stage gates on them.
+    let detector_set = |layer: usize, stage: usize| detector_sets.iter().find(|d| d.layer == layer && d.stage == stage);
     let mut artifact = Artifact::native(native)?;
     let mut shares = Vec::new();
     // Per layer and stage, the components gated there (each component's home, its gate's stage).
@@ -337,8 +361,13 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
         Ok((zs, ss))
     };
     // Per stage its gate reads' kind: direction (true) or own (false), refused where mixed.
+    // A detector gate is a direction gate on the stage's detectors (`Read::Detectors`).
     let direction_of = |comps: &[usize]| -> Result<bool, String> {
-        let directions = comps.iter().filter(|&&b| matches!(components[b].read, Read::Direction { .. })).count();
+        let detectors = comps.iter().filter(|&&b| matches!(components[b].read, Read::Detectors { .. })).count();
+        if detectors != 0 && detectors != comps.len() {
+            return Err(error(format!("a stage with {detectors} detector gate reads among {} (a stage gates one way)", comps.len())));
+        }
+        let directions = comps.iter().filter(|&&b| matches!(components[b].read, Read::Direction { .. } | Read::Detectors { .. })).count();
         if directions != 0 && directions != comps.len() {
             return Err(error(format!("a stage with {directions} direction and {} own gate reads (a stage gates one way)", comps.len() - directions)));
         }
@@ -358,6 +387,25 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
     let logits_of = |comps: &[usize]| comps.iter().any(|&b| matches!(components[b].read, Read::Logits { .. }));
     for (&(l, stage_index), comps) in &at {
         direction_of(comps)?;
+        let detecting = comps.iter().any(|&b| matches!(components[b].read, Read::Detectors { .. }));
+        match (detecting, detector_set(l, stage_index)) {
+            (true, None) => return Err(error(format!("layer {l} stage {stage_index}: detector gate reads without the stage's detectors"))),
+            (false, Some(_)) => return Err(error(format!("layer {l} stage {stage_index}: detectors with no detector gate reading them"))),
+            (true, Some(set)) => {
+                let k = set.directions.len();
+                if k == 0 || set.thresholds.len() != k || !(stage_index == 0 || stage_index == 2) {
+                    return Err(error(format!("layer {l} stage {stage_index}: detectors at the attention's or the MLP's input, each with one threshold")));
+                }
+                for &b in comps {
+                    if let Read::Detectors { terms, .. } = &components[b].read
+                        && (terms.is_empty() || terms.iter().any(|(j, a)| *j >= k || *a == 0.0))
+                    {
+                        return Err(error(format!("component {b}: a detector gate reads some of its stage's {k} detectors, each with a nonzero weight")));
+                    }
+                }
+            }
+            (false, None) => {}
+        }
         if active_of(comps)? && stage_index != 2 {
             return Err(error("all-on activation reads gate components at the MLP's input only"));
         }
@@ -454,7 +502,10 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
         let v_a = Array2::from_shape_fn((r_a, d), |(r, j)| factors[read_rows[r].0].v[[j, read_rows[r].1]]);
         // `share`: the components share the stage's gates (an assignment, own gates on the squared
         // norm of their members' reads).
-        let gate_ops = |prefix: &str, comps: &[usize], cols: &Interface, share: bool| -> Result<Vec<Operator>, String> {
+        // `detectors`: the stage's detectors, where its gates read them (`Read::Detectors`): the
+        // gates' direction rows are the combinations over the detectors and the detectors'
+        // operators follow the stage's others.
+        let gate_ops = |prefix: &str, comps: &[usize], cols: &Interface, share: bool, detectors: Option<&DetectorSet>| -> Result<Vec<Operator>, String> {
             let count = comps.len();
             let direction = direction_of(comps)?;
             // A stage with logit reads gates on squared reads (`Read::Logits`).
@@ -473,15 +524,24 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
                     ops.push(Operator::identity(format!("{prefix}.gate_identity"), units(count)?));
                     ops.push(dense(&format!("{prefix}.threshold"), units(count)?, Interface::constant(), Array2::from_shape_fn((count, 1), |(b, _)| if squared { -tau(b) * tau(b).abs() } else { log_threshold(tau(b)) }))?);
                 }
+                true if detectors.is_some() => {
+                    let k = detectors.map_or(0, |d| d.directions.len());
+                    let g = Array2::from_shape_fn((count, k), |(b, j)| match &components[comps[b]].read {
+                        Read::Detectors { terms, .. } => terms.iter().filter(|(i, _)| *i == j).map(|(_, a)| a).sum(),
+                        _ => 0.0,
+                    });
+                    ops.push(dense(&format!("{prefix}.direction"), units(count)?, units(k)?, g)?);
+                    ops.push(dense(&format!("{prefix}.threshold"), units(count)?, Interface::constant(), Array2::from_shape_fn((count, 1), |(b, _)| log_threshold(components[comps[b]].tau)))?);
+                }
                 true => {
                     let w = cols.width();
                     let g = Array2::from_shape_fn((count, w), |(b, j)| match &components[comps[b]].read {
                         Read::Direction { coefficients, .. } => coefficients[j],
-                        Read::Own(_) | Read::Active { .. } | Read::Logits { .. } => 0.0,
+                        Read::Own(_) | Read::Active { .. } | Read::Logits { .. } | Read::Detectors { .. } => 0.0,
                     });
                     let c = Array2::from_shape_fn((count, 1), |(b, _)| match &components[comps[b]].read {
                         Read::Direction { coefficients, .. } => coefficients[w] - components[comps[b]].tau,
-                        Read::Own(_) | Read::Active { .. } | Read::Logits { .. } => 0.0,
+                        Read::Own(_) | Read::Active { .. } | Read::Logits { .. } | Read::Detectors { .. } => 0.0,
                     });
                     ops.push(dense(&format!("{prefix}.direction"), units(count)?, cols.clone(), g)?);
                     ops.push(dense(&format!("{prefix}.threshold"), units(count)?, Interface::constant(), c)?);
@@ -503,7 +563,26 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
             if share && direction {
                 ops.push(dense(&format!("{prefix}.assign"), units(count)?, units(count)?, Array2::eye(count))?);
             }
+            if let Some(set) = detectors {
+                let (k, d) = (set.directions.len(), cols.width());
+                if set.directions.iter().any(|g| g.len() != d) {
+                    return Err(error(format!("{prefix}: detector directions of another width than the stage's input {d}")));
+                }
+                ops.push(dense(&format!("{prefix}.detectors"), units(k)?, cols.clone(), Array2::from_shape_fn((k, d), |(j, i)| set.directions[j][i]))?);
+                ops.push(Operator::identity(format!("{prefix}.detector_identity"), units(k)?));
+                ops.push(dense(&format!("{prefix}.detector_thresholds"), units(k)?, Interface::constant(), Array2::from_shape_fn((k, 1), |(j, _)| -set.thresholds[j]))?);
+            }
             Ok(ops)
+        };
+        // A stage's detector operators (`Read::Detectors`), with their count: by name among a rule's
+        // own operators (from `base`), else in the artifact.
+        let detector_ops = |artifact: &Artifact, operators: &[Operator], base: usize, prefix: &str| -> Option<(usize, usize, usize, usize)> {
+            let at = |part: &str| {
+                let n = format!("{prefix}.{part}");
+                operators.iter().position(|o| o.name == n).map(|i| (base + i, operators[i].rows.width())).or_else(|| index_of(&artifact.program, &n).ok().map(|i| (i, artifact.program.operators[i].rows.width())))
+            };
+            let (d, k) = at("detectors")?;
+            Some((d, at("detector_identity")?.0, at("detector_thresholds")?.0, k))
         };
         // The attention input stage's nodes from `input` (node 0 of a rule's nodes so far): the
         // stacked read, the gate, the gate's width, the gated activations; returns (gated node,
@@ -512,13 +591,25 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
         // gates then the stage's own; without, its own gates alone. `own` selects the own
         // components' read norms where carried rows come first in the read; an unshared own gate
         // reads their logs (`groups` of them, [`log_threshold`]).
-        let stage_nodes = |nodes: &mut Vec<Node>, input: usize, (read, gate_a, gate_b, soft): (usize, usize, usize, usize), assign: Option<usize>, direction: bool, own: Option<usize>, extra: Option<(Vec<usize>, Vec<usize>)>, groups: usize| -> (Option<usize>, usize, usize) {
+        // A detector stage's gate reads its detectors' outputs `ln max(|Gx|, t₀) − θ` (`detectors`:
+        // their operators and count, [`Read::Detectors`]) in place of `input`.
+        let stage_nodes = |nodes: &mut Vec<Node>, input: usize, (read, gate_a, gate_b, soft): (usize, usize, usize, usize), assign: Option<usize>, direction: bool, own: Option<usize>, extra: Option<(Vec<usize>, Vec<usize>)>, groups: usize, detectors: Option<(usize, usize, usize, usize)>| -> (Option<usize>, usize, usize) {
+            let gate_input = match detectors {
+                Some((g, identity, thresholds, k)) => {
+                    nodes.push(Node::Affine { terms: vec![(input, g)], bias: None });
+                    nodes.push(Node::GroupNorm { input: nodes.len() - 1 });
+                    nodes.push(Node::Pointwise { input: nodes.len() - 1, laws: vec![Law::Log; k] });
+                    nodes.push(Node::Affine { terms: vec![(nodes.len() - 1, identity)], bias: Some(thresholds) });
+                    nodes.len() - 1
+                }
+                None => input,
+            };
             // A shared stage (`assign`, gates × components): the gates' pre-activations and widths,
             // then each component's own, z_b = Σ_m A_mb z_m and w_b = Σ_m A_mb w_m (a 0/1
             // assignment gives each component its gate's), before the reads.
             if let Some(assign) = assign {
                 let (a, z) = if direction {
-                    nodes.push(Node::Affine { terms: vec![(input, gate_a)], bias: Some(gate_b) });
+                    nodes.push(Node::Affine { terms: vec![(gate_input, gate_a)], bias: Some(gate_b) });
                     (None, nodes.len() - 1)
                 } else {
                     nodes.push(Node::Affine { terms: vec![(input, read)], bias: None });
@@ -546,7 +637,7 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
             // A direction gate and its width come before the reads they gate, so each row reads
             // only its components on (`DeviceProgram`'s gated reads); an own gate reads them.
             let (a, z, s) = if direction {
-                nodes.push(Node::Affine { terms: vec![(input, gate_a)], bias: Some(gate_b) });
+                nodes.push(Node::Affine { terms: vec![(gate_input, gate_a)], bias: Some(gate_b) });
                 nodes.push(Node::Constant { operator: soft });
                 nodes.push(Node::Affine { terms: vec![(input, read)], bias: None });
                 (nodes.len() - 1, nodes.len() - 3, nodes.len() - 2)
@@ -596,7 +687,7 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
                 for (row, slice) in read_rows.iter().enumerate() {
                     held.entry(*slice).or_default().push((format!("{name}.attn.read"), Held::Read { row }));
                 }
-                let mut gates = gate_ops(&format!("{name}.attn"), &a_comps, &x_interface, attn_shared)?;
+                let mut gates = gate_ops(&format!("{name}.attn"), &a_comps, &x_interface, attn_shared, detector_set(l, 0))?;
                 operators.append(&mut gates);
                 for (s, picked) in &selections {
                     if !picked.is_empty() {
@@ -673,7 +764,7 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
                 nodes.push(Node::Gated { value: a, gate: z, scale: Some(w) });
                 (Some(nodes.len() - 1), z, w)
             } else {
-                stage_nodes(&mut nodes, 0, (read_op, gate_a, gate_b, soft), assign, a_direction, own, Some(parts), widths.len())
+                stage_nodes(&mut nodes, 0, (read_op, gate_a, gate_b, soft), assign, a_direction, own, Some(parts), widths.len(), detector_ops(&artifact, &operators, base, &format!("{name}.attn")))
             };
             let gated = gated.ok_or("the gated reads")?;
             let mut projections = Vec::new();
@@ -761,7 +852,7 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
                 );
                 let assign = if attn_shared { Some(index_of(&artifact.program, &format!("{name}.attn.assign"))?) } else { None };
                 let own = if a_own { Some(index_of(&artifact.program, &format!("{name}.attn.select_own"))?) } else { None };
-                let (_, z, s) = stage_nodes(&mut nodes, heads, stage_ops, assign, a_direction, own, None, widths.len());
+                let (_, z, s) = stage_nodes(&mut nodes, heads, stage_ops, assign, a_direction, own, None, widths.len(), detector_ops(&artifact, &[], 0, &format!("{name}.attn")));
                 operators.push(dense(&format!("{name}.o.select_gate"), units(carried.len())?, units(a_comps.len())?, selection(&carried, a_comps.len()))?);
                 nodes.push(Node::Affine { terms: vec![(z, base + operators.len() - 1)], bias: None });
                 gate_parts.push(nodes.len() - 1);
@@ -776,7 +867,7 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
                 if is_shared(&o_own) {
                     return Err(error(format!("layer {l}: gate sharing at the o stage is not built (only at the attention's and the MLP's inputs)")));
                 }
-                let mut gates = gate_ops(&format!("{name}.o"), &o_own, &concat, false)?;
+                let mut gates = gate_ops(&format!("{name}.o"), &o_own, &concat, false, None)?;
                 let first = base + operators.len();
                 operators.append(&mut gates);
                 if o_direction {
@@ -854,7 +945,7 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
             dense(&format!("{name}.mlp.dn_read"), dn_stacked.clone(), up_rows.clone(), Array2::from_shape_fn((dn_rows.len(), hidden), |(r, j)| factors[dn].v[[j, dn_rows[r]]]))?,
             dense(&format!("{name}.mlp.dn_write"), out_rows.clone(), dn_stacked.clone(), Array2::from_shape_fn((out_rows.width(), dn_rows.len()), |(r, c)| factors[dn].u[[dn_rows[c], r]]))?,
         ];
-        let mut gates = gate_ops(&format!("{name}.mlp.fc"), &f_comps, &h2_interface, is_shared(&f_comps))?;
+        let mut gates = gate_ops(&format!("{name}.mlp.fc"), &f_comps, &h2_interface, is_shared(&f_comps), detector_set(l, 2))?;
         operators.append(&mut gates);
         let mut inputs = vec![h2];
         inputs.extend(extra_inputs(&f_cross, &inputs));
@@ -910,7 +1001,7 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
                 (nodes.len() - 1, z, s)
             }
         } else {
-            let (gated, z, s) = stage_nodes(&mut nodes, 0, (base, base + 4, base + 5, base + 6), fc_assign, f_direction, fc_own, Some(fc_parts), fc_widths.len());
+            let (gated, z, s) = stage_nodes(&mut nodes, 0, (base, base + 4, base + 5, base + 6), fc_assign, f_direction, fc_own, Some(fc_parts), fc_widths.len(), detector_ops(&artifact, &operators, base, &format!("{name}.mlp.fc")));
             (gated.ok_or("the gated reads")?, z, s)
         };
         nodes.push(Node::Affine { terms: vec![(gated, base + 1)], bias: None });
@@ -938,7 +1029,7 @@ pub fn explanation_with_gate(native: &OperatorProgram, layers: &[LayerNodes], de
             // (cross-stage sharing: parts spanning the read and the write maps, as descent's share
             // arm, d6ad2537cb); their own gates stay unshared among themselves.
             let follows = is_shared(&d_own);
-            let mut gates = gate_ops(&format!("{name}.mlp.dn"), &d_own, &up_rows, false)?;
+            let mut gates = gate_ops(&format!("{name}.mlp.dn"), &d_own, &up_rows, false, None)?;
             let first = base + operators.len();
             operators.append(&mut gates);
             if d_direction {
@@ -1061,6 +1152,45 @@ fn groups_of(artifact: Artifact, layers: &[LayerNodes], gate: Gate) -> Result<Ex
     let program = &artifact.program;
     let named = |name: &str| index_of(program, name);
     let mut groups: Vec<Group> = Vec::new();
+    // A detector stage's combination entries off their gates' supports, zero and removed.
+    let mut removed: Vec<usize> = Vec::new();
+    // A stage's gate rows (`{prefix}.direction`, one group per row, `g{b}`), and with detectors their
+    // rows and thresholds; each group's index into `into`.
+    let mut gate_groups = |prefix: &str, groups: &mut Vec<Group>, trainable: &mut Vec<usize>, into: &mut Vec<usize>| -> Result<(), String> {
+        let Ok(g) = named(&format!("{prefix}.direction")) else { return Ok(()) };
+        trainable.push(g);
+        let (rows, cols) = (program.operators[g].rows.width(), program.operators[g].cols.width());
+        let detectors = named(&format!("{prefix}.detectors")).ok();
+        let values = program.operators[g].matrix();
+        let mut off = Vec::new();
+        for b in 0..rows {
+            let cells = match detectors {
+                Some(_) => {
+                    off.extend((0..cols).filter(|j| values[[b, *j]] == 0.0).map(|j| Cells { operator: g, rows: vec![b], cols: j..j + 1 }));
+                    (0..cols).filter(|j| values[[b, *j]] != 0.0).map(|j| Cells { operator: g, rows: vec![b], cols: j..j + 1 }).collect()
+                }
+                None => vec![Cells { operator: g, rows: vec![b], cols: 0..cols }],
+            };
+            groups.push(Group { name: format!("{prefix}.g{b}"), cells });
+            into.push(groups.len() - 1);
+        }
+        if let Some(d) = detectors {
+            if !off.is_empty() {
+                groups.push(Group { name: format!("{prefix}.off"), cells: off });
+                removed.push(groups.len() - 1);
+            }
+            trainable.push(d);
+            for j in 0..program.operators[d].rows.width() {
+                groups.push(Group { name: format!("{prefix}.det{j}"), cells: vec![Cells { operator: d, rows: vec![j], cols: 0..program.operators[d].cols.width() }] });
+                into.push(groups.len() - 1);
+            }
+            let t = named(&format!("{prefix}.detector_thresholds"))?;
+            trainable.push(t);
+            groups.push(Group { name: format!("{prefix}.detector_thresholds"), cells: vec![Cells { operator: t, rows: (0..program.operators[t].rows.width()).collect(), cols: 0..1 }] });
+            into.push(groups.len() - 1);
+        }
+        Ok(())
+    };
     let mut trainable: Vec<usize> = Vec::new();
     let mut out: Vec<Layer> = layers.iter().map(|sites| Layer { sites: sites.clone(), heads: Vec::new(), functions: Vec::new(), sink: None, thresholds: Vec::new(), components: Vec::new() }).collect();
     // A group per row (or column) of an operator, named.
@@ -1128,13 +1258,7 @@ fn groups_of(artifact: Artifact, layers: &[LayerNodes], gate: Gate) -> Result<Ex
         let mut thresholds = Vec::new();
         for prefix in ["attn", "o"] {
             // A direction stage's gate rows (only such a stage has a direction operator).
-            if let Ok(g) = named(&format!("{name}.{prefix}.direction")) {
-                trainable.push(g);
-                for b in 0..rows_of(g) {
-                    groups.push(Group { name: format!("{name}.{prefix}.g{b}"), cells: vec![Cells { operator: g, rows: vec![b], cols: 0..cols_of(g) }] });
-                    thresholds.push(groups.len() - 1);
-                }
-            }
+            gate_groups(&format!("{name}.{prefix}"), &mut groups, &mut trainable, &mut thresholds)?;
             if let Ok(t) = named(&format!("{name}.{prefix}.threshold")) {
                 trainable.push(t);
                 groups.push(Group { name: format!("{name}.{prefix}.thresholds"), cells: vec![Cells { operator: t, rows: (0..rows_of(t)).collect(), cols: 0..1 }] });
@@ -1191,13 +1315,7 @@ fn groups_of(artifact: Artifact, layers: &[LayerNodes], gate: Gate) -> Result<Ex
             }
         }
         for prefix in ["fc", "dn"] {
-            if let Ok(g) = named(&format!("{name}.mlp.{prefix}.direction")) {
-                trainable.push(g);
-                for b in 0..rows_of(g) {
-                    groups.push(Group { name: format!("{name}.mlp.{prefix}.g{b}"), cells: vec![Cells { operator: g, rows: vec![b], cols: 0..cols_of(g) }] });
-                    layer.thresholds.push(groups.len() - 1);
-                }
-            }
+            gate_groups(&format!("{name}.mlp.{prefix}"), &mut groups, &mut trainable, &mut layer.thresholds)?;
             if let Ok(t) = named(&format!("{name}.mlp.{prefix}.threshold")) {
                 trainable.push(t);
                 groups.push(Group { name: format!("{name}.mlp.{prefix}.thresholds"), cells: vec![Cells { operator: t, rows: (0..rows_of(t)).collect(), cols: 0..1 }] });
@@ -1215,7 +1333,7 @@ fn groups_of(artifact: Artifact, layers: &[LayerNodes], gate: Gate) -> Result<Ex
     trainable.sort_unstable();
     trainable.dedup();
     let reference = mean_squares(&artifact.program, &groups);
-    Ok(Explanation { artifact, trainable, groups, layers: out, removed: Vec::new(), fixed_nats: 0.0, reference, reads: Vec::new(), shares: Vec::new(), scoring: crate::library_mdl::GateScoring::Compiled, mixes: Vec::new() })
+    Ok(Explanation { artifact, trainable, groups, layers: out, removed, fixed_nats: 0.0, reference, reads: Vec::new(), shares: Vec::new(), scoring: crate::library_mdl::GateScoring::Compiled, mixes: Vec::new() })
 }
 
 /// The uses of `M`'s maps in an explanation [`explanation`] built (`artifact::Owner::uses`), where
@@ -1574,12 +1692,12 @@ fn set_gate(part: &mut Dumped, read: String, (on, tau, g): StageGate) {
 pub fn dump_parts(native: &OperatorProgram, layers: &[LayerNodes], artifact: &Artifact, start: &Path, arm: &str, inputs: &FamilyInputs, dir: &Path) -> Result<usize, String> {
     let records: Vec<ArmRecord> = serde_json::from_slice(&std::fs::read(start).map_err(|e| error(format!("{}: {e}", start.display())))?).map_err(error)?;
     let components = records.into_iter().find(|r| r.arm == arm).ok_or_else(|| error(format!("{}: no arm {arm}", start.display())))?.components;
-    if components.iter().any(|c| matches!(c.read, Read::Active { .. } | Read::Logits { .. })) {
-        return Err(error("dump_parts: all-on activation and logit reads are not dumped"));
+    if components.iter().any(|c| matches!(c.read, Read::Active { .. } | Read::Logits { .. } | Read::Detectors { .. })) {
+        return Err(error("dump_parts: all-on activation, logit and detector reads are not dumped"));
     }
     let read_site = |c: &Component| match &c.read {
         Read::Own([site, _]) => *site,
-        Read::Direction { site, .. } | Read::Active { site } | Read::Logits { site } => *site,
+        Read::Direction { site, .. } | Read::Active { site } | Read::Logits { site } | Read::Detectors { site, .. } => *site,
     };
     // Per layer and stage, the components gated there, as `explanation` orders them.
     let mut at: BTreeMap<(usize, usize), Vec<usize>> = BTreeMap::new();
@@ -1981,7 +2099,7 @@ mod tests {
         // Component reads: own (threshold −1 below a norm) or a direction (g small, c = 10).
         let mut direction = |site: usize| serde_json::json!({"direction": {"site": site, "coefficients": (0..=inputs[site]).map(|j| if j < inputs[site] { 0.01 * (rng.random::<f64>() - 0.5) } else { 10.0 }).collect::<Vec<f64>>()}});
         let mut arms = Vec::new();
-        for (arm, [attention, up, down]) in [("own", [false; 3]), ("direction", [true; 3]), ("stages", [false, true, false]), ("mixed", [false, true, true]), ("active", [false; 3]), ("active_gated", [false; 3]), ("active_shared", [false; 3])] {
+        for (arm, [attention, up, down]) in [("own", [false; 3]), ("direction", [true; 3]), ("stages", [false, true, false]), ("mixed", [false, true, true]), ("active", [false; 3]), ("active_gated", [false; 3]), ("active_shared", [false; 3]), ("own_gated", [false; 3]), ("detectors", [false; 3]), ("detectors_gated", [false; 3])] {
             let mut components = Vec::new();
             for l in 0..2 {
                 let (q, o, fc, dn) = (6 * l, 6 * l + 3, 6 * l + 4, 6 * l + 5);
@@ -1992,10 +2110,19 @@ mod tests {
                 // on their own down gates; "mixed" puts one c_fc part on its own read.
                 for i in 0..count[fc] {
                     let own = !up || (arm == "mixed" && i == 0);
-                    let r = if arm.starts_with("active") { serde_json::json!({"active": {"site": fc}}) } else if own { serde_json::json!({"own": [fc, i]}) } else { direction(fc) };
-                    // "active_gated" and "active_shared": thresholds that turn about half of the parts
-                    // off; "active_shared" lets each move to the next part's gate.
-                    let tau = if arm == "active_gated" || arm == "active_shared" { 0.05 } else { -1.0 };
+                    let r = if arm.starts_with("active") {
+                        serde_json::json!({"active": {"site": fc}})
+                    } else if arm.starts_with("detectors") {
+                        serde_json::json!({"detectors": {"site": fc, "terms": [[i, 1.0]]}})
+                    } else if own {
+                        serde_json::json!({"own": [fc, i]})
+                    } else {
+                        direction(fc)
+                    };
+                    // "active_gated", "active_shared", "own_gated" and "detectors_gated": thresholds
+                    // that turn about half of the parts off; "active_shared" lets each move to the
+                    // next part's gate.
+                    let tau = if ["active_gated", "active_shared", "own_gated", "detectors_gated"].contains(&arm) { 0.05 } else { -1.0 };
                     let candidates: Vec<usize> = if arm == "active_shared" { vec![components.len() - i + (i + 1) % count[fc]] } else { Vec::new() };
                     components.push(serde_json::json!({"read": r, "tau": tau, "slices": [[fc, i], [dn, i]], "candidates": candidates}));
                 }
@@ -2004,7 +2131,20 @@ mod tests {
                     components.push(serde_json::json!({"read": r, "tau": -1.0, "slices": [[dn, i]]}));
                 }
             }
-            arms.push(serde_json::json!({"arm": arm, "components": components}));
+            // A detector arm's MLP input stages: one detector per c_fc slice, its own read, at
+            // threshold 0, each part's gate that detector alone (the own gate's form).
+            let detectors: Vec<serde_json::Value> = if arm.starts_with("detectors") {
+                (0..2)
+                    .map(|l| {
+                        let (v, _, _) = &frames[6 * l + 4];
+                        let directions: Vec<Vec<f64>> = (0..v.ncols()).map(|i| v.column(i).to_vec()).collect();
+                        serde_json::json!({"layer": l, "stage": 2, "thresholds": vec![0.0; directions.len()], "directions": directions})
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            arms.push(serde_json::json!({"arm": arm, "components": components, "detectors": detectors}));
         }
         let start = factors.join("start.json");
         std::fs::write(&start, serde_json::Value::Array(arms).to_string()).expect("the start");
@@ -2016,7 +2156,7 @@ mod tests {
         let sequences: Vec<Vec<u32>> = tokens.chunks(12).map(<[u32]>::to_vec).collect();
         let batch = Batch::new(sequences[..3].to_vec(), sequences[3..6].to_vec()).expect("the batch");
         let device = Device::host();
-        for arm in ["own", "direction", "stages", "active"] {
+        for arm in ["own", "direction", "stages", "active", "detectors"] {
             let explanation = super::explanation(&native, &layers, &factors, &start, arm).expect("the explanation");
             let blocks: Vec<_> = explanation.layers.iter().map(|l| l.sites.clone()).collect();
             let ic = Interchange::new(&device, &native, &blocks, &explanation.artifact, &explanation.trainable, Vec::new(), 1 << 30, 64).expect("the experiments");
@@ -2066,6 +2206,14 @@ mod tests {
         assert!(shared.shares.len() == 2, "one shared stage per layer");
         let bits: f64 = Interchange::new(&device, &native, &blocks, &shared.artifact, &shared.trainable, Vec::new(), 1 << 30, 64).expect("the experiments").evaluate(&batch, &clean, false).expect("evaluate").bits.iter().flatten().sum();
         assert!((bits - open).abs() <= 1e-9 * open.max(1.0), "shared all-on gates {bits} bits against unshared {open}");
+        // Detector gates with one detector each, the part's own read at threshold 0, are its own
+        // gates: the hard explanation scores as the own-gated one, some parts off.
+        let score = |arm: &str| -> f64 {
+            let explanation = super::explanation(&native, &layers, &factors, &start, arm).expect("the explanation");
+            Interchange::new(&device, &native, &blocks, &explanation.artifact, &explanation.trainable, Vec::new(), 1 << 30, 64).expect("the experiments").evaluate(&batch, &clean, false).expect("evaluate").bits.iter().flatten().sum()
+        };
+        let (own, detected) = (score("own_gated"), score("detectors_gated"));
+        assert!(own > 1e-3 && (own - detected).abs() <= 1e-9 * own, "detector gates {detected} bits against own gates {own}");
         let mixed = super::explanation(&native, &layers, &factors, &start, "mixed");
         assert!(mixed.as_ref().is_err_and(|e| e.contains("gates one way")), "a stage with both kinds of read is refused: {:?}", mixed.err());
         std::fs::remove_dir_all(&factors).expect("the factors are removed");
