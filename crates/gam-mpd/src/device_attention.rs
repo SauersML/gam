@@ -150,6 +150,11 @@ pub(crate) fn forward_segments(d: &Device, (q, k, v): Values<'_>, segments: &[Se
     if let Some(length) = common_length(segments)
         && !tiles(segments.len() * length, length)
     {
+        // Segments that are the call's rows in order, each a whole sequence from position 0 (the
+        // graph checker's padded heads): nothing to gather or put back (a copy per segment each).
+        if q.rows() == segments.len() * length && segments.iter().enumerate().all(|(i, s)| s.first == 0 && s.before.is_empty() && s.rows == (i * length..(i + 1) * length)) {
+            return forward_whole(d, (q, k, v), segments.len(), scale, causal, arithmetic);
+        }
         let whole = Whole::of(segments, length);
         let (qs, ks, vs) = (d.gather_ranges(q, &whole.keys)?, d.gather_ranges(k, &whole.keys)?, d.gather_ranges(v, &whole.keys)?);
         let all = forward_whole(d, (&qs, &ks, &vs), segments.len(), scale, causal, arithmetic)?;
