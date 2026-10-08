@@ -65,6 +65,7 @@ def test_ir_carries_explanation():
     fake = types.SimpleNamespace(model="vpd4l", behavior_record=None, decomposition="vpd")
     ir = score.Checker.ir(fake, {"source": "from mech import L\n", "explanation": "L2.H4 copies the token."})
     assert ir["valid"] and ir["explanation"] == "L2.H4 copies the token."
+    assert ir["explanation_tokens"] > 3 and ir["explanation_token_types"] > 150_000
     assert score.Checker.ir(fake, "from mech import L\n")["explanation"] == ""
     assert score.Checker.ir(fake, ir) is ir
 

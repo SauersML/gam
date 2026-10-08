@@ -101,7 +101,7 @@ CODES = {"q_proj": "q", "k_proj": "k", "v_proj": "v", "o_proj": "o", "c_fc": "fc
 SITE_OF = {code: site for site, code in CODES.items()}
 PART = re.compile(r"<p:(\d+)\.(?:(q|k|v|o|fc|down|attn|mlp)\.(\d+|rest)|h\.(\d+)|(a|m))>")
 ROUTES = ("query", "key", "value", "input")
-EXPORTS = ("align", "claim", "node", "edges", "L", "PD", "embed", "logits")
+EXPORTS = ("align", "claim", "base", "node", "edges", "L", "PD", "embed", "logits")
 ATTRIBUTES = ("head", "attn", "mlp", "rest", "query", "key", "value", "input") + SITES
 LIBRARY_ARM = "grouped_own"  # the arm of decomp's start that the library view addresses
 
@@ -194,6 +194,7 @@ class _Program:
         self.edges: dict[tuple, Edge] = {}
         self.aligned: dict[str, list[Piece]] = {}
         self.claimed: dict[str, list[Piece]] = {}
+        self.base: list[Piece] = []
 
 
 def _shape() -> dict | None:
@@ -593,6 +594,15 @@ def align(variable, *parts) -> None:
     _PROGRAM.aligned.setdefault(name, []).extend(_pieces(parts, f"align({name}, ...)"))
 
 
+def base(*parts) -> None:
+    """Generic machinery the program runs without explaining it (the model's shared base library): one node
+    per layer's attention or MLP, reading the embedding and the earlier base nodes and feeding every later
+    node and the logits; its structure is charged once across behaviors, outside the program's total."""
+    if _PROGRAM is None:
+        raise MechError("base() runs inside a program")
+    _PROGRAM.base.extend(_pieces(parts, "base(...)"))
+
+
 def claim(pattern, *parts) -> None:
     """The attention of `parts` (q_proj and k_proj parts, or native heads, in each of their layers)
     follows the pattern variable `pattern`: at query t, the positions its value lists (uniformly) or
@@ -818,8 +828,17 @@ def _validate(program: _Program, namespace: dict, ir: dict, behavior: dict | Non
                 if n.id in taken:
                     raise MechError(f"node {n.id} of variable {name} is also a node the program names; rename one")
                 program.nodes.append(n)
+    sites = sorted({(p.layer, p.block()) for p in program.base})
+    machinery = []
+    for layer, block in sites:  # base nodes: one per layer's attention or MLP
+        made = Node(_merged(p for p in program.base if (p.layer, p.block()) == (layer, block)))
+        made.id = "base" if len(sites) == 1 else f"base.{layer}.{block}"
+        if made.id in taken:
+            raise MechError(f"node {made.id} of base() is also a node the program names; rename it")
+        machinery.append(made)
+    ir["base"] = [n.id for n in machinery]
     owner = {}
-    for n in program.nodes:
+    for n in program.nodes + machinery:
         for p in n.pieces:
             if p.view == "library":
                 continue  # library parts may overlap; the checker takes the union per node
@@ -829,18 +848,28 @@ def _validate(program: _Program, namespace: dict, ir: dict, behavior: dict | Non
                     raise MechError(f"{Piece(p.view, p.layer, p.kind, (i,), rest=p.rest).name()} is in nodes {o} and "
                                     f"{n.id}; a part belongs to one node")
     ir["bindings"], ir["variables"], ir["answer"] = [], [], None
+
+    def connect(src, dst) -> bool:
+        if src is dst or not _connects(src, dst, "input"):
+            return False
+        program.edges.setdefault((id(src), id(dst), "input"), Edge(src, dst, "input"))
+        return True
+
+    for b in machinery:  # base nodes read the embedding and earlier base nodes, and feed everything later
+        connect(embed, b)
+        for n in program.nodes:
+            if n not in machinery:
+                connect(b, n)
+        for c in machinery:
+            connect(b, c)
+        connect(b, logits)
+    program.nodes.extend(machinery)
     if algorithm is not None:
         sinks = [v for v in aligned if not algorithm.readers[v]]
         if len(sinks) != 1:
             raise MechError("the answer is the one aligned variable no variable reads; " +
                             (f"{', '.join(sinks)} are all unread" if sinks else "align the answer's parts"))
         answer = ir["answer"] = sinks[0]
-
-        def connect(src, dst) -> bool:
-            if src is dst or not _connects(src, dst, "input"):
-                return False
-            program.edges.setdefault((id(src), id(dst), "input"), Edge(src, dst, "input"))
-            return True
 
         line = {v: algorithm.functions[v].__code__.co_firstlineno for v in algorithm.functions}
         for name, ns in held.items():
@@ -1311,10 +1340,11 @@ SKIPPED = {tokenize.COMMENT, tokenize.NL, tokenize.NEWLINE, tokenize.INDENT, tok
 
 def code_length(source: str) -> tuple[int, int]:
     """(python_tokens, token_types) of a source whose part tokens are quoted (quote_parts). Tokens of the
-    code without comments and docstrings: a name, keyword, operator or part token is one token, a number
-    or string literal one token per character as written. token_types = keywords + operators + mech and
-    builtin names + names the program defines + part tokens + literal characters (printable ASCII, tab,
-    newline and any other character the literals use)."""
+    code without comments, docstrings and part tokens (the checker charges parts in the program's
+    structure): a name, keyword or operator is one token, a number or string literal one token per
+    character as written. token_types = keywords + operators + mech and builtin names + names the program
+    defines + literal characters (printable ASCII, tab, newline and any other character the literals
+    use)."""
     tree = ast.parse(source)
     docs = _docstring_ranges(tree, source)
 
@@ -1329,9 +1359,7 @@ def code_length(source: str) -> tuple[int, int]:
             continue
         literal = t.type in (tokenize.NUMBER, tokenize.STRING) or "STRING" in tokenize.tok_name[t.type]
         if t.type == tokenize.STRING and PART.fullmatch(t.string[1:-1]) and t.string[0] == t.string[-1]:
-            tokens += 1
-            names.add(t.string[1:-1])
-            continue
+            continue  # a part: the checker charges it in the program's structure
         if literal:
             if t.type == tokenize.STRING and in_doc(t.start, t.end):
                 continue
@@ -1342,6 +1370,17 @@ def code_length(source: str) -> tuple[int, int]:
         if t.type == tokenize.NAME and t.string not in KEYWORDS and t.string not in FIXED_NAMES:
             names.add(t.string)
     return tokens, len(KEYWORDS) + len(OPERATORS) + len(FIXED_NAMES) + len(names) + len(characters)
+
+
+READER = "qwen3-0.6b"  # the reader (Qwen3-8B) shares the tokenizer of every Qwen3 size
+
+
+def explanation_length(text: str) -> tuple[int, int]:
+    """(explanation_tokens, explanation_token_types) of an answer's English explanation: its tokens under
+    the reader's tokenizer, and the size of the reader's vocabulary, the alphabet the reader already knows
+    (a uniform code over it costs log2 of that per token)."""
+    tk = tokenizer(READER)
+    return (len(tk.encode(text, add_special_tokens=False).ids) if text else 0), tk.get_vocab_size()
 
 
 def english(source: str) -> str:

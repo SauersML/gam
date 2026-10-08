@@ -142,6 +142,9 @@ class Checker:
             ir = {"model": self.model, "nodes": [], "edges": [], "python_tokens": 0, "token_types": 0,
                   "source": source, "valid": False, "error": f"{type(e).__name__}: {e}"}
         ir["explanation"] = explanation
+        sys.path.insert(0, str(HERE))
+        import mech
+        ir["explanation_tokens"], ir["explanation_token_types"] = mech.explanation_length(explanation)
         return ir
 
     def finish(self, ir, answer, reader):
