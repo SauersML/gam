@@ -1,5 +1,5 @@
 """Greater-than: "from 1816 to 18" -> a year after the start within its century: the end year's last two
-digits exceed the start year's. The answer here is the smallest such year."""
+digits exceed the start year's. Any such year is right."""
 from mech import bind, claim
 
 
@@ -18,9 +18,12 @@ def rest(full, text):
 
 
 def answer(tokens, start):
-    # the year after the start, or what is left of it once its first digits are written
+    # every later year of the start's century, or what is left of each once its first digits are written
     out = []
     for t, y in enumerate(start):
         text = "".join(tokens[: t + 1])
-        out.append(None if y is None or text.rstrip().endswith(str(y)) else rest(" " + str(y + 1), text))
+        if y is None or text.rstrip().endswith(str(y)):
+            out.append(None)
+        else:
+            out.append(sorted({rest(" " + str(later), text) for later in range(y + 1, y // 100 * 100 + 100)}) or None)
     return out

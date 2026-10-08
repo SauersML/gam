@@ -142,6 +142,19 @@ def test_answers_start_with_a_token():
         assert ir["valid"] and ir["algorithm_accuracy"] == 1.0, ir["error"]
 
 
+def test_answer_sets():
+    sets = INDUCTION.replace("return [tokens[js[-1]] if js else None for js in match]",
+                             "return [[tokens[js[-1]], 't9'] if js else None for js in match]")
+    ir = toy_trace(sets)
+    assert ir["valid"] and ir["algorithm_accuracy"] == 1.0, ir["error"]
+    pair = next(b for b in ir["bindings"] if b["variable"] == "answer")["pairs"][0]
+    assert pair["answers"] == [[6, 9]] and pair["answer"] == [6] and pair["answer_text"] == [["t6", "t9"]]
+    plain = toy_trace(INDUCTION)
+    assert all("answers" not in p for b in plain["bindings"] for p in b["pairs"])
+    assert "collection of them" in toy_trace(INDUCTION.replace("return [tokens[js[-1]] if js else None",
+                                                                "return [[1, 2] if js else None"))["error"]
+
+
 def test_causal_answers():
     peek = INDUCTION.replace("return [tokens[js[-1]] if js else None for js in match]",
                              "return [tokens[t + 1] if t + 1 < len(tokens) else None for t in range(len(tokens))]")

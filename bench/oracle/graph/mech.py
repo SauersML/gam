@@ -38,7 +38,7 @@ query t attends to, uniformly (none: position 0), or maps positions to weights; 
 and k_proj parts (or native heads), in one layer or several (the pattern holds in each). A claim states
 what the parts compute; they still compute it with M's weights.
 The answer is the one bound variable that no variable reads: its value at t is the token M predicts
-after position t (a longer string: its first token).
+after position t (a longer string: its first token; a list of strings: any of them).
 Edges follow the data flow: a variable reading `tokens` reads the token embedding; one reading another
 variable reads the writes of that variable's parts (through unbound steps); a variable spanning layers
 feeds its own later parts; the answer's parts and the embedding write the logits.
@@ -703,22 +703,25 @@ def _evaluate(program: _Program, algorithm: _Algorithm, answer: str, behavior: d
             cache[key].update(algorithm.values(prompts[i][: t + 1], [name], cache[key]))
         return cache[key][name]
 
+    def token(a, i: int, t: int):  # an answer: a string, or a sorted list of strings (any of them is right)
+        if a is None or isinstance(a, str):
+            return a
+        if isinstance(a, (list, tuple, set, frozenset)) and a and all(isinstance(x, str) for x in a):
+            return sorted(set(a))
+        raise MechError(f"the answer {answer} at position {t} of prompt {i} is {a!r}, not a token string or a "
+                        "collection of them")
+
     ir["clean"] = []  # per target: the answer on the clean prompt, and the prompt's next token
     for i, ts in enumerate(targets):
         for t in ts:
-            a = at(i, t, answer)[t]
-            if a is not None and not isinstance(a, str):
-                raise MechError(f"the answer {answer} at position {t} of prompt {i} is {a!r}, not a token string")
-            ir["clean"].append([i, t, a, prompts[i][t + 1] if t + 1 < len(prompts[i]) else None])
+            ir["clean"].append([i, t, token(at(i, t, answer)[t], i, t), prompts[i][t + 1] if t + 1 < len(prompts[i]) else None])
 
     def swapped(i: int, j: int, v: str) -> list | None:  # the answers at i's targets with v from prompt j
         out = []
         for t in targets[i]:
-            a = algorithm.values(prompts[i][: t + 1], [answer], {v: at(j, t, v)})[answer][t]
+            a = token(algorithm.values(prompts[i][: t + 1], [answer], {v: at(j, t, v)})[answer][t], i, t)
             if a is None:
                 return None
-            if not isinstance(a, str):
-                raise MechError(f"the answer {answer} at position {t} of prompt {i} is {a!r}, not a token string")
             out.append(a)
         return out
 
@@ -1110,24 +1113,32 @@ def behavior_tokens(behavior, model: str) -> tuple[dict, dict]:
 
 def _answer_ids(ir: dict, model: str, known: dict | None) -> dict:
     """Adds each interchange answer's token id (the checker's "answer"; a string that starts with no token
-    makes the program invalid) and the algorithm's accuracy: the share of targets whose clean answer starts
-    with the prompt's next token."""
+    makes the program invalid), for answers that are sets of strings the ids of the set ("answers", the
+    first as "answer"), and the algorithm's accuracy: the share of targets whose clean answer (one of its
+    set) starts with the prompt's next token."""
+    known = known or {}
+
+    def ids(text) -> list:
+        return sorted({_token_id(model, x, known) for x in ([text] if isinstance(text, str) else text)}, key=lambda i: (i is None, i))
+
     clean = ir.pop("clean", None)
     if clean is not None:
-        hits = [a is not None and n is not None and _token_id(model, a, known or {}) == _token_id(model, n, known or {})
-                for _, _, a, n in clean]
+        hits = [a is not None and n is not None and _token_id(model, n, known) in ids(a) for _, _, a, n in clean]
         ir["algorithm_accuracy"] = sum(hits) / len(hits) if hits else None
     for b in ir.get("bindings") or []:
         for pair in b["pairs"]:
-            pair["answer"] = []
+            sets = []
             for text in pair["answer_text"]:
-                i = _token_id(model, text, known or {})
-                if i is None:
+                found = ids(text)
+                if None in found:
                     ir.update(nodes=[], edges=[], bindings=[], variables=[], answer=None, claims={}, valid=False,
                               error=f"the answer {text!r} (variable {ir.get('answer')}, interchanging {b['variable']}, "
                                     f"prompt {pair['base']}) starts with no token of {model}")
                     return ir
-                pair["answer"].append(i)
+                sets.append(found)
+            pair["answer"] = [s[0] for s in sets]
+            if any(not isinstance(text, str) for text in pair["answer_text"]):
+                pair["answers"] = sets
     return ir
 
 

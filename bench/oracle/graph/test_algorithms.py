@@ -1,6 +1,6 @@
 """The family algorithms (bench/oracle/graph/algorithms/, index.json: behavior family -> algorithm) on their
-vpd4l and Qwen3-0.6B behaviors: each traces with its answer bound, and its answer is the prompt's next
-token on nearly every target (greater-than's answer is one valid year of many, so it has no accuracy bar).
+vpd4l and Qwen3-0.6B behaviors: each traces with its answer bound, and its answer (or one of its set of
+answers) is the prompt's next token on nearly every target.
 
   ~/mpd-data/venv/bin/python -m pytest bench/oracle/graph/test_algorithms.py
 """
@@ -38,7 +38,7 @@ def check(behavior, model, answer, low):
     ir = mech.trace(source, model, behavior=behavior)
     assert ir["valid"], (model, behavior["id"], ir["error"])
     assert ir["bindings"][0]["pairs"], (model, behavior["id"])
-    if behavior["family"] != "greater_than" and ir["algorithm_accuracy"] < 0.95:
+    if ir["algorithm_accuracy"] < 0.95:
         low[(model, behavior["id"])] = ir["algorithm_accuracy"]
 
 
