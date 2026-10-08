@@ -2170,13 +2170,10 @@ fn stack_sites(weights: &Weights, circuits: &[&Circuit], batch: &Batch, scored: 
         // With counterfactual stand-ins, the site's stand-in unit: its `rest` (not computing), on each
         // copy's rows the counterfactual write of the parts the copy does not name (the computing
         // unit's `down_proj` or `o_proj` counts), as a program's remainder unit.
-        let standin_unit = (!delete).then(|| {
-            let mut rest = block.clone();
-            match &mut rest {
-                Block::AttnSlices { rest, .. } | Block::Slices { rest, .. } => *rest = true,
-                _ => {}
-            }
-            rest
+        let standin_unit = (!delete).then(|| match &block {
+            Block::AttnSlices { layer, q, k, v, o, .. } => Block::AttnSlices { layer: *layer, q: q.clone(), k: k.clone(), v: v.clone(), o: o.clone(), rest: true },
+            Block::Slices { layer, fc, down, .. } => Block::Slices { layer: *layer, fc: fc.clone(), down: down.clone(), rest: true },
+            other => other.clone(),
         });
         let at = units.len();
         units.push(Unit { block, computes: true, routes: [Incoming::all(), Incoming::all(), Incoming::all()], hidden: Incoming::all() });
