@@ -642,8 +642,7 @@ def algorithm_explanation(ir: dict, behavior: dict, facts_of: dict[str, dict], s
                              f"the counterfactual's answer on {f['switch_flip_share']:.0%} of the targets where the two answers differ")
             if f.get("alignment_error_bits") is not None:
                 e = f["alignment_error_bits"]
-                sentence += (f". Swapping {them} between prompts inside M moves M's output as {name} predicts"
-                             + (" (alignment error 0 bits)" if e == 0 else f" with an alignment error of {e:.0f} bits"))
+                sentence += f". Its interchange test (the values of {them} swapped between prompts inside M) has an alignment error of {e:.0f} bits"
         else:
             sentence += "; no parts are aligned to it"
         lines.append(sentence + ".")
