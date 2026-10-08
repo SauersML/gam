@@ -1081,12 +1081,17 @@ def recovery(rep, run, st, true_assign):
 # --------------------------------------------------------------------------------------------- gate training
 
 
+SCALE = 1.0   # the guards' noise in training, in e-folds of the own write
+
+
 def train_gates(rep, run, members, N, steps=600, seed=0, log=print):
     """The guards' thresholds trained as the design's gates are (torch, CPU): each block on with probability Phi(z),
-    z = (own write - tau) / s (s a tenth of its own write's root mean square, the own write from M's run), drawn each
-    pass with Phi's gradient straight through; loss = the hard program's data term (bits per token) + lambda E[bits
-    per token], lambda by dual ascent on E[bits] <= K (K the exact program's bits per token; log lambda moves up to
-    1/20 per step, saturating at a 5% violation), from all on (tau = -3 s). Reports the budget's gradient on the
+    z = (ln own write - ln tau) / SCALE (a block writing nothing is off exactly; the own write from M's run), drawn each
+    pass with Phi's gradient straight through (a closed gate is still drawn on, so it keeps a gradient); loss = the
+    hard program's data term (bits per token) + lambda E[bits per token], lambda fixed at the balance rate (the median
+    over thresholds of |d data / d tau| / |d E / d tau| at the start), and after every step the least common shift of all
+    thresholds puts the hard program's bits at most K (K the exact program's bits per token). Started all on (tau 3 SCALE e-folds below
+    each block's least write), then shifted. Reports the budget's gradient on the
     thresholds at the start, the trained hard gates against the exact ones, and the seconds per step."""
     import torch
     torch.manual_seed(seed)
@@ -1098,8 +1103,10 @@ def train_gates(rep, run, members, N, steps=600, seed=0, log=print):
     K = float(st.J - (rep.D.bits() + sum(st.cost[b][1] for b in ids) + sum(body_bits(p, rep.B, rep.unit) for p, c in st.count.items() if c >= 2)) / N)
     own = np.stack([own_write(rep, run, st.members[b]) for b in ids], 1)
     exact = np.stack([st.on[b] for b in ids], 1)
-    sc = 0.1 * np.sqrt((own ** 2).mean(0))
-    sc[sc == 0] = 1.0
+    # the guard reads its own write's magnitude on a log scale: z = (ln own - theta) / S, theta = ln tau, so a block
+    # that writes nothing is off exactly (z = -inf) and the noise is relative (S e-folds)
+    lown = np.log(np.maximum(own, 1e-300))
+    lown[own <= 0] = -np.inf
     rules = [(p, c) for p, c in st.count.items() if c >= 2]
     bits = np.array([st.cost[b][0] + lg for b in ids])
     per_bind = np.zeros((len(ids), len(rules)))
@@ -1119,8 +1126,9 @@ def train_gates(rep, run, members, N, steps=600, seed=0, log=print):
     maps = [(tgroup(prog.read[l]), tgroup(prog.write[l]) if l < toy.L else None) for l in range(toy.L + 1)]
     s0 = T_(run.s[0], dtype=torch.float32)
     y_m = T_(run.y, dtype=torch.float32)
-    own_t, sc_t, exact_t = T_(own, dtype=torch.float32), T_(sc, dtype=torch.float32), T_(exact)
-    theta = torch.full((len(ids),), -3.0, requires_grad=True)
+    lown_t, exact_t = T_(lown, dtype=torch.float32), T_(exact)
+    floor = np.array([lown[np.isfinite(lown[:, x]), x].min() if np.isfinite(lown[:, x]).any() else 0.0 for x in range(len(ids))])
+    theta = T_(floor - 3 * SCALE, dtype=torch.float32).requires_grad_()
     opt = torch.optim.Adam([theta], lr=0.05)
     act = torch.relu if toy.rec["config"]["mlp_act"] == "relu" else (lambda x: x)
     bias = T_(toy.bias, dtype=torch.float32)
@@ -1144,28 +1152,52 @@ def train_gates(rep, run, members, N, steps=600, seed=0, log=print):
             e = e + bb * (1 - torch.prod(1 - phi[:, u], 1))
         return e.mean()
 
-    lam, H, hist, t0 = 1e-3, 20.0, [], time.time()
+    def phi_of(th):
+        return 0.5 * (1 + torch.erf((lown_t - th) / (SCALE * math.sqrt(2))))
+
+    def project():
+        # one common shift of every threshold: the least for which the hard program's bits per token are at most K
+        # (bisection; the hard bits fall as the shift grows). The soft expectation is not pinned: tokens whose own
+        # write is exactly zero keep Phi(-tau) of it, which would push every threshold past the true writes.
+        with torch.no_grad():
+            if expected_bits((lown_t - theta + 30.0 > 0).float()).item() <= K:
+                return                              # the budget binds at no shift: none
+            lo, hi = -30.0, 30.0
+            for _ in range(50):
+                mid = 0.5 * (lo + hi)
+                lo, hi = (mid, hi) if expected_bits((lown_t - theta - mid > 0).float()).item() > K else (lo, mid)
+            theta.add_(hi)
+
+    project()
+    # lambda at the balance rate: the median over thresholds of |d data/d theta| / |d E/d theta| at the projected start
+    phi = phi_of(theta)
+    g = torch.bernoulli(phi.detach()) + phi - phi.detach()
+    data, e = ((forward(g) - y_m) ** 2).sum(1).mean() / (2 * LN2), expected_bits(phi)
+    gd = torch.autograd.grad(data, theta, retain_graph=True)[0].abs()
+    ge = torch.autograd.grad(e, theta)[0].abs()
+    grad0 = ge.mean().item()
+    ok = (gd > 0) & (ge > 0)
+    lam = float((gd[ok] / ge[ok]).median()) if ok.any() else 1e-3
+    hist, t0 = [], time.time()
     for step in range(steps + 1):
-        z = own_t / sc_t - theta
-        phi = 0.5 * (1 + torch.erf(z / math.sqrt(2)))
+        phi = phi_of(theta)
         g = torch.bernoulli(phi.detach()) + phi - phi.detach()
         data = ((forward(g) - y_m) ** 2).sum(1).mean() / (2 * LN2)
         e = expected_bits(phi)
-        if step == 0:
-            grad0 = torch.autograd.grad(e, theta, retain_graph=True)[0].abs().mean().item()
         opt.zero_grad()
         (data + lam * e).backward()
         opt.step()
-        lam = lam * math.exp(max(-1.0, min(1.0, (e.item() - K) / K / 0.05)) / H)
+        project()
         if step % 100 == 0 or step == steps:
             with torch.no_grad():
-                hard = own_t / sc_t - theta > 0
+                hard = lown_t - theta > 0
                 kl = ((forward(hard.float()) - y_m) ** 2).sum(1).mean().item() / (2 * LN2)
                 jac = float(((hard & exact_t).sum() / (hard | exact_t).sum().clamp_min(1)).item())
                 eh = expected_bits(hard.float()).item()
-            hist.append({"step": step, "E_bits_soft": round(e.item(), 1), "E_bits_hard": round(eh, 1), "K": round(K, 1),
+                es = expected_bits(phi_of(theta)).item()
+            hist.append({"step": step, "E_bits_soft": round(es, 1), "E_bits_hard": round(eh, 1), "K": round(K, 1),
                          "hard_kl_bits": kl, "jaccard_with_exact_gates": round(jac, 4), "lambda": lam})
-            log(f"  gates step {step}: E[bits] {e.item():.1f} (hard {eh:.1f}, K {K:.1f}), hard KL {kl:.3g}, gates vs exact Jaccard {jac:.4f}, lambda {lam:.3g}")
+            log(f"  gates step {step}: E[bits] {es:.1f} (hard {eh:.1f}, K {K:.1f}), hard KL {kl:.3g}, gates vs exact Jaccard {jac:.4f}, lambda {lam:.3g}")
     return {"budget_grad_on_thresholds_at_start": grad0, "seconds_per_step": (time.time() - t0) / (steps + 1), "trace": hist}
 
 
