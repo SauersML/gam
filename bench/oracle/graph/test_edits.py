@@ -65,6 +65,16 @@ def test_credit_signs():
     assert dS[Edit("unalign", "answer", "align")] == float("inf")  # the answer must stay aligned
 
 
+def test_dropping_a_blocks_last_writer_drops_the_block():
+    a = Answer.parse(SOURCE)
+    gone = apply(a, Edit("drop", "answer", "align", "<p:2.o.735>"))  # 2.v.559 writes only layer 2's own stream
+    assert [s.parts for s in gone.statements if s.variable == "answer"] == [("<p:3.o.806>",)]
+    kept = apply(a, Edit("drop", "answer", "align", "<p:2.v.559>"))
+    assert [s.parts for s in kept.statements if s.variable == "answer"] == [("<p:2.o.735>", "<p:3.o.806>")]
+    claimed = apply(a, Edit("drop", "prev", "claim", "<p:1.q.316>"))  # a claim's parts need no writer
+    assert [s.parts for s in claimed.statements if s.kind == "claim"] == [("<p:1.k.329>",)]
+
+
 def test_refine_reaches_the_optimum():
     a = Answer.parse(SOURCE)
     best, s, accepted = refine(a, stand_in, {"answer": ["<p:0.m.0>", "<p:2.v.9>"]}, rounds=8, per_variable=2)

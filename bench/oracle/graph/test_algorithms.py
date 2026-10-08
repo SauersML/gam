@@ -23,6 +23,23 @@ def test_every_algorithm_is_indexed():
     assert sorted(set(INDEX.values())) == sorted(p.stem for p in (HERE / "algorithms").glob("*.py"))
 
 
+def test_no_heldout_family_has_an_algorithm():
+    # held-out families (behaviors/build.py's split) never become training answers
+    sys.path.insert(0, str(HERE / "behaviors"))
+    import build
+    import teacher
+
+    assert [f for f in INDEX if build.split_of(f) != "train"] == []
+    for split in ("heldout", None):
+        try:
+            teacher.algorithm_of({"id": "x", "family": "induction_random", "split": split})
+        except ValueError as e:
+            assert "held-out" in str(e)
+        else:
+            raise AssertionError(f"algorithm_of gave an algorithm to a behavior of split {split}")
+    assert "def answer" in teacher.algorithm_of({"id": "x", "family": "induction_random", "split": "train"})
+
+
 def test_algorithms_predict_their_behaviors():
     low = {}
     for model, answer in ANSWER.items():

@@ -44,11 +44,6 @@ TERMS = ("total_bits", "exec_error_bits", "necessity_error_bits", "binding_error
          "opaque_bits", "base_bits", "reader_error_bits", "N", "experiments", "python_tokens", "opaque_numbers", "valid")
 
 
-def keyword() -> str:
-    """The alignment statement's name in mech's current answer format."""
-    return "align" if hasattr(mech, "align") else "bind"
-
-
 def values_of(algorithm: str, names: list[str], tokens: list[str]) -> dict:
     """The algorithm's variables `names` on `tokens` (teacher.patterns' evaluation)."""
     namespace = {"__builtins__": mech.SAFE_BUILTINS}
@@ -62,15 +57,14 @@ def variable_prompts(behavior: dict) -> dict[str, list[dict]]:
     pairs, {"token_ids", "target_positions"} for the base and the source with the positions up to the base's last
     target where the variable differs between them."""
     model, algorithm = behavior["model"], teacher.algorithm_of(behavior)
-    k = keyword()
-    traced = mech.trace_inline(algorithm + f"\n{k}(answer, {teacher.ANY[model]})\n", model)
+    traced = mech.trace_inline(algorithm + f"\nalign(answer, {teacher.ANY[model]})\n", model)
     claimed = teacher.patterns(algorithm, behavior)
     names = [v["name"] for v in traced["variables"] if v["name"] not in claimed]
     payload, _ = mech.behavior_tokens(behavior, model)
     ids = [p["token_ids"] for p in behavior["prompts"]]
     out = {}
     for v in names:
-        lines = [f"{k}(answer, <p:3.fc.0>, <p:3.down.0>)"] if v == "answer" else [f"{k}({v}, {teacher.ANY[model]})", f"{k}(answer, <p:3.fc.0>, <p:3.down.0>)"]
+        lines = ["align(answer, <p:3.fc.0>, <p:3.down.0>)"] if v == "answer" else [f"align({v}, {teacher.ANY[model]})", "align(answer, <p:3.fc.0>, <p:3.down.0>)"]
         ir = mech.trace_inline(algorithm + "\n\n" + "\n".join(lines) + "\n", model, behavior, mech.DEFAULT_DECOMPOSITION.get(model))
         if not ir.get("valid", True):
             print(f"{behavior['id']}: variable {v} does not trace aligned ({ir.get('error')})", file=sys.stderr)

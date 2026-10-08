@@ -35,6 +35,8 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 PART = re.compile(r"<p:[^>]+>")
+SITE = re.compile(r"<p:(\d+)\.(\w+)")  # a part token's layer and site code
+WRITERS = {"o", "down", "h", "a", "m", "attn", "mlp"}  # site codes whose parts write the residual stream
 STATEMENT = re.compile(r"^(\s*)(align|claim)\(\s*(\w+)\s*,(.*)\)\s*$")
 
 
@@ -104,11 +106,21 @@ def apply(answer: Answer, edit: Edit) -> Answer:
         del statements[j]
     elif j is not None and edit.op == "drop":
         kept = tuple(p for p in statements[j].parts if p != edit.part)
+        if edit.kind == "align" and not any(block(p) == block(edit.part) and SITE.match(p)[2] in WRITERS for p in kept):
+            # the block's last residual writer gone: its q/k/v_proj or c_fc parts write only that block's own
+            # stream, which nothing of the variable reads any more (each node computes alone), so they go too
+            kept = tuple(p for p in kept if block(p) != block(edit.part))
         if kept:
             statements[j] = replace(statements[j], parts=kept)
         else:
             del statements[j]
     return replace(answer, statements=tuple(statements))
+
+
+def block(part: str) -> tuple[int, str]:
+    """A part token's layer and block (attention or MLP)."""
+    layer, code = SITE.match(part).groups()
+    return int(layer), "mlp" if code in ("fc", "down", "m", "mlp") else "attn"
 
 
 def drops(answer: Answer) -> list[Edit]:

@@ -1,20 +1,17 @@
 """Teacher programs (#2951 graph oracle): a search's program (nodes of decomposition parts, e2e/search.py) and
 its behavior's family algorithm (algorithms/index.json) -> algorithm programs whose variables are aligned to
-the search's nodes; the checker scores every assignment and the best is printed with its facts and English
-(printer.py), in the oracle's answer format.
+the search's nodes. e2e/teacher_run.py scores every assignment, refines the best (edits.refine) and prints it
+(printer.py) in the oracle's answer format. Held-out families have no algorithm here: algorithm_of refuses a
+behavior outside the train split, so no held-out behavior becomes a training answer.
 
 Assignments: the algorithm's aligned variables, in data-flow order, take the program's nodes in layer order,
 each a contiguous run of nodes that writes the residual stream (the answer takes the last run). A variable
 whose values are attention patterns (lists of positions) is claimed on the query and key parts of the
 attention nodes of the aligned variable that reads it.
-
-  teacher.py SEARCH.json BEHAVIOR.json [--out-dir DIR] [--vpd DIR]
-writes DIR/<behavior>.py, .answer.txt, .graph.json and .assignments.jsonl (every assignment's score).
 """
 
 from __future__ import annotations
 
-import argparse
 import itertools
 import json
 import re
@@ -31,7 +28,9 @@ ANY = {"vpd4l": "<p:0.v.0>, <p:0.o.0>", "qwen3-0.6b": "<p:0.h.0>"}  # parts that
 
 
 def algorithm_of(behavior: dict) -> str:
-    """The family algorithm's source for a behavior."""
+    """The family algorithm's source for a train behavior."""
+    if behavior.get("split") != "train":
+        raise ValueError(f"{behavior.get('id')}: split {behavior.get('split')}; held-out behaviors never become training answers")
     index = json.loads((HERE / "algorithms/index.json").read_text())
     if behavior["family"] not in index:
         raise KeyError(f"no algorithm for family {behavior['family']}")
@@ -104,41 +103,3 @@ def assignments(ir: dict, algorithm: str, behavior: dict) -> list[str]:
                 if mech.trace_inline(source, model, decomposition=ir.get("decomposition") or "native")["valid"]:
                     out.append(source)
     return out
-
-
-def main():
-    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("search", type=Path)
-    ap.add_argument("behavior", type=Path)
-    ap.add_argument("--out-dir", type=Path, default=Path.home() / "mpd-data/graph_oracle/teacher")
-    ap.add_argument("--vpd", type=Path, default=Path.home() / "mpd-data/engine/vpd4l_decomposition")
-    a = ap.parse_args()
-    import printer
-    import score
-
-    behavior = json.loads(a.behavior.read_text())
-    ir = search_ir(json.loads(a.search.read_text()), behavior["model"])
-    candidates = assignments(ir, algorithm_of(behavior), behavior)
-    if not candidates:
-        sys.exit("no assignment: fewer residual-writing nodes than aligned variables")
-    views = {"vpd": a.vpd} if behavior["model"] == "vpd4l" else None
-    with score.Checker(behavior["model"], views=views) as c:
-        c.behavior(a.behavior)
-        scores = c.score_batch(candidates, reader=False)
-    a.out_dir.mkdir(parents=True, exist_ok=True)
-    name = behavior["id"]
-    with open(a.out_dir / f"{name}.assignments.jsonl", "w") as f:
-        for src, s in zip(candidates, scores):
-            f.write(json.dumps({"source": src, "score": s}) + "\n")
-    best = min(range(len(candidates)), key=lambda k: scores[k]["total_bits"])
-    traced = mech.trace_inline(candidates[best], behavior["model"], behavior, ir.get("decomposition") or "native")
-    src, graph = printer.printed(traced, behavior, scores[best])
-    (a.out_dir / f"{name}.py").write_text(src)
-    (a.out_dir / f"{name}.answer.txt").write_text(printer.answer_of(src, graph["explanation"]))
-    (a.out_dir / f"{name}.graph.json").write_text(json.dumps(graph, indent=1))
-    print(f"{name}: {len(candidates)} assignments; best total {scores[best]['total_bits']:.4g} bits "
-          f"(alignment {scores[best].get('binding_error_bits', 0):.4g})")
-
-
-if __name__ == "__main__":
-    main()
