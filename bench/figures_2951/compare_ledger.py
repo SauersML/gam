@@ -75,7 +75,7 @@ def F(arm, n):
 refs = {'mlp': vpd('published_mlp', 'mlp'), 'whole': vpd('published', 'whole')}
 arms = [a for a in (ours(p) for p in (L(POINTS) or []) if p.get('arm_entry') and os.path.exists(p['arm_entry'])) if a]
 ledger = []
-fmt = lambda v, d=3: '-' if v is None else (f'{v:.{d}f}' if isinstance(v, float) and abs(v) < 1e4 else f'{v:.4g}')
+fmt = lambda v, d=3: '-' if v is None else (f'{v:.1e}' if isinstance(v, float) and abs(v) < 1e-2 else f'{v:.{d}f}' if isinstance(v, float) and abs(v) < 1e4 else f'{v:.4g}')
 for arm in arms:
     ref = refs[arm['scope']]
     common = set(arm['weight_index']) & set(ref['weight_index'])
