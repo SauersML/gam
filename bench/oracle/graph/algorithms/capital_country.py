@@ -19,7 +19,7 @@ COUNTRY = {
     'Reykjavik': ' Iceland', 'Rome': ' Italy', 'Santiago': ' Chile', 'Seoul': ' Korea',
     'Sofia': ' Bulgaria', 'Stockholm': ' Sweden', 'Sucre': ' Bolivia', 'Tehran': ' Iran',
     'Tokyo': ' Japan', 'Tripoli': ' Libya', 'Vienna': ' Austria', 'Warsaw': ' Poland',
-    'Zagreb': ' Croatia', 'ogota': ' Colombia', 'ucharest': ' Romania',
+    'Zagreb': ' Croatia',
 }
 
 
