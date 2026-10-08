@@ -340,14 +340,14 @@ class VllmSampler:
     """vLLM serving the base with the policy's adapter (reloaded by path at every version). It takes the
     first visible GPU; the trainer takes the second when there is one (--gpu-memory set accordingly)."""
 
-    def __init__(self, args, rank: int, end: int):
-        from vllm import LLM
-
+    def __init__(self, args, rank: int, end: int, model: str | None = None):
         self.share, self.args, self.rank = args.share_gpu, args, rank
         self.max_tokens, self.end = args.max_tokens, end
         self.policy = None  # with --share-gpu: the trainer, moved to the host while vLLM samples
         self.rows = None  # with part tokens: () -> (first id, input rows, output rows), copied into vLLM before sampling
-        self.start(args.base)
+        self.llm = None
+        if model is not None:  # else started later (part tokens: from the extended-vocabulary checkpoint)
+            self.start(model)
 
     def start(self, model: str):
         from vllm import LLM
@@ -375,7 +375,9 @@ class VllmSampler:
         """Restarts vLLM on a materialized checkpoint (part tokens' current rows)."""
         import gc
 
-        del self.llm
+        if self.llm is not None and self.share:
+            raise RuntimeError("vLLM's sleep mode allows one engine per process: no restart with --share-gpu")
+        self.llm = None
         gc.collect()
         torch.cuda.empty_cache()
         if self.share and self.policy is not None:
@@ -850,18 +852,20 @@ def main():
         return
     if args.part_tokens:  # in-process vLLM engine: part rows are copied into its weights before each sampling call
         os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+        if args.share_gpu and args.materialize_every:
+            raise SystemExit("--materialize-every restarts vLLM, which sleep mode (--share-gpu) allows once per process")
     use_vllm = args.sampler == "vllm" or (args.sampler == "auto" and torch.cuda.is_available() and __import__("importlib").util.find_spec("vllm") is not None)
     sampler = None
     if use_vllm:  # vLLM first, on the first visible GPU, before the trainer touches CUDA
         from transformers import AutoTokenizer
 
         rank = json.loads((Path(args.init) / "adapter_config.json").read_text())["r"] if args.init else args.lora_rank
-        sampler = VllmSampler(args, rank, AutoTokenizer.from_pretrained(args.base).convert_tokens_to_ids("<|im_end|>"))
+        sampler = VllmSampler(args, rank, AutoTokenizer.from_pretrained(args.base).convert_tokens_to_ids("<|im_end|>"), None if args.part_tokens else args.base)
     dev = torch.device(f"cuda:{torch.cuda.device_count() - 1}" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
     pol = Policy(args, dev)
     if isinstance(sampler, VllmSampler):
         sampler.policy = pol
-        if pol.parts is not None:  # vLLM samples from a checkpoint with the extended vocabulary, then gets the rows in place
+        if pol.parts is not None:  # vLLM starts once, on a checkpoint with the extended vocabulary; the rows then come in place
             sampler.reload(pol.materialize(out / "vocab", args.base))
             sampler.rows = pol.part_rows
     if sampler is None:

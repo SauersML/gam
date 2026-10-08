@@ -49,9 +49,9 @@ def main():
     with tempfile.TemporaryDirectory() as tmp:
         args = argparse.Namespace(base=base, init=None, lora_rank=8, part_tokens="stand-in", share_gpu=True, gpu_memory=0.6, max_model_len=2048,
                                   max_tokens=16, seed=0)
-        sampler = train.VllmSampler(args, 8, 0)
         pol = train.Policy(args, torch.device("cuda"))
-        sampler.policy, sampler.end = pol, pol.end
+        sampler = train.VllmSampler(args, 8, pol.end)  # started on the extended-vocabulary checkpoint below
+        sampler.policy = pol
         sampler.reload(pol.materialize(Path(tmp) / "vocab", base))
         sampler.rows = pol.part_rows
         with torch.no_grad():
@@ -61,6 +61,7 @@ def main():
         prompt = pol.prompt_ids("Name a part.")
         out = sampler([prompt], 2, Path(tmp) / "adapter", 0)
         first, rows_in, rows_out = pol.part_rows()
+        sampler.llm.wake_up()  # an asleep engine's weights are not on the GPU
         got = sampler.llm.apply_model(lambda m: (m.model.embed_tokens.weight.data[first : first + rows_in.shape[0]].float().cpu(),
                                                  m.lm_head.weight.data[first : first + rows_out.shape[0]].float().cpu()))[0]
         assert torch.allclose(got[0], rows_in.float().cpu(), atol=1e-2) and torch.allclose(got[1], rows_out.float().cpu(), atol=1e-2), "rows differ"
@@ -68,8 +69,6 @@ def main():
         from vllm import SamplingParams
         from vllm.lora.request import LoRARequest
 
-        sampler.llm.wake_up()
-        sampler.push_rows()
         res = sampler.llm.generate([{"prompt_token_ids": prompt + completion}], SamplingParams(max_tokens=1, prompt_logprobs=0),
                                    lora_request=LoRARequest("t", 1, str(Path(tmp) / "adapter")), use_tqdm=False)[0]
         sampler.llm.sleep(level=1)
