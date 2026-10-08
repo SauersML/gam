@@ -26,6 +26,7 @@ class PartEmbedding(nn.Module):
     def __init__(self, base: nn.Embedding, parts: nn.Module, first: int):
         super().__init__()
         self.base, self.parts, self.first = base, parts, first
+        self.cached = None  # rows computed once for a whole forward/backward (see rows_once)
 
     @property
     def weight(self):
@@ -37,7 +38,7 @@ class PartEmbedding(nn.Module):
         mask = ids >= self.first
         if not bool(mask.any()):
             return out
-        rows = self.parts.input_rows().to(out.dtype)
+        rows = (self.cached if self.cached is not None else self.parts.input_rows()).to(out.dtype)
         part = rows[(ids - self.first).clamp(min=0, max=rows.shape[0] - 1)]
         return torch.where(mask[..., None], part, out)
 
@@ -46,6 +47,7 @@ class PartHead(nn.Module):
     def __init__(self, base: nn.Linear, parts: nn.Module, first: int):
         super().__init__()
         self.base, self.parts, self.first = base, parts, first
+        self.cached = None
 
     @property
     def weight(self):
@@ -53,9 +55,27 @@ class PartHead(nn.Module):
 
     def forward(self, h: torch.Tensor) -> torch.Tensor:
         logits = self.base(h)
-        part = h @ self.parts.output_rows().to(h.dtype).T
+        part = h @ (self.cached if self.cached is not None else self.parts.output_rows()).to(h.dtype).T
         end = self.first + part.shape[-1]
         return torch.cat([logits[..., : self.first], part, logits[..., end:]], -1)  # past the padded rows: just appended
+
+
+class rows_once:
+    """Within the block the wrappers use one computation of the part rows (the projections of every part's
+    features cost a matrix product per call; a checkpointed output layer would call them per chunk and again
+    in the backward pass). Gradients still reach the projections through the shared rows."""
+
+    def __init__(self, causal: nn.Module):
+        self.emb, self.head = causal.model.embed_tokens, causal.lm_head
+
+    def __enter__(self):
+        if isinstance(self.emb, PartEmbedding):
+            self.emb.cached, self.head.cached = self.emb.parts.input_rows(), self.head.parts.output_rows()
+        return self
+
+    def __exit__(self, *exc):
+        if isinstance(self.emb, PartEmbedding):
+            self.emb.cached = self.head.cached = None
 
 
 def install(causal: nn.Module, tok, parts: nn.Module) -> int:

@@ -57,6 +57,7 @@ import argparse
 import json
 import os
 import random
+import re
 import sys
 import time
 from pathlib import Path
@@ -78,10 +79,23 @@ BEHAVIORS = Path.home() / "mpd-data/graph_oracle/behaviors"
 SEARCH = Path.home() / "mpd-data/graph_oracle/runs/search"
 
 
+PART_TOKEN = re.compile(r"<p:[^>\s]+>")
+
+
+def to_mech(text: str) -> str:
+    """An answer with part tokens written as the mech addresses they name (part_tokens.address_of)."""
+    if "<p:" not in text:
+        return text
+    import part_tokens
+
+    return PART_TOKEN.sub(lambda m: part_tokens.address_of(m[0]), text)
+
+
 def item(answer: str, behavior: dict, seed: int, uniform_seeds: int, experiments: int) -> dict:
     """A scoring item from an oracle answer: prompt.split_answer's program (the last python block that
-    parses) and explanation (the plain English after it, which alone the reader reads)."""
-    source, explanation = split_answer(answer)
+    parses) and explanation (the plain English after it, which alone the reader reads); part tokens are
+    written as their mech addresses."""
+    source, explanation = split_answer(to_mech(answer))
     return {"source": source, "explanation": explanation, "behavior": behavior, "seed": seed, "uniform_seeds": uniform_seeds, "experiments": experiments}
 
 
@@ -151,12 +165,13 @@ def baselines(b: dict) -> dict[str, str]:
     return out
 
 
-def load_parts(spec: str, init: str | None):
-    """The part-token module (g-predict's part_tokens.load(spec)), with projections resumed from an --init
-    adapter's part_tokens.pt when it has one."""
+def load_parts(spec: str, init: str | None, model, base_vocab: int, dev):
+    """g-predict's part_tokens.PartTokens over the registry at SPEC (part_tokens.py build), scaled to the
+    mean RMS of the base token embeddings, with projections resumed from an --init adapter's part_tokens.pt."""
     import part_tokens
 
-    parts = part_tokens.load(spec)
+    emb = model.get_input_embeddings().weight[:base_vocab].detach().float()
+    parts = part_tokens.PartTokens(part_tokens.Registry.load(spec), model.config.hidden_size, float(emb.pow(2).mean(-1).sqrt().mean()), base_vocab, dev)
     if init and (Path(init) / "part_tokens.pt").exists():
         parts.load_state_dict(torch.load(Path(init) / "part_tokens.pt", map_location="cpu"))
     return parts
@@ -178,7 +193,7 @@ class Policy:
         if getattr(args, "part_tokens", None):  # part tokens: rows from the parts' read/write vectors (part_vocab.py)
             import part_vocab
 
-            self.parts = load_parts(args.part_tokens, args.init).to(dev)
+            self.parts = load_parts(args.part_tokens, args.init, base, len(self.tok), dev).to(dev)
             self.first_part = part_vocab.install(base, self.tok, self.parts)
         if args.init:
             self.model = PeftModel.from_pretrained(base, args.init, adapter_name="default", is_trainable=True)
@@ -268,12 +283,38 @@ class Policy:
         def run():
             hidden = causal.model(**inputs).last_hidden_state
             flat = hidden.reshape(-1, hidden.shape[-1])[src]
+            if self.parts is None:
+                def piece(h, t):
+                    return torch.log_softmax(causal.lm_head(h).float(), -1).gather(-1, t[:, None])[:, 0]
 
-            def piece(h, t):
-                return torch.log_softmax(causal.lm_head(h).float(), -1).gather(-1, t[:, None])[:, 0]
+                return torch.cat([checkpoint(piece, flat[k : k + 1024], target[k : k + 1024], use_reentrant=False) for k in range(0, len(target), 1024)])
+            head = causal.lm_head  # part tokens: the output rows enter each checkpointed chunk as an input, so its recompute uses them
+            rows_out = head.cached if head.cached is not None else head.parts.output_rows()
 
-            return torch.cat([checkpoint(piece, flat[k : k + 1024], target[k : k + 1024], use_reentrant=False) for k in range(0, len(target), 1024)])
+            def piece_parts(h, t, rows):
+                logits = head.base(h)
+                part = h @ rows.to(h.dtype).T
+                end = head.first + part.shape[-1]
+                logits = torch.cat([logits[..., : head.first], part, logits[..., end:]], -1)
+                return torch.log_softmax(logits.float(), -1).gather(-1, t[:, None])[:, 0]
 
+            return torch.cat([checkpoint(piece_parts, flat[k : k + 1024], target[k : k + 1024], rows_out, use_reentrant=False) for k in range(0, len(target), 1024)])
+
+        if self.parts is not None:  # one computation of the part rows for this call (forward, chunks, backward)
+            import part_vocab
+
+            once = part_vocab.rows_once(causal)
+            once.__enter__()
+        try:
+            lp = self._run_logprobs(run, ref)
+        finally:
+            if self.parts is not None:
+                once.__exit__(None, None, None)
+        out = torch.zeros(shape, device=self.dev, dtype=torch.float32).index_put((rows, cols), lp)
+        mask = torch.zeros(shape, device=self.dev).index_put((rows, cols), torch.ones_like(lp))
+        return out, mask
+
+    def _run_logprobs(self, run, ref: bool) -> torch.Tensor:
         if ref:
             with torch.no_grad():
                 if self.has_ref:
@@ -289,9 +330,7 @@ class Policy:
                         lp = run()
         else:
             lp = run()
-        out = torch.zeros(shape, device=self.dev, dtype=torch.float32).index_put((rows, cols), lp)
-        mask = torch.zeros(shape, device=self.dev).index_put((rows, cols), torch.ones_like(lp))
-        return out, mask
+        return lp
 
     def train_mode(self, on: bool):
         inner = self.model.base_model.model
@@ -425,7 +464,7 @@ class ValidSampler:
         from concurrent.futures import ThreadPoolExecutor
 
         with ThreadPoolExecutor(8) as ex:  # each trace is a fork of a tracer server
-            return list(ex.map(lambda c: bool(mech.trace(program_of(self.tok.decode(c, skip_special_tokens=True)), self.model)["valid"]), completions))
+            return list(ex.map(lambda c: bool(mech.trace(program_of(to_mech(self.tok.decode(c, skip_special_tokens=True))), self.model)["valid"]), completions))
 
     def __call__(self, prompts: list[list[int]], n: int, adapter: Path, version: int) -> list[list[list[int]]]:
         groups = self.inner(prompts, n, adapter, version)
@@ -571,7 +610,8 @@ def sft_examples(args, pol, pool: list[dict]) -> tuple[list, list]:
         text = "```python\n" + r["source"].strip() + "\n```"
         return text + ("\n\n" + r["explanation"].strip() if r.get("explanation") else "")
 
-    programs = [(pol.prompt_ids(render(by_id[r["behavior"]])), pol.tok.encode(answer(r).strip(), add_special_tokens=False) + end) for _, r in sorted(best.items())]
+    target = (lambda text: pol.parts.reg.rewrite(text)) if getattr(pol, "parts", None) is not None else (lambda text: text)  # noqa: E731  addresses -> part tokens
+    programs = [(pol.prompt_ids(render(by_id[r["behavior"]])), pol.tok.encode(target(answer(r).strip()), add_special_tokens=False) + end) for _, r in sorted(best.items())]
     questions = []
     for path in args.data or []:
         for line in open(os.path.expanduser(path)):
@@ -806,7 +846,7 @@ def main():
     ap.add_argument("--pack", action="store_true", help="GRPO / DPO: one sequence per group (the shared prompt once; see Policy.token_logprobs); sets GRPO's micro-batch to the group")
     ap.add_argument("--sampler", choices=["auto", "vllm", "hf"], default="auto")
     ap.add_argument("--resample", type=int, default=0, help="redraw each invalid program (mech.trace) up to R times at sampling time")
-    ap.add_argument("--part-tokens", help="part tokens: g-predict's part_tokens.load(SPEC) module; its projections train with the LoRA and vLLM samples from a materialized checkpoint")
+    ap.add_argument("--part-tokens", help="part tokens: the registry file of g-predict's part_tokens.py build; the projections train with the LoRA and vLLM gets the rows in place")
     ap.add_argument("--materialize-every", type=int, default=0, help="with --part-tokens: also rewrite the checkpoint and restart vLLM every K steps (0: only at the start; the rows are copied in place before every sampling call)")
     ap.add_argument("--share-gpu", action="store_true", help="one GPU for vLLM and the trainer: vLLM sleeps (weights to host) while training and the trainer moves to the host while sampling, so --gpu-memory can be 0.8")
     ap.add_argument("--execution-only", action="store_true", help="score without the reader term (required when GRAPH_READER is unset and the checker scores)")

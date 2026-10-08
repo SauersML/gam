@@ -79,9 +79,10 @@ def main():
         check_left_padding(pol)
         check_init_adapter(Path(d))
         check_part_vocab(Path(d))
+        check_registry_parts(Path(d))
     check_split_prompts()
     print("ok: token log-probabilities, KL 0 and DPO ln 2 at the reference, GRPO gradient = summed log-probability policy gradient, "
-          "packed groups = separate sequences, left-padded batched generation, g-predict's adapters = their PEFT conversion, prompt split, part tokens")
+          "packed groups = separate sequences, left-padded batched generation, g-predict's adapters = their PEFT conversion, prompt split, part tokens (stand-in and registry)")
 
 
 def check_pack(pol):
@@ -181,6 +182,42 @@ def check_part_vocab(base: Path):
             got = plain(input_ids=mixed).logits
         assert got.shape == want.shape and torch.allclose(got, want, atol=1e-4), float((got - want).abs().max())
         assert len(AutoTokenizer.from_pretrained(d)) == first + 3
+
+
+def check_registry_parts(base: Path):
+    """g-predict's PartTokens over a small registry through the Policy: one computation of the rows per
+    log-probability call gives the same values and gradients as recomputing them; part tokens in an answer
+    become mech addresses for the checker; SFT targets get part tokens for addresses."""
+    import part_tokens
+
+    addresses = [f"PD.vpd[{l}].v_proj[{i}]" for l in (1, 2) for i in (3, 7)] + ["PD.vpd[0].c_fc[12]"]
+    g = torch.Generator().manual_seed(9)
+    reg = part_tokens.Registry(addresses, {"vpd.v": torch.randn(4, 10, generator=g), "vpd.fc": torch.randn(1, 12, generator=g)})
+    path = Path(tempfile.mkdtemp()) / "reg.safetensors"
+    reg.save(path)
+    args = argparse.Namespace(base=str(base), init=None, lora_rank=4, part_tokens=str(path))
+    pol = train.Policy(args, torch.device("cpu"))
+    first = pol.first_part
+    prompt, comp = [11, 12, 13], [first, 50, first + 4, first + 2]
+    lp, mask = pol.token_logprobs([prompt], [comp])  # rows computed once for the call
+    (lp * mask).sum().backward()
+    grads = [p.grad.clone() for p in pol.parts.parameters() if p.grad is not None]
+    assert grads and all(gr.abs().sum() > 0 for gr in grads[:2])
+    pol.model.zero_grad()
+    pol.parts.zero_grad()
+    import part_vocab
+
+    causal = pol.model.base_model.model
+    ids = torch.tensor([prompt + comp])
+    with torch.no_grad():
+        plain = causal(input_ids=ids).logits  # no cache: the wrappers recompute the rows
+        with part_vocab.rows_once(causal):
+            once = causal(input_ids=ids).logits
+    assert torch.allclose(plain, once, atol=1e-6)
+    text = "```python\nx = bind('v', <p:2.v.7>, <p:0.fc.12>)\n```\nThe value head."
+    assert train.to_mech(text) == "```python\nx = bind('v', PD.vpd[2].v_proj[7], PD.vpd[0].c_fc[12])\n```\nThe value head."
+    assert pol.parts.reg.rewrite("node(PD.vpd[1].v_proj[3])") == "node(<p:1.v.3>)"
+    assert pol.tok.decode([first + 4]) == "<p:0.fc.12>"
 
 
 def check_init_adapter(base: Path):

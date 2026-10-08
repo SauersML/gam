@@ -44,8 +44,7 @@ def main():
     from transformers import AutoConfig
 
     d = AutoConfig.from_pretrained(base).hidden_size
-    sys.modules["part_tokens"] = type(sys)("part_tokens")
-    sys.modules["part_tokens"].load = lambda spec: Parts(d)
+    train.load_parts = lambda spec, init, model, base_vocab, dev: Parts(d)  # stand-in parts
     with tempfile.TemporaryDirectory() as tmp:
         args = argparse.Namespace(base=base, init=None, lora_rank=8, part_tokens="stand-in", share_gpu=True, gpu_memory=0.6, max_model_len=2048,
                                   max_tokens=16, seed=0)
