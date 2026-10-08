@@ -957,8 +957,33 @@ def make_rot_fc(n, l):
             out = out * sc
         rot_record(recs, Rbs, [n], [R])
         state['rot'][l] = (gam, Q)
+        if state.get('alone') is not None and mode == 'hard':
+            state['alone'][l] = (p.detach(), gam.detach(), Q.detach())
         return out
     return fwd
+
+def acts_alone(l, p, gam, Q, stride=8, n_tok=256):
+    """Layer l's MLP blocks (rot) acting alone: for each block on at a token, its effect with only it on (its slices'
+    write W_dn,G Q_j Q_j^T GELU(Q_j Q_j^T p_G)) against its effect in context (the group's write with the token's
+    blocks on less that without it), as 1 - sum ||alone - context||^2 / sum ||context||^2 in the output space over the
+    (token, block on) pairs of every stride-th token (up to n_tok). The context is the block's group: GELU acts per
+    neuron and the groups partition the neurons, so blocks of different groups never interact. Returns (the score,
+    the pairs, the two sums)."""
+    R = ROT[l]; g = R['g']
+    P_ = permuted(p.reshape(-1, p.shape[-1])[::stride][:n_tok], R['perm'], R['inv']).view(-1, R['ng'], g)
+    c = qeinsum('tnk,nki->tni', P_, Q)                                                       # [t, ng, i] slice coordinates
+    gs = gam.reshape(-1, R['ng'], g)[::stride][:n_tok]                                       # the slices' (hard) gates
+    memT = (R['L'].argmax(-1) [:, None, :] == torch.arange(g, device=dev)[None, :, None]).float()[None]   # [1, ng, j, i]
+    Mo = qeinsum('nki,nkm,nmj->nij', Q, R['Gdn'], Q)                                         # the output metric
+    def f(m):
+        # The writes (slice coordinates) of the slices in masks m [t, ng, j, i].
+        return m * qeinsum('tnjk,nki->tnji', vpd_model.gelu_tanh(qeinsum('tnji,nki->tnjk', m * c[:, :, None, :], Q)), Q)
+    ctx = f(gs[:, :, None, :]) - f(gs[:, :, None, :] * (1 - memT))
+    alone = f(memT.expand(gs.shape[0], -1, -1, -1))
+    on = (gs[:, :, None, :] * memT).amax(-1)                                                 # [t, ng, j]: on and non-empty
+    nrm = lambda v: qeinsum('tnji,nik,tnjk->tnj', v, Mo, v)
+    num, den = (nrm(alone - ctx) * on).sum(), (nrm(ctx) * on).sum()
+    return 1 - (num / den.clamp_min(1e-30)).item(), int(on.sum().item()), num.item(), den.item()
 
 def rot_dn_core(R, a, gam, Q, mode):
     """A down_proj map's slices on its input a, gated by its c_fc blocks' gates: (z before M's product, coefficients)."""
@@ -1224,8 +1249,9 @@ def rot_attention(i, h, causal):
             if i not in SCORE_NORM:
                 SCORE_NORM[i] = (sm.mean((0, 2))[None, :, None], sm.std((0, 2)).clamp_min(1e-6)[None, :, None])
             sc = ((sm - SCORE_NORM[i][0]) / SCORE_NORM[i][1]).transpose(1, 2)                   # [B, T, H]
-        terms = [sc[..., None] * R_['beta'] if R_['ng'] == NH else (sc @ R_['beta'].view(-1, NH).T).view(B_, T_, 1, -1) for R_ in (Rq, Rk, Ro)]
-        ex = tuple(terms) if ex is None else tuple(e_ + t_ for e_, t_ in zip(ex, terms))
+        if 'beta' in Rq:                                                            # (the weights come after calibration)
+            terms = [sc[..., None] * R_['beta'] if R_['ng'] == NH else qeinsum('bth,ngh->btng', sc, R_['beta']) for R_ in (Rq, Rk, Ro)]
+            ex = tuple(terms) if ex is None else tuple(e_ + t_ for e_, t_ in zip(ex, terms))
     z, c, recs, Rbs = rot_run(rot_attention_core, Rq, Rk, Ro, q, k, v, causal, Qq, Qk, Q, noise, ex, rot_index_bits_t(),
                               *rot_core_args(), 'all' if state.get('allon_family') == 'attn' else state['mode'])
     rot_record(recs, Rbs, [f'h.{i}.attn.q_proj', f'h.{i}.attn.k_proj', f'h.{i}.attn.o_proj'], [Rq, Rk, Ro])
@@ -1614,7 +1640,12 @@ def evaluate(final=False):
         ids = ev[i:i + 4]
         lm = run(ids, 'M')
         state['probe'] = {} if LEVIN else None
+        state['alone'] = {} if ROT and i == 0 else None
         lp = run(ids, 'hard'); r['kl'].append(kl_bits(lm, lp).mean().item())
+        if state['alone'] is not None:
+            # The MLP blocks acting alone (on the first held-out sequences).
+            alone_rec = {l: acts_alone(l, *v) for l, v in state['alone'].items()}
+            state['alone'] = None
         r['active'].append(torch.stack(state['hard']).sum(0).mean().item())
         if LEVIN:
             # Levin's cost per token, and each block's on-anywhere (for the pruning).
@@ -1677,6 +1708,9 @@ def evaluate(final=False):
     out['induction'] = {'kl_first': round(kl_t[:, 1:100].mean().item(), 3), 'kl_repeat': round(kl_t[:, 100:].mean().item(), 3),
                         'loss_repeat_M': round(loss(lm), 3), 'loss_repeat_P': round(loss(lp), 3),
                         'blocks_on_repeat_not_first': sorted(rows, key=lambda r: -(r['on_repeat'] - r['on_first']))[:40]}
+    if ROT:
+        out['mlp_acts_alone'] = {l: round(v[0], 4) for l, v in alone_rec.items()}
+        out['mlp_acts_alone_all'] = round(1 - sum(v[2] for v in alone_rec.values()) / max(1e-30, sum(v[3] for v in alone_rec.values())), 4)
     if LEVIN:
         # Levin's cost of the delivered program (KL + log2 of the concepts on plus the gates evaluated, per token);
         # then the non-empty blocks never on in these hard passes (held-out text, the induction check) are pruned.
@@ -2139,7 +2173,7 @@ for step in range(steps):
     if LR_DECAY:
         for g_ in opt.param_groups:
             g_['lr'] = g_['lr0'] * (1 - 0.9 * step / max(1, steps - 1))
-    opt.zero_grad(); (objective + lam * (ek - K)).backward(); opt.step()
+    opt.zero_grad(); (objective if LEVIN else objective + lam * (ek - K)).backward(); opt.step()
     if LEVIN:
         lam = G_t.item()                                                           # logged in lambda's place
     elif DUAL == 'pin':
