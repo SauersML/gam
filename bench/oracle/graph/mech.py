@@ -61,7 +61,7 @@ trace(source, model, behavior=...) checks a program, runs it in a sandboxed chil
 the behavior, evaluates the algorithm on its prompts: per aligned variable, interchange pairs (prompt i
 with the variable's value from prompt j, the next prompt of i's length, and the answer at each of i's
 targets), and each claim's pattern on every prompt and counterfactual. It returns the IR the checker
-reads. Parts a program leaves out are the checker's stand-ins (deleted, with a decomposition attached).
+reads. Parts a program leaves out are the checker's stand-ins (their values on the prompt's counterfactual).
 code_length counts Python tokens (a part token is one); english extracts comments and docstrings;
 shapes(model) is the registry of model sizes (shapes.json, `mech.py shapes --write`).
 """

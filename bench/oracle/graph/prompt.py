@@ -37,9 +37,9 @@ aligned to parts of the model; it may import only `from mech import align, claim
 - claim(pattern, parts...): the attention of these query and key parts follows the variable `pattern`,
   whose value at t lists the positions 0..t attended (or maps positions to weights).
 - Parts are written as part tokens:
-{parts}  Every part you do not name is deleted, except the model's shared base: generic parts that run in every
-  program for free (naming one makes it yours). Name the parts that carry the information that decides
-  the answer, and nothing more: write the smallest program that explains.
+{parts}  Every part you do not name writes what it writes when the model reads the prompt's counterfactual
+  (the prompt with the deciding information changed), so the parts you name must carry that information.
+  Name those parts and nothing more: write the smallest program that explains.
 - Comments and docstrings are your working notes: they cost nothing and nobody else reads them.
 - The explanation after the code says what each variable is, which parts hold it and how they connect,
   in a few plain sentences. A reader that never sees the code predicts the model under experiments from

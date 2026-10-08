@@ -517,8 +517,7 @@ def explanation_of(ir: dict, behavior: dict, facts_of: dict[str, dict]) -> str:
                          f"{name[e['from']]}{route}.")
         if writers:
             lines.append(f"The output reads {', '.join(name[w] for w in writers)}.")
-    lines.append("Every other part of the model is deleted." if ir.get("decomposition")
-                 else "Everything else behaves as it does on the edited prompt.")
+    lines.append("Every other part of the model writes what it writes on the counterfactual prompt.")
     return " ".join(lines)
 
 
@@ -612,8 +611,7 @@ def algorithm_explanation(ir: dict, behavior: dict, facts_of: dict[str, dict]) -
             sentence += ", a step no part holds on its own"
         lines.append(sentence + ".")
     lines.append(f"{ir['answer']} is the prediction.")
-    lines.append("Every other part of the model is deleted." if ir.get("decomposition")
-                 else "Everything else behaves as it does on the edited prompt.")
+    lines.append("Every other part of the model writes what it writes on the counterfactual prompt.")
     return " ".join(lines)
 
 
