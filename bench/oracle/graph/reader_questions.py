@@ -20,7 +20,7 @@ it, on the same questions. Control: each behavior's questions read with another 
 
   reader_questions.py build --manifest MANIFEST.jsonl --out QUESTIONS.jsonl [--per-type 16]
   reader_questions.py score --questions QUESTIONS.jsonl --out RESULT.json [--model Qwen/Qwen3-8B --device mps]
-build runs the checker (score.Checker, GRAPH_CHECKER) for the switch questions.
+build runs the checker (score.Checker, GRAPH_CHECKER) for the switch questions; --types picks the types.
 """
 
 from __future__ import annotations
@@ -141,8 +141,8 @@ def _algorithm(program_source: str):
     return algorithm, [n for n in algorithm.params if n != "answer"]
 
 
-def build_behavior(entry: dict, per_type: int, seed: int, checker=None) -> list[dict]:
-    """The questions of one teacher answer (manifest entry)."""
+def build_behavior(entry: dict, per_type: int, seed: int, checker=None, types=("next", "switch", "step")) -> list[dict]:
+    """The questions of one teacher answer (manifest entry), of the given types."""
     import mech
     import prompt as P
 
@@ -156,7 +156,7 @@ def build_behavior(entry: dict, per_type: int, seed: int, checker=None) -> list[
     out = []
     # next: M's top token against 3 other prompts' top tokens.
     tops = [(i, k, p["model_top"][k][0][0]) for i, p in enumerate(prompts) for k, _ in enumerate(p["target_positions"]) if p.get("model_top")]
-    for i, k, top in rng.sample(tops, min(per_type, len(tops))):
+    for i, k, top in (rng.sample(tops, min(per_type, len(tops))) if "next" in types else []):
         others = sorted({t for _, _, t in tops if t != top})
         if len(others) < 3:
             continue
@@ -165,7 +165,7 @@ def build_behavior(entry: dict, per_type: int, seed: int, checker=None) -> list[
         pos = prompts[i]["target_positions"][k]
         out.append({**base, "type": "next", "text": decode(prompts[i]["token_ids"][: pos + 1]), "options": options, "answer": options.index(top)})
     # switch: the checker's clean complement run of the answer's parts.
-    if checker is not None:
+    if checker is not None and "switch" in types:
         source = P.program_of(Path(entry["answer"]).read_text())
         checker.behavior(str(path))
         reply = checker.request({"op": "complement", "program": checker.ir(source), "stand_in": "counterfactual"})
@@ -178,7 +178,7 @@ def build_behavior(entry: dict, per_type: int, seed: int, checker=None) -> list[
                         "clean_token": decode([r["clean_top"]]), "counter_token": decode([r["counterfactual_top"]]),
                         "answer": 0 if r["complement"][1] > r["complement"][0] else 1, "complement": r["complement"]})
     # step: intermediate variables of the answer's algorithm on two texts.
-    algorithm, steps = _algorithm(P.program_of(Path(entry["answer"]).read_text()))
+    algorithm, steps = _algorithm(P.program_of(Path(entry["answer"]).read_text())) if "step" in types else (None, [])
     if steps:
         toks, _ = mech.behavior_tokens(behavior, entry["model"])
         cands = []
@@ -259,7 +259,7 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--per-type", type=int, default=16)
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--no-checker", action="store_true", help="build: skip the switch questions")
+    ap.add_argument("--types", default="next,switch,step", help="build: the question types")
     ap.add_argument("--model", default="Qwen/Qwen3-8B")
     ap.add_argument("--device")
     ap.add_argument("--dtype", choices=["float32", "bfloat16"])
@@ -269,13 +269,13 @@ def main():
     entries = [json.loads(line) for line in open(args.manifest) if line.strip()]
     if args.command == "build":
         checker = None
-        if not args.no_checker:
+        if "switch" in args.types.split(","):
             import score as S
 
             checker = S.Checker("vpd4l", views={"vpd": str(Path.home() / "mpd-data/engine/vpd4l_decomposition")}, device="gpu")
         with open(args.out, "w") as f:
             for e in entries:
-                qs = build_behavior(e, args.per_type, args.seed, checker)
+                qs = build_behavior(e, args.per_type, args.seed, checker, args.types.split(","))
                 print(e["behavior"], {t: sum(q["type"] == t for q in qs) for t in ("next", "switch", "step")}, flush=True)
                 for q in qs:
                     f.write(json.dumps(q) + "\n")
