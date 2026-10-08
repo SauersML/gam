@@ -363,7 +363,7 @@ with torch.no_grad():
 X_FC = {n: X[n] for n in mlp if n.endswith('c_fc')} if ARM == 'rot' else {}
 del X
 
-state = {'mode': 'M', 'soft': [], 'hard': [], 'gates': {}, 'share': {}, 'r': {}, 'writers': {}, 'on': {}, 'gate': {}, 'edges_soft': [], 'edges_hard': [], 'share_a': {}, 'wedits_M': {}, 'wedits_P': {}, 'entry': {}, 'force_on': []}
+state = {'mode': 'M', 'soft': [], 'hard': [], 'gates': {}, 'share': {}, 'r': {}, 'writers': {}, 'on': {}, 'gate': {}, 'edges_soft': [], 'edges_hard': [], 'share_a': {}, 'wedits_M': {}, 'wedits_P': {}, 'entry': {}, 'force_on': [], 'gn_in': {}}
 SQ2 = math.sqrt(2)
 def make(n):
     st = T.site(n); p = P[n]; grp = GROUP.get(n); mult = MULT.get(n)
@@ -442,6 +442,11 @@ def make(n):
         if state.get('calib') is not None:
             state['calib'].setdefault(n, []).append(read.detach().reshape(-1))
         z = ((read - p['tau']) if 'taun' not in p else torch.maximum(c * un - p['tau'], -c * un - p['taun'])) / p['s']
+        if n in GN:
+            # The layer's gate network on the MLP's own input (the normed stream entering c_fc).
+            if n.endswith('c_fc'):
+                state['gn_in'][('mlp', layer)] = x
+            z = z + gate_net_s(n, state['gn_in'][('mlp', layer)])
         hard = (z > 0).float()
         phi = 0.5 * (1 + torch.erf(z / SQ2))
         if state['force_on']:
@@ -539,6 +544,12 @@ def make_attn(n):
                 z = torch.maximum(cs - p['tau'][:, None, :], -cs - p['taun'][:, None, :]) / p['s'][:, None, :]
             else:
                 z = (c.abs() * p['U'].norm(dim=-1)[:, None, :] - p['tau'][:, None, :]) / p['s'][:, None, :]
+            if n in GN:
+                # The layer's gate network on the stream entering the attention (q's input; o reads it too).
+                if not p['o']:
+                    state['gn_in'][('attn', n.split('.')[1])] = x
+                g_ = gate_net_s(n, state['gn_in'][('attn', n.split('.')[1])])
+                z = z + g_.reshape(-1, NH, z.shape[-1]).permute(1, 0, 2)
             hard, phi = force_rows((z > 0).float(), 0.5 * (1 + torch.erf(z / SQ2)), x.shape[1])
             state['hard'].append(hard.sum((0, 2)))
             if state['mode'] == 'hard':
@@ -955,6 +966,21 @@ if ARM == 'rot' and GATENET:
                              'b1': torch.zeros(GATENET, device=dev, requires_grad=True),
                              'W2': torch.zeros(GATENET, n_out, device=dev, requires_grad=True)}
 
+if ARM != 'rot' and GATENET:
+    # Slice arms: one network per map, reading its layer's stream (the MLP's or the attention's normed input), one
+    # output per slice.
+    for n in mlp + sliced:
+        n_out = P[n]['V'].shape[1] if n in P else NH * A[n]['V'].shape[-1]
+        d_ = T.wte.shape[1]
+        GN[n] = {'W1': (torch.randn(d_, GATENET, device=dev) * math.sqrt(2 / d_)).requires_grad_(),
+                 'b1': torch.zeros(GATENET, device=dev, requires_grad=True),
+                 'W2': torch.zeros(GATENET, n_out, device=dev, requires_grad=True)}
+
+def gate_net_s(n, x):
+    """Map n's gate network's output for each of its slices at each token of x [B, T, d]."""
+    P_ = GN[n]
+    return F.gelu(x @ P_['W1'] + P_['b1']) @ P_['W2']
+
 def gate_net(l, part, x):
     """The layer's gate network's output for every block of `part` at each token of x [B, T, d] (zero without one)."""
     if (l, part) not in GN:
@@ -1196,6 +1222,8 @@ def attn_v(l, h, pattern):
                 z = torch.maximum(ms - p['tau'][None, :, None, :], -ms - p['taun'][None, :, None, :]) / p['s'][None, :, None, :]
             else:
                 z = (r - p['tau'][None, :, None, :]) / p['s'][None, :, None, :]
+            if n in GN:
+                z = z + gate_net_s(n, h).view(B_, T_, NH, -1).permute(0, 2, 1, 3)
             hard = (z > 0).float(); soft = 0.5 * (1 + torch.erf(z / SQ2))
         if state['force_on']:
             # The all-on sequences' gates on.
