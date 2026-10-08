@@ -359,7 +359,7 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--format", default="chat", choices=("chat", "raw"))
     ap.add_argument("--save-at", type=lambda t: [int(x) for x in t.split(",") if x], default=[], help="steps at which to also save the adapters (1500,3000)")
-    ap.add_argument("--checkpointing", default="auto", choices=("auto", "on", "off"), help="activation recomputation (auto: on cards under 40 GB)")
+    ap.add_argument("--checkpointing", default="auto", choices=("auto", "on", "off"), help="activation recomputation (auto: on cards under 70 GB)")
     ap.add_argument("--eval-only", default="", help="ADAPTERS: score base and these adapters on the held-out sets, no training")
     ap.add_argument("--export-peft", default="", help="only convert OUT/adapters.safetensors to OUT/peft (no training)")
     args = ap.parse_args()
@@ -435,8 +435,8 @@ def main():
         params += setup_part_tokens(args.part_tokens, model, tok, dev)
 
     opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=0.0)
-    big = dev.type == "cuda" and torch.cuda.get_device_properties(0).total_memory > 40 * 2**30
-    if args.checkpointing == "on" or (args.checkpointing == "auto" and not big):  # recompute activations on cards under 40 GB
+    big = dev.type == "cuda" and torch.cuda.get_device_properties(0).total_memory > 70 * 2**30
+    if args.checkpointing == "on" or (args.checkpointing == "auto" and not big):  # recompute activations below 80 GB cards (8B ran out of 48 GB without)
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     model.config.use_cache = False
     step, t0 = 0, time.time()
