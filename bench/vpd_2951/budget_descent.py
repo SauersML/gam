@@ -1888,11 +1888,15 @@ def save(step):
                     # rot: per layer the neuron order (groups of DESCENT_ROT consecutive), angles, assignments,
                     # thresholds, noise scales and the slices' log widths.
                     'rot': {l: {k: R[k].detach().float().cpu() if R[k].dtype.is_floating_point else R[k].cpu()
-                                for k in ('perm', 'A', 'L', 'tau', 's', 'ls_fc', 'ls_dn')} for l, R in ROT.items()},
+                                for k in ('perm', 'A', 'L', 'tau', 's', 'ls_fc', 'ls_dn', 'Q0') if k in R} for l, R in ROT.items()},
+                    # Each group's basis: Q = Q0 (I + S)^-1 (I - S) for groups larger than 64 (Q0 the start's basis where
+                    # saved, else I), exp(S) otherwise, S the skew part of A's strict upper triangle; the guard reads
+                    # ln R against tau (log) or R (linear).
+                    'rot_basis': {'cayley_above': 64, 'guard': 'log' if LOGGATE else 'linear'},
                     # rot attention: per layer the OV groups' (consecutive value coordinates of the heads) angles,
                     # assignments, thresholds, noise scales and widths, and the QK planes' assignments, thresholds,
                     # noise scales and widths.
-                    'rota': {l: {x: {k: R[x][k].detach().float().cpu() for k in ('A', 'L', 'tau', 's', 'ls', 'ls_fc', 'ls_dn') if k in R[x]}
+                    'rota': {l: {x: {k: R[x][k].detach().float().cpu() for k in ('A', 'L', 'tau', 's', 'ls', 'ls_fc', 'ls_dn', 'Q0') if k in R[x]}
                                  for x in ('q', 'k', 'ov')} for l, R in ROTA.items()}}, os.environ['DESCENT_SAVE'])
 
 draw(True)
