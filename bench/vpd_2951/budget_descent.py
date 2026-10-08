@@ -441,7 +441,7 @@ def make(n):
         read = x @ p['G'] if ARM == 'dir' else c if start == 'neuron' else c.abs() * un
         if state.get('calib') is not None:
             state['calib'].setdefault(n, []).append(read.detach().reshape(-1))
-        z = (read - p['tau']) / p['s']
+        z = ((read - p['tau']) if 'taun' not in p else torch.maximum(c * un - p['tau'], -c * un - p['taun'])) / p['s']
         hard = (z > 0).float()
         phi = 0.5 * (1 + torch.erf(z / SQ2))
         if state['force_on']:
@@ -534,7 +534,11 @@ def make_attn(n):
         else:
             if state.get('calib') is not None:
                 state['calib'].setdefault(n, []).append((c.abs() * p['U'].norm(dim=-1)[:, None, :]).reshape(-1))
-            z = (c.abs() * p['U'].norm(dim=-1)[:, None, :] - p['tau'][:, None, :]) / p['s'][:, None, :]
+            if 'taun' in p:
+                cs = c * p['U'].norm(dim=-1)[:, None, :]
+                z = torch.maximum(cs - p['tau'][:, None, :], -cs - p['taun'][:, None, :]) / p['s'][:, None, :]
+            else:
+                z = (c.abs() * p['U'].norm(dim=-1)[:, None, :] - p['tau'][:, None, :]) / p['s'][:, None, :]
             hard, phi = force_rows((z > 0).float(), 0.5 * (1 + torch.erf(z / SQ2)), x.shape[1])
             state['hard'].append(hard.sum((0, 2)))
             if state['mode'] == 'hard':
@@ -1187,7 +1191,11 @@ def attn_v(l, h, pattern):
         else:
             if state.get('calib') is not None:
                 state['calib'].setdefault(n, []).append(r.detach().reshape(-1))
-            z = (r - p['tau'][None, :, None, :]) / p['s'][None, :, None, :]
+            if 'taun' in p:
+                ms = m * p['U'].norm(dim=-1)[None, :, None, :]
+                z = torch.maximum(ms - p['tau'][None, :, None, :], -ms - p['taun'][None, :, None, :]) / p['s'][None, :, None, :]
+            else:
+                z = (r - p['tau'][None, :, None, :]) / p['s'][None, :, None, :]
             hard = (z > 0).float(); soft = 0.5 * (1 + torch.erf(z / SQ2))
         if state['force_on']:
             # The all-on sequences' gates on.
@@ -1555,6 +1563,13 @@ rms = lambda q: q.detach().pow(2).mean().sqrt().item()
 # train: whether the gap to VPD is the gates or the parts (VPD's own causal gates on these parts: 0.80 bits per
 # token at 190 active, whole model).
 GATES_ONLY = os.environ.get('DESCENT_GATES_ONLY') == '1'
+# DESCENT_SIGNED=1 (slice arms): a slice's guard reads its signed own write, on when c ||u|| > tau or -c ||u|| > tau_neg,
+# each sign its own threshold (both started at the calibrated |c| ||u|| threshold, so the start is unchanged):
+# the read |c| ||u|| fires on a large negative pre-activation that GELU discards, and VPD's own gates on its parts
+# are functions of the signed read.
+if os.environ.get('DESCENT_SIGNED') == '1' and ARM != 'rot':
+    for cont in [P[n] for n in mlp] + [A[n] for n in sliced]:
+        cont['taun'] = cont['tau'].detach().clone().requires_grad_()
 slots = [(P[n], w, rms(P[n][w])) for n in mlp for w in (('F',) if EXACT else ('V', 'U')) + (('G',) if ARM == 'dir' else ())
          if not (EXACT and NEURON_DOWN and n.endswith('down_proj') and w == 'F') and ARM != 'rot' and not GATES_ONLY]
 # rot: rotation angles by 1e-3 per step, thresholds by a tenth of their noise scale, assignment logits by 0.02.
@@ -1564,6 +1579,7 @@ slots += [(A[n], w, rms(A[n][w])) for n in sliced for w in (('V', 'U') if ATTN_F
 for l, S in SHARE_A.items():
     slots += [(S, 't', 100 / 3 * S['s'].mean().item()), (S, 'L_v', 20 / 3), (S, 'L_o', 20 / 3)]
 slots += [(P[n], 'tau', 100 / 3 * P[n]['s'].mean().item()) for n in mlp if ARM != 'rot']
+slots += [(cont, 'taun', 100 / 3 * cont['s'].mean().item()) for cont in [P[n] for n in mlp] + [A[n] for n in sliced] if 'taun' in cont]
 for l, S in SHARE.items():
     # part thresholds by 1% of their noise scale x 10, assignment logits by 0.02 per step
     slots += [(S, 't', 100 / 3 * S['s'].mean().item()), (S, 'L_fc', 20 / 3), (S, 'L_dn', 20 / 3)]
@@ -1674,7 +1690,7 @@ def description_bits():
             v = (e * M_).sum() / (M_.sum() * mu.shape[0])
             total = total + 0.5 * ((torch.log(v) - 2 * ls + e / v - 1) * M_).sum()
             continue
-        if key in ('tau', 't'):
+        if key in ('tau', 't', 'taun'):
             # Thresholds and widths are locations, not zero-centred: their prior N(m, v) has its mean m fitted
             # too (described in (1/2) ln n nats), v = mean((mu - m)^2 + sigma^2) at its optimum. Under
             # N(0, v) a tensor's thresholds, all near one value tau_0, had v ~ tau_0^2, which pushed every
