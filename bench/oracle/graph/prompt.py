@@ -129,6 +129,10 @@ def render(behavior: dict, prompts: int = 4, shots: int = 1, decomposition: str 
     parts = [REFERENCE.format(parts=names)]
     for name, entry, source, explanation in examples(behavior, shots):
         parts.append(f"Example answer ({entry['model']}):\n```python\n{source.strip()}\n```\n\n{explanation}")
+    groups = mech.library(model)
+    if groups:  # the model's shared named groups: part sets defined once, each written as one name
+        parts.append("Named groups of parts (import G as well; write G.<name> wherever parts go; a group costs one "
+                     "part name):\n" + "\n".join(f"  G.{n}: {g.get('role', '')}".rstrip() for n, g in sorted(groups.items())))
     parts.append(f"{sizes}\n{behavior_text(behavior, prompts)}\n\nWrite the program, then the explanation.")
     return "\n\n".join(parts)
 

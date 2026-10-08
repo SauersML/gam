@@ -75,6 +75,16 @@ def test_dropping_a_blocks_last_writer_drops_the_block():
     assert [s.parts for s in claimed.statements if s.kind == "claim"] == [("<p:1.k.329>",)]
 
 
+def test_named_groups_are_choices():
+    src = SOURCE.replace("align(prev, <p:1.v.228>, <p:1.o.311>)", "align(prev, G.prev_l1, <p:1.v.228>, <p:1.o.311>)")
+    a = Answer.parse(src)
+    assert a.source() == src and ("prev", "G.prev_l1") in [(a.statements[j].variable, p) for j, p in a.parts()]
+    gone = apply(a, Edit("drop", "prev", "align", "G.prev_l1"))
+    assert "align(prev, <p:1.v.228>, <p:1.o.311>)" in gone.source()
+    kept = apply(a, Edit("drop", "prev", "align", "<p:1.o.311>"))  # the group may write layer 1: no cascade
+    assert "align(prev, G.prev_l1, <p:1.v.228>)" in kept.source()
+
+
 def test_refine_reaches_the_optimum():
     a = Answer.parse(SOURCE)
     best, s, accepted = refine(a, stand_in, {"answer": ["<p:0.m.0>", "<p:2.v.9>"]}, rounds=8, per_variable=2)

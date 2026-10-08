@@ -53,6 +53,11 @@ Parts (layer L, index I, from 0). The oracle writes one part token per part; tex
 Native units appear only where the attached decomposition leaves a block uncovered: none with VPD or the
 library, heads with transcoders. Text indices may be ints, slices or ranges.
 
+Named groups: G.<name> is a group of parts from the model's shared library (LIBRARY_DIR/<model>.json,
+{name: {"parts": [part tokens], "role": ...}}), written wherever parts are; the IR lists each group a
+program uses and the nodes holding its parts ("groups"), so the checker can charge a group use as one
+name and its definition once per model.
+
 The low-level form, without an algorithm: node(*parts) makes one node; `writer >> reader` is an edge
 (writer: a node or embed; reader: a node, a route node.query/.key/.value/.input, or logits); edges(...)
 lists them.
@@ -101,9 +106,10 @@ CODES = {"q_proj": "q", "k_proj": "k", "v_proj": "v", "o_proj": "o", "c_fc": "fc
 SITE_OF = {code: site for site, code in CODES.items()}
 PART = re.compile(r"<p:(\d+)\.(?:(q|k|v|o|fc|down|attn|mlp)\.(\d+|rest)|h\.(\d+)|(a|m))>")
 ROUTES = ("query", "key", "value", "input")
-EXPORTS = ("align", "claim", "node", "edges", "L", "PD", "embed", "logits")
+EXPORTS = ("align", "claim", "node", "edges", "L", "PD", "G", "embed", "logits")
 ATTRIBUTES = ("head", "attn", "mlp", "rest", "query", "key", "value", "input") + SITES
 LIBRARY_ARM = "grouped_own"  # the arm of decomp's start that the library view addresses
+LIBRARY_DIR = Path.home() / "mpd-data/graph_oracle/library"  # per model, the shared named groups of parts
 
 
 class MechError(Exception):
@@ -125,6 +131,18 @@ def shapes(model: str) -> dict:
     if model not in _SHAPES:
         raise MechError(f"unknown model {model!r}; models: {', '.join(sorted(_SHAPES))}")
     return _SHAPES[model]
+
+
+_LIBRARIES: dict[str, dict] = {}
+
+
+def library(model: str) -> dict[str, dict]:
+    """The model's shared library of named groups, {name: {"parts": [part tokens], "role": ...}} (empty
+    without a library file)."""
+    if model not in _LIBRARIES:
+        path = LIBRARY_DIR / f"{model}.json"
+        _LIBRARIES[model] = json.loads(path.read_text()) if path.exists() else {}
+    return _LIBRARIES[model]
 
 
 def build_shapes(data: Path) -> dict:
@@ -185,8 +203,10 @@ _PROGRAM: "_Program | None" = None
 
 
 class _Program:
-    def __init__(self, model: str, decomposition: str | None, namespace: dict):
+    def __init__(self, model: str, decomposition: str | None, namespace: dict, groups: dict[str, list[str]] | None = None):
         self.model = model
+        self.groups = groups or {}  # the named groups G.<name> may use: name -> part tokens
+        self.used: set[str] = set()
         self.shape = shapes(model)
         self.decomposition = decomposition
         self.namespace = namespace
@@ -427,10 +447,40 @@ def _covered(p: Piece) -> None:
                         f"name its parts ({sites}) instead of native units")
 
 
+class Group:
+    """A named group of parts from the model's shared library, written G.<name>."""
+
+    def __init__(self, name: str, tokens: list[str]):
+        self.name, self.tokens = name, tokens
+
+    def __rshift__(self, other):
+        raise MechError(f"G.{self.name} is a group of parts; make it a node, node(G.{self.name}), before connecting it")
+
+
+class _Groups:
+    def __getattr__(self, name: str) -> Group:
+        groups = _PROGRAM.groups if _PROGRAM is not None else {}
+        if name not in groups:
+            known = ", ".join(sorted(groups)[:20]) or "none"
+            raise MechError(f"G.{name}: no such group in the model's library (groups: {known})")
+        return Group(name, groups[name])
+
+
 def _pieces(parts, what: str) -> tuple[Piece, ...]:
-    """Part arguments (pieces, whole sites, part tokens, or lists of them) as pieces."""
+    """Part arguments (pieces, whole sites, part tokens, named groups, or lists of them) as pieces."""
+    def flat(items):
+        for p in items:
+            if isinstance(p, Group):
+                if _PROGRAM is not None:
+                    _PROGRAM.used.add(p.name)
+                yield from p.tokens
+            elif isinstance(p, (list, tuple)):
+                yield from flat(p)
+            else:
+                yield p
+
     out = []
-    for p in (q for p in parts for q in (p if isinstance(p, (list, tuple)) else (p,))):
+    for p in flat(parts):
         if isinstance(p, str):
             p = _part(p)
         elif isinstance(p, _Site):
@@ -513,6 +563,7 @@ class _Logits:
 
 L = _Layers()
 PD = _PD()
+G = _Groups()
 embed = _Embed()
 logits = _Logits()
 
@@ -875,6 +926,13 @@ def _validate(program: _Program, namespace: dict, ir: dict, behavior: dict | Non
     ir["edges"] = [{"from": "embed" if e.src is embed else e.src.id,
                     "to": "logits" if e.dst is logits else e.dst.id, "route": e.route}
                    for e in program.edges.values()]
+    holder = {(p.view, p.layer, p.kind, i): n.id for n in program.nodes for p in n.pieces
+              for i in (("rest",) if p.rest else p.index)}
+    ir["groups"] = []
+    for name in sorted(program.used):
+        held = {holder.get((p.view, p.layer, p.kind, i)) for p in _pieces(program.groups[name], f"G.{name}")
+                for i in (("rest",) if p.rest else p.index)}
+        ir["groups"].append({"name": name, "parts": list(program.groups[name]), "nodes": sorted(h for h in held if h)})
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -997,14 +1055,15 @@ def quote_parts(source: str) -> str:
 
 def _empty(source: str, model: str, decomposition: str | None) -> dict:
     return {"model": model, "decomposition": decomposition, "nodes": [], "edges": [], "alignments": [],
-            "variables": [], "answer": None, "claims": {}, "python_tokens": 0, "token_types": 0,
+            "variables": [], "answer": None, "claims": {}, "groups": [], "python_tokens": 0, "token_types": 0,
             "source": source, "valid": False, "error": None}
 
 
-def _trace(source: str, model: str, behavior: dict | None = None, decomposition: str | None = None) -> dict:
+def _trace(source: str, model: str, behavior: dict | None = None, decomposition: str | None = None,
+           groups: dict[str, list[str]] | None = None) -> dict:
     """Checks and runs `source` in this process -> IR, with answers as token strings (`behavior`: the
-    prompts, counterfactuals and targets as token strings, behavior_tokens()). The sandboxed child's
-    entry point."""
+    prompts, counterfactuals and targets as token strings, behavior_tokens(); `groups`: the named groups,
+    name -> part tokens, the model's library when None). The sandboxed child's entry point."""
     global _PROGRAM
     decomposition = DEFAULT_DECOMPOSITION.get(model) if decomposition is None else decomposition
     decomposition = None if decomposition == "native" else decomposition
@@ -1033,7 +1092,9 @@ def _trace(source: str, model: str, behavior: dict | None = None, decomposition:
             else:
                 namespace[bound] = exports[name]
         tree = ast.fix_missing_locations(_NoImports().visit(tree))
-        _PROGRAM = program = _Program(model, decomposition, namespace)
+        if groups is None:
+            groups = {name: g["parts"] for name, g in library(model).items()}
+        _PROGRAM = program = _Program(model, decomposition, namespace, groups)
         try:
             exec(compile(tree, "<program>", "exec"), namespace)
             _validate(program, namespace, ir, behavior)
@@ -1051,7 +1112,7 @@ def _trace(source: str, model: str, behavior: dict | None = None, decomposition:
         line = _line_of(e)
         ir["error"] = (f"line {line}: " if line else "") + f"{type(e).__name__}: {e}"
     if not ir["valid"]:
-        ir.update(nodes=[], edges=[], alignments=[], variables=[], answer=None, claims={})
+        ir.update(nodes=[], edges=[], alignments=[], variables=[], answer=None, claims={}, groups=[])
     return ir
 
 
@@ -1136,7 +1197,7 @@ def _answer_ids(ir: dict, model: str, known: dict | None) -> dict:
             for text in pair["answer_text"]:
                 found = ids(text)
                 if None in found:
-                    ir.update(nodes=[], edges=[], alignments=[], variables=[], answer=None, claims={}, valid=False,
+                    ir.update(nodes=[], edges=[], alignments=[], variables=[], answer=None, claims={}, groups=[], valid=False,
                               error=f"the answer {text!r} (variable {ir.get('answer')}, interchanging {b['variable']}, "
                                     f"prompt {pair['base']}) starts with no token of {model}")
                     return ir
@@ -1147,10 +1208,11 @@ def _answer_ids(ir: dict, model: str, known: dict | None) -> dict:
     return ir
 
 
-def trace_inline(source: str, model: str, behavior=None, decomposition: str | None = None) -> dict:
+def trace_inline(source: str, model: str, behavior=None, decomposition: str | None = None,
+                 groups: dict[str, list[str]] | None = None) -> dict:
     """Checks and runs `source` in this process (trusted sources only; `trace` sandboxes) -> IR."""
     payload, known = behavior_tokens(behavior, model) if behavior is not None else (None, None)
-    return _answer_ids(_trace(source, model, payload, decomposition), model, known)
+    return _answer_ids(_trace(source, model, payload, decomposition, groups), model, known)
 
 
 MEMORY = 1 << 30  # bytes a traced program may use
@@ -1208,7 +1270,7 @@ def _traced_child(req: dict) -> dict:
             os.close(r)
             _limit(timeout)
             sys.setrecursionlimit(500)
-            data = json.dumps(_trace(source, model, req.get("behavior"), req.get("decomposition"))).encode()
+            data = json.dumps(_trace(source, model, req.get("behavior"), req.get("decomposition"), req.get("groups"))).encode()
             view = memoryview(data)
             while view:
                 view = view[os.write(w, view):]
@@ -1247,10 +1309,11 @@ def _traced_child(req: dict) -> dict:
 
 
 def serve() -> None:
-    """JSON lines on stdin {"source", "model", "timeout", "behavior", "decomposition"} -> IR lines on
-    stdout, one forked child each."""
+    """JSON lines on stdin {"source", "model", "timeout", "behavior", "decomposition", "groups"} -> IR lines
+    on stdout, one forked child each."""
     for model in MODELS:
         shapes(model)
+        library(model)
     for line in sys.stdin:
         print(json.dumps(_traced_child(json.loads(line))), flush=True)
 
@@ -1258,16 +1321,18 @@ def serve() -> None:
 _SERVERS = threading.local()
 
 
-def trace(source: str, model: str, timeout: float = 10.0, behavior=None, decomposition: str | None = None) -> dict:
+def trace(source: str, model: str, timeout: float = 10.0, behavior=None, decomposition: str | None = None,
+          groups: dict[str, list[str]] | None = None) -> dict:
     """Checks and runs `source` sandboxed (restricted names and builtins; a forked child with CPU and
     memory limits and a wall-clock deadline) -> IR dict. `behavior` (a record or its file): evaluate the
     algorithm's interchange pairs and claims on its prompts; `decomposition`: what PD names ("vpd",
-    "library", "transcoder", or "native" for none; the model's default when None). Each thread keeps one
+    "library", "transcoder", or "native" for none; the model's default when None); `groups`: the named
+    groups G.<name> may use (name -> part tokens; the model's library when None). Each thread keeps one
     tracer server (`mech.py serve`, started with -I -S: no site hooks, the standard library only, no
     memory-ledger reservation), so a trace costs a fork, a few milliseconds."""
     payload, known = behavior_tokens(behavior, model) if behavior is not None else (None, None)
     request = json.dumps({"source": source, "model": model, "timeout": timeout, "behavior": payload,
-                          "decomposition": decomposition})
+                          "decomposition": decomposition, "groups": groups})
     for attempt in range(2):
         server = getattr(_SERVERS, "proc", None)
         if server is None or server.poll() is not None or _SERVERS.pid != os.getpid():  # a forked caller starts its own
@@ -1290,13 +1355,13 @@ def trace(source: str, model: str, timeout: float = 10.0, behavior=None, decompo
 
 
 def trace_many(sources: list[str], model: str, timeout: float = 10.0, workers: int = 8, behavior=None,
-               decomposition: str | None = None) -> list[dict]:
+               decomposition: str | None = None, groups: dict[str, list[str]] | None = None) -> list[dict]:
     from concurrent.futures import ThreadPoolExecutor
 
     if behavior is not None and not isinstance(behavior, dict):
         behavior = json.loads(Path(behavior).expanduser().read_text())
     with ThreadPoolExecutor(workers) as pool:
-        return list(pool.map(lambda s: trace(s, model, timeout, behavior, decomposition), sources))
+        return list(pool.map(lambda s: trace(s, model, timeout, behavior, decomposition, groups), sources))
 
 
 # ---------------------------------------------------------------------------------------------------

@@ -34,7 +34,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
-PART = re.compile(r"<p:[^>]+>")
+PART = re.compile(r"<p:[^>]+>|\bG\.\w+")  # a part token or a named group of the model's library (mech's G)
 SITE = re.compile(r"<p:(\d+)\.(\w+)")  # a part token's layer and site code
 WRITERS = {"o", "down", "h", "a", "m", "attn", "mlp"}  # site codes whose parts write the residual stream
 STATEMENT = re.compile(r"^(\s*)(align|claim)\(\s*(\w+)\s*,(.*)\)\s*$")
@@ -106,7 +106,8 @@ def apply(answer: Answer, edit: Edit) -> Answer:
         del statements[j]
     elif j is not None and edit.op == "drop":
         kept = tuple(p for p in statements[j].parts if p != edit.part)
-        if edit.kind == "align" and not any(block(p) == block(edit.part) and SITE.match(p)[2] in WRITERS for p in kept):
+        if edit.kind == "align" and SITE.match(edit.part) and not any(
+                not SITE.match(p) or block(p) == block(edit.part) and SITE.match(p)[2] in WRITERS for p in kept):  # a group may hold a writer
             # the block's last residual writer gone: its q/k/v_proj or c_fc parts write only that block's own
             # stream, which nothing of the variable reads any more (each node computes alone), so they go too
             kept = tuple(p for p in kept if block(p) != block(edit.part))

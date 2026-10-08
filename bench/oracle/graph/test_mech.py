@@ -301,6 +301,39 @@ def test_whole_site():
     assert v["nodes"][0]["pieces"][0]["index"] == list(range(3072))  # the checker takes VPD units by name
 
 
+def test_named_groups():
+    groups = {"prev_l1": ["<p:1.v.228>", "<p:1.v.346>", "<p:1.o.311>"], "copy_l3": ["<p:3.v.677>", "<p:3.o.806>"]}
+    src = INDUCTION.replace("from mech import align, claim", "from mech import align, claim, G")
+    src = src.replace("align(prev, <p:1.v.228>, <p:1.v.346>, <p:1.o.311>, <p:1.o.340>)", "align(prev, G.prev_l1, <p:1.o.340>)")
+    src = src.replace("<p:3.v.677>, <p:3.o.806>)", "G.copy_l3)")
+    plain = mech.trace_inline(INDUCTION, "vpd4l", groups={})
+    ir = mech.trace_inline(src, "vpd4l", groups=groups)
+    assert ir["valid"], ir["error"]
+    assert ir["nodes"] == plain["nodes"] and ir["edges"] == plain["edges"]  # a group is its parts
+    assert ir["groups"] == [{"name": "copy_l3", "parts": groups["copy_l3"], "nodes": ["answer.3.attn"]},
+                            {"name": "prev_l1", "parts": groups["prev_l1"], "nodes": ["prev"]}], ir["groups"]
+    assert plain["groups"] == []
+    sandboxed = mech.trace(src, "vpd4l", groups=groups)
+    assert sandboxed["groups"] == ir["groups"], sandboxed["error"]
+    bad = mech.trace_inline(src.replace("G.prev_l1", "G.nothing"), "vpd4l", groups=groups)
+    assert not bad["valid"] and "G.nothing: no such group" in bad["error"] and "prev_l1" in bad["error"]
+    low = mech.trace_inline(HEAD.replace("logits", "logits, G") + "n = node(G.copy_l3)\nedges(embed >> n, n >> logits)\n",
+                            "vpd4l", groups=groups)
+    assert low["valid"] and low["groups"] == [{"name": "copy_l3", "parts": groups["copy_l3"], "nodes": ["n"]}], low["error"]
+
+
+def test_prompt_lists_named_groups(monkeypatch):
+    import prompt
+
+    behavior = json.loads(BEHAVIOR.read_text()) if BEHAVIOR.exists() else None
+    if behavior is None:
+        return
+    assert "Named groups" not in prompt.render(behavior, shots=0) or mech.library("vpd4l")
+    monkeypatch.setitem(mech._LIBRARIES, "vpd4l", {"prev_l1": {"parts": ["<p:1.o.311>"], "role": "the previous token"}})
+    text = prompt.render(behavior, shots=0)
+    assert "  G.prev_l1: the previous token" in text and "<p:1.o.311>" not in text.split("Named groups")[1]
+
+
 def test_low_level_ir():
     ir = mech.trace_inline(HEAD + "a = node(PD[1].q_proj[1], PD[1].o_proj[3])\nb = node(PD[3].c_fc[2], PD[3].down_proj[5:8])\n"
                            "edges(a >> b, embed >> a.query, b >> logits)\nnode(PD[0].down_proj[9], PD[0].c_fc[1]) >> a.input\n",
