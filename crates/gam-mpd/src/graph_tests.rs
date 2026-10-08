@@ -58,7 +58,7 @@ fn full_program() -> Program {
             }
         }
     }
-    Program { model: "tiny".into(), nodes, edges, python_tokens: 0, token_types: 0, source: String::new(), valid: true, error: None, standin: None, base: Vec::new(), bindings: Vec::new() }
+    Program { model: "tiny".into(), nodes, edges, python_tokens: 0, token_types: 0, source: String::new(), valid: true, error: None, standin: None, base: Vec::new(), explanation_tokens: 0, explanation_token_types: 0, bindings: Vec::new() }
 }
 
 /// The Checker keeps `M`'s log-probabilities in float32 (relative rounding `2^-24`): on
@@ -229,13 +229,7 @@ fn checker_counterfactual_default_scores_the_empty_program_at_the_behavior_signa
     assert!(max(&signal.iter().zip(&measured).map(|(a, b)| a - b).collect::<Vec<_>>()) < F32_KL, "empty program clean error {measured:?} vs KL(M(x) ‖ M(x')) {signal:?}");
     assert!(empty.valid);
     let (full, _) = checker.score(&full_program(), 16, 3, true, None).expect("score");
-    // Precision pricing runs the full program with its blocks quantized where the search found that
-    // cheaper (design.txt section 2): exact blocks give M, quantized ones that precision's error.
-    if full.widths.iter().all(|w| w.bits.is_none()) {
-        assert!(full.exec_error_bits / full.n < F32_KL, "full program error {:e} bits per token", full.exec_error_bits / full.n);
-    } else {
-        assert!(full.exec_error_bits / full.n < 1e-2, "full program error {:e} bits per token at widths {:?}", full.exec_error_bits / full.n, full.widths);
-    }
+    assert!(full.exec_error_bits / full.n < F32_KL, "full program error {:e} bits per token", full.exec_error_bits / full.n);
 }
 
 #[test]

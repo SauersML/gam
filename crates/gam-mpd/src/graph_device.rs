@@ -222,12 +222,6 @@ pub(crate) fn edited<A>(m: &Array2<A>) {
     dropped((m.as_ptr() as usize, m.nrows(), m.ncols()));
 }
 
-/// [`edited`] for a host vector the device keeps as a `1 × n` row ([`row`]: a head norm's gain,
-/// an MLP's biases), which `Weights::quantize`'s restore releases with its head or MLP.
-pub(crate) fn edited_row(v: &Array1<f64>) {
-    dropped((v.as_ptr() as usize, 1, v.len()));
-}
-
 /// Drops the copies of the host array at `(address, rows, cols)`, of every generation (an edit
 /// does not say whose weights it changes; another generation's copy merely uploads again).
 fn dropped(at: (usize, usize, usize)) {

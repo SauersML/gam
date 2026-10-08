@@ -75,6 +75,12 @@ pub struct Program {
     /// across behaviors.
     #[serde(default)]
     pub base: Vec<String>,
+    /// The English explanation's tokens and token types (the reader's tokenizer), counted by the
+    /// program's writer: `Score::explanation_bits`.
+    #[serde(default)]
+    pub explanation_tokens: usize,
+    #[serde(default)]
+    pub explanation_token_types: usize,
     /// The algorithm's variables bound to parts ([`BindingIr`]), checked by interchange.
     #[serde(default)]
     pub bindings: Vec<BindingIr>,
@@ -225,19 +231,6 @@ pub struct HeadWeights {
     pub scale: f64,
     pub rotary: Option<Rotary>,
     pub causal: bool,
-}
-
-impl HeadWeights {
-    /// Map `m` (0 query, 1 key, 2 value, 3 output) for an in-place change: a key or value map the
-    /// head shares is copied for it first.
-    fn map_mut(&mut self, m: usize) -> &mut Stored {
-        match m {
-            0 => &mut self.query,
-            1 => Arc::make_mut(&mut self.key),
-            2 => Arc::make_mut(&mut self.value),
-            _ => &mut self.output,
-        }
-    }
 }
 
 /// One MLP: `h = φ(G x̂ + b)` (times `U x̂ + c` when gated), written by `D h`.
@@ -657,6 +650,17 @@ impl Weights {
     /// (`Program::standin`).
     pub fn has_vpd(&self) -> bool {
         !self.vpd.is_empty() || !self.vpd_attention.is_empty()
+    }
+
+    /// The parts a program may name: every head and neuron, every VPD subcomponent and remainder of
+    /// an attached view, every transcoder feature and every library part.
+    pub fn vocabulary(&self) -> usize {
+        let native: usize = (0..self.layers.len()).map(|l| self.layers[l].heads.len() + self.neurons(l)).sum();
+        let mlp: usize = self.vpd.values().map(|v| v.fc_u.nrows() + v.down_u.nrows() + 2).sum();
+        let attention: usize = self.vpd_attention.values().map(|a| [&a.q, &a.k, &a.v, &a.o].iter().map(|f| f.0.nrows() + 1).sum::<usize>()).sum();
+        let features: usize = self.transcoders.values().map(|t| t.count).sum();
+        let library: usize = self.library.values().map(Vec::len).sum();
+        native + mlp + attention + features + library
     }
 }
 
@@ -1433,6 +1437,43 @@ impl Graph {
             unit.computes = true;
         }
         circuit
+    }
+
+    /// What a reader takes in from the program's structure (design_v2 section 2): each part a node
+    /// lists costs `log2 V` bits to name (`V` = [`Weights::vocabulary`]), a VPD remainder its
+    /// matrix's rank in names (it holds that many directions), and each edge `log2(3 (n + 1)²)`
+    /// bits for `n` nodes (its writer, reader and route). Returns the part names, the bits of every
+    /// part and edge outside `base`, and the bits of `base`'s nodes and the edges that touch them.
+    pub fn structure(&self, weights: &Weights, base: &BTreeSet<usize>) -> (usize, f64, f64) {
+        let name = (weights.vocabulary().max(2) as f64).log2();
+        // Names in one site's list: one per subcomponent, the rank for the remainder (index `count`).
+        let names = |list: &[usize], (u, v): (&Array2<f64>, &Array2<f64>)| -> usize { list.iter().map(|&i| if i < u.nrows() { 1 } else { u.ncols().min(v.nrows()) }).sum() };
+        let mut parts = 0;
+        let (mut bits, mut base_bits) = (0.0, 0.0);
+        for (k, block) in self.blocks.iter().enumerate() {
+            let count = match block {
+                Block::Heads { heads, .. } => heads.len(),
+                Block::Neurons { neurons, .. } => neurons.len(),
+                Block::Features { features, .. } => features.len(),
+                Block::Slices { layer, fc, down, .. } => weights.vpd.get(layer).map_or(fc.len() + down.len(), |v| names(fc, (&v.fc_u, &v.fc_v)) + names(down, (&v.down_u, &v.down_v))),
+                Block::AttnSlices { layer, q, k, v, o, .. } => match weights.vpd_attention.get(layer) {
+                    Some(a) => names(q, (&a.q.0, &a.q.1)) + names(k, (&a.k.0, &a.k.1)) + names(v, (&a.v.0, &a.v.1)) + names(o, (&a.o.0, &a.o.1)),
+                    None => q.len() + k.len() + v.len() + o.len(),
+                },
+            };
+            parts += count;
+            *(if base.contains(&k) { &mut base_bits } else { &mut bits }) += count as f64 * name;
+        }
+        let n = self.blocks.len() as f64;
+        let edge = (3.0 * (n + 1.0) * (n + 1.0)).log2();
+        let touches = |w: &Writer, r: Option<usize>| matches!(w, Writer::Unit(u) if base.contains(u)) || r.is_some_and(|r| base.contains(&r));
+        for (w, r, _) in &self.edges {
+            *(if touches(w, *r) { &mut base_bits } else { &mut bits }) += edge;
+        }
+        for &(w, r) in &self.internal {
+            *(if base.contains(&w) || base.contains(&r) { &mut base_bits } else { &mut bits }) += edge;
+        }
+        (parts, bits, base_bits)
     }
 
     /// Opaque numbers: every weight a declared node reads (a head's query, key, value and output
@@ -2625,303 +2666,17 @@ impl Weights {
     }
 }
 
-// ------------------------------------------------------------------------------ precision
-
-/// The bit widths a declared block's numbers may take (design.txt section 2): uniform
-/// quantization with one stored scale per row of the block's pieces.
-pub const WIDTHS: [u32; 8] = [1, 2, 3, 4, 6, 8, 12, 16];
-
-/// `row` quantized uniformly to `bits` bits with one scale: one bit keeps each value's sign at the
-/// row's mean magnitude (the least-squares scale of a sign code); more bits round each value to the
-/// nearest of `2^(bits−1) − 1` steps on either side of zero, the largest magnitude the top step.
-fn quantize_row(mut row: ndarray::ArrayViewMut1<f64>, bits: u32) {
-    if bits == 1 {
-        let s = row.iter().map(|x| x.abs()).sum::<f64>() / row.len().max(1) as f64;
-        row.mapv_inplace(|x| if x == 0.0 { 0.0 } else { s * x.signum() });
-        return;
-    }
-    let steps = f64::from((1u32 << (bits - 1)) - 1);
-    let top = row.iter().fold(0.0f64, |m, x| m.max(x.abs()));
-    if top > 0.0 {
-        let step = top / steps;
-        row.mapv_inplace(|x| (x / step).round() * step);
-    }
-}
-
-/// [`quantize_row`] of a stored row, in float64 and rounded back to float32.
-fn quantize_stored(mut row: ndarray::ArrayViewMut1<f32>, bits: u32) {
-    let mut wide_row = row.mapv(f64::from);
-    quantize_row(wide_row.view_mut(), bits);
-    row.zip_mut_with(&wide_row, |w, x| *w = *x as f32);
-}
-
-/// The weights a quantization replaced, to put back.
-pub struct Unquantize {
-    heads: Vec<(usize, usize, HeadWeights)>,
-    mlps: Vec<(usize, MlpWeights)>,
-    vpd: Vec<(usize, VpdMlp)>,
-    attention: Vec<(usize, VpdAttention)>,
-    features: Vec<(usize, usize, (Array1<f64>, f64, Array1<f64>))>,
-}
-
-/// The device's resident copies of a head's or an MLP's matrices are uploaded again
-/// (`graph_device::edited`): every in-place change of `M`'s weights goes through these.
-fn device_head_edited(w: &HeadWeights) {
-    for m in [&w.query, &*w.key, &*w.value, &w.output] {
-        crate::graph_device::edited(m);
-    }
-    for (gain, _) in [&w.query_norm, &w.key_norm].into_iter().flatten() {
-        crate::graph_device::edited_row(gain);
-    }
-}
-
-/// The same for VPD's factors of an MLP or an attention (the device keeps them resident).
-fn device_vpd_edited(v: &VpdMlp) {
-    for m in [&v.fc_u, &v.fc_v, &v.down_u, &v.down_v] {
-        crate::graph_device::edited(m);
-    }
-}
-
-fn device_attention_edited(a: &VpdAttention) {
-    for (u, v) in [&a.q, &a.k, &a.v, &a.o] {
-        crate::graph_device::edited(u);
-        crate::graph_device::edited(v);
-    }
-}
-
-fn device_mlp_edited(m: &MlpWeights) {
-    for x in [Some(&m.gate), m.up.as_ref(), Some(&m.out)].into_iter().flatten() {
-        crate::graph_device::edited(x);
-    }
-    crate::graph_device::edited_row(&m.bias);
-    crate::graph_device::edited_row(&m.up_bias);
-}
-
-impl Unquantize {
-    pub fn restore(self, weights: &mut Weights) {
-        for (l, h, w) in self.heads.into_iter().rev() {
-            device_head_edited(&weights.layers[l].heads[h]);
-            weights.layers[l].heads[h] = w;
-        }
-        for (l, m) in self.mlps.into_iter().rev() {
-            if let Some(old) = &weights.layers[l].mlp {
-                device_mlp_edited(old);
-            }
-            weights.layers[l].mlp = Some(m);
-        }
-        for (l, v) in self.vpd.into_iter().rev() {
-            if let Some(old) = weights.vpd.insert(l, v) {
-                device_vpd_edited(&old);
-            }
-        }
-        for (l, a) in self.attention.into_iter().rev() {
-            if let Some(old) = weights.vpd_attention.insert(l, a) {
-                device_attention_edited(&old);
-            }
-        }
-        for (l, f, row) in self.features.into_iter().rev() {
-            if let Some(t) = weights.transcoders.get_mut(&l) {
-                t.rows.insert(f, row);
-            }
-        }
-    }
-}
-
-/// Whether `block`'s pieces quantize ([`Weights::quantize`]): every declared piece does (a
-/// remainder of the complement is never declared).
-fn quantizes(block: &Block) -> bool {
-    !matches!(block, Block::Features { rest: true, .. } | Block::Slices { rest: true, .. } | Block::AttnSlices { rest: true, .. })
-}
-
-/// The rows of `block`'s pieces, each quantized with its own scale: a head's query, key and
-/// value rows and output columns; a neuron's gate and up rows and down column; a VPD
-/// subcomponent's two vectors.
-fn quantized_rows(weights: &Weights, block: &Block) -> usize {
-    match block {
-        Block::Heads { layer, heads } => heads.iter().map(|&h| {
-            let w = &weights.layers[*layer].heads[h];
-            w.query.nrows() + w.key.nrows() + w.value.nrows() + w.output.ncols()
-        }).sum(),
-        Block::Neurons { layer, neurons } => neurons.len() * weights.layers[*layer].mlp.as_ref().map_or(0, |m| 2 + usize::from(m.up.is_some())),
-        Block::Slices { layer, fc, down, .. } => {
-            let counts = weights.vpd.get(layer).map_or((0, 0), |v| (v.fc_u.nrows(), v.down_u.nrows()));
-            let hidden = weights.neurons(*layer);
-            let d = weights.width();
-            // A remainder's rows: the gate's (hidden) or the down map's (width).
-            fc.iter().map(|&i| if i == counts.0 { hidden } else { 2 }).sum::<usize>() + down.iter().map(|&i| if i == counts.1 { d } else { 2 }).sum::<usize>()
-        }
-        // A subcomponent's two vectors; a remainder's rows: the stacked heads' (query, key, value)
-        // or the width's (output).
-        Block::AttnSlices { layer, q, k, v, o, .. } => {
-            let counts = weights.vpd_attention.get(layer).map_or([0; 4], |a| [a.q.0.nrows(), a.k.0.nrows(), a.v.0.nrows(), a.o.0.nrows()]);
-            let stacked: usize = weights.layers[*layer].heads.iter().map(|h| h.query.nrows()).sum();
-            [q, k, v, o].into_iter().zip(counts).enumerate().map(|(m, (list, n))| list.iter().map(|&i| if i == n { if m == 3 { weights.width() } else { stacked } } else { 2 }).sum::<usize>()).sum()
-        }
-        // A feature's encoder and decoder rows (its bias stays exact).
-        Block::Features { features, .. } => 2 * features.len(),
-    }
-}
-
-impl Weights {
-    /// Every block of `blocks` with a width quantized in place to it ([`quantize_row`] on each of
-    /// its rows): a VPD subcomponent's vectors are quantized and its matrix moves by the change of
-    /// their product, so the remainder piece stays as it was. Returns what puts the weights back.
-    pub fn quantize(&mut self, blocks: &[(Block, Option<u32>)]) -> Result<Unquantize, String> {
-        let mut out = Unquantize { heads: Vec::new(), mlps: Vec::new(), vpd: Vec::new(), attention: Vec::new(), features: Vec::new() };
-        for (block, bits) in blocks {
-            let Some(bits) = *bits else { continue };
-            match block {
-                Block::Heads { layer, heads } => {
-                    for &h in heads {
-                        let w = self.layers.get_mut(*layer).and_then(|l| l.heads.get_mut(h)).ok_or("no such head")?;
-                        device_head_edited(w);
-                        out.heads.push((*layer, h, w.clone()));
-                        for m in [&mut w.query, Arc::make_mut(&mut w.key), Arc::make_mut(&mut w.value)] {
-                            m.rows_mut().into_iter().for_each(|r| quantize_stored(r, bits));
-                        }
-                        w.output.columns_mut().into_iter().for_each(|c| quantize_stored(c, bits));
-                    }
-                }
-                Block::Neurons { layer, neurons } => {
-                    let mlp = self.layers.get_mut(*layer).and_then(|l| l.mlp.as_mut()).ok_or("a neuron block without an MLP")?;
-                    device_mlp_edited(mlp);
-                    out.mlps.push((*layer, mlp.clone()));
-                    for &i in neurons {
-                        quantize_stored(mlp.gate.row_mut(i), bits);
-                        if let Some(up) = mlp.up.as_mut() {
-                            quantize_stored(up.row_mut(i), bits);
-                        }
-                        quantize_stored(mlp.out.column_mut(i), bits);
-                    }
-                }
-                Block::Slices { layer, fc, down, .. } => {
-                    let vpd = self.vpd.get_mut(layer).ok_or_else(|| format!("layer {layer} has no VPD view"))?;
-                    let mlp = self.layers.get_mut(*layer).and_then(|l| l.mlp.as_mut()).ok_or("a VPD view of a layer without an MLP")?;
-                    device_mlp_edited(mlp);
-                    device_vpd_edited(vpd);
-                    out.vpd.push((*layer, vpd.clone()));
-                    out.mlps.push((*layer, mlp.clone()));
-                    // c_fc: gate (hidden × width) holds U_fc[i] ⊗ V_fc[:, i]; down_proj: out (width ×
-                    // hidden) holds U_down[j] ⊗ V_down[:, j].
-                    for (indices, u, v, w) in [(fc, &mut vpd.fc_u, &mut vpd.fc_v, &mut mlp.gate), (down, &mut vpd.down_u, &mut vpd.down_v, &mut mlp.out)] {
-                        if indices.contains(&u.nrows()) {
-                            // The remainder W − Σ U Vᵀ (out × in, as w): its rows quantized.
-                            let all = u.t().dot(&v.t());
-                            let mut rest = wide(w.view()) - &all;
-                            rest.rows_mut().into_iter().for_each(|r| quantize_row(r, bits));
-                            *w = (all + rest).mapv(|x| x as f32);
-                        }
-                        let count = u.nrows();
-                        for &i in indices.iter().filter(|&&i| i < count) {
-                            if i >= u.nrows() || i >= v.ncols() {
-                                return Err(format!("subcomponent {i} out of range"));
-                            }
-                            let (old_u, old_v) = (u.row(i).to_owned(), v.column(i).to_owned());
-                            quantize_row(u.row_mut(i), bits);
-                            quantize_row(v.column_mut(i), bits);
-                            let (new_u, new_v) = (u.row(i).to_owned(), v.column(i).to_owned());
-                            let change = new_u.insert_axis(Axis(1)).dot(&new_v.insert_axis(Axis(0))) - old_u.insert_axis(Axis(1)).dot(&old_v.insert_axis(Axis(0)));
-                            if change.dim() != w.dim() {
-                                return Err("VPD factors of another shape than the matrix".into());
-                            }
-                            add_wide(w.view_mut(), change.view());
-                        }
-                    }
-                }
-                Block::AttnSlices { rest: true, .. } | Block::Features { rest: true, .. } => continue,
-                Block::AttnSlices { layer, q, k, v, o, .. } => {
-                    let a = self.vpd_attention.get_mut(layer).ok_or_else(|| format!("layer {layer}'s attention has no VPD view"))?;
-                    device_attention_edited(a);
-                    out.attention.push((*layer, a.clone()));
-                    let lw = self.layers.get_mut(*layer).ok_or("no such layer")?;
-                    for (h, w) in lw.heads.iter().enumerate() {
-                        device_head_edited(w);
-                        out.heads.push((*layer, h, w.clone()));
-                    }
-                    for (m, (list, factors)) in [q, k, v, o].into_iter().zip([&mut a.q, &mut a.k, &mut a.v, &mut a.o]).enumerate() {
-                        if list.is_empty() {
-                            continue;
-                        }
-                        let (u, vv) = factors;
-                        let count = u.nrows();
-                        // The change of the stacked map (out × in) the quantized pieces make.
-                        let mut change: Array2<f64> = Array2::zeros((u.ncols(), vv.nrows()));
-                        if list.contains(&count) {
-                            let w = attention_maps(lw)[m].clone();
-                            let all = u.t().dot(&vv.t());
-                            let rest = &w - &all;
-                            let mut quantized = rest.clone();
-                            quantized.rows_mut().into_iter().for_each(|r| quantize_row(r, bits));
-                            change += &(quantized - rest);
-                        }
-                        for &i in list.iter().filter(|&&i| i < count) {
-                            let (old_u, old_v) = (u.row(i).to_owned(), vv.column(i).to_owned());
-                            quantize_row(u.row_mut(i), bits);
-                            quantize_row(vv.column_mut(i), bits);
-                            let (new_u, new_v) = (u.row(i).to_owned(), vv.column(i).to_owned());
-                            change += &(new_u.insert_axis(Axis(1)).dot(&new_v.insert_axis(Axis(0))) - old_u.insert_axis(Axis(1)).dot(&old_v.insert_axis(Axis(0))));
-                        }
-                        // Split over the heads: rows of the stacked query, key or value map, columns of
-                        // the output map.
-                        let mut at = 0;
-                        for w in lw.heads.iter_mut() {
-                            let dim = [&w.query, &*w.key, &*w.value, &w.output][m.min(3)].dim();
-                            let width = if m == 3 { dim.1 } else { dim.0 };
-                            let part = if m == 3 { change.slice(s![.., at..at + width]).to_owned() } else { change.slice(s![at..at + width, ..]).to_owned() };
-                            if part.dim() != dim {
-                                return Err("VPD attention factors of another shape than the heads' maps".into());
-                            }
-                            add_wide(w.map_mut(m).view_mut(), part.view());
-                            at += width;
-                        }
-                    }
-                }
-                Block::Features { layer, features, .. } => {
-                    let t = self.transcoders.get_mut(layer).ok_or_else(|| format!("layer {layer} has no transcoder"))?;
-                    for &f in features {
-                        let row = t.rows.get_mut(&f).ok_or_else(|| format!("feature {f} not loaded (Weights::load_features)"))?;
-                        out.features.push((*layer, f, row.clone()));
-                        quantize_row(row.0.view_mut(), bits);
-                        quantize_row(row.2.view_mut(), bits);
-                    }
-                }
-            }
-        }
-        Ok(out)
-    }
-}
-
 /// What a score's runs need ([`Checker::measure_runs`]): the runs (program, experiment, `M`'s cache
-/// key), the runs grouped by weight edit, each program parsed with its circuit, the behavior's size, the reader's candidate count and `M`'s clean outcome.
+/// key), the runs grouped by weight edit, each program parsed with its circuit, the reader's candidate
+/// count and `M`'s clean outcome.
 #[derive(Clone, Copy)]
 struct Plan<'a> {
     runs: &'a [(usize, Experiment, String)],
     groups: &'a BTreeMap<Option<String>, Vec<usize>>,
     parsed: &'a [(Graph, bool, Option<String>)],
     circuits: &'a [Circuit],
-    n: f64,
     top: usize,
     clean: Option<&'a Array2<f64>>,
-}
-
-/// One declared block's precision: its node, bit width (`None`: exact, at `½ log2 N` per number),
-/// numbers and scales, and the bits they cost.
-#[derive(Clone, Debug, Serialize)]
-pub struct Width {
-    pub node: String,
-    pub bits: Option<u32>,
-    pub numbers: usize,
-    pub scales: usize,
-    pub cost_bits: f64,
-}
-
-/// The bits of `numbers` numbers at `bits` bits with `scales` 32-bit scales, or exact (`None`)
-/// at `½ log2 N` each, the upper bound (two-part code length of a number).
-fn width_cost(numbers: usize, scales: usize, bits: Option<u32>, n: f64) -> f64 {
-    match bits {
-        Some(b) => numbers as f64 * f64::from(b) + 32.0 * scales as f64,
-        None => numbers as f64 * 0.5 * n.log2(),
-    }
 }
 
 // ------------------------------------------------------------------------------ site operations
@@ -3651,14 +3406,6 @@ pub struct Behavior {
     pub model_accuracy: Option<f64>,
 }
 
-impl Behavior {
-    /// The declared size in scored tokens: `2^24`, times the behavior's frequency when it states one,
-    /// and at least one token, so an exact number's price `½ log2 N` is never negative.
-    pub fn size(&self) -> f64 {
-        (16_777_216.0 * self.frequency.unwrap_or(1.0)).max(1.0)
-    }
-}
-
 /// A counterfactual run computed once by whichever run asks first.
 type RunCell = Arc<std::sync::OnceLock<Result<Arc<Reference>, String>>>;
 
@@ -3717,8 +3464,8 @@ pub struct Checker {
     /// same directory shares; `None` (the default) keeps them in memory only.
     pub disk_cache: Option<std::path::PathBuf>,
     /// A directory of small per-behavior memos shared across checker processes and runs: the
-    /// targets (`Checker::targets`, hundreds of runs of `M`) and native blocks' bit widths
-    /// (`Checker::width`), named like the disk cache's files (behavior, prompts, weights, semantics).
+    /// targets (`Checker::targets`, hundreds of runs of `M`), named like the disk cache's files
+    /// (behavior, prompts, weights, semantics).
     pub memo_dir: Option<std::path::PathBuf>,
     /// Heads by their measured removal effect on `M` (mean `KL(M ‖ M without the head)` at the
     /// targets), strongest first; measured on first use.
@@ -3746,8 +3493,6 @@ pub struct Checker {
     /// Whether scores measure necessity (`Score::necessity_error_bits`; true by default): a search
     /// ranking candidates by sufficiency alone may skip its runs.
     pub necessity: bool,
-    /// Each declared block's bit width as the search chose it (`Checker::width`), by the block.
-    widths: BTreeMap<String, Option<u32>>,
     /// [`Reference::zeros`] by row count, for deleting programs' runs.
     zeros: std::sync::Mutex<BTreeMap<usize, Arc<Reference>>>,
     /// `M`'s normed attention input per (layer, on the counterfactuals?), for attention claims
@@ -3773,11 +3518,22 @@ pub struct Score {
     /// interchange gives the algorithm's answer, and for a program that binds nothing.
     pub binding_error_bits: f64,
     pub reader_error_bits: f64,
+    /// What a reader takes in (design_v2 section 2): `structure_bits + code_bits + explanation_bits`.
+    pub complexity_bits: f64,
+    /// The program's parts and edges ([`Graph::structure`]), its shared base's apart.
+    pub structure_bits: f64,
+    /// The algorithm's tokens without comments (`Program::python_tokens` times `log2` of its token
+    /// types).
     pub code_bits: f64,
+    /// The English explanation's tokens times `log2` of their types (`Program::explanation_tokens`).
+    pub explanation_bits: f64,
+    /// Part names the program's nodes list ([`Graph::structure`]; a remainder counts its rank).
+    pub parts: usize,
     pub python_tokens: usize,
+    /// The weight numbers the declared nodes read (reported only: weights are not in the score).
     pub opaque_numbers: usize,
-    pub opaque_bits: f64,
-    /// The precision of the program's shared base nodes (`Program::base`), not in `total_bits`.
+    /// The structure bits of the program's shared base nodes (`Program::base`) and the edges that
+    /// touch them, not in `total_bits`: the caller charges a base once across behaviors.
     pub base_bits: f64,
     /// What undeclared pieces carried: "delete" or "counterfactual" ([`Graph::delete`]).
     pub standin: String,
@@ -3787,8 +3543,6 @@ pub struct Score {
     pub valid: bool,
     pub error: Option<String>,
     pub per_family: BTreeMap<String, Family>,
-    /// Each declared block's precision ([`Width`]); `opaque_bits` is their sum.
-    pub widths: Vec<Width>,
 }
 
 /// One experiment family's share of the execution error.
@@ -3876,7 +3630,6 @@ impl Checker {
             site_references: std::sync::Mutex::new(Vec::new()),
             reference_bytes: 3 << 30,
             necessity: true,
-            widths: BTreeMap::new(),
             zeros: std::sync::Mutex::new(BTreeMap::new()),
             claim_inputs: BTreeMap::new(),
         })
@@ -4218,7 +3971,6 @@ impl Checker {
     /// experiment and cached; runs go in parallel threads, experiments that edit weights grouped
     /// by their edit (the edit applied once, then every run that needs it).
     pub fn score_batch(&mut self, programs: &[Program], count: usize, seed: u64, edges: bool, n: Option<f64>, top: usize) -> Result<Vec<(Score, Vec<Measured>)>, String> {
-        let n = n.unwrap_or_else(|| self.behavior.size());
         let seed = self.uniform_seeds.map_or(seed, |m| seed % m.max(1));
         let targets = self.targets()?;
         let parsed: Vec<(Graph, bool, Option<String>)> = programs
@@ -4239,6 +3991,8 @@ impl Checker {
             .into_iter()
             .filter(|e| donors || !matches!(e, Experiment::Sites { draw } if Interventions::needs_donor(draw)))
             .collect();
+        // N: the tokens the experiment set scores, so the errors are its total code length in bits.
+        let n = n.unwrap_or_else(|| experiments.iter().map(|e| self.rows_of(e).len()).sum::<usize>().max(1) as f64);
         // Per run (program, experiment) the cache key of M's outcome.
         let mut runs: Vec<(usize, Experiment, String)> = Vec::new();
         let mut drawn = vec![0usize; programs.len()];
@@ -4259,14 +4013,12 @@ impl Checker {
         }
         let mut measured: Vec<Option<(Vec<f64>, Option<Candidates>)>> = vec![None; runs.len()];
         let clean = if top > 0 { Some(self.model_outcome(&Graph::empty(), &Experiment::Clean)?) } else { None };
-        let plan = Plan { runs: &runs, groups: &groups, parsed: &parsed, circuits: &circuits, n, top, clean: clean.as_ref() };
-        let result = self.measure_runs(plan, &mut measured);
-        let widths = result?;
+        let plan = Plan { runs: &runs, groups: &groups, parsed: &parsed, circuits: &circuits, top, clean: clean.as_ref() };
+        self.measure_runs(plan, &mut measured)?;
         // Necessity, for each program with nodes: the same complement experiments for every program.
         let complements = complements(&experiments);
         let named: Vec<usize> = (0..parsed.len()).filter(|&i| self.necessity && !parsed[i].0.blocks.is_empty()).collect();
-        let quantized: Vec<Vec<(Block, Option<u32>)>> = named.iter().map(|&i| parsed[i].0.blocks.iter().cloned().zip(widths[i].iter().map(|w| w.bits)).collect()).collect();
-        let necessity_kl = self.necessity_runs(&named.iter().map(|&i| (&parsed[i].0, &circuits[i])).collect::<Vec<_>>(), &quantized, &complements)?;
+        let necessity_kl = self.necessity_runs(&named.iter().map(|&i| (&parsed[i].0, &circuits[i])).collect::<Vec<_>>(), &complements)?;
         let mut necessity = vec![(0.0, BTreeMap::new()); parsed.len()];
         for (&i, kls) in named.iter().zip(&necessity_kl) {
             let mut families: BTreeMap<String, Family> = BTreeMap::new();
@@ -4309,24 +4061,28 @@ impl Checker {
             per_family.extend(necessity_families);
             let exec_error_bits = n * total.0 / total.1.max(1) as f64;
             let code_bits = if *valid && program.token_types > 1 { program.python_tokens as f64 * (program.token_types as f64).log2() } else { 0.0 };
+            let explanation_bits = if *valid && program.explanation_token_types > 1 { program.explanation_tokens as f64 * (program.explanation_token_types as f64).log2() } else { 0.0 };
             let opaque_numbers = graph.opaque_numbers(&self.weights);
             // A shared base library's nodes are priced apart, for the caller to charge once.
-            let in_base = |w: &Width| program.base.contains(&w.node);
-            let opaque_bits: f64 = widths[i].iter().filter(|w| !in_base(w)).map(|w| w.cost_bits).sum();
-            let base_bits: f64 = widths[i].iter().filter(|w| in_base(w)).map(|w| w.cost_bits).sum();
+            let base: BTreeSet<usize> = graph.ids.iter().enumerate().filter(|(_, id)| program.base.contains(id)).map(|(k, _)| k).collect();
+            let (parts, structure_bits, base_bits) = graph.structure(&self.weights, &base);
+            let complexity_bits = structure_bits + code_bits + explanation_bits;
             let claim_error_bits = n * self.claim_error(graph)?;
             let binding_error_bits = n * self.binding_error(graph)?;
             let score = Score {
-                total_bits: exec_error_bits + necessity_error_bits + claim_error_bits + binding_error_bits + code_bits + opaque_bits,
+                total_bits: exec_error_bits + necessity_error_bits + claim_error_bits + binding_error_bits + complexity_bits,
                 exec_error_bits,
                 necessity_error_bits,
                 claim_error_bits,
                 binding_error_bits,
                 reader_error_bits: 0.0,
+                complexity_bits,
+                structure_bits,
                 code_bits,
+                explanation_bits,
+                parts,
                 python_tokens: if *valid { program.python_tokens } else { 0 },
                 opaque_numbers,
-                opaque_bits,
                 base_bits,
                 standin: if graph.delete { "delete" } else { "counterfactual" }.into(),
                 n,
@@ -4334,7 +4090,6 @@ impl Checker {
                 valid: *valid,
                 error: error.clone(),
                 per_family,
-                widths: widths[i].clone(),
             };
             out.push((score, outcomes));
         }
@@ -4348,10 +4103,9 @@ impl Checker {
     /// clean and weight edits), whose prediction is `M`'s own run less the program's parts, nothing
     /// recomputed ([`Checker::without_parts`]); otherwise set to their counterfactual values, the
     /// prediction being the program run with the roles swapped (on the counterfactual, its
-    /// stand-ins from the prompt) with its blocks quantized to their widths. A program that names
-    /// every part its information flows through predicts it; a part it leaves out that carries its
-    /// nodes' information moves `M` away.
-    pub(crate) fn necessity_runs(&mut self, programs: &[(&Graph, &Circuit)], quantized: &[Vec<(Block, Option<u32>)>], complements: &[Experiment]) -> Result<Vec<Vec<Option<Vec<f64>>>>, String> {
+    /// stand-ins from the prompt). A program that names every part its information flows through
+    /// predicts it; a part it leaves out that carries its nodes' information moves `M` away.
+    pub(crate) fn necessity_runs(&mut self, programs: &[(&Graph, &Circuit)], complements: &[Experiment]) -> Result<Vec<Vec<Option<Vec<f64>>>>, String> {
         let mut out = vec![Vec::with_capacity(complements.len()); programs.len()];
         if programs.is_empty() {
             return Ok(out);
@@ -4359,57 +4113,35 @@ impl Checker {
         let standin = Graph::empty().program(&self.weights, true);
         let counterfactual = self.counterfactual.is_some();
         for e in complements {
-            let edit = match e {
-                Experiment::Edit { edit, .. } => Some(edit.clone()),
-                _ => None,
-            };
             let measured: Vec<bool> = programs.iter().map(|(g, _)| if g.delete { !matches!(e, Experiment::Sites { .. }) } else { counterfactual }).collect();
             self.set_edit(e);
-            let result = (|| -> Result<(), String> {
-                // M's complement runs, deleting programs' predictions and the swapped runs'
-                // counterfactual runs, with M's exact weights (the experiment's edit applied).
-                let restore = edit.as_ref().map(|x| x.apply(&mut self.weights)).transpose()?;
-                let made = (|| -> Result<Vec<Option<(Array2<f64>, Option<Array2<f64>>)>>, String> {
-                    let mut models = Vec::with_capacity(programs.len());
-                    for ((g, _), &m) in programs.iter().zip(&measured) {
-                        models.push(if m { Some((self.run(&g.complement_model(&self.weights), e)?, if g.delete { Some(self.without_parts(g)?) } else { None })) } else { None });
-                    }
-                    if programs.iter().zip(&measured).any(|((g, _), &m)| m && !g.delete) {
-                        self.prewarm_swapped(&standin, e)?;
-                    }
-                    Ok(models)
-                })();
-                if let Some(r) = restore {
-                    r.restore(&mut self.weights)?;
+            // Every run with the experiment's edit applied to M's weights.
+            let restore = match e {
+                Experiment::Edit { edit, .. } => Some(edit.apply(&mut self.weights)?),
+                _ => None,
+            };
+            let result = (|| -> Result<Vec<Option<Vec<f64>>>, String> {
+                if programs.iter().zip(&measured).any(|((g, _), &m)| m && !g.delete) {
+                    self.prewarm_swapped(&standin, e)?;
                 }
-                let models = made?;
-                for (k, (((_, circuit), blocks), model)) in programs.iter().zip(quantized).zip(models).enumerate() {
-                    let Some((model, frozen)) = model else {
-                        out[k].push(None);
-                        continue;
-                    };
-                    if let Some(predicted) = frozen {
-                        out[k].push(Some(kl_bits(&model, &predicted)));
+                let mut kls = Vec::with_capacity(programs.len());
+                for ((g, circuit), &m) in programs.iter().zip(&measured) {
+                    if !m {
+                        kls.push(None);
                         continue;
                     }
-                    let unquantize = self.weights.quantize(blocks)?;
-                    let restore = match edit.as_ref().map(|x| x.apply(&mut self.weights)).transpose() {
-                        Ok(r) => r,
-                        Err(err) => {
-                            unquantize.restore(&mut self.weights);
-                            return Err(err);
-                        }
-                    };
-                    let predicted = self.run_swapped(circuit, e);
-                    let restored = restore.map(|r| r.restore(&mut self.weights)).transpose();
-                    unquantize.restore(&mut self.weights);
-                    restored?;
-                    out[k].push(Some(kl_bits(&model, &predicted?)));
+                    let model = self.run(&g.complement_model(&self.weights), e)?;
+                    let predicted = if g.delete { self.without_parts(g)? } else { self.run_swapped(circuit, e)? };
+                    kls.push(Some(kl_bits(&model, &predicted)));
                 }
-                Ok(())
+                Ok(kls)
             })();
             self.set_edit(&Experiment::Clean);
-            result?;
+            let restored = restore.map(|r| r.restore(&mut self.weights)).transpose();
+            for (k, kl) in result?.into_iter().enumerate() {
+                out[k].push(kl);
+            }
+            restored?;
         }
         Ok(out)
     }
@@ -4456,16 +4188,16 @@ impl Checker {
         }
     }
 
-    /// The runs of a score: first `M` with its exact weights (each experiment once, its outcome
-    /// cached) and the counterfactual runs every program reads; then each program with its declared
-    /// blocks quantized to their widths ([`Checker::width`]), experiments grouped by weight edit
-    /// (the edit applied once on top), runs in parallel threads. Returns each program's widths.
-    fn measure_runs(&mut self, plan: Plan, measured: &mut [Option<(Vec<f64>, Option<Candidates>)>]) -> Result<Vec<Vec<Width>>, String> {
-        let Plan { runs, groups, parsed, circuits, n, top, clean } = plan;
-        // Where the score's time goes, logged at its end: M's outcomes, the width searches, the
-        // counterfactual runs and the programs' runs.
+    /// The runs of a score: first `M` (each experiment once, its outcome cached), then per weight
+    /// edit (applied once) the counterfactual runs every program reads and every program's runs of
+    /// the edit's experiments, on parallel threads. Every run uses `M`'s weights: precision is not in
+    /// the score (design_v2 section 2).
+    fn measure_runs(&mut self, plan: Plan, measured: &mut [Option<(Vec<f64>, Option<Candidates>)>]) -> Result<(), String> {
+        let Plan { runs, groups, parsed, circuits, top, clean } = plan;
+        // Where the score's time goes, logged at its end: M's outcomes, the counterfactual runs and
+        // the programs' runs.
         let started = std::time::Instant::now();
-        let mut seconds = [0.0f64; 4];
+        let mut seconds = [0.0f64; 3];
         // M's outcomes come from its native circuit, the same for every program whatever its views.
         let native = Graph::empty().model(&self.weights);
         // M's outcomes of this score, held until it ends: the cache's byte budget may drop some
@@ -4517,35 +4249,18 @@ impl Checker {
             result?;
         }
         seconds[0] = started.elapsed().as_secs_f64();
-        let searched = self.widths.len();
-        let mut widths = Vec::with_capacity(parsed.len());
-        for (graph, _, _) in parsed {
-            let mut chosen = Vec::with_capacity(graph.blocks.len());
-            for (k, block) in graph.blocks.iter().enumerate() {
-                let bits = self.width(block, n)?;
-                let numbers = Graph { ids: vec![String::new()], blocks: vec![block.clone()], ..Graph::empty() }.opaque_numbers(&self.weights);
-                let scales = quantized_rows(&self.weights, block);
-                chosen.push(Width { node: graph.ids.get(k).cloned().unwrap_or_default(), bits, numbers, scales: if bits.is_some() { scales } else { 0 }, cost_bits: width_cost(numbers, scales, bits, n) });
-            }
-            widths.push(chosen);
-        }
-        seconds[1] = started.elapsed().as_secs_f64() - seconds[0];
-        let searched = self.widths.len() - searched;
         let mut made_bytes = 0usize;
-        let quantized: Vec<Vec<(Block, Option<u32>)>> = parsed.iter().zip(&widths).map(|((g, _, _), w)| g.blocks.iter().cloned().zip(w.iter().map(|x| x.bits)).collect()).collect();
         // The programs' runs, per edit group in chunks of experiments: a chunk's counterfactual runs
-        // are made first with M's exact weights (on this thread: made inside parallel runs, a run
-        // waiting on one could be stolen by the thread making it while that thread waits on the
-        // device's pool, and neither returns), then each program runs its experiments of the chunk
-        // with its blocks quantized. Counterfactual runs past `reference_bytes` are dropped after
-        // each chunk (a Qwen3-0.6B run holds 2.8 GB), never during one, so no run is remade under
-        // quantized weights.
+        // are made first (on this thread: made inside parallel runs, a run waiting on one could be
+        // stolen by the thread making it while that thread waits on the device's pool, and neither
+        // returns), then every program's runs of the chunk in parallel. Counterfactual runs past
+        // `reference_bytes` are dropped after each chunk (a Qwen3-0.6B run holds 2.8 GB), never
+        // during one.
         for members in groups.values() {
-            // The group's weight edit: applied to M's exact weights while its counterfactual runs are
-            // made, and on top of each program's quantized weights while it runs (an experiment
-            // edits the program's own weights).
-            let edit = match &runs[members[0]].1 {
-                Experiment::Edit { edit, .. } => Some(edit.clone()),
+            // The group's weight edit, applied to M's weights for its counterfactual runs and the
+            // programs' runs alike (an experiment edits the program's own weights).
+            let restore = match &runs[members[0]].1 {
+                Experiment::Edit { edit, .. } => Some(edit.apply(&mut self.weights)?),
                 _ => None,
             };
             self.set_edit(&runs[members[0]].1.clone());
@@ -4562,46 +4277,25 @@ impl Checker {
                     self.reference_bytes = usize::MAX;
                     let before = self.held_references();
                     let prewarm = std::time::Instant::now();
-                    let restore = edit.as_ref().map(|e| e.apply(&mut self.weights)).transpose()?;
-                    let made: Result<(), String> = chunk.iter().try_for_each(|&r| self.prewarm(&runs[r].1));
-                    if let Some(r) = restore {
-                        r.restore(&mut self.weights)?;
-                    }
-                    made?;
-                    seconds[2] += prewarm.elapsed().as_secs_f64();
+                    chunk.iter().try_for_each(|&r| self.prewarm(&runs[r].1))?;
+                    seconds[1] += prewarm.elapsed().as_secs_f64();
                     made_bytes += self.held_references().saturating_sub(before);
                     // Chunks as large as the budget holds.
                     per = per.max(self.held_references().saturating_sub(before) / chunk.len());
                     let keys: BTreeSet<&str> = chunk.iter().map(|&r| runs[r].2.as_str()).collect();
-                    for (i, blocks) in quantized.iter().enumerate() {
-                        let mine: Vec<usize> = members.iter().copied().filter(|&r| runs[r].0 == i && keys.contains(runs[r].2.as_str())).collect();
-                        if mine.is_empty() {
-                            continue;
-                        }
-                        let unquantize = self.weights.quantize(blocks)?;
-                        let restore = match edit.as_ref().map(|e| e.apply(&mut self.weights)).transpose() {
-                            Ok(r) => r,
-                            Err(e) => {
-                                unquantize.restore(&mut self.weights);
-                                return Err(e);
-                            }
-                        };
-                        let this = &*self;
-                        let score_p = |&r: &usize| -> Result<(usize, Vec<f64>, Option<Candidates>), String> {
-                            let (i, e, key) = &runs[r];
-                            let m = outcomes.get(key).ok_or("M's outcome went missing")?;
-                            let p = this.run(&circuits[*i], e)?;
-                            let kl = kl_bits(m, &p);
-                            let candidates = clean.map(|c| Candidates::of(c, m, &p, &this.rows_of(e), &this.rows_of(&Experiment::Clean), top));
-                            Ok((r, kl, candidates))
-                        };
-                        let scored: Result<Vec<(usize, Vec<f64>, Option<Candidates>)>, String> = if mine.len() == 1 { mine.iter().map(score_p).collect() } else { mine.par_iter().map(score_p).collect() };
-                        let restored = restore.map(|r| r.restore(&mut self.weights)).transpose();
-                        unquantize.restore(&mut self.weights);
-                        restored?;
-                        for (r, kl, candidates) in scored? {
-                            measured[r] = Some((kl, candidates));
-                        }
+                    let mine: Vec<usize> = members.iter().copied().filter(|&r| keys.contains(runs[r].2.as_str())).collect();
+                    let this = &*self;
+                    let score_p = |&r: &usize| -> Result<(usize, Vec<f64>, Option<Candidates>), String> {
+                        let (i, e, key) = &runs[r];
+                        let m = outcomes.get(key).ok_or("M's outcome went missing")?;
+                        let p = this.run(&circuits[*i], e)?;
+                        let kl = kl_bits(m, &p);
+                        let candidates = clean.map(|c| Candidates::of(c, m, &p, &this.rows_of(e), &this.rows_of(&Experiment::Clean), top));
+                        Ok((r, kl, candidates))
+                    };
+                    let scored: Vec<(usize, Vec<f64>, Option<Candidates>)> = if mine.len() == 1 { mine.iter().map(score_p).collect::<Result<_, _>>()? } else { mine.par_iter().map(score_p).collect::<Result<_, _>>()? };
+                    for (r, kl, candidates) in scored {
+                        measured[r] = Some((kl, candidates));
                     }
                     self.reference_bytes = budget;
                     self.drop_references()?;
@@ -4611,19 +4305,13 @@ impl Checker {
             })();
             self.reference_bytes = budget;
             self.set_edit(&Experiment::Clean);
+            let restored = restore.map(|r| r.restore(&mut self.weights)).transpose();
             result?;
+            restored?;
         }
-        seconds[3] = started.elapsed().as_secs_f64() - seconds[0] - seconds[1] - seconds[2];
-        log::info!(
-            "graph score of {} programs: M's outcomes {:.1} s, {searched} width searches {:.1} s, counterfactual runs {:.1} s ({:.1} GB made), program runs {:.1} s",
-            parsed.len(),
-            seconds[0],
-            seconds[1],
-            seconds[2],
-            made_bytes as f64 / 1e9,
-            seconds[3]
-        );
-        Ok(widths)
+        seconds[2] = started.elapsed().as_secs_f64() - seconds[0] - seconds[1];
+        log::info!("graph score of {} programs: M's outcomes {:.1} s, counterfactual runs {:.1} s ({:.1} GB made), program runs {:.1} s", parsed.len(), seconds[0], seconds[1], made_bytes as f64 / 1e9, seconds[2]);
+        Ok(())
     }
 
     /// The bytes of the counterfactual runs both caches hold.
@@ -4826,8 +4514,8 @@ impl Checker {
         Ok((base, rows, donor))
     }
 
-    /// Computes the counterfactual runs a program's run of `e` reads (with the current weights,
-    /// exact while `M` is scored), so a later run under quantized weights finds them made.
+    /// Computes the counterfactual runs a program's run of `e` reads (with the current weights), on
+    /// this thread before the programs' parallel runs.
     fn prewarm(&self, e: &Experiment) -> Result<(), String> {
         let circuit = Graph::empty().program(&self.weights, true);
         match e {
@@ -4835,66 +4523,6 @@ impl Checker {
             Experiment::Counterfactual => self.referenced(&circuit, &self.counterfactual.as_ref().ok_or("the behavior has no counterfactuals")?.0).map(|_| ()),
             _ => self.referenced(&circuit, &self.clean.0).map(|_| ()),
         }
-    }
-
-    /// `block`'s bit width (`None`: exact), searched once per behavior and kept: each width cheaper
-    /// than exact numbers at `½ log2 N` is tried by quantizing the block in `M` and measuring
-    /// `KL(M ‖ M_quantized)` on the fit experiments (the clean and counterfactual prompts), and the
-    /// width minimizing its numbers' and scales' bits plus `N` times that error wins. Transcoder
-    /// features are not `M`'s weights: their error is measured on the program of that block alone
-    /// (node-level, counterfactual stand-ins), exact against quantized.
-    pub fn width(&mut self, block: &Block, n: f64) -> Result<Option<u32>, String> {
-        // The search minimizes bits plus N times the error, so its choice depends on N as well.
-        let key = format!("{} {n}", serde_json::to_string(block).map_err(|e| e.to_string())?);
-        if let Some(b) = self.widths.get(&key) {
-            return Ok(*b);
-        }
-        // A native block's width depends on M and the behavior alone, so it is memoized across runs; a
-        // view's (VPD, library, transcoder) also on the view's weights, which the memo's name omits.
-        let native = matches!(block, Block::Heads { .. } | Block::Neurons { .. });
-        if let Some(b) = native.then(|| self.memo_get::<Option<u32>>(&format!("width {key}"))).flatten() {
-            self.widths.insert(key, b);
-            return Ok(b);
-        }
-        let numbers = Graph { ids: vec![String::new()], blocks: vec![block.clone()], ..Graph::empty() }.opaque_numbers(&self.weights);
-        let scales = quantized_rows(&self.weights, block);
-        let mut best = (None, width_cost(numbers, scales, None, n));
-        if quantizes(block) {
-            let mut fit = vec![Experiment::Clean];
-            if self.counterfactual.is_some() {
-                fit.push(Experiment::Counterfactual);
-            }
-            let graph = Graph::empty();
-            let model = if matches!(block, Block::Features { .. }) {
-                Graph { ids: vec![String::new()], blocks: vec![block.clone()], ..Graph::empty() }.program(&self.weights, false)
-            } else {
-                graph.model(&self.weights)
-            };
-            let exact: Vec<Array2<f64>> = if matches!(block, Block::Features { .. }) {
-                fit.iter().map(|e| self.run(&model, e)).collect::<Result<_, _>>()?
-            } else {
-                fit.iter().map(|e| self.model_outcome(&graph, e)).collect::<Result<_, _>>()?
-            };
-            for &bits in &WIDTHS {
-                let cost = width_cost(numbers, scales, Some(bits), n);
-                if cost >= best.1 {
-                    continue;
-                }
-                let restore = self.weights.quantize(&[(block.clone(), Some(bits))])?;
-                let measured: Result<Vec<f64>, String> = fit.iter().zip(&exact).map(|(e, m)| Ok(kl_bits(m, &self.run(&model, e)?))).collect::<Result<Vec<Vec<f64>>, String>>().map(|v| v.concat());
-                restore.restore(&mut self.weights);
-                let kl = measured?;
-                let total = cost + n * kl.iter().sum::<f64>() / kl.len().max(1) as f64;
-                if total < best.1 {
-                    best = (Some(bits), total);
-                }
-            }
-        }
-        if native {
-            self.memo_put(&format!("width {key}"), &best.0);
-        }
-        self.widths.insert(key, best.0);
-        Ok(best.0)
     }
 
     /// An experiment's scored tokens as (prompt, position), in its rows' order: a node swap's and a

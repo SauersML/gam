@@ -65,7 +65,7 @@ fn full_program() -> Program {
             }
         }
     }
-    Program { model: "tiny".into(), nodes, edges, python_tokens: 0, token_types: 0, source: String::new(), valid: true, error: None, standin: None, base: Vec::new(), bindings: Vec::new() }
+    Program { model: "tiny".into(), nodes, edges, python_tokens: 0, token_types: 0, source: String::new(), valid: true, error: None, standin: None, base: Vec::new(), explanation_tokens: 0, explanation_token_types: 0, bindings: Vec::new() }
 }
 
 fn max(values: &[f64]) -> f64 {
@@ -439,48 +439,6 @@ fn every_program_faces_the_same_experiments() {
     assert!(targets.pieces.iter().any(|(b, _)| matches!(b, crate::graph::Block::Heads { .. })) && !targets.cuts.is_empty());
 }
 
-/// A quantized head keeps at most 2^b − 1 values per row (one bit: the sign at one magnitude) and
-/// a quantized neuron's rows likewise; restoring returns the exact weights.
-#[test]
-fn quantization_rounds_rows_and_restores() {
-    let (mut weights, _) = model("graph_sites_quantize");
-    let before = weights.clone();
-    let blocks = vec![(crate::graph::Block::Heads { layer: 0, heads: vec![0] }, Some(2)), (crate::graph::Block::Neurons { layer: 1, neurons: vec![0, 3] }, Some(1))];
-    let restore = weights.quantize(&blocks).expect("quantize");
-    let distinct = |row: ndarray::ArrayView1<f32>| {
-        let mut v: Vec<f32> = row.to_vec();
-        v.sort_by(f32::total_cmp);
-        v.dedup();
-        v.len()
-    };
-    assert!(weights.layers[0].heads[0].query.rows().into_iter().all(|r| distinct(r) <= 3));
-    assert!(weights.layers[0].heads[0].output.columns().into_iter().all(|c| distinct(c) <= 3));
-    let mlp = weights.layers[1].mlp.as_ref().expect("an MLP");
-    assert!(distinct(mlp.gate.row(3)) <= 3 && distinct(mlp.out.column(0)) <= 3);
-    assert_eq!(mlp.gate.row(1), before.layers[1].mlp.as_ref().expect("an MLP").gate.row(1), "an undeclared neuron stays exact");
-    restore.restore(&mut weights);
-    assert_eq!(weights.layers[0].heads[0].query, before.layers[0].heads[0].query);
-    assert_eq!(weights.layers[1].mlp.as_ref().map(|m| m.gate.clone()), before.layers[1].mlp.as_ref().map(|m| m.gate.clone()));
-}
-
-/// Each declared block gets a width no costlier than exact numbers, the score charges their sum,
-/// and the program runs with the quantized weights.
-#[test]
-fn widths_are_chosen_and_charged() {
-    let (weights, sequences) = model("graph_sites_widths");
-    let mut checker = Checker::new(weights, behavior(&sequences)).expect("checker");
-    let mut program = Program { model: "tiny".into(), valid: true, ..Program::default() };
-    program.nodes = vec![NodeIr { id: "h".into(), pieces: vec![PieceIr { view: "native".into(), layer: 1, kind: "head".into(), index: Some(crate::graph::Index::One(0)) }], claim: None }];
-    program.edges = vec![EdgeIr { from: "h".into(), to: "logits".into(), route: "input".into() }];
-    let (score, _) = checker.score(&program, 6, 1, true, None).expect("score");
-    assert_eq!(score.widths.len(), 1);
-    let w = &score.widths[0];
-    assert_eq!(w.node, "h");
-    assert!((score.opaque_bits - w.cost_bits).abs() < 1e-9);
-    assert!(w.cost_bits <= w.numbers as f64 * 0.5 * score.n.log2() + 1e-9);
-    assert!(w.bits.is_none_or(|b| crate::graph::WIDTHS.contains(&b) && w.scales > 0));
-}
-
 /// A score holds its own M outcomes: a cache budget that keeps none of them still scores, and
 /// scores as a large one does.
 #[test]
@@ -589,36 +547,8 @@ fn vpd_remainders_are_declarable_pieces() {
     assert_eq!(numbers, 2 * hidden * width, "a remainder costs its matrix");
 }
 
-/// VPD attention pieces quantize: a subcomponent's vectors round to their width, the heads' maps
-/// move by the change of its product (a remainder's rows round in place), and restoring returns
-/// every head and factor.
-#[test]
-fn vpd_attention_pieces_quantize() {
-    let (mut weights, _) = model("graph_sites_vpd_quantize");
-    let heads = weights.layers[0].heads.len();
-    let (dh, width) = weights.layers[0].heads[0].query.dim();
-    let wave = |rows: usize, cols: usize, phase: f64| Array2::from_shape_fn((rows, cols), |(i, j)| 0.1 * ((i * 5 + j * 3) as f64 + phase).cos());
-    let qkv = (wave(3, heads * dh, 0.2), wave(width, 3, 0.9));
-    weights.vpd_attention.insert(0, crate::graph::VpdAttention { q: qkv.clone(), k: qkv.clone(), v: qkv, o: (wave(3, width, 1.3), wave(heads * dh, 3, 0.4)) });
-    let before = weights.clone();
-    let block = crate::graph::Block::AttnSlices { layer: 0, q: vec![1], k: Vec::new(), v: Vec::new(), o: vec![0, 3], rest: false };
-    let restore = weights.quantize(&[(block, Some(2))]).expect("quantize");
-    let a = &weights.vpd_attention[&0];
-    let mut q1: Vec<f64> = a.q.0.row(1).to_vec();
-    q1.sort_by(f64::total_cmp);
-    q1.dedup();
-    assert!(q1.len() <= 3, "a 2-bit subcomponent row keeps at most 3 values");
-    assert_eq!(a.q.0.row(0), before.vpd_attention[&0].q.0.row(0), "an undeclared subcomponent stays");
-    assert!(weights.layers[0].heads.iter().zip(&before.layers[0].heads).any(|(w, b)| w.query != b.query) && weights.layers[0].heads.iter().zip(&before.layers[0].heads).any(|(w, b)| w.output != b.output));
-    assert!(weights.layers[0].heads.iter().zip(&before.layers[0].heads).all(|(w, b)| w.key == b.key && w.value == b.value));
-    restore.restore(&mut weights);
-    assert!(weights.layers[0].heads.iter().zip(&before.layers[0].heads).all(|(w, b)| w.query == b.query && w.output == b.output));
-    assert_eq!(weights.vpd_attention[&0].q.0, before.vpd_attention[&0].q.0);
-    assert_eq!(weights.vpd_attention[&0].o.0, before.vpd_attention[&0].o.0);
-}
-
-/// A second checker given the same memo directory reads the first one's targets and native bit widths
-/// instead of measuring them again, and scores a program exactly as the first did.
+/// A second checker given the same memo directory reads the first one's targets instead of
+/// measuring them again, and scores a program exactly as the first did.
 #[test]
 fn memos_serve_a_later_checker() {
     let (weights, sequences) = model("graph_sites_memo");
@@ -640,52 +570,6 @@ fn memos_serve_a_later_checker() {
     assert_eq!(a.total_bits, b.total_bits);
     assert_eq!(a.exec_error_bits, b.exec_error_bits);
     let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// On a device, a run after VPD subcomponents are quantized or edited (their factors change in
-/// place) reads the new factors, and a run after restoring reads the old ones: each device run is
-/// the host's.
-#[test]
-fn device_runs_read_quantized_and_edited_vpd_factors() {
-    let (mut weights, sequences) = model("graph_sites_device_vpd");
-    let (hidden, width) = weights.layers[0].mlp.as_ref().expect("an MLP").gate.dim();
-    let wave = |rows: usize, cols: usize, phase: f64| Array2::from_shape_fn((rows, cols), |(i, j)| 0.1 * ((i * 7 + j * 3) as f64 + phase).sin());
-    weights.vpd.insert(0, crate::graph::VpdMlp { fc_u: wave(5, hidden, 0.3), fc_v: wave(width, 5, 1.1), down_u: wave(4, width, 2.0), down_v: wave(hidden, 4, 0.7) });
-    let vpd = |kind: &str, index: crate::graph::Index| PieceIr { view: "vpd".into(), layer: 0, kind: kind.into(), index: Some(index) };
-    let mut program = full_program();
-    program.nodes.iter_mut().find(|n| n.id == "m0").expect("m0").pieces = vec![vpd("c_fc", crate::graph::Index::Many((0..5).collect())), vpd("down_proj", crate::graph::Index::Many((0..4).collect()))];
-    let mut batch = Batch::new(&sequences).expect("batch");
-    let rows: Vec<usize> = (0..batch.tokens.len()).collect();
-    batch.reference = Some(std::sync::Arc::new(reference(&weights, &Batch::new(&sequences.iter().rev().cloned().collect::<Vec<_>>()).expect("cf")).expect("reference")));
-    let run = |w: &Weights| {
-        let graph = Graph::parse(&program, w).expect("parse");
-        execute(w, &graph.program(w, true), &batch, &rows, &BTreeMap::new()).expect("program").log_probabilities
-    };
-    let block = crate::graph::Block::Slices { layer: 0, fc: vec![0, 2], down: vec![1], rest: false };
-    let edit = WeightEdit::Subcomponents { layer: 0, down: false, indices: vec![1, 3], factor: 0.25 };
-    // Host runs (no device yet), then the same steps on the device (the host backend).
-    let mut outcomes = Vec::new();
-    for on_device in [false, true] {
-        if on_device {
-            assert!(crate::graph::use_device(Device::host()), "a device was already set");
-        }
-        let exact = run(&weights);
-        let restore = weights.quantize(&[(block.clone(), Some(2))]).expect("quantize");
-        let quantized = run(&weights);
-        restore.restore(&mut weights);
-        let restored = run(&weights);
-        let undo = edit.apply(&mut weights).expect("edit");
-        let edited = run(&weights);
-        undo.restore(&mut weights).expect("restore");
-        let after = run(&weights);
-        outcomes.push([exact, quantized, restored, edited, after]);
-    }
-    let [host, device] = &outcomes[..] else { panic!("two passes") };
-    for (k, name) in ["exact", "quantized", "restored", "edited", "after the edit"].iter().enumerate() {
-        let kl = max(&kl_bits(&host[k], &device[k]));
-        assert!(kl < 1e-9, "{name}: KL(host ‖ device) = {kl:e} bits");
-    }
-    assert!(max(&kl_bits(&host[0], &host[1])) > 1e-9 && max(&kl_bits(&host[0], &host[3])) > 1e-9, "the quantization and the edit change the program");
 }
 
 /// Necessity: the full program predicts `M` with its nodes at their counterfactual values (no
@@ -720,14 +604,14 @@ fn necessity_pays_for_left_out_mediators() {
     assert!(families.iter().any(|k| *k == "necessity_clean") && families.iter().any(|k| k.starts_with("necessity_edit") || k.starts_with("necessity_rank")) && families.iter().any(|k| k.starts_with("necessity_site")), "{families:?}");
     assert!(full.necessity_error_bits / full.n < f32_kl, "full program necessity {:e} bits per token", full.necessity_error_bits / full.n);
     assert!(partial.necessity_error_bits / partial.n > 1e-3 && partial.necessity_error_bits > 100.0 * full.necessity_error_bits, "partial {:e}, full {:e} bits per token", partial.necessity_error_bits / partial.n, full.necessity_error_bits / full.n);
-    assert!((partial.total_bits - partial.exec_error_bits - partial.necessity_error_bits - partial.code_bits - partial.opaque_bits).abs() < 1e-6 * partial.total_bits);
+    assert!((partial.total_bits - partial.exec_error_bits - partial.necessity_error_bits - partial.claim_error_bits - partial.binding_error_bits - partial.complexity_bits).abs() < 1e-6 * partial.total_bits);
     assert_eq!(none.necessity_error_bits, 0.0);
     assert!(none.exec_error_bits > full.exec_error_bits && none.exec_error_bits / none.n > 1e-3);
     let empty_graph = Graph::empty();
     let circuit = empty_graph.program(&checker.weights, true);
     let targets = checker.targets().expect("targets");
     let experiments = sample(&checker.weights, true, 30, 3, &targets, &checker.sites);
-    let measured = checker.necessity_runs(&[(&empty_graph, &circuit)], &[Vec::new()], &complements(&experiments)).expect("empty necessity");
+    let measured = checker.necessity_runs(&[(&empty_graph, &circuit)], &complements(&experiments)).expect("empty necessity");
     assert!(measured[0].len() >= 3 && measured[0].iter().all(|kl| kl.as_ref().is_some_and(|kl| max(kl) < f32_kl)), "{:?}", measured[0].iter().map(|kl| kl.as_ref().map(|kl| max(kl))).collect::<Vec<_>>());
 }
 
@@ -767,4 +651,40 @@ fn deleting_programs_score_named_parts_alone() {
     let expected = kl_bits(&m, &deleted).iter().sum::<f64>() / m.nrows() as f64;
     let clean = empty.per_family["clean"].mean_kl_bits;
     assert!((clean - expected).abs() < 1e-9 * expected.max(1.0), "empty program on the clean prompts {clean} vs KL(M ‖ all deleted) {expected}");
+}
+
+/// The score's complexity is what a reader takes in (design_v2 section 2): each listed part costs
+/// `log2 V` bits, a VPD remainder its matrix's rank in names, each edge `log2(3 (n + 1)²)`; a shared
+/// base's nodes are priced apart, outside the total; weights are reported but not scored; and `N` is
+/// the number of tokens the experiment set scores.
+#[test]
+fn complexity_is_what_a_reader_takes_in() {
+    let (mut weights, sequences) = model("graph_sites_complexity");
+    let (hidden, width) = weights.layers[0].mlp.as_ref().expect("an MLP").gate.dim();
+    let wave = |rows: usize, cols: usize, phase: f64| Array2::from_shape_fn((rows, cols), |(i, j)| 0.1 * ((i * 7 + j * 3) as f64 + phase).sin());
+    weights.vpd.insert(0, crate::graph::VpdMlp { fc_u: wave(5, hidden, 0.3), fc_v: wave(width, 5, 1.1), down_u: wave(4, width, 2.0), down_v: wave(hidden, 4, 0.7) });
+    let vocabulary = weights.vocabulary();
+    let vpd = |kind: &str, index: crate::graph::Index| PieceIr { view: "vpd".into(), layer: 0, kind: kind.into(), index: Some(index) };
+    let mut program = Program { model: "tiny".into(), valid: true, ..Program::default() };
+    program.nodes = vec![
+        NodeIr { id: "f".into(), pieces: vec![vpd("c_fc", crate::graph::Index::Many(vec![0, 3])), vpd("down_proj", crate::graph::Index::Name("rest".into()))], claim: None },
+        NodeIr { id: "h".into(), pieces: vec![PieceIr { view: "native".into(), layer: 1, kind: "head".into(), index: Some(crate::graph::Index::One(1)) }], claim: None },
+    ];
+    program.edges = vec![EdgeIr { from: "embed".into(), to: "f".into(), route: "input".into() }, EdgeIr { from: "f".into(), to: "logits".into(), route: "input".into() }, EdgeIr { from: "h".into(), to: "logits".into(), route: "input".into() }];
+    let with_base = Program { base: vec!["f".into()], ..program.clone() };
+    let mut checker = Checker::new(weights, behavior(&sequences)).expect("checker");
+    let scores = checker.score_batch(&[program, with_base], 6, 2, true, None, 0).expect("scores");
+    let (plain, based) = (&scores[0].0, &scores[1].0);
+    let name = (vocabulary as f64).log2();
+    let edge = (3.0 * 9.0f64).log2();
+    // Two c_fc subcomponents, the down_proj remainder (rank min(width, hidden)) and one head.
+    assert_eq!(plain.parts, 2 + width.min(hidden) + 1);
+    assert!((plain.structure_bits - (plain.parts as f64 * name + 3.0 * edge)).abs() < 1e-9, "structure {} bits", plain.structure_bits);
+    assert_eq!(plain.base_bits, 0.0);
+    // The base node f, its edges and the edge into it are charged apart.
+    assert!((based.base_bits - ((2 + width.min(hidden)) as f64 * name + 2.0 * edge)).abs() < 1e-9 && (based.structure_bits - (name + edge)).abs() < 1e-9);
+    assert!((plain.total_bits - plain.exec_error_bits - plain.necessity_error_bits - plain.claim_error_bits - plain.binding_error_bits - plain.complexity_bits).abs() < 1e-6 * plain.total_bits);
+    assert!(plain.opaque_numbers > 0);
+    let scored: usize = scores[0].1.iter().map(|m| m.1.len()).sum();
+    assert_eq!(plain.n, scored as f64, "N is the tokens the experiments score");
 }
