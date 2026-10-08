@@ -673,6 +673,11 @@ fn complexity_is_what_a_reader_takes_in() {
     program.edges = vec![EdgeIr { from: "embed".into(), to: "f".into(), route: "input".into() }, EdgeIr { from: "f".into(), to: "logits".into(), route: "input".into() }, EdgeIr { from: "h".into(), to: "logits".into(), route: "input".into() }];
     let with_base = Program { base: vec!["f".into()], ..program.clone() };
     let mut checker = Checker::new(weights, behavior(&sequences)).expect("checker");
+    // The model's shared base holds f's parts, so the program may list f as base (each program that
+    // names them takes them over from the shared base node, which is then dropped).
+    let mut library = Program { model: "tiny".into(), valid: true, ..Program::default() };
+    library.nodes = vec![NodeIr { id: "lib".into(), pieces: program.nodes[0].pieces.clone(), claim: None }];
+    checker.set_base(Some(library)).expect("shared base");
     let scores = checker.score_batch(&[program, with_base], 6, 2, true, None, 0).expect("scores");
     let (plain, based) = (&scores[0].0, &scores[1].0);
     let name = (vocabulary as f64).log2();
@@ -752,4 +757,26 @@ fn deleting_programs_need_no_counterfactuals() {
     let scores = checker.score_batch(&[partial, full], 4, 1, true, None, 0).expect("scores");
     assert!(scores.iter().all(|(s, _)| s.valid && s.standin == "delete"));
     assert!(scores[1].0.exec_error_bits < scores[0].0.exec_error_bits);
+}
+
+/// A program's own base nodes (`Program::base`, priced outside the total) may hold only parts of the
+/// model's shared base: with none loaded, or with parts outside it, the program is invalid.
+#[test]
+fn a_program_base_holds_only_shared_base_parts() {
+    let (weights, sequences) = model("graph_sites_base_parts");
+    let node = |id: &str, layer: usize, index: usize| NodeIr { id: id.into(), pieces: vec![PieceIr { view: "native".into(), layer, kind: "head".into(), index: Some(crate::graph::Index::One(index)) }], claim: None };
+    let mut own = Program { model: "tiny".into(), valid: true, ..Program::default() };
+    own.nodes = vec![node("b", 0, 0)];
+    own.base = vec!["b".into()];
+    let mut checker = Checker::new(weights, behavior(&sequences)).expect("checker");
+    let alone = checker.score_batch(&[own.clone()], 4, 1, true, None, 0).expect("score");
+    assert!(!alone[0].0.valid, "no shared base: a program may not price its own parts as base");
+    let mut shared = Program { model: "tiny".into(), valid: true, ..Program::default() };
+    shared.nodes = vec![node("lib", 0, 0)];
+    checker.set_base(Some(shared)).expect("base");
+    let mut outside = own.clone();
+    outside.nodes = vec![node("b", 1, 0)];
+    let scores = checker.score_batch(&[own, outside], 4, 1, true, None, 0).expect("scores");
+    assert!(scores[0].0.valid, "{:?}", scores[0].0.error);
+    assert!(!scores[1].0.valid && scores[1].0.error.as_deref().is_some_and(|e| e.contains("outside the model's shared base")));
 }

@@ -3871,11 +3871,18 @@ impl Checker {
     /// dropped), listed in `Program::base`, with the base's declared edges among the nodes kept. A
     /// program that reuses a base node's id is marked invalid.
     pub fn with_base(&self, program: &Program) -> Program {
-        let Some(base) = &self.base else { return program.clone() };
         let mut out = program.clone();
         if !out.valid {
             return out;
         }
+        // Base parts are priced outside the total, so a program may list as its own base only parts
+        // of the model's shared base (else it could move every part there for free).
+        if let Some(e) = self.foreign_base_part(program) {
+            out.valid = false;
+            out.error = Some(e);
+            return out;
+        }
+        let Some(base) = &self.base else { return out };
         if let Some(n) = base.nodes.iter().find(|n| program.nodes.iter().any(|m| m.id == n.id)) {
             out.valid = false;
             out.error = Some(format!("node id {} is the shared base's", n.id));
@@ -3928,6 +3935,43 @@ impl Checker {
         out.edges.extend(base.edges.iter().filter(|e| present(&e.from) && present(&e.to)).cloned());
         out.base.extend(kept);
         out
+    }
+
+    /// The first part a node of `program`'s own base (`Program::base`) holds outside the model's
+    /// shared base ([`Checker::base`]; with none, every part is outside), as an error.
+    fn foreign_base_part(&self, program: &Program) -> Option<String> {
+        // A piece's units ("rest" as None), or None for every unit of its kind in the layer.
+        let units = |p: &PieceIr| -> Option<Vec<Option<usize>>> {
+            match &p.index {
+                None => None,
+                Some(Index::One(i)) => Some(vec![Some(*i)]),
+                Some(Index::Many(v)) => Some(v.iter().map(|&i| Some(i)).collect()),
+                Some(Index::Name(_)) => Some(vec![None]),
+            }
+        };
+        let mut library: BTreeMap<(String, usize, String), Option<BTreeSet<Option<usize>>>> = BTreeMap::new();
+        for p in self.base.iter().flat_map(|b| &b.nodes).flat_map(|n| &n.pieces) {
+            let entry = library.entry((p.view.clone(), p.layer, p.kind.clone())).or_insert_with(|| Some(BTreeSet::new()));
+            match (units(p), entry.as_mut()) {
+                (None, _) => *entry = None,
+                (Some(u), Some(set)) => set.extend(u),
+                (Some(_), None) => {}
+            }
+        }
+        for node in program.nodes.iter().filter(|n| program.base.contains(&n.id)) {
+            for p in &node.pieces {
+                let inside = match (library.get(&(p.view.clone(), p.layer, p.kind.clone())), units(p)) {
+                    (None, _) => false,
+                    (Some(None), _) => true,
+                    (Some(Some(_)), None) => false,
+                    (Some(Some(set)), Some(u)) => u.iter().all(|x| set.contains(x)),
+                };
+                if !inside {
+                    return Some(format!("base node {}: {} {} layer {} holds parts outside the model's shared base", node.id, p.view, p.kind, p.layer));
+                }
+            }
+        }
+        None
     }
 
     /// Sets (or with `None` clears) the shared base, checked by parsing it alone; returns its
