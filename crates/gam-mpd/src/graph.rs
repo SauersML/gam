@@ -4314,7 +4314,9 @@ impl Checker {
         let programs = merged.as_slice();
         let empty = self.empty_graph()?;
         let seed = self.uniform_seeds.map_or(seed, |m| seed % m.max(1));
-        let targets = self.targets()?;
+        // Targets aim the drawn experiments; a score of none (the clean and counterfactual runs alone)
+        // does not measure them.
+        let targets = if count > 0 { self.targets()? } else { Targets::default() };
         let parsed: Vec<(Graph, bool, Option<String>)> = programs
             .iter()
             .map(|program| match Graph::parse(program, &self.weights) {
