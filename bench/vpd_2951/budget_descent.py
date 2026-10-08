@@ -88,9 +88,10 @@ sliced = [] if os.environ.get('DESCENT_ARM') == 'rot' else attn
 tok = np.memmap(TOKENS, dtype=np.uint16 if TOKENS.endswith('.u16') else np.float64, mode='r').reshape(-1, 513)
 ev = torch.tensor(tok[1024:1032, :512].astype(np.int64), device=dev)
 # Training rows: DESCENT_TRAIN_ROWS rows of the file, skipping the held-out rows 1024..1031 (default 1024).
-# DESCENT_BATCH sequences of DESCENT_SEQ tokens per step (default 8 x 256).
+# DESCENT_BATCH sequences of DESCENT_SEQ tokens per step (default 32 x 512, the largest that fits an A40 on the whole
+# model: 33 GB, 16,179 tokens/s against 14,911 at 16 x 512 and 8,660 at 8 x 256, compiled).
 train_rows = int(os.environ.get('DESCENT_TRAIN_ROWS', '1024'))
-batch, seq = int(os.environ.get('DESCENT_BATCH', '8')), int(os.environ.get('DESCENT_SEQ', '256'))
+batch, seq = int(os.environ.get('DESCENT_BATCH', '32')), int(os.environ.get('DESCENT_SEQ', '512'))
 # VPD's mean active (causal importance > 0) slices per token at each MLP map, rows 1024..1031,
 # from M's clean inputs (fitmath proto.log); 129 in total.
 # The VPD start's thresholds match VPD's per-map counts scaled down to the budget when the budget is
@@ -738,7 +739,7 @@ ROT_ALL = list(ROT.values())
 STW = float(os.environ.get('DESCENT_STW', '10'))
 ANNEAL = float(os.environ.get('DESCENT_ANNEAL', '1'))
 
-def rot_train_gate(hard, phi, z):
+def rot_train_gate(hard, phi, z, a=None):
     """A block's gate in training. mf: the expected gate Phi(z); st: the hard gate (as the scorer runs it) with
     Phi(z)'s gradient; bern: on with probability Phi(z), drawn each pass (on or off, as the scorer runs it, and on
     average the expected gate), with Phi(z)'s gradient. Under st a block pushed off gets no gradient back (the
@@ -754,7 +755,7 @@ def rot_train_gate(hard, phi, z):
     if gate == 'anneal':
         # The mean-field gate narrowed as training goes, Phi(z / a), a from 1 to 1/20 over the first DESCENT_ANNEAL
         # (default all) of the steps: a continuation from the smooth gate to the hard one the scorer runs.
-        a = max(0.05, 1 - state.get('progress', 0.0) / ANNEAL)
+        a = max(0.05, 1 - state.get('progress', 0.0) / ANNEAL) if a is None else a
         return 0.5 * (1 + torch.erf(z / (a * SQ2)))
     return hard + phi - phi.detach()
 
@@ -774,7 +775,9 @@ def rot_memo(key, tensors, make):
     return out
 
 def qeinsum(eq, *ops):
-    """torch.einsum in full float32."""
+    """torch.einsum in full float32 (a compiled core's caller holds float32 for all of it)."""
+    if torch.compiler.is_compiling():
+        return torch.einsum(eq, *ops)
     with full_float32():
         return torch.einsum(eq, *ops)
 
@@ -856,54 +859,113 @@ def rot_index_bits():
     return rot_memo('index', Ls, lambda: math.log2(max(2, int(torch.stack(
         [(torch.zeros(L.shape[:2], device=dev).scatter_(1, L.argmax(-1), 1.0) > 0).sum() for L in Ls]).sum()))))
 
+def rot_index_bits_t():
+    """rot_index_bits as a device scalar, with no host wait."""
+    Ls = [R['L'] for R in ROT_ALL]
+    return rot_memo('index_t', Ls, lambda: torch.stack(
+        [(torch.zeros(L.shape[:2], device=dev).scatter_(1, L.argmax(-1), 1.0) > 0).sum() for L in Ls]).sum().clamp_min(2).double().log2().float())
+
+# torch.compile (speed): each map's per-token rotation and gate work runs as one function, compiled in the training
+# pass on CUDA (inductor fuses the element-wise chains of the forward and of the backward); M's own products, the
+# bases Q, the noise draws and the pass's records stay outside it. A core runs every product in full float32 (its
+# matrix products read the TF32 switch when they run); calibration, evaluation and MPS run the same cores eagerly.
+# On an A40 the element-wise work was about three quarters of a whole-model step's device time.
+COMPILE = dev == 'cuda'
+if COMPILE:
+    import torch._dynamo, torch._inductor.config
+    torch._dynamo.config.cache_size_limit = 64
+    torch._inductor.config.fallback_random = True
+_compiled = {}
+
+def rot_run(core, *a):
+    """core(*a) (its last argument the pass's mode) with every product in full float32, compiled in the training
+    pass."""
+    f = core
+    if COMPILE and a[-1] == 'soft' and torch.is_grad_enabled() and state.get('calib') is None:
+        f = _compiled.get(core) or _compiled.setdefault(core, torch.compile(core, dynamic=False))
+    with full_float32():
+        return f(*a)
+
+def rot_core_args():
+    """The pass's sequences forced on (a device index, or None) and the annealed gate's width (a device scalar, or
+    None): a core's inputs, so a compiled core never sees a changing Python number."""
+    on = torch.tensor(state['force_on'], device=dev) if state['force_on'] else None
+    ga = torch.full((), max(0.05, 1 - state.get('progress', 0.0) / ANNEAL), device=dev) if gate == 'anneal' else None
+    return on, ga
+
+def rot_record(recs, Rbs, keys):
+    """Appends a core's per-token records (bits on, blocks on, training-gate bits) and, in calibration, its blocks'
+    reads to the pass's state."""
+    for (hb, n_on, sb), Rb, key in zip(recs, Rbs, keys):
+        if state.get('calib') is not None:
+            state['calib'].setdefault(key, []).append(Rb.detach().reshape(-1))
+        state['hard'].append(hb); state['rot_on'].append(n_on)
+        if sb is not None:
+            state['soft'].append(sb)
+
+def rot_gate_core(R, r, bits_i, idx, on, ga, mode, extra=None):
+    """The gates of R's slices [B, T, ng, g] from their reads r and their bits bits_i [ng, g] (extra: the gate
+    network's term in z); with the per-token records (bits on, blocks on, training-gate bits or None) and the
+    blocks' reads Rb."""
+    g = R['L'].shape[-1]
+    hot = (R['L'].argmax(-1, keepdim=True) == torch.arange(g, device=r.device)).float(); Lsm = torch.softmax(R['L'], -1)
+    M_ = hot if mode == 'hard' else Lsm
+    Rb = (qeinsum('...ni,nij->...nj', r.pow(2), M_) + 1e-20).sqrt()
+    z = (Rb - R['tau']) / R['s']
+    if extra is not None:
+        z = z + extra
+    hard, phi = (z > 0).float(), 0.5 * (1 + torch.erf(z / SQ2))
+    if on is not None:
+        hard, phi = hard.index_fill(0, on, 1.0), phi.index_fill(0, on, 1.0)
+    Lj = qeinsum('ni,nij->nj', bits_i, M_) + rot_tau_bits(R) + idx
+    hb, n_on = (hard * Lj).sum((-1, -2)).reshape(-1), hard.sum((-1, -2)).reshape(-1)
+    if mode == 'hard':
+        return qeinsum('...nj,nij->...ni', hard, hot), (hb, n_on, None), Rb
+    gb = rot_train_gate(hard, phi, z, ga)
+    return qeinsum('...nj,nij->...ni', gb, Lsm), (hb, n_on, (gb * Lj).sum((-1, -2)).reshape(-1)), Rb
+
+def rot_fc_core(R, p, xe, Q, ex, idx, on, ga, mode):
+    """A c_fc map after M's product p = x W^T: its slices' coefficients (with the read noise xe), its blocks' gates
+    (ex: the gate network's term) and its output; returns (output, gates, records, block reads)."""
+    sh = p.shape[:-1]
+    c = qeinsum('...nk,nki->...ni', permuted(p, R['perm'], R['inv']).view(*sh, R['ng'], ROTG), Q)
+    if xe is not None:
+        c = c + xe.view(*sh, R['ng'], ROTG) * R['ls_fc'].exp()
+    recs, Rbs = [], []
+    if mode == 'all':
+        gam = torch.ones_like(c)
+    else:
+        bits_i, wn = rot_slice_bits(R, Q)
+        abar = permuted(vpd_model.gelu_tanh(p), R['perm'], R['inv']).view(*sh, R['ng'], ROTG)
+        gam, rec, Rb = rot_gate_core(R, qeinsum('...nk,nki->...ni', abar, Q).abs() * wn, bits_i, idx, on, ga, mode, ex)
+        recs.append(rec); Rbs.append(Rb)
+    return permuted(qeinsum('...ni,nki->...nk', c * gam, Q).reshape(*sh, -1), R['inv'], R['perm']), gam, recs, Rbs
+
 def make_rot_fc(n, l):
     R = ROT[l]; W = T.site(n).W
     def fwd(x):
         p = x @ W.T
         if state['mode'] == 'M':
             return p
-        sh = p.shape[:-1]
         for b, kind, G, a in state['entry'].get(n, ()):
             if kind == 'out':
                 # c_fc rows G scaled by 1 + a, entry-wise in every slice's read.
                 sc = torch.ones(p.shape[-1], device=p.device); sc[G] = 1 + a
                 p = p.index_copy(0, torch.tensor([b], device=p.device), (p[b] * sc)[None])
         Q = rot_Q(R)
-        c = qeinsum('...nk,nki->...ni', permuted(p, R['perm'], R['inv']).view(*sh, R['ng'], ROTG), Q)
-        if state.get('noise'):
-            eps = torch.randn(R['ng'] * ROTG, x.shape[-1], device=x.device)
-            c = c + (x @ eps.T).view(*sh, R['ng'], ROTG) * R['ls_fc'].exp()
-        if state['mode'] == 'all':
-            gam = torch.ones_like(c)
-        else:
-            bits_i, wn = rot_slice_bits(R, Q)
-            abar = permuted(vpd_model.gelu_tanh(p), R['perm'], R['inv']).view(*sh, R['ng'], ROTG)
-            r = qeinsum('...nk,nki->...ni', abar, Q).abs() * wn
-            Lsm = torch.softmax(R['L'], -1)
-            hot = F.one_hot(R['L'].argmax(-1), ROTG).float()
-            M_ = hot if state['mode'] == 'hard' else Lsm
-            Rb = (qeinsum('...ni,nij->...nj', r.pow(2), M_) + 1e-20).sqrt()
-            if state.get('calib') is not None:
-                state['calib'].setdefault(n, []).append(Rb.detach().reshape(-1))
-            z = (Rb - R['tau']) / R['s']
-            if GN:
-                z = z + gate_net(l, 'mlp', x).view(*sh, R['ng'], R['g'])
-            hard, phi = (z > 0).float(), 0.5 * (1 + torch.erf(z / SQ2))
-            if state['force_on']:
-                on = torch.tensor(state['force_on'], device=z.device)
-                hard, phi = hard.index_fill(0, on, 1.0), phi.index_fill(0, on, 1.0)
-            Lj = qeinsum('ni,nij->nj', bits_i, M_) + rot_tau_bits(R) + rot_index_bits()
-            state['hard'].append((hard * Lj).sum((-1, -2)).reshape(-1))
-            state['rot_on'].append(hard.sum((-1, -2)).reshape(-1))
-            if state['mode'] == 'hard':
-                gam = qeinsum('...nj,nij->...ni', hard, hot)
-            else:
-                gb = rot_train_gate(hard, phi, z)
-                state['soft'].append((gb * Lj).sum((-1, -2)).reshape(-1))
-                gam = qeinsum('...nj,nij->...ni', gb, Lsm)
+        xe = x @ torch.randn(R['ng'] * ROTG, x.shape[-1], device=x.device).T if state.get('noise') else None
+        ex = gate_net(l, 'mlp', x).view(*p.shape[:-1], R['ng'], R['g']) if GN and state['mode'] != 'all' else None
+        out, gam, recs, Rbs = rot_run(rot_fc_core, R, p, xe, Q, ex, rot_index_bits_t(), *rot_core_args(), state['mode'])
+        rot_record(recs, Rbs, [n])
         state['rot'][l] = (gam, Q)
-        return permuted(qeinsum('...ni,nki->...nk', c * gam, Q).reshape(*sh, -1), R['inv'], R['perm'])
+        return out
     return fwd
+
+def rot_dn_core(R, a, gam, Q, mode):
+    """A down_proj map's slices on its input a, gated by its c_fc blocks' gates: (z before M's product, coefficients)."""
+    sh = a.shape[:-1]
+    c = qeinsum('...nk,nki->...ni', permuted(a, R['perm'], R['inv']).view(*sh, R['ng'], ROTG), Q) * gam
+    return permuted(qeinsum('...ni,nki->...nk', c, Q).reshape(*sh, -1), R['inv'], R['perm']), c
 
 def make_rot_dn(n, l):
     R = ROT[l]; W = T.site(n).W
@@ -912,8 +974,7 @@ def make_rot_dn(n, l):
             return a @ W.T
         sh = a.shape[:-1]
         gam, Q = state['rot'][l]
-        c = qeinsum('...nk,nki->...ni', permuted(a, R['perm'], R['inv']).view(*sh, R['ng'], ROTG), Q) * gam
-        z = permuted(qeinsum('...ni,nki->...nk', c, Q).reshape(*sh, -1), R['inv'], R['perm'])
+        z, c = rot_run(rot_dn_core, R, a, gam, Q, state['mode'])
         for b, kind, G, a_ in state['entry'].get(n, ()):
             if kind == 'in':
                 # down_proj columns G scaled by 1 + a, entry-wise in every slice's write.
@@ -1010,48 +1071,19 @@ def rot_read_bits(R, Q):
     v = (nr.sum() + d_ * s2.sum()) / (d_ * nr.numel())
     return (0.5 * (d_ * torch.log(v / s2) + (nr + d_ * s2) / v - d_)) / math.log(2) + rot_angle_bits(R)
 
-def rot_gate(Rb, R, Lj, hot, Lsm, calib_key, extra=0.0):
-    """From the blocks' reads Rb [B, T, groups, blocks]: appends the bits and blocks on per token, returns the
-    slices' gates [B, T, groups, slices]."""
-    if state.get('calib') is not None:
-        state['calib'].setdefault(calib_key, []).append(Rb.detach().reshape(-1))
-    z = (Rb - R['tau']) / R['s'] + extra
-    hard, phi = (z > 0).float(), 0.5 * (1 + torch.erf(z / SQ2))
-    if state['force_on']:
-        on = torch.tensor(state['force_on'], device=z.device)
-        hard, phi = hard.index_fill(0, on, 1.0), phi.index_fill(0, on, 1.0)
-    state['hard'].append((hard * Lj).sum((-1, -2)).reshape(-1))
-    state['rot_on'].append(hard.sum((-1, -2)).reshape(-1))
-    if state['mode'] == 'hard':
-        return qeinsum('...nj,nij->...ni', hard, hot)
-    gb = rot_train_gate(hard, phi, z)
-    state['soft'].append((gb * Lj).sum((-1, -2)).reshape(-1))
-    return qeinsum('...nj,nij->...ni', gb, Lsm)
-
-def rot_blocks(R, r, bits_i, calib_key, extra=0.0):
-    """The gates of R's slices from their reads r [B, T, ng, g] and their bits bits_i [ng, g] (extra: the gate
-    network's term in z)."""
-    hot = F.one_hot(R['L'].argmax(-1), R['L'].shape[-1]).float(); Lsm = torch.softmax(R['L'], -1)
-    M_ = hot if state['mode'] == 'hard' else Lsm
-    Rb = (qeinsum('btni,nij->btnj', r.pow(2), M_) + 1e-20).sqrt()
-    Lj = qeinsum('ni,nij->nj', bits_i, M_) + rot_tau_bits(R) + rot_index_bits()
-    return rot_gate(Rb, R, Lj, hot, Lsm, calib_key, extra)
-
-def rot_attention(i, h, causal):
-    """Layer i's attention output under the rot arm: q blocks gated at the query, k blocks at the key, OV blocks on
-    the heads' output at the query, M's weights throughout."""
-    Rq, Rk, Ro = ROTA[i]['q'], ROTA[i]['k'], ROTA[i]['ov']; B_, T_ = h.shape[0], h.shape[1]
-    site = lambda k: T.site(f'h.{i}.attn.{k}')
+def rot_attention_core(Rq, Rk, Ro, q, k, v, causal, Qq, Qk, Q, noise, ex, idx, on, ga, mode):
+    """Layer's attention after M's q, k, v products: q blocks gated at the query, k blocks at the key, OV blocks on
+    the heads' output at the query (ex: the gate network's terms for q, k and OV, or None); returns (the input of M's o_proj, the OV coefficients, records, block reads)."""
+    B_, T_ = q.shape[0], q.shape[1]
     grp = lambda t_: t_.view(B_, T_, -1, Rq['g'])
-    q, k, v = site('q_proj')(h), site('k_proj')(h), site('v_proj')(h)
-    Qq, Qk = rot_Q(Rq), rot_Q(Rk)
     cq = qeinsum('btnk,nki->btni', grp(q), Qq); ck = qeinsum('btnk,nki->btni', grp(k), Qk)
-    if state.get('noise'):
-        cq = cq + grp(h @ torch.randn(q.shape[-1], h.shape[-1], device=h.device).T) * Rq['ls'].exp()
-        ck = ck + grp(h @ torch.randn(k.shape[-1], h.shape[-1], device=h.device).T) * Rk['ls'].exp()
+    if noise is not None:
+        cq = cq + grp(noise[0]) * Rq['ls'].exp()
+        ck = ck + grp(noise[1]) * Rk['ls'].exp()
     rope = lambda t_: T._rope(t_.view(B_, T_, NH, HD).transpose(1, 2), T_)
     back = lambda c_, Q_: qeinsum('btni,nki->btnk', c_, Q_).reshape(B_, T_, -1)
-    if state['mode'] != 'all':
+    recs, Rbs = [], []
+    if mode != 'all':
         # The keys' per-coordinate variance over the attended keys, RoPE undone at the query: for plane c,
         # cov_rel = R_t^T cov_c(t) R_t; coordinate c (first of its plane) takes cov_rel[0, 0], c + HD/2 cov_rel[1, 1].
         with torch.no_grad():
@@ -1066,27 +1098,44 @@ def rot_attention(i, h, causal):
         d1 = si ** 2 * cv[..., 0, 0] - 2 * co * si * cv[..., 0, 1] + co ** 2 * cv[..., 1, 1]
         D = torch.cat((d0, d1), -1).clamp_min(0).transpose(1, 2).reshape(B_, T_, -1, Rq['g'])  # [B, T, ng, g] by coordinate
         rq = (cq.pow(2) * qeinsum('btnk,nki->btni', D, Qq.pow(2)) / HD + 1e-20).sqrt()
-        gn = gate_net(i, 'attn', h)
-        ex = {}
-        if GN:
-            gn = gn.view(B_, T_, -1); o_ = 0
-            for x_, R_ in (('q', Rq), ('k', Rk), ('ov', Ro)):
-                m_ = R_['ng'] * R_['g']; ex[x_] = gn[..., o_:o_ + m_].view(B_, T_, R_['ng'], R_['g']); o_ += m_
-        cq = cq * rot_blocks(Rq, rq, rot_read_bits(Rq, Qq), f'h.{i}.attn.q_proj', ex.get('q', 0.0))
-        ck = ck * rot_blocks(Rk, ck.abs(), rot_read_bits(Rk, Qk), f'h.{i}.attn.k_proj', ex.get('k', 0.0))
+        gq, rec, Rb = rot_gate_core(Rq, rq, rot_read_bits(Rq, Qq), idx, on, ga, mode, ex and ex[0]); recs.append(rec); Rbs.append(Rb)
+        gk, rec, Rb = rot_gate_core(Rk, ck.abs(), rot_read_bits(Rk, Qk), idx, on, ga, mode, ex and ex[1]); recs.append(rec); Rbs.append(Rb)
+        cq, ck = cq * gq, ck * gk
     qh, kh = rope(back(cq, Qq)), rope(back(ck, Qk))
     pattern = ((qh @ kh.transpose(-1, -2)) / math.sqrt(HD)).masked_fill(~causal, float('-inf')).softmax(-1)
     a = grp((pattern @ v.view(B_, T_, NH, HD).transpose(1, 2)).transpose(1, 2).reshape(B_, T_, -1))
-    Q = rot_Q(Ro)
     c = qeinsum('btnk,nki->btni', a, Q)
-    if state.get('noise'):
+    if noise is not None:
         # Each OV slice's read noise at each key, mixed by the pattern like the values.
-        vn = (h @ torch.randn(NH * HD, h.shape[-1], device=h.device).T).view(B_, T_, NH, HD).transpose(1, 2)
+        vn = noise[2].view(B_, T_, NH, HD).transpose(1, 2)
         c = c + grp((pattern @ vn).transpose(1, 2).reshape(B_, T_, -1)) * Ro['ls_fc'].exp()
-    if state['mode'] != 'all':
+    if mode != 'all':
         bits_i, wn = rot_slice_bits(Ro, Q)
-        c = c * rot_blocks(Ro, c.abs() * wn, bits_i, f'h.{i}.attn.o_proj', ex.get('ov', 0.0))
-    y = site('o_proj')(back(c, Q))
+        go, rec, Rb = rot_gate_core(Ro, c.abs() * wn, bits_i, idx, on, ga, mode, ex and ex[2]); recs.append(rec); Rbs.append(Rb)
+        c = c * go
+    return back(c, Q), c, recs, Rbs
+
+def rot_attention(i, h, causal):
+    """Layer i's attention output under the rot arm: M's q, k, v and o products around rot_attention_core."""
+    Rq, Rk, Ro = ROTA[i]['q'], ROTA[i]['k'], ROTA[i]['ov']; B_, T_ = h.shape[0], h.shape[1]
+    site = lambda k: T.site(f'h.{i}.attn.{k}')
+    q, k, v = site('q_proj')(h), site('k_proj')(h), site('v_proj')(h)
+    Qq, Qk, Q = rot_Q(Rq), rot_Q(Rk), rot_Q(Ro)
+    noise = None
+    if state.get('noise'):
+        noise = (h @ torch.randn(q.shape[-1], h.shape[-1], device=h.device).T, h @ torch.randn(k.shape[-1], h.shape[-1], device=h.device).T,
+                 h @ torch.randn(NH * HD, h.shape[-1], device=h.device).T)
+    ex = None
+    if GN and state['mode'] != 'all':
+        # The gate network's output for every q, k and OV block of the layer, split by map.
+        gn, ex, o_ = gate_net(i, 'attn', h).view(B_, T_, -1), [], 0
+        for R_ in (Rq, Rk, Ro):
+            m_ = R_['ng'] * R_['g']; ex.append(gn[..., o_:o_ + m_].view(B_, T_, R_['ng'], R_['g'])); o_ += m_
+        ex = tuple(ex)
+    z, c, recs, Rbs = rot_run(rot_attention_core, Rq, Rk, Ro, q, k, v, causal, Qq, Qk, Q, noise, ex, rot_index_bits_t(),
+                              *rot_core_args(), state['mode'])
+    rot_record(recs, Rbs, [f'h.{i}.attn.q_proj', f'h.{i}.attn.k_proj', f'h.{i}.attn.o_proj'])
+    y = site('o_proj')(z)
     if state.get('noise'):
         y = y + (c * Ro['ls_dn'].exp()).reshape(B_, T_, -1) @ torch.randn(NH * HD, y.shape[-1], device=h.device)
     return y
@@ -1332,8 +1381,32 @@ if sliced:
         del cap
 
 def kl_bits(lm, lp):
-    pm = F.log_softmax(lm.float(), -1); pp = F.log_softmax(lp.float(), -1)
-    return (pm.exp() * (pm - pp)).sum(-1) / math.log(2)
+    return KLBits.apply(lm, lp)
+
+class KLBits(torch.autograd.Function):
+    """KL(M || P) in bits per token from M's logits lm and P's lp [..., V], over chunks of tokens, its gradient in lp
+    taken directly, (softmax(lp) - softmax(lm)) / ln 2: only the two logit tensors are kept for the backward
+    (autograd through log_softmax kept five vocabulary-wide tensors; the whole model ran out of an A40's memory at
+    32 x 512 tokens)."""
+    CHUNK = 2048
+    @staticmethod
+    def forward(ctx, lm, lp):
+        ctx.save_for_backward(lm, lp)
+        V = lm.shape[-1]; fm, fp = lm.reshape(-1, V), lp.reshape(-1, V)
+        out = torch.empty(fm.shape[0], device=lm.device)
+        for i in range(0, fm.shape[0], KLBits.CHUNK):
+            pm = F.log_softmax(fm[i:i + KLBits.CHUNK].float(), -1); pp = F.log_softmax(fp[i:i + KLBits.CHUNK].float(), -1)
+            out[i:i + KLBits.CHUNK] = (pm.exp() * (pm - pp)).sum(-1) / math.log(2)
+        return out.view(lm.shape[:-1])
+    @staticmethod
+    def backward(ctx, g):
+        lm, lp = ctx.saved_tensors
+        V = lm.shape[-1]; fm, fp, fg = lm.reshape(-1, V), lp.reshape(-1, V), g.reshape(-1)
+        grad = torch.empty_like(fp)
+        for i in range(0, fm.shape[0], KLBits.CHUNK):
+            j = slice(i, i + KLBits.CHUNK)
+            grad[j] = (F.softmax(fp[j].float(), -1) - F.softmax(fm[j].float(), -1)) * (fg[j, None] / math.log(2))
+        return None, grad.view(lp.shape)
 
 def run(ids, mode):
     state['mode'], state['soft'], state['hard'], state['edges_soft'], state['edges_hard'] = mode, [], [], [], []
