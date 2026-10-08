@@ -8,7 +8,8 @@ counterfactual values, everything else on the prompt), whose execution error is 
 mediated paths included, its partners in the block (c_fc's down_proj, a head's q/k with v/o) all on. Chunks start
 at --chunk subcomponents per site; the --keep largest are split in half and measured again, down to --leaf; the
 ranking lists the leaf chunks by effect, then the larger chunks, members by VPD importance. Necessity is off while
-ranking (it scores the program, not the chunk).
+ranking (it scores the program, not the chunk), and a removal is scored on the clean and counterfactual prompts
+alone (--rank-experiments 0) unless asked for more.
 
 Then the k-curve: per k in --ks, align(answer, the ranking's first k) in the family algorithm (closed as
 teacher_run.closed makes it valid; held-out behaviors, which have no algorithm, as node programs) scored in full,
@@ -78,7 +79,7 @@ def rank(b: str, checker, sizes: dict, importance: dict, a, log) -> tuple[list, 
         sources = [without(sizes, c) for c in chunks]
         results = []
         for k in range(0, len(sources), a.batch):
-            results += checker.score_batch(sources[k:k + a.batch], experiments=a.experiments, seed=0, reader=False,
+            results += checker.score_batch(sources[k:k + a.batch], experiments=a.rank_experiments, seed=0, reader=False,
                                            stand_in="counterfactual", options={"necessity": False})
         return [r["exec_error_bits"] if r.get("valid", True) else -1.0 for r in results]  # an invalid program ranks last
 
@@ -150,6 +151,8 @@ def main():
     ap.add_argument("--importance", type=Path, default=DATA / "experiments/importance", help="mpd_vpd_importance_2951's tables (site sizes, order within a chunk)")
     ap.add_argument("--device")
     ap.add_argument("--experiments", type=int, default=16)
+    ap.add_argument("--rank-experiments", type=int, default=0, help="experiments drawn per chunk removal (0: the clean and "
+                    "counterfactual prompts alone, the contrast itself)")
     ap.add_argument("--chunk", type=int, default=256, help="subcomponents per first chunk")
     ap.add_argument("--leaf", type=int, default=8, help="the chunk size splitting stops at")
     ap.add_argument("--keep", type=int, default=32, help="chunks split per level (largest effect first)")
@@ -174,7 +177,8 @@ def main():
             log(f"k={r['k']} ({r['parts']} parts): reproduced {r['reproduced']:.1%}, total {r['score']['total_bits']:.6g} vs empty "
                 f"{empty['total_bits']:.6g} (exec {r['score']['exec_error_bits']:.4g}, necessity {r['score']['necessity_error_bits']:.4g}, "
                 f"alignment {r['score'].get('alignment_error_bits') or 0:.4g}, complexity {r['score']['complexity_bits']:.4g})")
-        record = {"behavior": b, "semantics": "counterfactual", "experiments": a.experiments, "chunk": a.chunk, "leaf": a.leaf,
+        record = {"behavior": b, "semantics": "counterfactual", "experiments": a.experiments, "rank_experiments": a.rank_experiments,
+                  "chunk": a.chunk, "leaf": a.leaf,
                   "keep": a.keep, "checker": str(score_module.BINARY), "empty": empty, "curve": rows,
                   "ranking": [[search.name(u), e] for u, e in ranked[:2048]], "chunks": chunks, "seconds": round(time.time() - t0)}
         (a.out / f"{b}.json").write_text(json.dumps(record, indent=1))
