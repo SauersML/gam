@@ -886,6 +886,8 @@ def make_rot_fc(n, l):
             if state.get('calib') is not None:
                 state['calib'].setdefault(n, []).append(Rb.detach().reshape(-1))
             z = (Rb - R['tau']) / R['s']
+            if GN:
+                z = z + gate_net(l, 'mlp', x).view(*sh, R['ng'], R['g'])
             hard, phi = (z > 0).float(), 0.5 * (1 + torch.erf(z / SQ2))
             if state['force_on']:
                 on = torch.tensor(state['force_on'], device=z.device)
@@ -976,6 +978,31 @@ if ARM == 'rot' and attn:
                 ROTA[l][name]['Q0'] = Q0
 ROT_ALL = list(ROT.values()) + [R[x] for R in ROTA.values() for x in ('q', 'k', 'ov')]
 
+# DESCENT_GATENET=H: each layer's gates also read a small causal network of the layer's own input at the token
+# (the normed residual stream entering the attention, or the MLP): one hidden layer of H units (GELU), its output
+# added to every block's z there. Linear own reads cannot decode a superposed code; the network can. Its
+# weights are part of the switching function, described once per run under F (zero-mean priors), not counted per
+# token; the output layer starts at zero, so the start is the own-read gates'.
+GATENET = int(os.environ.get('DESCENT_GATENET', '0'))
+GN = {}
+if ARM == 'rot' and GATENET:
+    for l in range(T.n_layer):
+        outs = {'mlp': ROT[l]['ng'] * ROT[l]['g']}
+        if ROTA:
+            outs['attn'] = sum(ROTA[l][x]['ng'] * ROTA[l][x]['g'] for x in ('q', 'k', 'ov'))
+        for part, n_out in outs.items():
+            d_ = T.wte.shape[1]
+            GN[(l, part)] = {'W1': (torch.randn(d_, GATENET, device=dev) * math.sqrt(2 / d_)).requires_grad_(),
+                             'b1': torch.zeros(GATENET, device=dev, requires_grad=True),
+                             'W2': torch.zeros(GATENET, n_out, device=dev, requires_grad=True)}
+
+def gate_net(l, part, x):
+    """The layer's gate network's output for every block of `part` at each token of x [B, T, d] (zero without one)."""
+    if (l, part) not in GN:
+        return 0.0
+    P_ = GN[(l, part)]
+    return F.gelu(x @ P_['W1'] + P_['b1']) @ P_['W2']
+
 def rot_read_bits(R, Q):
     """Per q or k slice [ng, g]: its dense read's description and its angles' share, in bits."""
     s2 = (2 * R['ls']).exp(); d_ = R['di']
@@ -983,12 +1010,12 @@ def rot_read_bits(R, Q):
     v = (nr.sum() + d_ * s2.sum()) / (d_ * nr.numel())
     return (0.5 * (d_ * torch.log(v / s2) + (nr + d_ * s2) / v - d_)) / math.log(2) + rot_angle_bits(R)
 
-def rot_gate(Rb, R, Lj, hot, Lsm, calib_key):
+def rot_gate(Rb, R, Lj, hot, Lsm, calib_key, extra=0.0):
     """From the blocks' reads Rb [B, T, groups, blocks]: appends the bits and blocks on per token, returns the
     slices' gates [B, T, groups, slices]."""
     if state.get('calib') is not None:
         state['calib'].setdefault(calib_key, []).append(Rb.detach().reshape(-1))
-    z = (Rb - R['tau']) / R['s']
+    z = (Rb - R['tau']) / R['s'] + extra
     hard, phi = (z > 0).float(), 0.5 * (1 + torch.erf(z / SQ2))
     if state['force_on']:
         on = torch.tensor(state['force_on'], device=z.device)
@@ -1001,13 +1028,14 @@ def rot_gate(Rb, R, Lj, hot, Lsm, calib_key):
     state['soft'].append((gb * Lj).sum((-1, -2)).reshape(-1))
     return qeinsum('...nj,nij->...ni', gb, Lsm)
 
-def rot_blocks(R, r, bits_i, calib_key):
-    """The gates of R's slices from their reads r [B, T, ng, g] and their bits bits_i [ng, g]."""
+def rot_blocks(R, r, bits_i, calib_key, extra=0.0):
+    """The gates of R's slices from their reads r [B, T, ng, g] and their bits bits_i [ng, g] (extra: the gate
+    network's term in z)."""
     hot = F.one_hot(R['L'].argmax(-1), R['L'].shape[-1]).float(); Lsm = torch.softmax(R['L'], -1)
     M_ = hot if state['mode'] == 'hard' else Lsm
     Rb = (qeinsum('btni,nij->btnj', r.pow(2), M_) + 1e-20).sqrt()
     Lj = qeinsum('ni,nij->nj', bits_i, M_) + rot_tau_bits(R) + rot_index_bits()
-    return rot_gate(Rb, R, Lj, hot, Lsm, calib_key)
+    return rot_gate(Rb, R, Lj, hot, Lsm, calib_key, extra)
 
 def rot_attention(i, h, causal):
     """Layer i's attention output under the rot arm: q blocks gated at the query, k blocks at the key, OV blocks on
@@ -1038,8 +1066,14 @@ def rot_attention(i, h, causal):
         d1 = si ** 2 * cv[..., 0, 0] - 2 * co * si * cv[..., 0, 1] + co ** 2 * cv[..., 1, 1]
         D = torch.cat((d0, d1), -1).clamp_min(0).transpose(1, 2).reshape(B_, T_, -1, Rq['g'])  # [B, T, ng, g] by coordinate
         rq = (cq.pow(2) * qeinsum('btnk,nki->btni', D, Qq.pow(2)) / HD + 1e-20).sqrt()
-        cq = cq * rot_blocks(Rq, rq, rot_read_bits(Rq, Qq), f'h.{i}.attn.q_proj')
-        ck = ck * rot_blocks(Rk, ck.abs(), rot_read_bits(Rk, Qk), f'h.{i}.attn.k_proj')
+        gn = gate_net(i, 'attn', h)
+        ex = {}
+        if GN:
+            gn = gn.view(B_, T_, -1); o_ = 0
+            for x_, R_ in (('q', Rq), ('k', Rk), ('ov', Ro)):
+                m_ = R_['ng'] * R_['g']; ex[x_] = gn[..., o_:o_ + m_].view(B_, T_, R_['ng'], R_['g']); o_ += m_
+        cq = cq * rot_blocks(Rq, rq, rot_read_bits(Rq, Qq), f'h.{i}.attn.q_proj', ex.get('q', 0.0))
+        ck = ck * rot_blocks(Rk, ck.abs(), rot_read_bits(Rk, Qk), f'h.{i}.attn.k_proj', ex.get('k', 0.0))
     qh, kh = rope(back(cq, Qq)), rope(back(ck, Qk))
     pattern = ((qh @ kh.transpose(-1, -2)) / math.sqrt(HD)).masked_fill(~causal, float('-inf')).softmax(-1)
     a = grp((pattern @ v.view(B_, T_, NH, HD).transpose(1, 2)).transpose(1, 2).reshape(B_, T_, -1))
@@ -1051,7 +1085,7 @@ def rot_attention(i, h, causal):
         c = c + grp((pattern @ vn).transpose(1, 2).reshape(B_, T_, -1)) * Ro['ls_fc'].exp()
     if state['mode'] != 'all':
         bits_i, wn = rot_slice_bits(Ro, Q)
-        c = c * rot_blocks(Ro, c.abs() * wn, bits_i, f'h.{i}.attn.o_proj')
+        c = c * rot_blocks(Ro, c.abs() * wn, bits_i, f'h.{i}.attn.o_proj', ex.get('ov', 0.0))
     y = site('o_proj')(back(c, Q))
     if state.get('noise'):
         y = y + (c * Ro['ls_dn'].exp()).reshape(B_, T_, -1) @ torch.randn(NH * HD, y.shape[-1], device=h.device)
@@ -1565,6 +1599,7 @@ slots = [(P[n], w, rms(P[n][w])) for n in mlp for w in (('F',) if EXACT else ('V
          if not (EXACT and NEURON_DOWN and n.endswith('down_proj') and w == 'F') and not (FREEZE and w in ('V', 'U', 'F')) and ARM != 'rot']
 # rot: rotation angles by 1e-3 per step, thresholds by a tenth of their noise scale, assignment logits by 0.02.
 slots += [x for R in ROT_ALL for x in ((R, 'A', 1 / 3), (R, 'tau', 100 / 3 * R['s'].mean().item()), (R, 'L', 20 / 3))]
+slots += [x for P_ in GN.values() for x in ((P_, 'W1', rms(P_['W1'])), (P_, 'b1', 0.1), (P_, 'W2', 1 / math.sqrt(GATENET)))]
 slots += [(A[n], w, rms(A[n][w])) for n in sliced for w in (('V', 'U') if ATTN_FREE else ('F',))] + [(A[n], 'tau', 100 / 3 * A[n]['s'].mean().item()) for n in sliced]
 for l, S in SHARE_A.items():
     slots += [(S, 't', 100 / 3 * S['s'].mean().item()), (S, 'L_v', 20 / 3), (S, 'L_o', 20 / 3)]
