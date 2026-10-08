@@ -1669,8 +1669,12 @@ def description_bits():
     return total / math.log(2)
 # The budget: each step descends F + lam (E[k] - K); DESCENT_DUAL picks how lam (and the thresholds) follow it.
 DUAL = os.environ.get('DESCENT_DUAL', 'logint')
-if DUAL not in ('logint', 'pin'):
-    raise SystemExit('DESCENT_DUAL: logint or pin')
+if DUAL not in ('logint', 'pin', 'loghard'):
+    raise SystemExit('DESCENT_DUAL: logint, pin or loghard')
+# DESCENT_DUAL=loghard: logint whose lambda follows the delivered program's bits (a hard pass at the posterior mean
+# on up to four of the step's clean sequences) instead of the training pass's: under logint the whole model's
+# held-out hard program spent 2.96M of K = 4.22M bits per token at 10M tokens, the training count (sampled
+# parameters and gates) sitting above it.
 # DESCENT_DUAL=logint: the budget term lambda (E[k] - K) with log lambda integrated, log lambda <- log
 # lambda + (E[k] - K) / (K B_H), lambda started at the median over thresholds of the balance
 # |dF/dtau| / |dE[k]/dtau| (edits' rule in the Rust fitter); B_H, the horizon in steps, is a tenth of the
@@ -1714,6 +1718,15 @@ t0 = time.time()
 # toys' hard KL to 158 bits per token, and the multiplier alone left the MLP 16% under budget; pinning the training
 # pass's own count (sampled parameters and gates, upstream blocks drawn off) let the held-out hard program run
 # 7.0M bits per token at 5M tokens against K = 4.2M.
+def delivered_bits(ids, kinds):
+    """The delivered (hard, posterior-mean) program's bits per token on up to four of the step's clean sequences."""
+    rows = [b for b, k_ in enumerate(kinds) if k_ is None][:4] or [0]
+    draw(True)
+    install([None] * len(rows))
+    with torch.no_grad():
+        run(ids[rows], 'hard')
+    return torch.stack(state['hard']).sum(0).mean().item()
+
 def pin_shift(ids, kinds):
     rows = [b for b, k_ in enumerate(kinds) if k_ is None][:4]
     if not rows:
@@ -1787,6 +1800,8 @@ for step in range(steps):
     opt.zero_grad(); (objective + lam * (ek - K)).backward(); opt.step()
     if DUAL == 'pin':
         pin_shift(ids, kinds)
+    elif DUAL == 'loghard':
+        lam = lam * math.exp(min((delivered_bits(ids, kinds) - K) / K, 1.0) / B_H)
     else:
         # The relative violation, capped at +1 as it is bounded by -1 below, so lambda rises no faster than
         # it can fall (an uncapped rise ran away at K = 64 while the count started at 3.7 K).
