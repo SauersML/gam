@@ -41,7 +41,14 @@ pub(crate) struct DeviceState {
     references: Vec<(u64, BTreeMap<(Field, usize, usize), Tensor>)>,
     /// Rotary tables by rotary and positions ([`DeviceState::rotations`]).
     rotations: HashMap<RotationKey, (Tensor, Tensor)>,
+    /// Products of counterfactual runs' arrays with weight matrices ([`DeviceState::reference_product`]),
+    /// by run, array, layer and matrix; dropped whenever a weight changes.
+    products: BTreeMap<(u64, Field, usize, usize), Tensor>,
 }
+
+/// The bytes of reference products kept ([`DeviceState::reference_product`]): past them every
+/// product goes and is made again on use.
+const KEPT_PRODUCT_BYTES: usize = 2 << 30;
 
 /// A rotary's base, dimensions and pairing, and the positions of its table's rows.
 type RotationKey = (u32, u32, bool, Vec<u32>);
@@ -98,7 +105,7 @@ fn on_device<T: Send>(f: impl FnOnce(&mut DeviceState) -> T + Send) -> Option<T>
 
 impl DeviceState {
     pub(crate) fn new(device: Device) -> Self {
-        Self { device, generation: 0, resident: HashMap::new(), uploaded: Vec::new(), stacks: HashMap::new(), references: Vec::new(), rotations: HashMap::new() }
+        Self { device, generation: 0, resident: HashMap::new(), uploaded: Vec::new(), stacks: HashMap::new(), references: Vec::new(), rotations: HashMap::new(), products: BTreeMap::new() }
     }
 
     fn arithmetic(&self) -> Arithmetic {
@@ -174,6 +181,38 @@ impl DeviceState {
             }
         }
         Ok(())
+    }
+
+    /// A copy of `x wᵀ` for counterfactual run `r`'s array `(field, layer)` and weight matrix `w`
+    /// (`matrix` names it within the layer), made on first use and kept until a weight changes:
+    /// every program's run on that counterfactual run (each program of a batch, each run of a score)
+    /// reads the same product, such as an MLP's counterfactual pre-activation or the full write a
+    /// remainder's stand-in subtracts its named parts from.
+    fn reference_product(&mut self, r: &Reference, (field, layer): (Field, usize), matrix: usize, w: Matrix) -> Result<Tensor, String> {
+        let e = |e: GpuError| e.to_string();
+        let key = (r.id, field, layer, matrix);
+        if !self.products.contains_key(&key) {
+            self.ensure_reference(r, (field, layer, 0))?;
+            let wk = match w {
+                Matrix::Host(m) => Some(self.ensure(m.view()).map_err(e)?),
+                Matrix::Device(_) => None,
+            };
+            let wt = match (w, wk) {
+                (Matrix::Device(t), _) => t,
+                (Matrix::Host(_), Some(k)) => self.get(k).map_err(e)?,
+                (Matrix::Host(_), None) => return Err("a weight matrix went missing".into()),
+            };
+            let x = self.reference(r, (field, layer, 0))?;
+            let mut out = self.device.zeros(x.rows(), wt.rows()).map_err(e)?;
+            self.device.gemm(&mut out, 1.0, x, Op::N, wt, Op::T, 0.0, self.arithmetic()).map_err(e)?;
+            let bytes = |m: &BTreeMap<(u64, Field, usize, usize), Tensor>| m.values().map(|t| 4 * t.rows() * t.cols()).sum::<usize>();
+            if bytes(&self.products) + 4 * out.rows() * out.cols() > KEPT_PRODUCT_BYTES {
+                self.products.clear();
+            }
+            self.products.insert(key, out);
+        }
+        let kept = self.products.get(&key).ok_or("a reference product went missing")?;
+        self.device.copy(kept).map_err(e)
     }
 
     /// Array `key` of counterfactual run `r`, uploaded by [`DeviceState::ensure_reference`].
@@ -254,6 +293,7 @@ fn dropped(at: (usize, usize, usize)) {
     on_device(|s| {
         s.resident.retain(|k, _| !same(k));
         s.stacks.retain(|(keys, _), _| !keys.iter().any(same));
+        s.products.clear();
     });
 }
 
@@ -264,6 +304,7 @@ pub(crate) fn forget(generation: u64) {
         s.resident.retain(|k, _| k.0 != generation);
         s.uploaded.retain(|k| k.0 != generation);
         s.stacks.retain(|(keys, _), _| keys.first().is_none_or(|k| k.0 != generation));
+        s.products.clear();
     });
 }
 
@@ -362,12 +403,19 @@ fn standins(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, r: &Refer
                     s.device.gemm(&mut w, sign, &a, Op::N, &o, Op::T, 1.0, arithmetic).map_err(e)?;
                 }
             }
+            // A remainder unit (`rest`: the matrix less its named parts) subtracts its named parts
+            // from the full write, kept per counterfactual run (`reference_product`), as `sliced`
+            // computes it.
             Block::Slices { layer, down, rest, .. } => {
                 let mlp = weights.layers[*layer].mlp.as_ref().ok_or("a VPD view of a layer without an MLP")?;
                 let vpd = weights.vpd.get(layer).ok_or_else(|| format!("layer {layer} has no VPD view"))?;
                 s.ensure_reference(r, (Field::Active, *layer, 0))?;
                 let active = s.device.copy(s.reference(r, (Field::Active, *layer, 0))?).map_err(e)?;
-                w = sliced(s, (&vpd.down_u, &vpd.down_v), Matrix::Host(&mlp.out), down, *rest, &active, None).map_err(e)?;
+                w = sliced(s, (&vpd.down_u, &vpd.down_v), Matrix::Host(&mlp.out), down, false, &active, None).map_err(e)?;
+                if *rest {
+                    let full = s.reference_product(r, (Field::Active, *layer), PRODUCT_MLP_OUT, Matrix::Host(&mlp.out))?;
+                    w = less_named(s, full, w, down, vpd.down_u.nrows()).map_err(e)?;
+                }
             }
             Block::AttnSlices { layer, o, rest, .. } => {
                 let a = weights.vpd_attention.get(layer).ok_or_else(|| format!("layer {layer}'s attention has no VPD view"))?;
@@ -375,7 +423,11 @@ fn standins(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, r: &Refer
                 s.ensure_reference(r, (Field::Reads, *layer, 0))?;
                 let z = s.device.copy(s.reference(r, (Field::Reads, *layer, 0))?).map_err(e)?;
                 let outputs = s.stacked(&lw.heads.iter().map(|h| &h.output).collect::<Vec<_>>(), false).map_err(e)?;
-                w = sliced(s, (&a.o.0, &a.o.1), Matrix::Device(&outputs), o, *rest, &z, None).map_err(e)?;
+                w = sliced(s, (&a.o.0, &a.o.1), Matrix::Device(&outputs), o, false, &z, None).map_err(e)?;
+                if *rest {
+                    let full = s.reference_product(r, (Field::Reads, *layer), PRODUCT_ATTENTION_OUT, Matrix::Device(&outputs))?;
+                    w = less_named(s, full, w, o, a.o.0.nrows()).map_err(e)?;
+                }
             }
             Block::Features { layer, features, rest } => {
                 s.ensure_reference(r, (Field::Input, *layer, 0))?;
@@ -396,8 +448,6 @@ fn standins(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, r: &Refer
     Ok((embed, out))
 }
 
-/// `circuit` run on the process's device ([`use_device`]), or `None` when there is none or the
-/// circuit holds a block the device path does not cover.
 /// Copies of one batch run together as one batch ([`run_stacked`]): `count` copies of `rows` rows
 /// each, copy `j` at rows `j·rows..(j + 1)·rows`, each naming its own subcomponents of the merged
 /// circuit's VPD units.
@@ -461,6 +511,8 @@ pub(crate) fn per_copy(execution: Execution, count: usize) -> Result<Vec<Array2<
         .collect()
 }
 
+/// `circuit` run on the process's device ([`use_device`]), or `None` when there is none or the
+/// circuit holds a block the device path does not cover.
 pub(crate) fn run(weights: &Weights, circuit: &Circuit, job: &Run) -> Option<Result<Execution, String>> {
     // A VPD-view attention's heads attend together (alike).
     let covered = |b: &Block| match b {
@@ -945,7 +997,7 @@ fn vpd_site(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, job: &Run
     let e = |e: GpuError| e.to_string();
     // A slot's per-copy counts in a stacked run.
     let mask = |u: usize, slot: usize| -> Masked<'_> { copies.and_then(|(c, rows)| c.masks.get(&(u, slot)).map(|m| (m, rows, c.rows))) };
-    let (rows, width, arithmetic, ops) = (job.tokens.len(), weights.width(), s.arithmetic(), job.ops);
+    let (rows, width, ops) = (job.tokens.len(), weights.width(), job.ops);
     let mut writes = BTreeMap::new();
     let computing = |u: &usize| circuit.units[*u].computes && !job.swaps.contains_key(u);
     // A unit's route inputs (after the cuts into the site) and their normed values under `norm`, the
@@ -987,11 +1039,12 @@ fn vpd_site(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, job: &Run
         let mlp = lw.mlp.as_ref().ok_or("a VPD view of a layer without an MLP")?;
         let vpd = weights.vpd.get(&layer).ok_or_else(|| format!("layer {layer} has no VPD view"))?;
         let x_ref = reference(s, Field::Input, layer)?;
-        let (gate, bias) = (s.ensure(mlp.gate.view()).map_err(e)?, s.ensure(row(&mlp.bias)).map_err(e)?);
-        let mut pre_ref = s.device.zeros(rows, mlp.gate.nrows()).map_err(e)?;
-        if let Some(x) = &x_ref {
-            s.device.gemm(&mut pre_ref, 1.0, x, Op::N, s.get(gate).map_err(e)?, Op::T, 0.0, arithmetic).map_err(e)?;
-        }
+        let bias = s.ensure(row(&mlp.bias)).map_err(e)?;
+        // The counterfactual pre-activation, the same for every program on this counterfactual run.
+        let mut pre_ref = match job.reference {
+            Some(r) if !r.zero => s.reference_product(r, (Field::Input, layer), PRODUCT_MLP_GATE, Matrix::Host(&mlp.gate))?,
+            _ => s.device.zeros(rows, mlp.gate.nrows()).map_err(e)?,
+        };
         s.device.add_row(&mut pre_ref, 1.0, s.get(bias).map_err(e)?).map_err(e)?;
         let mut deltas: BTreeMap<usize, Tensor> = BTreeMap::new();
         for &u in slices.iter().filter(|u| computing(u)) {
@@ -1029,13 +1082,13 @@ fn vpd_site(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, job: &Run
             maps.push(s.stacked(&per_head, along_rows).map_err(e)?);
         }
         let x_ref = reference(s, Field::AttentionInput, layer)?;
+        // The counterfactual queries, keys and values, the same for every program on this run.
         let mut refs = Vec::with_capacity(3);
-        for map in &maps[..3] {
-            let mut p = s.device.zeros(rows, map.rows()).map_err(e)?;
-            if let Some(x) = &x_ref {
-                s.device.gemm(&mut p, 1.0, x, Op::N, map, Op::T, 0.0, arithmetic).map_err(e)?;
-            }
-            refs.push(p);
+        for (m, map) in maps[..3].iter().enumerate() {
+            refs.push(match job.reference {
+                Some(r) if !r.zero => s.reference_product(r, (Field::AttentionInput, layer), PRODUCT_ATTENTION_IN + m, Matrix::Device(map))?,
+                _ => s.device.zeros(rows, map.rows()).map_err(e)?,
+            });
         }
         let factors = [&a.q, &a.k, &a.v];
         let mut deltas: BTreeMap<usize, Vec<Tensor>> = BTreeMap::new();
@@ -1244,9 +1297,26 @@ fn features_write(s: &mut DeviceState, weights: &Weights, layer: usize, features
 }
 
 /// A matrix `W` of a VPD view: a host matrix (kept resident) or a device tensor (stacked head maps).
+#[derive(Clone, Copy)]
 enum Matrix<'a> {
     Host(&'a Stored),
     Device(&'a Tensor),
+}
+
+/// Which matrix of a layer a reference product multiplies ([`DeviceState::reference_product`]).
+const PRODUCT_MLP_GATE: usize = 0;
+const PRODUCT_MLP_OUT: usize = 1;
+const PRODUCT_ATTENTION_OUT: usize = 2;
+/// The query, key and value maps: `PRODUCT_ATTENTION_IN + m` for map `m`.
+const PRODUCT_ATTENTION_IN: usize = 3;
+
+/// A remainder unit's write: the full write `full` less its named parts' `named` (subcomponents
+/// `picked` of a matrix with `count` of them), as [`sliced`] with `rest` computes it.
+fn less_named(s: &DeviceState, mut full: Tensor, named: Tensor, picked: &[usize], count: usize) -> Result<Tensor, GpuError> {
+    if picked.iter().any(|&i| i <= count) {
+        s.device.axpy(&mut full, -1.0, &named)?;
+    }
+    Ok(full)
 }
 
 /// `graph::sliced_parts` on the device: subcomponents `picked` of `w` (out × in) with factors `U`
