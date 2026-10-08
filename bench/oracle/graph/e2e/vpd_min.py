@@ -6,7 +6,7 @@ then group and one-by-one pruning, under a part budget; the result as {"behavior
 reproduced = 1 - execution error / the empty program's (fit families, the empty program scored in the same
 run); weights_share = opaque numbers / every head and MLP number; parts = heads + subcomponents.
 
-  vpd_min.py BEHAVIOR_ID... [--budget 2048] [--device gpu] [--out ~/mpd-data/graph_oracle/runs/vpd_min]
+  vpd_min.py BEHAVIOR_ID... [--budget 512] [--experiments 8] [--device gpu] [--out ~/mpd-data/graph_oracle/runs/vpd_min]
 """
 
 from __future__ import annotations
@@ -47,10 +47,10 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("behaviors", nargs="+")
     ap.add_argument("--model", default="vpd4l")
-    ap.add_argument("--budget", type=int, default=1024, help="the most parts a program may declare")
+    ap.add_argument("--budget", type=int, default=512, help="the most parts a program may declare")
     ap.add_argument("--growth", type=float, default=2.0, help="ratio between successive prefix sizes")
     ap.add_argument("--device")
-    ap.add_argument("--experiments", type=int, default=16)
+    ap.add_argument("--experiments", type=int, default=8, help="per score during the search (the result is rescored on a held-out seed)")
     ap.add_argument("--rankings", type=Path, default=DATA / "experiments/vpd_rankings")
     ap.add_argument("--export", type=Path)
     ap.add_argument("--vpd", type=Path, default=Path.home() / "mpd-data/engine/vpd4l_decomposition")
