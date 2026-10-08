@@ -135,14 +135,19 @@ def totals(results: list[dict]) -> list[float]:
     return [r["total_bits"] if r.get("valid", True) else math.inf for r in results]
 
 
-def credit(answer: Answer, score, k: int = 16, rng: random.Random | None = None) -> tuple[float, dict[Edit, float]]:
-    """The answer's score and dS for k part drops sampled uniformly (all when fewer) and every statement drop,
-    one checker batch."""
+def credit_edits(answer: Answer, k: int = 16, rng: random.Random | None = None) -> list[Edit]:
+    """credit's edits: k part drops sampled uniformly (all when fewer), then every statement drop."""
     rng = rng or random.Random(0)
     part_drops = drops(answer)
     if len(part_drops) > k:
         part_drops = rng.sample(part_drops, k)
-    edits = part_drops + unaligns(answer)
+    return part_drops + unaligns(answer)
+
+
+def credit(answer: Answer, score, k: int = 16, rng: random.Random | None = None) -> tuple[float, dict[Edit, float]]:
+    """The answer's score and dS for k part drops sampled uniformly (all when fewer) and every statement drop,
+    one checker batch."""
+    edits = credit_edits(answer, k, rng)
     s = totals(score([answer.source()] + [apply(answer, e).source() for e in edits]))
     return s[0], {e: v - s[0] for e, v in zip(edits, s[1:])}
 

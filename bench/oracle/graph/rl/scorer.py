@@ -78,18 +78,19 @@ def checker(items: list[dict]) -> list[dict]:
         if c.loaded != path:
             load_behavior(c, path)
             c.loaded = path
-        def key(k):
-            return items[k].get("seed", 0), items[k].get("uniform_seeds") or 0, items[k].get("experiments") or 32, json.dumps(items[k].get("options"), sort_keys=True)
+        def key(k):  # an item with "reader": False is scored without the reader term (an edit keeps the answer's explanation)
+            return (items[k].get("seed", 0), items[k].get("uniform_seeds") or 0, items[k].get("experiments") or 32, json.dumps(items[k].get("options"), sort_keys=True),
+                    items[k].get("reader", True))
 
-        for seed, uniform, experiments, options in sorted({key(k) for k in ks}):  # one batch request per seed: M once per experiment, the programs in parallel
-            batch = [k for k in ks if key(k) == (seed, uniform, experiments, options)]
+        for seed, uniform, experiments, options, reader in sorted({key(k) for k in ks}):  # one batch request per seed: M once per experiment, the programs in parallel
+            batch = [k for k in ks if key(k) == (seed, uniform, experiments, options, reader)]
             extra = {"options": json.loads(options)} if json.loads(options) else {}
             for s in range(0, len(batch), BATCH):  # a server's memory grows with the programs of one request
                 chunk = batch[s : s + BATCH]
                 # without a reader server the reader items (13 MB per vpd4l score) are kept only for every
                 # ITEMS_EVERY-th program (g-reader scores those offline), dropped otherwise
                 programs = [{"source": items[k]["source"], "explanation": items[k].get("explanation", "")} for k in chunk]  # the reader reads the explanation alone
-                for k, r in zip(chunk, c.score_batch(programs, experiments=experiments, seed=seed, uniform_seeds=uniform or None, **extra)):
+                for k, r in zip(chunk, c.score_batch(programs, experiments=experiments, seed=seed, uniform_seeds=uniform or None, reader=reader, **extra)):
                     if not os.environ.get("GRAPH_READER") and not (ITEMS_EVERY and k % ITEMS_EVERY == 0):
                         r.pop("items", None)
                     elif ITEM_STRIDE > 1 and r.get("items"):  # every ITEM_STRIDE-th item: the reader term's mean stays unbiased
