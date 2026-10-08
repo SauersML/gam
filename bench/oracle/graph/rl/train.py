@@ -684,7 +684,7 @@ def rloo(S: np.ndarray, scale: float) -> np.ndarray:
     (leave-one-out), in units of the behavior's fixed scale. No per-group standard deviation: it blew tiny score
     differences within a group of near-equal answers up to unit advantages."""
     n = len(S)
-    if n < 2:
+    if n < 2 or (S == S[0]).all():  # equal scores: exactly no signal (the formula leaves rounding residue)
         return np.zeros(n)
     return ((S.sum() - S) / (n - 1) - S) / scale
 
@@ -1286,6 +1286,7 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--steps", type=int, default=1)
     ap.add_argument("--hours", type=float, help="stop and save after this many hours")
+    ap.add_argument("--checker-hours", type=float, help="stop and save once training scores (with rl2's credit and refinement) used this many checker hours")
     ap.add_argument("--behaviors-per-step", type=int, default=8)
     ap.add_argument("--samples", type=int, default=8, help="programs per behavior per step (the group)")
     ap.add_argument("--max-tokens", type=int, default=1536)
@@ -1418,6 +1419,8 @@ def main():
     started = time.time()
     for step in range(args.steps):
         if args.hours and time.time() - started > 3600 * args.hours:
+            break
+        if args.checker_hours and TOTALS["checker_seconds"] > 3600 * args.checker_hours:  # the A/B's budget: equal checker time per arm
             break
         pol.save(adapter)
         if args.materialize_every and step and step % args.materialize_every == 0:

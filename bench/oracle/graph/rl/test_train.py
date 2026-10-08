@@ -377,6 +377,7 @@ def check_rl2_pieces():
     A = train.rloo(np.array([1.0, 2.0, 3.0]), 2.0)
     assert np.allclose(A, [0.75, 0.0, -0.75]), A
     assert train.rloo(np.array([5.0]), 1.0).tolist() == [0.0]
+    assert train.rloo(np.array([0.1] * 7), 0.3).tolist() == [0.0] * 7
     args = argparse.Namespace(seed=0, eval_seed=5)
     seeds = [train.step_seed(args, s) for s in range(10)]
     assert len(set(seeds)) == 10 and 5 not in seeds
