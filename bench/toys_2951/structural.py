@@ -206,9 +206,11 @@ class Rep:
         self.S0 = sp.csr_matrix((val, (rows, idx)), shape=(toy.wte.shape[0], self.C))
         readable = set(idx.tolist())
         items, w = [], []
+        self.readable = []
         for l in range(L + 1):
             M_ = toy.fc[l] if l < L else toy.head
             ks = np.array(sorted(readable), dtype=np.int64)
+            self.readable.append(ks)
             E = M_ @ D.A[:, ks]
             tol = 1e-12 * max(np.abs(E).max(), 1e-300)
             for i, x in zip(*np.nonzero(np.abs(E) > tol)):
@@ -505,6 +507,65 @@ def body_bits(p, B, unit=None):
     units, rd, n_slots = p
     ws = [w for u in units for w in u[1]] + [w for u in units for part in (u[2], u[3]) for _, w in part] + [w for _, _, w in rd]
     return sum(1 if unit is not None and abs(w) == unit else B for w in ws) + len(units) + n_slots
+
+
+def number_bits(vals, B, tol=1e-12):
+    """Numbers at B bits each, an entry of exactly +-1 its sign."""
+    vals = np.asarray(vals, dtype=float)
+    return float(np.where(np.abs(np.abs(vals) - 1.0) <= tol, 1.0, float(B)).sum())
+
+
+def code_cost(D, v):
+    """The bits of v's exact code on dictionary D (as Dictionary.code codes a write, without adding atoms): its atoms'
+    names and numbers, or, where that costs more than v itself, v's d numbers."""
+    nv = np.linalg.norm(v)
+    if nv == 0:
+        return 0.0
+    support, res, coef = [], v.copy(), np.zeros(0)
+    c = D.R @ v if len(D.R) else np.zeros(0)
+    while len(support) < 64 and len(D.R):
+        if support:
+            c = D.R @ res
+        k = int(np.abs(c).argmax())
+        if abs(c[k]) <= 1e-9 * nv or k in support:
+            break
+        support.append(k)
+        coef = np.linalg.lstsq(D.R[support].T, v, rcond=None)[0]
+        res = v - D.R[support].T @ coef
+        if np.linalg.norm(res) <= 1e-10 * nv:
+            break
+    res[np.abs(res) <= 1e-12 * nv] = 0.0
+    axes = np.nonzero(res)[0]
+    n = len(support) + len(axes)
+    if n > D.limit:
+        return float(len(v) * D.B)
+    C = max(len(D.atoms), 2)
+    return name_set(C, n) + number_bits(np.concatenate([coef, res[axes]]), D.B)
+
+
+def rank_one_bits(rep, l, kind, u, v):
+    """A rank-one piece u v^T of layer l's c_fc (kind 'fc': u over its neurons, v over the stream) or down_proj
+    (kind 'dn': u over the stream, v over its neurons) under the same code (the outer-product core form): c_fc, its
+    receivers (u != 0) and its senders (the atoms the read v^T A_l touches) named, nnz(u) + nnz(v^T A_l) numbers;
+    down_proj, its senders (v != 0) named with nnz(v) numbers and its write u coded exactly on the dictionary
+    (code_cost). Excludes the per-token index (pieces_bits_per_token adds it)."""
+    B = rep.B
+    if kind == "fc":
+        r = v @ rep.D.A[:, rep.readable[l]]
+        r = r[np.abs(r) > 1e-12 * max(np.abs(r).max(), 1e-300)]
+        nu = u[u != 0]
+        return name_set(rep.m[l], len(nu)) + name_set(rep.C, len(r)) + number_bits(nu, B) + number_bits(r, B)
+    nv = v[v != 0]
+    return name_set(rep.m[l], len(nv)) + number_bits(nv, B) + code_cost(rep.D, np.asarray(u, dtype=float))
+
+
+def pieces_bits_per_token(rep, pieces, ons):
+    """Per-token bits of an explanation by rank-one pieces [(layer, kind, u, v)] gated by ons (tokens x pieces,
+    True where a piece is on, e.g. VPD's causal importance > 0): each piece on costs log2(#pieces) and its
+    rank_one_bits. Returns the mean over tokens and each piece's bits."""
+    per = np.array([rank_one_bits(rep, l, k, u, v) for l, k, u, v in pieces])
+    ons = np.asarray(ons, dtype=float)
+    return float((ons @ (per + math.log2(max(len(pieces), 2)))).mean()), per
 
 
 def raw_bits(rep, js, B, ms=()):
