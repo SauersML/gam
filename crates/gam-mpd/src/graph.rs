@@ -98,12 +98,23 @@ pub struct BindingIr {
 }
 
 /// One interchange of a binding: prompts `base` and `source` (indices into the behavior, of one
-/// length) and the algorithm's answer token at each of the base's targets.
+/// length) and the algorithm's answer token at each of the base's targets, or with `answers` the
+/// set of tokens it accepts at each (many right answers: any later year), used in its place.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct PairIr {
     pub base: usize,
     pub source: usize,
+    #[serde(default)]
     pub answer: Vec<u32>,
+    #[serde(default)]
+    pub answers: Vec<Vec<u32>>,
+}
+
+impl PairIr {
+    /// The accepted tokens at each target.
+    fn accepted(&self) -> Vec<Vec<u32>> {
+        if self.answers.is_empty() { self.answer.iter().map(|&a| vec![a]).collect() } else { self.answers.clone() }
+    }
 }
 
 fn yes() -> bool {
@@ -3689,8 +3700,9 @@ impl Checker {
     }
 
     /// The error of `graph`'s bindings, bits per target: for each binding the mean, over its pairs'
-    /// base targets, of how much less likely `M` finds the algorithm's answer than its own top token
-    /// (`max log2 p − log2 p(answer)`) when the bound nodes' writes come from the source prompt and
+    /// base targets, of how much less likely `M` finds the algorithm's answer (its set of answers)
+    /// than its own top token (`max log2 p − log2 Σ p(answer)`, at least zero) when the bound nodes'
+    /// writes come from the source prompt and
     /// every other piece computes on the base (`M`'s circuit, [`Graph::model`]); summed over
     /// bindings. An answer `M`'s interchanged run ranks first costs nothing.
     pub fn binding_error(&mut self, graph: &Graph) -> Result<f64, String> {
@@ -3707,8 +3719,9 @@ impl Checker {
                 if base.token_ids.len() != source.token_ids.len() {
                     return Err(format!("binding {}: prompts {} and {} differ in length", binding.variable, pair.base, pair.source));
                 }
-                if pair.answer.len() != base.target_positions.len() {
-                    return Err(format!("binding {}: {} answers for prompt {}'s {} targets", binding.variable, pair.answer.len(), pair.base, base.target_positions.len()));
+                let accepted = pair.accepted();
+                if accepted.len() != base.target_positions.len() || accepted.iter().any(Vec::is_empty) {
+                    return Err(format!("binding {}: {} answers for prompt {}'s {} targets", binding.variable, accepted.len(), pair.base, base.target_positions.len()));
                 }
                 bases.push(base.token_ids.clone());
                 sources.push(source.token_ids.clone());
@@ -3720,16 +3733,19 @@ impl Checker {
             let mut answers = Vec::new();
             for (pair, &(start, _)) in binding.pairs.iter().zip(&base.spans) {
                 rows.extend(prompts[pair.base].target_positions.iter().map(|&t| start + t));
-                answers.extend(pair.answer.iter().copied());
+                answers.extend(pair.accepted());
             }
             let written = execute(&self.weights, &circuit, &source, &[], &BTreeMap::new())?.writes;
             let swaps: BTreeMap<usize, Array2<f64>> = nodes.iter().map(|&u| written.get(u).cloned().flatten().map(|w| (u, w)).ok_or_else(|| format!("binding {}: a bound node wrote nothing", binding.variable))).collect::<Result<_, _>>()?;
             let swapped = execute(&self.weights, &circuit, &base, &rows, &swaps)?.log_probabilities;
             let mut cost = 0.0;
-            for (row, &answer) in swapped.outer_iter().zip(&answers) {
+            for (row, set) in swapped.outer_iter().zip(&answers) {
                 let top = row.iter().fold(f64::NEG_INFINITY, |m, &x| m.max(x));
-                let p = row.get(answer as usize).copied().ok_or_else(|| format!("binding {}: answer token {answer} outside the vocabulary", binding.variable))?;
-                cost += (top - p) / std::f64::consts::LN_2;
+                let mut p = 0.0;
+                for &a in set {
+                    p += row.get(a as usize).copied().ok_or_else(|| format!("binding {}: answer token {a} outside the vocabulary", binding.variable))?.exp();
+                }
+                cost += ((top - p.ln()) / std::f64::consts::LN_2).max(0.0);
             }
             total += cost / answers.len().max(1) as f64;
         }

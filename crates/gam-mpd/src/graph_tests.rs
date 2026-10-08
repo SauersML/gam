@@ -900,7 +900,7 @@ fn bindings_are_checked_by_interchange() {
     let vocabulary = weights.embedding.nrows() as u32;
     let bound = |answers: &[u32]| {
         let mut p = program.clone();
-        p.bindings = vec![BindingIr { variable: "v".into(), nodes: vec!["m0".into()], pairs: pairs.iter().zip(answers).map(|(&(base, source), &a)| PairIr { base, source, answer: vec![a] }).collect() }];
+        p.bindings = vec![BindingIr { variable: "v".into(), nodes: vec!["m0".into()], pairs: pairs.iter().zip(answers).map(|(&(base, source), &a)| PairIr { base, source, answer: vec![a], ..PairIr::default() }).collect() }];
         p
     };
     let wrong: Vec<u32> = top.iter().map(|t| (t + 1) % vocabulary).collect();
@@ -910,6 +910,17 @@ fn bindings_are_checked_by_interchange() {
     assert!(true_error < 1e-6, "M's own interchanged answers cost {true_error:e} bits per target");
     assert!(false_error > 1e-3, "wrong answers cost {false_error:e} bits per target");
     assert_eq!(checker.binding_error(&graph).expect("no binding"), 0.0);
+    // A set of answers that holds M's top token costs nothing; a set without it pays.
+    let with_sets = |sets: Vec<Vec<u32>>| {
+        let mut p = bound(&top);
+        for (pair, set) in p.bindings[0].pairs.iter_mut().zip(sets) {
+            pair.answers = vec![set];
+        }
+        Graph::parse(&p, &weights).expect("parse")
+    };
+    let holding = checker.binding_error(&with_sets(top.iter().zip(&wrong).map(|(t, w)| vec![*w, *t]).collect())).expect("sets");
+    let missing = checker.binding_error(&with_sets(wrong.iter().map(|w| vec![*w]).collect())).expect("sets");
+    assert!(holding == 0.0 && (missing - false_error).abs() < 1e-9, "sets: holding {holding:e}, missing {missing:e} vs {false_error:e}");
     let (score, _) = checker.score(&bound(&wrong), 4, 1, true, None).expect("score");
     assert!((score.binding_error_bits - score.n * false_error).abs() <= 1e-6 * score.binding_error_bits, "the score charges N times the error");
     // A binding names nodes of the program.
