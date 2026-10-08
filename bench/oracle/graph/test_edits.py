@@ -7,7 +7,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
-from edits import Answer, Edit, apply, credit, refine  # noqa: E402
+from edits import Answer, Edit, adds, apply, credit, refine  # noqa: E402
 
 SOURCE = '''"""doc"""
 from mech import align, claim
@@ -71,3 +71,10 @@ def test_refine_reaches_the_optimum():
     named = {p for st in best.statements for p in st.parts}
     assert named == NEEDED, named
     assert s == len(NEEDED)
+
+
+def test_adds_go_to_the_align_statement():
+    a = Answer.parse("align(answer, <p:2.v.559>)\nclaim(answer, <p:1.q.3>)\n")
+    edit = adds(a, {"answer": ["<p:2.v.9>"]}, 1)[0]
+    assert edit.kind == "align", edit
+    assert apply(a, edit).statements[0].parts == ("<p:2.v.559>", "<p:2.v.9>")

@@ -80,9 +80,14 @@ def main():
         check_init_adapter(Path(d))
         check_part_vocab(Path(d))
         check_registry_parts(Path(d))
+        check_ppo(pol)
+        check_credit_advantages(pol)
+        check_rl2_step(pol)
     check_split_prompts()
+    check_rl2_pieces()
     print("ok: token log-probabilities, KL 0 and DPO ln 2 at the reference, GRPO gradient = summed log-probability policy gradient, "
-          "packed groups = separate sequences, left-padded batched generation, g-predict's adapters = their PEFT conversion, prompt split, part tokens (stand-in and registry)")
+          "packed groups = separate sequences, left-padded batched generation, g-predict's adapters = their PEFT conversion, prompt split, part tokens (stand-in and registry), "
+          "RL v2: RLOO at a fixed scale, step seeds, PPO epoch 0 = the GRPO gradient, clipping, token credit (canonical and other tokenizations), a whole step on stand-ins")
 
 
 def check_pack(pol):
@@ -270,6 +275,200 @@ def check_split_prompts():
         assert [p["text"] for p in train_views[0]["prompts"]] == ["1", "2", "3", "5", "6", "7", "9"]
         assert [p["text"] for p in held[0]["prompts"]] == ["0", "4", "8"]
         assert Path(held[0]["path"]).exists() and "path" not in __import__("json").loads(Path(held[0]["path"]).read_text())
+
+
+class Recorder:
+    """A stand-in optimizer and warmup: records the (clipped) gradients at each step, moves nothing unless lr > 0 (SGD)."""
+
+    def __init__(self, params, lr=0.0):
+        self.params, self.lr, self.grads = params, lr, []
+
+    def step(self):
+        if hasattr(self, "params"):
+            self.grads.append([p.grad.clone() if p.grad is not None else torch.zeros_like(p) for p in self.params])
+            with torch.no_grad():
+                for p in self.params:
+                    if p.grad is not None:
+                        p -= self.lr * p.grad
+
+    def zero_grad(self, set_to_none=True):
+        for p in self.params:
+            p.grad = None
+
+
+class NoWarmup:
+    def step(self):
+        pass
+
+
+def check_ppo(pol):
+    """ppo_update's first epoch is grpo_update's gradient (constant token advantages, the KL through the advantage), a
+    second epoch on an unmoved policy repeats it, and after a large step some ratios are clipped."""
+    g = torch.Generator().manual_seed(6)
+    prompts = [torch.randint(0, 1000, (n,), generator=g).tolist() for n in (4, 6)]
+    comps = [torch.randint(0, 1000, (n,), generator=g).tolist() for n in (5, 3)]
+    for p in pol.params:
+        torch.nn.init.normal_(p, std=0.02)
+    adv = [0.7, -1.3]
+    pol.model.zero_grad()
+    train.grpo_update(pol, prompts, comps, adv, beta=0.3, micro=1)
+    torch.nn.utils.clip_grad_norm_(pol.params, 1.0)
+    want = [p.grad.clone() for p in pol.params]
+    pol.model.zero_grad()
+    rec = Recorder(pol.params)
+    stats = train.ppo_update(pol, prompts, comps, [[a] * len(c) for a, c in zip(adv, comps)], 0.3, 1, 2, 0.2, rec, NoWarmup())
+    for epoch in range(2):
+        for a, b in zip(want, rec.grads[epoch]):
+            assert torch.allclose(a, b, atol=1e-6), (epoch, float((a - b).abs().max()))
+    assert stats["clip_fraction"] == [0.0, 0.0], stats
+    rec = Recorder(pol.params, lr=50.0)
+    stats = train.ppo_update(pol, prompts, comps, [[a] * len(c) for a, c in zip(adv, comps)], 0.0, 1, 2, 0.2, rec, NoWarmup())
+    assert stats["clip_fraction"][0] == 0.0 and stats["clip_fraction"][1] > 0.0, stats
+
+
+ANSWER = """I look at the previous token.
+```python
+def answer(tokens):
+    # the copy
+    return tokens
+
+
+align(answer, <p:2.v.559>, <p:2.o.735>)
+claim(answer, <p:1.q.3>)
+```
+The answer is copied by layer 2's value and output parts."""
+
+
+def check_credit_advantages(pol):
+    """credit_advantages: a part's tokens get dS(drop it) / scale, the rest of its statement dS(drop the statement) / scale
+    (+inf: 1), the other tokens the episode advantage; the same with a tokenization that re-encoding does not give."""
+    from edits import Edit
+
+    tok = pol.tok
+    source = train.split_answer(ANSWER)[0]
+    assert ANSWER[train.program_offset(ANSWER, source):].startswith(source)
+    dS = {Edit("drop", "answer", "align", "<p:2.v.559>"): 3.0, Edit("unalign", "answer", "align"): float("inf"), Edit("unalign", "answer", "claim"): -1.0}
+    canonical = tok.encode(ANSWER, add_special_tokens=False) + [pol.end]
+    chars = [i for ch in ANSWER for i in tok.encode(ch, add_special_tokens=False)] + [pol.end]
+    assert chars != canonical[: len(chars)]
+    for completion in (canonical, chars):
+        adv = train.credit_advantages(tok, completion, ANSWER, source, -0.25, dS, 2.0)
+        spans = train.token_spans(tok, completion, ANSWER)
+        assert len(adv) == len(completion) == len(spans)
+        part = ANSWER.index("<p:2.v.559>")
+        line = ANSWER.index("align(answer")
+        claim = ANSWER.index("claim(answer")
+        for (c0, c1), a in zip(spans, adv):
+            if c1 <= c0:
+                assert a == -0.25
+            elif c1 > part and c0 < part + len("<p:2.v.559>"):  # a token overlapping the part (" <")
+                assert a == 1.5, (ANSWER[c0:c1], a)
+            elif c0 >= line and c1 <= ANSWER.index("\n", line):
+                assert a == 1.0, (ANSWER[c0:c1], a)
+            elif c0 >= claim and c1 <= ANSWER.index("\n", claim):
+                assert a == -0.5, (ANSWER[c0:c1], a)
+            elif c1 <= line - 1 or c0 >= ANSWER.index("```\nThe"):
+                assert a == -0.25, (ANSWER[c0:c1], a)
+
+
+def check_rl2_pieces():
+    import numpy as np
+
+    A = train.rloo(np.array([1.0, 2.0, 3.0]), 2.0)
+    assert np.allclose(A, [0.75, 0.0, -0.75]), A
+    assert train.rloo(np.array([5.0]), 1.0).tolist() == [0.0]
+    args = argparse.Namespace(seed=0, eval_seed=5)
+    seeds = [train.step_seed(args, s) for s in range(10)]
+    assert len(set(seeds)) == 10 and 5 not in seeds
+    assert train.step_seed(argparse.Namespace(seed=1, eval_seed=5), 0) == 1 << 20
+    sc = train.Scales({"a": "x"})
+    sc.take([("a", "teacher", {}), ("a", "empty", {}), ("b", "empty", {})], [{"valid": True, "total_bits": 10.0}, {"valid": True, "total_bits": 40.0}, {"valid": True, "total_bits": 20.0}])
+    assert sc.scale == {"a": 10.0, "b": 20.0} and sc.target == {"a": 10.0, "b": 0.0}
+    sc.observe("a", np.array([12.0, 30.0, 99.0]), np.array([True, True, False]))
+    sc.observe("b", np.array([1.0]), np.array([True]))
+    assert abs(sc.gap["a"] - 1.1) < 1e-12 and sc.gap["b"] == sc.FLOOR
+    import random
+
+    picks = [sc.draw([{"id": "a"}, {"id": "b"}], 1, random.Random(i))[0]["id"] for i in range(400)]
+    assert picks.count("a") > 300, picks.count("a")
+
+
+def check_rl2_step(pol):
+    """A whole rl2 step on stand-ins: a sampler that writes fixed answers and the score of test_edits (10 bits per needed
+    part missing, 1 per part named; invalid without an answer statement). Behavior "x" gets answers of different
+    scores, "y" only invalid ones (dropped, refilled by "z"); credit marks tokens, refine improves the best answers
+    (expert iteration), and the PPO epochs and the expert-iteration step run."""
+    import json
+
+    import numpy as np
+    from edits import Answer
+
+    needed = {"<p:2.v.559>", "<p:2.o.735>", "<p:2.v.9>"}
+
+    def stand_in(items):
+        out = []
+        for it in items:
+            a = Answer.parse(it["source"])
+            named = {q for st in a.statements for q in st.parts}
+            valid = any(st.variable == "answer" and st.kind == "align" for st in a.statements)
+            out.append({"total_bits": 10.0 * len(needed - named) + len(named) if valid else 1e4, "valid": valid})
+        return out
+
+    def answer_with(parts):
+        return ANSWER.replace("<p:2.v.559>, <p:2.o.735>", ", ".join(parts)) if parts else ANSWER.replace("align(answer, <p:2.v.559>, <p:2.o.735>)\n", "")
+
+    texts = {"x": [answer_with(["<p:2.v.559>", "<p:2.o.735>"]), answer_with(["<p:2.v.559>"]), answer_with(["<p:2.v.559>", "<p:3.o.1>"]), answer_with([])],
+             "y": [answer_with([])] * 4, "z": [answer_with(["<p:2.v.9>"]), answer_with(["<p:2.v.9>", "<p:2.o.735>"]), answer_with(["<p:2.v.9>"]), answer_with([])]}
+    asked = []
+
+    def sampler(prompts, n, adapter, version):
+        out = []
+        for p in prompts:
+            bid = pol.tok.decode(p).split("behavior ")[1][0]
+            asked.append(bid)
+            out.append([pol.tok.encode(t, add_special_tokens=False) + [pol.end] for t in texts[bid][:n]])
+        return out
+
+    render = train.render
+    train.render = lambda b: "behavior " + b["id"]
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            logs = {k: open(Path(d) / f"{k}.jsonl", "w") for k in ("train", "samples", "improved")}
+            args = argparse.Namespace(seed=0, eval_seed=1_000_003, samples=4, experiments=4, credit=16, refill=1, refine=3, refine_adds=2, behaviors_per_step=2, beta=0.0,
+                                      pack=False, micro=2, ppo_epochs=2, clip=0.2, exit_beta=0.1)
+            pool = [{"id": "x", "model": "vpd4l"}, {"id": "y", "model": "vpd4l"}, {"id": "z", "model": "vpd4l"}]
+            scales = train.Scales({"x": answer_with(sorted(needed)), "y": answer_with(sorted(needed))})
+            rec = Recorder(pol.params)
+            for p in pol.params:
+                torch.nn.init.normal_(p, std=0.02)
+            pol.model.zero_grad()
+            first = {}
+            for step in range(64):  # the first step that draws x and y
+                if set(random_pick(pool, args, step)) == {"x", "y"}:
+                    first = train.rl2_step(step, args, pol, sampler, stand_in, scales, pool, Path(d), rec, NoWarmup(), {"x": {"answer": ["<p:2.v.9>", "<p:2.o.735>"]}}, logs, 0.0)
+                    break
+            assert first, "no step draws x and y"
+            assert first["groups"] == 3 and first["kept"] == 2 and first["refills"] == 1 and asked[-1] == "z", (first, asked)
+            assert scales.scale == {"x": 4.0, "y": 4.0, "z": 1e4} and scales.target["z"] == 0.0  # the teacher's 4 parts; z: the empty program's total
+            assert first["improved"] >= 1 and len(first["loss"]) == 2 and "exit_sft_loss" in first, first
+            assert len(rec.grads) == 3  # two PPO epochs and the expert-iteration step
+            for f in logs.values():
+                f.close()
+            rows = [json.loads(line) for line in open(Path(d) / "samples.jsonl")]
+            credited = [r for r in rows if r["credit"]]
+            assert len(rows) == 12 and credited and all(r["kept"] == (r["behavior"] != "y") for r in rows)
+            improved = [json.loads(line) for line in open(Path(d) / "improved.jsonl")]
+            assert all(r["bits"] < r["sampled_bits"] for r in improved), improved
+            assert any(set(Answer.parse(train.split_answer(r["text"])[0]).statements[0].parts) == needed for r in improved if r["behavior"] == "x"), improved
+            assert np.isfinite(first["mean_bits"])
+    finally:
+        train.render = render
+
+
+def random_pick(pool, args, step):
+    import random
+
+    return [b["id"] for b in random.Random(train.step_seed(args, step)).sample(pool, min(args.behaviors_per_step, len(pool)))]
 
 
 if __name__ == "__main__":

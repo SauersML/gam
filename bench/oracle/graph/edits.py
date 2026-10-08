@@ -122,7 +122,7 @@ def unaligns(answer: Answer) -> list[Edit]:
 def adds(answer: Answer, candidates: dict[str, list[str]], per_variable: int) -> list[Edit]:
     """The first `per_variable` candidates of each variable that its statement does not name yet."""
     named = {(s.variable, s.kind): set(s.parts) for s in answer.statements}
-    kinds = {s.variable: s.kind for s in answer.statements}
+    kinds = {s.variable: s.kind for s in answer.statements if s.kind != "claim"}  # a variable's align statement, not its claim (attention parts)
     out = []
     for variable, ranked in candidates.items():
         kind = kinds.get(variable, "align")
