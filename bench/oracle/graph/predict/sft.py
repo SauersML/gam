@@ -30,6 +30,7 @@ import json
 import math
 import random
 import re
+import sys
 import time
 from pathlib import Path
 
@@ -185,6 +186,28 @@ def setup_channel(path, model, tok, dev, weights=None):
     return list(CHANNEL["module"].parameters())
 
 
+# Part tokens (--part-tokens, bench/oracle/graph/part_tokens.py): every part of a registry is one token whose
+# input embedding and output row come from the part's own vectors; questions name parts by these tokens.
+PARTS = {"module": None}
+
+
+def setup_part_tokens(path, model, tok, dev, weights=None):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    import part_tokens
+
+    reg = part_tokens.Registry.load(path)
+    emb = model.get_input_embeddings().weight
+    rms = float(emb.detach().float().pow(2).mean(-1).sqrt().mean())
+    module = part_tokens.PartTokens(reg, emb.shape[1], rms, base_vocab=len(tok), dev=dev)
+    module.add_to_tokenizer(tok)
+    if weights:
+        from safetensors.torch import load_file
+
+        module.load_state_dict(load_file(weights))
+    PARTS["module"] = module
+    return list(module.parameters())
+
+
 def prompt_text(tok, q) -> str:
     """The oracle's context for a question: Qwen3's chat template with the question as the user turn and
     thinking off (the format g-rl's program training uses), or the first run's raw format. With the vector
@@ -193,6 +216,8 @@ def prompt_text(tok, q) -> str:
     if part_index(q) >= 0:
         k = CHANNEL["table"].shape[1]
         text = text.replace("<question>", "<part> " + PLACEHOLDER * k + "\n<question>", 1)
+    if PARTS["module"] is not None:
+        text = PARTS["module"].reg.rewrite(text)
     if FORMAT["name"] == "raw":
         return text + SEP
     return tok.apply_chat_template([{"role": "user", "content": text}], tokenize=False, add_generation_prompt=True, enable_thinking=False)
@@ -240,10 +265,12 @@ def collate(tok, items, max_tokens, dev):
 
 def answer_bits(model, ids, labels, mask, parts=None):
     """Per sequence: the answer's bits and its token count (the head runs at the answer positions only)."""
-    h = model.model(inputs_embeds=embed(model, ids, parts), attention_mask=mask).last_hidden_state[:, :-1]
+    pt = PARTS["module"]
+    emb = pt.embed(model, ids) if pt is not None else embed(model, ids, parts)
+    h = model.model(inputs_embeds=emb, attention_mask=mask).last_hidden_state[:, :-1]
     target = labels[:, 1:]
     valid = target != -100
-    lp = torch.log_softmax(model.lm_head(h[valid]).float(), dim=-1)
+    lp = torch.log_softmax(pt.logits(model, h[valid]) if pt is not None else model.lm_head(h[valid]).float(), dim=-1)
     nll = -lp.gather(-1, target[valid][:, None])[:, 0]
     bits = torch.zeros(ids.shape[0], device=ids.device).index_add(0, valid.nonzero()[:, 0], nll) / math.log(2)
     return bits, valid.sum(-1)
@@ -321,6 +348,8 @@ def main():
     ap.add_argument("--alpha", type=float, default=32.0)
     ap.add_argument("--eval-per-type", type=int, default=128)
     ap.add_argument("--hours", type=float, default=1.8)
+    ap.add_argument("--part-tokens", default="", help="part_tokens.py registry: parts are tokens computed from their vectors; questions name them so")
+    ap.add_argument("--part-weights", default="", help="with --eval-only: the trained part-token maps (part_tokens.safetensors)")
     ap.add_argument("--channel", default="", help="with --eval-only: the trained channel (channel.safetensors)")
     ap.add_argument("--vectors", default="", help="vectors.py table: questions about its parts carry the parts' vectors as soft tokens")
     ap.add_argument("--changed-min", type=float, default=0.1, help="threshold of changed() in bits: --changed-share draws from questions above it")
@@ -387,6 +416,8 @@ def main():
             a.B.data.copy_(state[f"{name}.B"])
         if args.vectors:  # the trained channel beside the adapters (channel*.safetensors)
             setup_channel(args.vectors, model, tok, dev, weights=args.channel)
+        if args.part_tokens:
+            setup_part_tokens(args.part_tokens, model, tok, dev, weights=args.part_weights)
         set_adapters(True)
         trained = evaluate_sets(args.eval_per_type)
         result = {"adapters": args.eval_only, "base": base, "trained": trained,
@@ -400,6 +431,8 @@ def main():
     eval_seconds = time.time() - started
     if args.vectors:  # after the base model's evaluation (it has no channel); trains with the adapters
         params += setup_channel(args.vectors, model, tok, dev)
+    if args.part_tokens:  # likewise: the base model reads addresses, the trained oracle part tokens
+        params += setup_part_tokens(args.part_tokens, model, tok, dev)
 
     opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=0.0)
     big = dev.type == "cuda" and torch.cuda.get_device_properties(0).total_memory > 40 * 2**30
@@ -434,6 +467,8 @@ def main():
                       str(out / f"adapters_step{step}.safetensors"))
             if CHANNEL["module"] is not None:
                 save_file({k: v.detach().cpu().contiguous() for k, v in CHANNEL["module"].state_dict().items()}, str(out / f"channel_step{step}.safetensors"))
+            if PARTS["module"] is not None:
+                save_file({k: v.detach().cpu().contiguous() for k, v in PARTS["module"].state_dict().items()}, str(out / f"part_tokens_step{step}.safetensors"))
         if args.eval_every and step % args.eval_every == 0:
             curve = {"step": step, "heldout": evaluate_sets(args.curve_per_type)}
             log.write(json.dumps(curve) + "\n")
@@ -450,6 +485,8 @@ def main():
     save_peft(out / "adapters.safetensors", out / "peft", args.model, args.rank, args.alpha)
     if CHANNEL["module"] is not None:
         save_file({k: v.detach().cpu().contiguous() for k, v in CHANNEL["module"].state_dict().items()}, str(out / "channel.safetensors"))
+    if PARTS["module"] is not None:
+        save_file({k: v.detach().cpu().contiguous() for k, v in PARTS["module"].state_dict().items()}, str(out / "part_tokens.safetensors"))
     trained = evaluate_sets(args.eval_per_type)
     result = {"steps": step, "base": base, "trained": trained,
               "gain_bits_per_question": {n: {k: base[n][k]["bits_per_question"] - t[k]["bits_per_question"] for k in t} for n, t in trained.items()},

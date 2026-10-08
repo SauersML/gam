@@ -18,6 +18,11 @@ if [ -n "${DATA_DIR:-}" ]; then
 fi
 # VECTORS=1: the vector channel; every question about a part carries the part's vectors (vectors.py) as soft tokens.
 vec=()
+# PART_TOKENS=1: every part of the set is one token computed from its vectors (part_tokens.py); questions name parts so.
+if [ -n "${PART_TOKENS:-}" ]; then
+    [ -s "$OUT/registry.safetensors" ] || $PY "$here/../part_tokens.py" build --native "$TARGET" --pieces "$PIECES" --out "$OUT/registry.safetensors"
+    vec=(--part-tokens "$OUT/registry.safetensors")
+fi
 if [ -n "${VECTORS:-}" ]; then
     [ -s "$OUT/vectors.safetensors" ] || $PY "$here/vectors.py" --model "$TARGET" --pieces "$PIECES" --out "$OUT/vectors.safetensors"
     vec=(--vectors "$OUT/vectors.safetensors")
@@ -32,7 +37,11 @@ sets=(--heldout "parts_all=$OUT/data/parts_all.jsonl" --heldout "parts_moved=$OU
     --steps "$STEPS" --hours "$HOURS" --changed-min 0.1 --changed-share 0.5 --eval-every 100 --curve-per-type 32 --eval-per-type 64 --save-every 300 "${vec[@]}" ${SFT_EXTRA:-}  # e.g. SFT_EXTRA="--checkpointing on" for 14B on 48 GB
 kl() { [ -s "$OUT/sft/eval_kl_$1.json" ] || $PY "$here/eval_kl.py" --model "$ORACLE" "${sets[@]}" --per-type 64 --stratify --batch 16 --out "$OUT/sft/eval_kl_$1.json" "${@:2}"; }
 kl base
-ch() { [ ${#vec[@]} -gt 0 ] && echo "--channel $OUT/sft/$1.safetensors"; }  # the channel trained beside those adapters
+ch() {  # the channel or part-token maps trained beside those adapters
+    [ -n "${VECTORS:-}" ] && echo "--channel $OUT/sft/$1.safetensors"
+    [ -n "${PART_TOKENS:-}" ] && echo "--part-weights $OUT/sft/${1/channel/part_tokens}.safetensors"
+    true
+}
 kl trained --adapters "$OUT/sft/adapters.safetensors" "${vec[@]}" $(ch channel)
 for f in "$OUT"/sft/adapters_step*.safetensors; do
     s=${f##*_step}; s=${s%.safetensors}
