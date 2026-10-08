@@ -126,6 +126,9 @@ struct Fit {
     reads: Vec<Array2<f32>>,
     masks: Vec<Array2<f32>>,
     inputs: BTreeMap<usize, Array2<f64>>,
+    /// Per site of the attention's input, the MLP's input and the down map's input (q, c_fc and
+    /// down sites) its input's mean over the fitting rows, `M`'s (`library_vpd`'s mean parts).
+    means: BTreeMap<usize, ndarray::Array1<f64>>,
 }
 
 fn fit_data(vpd: &Vpd, sequences: &[Vec<u32>], batch: usize) -> Result<Fit, String> {
@@ -135,6 +138,7 @@ fn fit_data(vpd: &Vpd, sequences: &[Vec<u32>], batch: usize) -> Result<Fit, Stri
     let mut reads: Vec<Vec<Array2<f32>>> = vec![Vec::new(); sites];
     let mut masks: Vec<Vec<Array2<f32>>> = vec![Vec::new(); sites];
     let mut inputs: BTreeMap<usize, Vec<Array2<f64>>> = BTreeMap::new();
+    let mut sums: BTreeMap<usize, (ndarray::Array1<f64>, usize)> = BTreeMap::new();
     for chunk in sequences.chunks(batch) {
         let views: Vec<&[u32]> = chunk.iter().map(Vec::as_slice).collect();
         let family = sequence_family(&views)?;
@@ -150,6 +154,12 @@ fn fit_data(vpd: &Vpd, sequences: &[Vec<u32>], batch: usize) -> Result<Fit, Stri
                 let mut a = d.zeros(family.rows, vpd.sites[s].1).map_err(error)?;
                 d.gemm(&mut a, 1.0, x, Op::N, &v[s], Op::N, 0.0, vpd.m.program.arithmetic()).map_err(error)?;
                 reads[s].push(d.download(&a).map_err(error)?.mapv(|x| x.abs() as f32));
+                if matches!(kind_of(s), Kind::Query | Kind::Up | Kind::Down) {
+                    let rows = d.download(x).map_err(error)?;
+                    let entry = sums.entry(s).or_insert_with(|| (ndarray::Array1::zeros(rows.ncols()), 0));
+                    entry.0 += &rows.sum_axis(Axis(0));
+                    entry.1 += rows.nrows();
+                }
                 if matches!(kind_of(s), Kind::Query | Kind::Up) {
                     let x = d.download(x).map_err(error)?;
                     let mut with_one = Array2::ones((x.nrows(), x.ncols() + 1));
@@ -171,6 +181,7 @@ fn fit_data(vpd: &Vpd, sequences: &[Vec<u32>], batch: usize) -> Result<Fit, Stri
         reads: reads.into_iter().map(stack32).collect::<Result<_, _>>()?,
         masks: masks.into_iter().map(stack32).collect::<Result<_, _>>()?,
         inputs: inputs.into_iter().map(|(s, parts)| Ok((s, stack64(parts)?))).collect::<Result<_, String>>()?,
+        means: sums.into_iter().map(|(s, (sum, n))| (s, sum / n.max(1) as f64)).collect(),
     })
 }
 
@@ -360,25 +371,31 @@ fn run_arm(vpd: &Vpd, arm: &Arm, family: &FamilyInputs) -> Result<(Tensor, Vec<f
 /// The arms fitted on `fit_rows` and scored on `held_out` (module note): per arm, held-out
 /// `KL(M ‖ P)` in bits per token, the slices executed per token (rank-one equivalents) per layer and
 /// in all, its components and the slices it keeps. Every arm's components are written to
-/// `components` (JSON: per component its gate read, threshold and slices).
+/// `components` (JSON: per component its gate read, threshold and slices), and each arm again as
+/// `{arm}_means` with each layer's means over the fitting rows (`library_vpd`'s mean parts: the
+/// attention's and the MLP's inputs and the activations, `M`'s).
 pub fn vpd_start(vpd: &Vpd, fit_rows: &[Vec<u32>], held_out: &[Vec<u32>], batch: usize, components: &Path) -> Result<Value, String> {
     let d = vpd.e.program.device().clone();
     let fit = fit_data(vpd, fit_rows, batch)?;
     let arms = arms(vpd, &fit)?;
+    let mean_of = |l: usize, kind: Kind| -> Vec<f64> { (0..vpd.sites.len()).find(|&s| vpd.sites[s].0 == l && kind_of(s) == kind).and_then(|s| fit.means.get(&s)).map(|m| m.to_vec()).unwrap_or_default() };
+    let means: Vec<Value> = (0..vpd.layers()).map(|l| json!({"layer": l, "attention": mean_of(l, Kind::Query), "mlp": mean_of(l, Kind::Up), "activation": mean_of(l, Kind::Down)})).collect();
     drop(fit);
     let records: Vec<Value> = arms
         .iter()
-        .map(|arm| {
-            json!({
-                "arm": arm.name,
-                "components": arm.components.iter().map(|c| {
+        .flat_map(|arm| {
+            let components: Vec<Value> = arm
+                .components
+                .iter()
+                .map(|c| {
                     let read = match &c.read {
                         Read::Own { site, index } => json!({"own": [site, index]}),
                         Read::Direction { site, coefficients } => json!({"direction": {"site": site, "coefficients": coefficients}}),
                     };
                     json!({"read": read, "tau": c.tau, "width": c.width, "slices": c.slices})
-                }).collect::<Vec<Value>>(),
-            })
+                })
+                .collect();
+            [json!({"arm": arm.name, "components": components}), json!({"arm": format!("{}_means", arm.name), "components": components, "means": means})]
         })
         .collect();
     std::fs::write(components, serde_json::to_vec(&records).map_err(error)?).map_err(error)?;
