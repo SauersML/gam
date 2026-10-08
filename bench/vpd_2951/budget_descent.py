@@ -510,6 +510,8 @@ def make(n):
                 un[b] = un_b
         if state['mode'] == 'all':
             return emit(c)
+        if SENSGATE:
+            un = sens_norm(n, p['U'], 'mlp')
         if slice_mean(n):
             cur['cm'] = XBAR[n] @ p['V']
             c = c - cur['cm']
@@ -669,8 +671,9 @@ def make_attn(n):
             if slice_mean(n):
                 cm = head_coefficients(XBAR[n][None], p['V'], p['o'])                 # [H, 1, C], the mean part
                 c = c - cm
+            un_ = sens_norm(n, p['U'], 'o' if p['o'] else 'head') if SENSGATE else p['U'].norm(dim=-1)[:, None, :]
             if state.get('calib') is not None:
-                state['calib'].setdefault(n, []).append((c.abs() * p['U'].norm(dim=-1)[:, None, :]).reshape(-1))
+                state['calib'].setdefault(n, []).append((c.abs() * un_).reshape(-1))
             ex = None
             if n in GN:
                 # The layer's gate network on the stream entering the attention (q's input; o reads it too).
@@ -682,7 +685,7 @@ def make_attn(n):
                 # The head's largest attention logit at the slice's token (the query's for q and o, the key's for k).
                 sg = state['score'][int(n.split('.')[1])].permute(1, 0, 2).reshape(NH, -1, 1) * p['beta'][:, None, :]
                 ex = sg if ex is None else ex + sg
-            args = (None, c, p['U'].norm(dim=-1)[:, None, :], p['tau'][:, None, :], p['s'][:, None, :], p['taun'][:, None, :] if 'taun' in p else None, ex)
+            args = (None, c, un_, p['tau'][:, None, :], p['s'][:, None, :], p['taun'][:, None, :] if 'taun' in p else None, ex)
             if CONCEPTS and n.endswith('k_proj'):
                 # k slices gated at their keys: a query reads every one on anywhere in its prefix, so each token counts
                 # that union (straight-through: the hard union's value, the expected union's gradient).
@@ -1554,7 +1557,8 @@ def attn_v(l, h, pattern):
         if state.get('capture') is not None:
             state['capture'].setdefault(n, []).append((m.abs() * p['U'].norm(dim=-1)[None, :, None, :]).permute(1, 0, 2, 3).reshape(NH, -1, m.shape[-1]))
     else:
-        r = m.abs() * p['U'].norm(dim=-1)[None, :, None, :]
+        un_ = sens_norm(n, p['U'], 'v') if SENSGATE else p['U'].norm(dim=-1)[None, :, None, :]
+        r = m.abs() * un_
         if SHARE_A:
             S = SHARE_A[l]
             rr = r.permute(1, 0, 2, 3).reshape(NH, -1, r.shape[-1])               # [H, tokens, C]
@@ -1577,7 +1581,7 @@ def attn_v(l, h, pattern):
             if 'beta' in p:
                 sg = state['score'][l][..., None] * p['beta'][None, :, None, :]
                 ex = sg if ex is None else ex + sg
-            args = (r, m, p['U'].norm(dim=-1)[None, :, None, :], p['tau'][None, :, None, :], p['s'][None, :, None, :],
+            args = (r, m, un_, p['tau'][None, :, None, :], p['s'][None, :, None, :],
                     p['taun'][None, :, None, :] if 'taun' in p else None, ex)
             if not state['force_on']:
                 mg, hb, sb, hd = slice_apply_run(*args, (1, 3), state['mode'])
@@ -1742,6 +1746,127 @@ def hidden(ids):
     return vpd_model.rms(x, T.ln_f, T.eps)
 if attn:
     T.hidden = hidden
+
+# DESCENT_SENSGATE=1 (slice arms): each slice's gate reads |c(t)| sqrt(E_y[(g_y(t) . u_c)^2]) in place of
+# |c(t)| ||u_c||, so its read squared is s_c(t) = (v_c . x_t)^2 E_y[(g_y(t) . u_c)^2]: g_y(t) the gradient of
+# sum_s log p_M(y_s | s) with respect to the map's output at t (one backward pass of M per draw, so it holds both
+# the token's own prediction and its effect on later tokens through attention), y drawn from M's own distribution at
+# every token, DESCENT_SENS_K (4) draws per token. A v slice, gated after the pattern, takes the gradient at its
+# head's attention output. A gate input only: M's every-part-on pass, no gradient into the parts, bf16 products.
+# On an A40 at 32 x 512 it adds 0.31 s to skc-long's 1.55 s step: M's forward and the draws 0.075 s, the four
+# backward passes 0.13 s, the slices' norms 0.11 s (sens_kernels.py).
+SENSGATE = os.environ.get('DESCENT_SENSGATE') == '1'
+K_SENS = int(os.environ.get('DESCENT_SENS_K', '4'))
+
+def sens_capture(n, f):
+    """Map n's forward, keeping its output (and o_proj's input) during sens_pass."""
+    def g(x):
+        y = f(x)
+        cap = state.get('sens_cap')
+        if cap is not None:
+            cap[n] = y
+            if n.endswith('o_proj'):
+                cap[n + ':in'] = x
+        return y
+    return g
+
+if SENSGATE and dev == 'cuda':
+    import sens_kernels
+SDT = torch.bfloat16 if dev == 'cuda' else torch.float32                       # the sensitivity pass's map inputs
+
+def m_rms(x, w):
+    return vpd_model.rms(x, w, T.eps).to(SDT)
+def m_attn(q, k, v):
+    B_, T_ = q.shape[:2]
+    q, k, v = (z.view(B_, T_, NH, HD).transpose(1, 2) for z in (q, k, v))
+    y = F.scaled_dot_product_attention(T._rope(q, T_).to(v.dtype), T._rope(k, T_).to(v.dtype), v, is_causal=True)
+    return y.transpose(1, 2).reshape(B_, T_, -1)
+def m_add_rms(x, y, w):
+    x = x + y
+    return x, vpd_model.rms(x, w, T.eps).to(SDT)
+m_rms, m_attn, m_add_rms, m_gelu = ((torch.compile(f, dynamic=False) if COMPILE else f) for f in (m_rms, m_attn, m_add_rms, vpd_model.gelu_tanh))
+
+def m_hidden(ids):
+    """M's forward (vpd_model's Target.hidden) for sens_pass: the steps between its maps compiled, the maps (with
+    their edits and captures) as they are; a float32 stream, the maps' inputs in SDT."""
+    x = T.wte[ids].requires_grad_()                                             # a leaf, so the pass keeps a graph
+    site = lambda i, k: T.site(site_of(i, k))
+    h = m_rms(x, T.norms[0])
+    for i in range(T.n_layer):
+        y = m_attn(site(i, 'q_proj')(h), site(i, 'k_proj')(h), site(i, 'v_proj')(h))
+        x, h = m_add_rms(x, site(i, 'o_proj')(y), T.norms[2 * i + 1])
+        x, h = m_add_rms(x, site(i, 'down_proj')(m_gelu(site(i, 'c_fc')(h))), T.norms[2 * i + 2] if i + 1 < T.n_layer else T.ln_f)
+    return h
+
+def sens_pass(ids):
+    """M's forward with its graph on ids, then K backward passes, each from y ~ p_M(. | t) at every token (the
+    gradient of log p_M(y | t) at the final stream is wte_y - E_p[wte]): every slice map's output gradients
+    [K, B, T, d] in state['sens'], for the pass that follows. On CUDA bf16 products (a gate input only), y drawn by
+    sens_kernels.sample from the bf16 logits."""
+    cap, mode = {}, state['mode']
+    state['sens_cap'], state['mode'] = cap, 'M'
+    try:
+        with torch.enable_grad(), torch.autocast('cuda', dtype=SDT, enabled=dev == 'cuda'):
+            h = m_hidden(ids)
+    finally:
+        state['mode'], state['sens_cap'] = mode, None
+    names = list(cap); outs = [cap[k_] for k_ in names]
+    with torch.no_grad():
+        wte = T.wte.to(SDT)
+        L = h.detach().reshape(-1, h.shape[-1]) @ wte.T
+        if dev == 'cuda':
+            ys, p_ = sens_kernels.sample(L, K_SENS)
+        else:
+            p_ = torch.softmax(L, -1); ys = torch.multinomial(p_, K_SENS, replacement=True)
+        del L
+        Ew = (p_ @ wte).view(h.shape); del p_
+    grads = {k_: torch.empty(K_SENS, *o_.shape, device=o_.device, dtype=SDT) for k_, o_ in zip(names, outs)}
+    for j in range(K_SENS):
+        for k_, g_ in zip(names, torch.autograd.grad(h, outs, grad_outputs=wte[ys[:, j]].view(h.shape) - Ew, retain_graph=j < K_SENS - 1)):
+            grads[k_][j] = g_
+    state['sens'] = grads
+
+def sens_norm(n, U, kind):
+    """sqrt(E_y[(g_y . u_c)^2]) per token and slice of map n (U its writes) from state['sens']: kind mlp [B, T, C];
+    head (q, k: writes in their head's coordinates) and o [H, B T, C]; v [B, H, T, C], from o_proj's input. On CUDA
+    sens_kernels.draw_norms (the K products and squares summed in registers)."""
+    G = state['sens'].pop(n.replace('v_proj', 'o_proj') + ':in' if kind == 'v' else n)     # used once per pass
+    Ub = U.detach().to(G.dtype)
+    K_, B_, T_, d_ = G.shape
+    with torch.no_grad():
+        if dev == 'cuda':
+            if kind == 'mlp':
+                return sens_kernels.draw_norms(G, Ub, 1, B_ * T_, d_, (G.stride(0), 0, d_))[0].view(B_, T_, -1)
+            w = sens_kernels.draw_norms(G, Ub, NH, B_ * T_, d_ if kind == 'o' else HD, (G.stride(0), 0 if kind == 'o' else HD, d_))
+            return w.view(NH, B_, T_, -1).transpose(0, 1) if kind == 'v' else w
+        acc = 0.0
+        for g_ in G:
+            if kind == 'mlp':
+                w = g_ @ Ub.T
+            elif kind == 'head':
+                w = torch.einsum('nhd,hcd->hnc', g_.reshape(-1, NH, HD), Ub)
+            elif kind == 'o':
+                w = torch.einsum('nd,hcd->hnc', g_.reshape(-1, d_), Ub)
+            else:
+                w = torch.einsum('bthd,hcd->bhtc', g_.reshape(B_, T_, NH, HD), Ub)
+            acc = acc + w.pow(2)
+        return (acc / K_).sqrt()
+
+if SENSGATE:
+    for n in sliced + mlp:
+        T.site(n)._forward = sens_capture(n, T.site(n)._forward)
+    _hidden_sens = T.hidden
+    def hidden_sens(ids):
+        """P's passes compute M's gradients for their ids first; they are dropped once the forward is done (gate
+        inputs only), before the pass's backward."""
+        if state['mode'] in ('M', 'all'):
+            return _hidden_sens(ids)
+        sens_pass(ids)
+        try:
+            return _hidden_sens(ids)
+        finally:
+            state['sens'] = None
+    T.hidden = hidden_sens
 if sliced:
     # Calibration on P's own run with every slice on (= M): each v slice's noise scale and the v map's
     # threshold from the post-attention reads (the quantile matching VPD's mean count at the map).
