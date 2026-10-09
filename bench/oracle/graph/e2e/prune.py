@@ -3,16 +3,18 @@ keeping the set at each size k. The search behind the teacher answers.
 
 Every error is the execution error of the explanation naming the set (one output group, e2e/explain.ir; everything
 left out runs on the changed prompt), scored on the behavior's first --search-prompts prompts and their changed
-prompts alone (--rank-experiments 0) with necessity off; the signal is the error of naming nothing. Removing chunks from the whole model by their single
-removals fails here: the difference between prompt and changed prompt travels many parallel paths, so each chunk's
+prompts alone (--rank-experiments 0) with necessity off; the signal is the error of naming nothing. Removing chunks
+from the whole model by their single removals fails here: the difference between prompt and changed prompt travels many parallel paths, so each chunk's
 removal alone costs little and their joint removal costs everything. Growing from nothing named fails too: what is
 left out runs on the changed prompt, so a named block reaches the output only directly until a whole path from the
 input to the output is named, and no single block or matrix lowers the error. So, from the whole model (the eight
 blocks, one layer's attention or MLP each):
 
-  refine  split every piece in half, measure each half's removal, and drop the halves of least effect, as many as
-          can go together for at most --tol of the signal more error (found by bisection on their order); repeat
-          down to single subcomponents, then keep dropping the least costly one at a time until the smallest k.
+  refine  halve every piece, measure each half's removal, and drop the halves of least effect, as many as can go
+          together for at most --tol of the signal more error (found by bisection on their order); repeat down to
+          single subcomponents, then keep dropping the least costly one at a time until the smallest k. (Halving only
+          when nothing can go is cheaper and much worse: each round's budget goes to coarse pieces that each carry
+          part of the mechanism; bigram.mixed kept 0.6% at 208 subcomponents.)
 
 The set at each k in --ks is the first set of at most k subcomponents, and "knee" the set where refining stopped
 within the tolerance. Each kept set is then scored in full as an explanation (--experiments, seeds 0 and 1):
@@ -117,6 +119,8 @@ def main():
     a = ap.parse_args()
     a.out.mkdir(parents=True, exist_ok=True)
     for b in a.behaviors:
+        if (a.out / f"{b}.json").exists():
+            continue
         t0 = time.time()
         path = a.behaviors_dir / f"{b}.json"
         behavior = json.loads(path.read_text())
