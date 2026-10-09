@@ -498,6 +498,19 @@ class Native:
                     total[s:s + len(part)] += self._kl(logp, self.run(x, targets, plan, *zero))
         return (total / len(prompts)).tolist()
 
+    @torch.no_grad()
+    def flips(self, ids: list[int], targets: list[int], prompts: list[list[int]]) -> list[dict]:
+        """For each changed prompt that changes a token: {"position", "old", "new" (token ids), "flipped": whether the
+        model's most likely next token at the last target differs from its most likely one on the text}."""
+        last = max(targets)
+        top = int(self.reference([ids], [last])[0, 0].argmax())
+        out = []
+        for x in prompts:
+            diff = [p for p in range(len(ids)) if x[p] != ids[p]]
+            if diff:
+                out.append({"position": diff[0], "old": ids[diff[0]], "new": x[diff[0]], "flipped": int(self.reference([x], [last])[0, 0].argmax()) != top})
+        return out
+
     def positions(self, targets: list[int]) -> int:
         """The positions a graph's nodes can sit at: 0 to the last target."""
         return max(targets) + 1

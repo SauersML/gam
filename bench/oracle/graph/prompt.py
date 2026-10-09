@@ -59,6 +59,33 @@ def split_answer(answer: str) -> tuple[str, str]:
     return answer, ""
 
 
+def english_spans(source: str) -> list[tuple[int, int]]:
+    """The character spans [start, end) of a program's English: the docstring of graph() and every comment."""
+    import io
+    import tokenize
+
+    starts = [0]
+    for line in source.splitlines(keepends=True):
+        starts.append(starts[-1] + len(line))
+
+    def at(row, col):  # tokenize's (1-based row, column) -> a character offset
+        return starts[row - 1] + col
+
+    spans = []
+    try:
+        for t in tokenize.generate_tokens(io.StringIO(source).readline):
+            if t.type == tokenize.COMMENT:
+                spans.append((at(*t.start), at(*t.end)))
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, ast.FunctionDef) and node.name == "graph" and node.body and isinstance(node.body[0], ast.Expr) \
+                    and isinstance(node.body[0].value, ast.Constant) and isinstance(node.body[0].value.value, str):
+                d = node.body[0].value
+                spans.append((at(d.lineno, d.col_offset), at(d.end_lineno, d.end_col_offset)))
+    except (SyntaxError, tokenize.TokenError, IndentationError):
+        return []
+    return sorted(spans)
+
+
 def program_of(answer: str) -> str:
     """The program in an oracle's answer (split_answer's first part)."""
     return split_answer(answer)[0]

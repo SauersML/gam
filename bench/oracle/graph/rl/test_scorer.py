@@ -98,7 +98,7 @@ def check_sft_examples():
     train.render = lambda b: "input " + b["id"]
     tok = types.SimpleNamespace(encode=lambda text, add_special_tokens=False: [len(text)])
     pol = types.SimpleNamespace(tok=tok, end=0, prompt_ids=lambda text: [hash(text) % 97], parts=None, question_ids=lambda b: [hash("input " + b["id"]) % 97])
-    args = types.SimpleNamespace(data=[str(d / "q.jsonl")], max_model_len=100)
+    args = types.SimpleNamespace(data=[str(d / "q.jsonl")], max_model_len=100, max_tokens=100)
     programs, questions = train.sft_examples(args, pol, [{"id": "a"}, {"id": "b"}])
     assert programs == [([hash("input a") % 97], [len("```python\nA\n```"), 0])], programs
     assert questions == [([hash("Q") % 97], [3, 0])], questions

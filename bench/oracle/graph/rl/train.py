@@ -55,7 +55,8 @@ os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")  # CUDA may be in
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent))
 import edits  # noqa: E402
-from prompt import render, split_answer  # noqa: E402
+from prompt import english_spans, render, split_answer  # noqa: E402
+import reader as reader_module  # noqa: E402
 import score as score_module  # noqa: E402
 import scorer  # noqa: E402
 from scorer import SCORERS  # noqa: E402
@@ -467,6 +468,7 @@ def dpo_update(pol: Policy, prompts, winners, losers, beta: float, micro: int) -
     return {"loss": total, "margin": margin}
 
 
+READER: list = []  # the English reader (make_reader), when --reader
 TOTALS = {"checker_seconds": 0.0}  # checker time of every training score, credit and refinement so far (the A/B's cost axis)
 
 
@@ -670,12 +672,82 @@ def rl2_score(groups: list[dict], step: int, args, tok, score, clock: dict) -> l
                     "token_advantages": [[float(A[j])] * len(c) for j, c in enumerate(grp["completions"])], "credit": [None] * n})
     if args.credit:
         credit_groups(groups, seed, args, tok, score, clock)
+    if READER:
+        reader_credit(groups, tok, READER[0], clock)
     return groups
 
 
 def rl2_groups(chosen: list[dict], step: int, args, pol, sampler, score, adapter: Path, clock: dict) -> list[dict]:
     """rl2_sample, then rl2_score."""
     return rl2_score(rl2_sample(chosen, step, args, pol, sampler, adapter, clock), step, args, pol.tok, score, clock)
+
+
+def reader_credit(groups: list[dict], tok, reader, clock: dict):
+    """(8) The English of each answer, credited by the reader (reader.py): the bits it saves, ranked within the group
+    (leave-one-out wins and losses, as (3)); its tokens (the docstring and comments) get that advantage added to the
+    curve's, which the English shapes too, being written first. An answer without English saves 0 bits."""
+    for grp in groups:
+        sc = grp["scores"]
+        events = next((x.get("events") for x in sc if x.get("events")), [])
+        texts = [reader_module.english(x) if x.get("valid", True) else "" for x in sc]
+        todo = [j for j, t in enumerate(texts) if t]
+        bits = [0.0] * len(sc)
+        if todo and events:
+            got = timed(clock, "reader", reader.bits, grp["behavior"], [texts[j] for j in todo], events)
+            for j, b in zip(todo, got):
+                bits[j] = b
+        A = rloo([(-b,) for b in bits])
+        grp["reader_bits"], grp["reader_advantage"] = bits, A
+        for j, (c, text, it) in enumerate(zip(grp["completions"], grp["texts"], grp["items"])):
+            offset = program_offset(text, it["source"])
+            if offset is None or A[j] == 0.0:
+                continue
+            spans = [(offset + a, offset + b) for a, b in english_spans(it["source"])]
+            for t, (a, b) in enumerate(token_spans(tok, c, text)):
+                if b > a and any(a < e and b > s0 for s0, e in spans):
+                    grp["token_advantages"][j][t] += float(A[j])
+
+
+def make_reader(args, pol, sampler):
+    """The frozen base model as the English reader: vLLM's engine without the adapter, or the policy with its
+    adapter disabled (transformers)."""
+    from transformers import AutoTokenizer
+
+    import mech
+
+    tk = AutoTokenizer.from_pretrained(args.base)
+    target_tk = mech.tokenizer(args.model)
+
+    def tokens_of(ids):
+        return [target_tk.decode([i]) for i in ids]
+
+    def chat(q):
+        return tk.apply_chat_template([{"role": "user", "content": q}], add_generation_prompt=True, enable_thinking=False, tokenize=False)
+
+    if isinstance(sampler, VllmSampler):
+        def generate(prompts):
+            from vllm import SamplingParams
+
+            if not sampler.ready:
+                sampler.acquire()
+            try:
+                outs = sampler.llm.generate([chat(q) for q in prompts], SamplingParams(max_tokens=1, temperature=0.0, logprobs=20), use_tqdm=False)
+            finally:
+                if not sampler.held:
+                    sampler.release()
+            return [{d.decoded_token: d.logprob for d in o.outputs[0].logprobs[0].values()} for o in outs]
+    else:
+        def generate(prompts):
+            out = []
+            pol.train_mode(False)
+            with torch.no_grad(), pol.model.disable_adapter():
+                for q in prompts:
+                    ids = torch.tensor([pol.tok.encode(chat(q), add_special_tokens=False)], device=pol.dev)
+                    lp = torch.log_softmax(pol.model(input_ids=ids).logits[0, -1].float(), -1)
+                    v, i = lp.topk(20)
+                    out.append({pol.tok.decode([int(k)]): float(x) for x, k in zip(v.tolist(), i.tolist())})
+            return out
+    return reader_module.Reader(generate, tokens_of)
 
 
 def informative(group: dict) -> bool:
@@ -792,7 +864,7 @@ def rl2_step(step: int, args, pol, sampler, score, pool: list[dict], adapter: Pa
     groups without signal are dropped and refilled (5) by tasks drawn uniformly from the rest, up to --refill more
     sampling rounds; expert iteration (2, --refine > 0) from each group's best valid answer; --ppo-epochs clipped
     updates (4) on the kept groups, then one expert-iteration step (rl2_update)."""
-    clock = {"sample": 0.0, "score": 0.0, "credit": 0.0, "refine": 0.0, "train": 0.0}
+    clock = {"sample": 0.0, "score": 0.0, "credit": 0.0, "refine": 0.0, "train": 0.0, "reader": 0.0}
     score = memo(score)  # one experiment draw per step: a repeated program's score is the same
     rng = random.Random(step_seed(args, step))
     chosen = rng.sample(pool, min(args.behaviors_per_step, len(pool)))
@@ -841,6 +913,7 @@ def rl2_update(step: int, groups: list[dict], improved: list[dict], refills: int
            "mean_kl": float(np.mean([x["kl_bits"] for x in scores])) if scores else None, "mean_bits": float(np.mean([x["bits"] for x in scores])) if scores else None,
            "mean_steps": float(np.mean([x["steps"] for x in scores])) if scores else None,
            "best_area": float(np.mean([k[1] for k in best if k[0] == 0])) if any(k[0] == 0 for k in best) else None,
+           "mean_reader_bits": float(np.mean([b for g in groups for b in g.get("reader_bits", [])])) if any(g.get("reader_bits") for g in groups) else None,
            "credited": sum(c is not None for g in groups for c in g["credit"]), "improved": len(improved), "repeated_scores": repeated, **stats, "sampling": getattr(sampler, "stats", {}),
            "seconds": clock, "checker_seconds_total": TOTALS["checker_seconds"], "elapsed": time.time() - started}
     logs["train"].write(json.dumps(row) + "\n")
@@ -874,7 +947,7 @@ def rl2_async(args, pol, sampler, score, pool: list[dict], adapter: Path, learne
         return improved, memo_score.hits[0]
 
     carry = 0
-    clock = {"sample": 0.0, "score": 0.0, "credit": 0.0, "refine": 0.0, "train": 0.0}
+    clock = {"sample": 0.0, "score": 0.0, "credit": 0.0, "refine": 0.0, "train": 0.0, "reader": 0.0}
     learner.save(adapter)
     groups = rl2_sample(draw(0, carry), 0, args, pol, sampler, adapter, clock)
     with ThreadPoolExecutor(1) as pool_thread:
@@ -882,7 +955,7 @@ def rl2_async(args, pol, sampler, score, pool: list[dict], adapter: Path, learne
             if stop():
                 break
             future = pool_thread.submit(check, groups, step, clock)
-            nxt = {"sample": 0.0, "score": 0.0, "credit": 0.0, "refine": 0.0, "train": 0.0}
+            nxt = {"sample": 0.0, "score": 0.0, "credit": 0.0, "refine": 0.0, "train": 0.0, "reader": 0.0}
             t = time.time()
             upcoming = rl2_sample(draw(step + 1, carry), step + 1, args, pol, sampler, adapter, nxt) if step + 1 < args.steps else None
             improved, repeated = future.result()
@@ -1148,6 +1221,7 @@ def main():
     ap.add_argument("--run-name", help="the run's name in runs/oracle/<task>.<run>.json (default: the --out directory's name)")
     ap.add_argument("--search", help="bootstrap search answers of the training questions (DIR/<task>.py, native.py search, or <task>.answer.txt): SFT answers")
     ap.add_argument("--search-heldout", help="the search's answers to the held-out questions: evaluation baselines only")
+    ap.add_argument("--reader", action="store_true", help="rl2: credit each answer's English by the frozen base reader's bits (reader.py)")
     ap.add_argument("--credit", type=int, default=16, help="rl2: subcomponent names whose drop is scored per answer for per-token credit (0: episode advantages only)")
     ap.add_argument("--credit-answers", type=int, default=0, help="rl2: answers credited per group: the best valid one and K - 1 other distinct valid ones drawn at random (0: every distinct valid answer)")
     ap.add_argument("--refill", type=int, default=1, help="rl2: sampling rounds that replace groups without signal by tasks drawn uniformly")
@@ -1199,6 +1273,8 @@ def main():
         sampler = HfSampler(pol, args.max_tokens, args.hf_batch)
     score = SCORERS[args.scorer]
     scorer.DEVICE = args.scorer_device
+    if args.reader:
+        READER.append(make_reader(args, pol, sampler))
     root = Path(args.behaviors)
     pool = behaviors(root, args.model, "train")
     sets = {"heldout": behaviors(root, args.model, "heldout")}

@@ -100,7 +100,8 @@ class Scorer:
         """Each answer's score on a task (a text task record) under one draw of changed prompts (seed): {"valid",
         "error", "curve": [[bits, kl], ...] (the empty graph, then each step), "lo" and "hi": one subcomponent's and
         the whole model's description lengths, "kl_bits" and "bits" (the whole answer), "steps", "nodes", "edges",
-        "explanation", "notes"}; the
+        "explanation", "notes", "events": the changed prompts' token changes and whether each flips the model's top
+        next token (native.flips, the same for every answer)}; the
         source "vpd" stands for VPD's own answer (complete, one step)."""
         import mech
 
@@ -142,8 +143,9 @@ class Scorer:
                     own_bits.append(bits)
         kl = nat.faithfulness(ids, targets, graphs, prompts)
         lo = math.log2(positions * total)
+        events = nat.flips(ids, targets, prompts)  # what the English reader is asked about (reader.py)
         for s in out:
-            s.update(curve=[[0.0, kl[0]]], lo=lo, hi=positions * total * lo)
+            s.update(curve=[[0.0, kl[0]]], lo=lo, hi=positions * total * lo, events=events)
         for g, o, b, k in zip(graphs[1:], owners[1:], own_bits[1:], kl[1:]):
             s = out[o]
             s["curve"].append([b, k])
