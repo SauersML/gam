@@ -50,6 +50,7 @@ import mech  # noqa: E402
 TEXTS = Path.home() / "mpd-data/graph_oracle/texts"
 RANDOM = 8  # random draws per score
 CANDIDATES = 32  # replacement tokens the teacher tries per source position for an interchange claim
+ANSWER_TOKENS = 4096  # the oracle's answer budget (rl/train.py --max-tokens); a graph costs at least 4 tokens a node
 TEACH_STEPS, EDGE_STEPS, TEACH_LR = 2000, 600, 0.05  # the teacher's optimization (Adam on the strengths' logits)
 LN2 = math.log(2)
 
@@ -542,6 +543,8 @@ class Native:
         g = self._strength_loop(node_forward, torch.full((int(flat.sum()),), 2.0, device=self.dev), eps / 2, log, "nodes")
         sel = split(g)
         nodes = {(n, t, c) for n in names for t, c in (sel[n] > 0.5).nonzero().tolist()}
+        if 4 * len(nodes) > ANSWER_TOKENS:  # no answer the oracle can write holds this graph
+            return None, {"skipped": f"the node stage kept {len(nodes)} nodes, more than an answer of {ANSWER_TOKENS} tokens holds"}
         parents, out = all_edges(nodes, targets)
         if log:
             log(f"nodes kept: {len(nodes)}; connections between them: {sum(len(w) for w in parents.values()) + len(out)}")
@@ -734,6 +737,10 @@ def teach(split: str, n: int, offset: int = 0, stride: int = 1, epsilons=(0.25, 
                 continue
             t0 = time.time()
             g, s = nat.teach(ids, targets, eps)
+            if g is None or s["kl_bits"] > eps:  # recorded, so a rerun does not repeat it; never a training answer
+                (out / f"{stem}.json").write_text(json.dumps({"score": s, "eps": eps, "seconds": round(time.time() - t0, 1)}))
+                print(f"{stem}: no graph ({s.get('skipped') or 'KL %.3f above eps' % s['kl_bits']}), {time.time() - t0:.0f} s", flush=True)
+                continue
             claims = token_claims(nat.claims(ids, targets, g))
             (out / f"{stem}.py").write_text(program(g, claims))
             (out / f"{stem}.json").write_text(json.dumps({"score": s, "eps": eps, "claims": claims, "seconds": round(time.time() - t0, 1)}))
