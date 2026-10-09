@@ -350,6 +350,39 @@ def _line_of(exc: BaseException) -> int | None:
     return lines[-1] if lines else None
 
 
+def gates(on, model: str, behavior: dict | None) -> list[dict]:
+    """The IR nodes of a gate program: `on(tokens, targets)` run on every prompt and changed prompt of the behavior
+    (behavior_tokens()'s "sequences") returns, per position, the subcomponents that act there ({position: [part, ...]}
+    or [(position, part), ...]); subcomponents of one block acting at the same positions of every sequence are one
+    node, which acts there and nowhere else."""
+    if not behavior or not behavior.get("sequences"):
+        raise MechError("a gate program needs the behavior's sequences to run on")
+    shape = shapes(model)
+    where: dict[tuple, list[set]] = {}
+    sequences = behavior["sequences"]
+    for k, (ids, strings, targets) in enumerate(sequences):
+        out = on(list(strings), list(targets))
+        pairs = [(p, part) for p, parts in out.items() for part in parts] if isinstance(out, dict) else list(out)
+        for item in pairs:
+            if not (isinstance(item, tuple) and len(item) == 2):
+                raise MechError(f"on() returned {item!r}: positions map to lists of subcomponents, or (position, subcomponent) pairs")
+            position, token = item
+            if not isinstance(position, int) or not 0 <= position < len(strings):
+                raise MechError(f"on() returned position {position!r} for a sequence of {len(strings)} tokens")
+            unit = _part(token, "on", shape)
+            where.setdefault(unit, [set() for _ in sequences])[k].add(position)
+    grouped: dict[tuple, dict[str, set]] = {}
+    for (layer, site, index), at in where.items():
+        key = (layer, "mlp" if site in ("c_fc", "down_proj") else "attn", tuple(tuple(sorted(a)) for a in at))
+        grouped.setdefault(key, {}).setdefault(site, set()).add(index)
+    nodes = []
+    for j, ((layer, block, at), parts) in enumerate(sorted(grouped.items(), key=lambda kv: kv[0][:2])):
+        node = Node(f"n{j}", layer, block, parts).ir()
+        node["at"] = [{"tokens": list(ids), "positions": list(a)} for (ids, _, _), a in zip(sequences, at)]
+        nodes.append(node)
+    return nodes
+
+
 def _empty(source: str, model: str) -> dict:
     return {"model": model, "decomposition": "vpd", "standin": "counterfactual", "nodes": [], "edges": [], "alignments": [],
             "groups": [], "node_ids": {}, "labels": {}, "python_tokens": 0, "token_types": 0, "source": source,
@@ -371,6 +404,11 @@ def _trace(source: str, model: str, behavior: dict | None = None) -> dict:
         check(tree)
         namespace = {"__builtins__": SAFE_BUILTINS, "__name__": "explanation"}
         exec(compile(tree, "<explanation>", "exec"), namespace)
+        if callable(namespace.get("on")):  # a gate program: what acts where, wired as the model
+            nodes = gates(namespace["on"], model, behavior)
+            ir.update(nodes=nodes, wiring="model", edges=[] if nodes else [{"from": "embed", "to": "logits", "route": "input"}])
+            ir["valid"] = True
+            return ir
         if "nodes" not in namespace or "edges" not in namespace:
             raise MechError("the explanation defines no `nodes` dict and `edges` list")
         built, nodes, labels = build(namespace["nodes"], namespace["edges"], namespace.get("labels"), namespace, model, behavior)
@@ -608,6 +646,8 @@ def code_length(source: str) -> tuple[int, int]:
             continue
         if t.type == tokenize.STRING and any(a <= t.start and t.end <= b for a, b in docs):
             continue
+        if t.type == tokenize.STRING and PART.fullmatch(t.string[1:-1]):
+            continue  # a subcomponent's name: the checker prices it as a name
         if t.type in (tokenize.NUMBER, tokenize.STRING) or "STRING" in tokenize.tok_name[t.type]:
             tokens += len(t.string)
             characters.update(t.string)
