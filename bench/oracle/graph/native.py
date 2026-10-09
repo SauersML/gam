@@ -50,7 +50,7 @@ import mech  # noqa: E402
 TEXTS = Path.home() / "mpd-data/graph_oracle/texts"
 RANDOM = 8  # random draws per score
 CANDIDATES = 32  # replacement tokens the teacher tries per source position for an interchange claim
-ANSWER_TOKENS = 4096  # the oracle's answer budget (rl/train.py --max-tokens); a graph costs at least 4 tokens a node
+MAX_NODES, MAX_CONNECTIONS = 5000, 60000  # the edge stage's compute: beyond these the node stage could not prune it
 TEACH_STEPS, EDGE_STEPS, TEACH_LR = 2000, 600, 0.05  # the teacher's optimization (Adam on the strengths' logits)
 LN2 = math.log(2)
 
@@ -543,9 +543,11 @@ class Native:
         g = self._strength_loop(node_forward, torch.full((int(flat.sum()),), 2.0, device=self.dev), eps / 2, log, "nodes")
         sel = split(g)
         nodes = {(n, t, c) for n in names for t, c in (sel[n] > 0.5).nonzero().tolist()}
-        if 4 * len(nodes) > ANSWER_TOKENS:  # no answer the oracle can write holds this graph
-            return None, {"skipped": f"the node stage kept {len(nodes)} nodes, more than an answer of {ANSWER_TOKENS} tokens holds"}
+        if len(nodes) > MAX_NODES:
+            return None, {"skipped": f"the node stage kept {len(nodes)} nodes"}
         parents, out = all_edges(nodes, targets)
+        if sum(len(w) for w in parents.values()) + len(out) > MAX_CONNECTIONS:
+            return None, {"skipped": f"{len(nodes)} nodes with {sum(len(w) for w in parents.values()) + len(out)} connections between them"}
         if log:
             log(f"nodes kept: {len(nodes)}; connections between them: {sum(len(w) for w in parents.values()) + len(out)}")
         full = Graph(nodes, parents, out)
