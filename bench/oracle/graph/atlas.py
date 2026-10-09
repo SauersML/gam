@@ -210,22 +210,34 @@ def table(behavior: dict, device: str = "mps") -> dict[str, dict]:
     return json.loads(path.read_text()) if path.exists() else scores(behavior, device)
 
 
-def text(behavior: dict, top: int = 48, more: int = 208, device: str = "mps") -> str:
-    """The behavior's subcomponent table for the oracle's prompt: the first `top` with what each does, then the next
-    `more` with how far and where they move."""
+def node_name(token: str) -> str:
+    """The node a chain explanation puts a subcomponent in: its block, "attn<L>" or "mlp<L>"."""
+    layer, code = token[3:-1].split(".")[:2]
+    return f"{'mlp' if mech.SITES[code] in ('c_fc', 'down_proj') else 'attn'}{layer}"
+
+
+def listed(behavior: dict, n: int, device: str = "mps") -> list[str]:
+    """The behavior's first n subcomponents by ranking(): the oracle's list."""
+    return ranking(table(behavior, device))[:n]
+
+
+def text(behavior: dict, top: int = 48, n: int = 1024, device: str = "mps") -> str:
+    """The behavior's subcomponent list for the oracle's prompt: its first n subcomponents grouped by block in execution
+    order (most moved first within a block), then how far and where the first `top` move and what they do."""
     table_ = table(behavior, device)
     atlas = load()["parts"]
-    ranked = ranking(table_)
-    lines = ["Subcomponents whose activation differs most between the prompts and the changed prompts where the model needs"
-             " them (the largest difference, in units of the subcomponent's typical activation in text, and the token"
-             " where it is largest; VPD's causal importance summed over positions; what it does in text):"]
-    for p in ranked[:top]:
-        s = table_[p]
-        lines.append(f"  {p} moves {s['moved']:.1f} at {s['moved_at']!r}, need {s['need']:.1f}: {describe(atlas[p])}")
-    if more:
-        lines.append("Next (subcomponent, difference, token):")
-        rest = [f"{p} {table_[p]['moved']:.1f} {table_[p]['moved_at']!r}" for p in ranked[top:top + more]]
-        lines += ["  " + "; ".join(rest[i:i + 6]) for i in range(0, len(rest), 6)]
+    ranked = ranking(table_)[:n]
+    order = lambda name: (int(name.lstrip("atnmlp")), name.startswith("mlp"))  # noqa: E731
+    by_block: dict[str, list[str]] = {}
+    for p in ranked:
+        by_block.setdefault(node_name(p), []).append(p)
+    lines = [f"The {len(ranked)} subcomponents whose activations differ most between the prompts and the changed prompts where"
+             " the model needs them, by block (attn<L>: layer L attention, mlp<L>: layer L MLP), most first:"]
+    for name in sorted(by_block, key=order):
+        lines.append(f"{name}: " + " ".join(by_block[name]))
+    lines.append(f"The first {min(top, len(ranked))}: the largest difference, in units of the subcomponent's typical activation in"
+                 " text, the token where it is largest, and what it does in text:")
+    lines += [f"  {p} {table_[p]['moved']:.1f} at {table_[p]['moved_at']!r}: {describe(atlas[p])}" for p in ranked[:top]]
     return "\n".join(lines)
 
 

@@ -38,6 +38,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 sys.path.insert(0, str(HERE))
 
+import atlas  # noqa: E402
 import explain  # noqa: E402
 import mech  # noqa: E402
 import score as score_module  # noqa: E402
@@ -59,12 +60,13 @@ def errors(checker, sets: list[list[tuple]], a) -> list[float]:
     return [r["exec_error_bits"] if r.get("valid", True) else float("inf") for r in out]
 
 
-def blocks(model: str) -> list[tuple]:
-    """Every subcomponent, one tuple per block (layer, attention or MLP), in matrix order."""
+def blocks(model: str, only: list[tuple] | None = None) -> list[tuple]:
+    """Every subcomponent (or those of `only`, in its order), one tuple per block (layer, attention or MLP)."""
+    units = only if only is not None else [(l, site, i) for l, row in enumerate(mech.shapes(model)["views"]["vpd"])
+                                           for site, n in sorted(row.items()) for i in range(n)]
     out = {}
-    for l, row in enumerate(mech.shapes(model)["views"]["vpd"]):
-        for site, n in sorted(row.items()):
-            out.setdefault((l, site in ("c_fc", "down_proj")), []).extend((l, site, i) for i in range(n))
+    for u in units:
+        out.setdefault((u[0], u[1] in ("c_fc", "down_proj")), []).append(u)
     return [tuple(v) for _, v in sorted(out.items())]
 
 
@@ -115,6 +117,7 @@ def main():
     ap.add_argument("--tol", type=float, default=0.01, help="the share of the signal a refining round may lose")
     ap.add_argument("--ks", type=int, nargs="+", default=[8, 16, 32, 64, 128, 256])
     ap.add_argument("--batch", type=int, default=3)
+    ap.add_argument("--listed", type=int, default=0, help="search only the behavior's first N subcomponents in its atlas table (the oracle's list)")
     ap.add_argument("--out", type=Path, default=DATA / "runs/prune_v4")
     a = ap.parse_args()
     a.out.mkdir(parents=True, exist_ok=True)
@@ -124,7 +127,8 @@ def main():
         t0 = time.time()
         path = a.behaviors_dir / f"{b}.json"
         behavior = json.loads(path.read_text())
-        chunks = blocks(behavior["model"])
+        listed = explain.units_of(" ".join(atlas.ranking(atlas.table(behavior))[:a.listed])) if a.listed else None
+        chunks = blocks(behavior["model"], listed)
         log = lambda m: print(f"{b}: {m}", flush=True)  # noqa: E731
         searched = a.out / "search" / f"{b}.json"  # the prompts the search scores on
         searched.parent.mkdir(exist_ok=True)

@@ -4,7 +4,7 @@ split_answer separates the two. No weights or vectors: the behavior's descriptio
 next tokens and probabilities (the behavior file's `model_top`), the behavior's variables, the parts of M it may name,
 and the subcomponents VPD's causal importance says M needs on the behavior's prompts with what each does (atlas.py).
 
-  prompt.py BEHAVIOR.json [--prompts 4] [--shots 0] [--table 48]      prints the prompt
+  prompt.py BEHAVIOR.json [--prompts 4] [--shots 0] [--table 48] [--listed 1024]      prints the prompt
 """
 
 from __future__ import annotations
@@ -24,6 +24,7 @@ import family  # noqa: E402
 import mech  # noqa: E402
 
 TEACHER = Path.home() / "mpd-data/graph_oracle/teacher_v4/manifest.jsonl"
+LISTED = 1024  # subcomponents listed per behavior (atlas.text); the teacher answers name only these
 
 REFERENCE = """\
 Explain how the model computes the behavior below. Answer with one Python program in a ```python block, then plain
@@ -108,13 +109,14 @@ def examples(behavior: dict, shots: int) -> list[tuple[str, str]]:
     return [(r["behavior"], Path(r["answer"]).read_text().strip()) for r in rows[:shots]]
 
 
-def render(behavior: dict, prompts: int = 4, shots: int = 0, table: int = 48, more: int = 208) -> str:
-    """The oracle's prompt for `behavior`, with its first `table` subcomponents described and `more` listed (atlas.text)."""
+def render(behavior: dict, prompts: int = 4, shots: int = 0, table: int = 48, listed: int = LISTED) -> str:
+    """The oracle's prompt for `behavior`, with its first `listed` subcomponents by block and the first `table` described
+    (atlas.text)."""
     sizes, parts = views(behavior["model"])
     out = [REFERENCE.format(parts=parts)]
     out += [f"Example answer (behavior {b}):\n{text}" for b, text in examples(behavior, shots)]
-    listed = f"\n{atlas.text(behavior, table, more)}" if table else ""
-    out.append(f"{sizes}\n{behavior_text(behavior, prompts)}{listed}\n\nWrite the program, then the explanation.")
+    candidates = f"\n{atlas.text(behavior, table, listed)}" if listed else ""
+    out.append(f"{sizes}\n{behavior_text(behavior, prompts)}{candidates}\n\nWrite the program, then the explanation.")
     return "\n\n".join(out)
 
 
@@ -151,8 +153,9 @@ def main():
     ap.add_argument("--prompts", type=int, default=4)
     ap.add_argument("--shots", type=int, default=0)
     ap.add_argument("--table", type=int, default=48)
+    ap.add_argument("--listed", type=int, default=LISTED)
     a = ap.parse_args()
-    print(render(json.loads(a.behavior.read_text()), a.prompts, a.shots, a.table))
+    print(render(json.loads(a.behavior.read_text()), a.prompts, a.shots, a.table, a.listed))
 
 
 if __name__ == "__main__":
