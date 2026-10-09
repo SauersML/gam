@@ -13,7 +13,8 @@ where it writes the residual stream; its subcomponents leave the base's nodes. E
   teacher.py [BEHAVIOR...] [--experiments 64] [--out ~/mpd-data/graph_oracle/teacher_v4] [--heldout]
 writes OUT/<behavior>.py, OUT/<behavior>.answer.txt (the program in a python block, then the English) and appends
 OUT/manifest.jsonl. --heldout does the held-out behaviors instead, into ~/mpd-data/graph_oracle/teacher_heldout by
-default: the search baseline of the evaluation, never training input.
+default: the search baseline of the evaluation, never training input. A held-out behavior has no variables to place,
+so its answer is the search's own best set by total on seed 0, from the scores the search wrote (no checker runs).
 """
 
 from __future__ import annotations
@@ -108,6 +109,26 @@ def shape(nodes: list[dict]) -> str:
     return " + ".join(f"{n['name']}:{len(n['units'])}" for n in nodes)
 
 
+def baseline(b: str, behavior: dict, path: Path, searched: dict, a, log):
+    """A held-out behavior's answer: the search's set of lowest seed-0 total as a chain, with the search's scores."""
+    by = {(str(c["k"]), c["seed"]): c for c in searched["curve"]}
+    k = min((k for k, seed in by if seed == 0 and by[(k, 0)]["score"]["valid"]), key=lambda k: by[(k, 0)]["score"]["total_bits"])
+    nodes, edges = explain.chain(explain.units_of(" ".join(searched["sets"][k])))
+    source = explain.source(nodes, edges, {})
+    (a.out / f"{b}.py").write_text(source)
+    answer_path = a.out / f"{b}.answer.txt"
+    answer_path.write_text(f"```python\n{source.strip()}\n```\n\n{english(behavior['description'], nodes, edges, {}, prompt.variables(behavior))}\n")
+    record = {"behavior": b, "family": behavior["family"], "model": behavior["model"], "answer": str(answer_path),
+              "behavior_path": str(path), "nodes": [{"name": n["name"], "parts": len(n["units"])} for n in nodes],
+              "edges": len(edges), "labels": {}, "parts": sum(len(n["units"]) for n in nodes), "experiments": searched["experiments"],
+              "score": {s: by[(k, s)]["score"] for s in (0, 1)}, "shares": {s: by[(k, s)]["shares"] for s in (0, 1)},
+              "set": k, "checker": searched["checker"]}
+    with open(a.out / "manifest.jsonl", "a") as f:
+        f.write(json.dumps(record) + "\n")
+    log(f"kept the search's set {k} ({record['parts']} subcomponents); reproduces {record['shares'][0]['reproduces']:.1%}, "
+        f"removes {record['shares'][0]['removes']:.1%} (seed 0)")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("behaviors", nargs="*", help="default: every behavior with a pruning run")
@@ -128,8 +149,12 @@ def main():
         behavior = json.loads(path.read_text())
         if (behavior.get("split") == "train") == a.heldout:
             continue
-        sets = json.loads((a.prune / f"{b}.json").read_text())["sets"]
+        searched = json.loads((a.prune / f"{b}.json").read_text())
+        sets = searched["sets"]
         log = lambda m: print(f"{b}: {m}", flush=True)  # noqa: E731
+        if a.heldout:
+            baseline(b, behavior, path, searched, a, log)
+            continue
         with score_module.Checker(behavior["model"], device=a.device) as checker:
             checker.behavior(path)
 
