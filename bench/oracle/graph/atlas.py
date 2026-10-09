@@ -159,13 +159,14 @@ def scores(behavior: dict, device: str = "mps", prompts: int = 32) -> dict[str, 
     positions up to the last target (VPD's measure of how much of it the model needs there), mean over prompts; `at`,
     where its importance peaks most often ("target" or the token there); `target` and `changed`, its mean activation at
     the targets on the prompts and on the changed prompts in units of its typical size in text; `moved`, the largest
-    change of that activation between prompt and changed prompt at any position, and `moved_need`, the same weighted by
-    the larger importance of the two."""
+    change of that activation between prompt and changed prompt at any position, `moved_need`, the same weighted by
+    the larger importance of the two, and `moved_at`, where `moved_need` peaks most often."""
     rms = {n: torch.tensor([load()["parts"][part(*site_of(n), c)]["rms"] for c in range(C)], device=device).clamp_min(1e-12)
            for n, C in model(device)[1].C.items()}
     tk = mech.tokenizer(behavior["model"])
     sums: dict[str, dict[str, torch.Tensor]] = {}
     peaks: dict[str, list[dict]] = {}
+    shifts: dict[str, list[dict]] = {}
     seqs = sequences(behavior)[:prompts]
     for ids, targets, changed in seqs:
         ci = importance(ids, device)
@@ -179,23 +180,35 @@ def scores(behavior: dict, device: str = "mps", prompts: int = 32) -> dict[str, 
             if b is not None:
                 s["changed"] += (b[n][0][targets] / rms[n]).mean(0)
                 moved = ((a[n][0] - b[n][0]) / rms[n]).abs()
+                weighted = moved * torch.maximum(c, cb[n])
                 s["moved"] += moved.max(0).values
-                s["moved_need"] += (moved * torch.maximum(c, cb[n])).max(0).values
+                s["moved_need"] += weighted.max(0).values
+                words = shifts.setdefault(n, [dict() for _ in range(c.shape[1])])
+                for k, t in enumerate(weighted.argmax(0).tolist()):
+                    w = "target" if t in targets else name(tk, ids[t])
+                    words[k][w] = words[k].get(w, 0) + 1
             words = peaks.setdefault(n, [dict() for _ in range(c.shape[1])])
             for k, t in enumerate(c.argmax(0).tolist()):
-                w = "target" if t in targets else tk.decode([ids[t]])
+                w = "target" if t in targets else name(tk, ids[t])
                 words[k][w] = words[k].get(w, 0) + 1
     out = {}
     for n, s in sums.items():
         values = {k: (v / len(seqs)).tolist() for k, v in s.items()}
         for c in range(len(values["need"])):
-            out[part(*site_of(n), c)] = {**{k: values[k][c] for k in values}, "at": max(peaks[n][c].items(), key=lambda kv: kv[1])[0]}
+            out[part(*site_of(n), c)] = {**{k: values[k][c] for k in values}, "at": max(peaks[n][c].items(), key=lambda kv: kv[1])[0],
+                                         "moved_at": max(shifts[n][c].items(), key=lambda kv: kv[1])[0] if n in shifts else ""}
     return out
 
 
+def name(tk, token: int) -> str:
+    """A token as text, or its vocabulary entry when it decodes to nothing (a special token)."""
+    return tk.decode([token]) or tk.id_to_token(token)
+
+
 def ranking(table: dict[str, dict]) -> list[str]:
-    """Subcomponents by causal importance on the behavior, most first."""
-    return sorted(table, key=lambda p: -table[p]["need"])
+    """Subcomponents by how far their activation moves between the prompts and the changed prompts where the model
+    needs them (`moved_need`), most first: what runs alike on both carries nothing the changed prompt removes."""
+    return sorted(table, key=lambda p: -table[p]["moved_need"])
 
 
 def table(behavior: dict, device: str = "mps") -> dict[str, dict]:
@@ -208,12 +221,12 @@ def text(behavior: dict, top: int = 48, device: str = "mps") -> str:
     """The behavior's subcomponent table for the oracle's prompt."""
     table_ = table(behavior, device)
     atlas = load()["parts"]
-    lines = ["Subcomponents the model needs most on these prompts (VPD's causal importance summed over positions; where it"
-             " peaks; activation at the targets on the prompts / the changed prompts, in units of its typical size in text;"
-             " what it does in text):"]
+    lines = ["Subcomponents whose activation differs most between the prompts and the changed prompts where the model needs"
+             " them (the largest difference, in units of the subcomponent's typical activation in text, and the token"
+             " where it is largest; VPD's causal importance summed over positions; what it does in text):"]
     for p in ranking(table_)[:top]:
         s = table_[p]
-        lines.append(f"  {p} need {s['need']:.1f} at {s['at']!r}, {s['target']:+.1f}/{s['changed']:+.1f}: {describe(p, atlas[p])}")
+        lines.append(f"  {p} moves {s['moved']:.1f} at {s['moved_at']!r}, need {s['need']:.1f}: {describe(p, atlas[p])}")
     return "\n".join(lines)
 
 
