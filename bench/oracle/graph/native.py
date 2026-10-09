@@ -183,6 +183,17 @@ class Native:
         _, ci = self.vpd.target_and_ci(torch.tensor([ids], device=self.dev))
         return {n: ci[n][0] for n in self.names}
 
+    @torch.no_grad()
+    def activations(self, ids: list[int]) -> dict:
+        """Every subcomponent's activation a_c(t) = (x_t . v_c) |u_c| on the model's own run, [T, C] per matrix."""
+        self.vpd.clear()
+        for n in self.names:
+            self.target.site(n).cache_input = True
+        self.target(torch.tensor([ids], device=self.dev))
+        out = {n: (self.target.site(n).last_input[0] @ self.target.site(n).V) * self.target.site(n).U.norm(dim=1) for n in self.names}
+        self.vpd.clear()
+        return out
+
     def vpd_answer(self, ids: list[int]) -> Graph:
         """VPD's own answer, for comparison: at every position the subcomponents whose causal importance there is above
         zero, complete."""

@@ -153,6 +153,33 @@ class Policy:
         chat = self.tok.apply_chat_template([{"role": "user", "content": text}], add_generation_prompt=True, enable_thinking=False, tokenize=False)
         return self.tok.encode(chat, add_special_tokens=False)
 
+    EVIDENCE = "<|fim_pad|>"  # the placeholder token whose input embedding an evidence vector replaces
+
+    def question_ids(self, b: dict) -> list[int]:
+        """The oracle's input for question b: the rendered question, and with --evidence (acts_fn set) one placeholder
+        per position and weight matrix, whose embeddings become the model's activations there (embed())."""
+        text = render(b)
+        if getattr(self, "acts_fn", None) is not None:
+            ids = b["prompts"][0]["token_ids"]
+            text += "\nactivations: " + self.EVIDENCE * (len(ids) * len(self.parts.ev_order))
+            q = self.prompt_ids(text)
+            self.evidence[tuple(q)] = self.acts_fn(ids)
+            return q
+        return self.prompt_ids(text)
+
+    def embed(self, ids: torch.Tensor, prompts: list[list[int]], starts: list[int]) -> torch.Tensor:
+        """Input embeddings of a batch [B, W], each prompt's placeholders (prompt r starting at starts[r]) replaced by
+        its evidence (PartTokens.evidence of its activations)."""
+        emb = self.model.get_input_embeddings()(ids)
+        ev_id = self.tok.convert_tokens_to_ids(self.EVIDENCE)
+        for r, (p, st) in enumerate(zip(prompts, starts)):
+            acts = self.evidence.get(tuple(p))
+            if acts is None:
+                continue
+            pos = st + (torch.tensor(p, device=ids.device) == ev_id).nonzero().flatten()
+            emb = emb.index_put((torch.full_like(pos, r), pos), self.parts.evidence(acts).to(emb.dtype))
+        return emb
+
     def save(self, path: Path):
         self.model.save_pretrained(str(path), selected_adapters=["default"])
         if self.parts is not None:
@@ -186,6 +213,7 @@ class Policy:
             att[r, : len(p) + len(c)] = 1
             comp[r, len(p) : len(p) + len(c)] = True
         ids, att, comp = ids.to(self.dev), att.to(self.dev), comp.to(self.dev)
+        evidence = bool(getattr(self, "evidence", None)) and any(tuple(p) in self.evidence for p in prompts)
         inputs = {"input_ids": ids, "attention_mask": att}
         rows, cols = comp[:, 1:].nonzero(as_tuple=True)
         src = rows * width + cols  # the hidden state at position t predicts token t + 1
@@ -194,7 +222,10 @@ class Policy:
         rows, cols = torch.as_tensor(rows, device=self.dev), torch.as_tensor(cols, device=self.dev)
 
         def run():
-            hidden = causal.model(**inputs).last_hidden_state
+            if evidence:
+                hidden = causal.model(inputs_embeds=self.embed(ids, prompts, [0] * len(prompts)), attention_mask=att).last_hidden_state
+            else:
+                hidden = causal.model(**inputs).last_hidden_state
             flat = hidden.reshape(-1, hidden.shape[-1])[src]
             if self.parts is None:
                 def piece(h, t):
@@ -279,8 +310,11 @@ class HfSampler:
             for r, p in enumerate(chunk):
                 ids[r, width - len(p) :] = torch.tensor(p)
                 att[r, width - len(p) :] = 1
-            gen = pol.model.generate(input_ids=ids.to(pol.dev), attention_mask=att.to(pol.dev), max_new_tokens=self.max_tokens, do_sample=True, temperature=1.0, top_p=1.0,
-                                     top_k=0, eos_token_id=pol.end, pad_token_id=pol.end)[:, width:].tolist()
+            kw = dict(attention_mask=att.to(pol.dev), max_new_tokens=self.max_tokens, do_sample=True, temperature=1.0, top_p=1.0, top_k=0, eos_token_id=pol.end, pad_token_id=pol.end)
+            if getattr(pol, "evidence", None) and any(tuple(p) in pol.evidence for p in chunk):  # embeddings in: generate returns the new tokens only
+                gen = pol.model.generate(inputs_embeds=pol.embed(ids.to(pol.dev), chunk, [width - len(p) for p in chunk]), **kw).tolist()
+            else:
+                gen = pol.model.generate(input_ids=ids.to(pol.dev), **kw)[:, width:].tolist()
             gens += [g[: g.index(pol.end) + 1] if pol.end in g else g for g in gen]
         out = [gens[k * n : (k + 1) * n] for k in range(len(prompts))]
         if pol.dev.type == "mps":
@@ -293,7 +327,7 @@ class VllmSampler:
     first visible GPU; the trainer takes the second when there is one (--gpu-memory set accordingly)."""
 
     def __init__(self, args, rank: int, end: int, model: str | None = None):
-        self.engine_options, self.sample_options = {}, {}
+        self.engine_options, self.sample_options = ({"enable_prompt_embeds": True} if getattr(args, "evidence", False) else {}), {}
         self.share, self.args, self.rank = args.share_gpu, args, rank
         self.max_tokens, self.end = args.max_tokens, end
         self.policy = None  # with --share-gpu: the trainer, moved to the host while vLLM samples
@@ -380,7 +414,14 @@ class VllmSampler:
             self.acquire()
         params = SamplingParams(n=n, temperature=1.0, top_p=1.0, top_k=-1, max_tokens=self.max_tokens, stop_token_ids=[self.end], logprobs=0, **self.sample_options)
         try:
-            outs = self.llm.generate([{"prompt_token_ids": p} for p in prompts], params, lora_request=LoRARequest(f"policy{version}", version + 1, str(adapter)), use_tqdm=False)
+            pol = self.policy
+            if pol is not None and getattr(pol, "evidence", None):  # evidence: the prompts go in as embeddings
+                with torch.no_grad():
+                    reqs = [{"prompt_embeds": pol.embed(torch.tensor([p], device=pol.dev), [p], [0])[0].to(torch.bfloat16).cpu()} if tuple(p) in pol.evidence
+                            else {"prompt_token_ids": p} for p in prompts]
+            else:
+                reqs = [{"prompt_token_ids": p} for p in prompts]
+            outs = self.llm.generate(reqs, params, lora_request=LoRARequest(f"policy{version}", version + 1, str(adapter)), use_tqdm=False)
         finally:
             if not self.held:
                 self.release()
@@ -608,7 +649,7 @@ def rl2_sample(chosen: list[dict], step: int, args, pol, sampler, adapter: Path,
     """A group of --samples answers per behavior (the sampling half of rl2_groups), with vLLM's log-probabilities of
     the sampled tokens (the behavior policy of ppo_update's importance weights)."""
     n = args.samples
-    prompts = [pol.prompt_ids(render(b)) for b in chosen]
+    prompts = [pol.question_ids(b) for b in chosen]
     comps = timed(clock, "sample", sampler, prompts, n, adapter, step)
     behavior = getattr(sampler, "token_logprobs", None) or [None] * (len(prompts) * n)
     return [{"behavior": b, "prompt": prompts[g], "completions": comps[g], "texts": [pol.tok.decode(c, skip_special_tokens=True) for c in comps[g]],
@@ -902,7 +943,7 @@ def sft_examples(args, pol, pool: list[dict]) -> tuple[list, list]:
     by_id = {b["id"]: b for b in pool}
     end = [pol.end]
     target = (lambda text: pol.parts.reg.rewrite(text)) if getattr(pol, "parts", None) is not None else (lambda text: text)  # noqa: E731  addresses -> part tokens
-    programs = [(pol.prompt_ids(render(by_id[bid])), pol.tok.encode(target(text.strip()), add_special_tokens=False) + end) for bid, text in sorted(TEACHER.items()) if bid in by_id]
+    programs = [(pol.question_ids(by_id[bid]), pol.tok.encode(target(text.strip()), add_special_tokens=False) + end) for bid, text in sorted(TEACHER.items()) if bid in by_id]
     questions = []
     for path in args.data or []:
         for line in open(os.path.expanduser(path)):
@@ -991,7 +1032,7 @@ def evaluate(sets: dict[str, list[dict]], pol, sampler, score, args, adapter: Pa
         for name, pool in sets.items():
             if not pool:
                 continue
-            prompts = [pol.prompt_ids(render(b)) for b in pool]
+            prompts = [pol.question_ids(b) for b in pool]
             groups = sampler(prompts, args.samples, adapter, version)
             answers = [(b, pol.tok.decode(c, skip_special_tokens=True)) for b, g in zip(pool, groups) for c in g]
             items = [item(t, b, args.eval_seed) for b, t in answers]
@@ -1068,6 +1109,7 @@ def main():
     ap.add_argument("--lora-rank", type=int, default=32)
     ap.add_argument("--micro", type=int, default=2)
     ap.add_argument("--sampler", choices=["auto", "vllm", "hf"], default="auto")
+    ap.add_argument("--evidence", action="store_true", help="the oracle also reads the model's activations: one input token per position and weight matrix, the subcomponents' features weighted by their activations through the part-token maps (needs --part-tokens)")
     ap.add_argument("--part-tokens", help="part tokens: the registry file of part_tokens.py build; the projections train with the LoRA and vLLM gets the rows in place")
     ap.add_argument("--materialize-every", type=int, default=0, help="with --part-tokens: also rewrite the checkpoint and restart vLLM every K steps (0: only at the start; the rows are copied in place before every sampling call)")
     ap.add_argument("--share-gpu", action="store_true", help="one GPU for vLLM and the trainer: vLLM sleeps (weights to host) while training and the trainer moves to the host while sampling, so --gpu-memory can be 0.8")
@@ -1121,6 +1163,13 @@ def main():
         sampler = VllmSampler(args, rank, AutoTokenizer.from_pretrained(args.base).convert_tokens_to_ids("<|im_end|>"), None if args.part_tokens else args.base)
     dev = torch.device(f"cuda:{torch.cuda.device_count() - 1}" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
     pol = Policy(args, dev)
+    pol.evidence, pol.acts_fn = {}, None
+    if args.evidence:
+        if pol.parts is None:
+            raise SystemExit("--evidence reads activations through the part-token maps: give --part-tokens")
+        import native
+
+        pol.acts_fn = native.Native(str(dev) if dev.type != "cuda" else "cuda").activations
     if isinstance(sampler, VllmSampler):
         sampler.policy = pol
         if pol.parts is not None:  # vLLM starts once, on a checkpoint with the extended vocabulary; the rows then come in place

@@ -208,6 +208,18 @@ class PartTokens(nn.Module):
             self.site_local[k] = local
             self.site_feats[k] = torch.zeros(len(uniq), f.shape[1], device=f.device).index_add(0, local, f.float()) / torch.bincount(local)[:, None].float()
             self.site_global[k] = torch.tensor(uniq, device=f.device)
+        # Evidence (rl/train.py --evidence): per weight matrix "h.L.attn.q_proj" ..., its parts' rows within their kind's
+        # features in subcomponent order, and its site within the kind.
+        ev = {}
+        for k in self.feats:
+            for j, i in enumerate(reg.by_kind[k]):
+                m = re.fullmatch(r"PD\[(\d+)\]\.(\w+)\[(\d+)\]", reg.addresses[i])
+                if m:
+                    name = f"h.{m[1]}.{'mlp' if m[2] in ('c_fc', 'down_proj') else 'attn'}.{m[2]}"
+                    ev.setdefault(name, (k, [], int(self.site_local[k][j])))[1].append((int(m[3]), j))
+        self.ev = {n: (k, torch.tensor([j for _, j in sorted(rows)], device=dev), site) for n, (k, rows, site) in ev.items()}
+        order = ["q_proj", "k_proj", "v_proj", "o_proj", "c_fc", "down_proj"]
+        self.ev_order = sorted(self.ev, key=lambda n: (int(n.split(".")[1]), order.index(n.split(".")[-1])))
 
     def rows(self, which: str) -> torch.Tensor:
         """[parts, hidden]: input embeddings (which = "in", RMS of the token embeddings) or output rows; each
@@ -222,6 +234,19 @@ class PartTokens(nn.Module):
                 out = torch.zeros(len(self.reg.addresses), y.shape[1], device=y.device, dtype=y.dtype)
             out = out.index_copy(0, self.idx[k], y)
         return out
+
+    def evidence(self, acts: dict) -> torch.Tensor:
+        """[T * matrices, hidden]: per position, per weight matrix (ev_order), the input map of its subcomponents'
+        features weighted by their activations there (a / sum |a|) plus the matrix's site component, at the token
+        embeddings' RMS: what is active, read through the same maps as the subcomponent tokens."""
+        rows = []
+        for name in self.ev_order:
+            k, local, site = self.ev[name]
+            a = acts[name].float()
+            w = a / a.abs().sum(-1, keepdim=True).clamp_min(1e-12)
+            y = self.p_in[self.names[k]](w @ self.feats[k][local].float()) + self.s_in[self.names[k]](self.site_feats[k][site])
+            rows.append(self.emb_rms * y / y.pow(2).mean(-1, keepdim=True).add(1e-6).sqrt())
+        return torch.stack(rows, 1).reshape(-1, rows[0].shape[-1])
 
     def site_rows(self) -> torch.Tensor:
         """[sites, hidden]: the output rows of the sites (the first level of the two-level choice)."""
