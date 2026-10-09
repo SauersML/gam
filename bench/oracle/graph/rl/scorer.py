@@ -1,41 +1,31 @@
-"""Scorers for the oracle's training (#2951): a batch of items (an explanation's source, or an IR, and its behavior) ->
-the checker's score dicts ({"total_bits", "exec_error_bits", "necessity_error_bits", "alignment_error_bits",
-"complexity_bits", "valid", "error", ...}).
+"""Scorers for the oracle's training (#2951): a batch of items (an explanation's source, or an IR, and its task) -> the
+checker's score dicts ({"exec_error_bits", "pairs", "valid", "error", ...}; score.order ranks them).
 
   checker  score.py's Checker: the score the oracle is trained on. An item with "ir" (the nothing-named baseline) is
            scored as that IR.
-  mock     no checker: code bits from mech.trace and no error terms; an invalid explanation pays MOCK_EMPTY_BITS.
-           Plumbing only: its optimum is the shortest valid explanation.
-  none     no score: evaluation only samples and saves (train.py --mode rescore scores later).
+  mock     no checker: KL 0 for a valid explanation and its pairs from mech.trace. Plumbing only: its optimum is the
+           valid explanation naming the fewest pairs.
 """
 
 from __future__ import annotations
 
 import json
-import math
 import sys
 from pathlib import Path
 
 GRAPH = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(GRAPH))
 
-MOCK_EMPTY_BITS = 1.0e4
-
 
 def mock(items: list[dict]) -> list[dict]:
     from concurrent.futures import ThreadPoolExecutor
 
     import mech
+    import score
 
     with ThreadPoolExecutor(8) as ex:  # each trace is a sandboxed child process
-        irs = list(ex.map(lambda it: mech.trace(it["source"], it["behavior"]["model"]), items))
-    out = []
-    for ir in irs:
-        valid, tokens, types = ir["valid"], ir.get("python_tokens", 0), ir.get("token_types", 1)
-        code = tokens * math.log2(max(types, 2)) if valid else 0.0
-        out.append({"total_bits": code if valid else MOCK_EMPTY_BITS, "exec_error_bits": 0.0 if valid else MOCK_EMPTY_BITS,
-                    "code_bits": code, "python_tokens": tokens if valid else 0, "valid": valid, "error": ir.get("error"), "scorer": "mock"})
-    return out
+        irs = list(ex.map(lambda it: it.get("ir") or mech.trace(it["source"], it["behavior"]["model"], behavior=it["behavior"]), items))
+    return [{"exec_error_bits": 0.0, "pairs": score.pairs(ir), "valid": ir["valid"], "error": ir.get("error"), "scorer": "mock"} for ir in irs]
 
 
 _CHECKERS = {}
@@ -76,7 +66,7 @@ def checker(items: list[dict]) -> list[dict]:
             batch = [k for k in ks if key(k) == (seed, uniform, experiments, options)]
             for s in range(0, len(batch), BATCH):  # a server's memory grows with the programs of one request
                 chunk = batch[s: s + BATCH]
-                programs = [items[k].get("ir") or {"source": items[k]["source"], "explanation": items[k].get("explanation", "")} for k in chunk]
+                programs = [items[k].get("ir") or items[k]["source"] for k in chunk]
                 for k, r in zip(chunk, c.score_batch(programs, experiments=experiments, seed=seed, uniform_seeds=uniform or None,
                                                      options=json.loads(options))):
                     out[k] = r
@@ -94,8 +84,4 @@ def checker(items: list[dict]) -> list[dict]:
     return out
 
 
-def none(items: list[dict]) -> list[dict]:
-    return [{"total_bits": float("nan"), "valid": None, "scorer": "none"} for _ in items]
-
-
-SCORERS = {"mock": mock, "checker": checker, "none": none}
+SCORERS = {"mock": mock, "checker": checker}

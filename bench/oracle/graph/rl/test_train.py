@@ -293,54 +293,36 @@ def check_ppo(pol):
 
 ANSWER = """I look at the previous token.
 ```python
-nodes = {
-    "quote": {"subcomponents": ["<p:1.o.4>"], "at": "all"},
-    "answer": {"subcomponents": ["<p:2.v.559>", "<p:2.o.735>"], "at": "targets"},
-}
-edges = [
-    ("input", "answer"),
-    ("quote", "answer"),
-    ("answer", "output"),
-]
-labels = {"quote": "inside"}
+def on(tokens, targets):
+    return {t: ["<p:2.v.559>", "<p:2.o.735>"] for t in targets}
 ```
 The answer is copied by layer 2's value and output parts."""
 
 
 def check_credit_advantages(pol):
-    """credit_advantages: a subcomponent's tokens get dS(drop it) / scale, the rest of its node's line dS(drop the node)
-    / scale (+inf: 1), an edge's line dS(cut it) / scale, the other tokens the episode advantage; the same with a
-    tokenization that re-encoding does not give."""
-    from edits import Edit
-
+    """credit_advantages: a credited subcomponent name's tokens get dS(drop it) / scale (+inf: 1), the other tokens the
+    episode advantage; the same with a tokenization that re-encoding does not give."""
     tok = pol.tok
     source = train.split_answer(ANSWER)[0]
     assert ANSWER[train.program_offset(ANSWER, source):].startswith(source)
-    dS = {Edit("drop", "answer", part="<p:2.v.559>"): 3.0, Edit("unalign", "answer"): float("inf"), Edit("unalign", "quote"): -1.0,
-          Edit("cut", "quote>answer"): 0.5}
+    v, o = source.index('"<p:2.v.559>"'), source.index('"<p:2.o.735>"')
+    dS = {(v, v + len('"<p:2.v.559>"')): 3.0, (o, o + len('"<p:2.o.735>"')): float("inf")}
     canonical = tok.encode(ANSWER, add_special_tokens=False) + [pol.end]
     chars = [i for ch in ANSWER for i in tok.encode(ch, add_special_tokens=False)] + [pol.end]
     assert chars != canonical[: len(chars)]
+    offset = train.program_offset(ANSWER, source)
     for completion in (canonical, chars):
         adv = train.credit_advantages(tok, completion, ANSWER, source, -0.25, dS, 2.0)
         spans = train.token_spans(tok, completion, ANSWER)
         assert len(adv) == len(completion) == len(spans)
-        part = ANSWER.index("<p:2.v.559>")
-        line = ANSWER.index('    "answer"')
-        quote = ANSWER.index('    "quote"')
-        cut = ANSWER.index('    ("quote", "answer")')
         for (c0, c1), a in zip(spans, adv):
             if c1 <= c0:
                 assert a == -0.25
-            elif c1 > part and c0 < part + len("<p:2.v.559>"):  # a token overlapping the part (" <")
+            elif c1 > offset + v and c0 < offset + v + len('"<p:2.v.559>"'):
                 assert a == 1.5, (ANSWER[c0:c1], a)
-            elif c0 >= line and c1 <= ANSWER.index("\n", line):
+            elif c1 > offset + o and c0 < offset + o + len('"<p:2.o.735>"'):
                 assert a == 1.0, (ANSWER[c0:c1], a)
-            elif c0 >= quote and c1 <= ANSWER.index("\n", quote):
-                assert a == -0.5, (ANSWER[c0:c1], a)
-            elif c0 >= cut and c1 <= ANSWER.index("\n", cut):
-                assert a == 0.25, (ANSWER[c0:c1], a)
-            elif c1 <= ANSWER.index("```python") + 9 or c0 >= ANSWER.index("```\nThe") + 3:
+            else:
                 assert a == -0.25, (ANSWER[c0:c1], a)
 
 
@@ -384,29 +366,30 @@ def check_rl2_pieces():
 
 def check_rl2_step(pol):
     """A whole rl2 step on stand-ins: a sampler that writes fixed answers and a stand-in score (10 bits per needed
-    subcomponent missing, 1 per subcomponent named; invalid unless a node that writes the output names one). Behavior "x" gets answers of different
-    scores, "y" only invalid ones (dropped, refilled by "z"); credit marks tokens, refine improves the best answers
-    (expert iteration), and the PPO epochs and the expert-iteration step run."""
+    subcomponent missing, 1 per subcomponent named; invalid when it names none). Behavior "x" gets answers of different
+    scores, "y" only invalid ones (dropped, refilled by "z"); credit marks tokens, refine drops what the best answers
+    name needlessly (expert iteration), and the PPO epochs and the expert-iteration step run."""
     import json
+    import re
 
     import numpy as np
-    from edits import Answer
 
     needed = {"<p:2.v.559>", "<p:2.o.735>", "<p:2.v.9>"}
+
+    def named_in(source):
+        return set(re.findall(r"<p:[^>]+>", source))
 
     def stand_in(items):
         out = []
         for it in items:
-            a = Answer.parse(it["source"])
-            named = {q for st in a.statements for q in st.parts}
-            valid = any(st.parts for st in a.statements if any(w == st.variable and r == "output" for w, r, *_ in a.edges))
-            out.append({"total_bits": 10.0 * len(needed - named) + len(named) if valid else 1e4, "valid": valid})
+            named = named_in(it["source"])
+            out.append({"total_bits": 10.0 * len(needed - named) + len(named) if named else 1e4, "valid": bool(named)})
         return out
 
     def answer_with(parts):
         return ANSWER.replace('"<p:2.v.559>", "<p:2.o.735>"', ", ".join(f'"{p}"' for p in parts))
 
-    texts = {"x": [answer_with(["<p:2.v.559>", "<p:2.o.735>"]), answer_with(["<p:2.v.559>"]), answer_with(["<p:2.v.559>", "<p:3.o.1>"]), answer_with([])],
+    texts = {"x": [answer_with(["<p:2.v.559>", "<p:2.o.735>", "<p:2.v.9>", "<p:3.o.1>"]), answer_with(["<p:2.v.559>"]), answer_with(["<p:2.v.559>", "<p:3.o.1>"]), answer_with([])],
              "y": [answer_with([])] * 4, "z": [answer_with(["<p:2.v.9>"]), answer_with(["<p:2.v.9>", "<p:2.o.735>"]), answer_with(["<p:2.v.9>"]), answer_with([])]}
     asked = []
 
@@ -423,7 +406,7 @@ def check_rl2_step(pol):
     try:
         with tempfile.TemporaryDirectory() as d:
             logs = {k: open(Path(d) / f"{k}.jsonl", "w") for k in ("train", "samples", "improved")}
-            args = argparse.Namespace(seed=0, eval_seed=1_000_003, samples=4, experiments=4, credit=16, credit_answers=0, refill=1, refine=3, refine_adds=2, behaviors_per_step=2, beta=0.0,
+            args = argparse.Namespace(seed=0, eval_seed=1_000_003, samples=4, experiments=4, credit=16, credit_answers=0, refill=1, refine=3, behaviors_per_step=2, beta=0.0,
                                       micro=2, ppo_epochs=2, clip=0.2, clip_high=0.28, dual_clip=3.0, tis_cap=2.0, exit_beta=0.1)
             pool = [{"id": "x", "model": "vpd4l"}, {"id": "y", "model": "vpd4l"}, {"id": "z", "model": "vpd4l"}]
             scales = train.Scales({"x": answer_with(sorted(needed)), "y": answer_with(sorted(needed))})
@@ -434,11 +417,11 @@ def check_rl2_step(pol):
             first = {}
             for step in range(64):  # the first step that draws x and y
                 if set(random_pick(pool, args, step)) == {"x", "y"}:
-                    first = train.rl2_step(step, args, pol, sampler, stand_in, scales, pool, Path(d), train.Learner(pol, rec, NoWarmup()), {"x": {"answer": ["<p:2.v.9>", "<p:2.o.735>"]}}, logs, 0.0)
+                    first = train.rl2_step(step, args, pol, sampler, stand_in, scales, pool, Path(d), train.Learner(pol, rec, NoWarmup()), logs, 0.0)
                     break
             assert first, "no step draws x and y"
             assert first["groups"] == 3 and first["kept"] == 2 and first["refills"] == 1 and asked[-1] == "z", (first, asked)
-            assert scales.scale == {"x": 4.0, "y": 4.0, "z": 1e4} and scales.target["z"] == 0.0  # the teacher's 4 parts; z: the empty program's total
+            assert scales.scale == {"x": 3.0, "y": 3.0, "z": 1e4} and scales.target["z"] == 0.0  # the teacher's 3 parts; z: the empty program's total
             assert first["improved"] >= 1 and len(first["loss"]) == 2 and "exit_sft_loss" in first, first
             assert first["repeated_scores"] > 0, first  # refinement starts from an answer the credit scored
             texts3 = [answer_with(["<p:2.v.559>", "<p:2.o.735>"]), answer_with(["<p:2.v.559>"]), answer_with(["<p:2.v.559>", "<p:3.o.1>"]), answer_with(["<p:2.o.735>"])]
@@ -457,13 +440,12 @@ def check_rl2_step(pol):
             assert len(rows) == 12 and credited and all(r["kept"] == (r["behavior"] != "y") for r in rows)
             improved = [json.loads(line) for line in open(Path(d) / "improved.jsonl")]
             assert all(r["bits"] < r["sampled_bits"] for r in improved), improved
-            assert any(set(next(st for st in Answer.parse(train.split_answer(r["text"])[0]).statements if st.variable == "answer").parts) == needed
-                       for r in improved if r["behavior"] == "x"), improved
+            assert any(named_in(train.split_answer(r["text"])[0]) == needed for r in improved if r["behavior"] == "x"), improved
             assert np.isfinite(first["mean_bits"])
             logs2 = {k: open(Path(d) / f"async_{k}.jsonl", "w") for k in ("train", "samples", "improved")}
             asked.clear()
             train.rl2_async(argparse.Namespace(**{**vars(args), "steps": 3, "async_rollouts": True}), pol, sampler, stand_in, scales, pool, Path(d), train.Learner(pol, rec, NoWarmup()),
-                            {"x": {"answer": ["<p:2.v.9>", "<p:2.o.735>"]}}, logs2, 0.0, lambda: False)
+                            logs2, 0.0, lambda: False)
             for f in logs2.values():
                 f.close()
             rows2 = [json.loads(line) for line in open(Path(d) / "async_train.jsonl")]

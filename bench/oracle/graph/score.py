@@ -2,9 +2,10 @@
 Rust checker (crates/gam-mpd/examples/mpd_graph_2951.rs, a JSON-lines server).
 
 An explanation names a circuit: which subcomponents act at which positions (mech.gates). Every subcomponent it leaves
-out is deleted (VPD's ablation), and its total is the KL in bits of the model's next-token distribution at the task's
-targets from the circuit's (exec_error_bits, summed over targets) plus PAIR_BITS per (subcomponent, position) pair it
-names (pairs): a subcomponent at a position is worth naming when it cuts that KL by more than PAIR_BITS.
+out is deleted (VPD's ablation), and it is judged by the KL in bits of the model's next-token distribution at the
+task's targets from the circuit's (exec_error_bits, summed over targets) and by the (subcomponent, position) pairs it
+names (pairs), against the task's reference, VPD's own answer (text.py) scored alongside it: an explanation no less
+faithful than the reference is better the fewer pairs it names, one less faithful worse by its excess KL (order).
 
     from score import Checker
     with Checker("vpd4l") as c:
@@ -12,6 +13,7 @@ names (pairs): a subcomponent at a position is worth naming when it cuts that KL
         print(c.score(open("explanation.py").read()))
 """
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -22,11 +24,19 @@ HERE = Path(__file__).resolve().parent
 EXPORTS = {"vpd4l": Path.home() / "mpd-data/engine/vpd4l"}
 VIEWS = {"vpd4l": {"vpd": Path.home() / "mpd-data/engine/vpd4l_decomposition"}}
 METRIC = "full"  # the model's whole next-token distribution
-PAIR_BITS = 0.01  # bits per (subcomponent, position) pair a circuit names
 # The published checker build (each release build of the graph checker is copied there).
 PUBLISHED = Path.home() / "mpd-data/graph_oracle/bin/mpd_graph_2951"
 # On MATS (mats-run with MATS_BUILD=1) or a pod: the job's own build, $MPD_BIN/mpd_graph_2951 (Linux, CUDA with device "gpu").
 BINARY = Path(os.environ.get("GRAPH_CHECKER") or (Path(os.environ["MPD_BIN"]) / "mpd_graph_2951" if os.environ.get("MPD_BIN") else PUBLISHED))
+
+
+def order(s: dict, reference: dict | None = None) -> tuple:
+    """How a score ranks, lower first: valid, then its KL above the reference's (a score of VPD's answer on the same
+    text, from the same checker; without one, its KL), then fewer pairs."""
+    if not s.get("valid", True):
+        return (1, math.inf, math.inf)
+    ref = reference["exec_error_bits"] if reference and reference.get("valid", True) else 0.0
+    return (0, max(0.0, s["exec_error_bits"] - ref), s["pairs"])
 
 
 def pairs(ir: dict) -> int:
@@ -89,9 +99,8 @@ class Checker:
         once per experiment it has not cached and the programs in parallel). uniform_seeds m: the experiments are drawn
         from seed mod m, so m collections recur across a caller's seeds. options: further request keys passed to the
         server as they are). stand_in: what the subcomponents a program does not name carry: "delete" (VPD's ablation)
-        or "counterfactual". metric: "full" (METRIC) or the checker's others. Each score's total_bits is
-        exec_error_bits + PAIR_BITS * pairs (the checker's own total kept as checker_total_bits); necessity runs are
-        off unless options turn them on."""
+        or "counterfactual". metric: "full" (METRIC) or the checker's others. Each score gains pairs; necessity runs
+        are off unless options turn them on."""
         irs = [self.ir(p) for p in programs]
         request = {"op": "score", "programs": irs, "experiments": experiments, "seed": seed, "routing": "edges", "N": N,
                    "reader_top": 0, "stand_in": stand_in, "metric": metric or METRIC, "necessity": False, **(options or {})}
@@ -100,26 +109,20 @@ class Checker:
         scores = self.request(request)["scores"]
         for s, ir in zip(scores, irs):
             s["pairs"] = pairs(ir)
-            s["checker_total_bits"] = s.get("total_bits")
-            if s.get("valid", True):
-                s["total_bits"] = s["exec_error_bits"] + PAIR_BITS * s["pairs"]
         return scores
 
     def ir(self, program):
-        """The IR of a program (source, IR, or {"source", "explanation"}), carrying its explanation's length."""
+        """The IR of a program (source, IR, or {"source", ...})."""
         if isinstance(program, dict) and "nodes" in program:
             return program
         sys.path.insert(0, str(HERE))
         import mech
 
-        source, explanation = (program, "") if isinstance(program, str) else (program["source"], program.get("explanation") or "")
+        source = program if isinstance(program, str) else program["source"]
         try:
-            ir = mech.trace(source, self.model, behavior=self.behavior_record)
+            return mech.trace(source, self.model, behavior=self.behavior_record)
         except Exception as e:  # the tracer's error is the program's error
-            ir = {"model": self.model, "nodes": [], "edges": [], "python_tokens": 0, "token_types": 0,
-                  "source": source, "valid": False, "error": f"{type(e).__name__}: {e}"}
-        ir["explanation_tokens"], ir["explanation_token_types"] = mech.explanation_length(explanation)
-        return ir
+            return {"model": self.model, "nodes": [], "edges": [], "source": source, "valid": False, "error": f"{type(e).__name__}: {e}"}
 
     def close(self):
         if self.process.poll() is None:

@@ -2,12 +2,14 @@
 real text by the circuit that computes it.
 
 A task is a window of LENGTH tokens of Pile validation text; the prediction after its last token is to be explained.
-An explanation is a gate program (mech.gates): which subcomponents act at which positions. It is scored with every
-subcomponent it leaves out deleted (VPD's ablation): the KL in bits of the model's next-token distribution there from
-the circuit's, plus PAIR_BITS per (subcomponent, position) the circuit names (score.py). VPD's own causal importance
-above THRESHOLD at the predicted position is the teacher: of the rules tried on 20 windows (the importance at the
-position above 0.5 or 0.2, with earlier positions' above 0.5 or 0.9, or every position's), it scored best (KL 1.69
-bits with 137 pairs; naming earlier positions bought little KL for ten times the pairs).
+An explanation is a gate program (mech.gates): which subcomponents act at which positions. With every subcomponent it
+leaves out deleted (VPD's ablation), it is judged by the KL in bits of the model's next-token distribution there from
+the circuit's, against VPD's own answer on the same text: at every position, the subcomponents whose causal importance
+there is above zero (VPD's definition of a needed subcomponent, its ablation as published). An explanation as faithful
+as VPD's (a KL no larger) is better the fewer (subcomponent, position) pairs it names; one less faithful is worse by its
+excess (score.order). VPD's answer is the teacher and each task's reference: on 20 held-out windows it keeps 0.44 bits
+with 7,090 pairs (its importance at the predicted position alone: 1.11 bits with 182). A position's subcomponents are
+written as one string of names, one oracle token each.
 
   text.py build --split train --n 2000 --offset 6000    writes ~/mpd-data/graph_oracle/texts/vpd4l/<id>.json (a
   text.py build --split heldout --n 200 --offset 9000   behavior: one prompt, its target, the model's top next tokens)
@@ -33,17 +35,18 @@ import mech  # noqa: E402
 
 TEXTS = Path.home() / "mpd-data/graph_oracle/texts"
 LENGTH = 32
-THRESHOLD = 0.2
 
 
 def teacher(ids: list[int], device: str = "mps") -> str:
-    """VPD's answer: the subcomponents whose causal importance at the last position exceeds THRESHOLD."""
-    parts = []
+    """VPD's answer: at every position, the subcomponents whose causal importance there is above zero (by layer, site
+    and index)."""
+    per: dict[int, list[tuple]] = {}
     for site, m in atlas.importance(ids, device).items():
         layer, kind = atlas.site_of(site)
-        parts += [atlas.part(layer, kind, i) for i in (m[-1] > THRESHOLD).nonzero().flatten().tolist()]
-    parts.sort(key=lambda p: (int(p[3:-1].split(".")[0]), list(mech.SITES).index(p[3:-1].split(".")[1]), int(p[3:-1].split(".")[2])))
-    return "def on(tokens, targets):\n    return {t: [" + ", ".join(f'"{p}"' for p in parts) + "] for t in targets}\n"
+        for t, i in (m > 0).nonzero().tolist():
+            per.setdefault(t, []).append((layer, list(mech.SITES.values()).index(kind), i, atlas.part(layer, kind, i)))
+    lines = [f'        {t}: "' + "".join(p for *_, p in sorted(per[t])) + '",' for t in sorted(per)]
+    return "def on(tokens, targets):\n    return {\n" + "\n".join(lines) + "\n    }\n"
 
 
 def top(ids: list[int], k: int = 3, device: str = "mps") -> list[list]:
