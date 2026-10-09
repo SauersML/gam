@@ -134,7 +134,7 @@ def main():
                 k = min(range(len(graphs)), key=lambda i: results[i]["total_bits"] if results[i]["valid"] else float("inf"))
                 return graphs[k], results[k]
 
-            bases = [(*explain.chain(explain.units_of(" ".join(units))), {}) for _, units in sorted(sets.items(), key=lambda kv: int(kv[0]))]
+            bases = [(*explain.chain(explain.units_of(" ".join(units))), {}) for units in sorted(sets.values(), key=len) if units]
             tried, results = bases, run(bases)
             (nodes, edges, _), _ = best(tried, results)
             labeled = []
