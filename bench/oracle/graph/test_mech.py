@@ -96,3 +96,36 @@ def test_the_structure_is_not_code():
     tokens, _ = mech.code_length(QUOTE)
     only, _ = mech.code_length("def marks(tokens):\n    return ['\"' in t for t in tokens]\n")
     assert tokens == only, "nodes, edges and labels are structure the checker prices"
+
+
+GATES = '''CHANGED = {'"', " ("}
+
+
+def on(tokens, targets):
+    gates = {i: ["<p:0.fc.225>", "<p:0.down.663>"] for i, t in enumerate(tokens) if t in CHANGED}
+    for i in targets:
+        gates.setdefault(i, []).extend(["<p:2.v.80>", "<p:2.o.63>"])
+    return gates
+'''
+
+
+def test_a_gate_program_names_what_acts_where():
+    ir = mech._trace(GATES, "vpd4l", BEHAVIOR)
+    assert ir["valid"], ir["error"]
+    assert ir["wiring"] == "model" and ir["edges"] == []
+    mlp, attn = ir["nodes"]
+    assert [p["kind"] for p in mlp["pieces"]] == ["c_fc", "down_proj"] and [p["kind"] for p in attn["pieces"]] == ["v_proj", "o_proj"]
+    assert [s["positions"] for s in mlp["at"]] == [[], [], [1], []], "the changed token, in the one sequence holding it"
+    assert [s["positions"] for s in attn["at"]] == [[3], [3], [3], [3]] and mlp["at"][2]["tokens"] == [1, 9, 3, 4]
+    tokens, _ = mech.code_length(GATES)
+    renamed, _ = mech.code_length(GATES.replace("<p:2.v.80>", "<p:3.down.3583>"))
+    assert tokens == renamed, "a subcomponent's name is priced as a name, not as code"
+    nothing = mech._trace("def on(tokens, targets):\n    return {}\n", "vpd4l", BEHAVIOR)
+    assert nothing["valid"] and nothing["nodes"] == [] and nothing["edges"] == [{"from": "embed", "to": "logits", "route": "input"}]
+
+
+def test_a_gate_program_says_what_is_wrong():
+    assert "position 9" in error(GATES.replace("for i in targets:", "for i in [9]:"))
+    assert "is not a subcomponent" in error(GATES.replace("<p:2.v.80>", "<p:2.x.80>"))
+    assert "subcomponents 0.." in error(GATES.replace("<p:2.v.80>", "<p:2.v.4096>"))
+    assert "needs the behavior" in error(GATES, behavior=None)

@@ -241,6 +241,32 @@ def text(behavior: dict, top: int = 48, n: int = 1024, device: str = "mps") -> s
     return "\n".join(lines)
 
 
+def activity_examples(n: int, length: int, top: int, offset: int, device: str = "mps", seed: int = 0) -> list[dict]:
+    """Text examples for the oracle ({"prompt", "completion"}, rl/train.py --data): `n` windows of `length` tokens of Pile validation text (rows from `offset`, past
+    the rows the atlas read), each with the gate program naming, at every position, the `top` subcomponents whose
+    activation is largest in units of their typical size in text (prompt.activity's question)."""
+    import random
+
+    import prompt
+    import vpd_model
+
+    rng = random.Random(seed)
+    rows = vpd_model.val_tokens(n, 512, offset)
+    rms = {name: torch.tensor([load()["parts"][part(*site_of(name), c)]["rms"] for c in range(C)], device=device).clamp_min(1e-12)
+           for name, C in model(device)[1].C.items()}
+    out = []
+    for r in range(n):
+        start = rng.randrange(0, rows.shape[1] - length)
+        ids = rows[r, start:start + length]
+        acts = activations(ids[None], device)
+        z = torch.cat([(acts[name][0] / rms[name]).abs() for name in acts], dim=1)  # [length, all subcomponents]
+        names = [part(*site_of(name), c) for name in acts for c in range(acts[name].shape[-1])]
+        best = z.topk(top, dim=1).indices.tolist()
+        gates = ", ".join(f"{t}: [" + ", ".join(f'"{names[j]}"' for j in row) + "]" for t, row in enumerate(best))
+        out.append({"prompt": prompt.activity("vpd4l", ids.tolist()), "completion": f"```python\ndef on(tokens, targets):\n    return {{{gates}}}\n```\n"})
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -253,6 +279,13 @@ def main():
     t = sub.add_parser("tables", help="write scores() of every behavior in a directory to TABLES")
     t.add_argument("behaviors", type=Path)
     t.add_argument("--device", default="mps")
+    e = sub.add_parser("examples", help="write text examples (activity_examples) as JSON lines of prompt and answer")
+    e.add_argument("--n", type=int, default=4000)
+    e.add_argument("--length", type=int, default=24)
+    e.add_argument("--top", type=int, default=6)
+    e.add_argument("--offset", type=int, default=1024)
+    e.add_argument("--device", default="mps")
+    e.add_argument("--out", type=Path, default=ATLAS.parent / "examples.jsonl")
     s = sub.add_parser("show")
     s.add_argument("behavior", type=Path)
     s.add_argument("--top", type=int, default=48)
@@ -261,6 +294,11 @@ def main():
     if a.cmd == "build":
         a.out.parent.mkdir(parents=True, exist_ok=True)
         a.out.write_text(json.dumps(build(a.rows, a.seq, a.batch, a.device)))
+        print(f"wrote {a.out}")
+    elif a.cmd == "examples":
+        with open(a.out, "w") as f:
+            for x in activity_examples(a.n, a.length, a.top, a.offset, a.device):
+                f.write(json.dumps(x) + "\n")
         print(f"wrote {a.out}")
     elif a.cmd == "tables":
         TABLES.mkdir(parents=True, exist_ok=True)

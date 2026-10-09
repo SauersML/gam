@@ -15,11 +15,11 @@ canonical form edits.Answer writes:
   labels = {"<node>": "<variable>", ...}                                                              (optional)
   ```
 
-  <the English explanation: any number of lines, then the turn ends>
+and the turn ends there: the answer is the program.
 
 with subcomponents of the attached decomposition only (the registry's part tokens, plus each site's remainder
-<p:L.S.rest>); writers "input" or a node, readers "output" or a node. Code lines and the explanation are free text
-with neither "<p:" nor three backticks in a row. mech still checks what a grammar cannot see (names, connections,
+<p:L.S.rest>); writers "input" or a node, readers "output" or a node. Code lines are free text with neither "<p:"
+nor three backticks in a row. mech still checks what a grammar cannot see (names, connections,
 variables of the behavior), and validity redraws (train.py --resample) cover those. The grammar is xgrammar's EBNF; a
 part token and its spelling in ordinary tokens both match (a part token's text is its name).
 
@@ -94,7 +94,7 @@ def answer_grammar(tokens: list[str]) -> str:
     """The answer's EBNF (module docstring) with subcomponents drawn from `tokens`."""
     q = json.dumps
     return "\n".join([
-        'root ::= "```python\\n" function* "nodes = {\\n" node+ "}\\nedges = [\\n" edge+ "]\\n" labels? "```\\n\\n" explanation',
+        'root ::= "```python\\n" function* "nodes = {\\n" node+ "}\\nedges = [\\n" edge+ "]\\n" labels? "```"',
         'function ::= "def " name "(tokens):\\n" body+ "\\n\\n"',
         'body ::= "    " code "\\n"',
         free("code", "\\n\\t"),
@@ -108,7 +108,6 @@ def answer_grammar(tokens: list[str]) -> str:
         "labels ::= " + " ".join([q('labels = {'), "label", "(", q(", "), "label", ")*", q("}\n")]),
         "label ::= " + " ".join([q('"'), "name", q('": "'), "name", q('"')]),
         "name ::= [A-Za-z_] [A-Za-z0-9_]*",
-        free("explanation", ""),
     ])
 
 
