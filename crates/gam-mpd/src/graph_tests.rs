@@ -804,7 +804,7 @@ fn old_and_v3_forms_of_an_answer_score_alike() {
     inexact_vpd_views(&mut weights, 1);
     let piece = |kind: &str, index: Vec<usize>| PieceIr { view: "vpd".into(), layer: 1, kind: kind.into(), index: Some(Index::Many(index)) };
     let edge = |from: &str, to: &str, route: &str| EdgeIr { from: from.into(), to: to.into(), route: route.into() };
-    let pairs: Vec<PairIr> = (0..f.sequences.len() - 1).map(|i| PairIr { base: i, source: i + 1 }).collect();
+    let pairs: Vec<PairIr> = (0..f.sequences.len() - 1).map(|i| PairIr { base: i, source: i + 1, changed: false }).collect();
     let form = |(prev, answer): (&str, &str), answer_alignment: bool| {
         let nodes = vec![
             NodeIr { id: prev.into(), pieces: vec![piece("v_proj", vec![1, 2]), piece("o_proj", vec![0, 3])], claim: None },
@@ -830,6 +830,39 @@ fn old_and_v3_forms_of_an_answer_score_alike() {
     let token = 37f64.log2();
     let names = 9.0 * (weights.vocabulary() as f64).log2();
     assert!((a.structure_bits - (names + (2.0 * 5.0 + 3.0 + 5.0 * 2.0 + 2.0) * token)).abs() < 1e-9, "structure {} bits", a.structure_bits);
+}
+
+/// Format v3's label test: a pair marked `changed` swaps the group's output from the base prompt's own
+/// changed prompt, the same as naming that changed prompt as a prompt of the behavior.
+#[test]
+fn a_changed_pair_reads_the_base_prompts_changed_prompt() {
+    use crate::graph::{AlignmentIr, PairIr};
+    let f = fixture("graph_v3_changed");
+    let library = Library::new(&f.device, &f.device, &f.native, &f.layers, &f.artifact, 1 << 28, 64).expect("library");
+    let mut weights = Weights::of(&library);
+    inexact_vpd_views(&mut weights, 1);
+    let cf = counterfactuals(&f.sequences);
+    let n = f.sequences.len();
+    let piece = |kind: &str, index: Vec<usize>| PieceIr { view: "vpd".into(), layer: 1, kind: kind.into(), index: Some(Index::Many(index)) };
+    let edge = |from: &str, to: &str| EdgeIr { from: from.into(), to: to.into(), route: "input".into() };
+    let program = |pairs: Vec<PairIr>| Program {
+        model: "tiny".into(),
+        valid: true,
+        nodes: vec![NodeIr { id: "g".into(), pieces: vec![piece("v_proj", vec![1, 2]), piece("o_proj", vec![0, 3])], claim: None }],
+        edges: vec![edge("embed", "g"), edge("g", "logits"), edge("embed", "logits")],
+        alignments: vec![AlignmentIr { variable: "label".into(), nodes: vec!["g".into()], pairs }],
+        standin: Some("counterfactual".into()),
+        ..Program::default()
+    };
+    let changed = program((0..n).map(|i| PairIr { base: i, source: 0, changed: true }).collect());
+    let mut own = Checker::new(weights.clone(), claims_behavior(&f.sequences, &cf)).expect("checker");
+    let a = own.alignment_error(&Graph::parse(&changed, &weights).expect("parse")).expect("changed pairs");
+    // The same swaps with the changed prompts listed as prompts n..2n of the behavior.
+    let listed: Vec<Vec<u32>> = f.sequences.iter().chain(&cf).cloned().collect();
+    let explicit = program((0..n).map(|i| PairIr { base: i, source: n + i, changed: false }).collect());
+    let mut both = Checker::new(weights.clone(), claims_behavior(&listed, &counterfactuals(&listed))).expect("checker");
+    let b = both.alignment_error(&Graph::parse(&explicit, &weights).expect("parse")).expect("explicit pairs");
+    assert!(a > 0.0 && (a - b).abs() <= 1e-9 * a.max(1.0), "changed pairs {a} bits vs explicit {b} bits");
 }
 
 /// A named group's use costs one name in the structure and its parts there none; its definition
@@ -1170,7 +1203,7 @@ fn alignments_are_checked_by_interchange() {
     let expected = mean(kl_bits(&target, &swapped).into_iter().zip(kl_bits(&target, &base)).map(|(e, s)| e.min(s)).collect());
     let aligned = |nodes: Vec<String>| {
         let mut p = program.clone();
-        p.alignments = vec![AlignmentIr { variable: "v".into(), nodes, pairs: pairs.iter().map(|&(base, source)| PairIr { base, source }).collect() }];
+        p.alignments = vec![AlignmentIr { variable: "v".into(), nodes, pairs: pairs.iter().map(|&(base, source)| PairIr { base, source, changed: false }).collect() }];
         p
     };
     let mut checker = Checker::new(weights.clone(), claims_behavior(&f.sequences, &cf)).expect("checker");

@@ -157,12 +157,17 @@ pub struct AlignmentIr {
 }
 
 /// One interchange of an alignment: prompts `base` and `source` (indices into the behavior, of one
-/// length). Its target is `M`'s own distribution on the source at the base's targets (an older IR's
-/// algorithm answer tokens, keys "answer"/"answers", are ignored).
+/// length), or with `changed` the base prompt and its own changed prompt (its counterfactual), so
+/// that the pair differs only where the behavior's change does (format v3's label test). Its target
+/// is `M`'s own distribution on the source at the base's targets (an older IR's algorithm answer
+/// tokens, keys "answer"/"answers", are ignored).
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct PairIr {
     pub base: usize,
+    #[serde(default)]
     pub source: usize,
+    #[serde(default)]
+    pub changed: bool,
 }
 
 fn yes() -> bool {
@@ -4351,14 +4356,20 @@ impl Checker {
             let mut bases = Vec::with_capacity(alignment.pairs.len());
             let mut sources = Vec::with_capacity(alignment.pairs.len());
             for pair in &alignment.pairs {
-                let (Some(base), Some(source)) = (prompts.get(pair.base), prompts.get(pair.source)) else {
-                    return Err(format!("alignment {}: prompt {} or {} outside the behavior", alignment.variable, pair.base, pair.source));
+                let Some(base) = prompts.get(pair.base) else {
+                    return Err(format!("alignment {}: prompt {} outside the behavior", alignment.variable, pair.base));
                 };
-                if base.token_ids.len() != source.token_ids.len() {
-                    return Err(format!("alignment {}: prompts {} and {} differ in length", alignment.variable, pair.base, pair.source));
+                let source = if pair.changed {
+                    base.partner()
+                } else {
+                    prompts.get(pair.source).map(|p| p.token_ids.clone()).ok_or_else(|| format!("alignment {}: prompt {} outside the behavior", alignment.variable, pair.source))?
+                };
+                if base.token_ids.len() != source.len() {
+                    let what = if pair.changed { "its changed prompt".to_string() } else { format!("prompt {}", pair.source) };
+                    return Err(format!("alignment {}: prompt {} and {what} differ in length", alignment.variable, pair.base));
                 }
                 bases.push(base.token_ids.clone());
-                sources.push(source.token_ids.clone());
+                sources.push(source);
             }
             let (mut base, mut source) = (Batch::new(&bases)?, Batch::new(&sources)?);
             self.mask(&mut base);
