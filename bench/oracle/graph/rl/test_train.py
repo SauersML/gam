@@ -419,7 +419,7 @@ def check_rl2_step(pol):
         with tempfile.TemporaryDirectory() as d:
             logs = {k: open(Path(d) / f"{k}.jsonl", "w") for k in ("train", "samples", "improved")}
             args = argparse.Namespace(seed=0, eval_seed=1_000_003, samples=4, credit=16, credit_answers=0, refill=1, refine=3, behaviors_per_step=2, beta=0.0,
-                                      micro=2, ppo_epochs=2, clip=0.2, clip_high=0.28, dual_clip=3.0, tis_cap=2.0, exit_beta=0.1)
+                                      micro=2, ppo_epochs=2, clip=0.2, clip_high=0.28, dual_clip=3.0, tis_cap=2.0, exit_beta=0.1, revise=False)
             pool = [{"id": "x", "model": "vpd4l"}, {"id": "y", "model": "vpd4l"}, {"id": "z", "model": "vpd4l"}]
             rec = Recorder(pol.params)
             for p in pol.params:
@@ -453,6 +453,12 @@ def check_rl2_step(pol):
             assert all(r["key"] < r["sampled_key"] for r in improved), improved
             assert any(named_in(train.split_answer(r["text"])[0]) == needed for r in improved if r["behavior"] == "x"), improved
             assert np.isfinite(first["mean_kl"]) and first["best_area"] is not None
+            logs3 = {k: open(Path(d) / f"revise_{k}.jsonl", "w") for k in ("train", "samples", "improved")}
+            rev = train.rl2_step(step, argparse.Namespace(**{**vars(args), "revise": True, "refine": 0}), pol, sampler, stand_in, pool, Path(d), train.Learner(pol, rec, NoWarmup()), logs3, 0.0)
+            assert rev["groups"] == 2 * first["groups"] and rev["revision_best_area"] is not None, rev  # every group revised once, scored
+            assert "could not run" in train.feedback({"valid": False, "error": "e"}) and "first 1 steps: 0.50 bits" in train.feedback({"valid": True, "curve": [[0, 9.0], [24.0, 0.5]]})
+            for f in logs3.values():
+                f.close()
             logs2 = {k: open(Path(d) / f"async_{k}.jsonl", "w") for k in ("train", "samples", "improved")}
             asked.clear()
             train.rl2_async(argparse.Namespace(**{**vars(args), "steps": 3, "async_rollouts": True}), pol, sampler, stand_in, pool, Path(d), train.Learner(pol, rec, NoWarmup()),

@@ -170,6 +170,21 @@ class Policy:
             return q
         return self.prompt_ids(text)
 
+    def revision_ids(self, b: dict, answer: str, report: str) -> list[int]:
+        """The oracle's input for revising an answer to question b: the question (question_ids' text, with its evidence),
+        the answer, and the verifier's report with the request to revise, as a three-turn conversation."""
+        text = render(b)
+        evidence = getattr(self, "acts_fn", None) is not None
+        if evidence:
+            ids = b["prompts"][0]["token_ids"]
+            text += "\nactivations: " + self.EVIDENCE * (len(ids) * len(self.parts.ev_order))
+        chat = self.tok.apply_chat_template([{"role": "user", "content": text}, {"role": "assistant", "content": answer}, {"role": "user", "content": report}],
+                                            add_generation_prompt=True, enable_thinking=False, tokenize=False)
+        q = self.tok.encode(chat, add_special_tokens=False)
+        if evidence:
+            self.evidence[tuple(q)] = self.acts_fn(getattr(self, "swap", {}).get(b["id"], ids))
+        return q
+
     def embed(self, ids: torch.Tensor, prompts: list[list[int]], starts: list[int]) -> torch.Tensor:
         """Input embeddings of a batch [B, W], each prompt's placeholders (prompt r starting at starts[r]) replaced by
         its evidence (PartTokens.evidence of its activations)."""
@@ -656,6 +671,49 @@ def rl2_sample(chosen: list[dict], step: int, args, pol, sampler, adapter: Path,
              "behavior_logprobs": behavior[g * n : (g + 1) * n]} for g, b in enumerate(chosen)]
 
 
+def prompt_of(grp: dict, j: int) -> list[int]:
+    """The prompt of a group's j-th completion: the question's, or a revision group's own per completion."""
+    return grp["prompts"][j] if "prompts" in grp else grp["prompt"]
+
+
+def feedback(s: dict) -> str:
+    """The verifier's report on an answer as the oracle reads it before revising: why it could not run, or the KL in
+    bits of the model's next-token distribution from the graph of its first k steps and that graph's description
+    length, for each k."""
+    if not s.get("valid", True):
+        return f"The verifier could not run your answer: {s.get('error')}"
+    c = s.get("curve") or [[0.0, float("nan")]]
+    lines = [f"no steps (the empty graph): {c[0][1]:.2f} bits"] + [f"first {k} steps: {kl:.2f} bits at a description length of {b:.0f} bits" for k, (b, kl) in enumerate(c[1:], 1)]
+    return ("The verifier ran the graph of your first k steps alone, over changed prompts of the text (one token replaced by a "
+            "draw from the model's own prediction there), and measured the KL of the model's next-token distribution from the "
+            "graph's:\n" + "\n".join(lines))
+
+
+REVISE = ("Write an improved answer in the same format: as faithful as possible at every description length, the most "
+          "important steps first, with its plain-English docstring and a comment line above each step.")
+
+
+def revise_groups(groups: list[dict], step: int, args, pol, sampler, score, adapter: Path, clock: dict) -> list[dict]:
+    """(9) The oracle revises each of its answers after reading the verifier's report on it (feedback): one revision per
+    answer, its prompt the question, the answer and the report as a conversation; a question's revisions form a group,
+    scored and ranked like first answers (rl2_score), so the oracle learns to use the verifier as a tool."""
+    prompts, owners = [], []
+    for grp in groups:
+        for j, text in enumerate(grp["texts"]):
+            prompts.append(pol.revision_ids(grp["behavior"], text, feedback(grp["scores"][j]) + "\n\n" + REVISE))
+            owners.append(grp)
+    comps = timed(clock, "sample", sampler, prompts, 1, adapter, step)
+    behavior = getattr(sampler, "token_logprobs", None) or [None] * len(prompts)
+    out, k = [], 0
+    for grp in groups:
+        n = len(grp["texts"])
+        cs = [comps[k + j][0] for j in range(n)]
+        out.append({"behavior": grp["behavior"], "prompt": prompts[k], "prompts": prompts[k:k + n], "completions": cs, "revision": True,
+                    "texts": [pol.tok.decode(c, skip_special_tokens=True) for c in cs], "behavior_logprobs": behavior[k:k + n]})
+        k += n
+    return rl2_score(out, step, args, pol.tok, score, clock)
+
+
 def rl2_score(groups: list[dict], step: int, args, tok, score, clock: dict) -> list[dict]:
     """The verifier half of rl2_groups, in place: every answer scored under the step's seed (one draw of changed
     prompts per question, shared by its group) and ranked within its group (score.keys);
@@ -777,7 +835,7 @@ def expert_iteration(groups: list[dict], step: int, args, pol, score, clock: dic
         if not dropped:
             continue
         new = text[:offset] + best + text[offset + len(src) :]
-        out.append({"behavior": b["id"], "prompt": grp["prompt"], "improved": pol.tok.encode(new, add_special_tokens=False) + [pol.end], "sampled": grp["completions"][j],
+        out.append({"behavior": b["id"], "prompt": prompt_of(grp, j), "improved": pol.tok.encode(new, add_special_tokens=False) + [pol.end], "sampled": grp["completions"][j],
                     "text": new, "key": list(best_key), "sampled_key": list(grp["keys"][j]), "dropped": dropped})
     return out
 
@@ -879,6 +937,8 @@ def rl2_step(step: int, args, pol, sampler, score, pool: list[dict], adapter: Pa
         used |= {b["id"] for b in extra}
         groups += rl2_groups(extra, step, args, pol, sampler, score, adapter, clock)
         refills += 1
+    if args.revise:
+        groups += revise_groups(groups, step, args, pol, sampler, score, adapter, clock)
     improved = expert_iteration(groups, step, args, pol, score, clock) if args.refine else []
     return rl2_update(step, groups, improved, refills, score.hits[0], clock, args, pol, sampler, learner, logs, started)
 
@@ -899,7 +959,7 @@ def rl2_update(step: int, groups: list[dict], improved: list[dict], refills: int
         logs["improved"].write(json.dumps({"step": step, "seed": step_seed(args, step), **{k: v for k, v in x.items() if k not in ("prompt", "improved", "sampled")}}) + "\n")
     logs["improved"].flush()
     t = time.time()
-    flat = [(grp["prompt"], c, a, b) for grp in kept for c, a, b in zip(grp["completions"], grp["token_advantages"], grp["behavior_logprobs"])]
+    flat = [(prompt_of(grp, j), c, a, b) for grp in kept for j, (c, a, b) in enumerate(zip(grp["completions"], grp["token_advantages"], grp["behavior_logprobs"]))]
     stats = learner.ppo([x[0] for x in flat], [x[1] for x in flat], [x[2] for x in flat], args.beta, args.micro, args.ppo_epochs, clip_of(args),
                         [x[3] for x in flat]) if flat else {}
     stats.pop("logprob_sums", None)
@@ -914,6 +974,7 @@ def rl2_update(step: int, groups: list[dict], improved: list[dict], refills: int
            "mean_kl": float(np.mean([x["kl_bits"] for x in scores])) if scores else None, "mean_bits": float(np.mean([x["bits"] for x in scores])) if scores else None,
            "mean_steps": float(np.mean([x["steps"] for x in scores])) if scores else None,
            "best_area": float(np.mean([k[1] for k in best if k[0] == 0])) if any(k[0] == 0 for k in best) else None,
+           "revision_best_area": float(np.mean([min(g["keys"])[1] for g in groups if g.get("revision") and min(g["keys"])[0] == 0])) if any(g.get("revision") and min(g["keys"])[0] == 0 for g in groups) else None,
            "mean_reader_bits": float(np.mean([b for g in groups for b in g.get("reader_bits", [])])) if any(g.get("reader_bits") for g in groups) else None,
            "credited": sum(c is not None for g in groups for c in g["credit"]), "improved": len(improved), "repeated_scores": repeated, **stats, "sampling": getattr(sampler, "stats", {}),
            "seconds": clock, "checker_seconds_total": TOTALS["checker_seconds"], "elapsed": time.time() - started}
@@ -1105,7 +1166,9 @@ def summarize(name: str, step: int, groups: list[tuple[dict, list, dict]], log) 
         keys = [key(x) for _, x in mine]
         j = min(range(len(keys)), key=keys.__getitem__)
         best = mine[j][1]
+        firsts = [k for (_, x), k in zip(mine, keys) if not x.get("revision")]
         row = {"set": name, "step": step, "behavior": b["id"], "valid_fraction": float(np.mean([k[0] == 0 for k in keys])), "best": shares(best),
+               "best_first_area": min(firsts)[1] if firsts and min(firsts)[0] == 0 else None, "best_is_revision": bool(best.get("revision")),
                "baselines": {n: shares(x) for n, x in base.items()}, "best_source": mine[j][0]}
         for n in ("search", "vpd"):
             if n in base and base[n].get("valid") and keys[j][0] == 0:
@@ -1113,7 +1176,8 @@ def summarize(name: str, step: int, groups: list[tuple[dict, list, dict]], log) 
         rows.append(row)
         log.write(json.dumps(row) + "\n")
     keys_ = ("area", "kl", "reproduces", "bits", "steps", "nodes", "edges")
-    return {"questions": len(rows), "valid_fraction": mean([r["valid_fraction"] for r in rows]),
+    return {"questions": len(rows), "valid_fraction": mean([r["valid_fraction"] for r in rows]), "best_first_area": mean([r["best_first_area"] for r in rows]),
+            "best_is_revision": mean([r["best_is_revision"] for r in rows]),
             "best_beats_search": mean([r.get("beats_search") for r in rows]), "best_beats_vpd": mean([r.get("beats_vpd") for r in rows]),
             "best": {k: mean([r["best"][k] for r in rows]) for k in keys_},
             "baselines": {n: {k: mean([r["baselines"][n][k] for r in rows if n in r["baselines"]]) for k in keys_} for n in sorted({n for _, _, base in groups for n in base})}}
@@ -1135,6 +1199,12 @@ def evaluate(sets: dict[str, list[dict]], pol, sampler, score, args, adapter: Pa
             groups = sampler(prompts, args.samples, adapter, version)
             answers = [(b, pol.tok.decode(c, skip_special_tokens=True)) for b, g in zip(pool, groups) for c in g]
             items = [item(t, b, args.eval_seed) for b, t in answers]
+            if getattr(args, "revise", False):  # the oracle with its tool: each answer revised once after the verifier's report
+                first = score(items)
+                rev = sampler([pol.revision_ids(b, t, feedback(x) + "\n\n" + REVISE) for (b, t), x in zip(answers, first)], 1, adapter, version)
+                revised = [(b, pol.tok.decode(c[0], skip_special_tokens=True)) for (b, _), c in zip(answers, rev)]
+                answers = [x for g in range(len(pool)) for x in answers[g * args.samples:(g + 1) * args.samples] + revised[g * args.samples:(g + 1) * args.samples]]
+                items = [item(t, b, args.eval_seed) for b, t in answers]
             base = [(b, n, src) for b in pool for n, src in (baselines(b).items() if args.baselines else [])]
             scores = score(items + [item(src, b, args.eval_seed) for b, _, src in base])
             per_base = {}
@@ -1142,9 +1212,11 @@ def evaluate(sets: dict[str, list[dict]], pol, sampler, score, args, adapter: Pa
                 per_base.setdefault(b["id"], {})[n] = x
                 samples.write(json.dumps({"set": name, "step": step, "run": run, "behavior": b["id"], "behavior_path": b.get("path"), "program": n, "source": src, "score": x}) + "\n")
             out = []
+            per = args.samples * (2 if getattr(args, "revise", False) else 1)  # first answers, then their revisions
             for g, b in enumerate(pool):
-                mine = [(it["source"], x) for it, x in zip(items[g * args.samples : (g + 1) * args.samples], scores[g * args.samples : (g + 1) * args.samples])]
-                for it, (src, x) in zip(items[g * args.samples : (g + 1) * args.samples], mine):
+                mine = [(it["source"], x) for it, x in zip(items[g * per : (g + 1) * per], scores[g * per : (g + 1) * per])]
+                for k, (it, (src, x)) in enumerate(zip(items[g * per : (g + 1) * per], mine)):
+                    x["revision"] = k >= args.samples
                     samples.write(json.dumps({"set": name, "step": step, "run": run, "behavior": b["id"], "behavior_path": b.get("path"), "program": "oracle", "source": src,
                                               "explanation": it["explanation"], "score": x}) + "\n")
                 ks = score_module.keys([m[1] for m in mine])
@@ -1228,6 +1300,7 @@ def main():
     ap.add_argument("--run-name", help="the run's name in runs/oracle/<task>.<run>.json (default: the --out directory's name)")
     ap.add_argument("--search", help="bootstrap search answers of the training questions (DIR/<task>.py, native.py search, or <task>.answer.txt): SFT answers")
     ap.add_argument("--search-heldout", help="the search's answers to the held-out questions: evaluation baselines only")
+    ap.add_argument("--revise", action="store_true", help="rl2: a second round in which the oracle revises each answer after reading the verifier's report on it (revise_groups)")
     ap.add_argument("--reader", action="store_true", help="rl2: credit each answer's English by the frozen base reader's bits (reader.py)")
     ap.add_argument("--credit", type=int, default=16, help="rl2: subcomponent names whose drop is scored per answer for per-token credit (0: episode advantages only)")
     ap.add_argument("--credit-answers", type=int, default=0, help="rl2: answers credited per group: the best valid one and K - 1 other distinct valid ones drawn at random (0: every distinct valid answer)")
@@ -1251,6 +1324,8 @@ def main():
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     (out / "config.json").write_text(json.dumps({**vars(args), "lr": lr}, indent=1))
+    if args.revise and args.async_rollouts:
+        raise SystemExit("--revise samples a second round inside the step: the synchronous loop (drop --async)")
     if args.part_tokens:  # in-process vLLM engine: part rows are copied into its weights before each sampling call
         os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
         if args.share_gpu and args.materialize_every:
