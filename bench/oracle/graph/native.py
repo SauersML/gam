@@ -28,7 +28,7 @@ connections in order in steps that double their number, each step keeping what c
 to the prediction (live), and ends at the step with the lowest KL.
 
   native.py search --split train --n N [--offset K --stride S] [--out DIR]   -> DIR/<task>.py, .json
-  native.py tidy DIR      every answer in DIR made live (live()), in place
+  native.py tidy DIR [--max-chars N]      every answer in DIR made live (live()), in place
 """
 
 from __future__ import annotations
@@ -732,13 +732,22 @@ def live(g: Graph, targets: list[int]) -> Graph:
         g = Graph(h.nodes - dead, {r: ws for r, ws in par.items() if ws}, [w for w in h.out if w not in dead])
 
 
-def tidy(directory: Path) -> None:
+def tidy(directory: Path, max_chars: int | None = None) -> None:
     """Every answer DIR/<task>.py rewritten with each step's graph made live (live()), steps that add nothing dropped,
-    comments and docstring kept: the same runs alone, shorter descriptions."""
+    comments and docstring kept: the same runs alone, shorter descriptions. max_chars: first cut each answer to its
+    most first steps within that many characters (the part an output budget can hold)."""
     for py in sorted(Path(directory).glob("*.py")):
         task = json.loads((TEXTS / "vpd4l" / f"{py.stem.split('.')[0]}.json").read_text())
         targets = task["prompts"][0]["target_positions"]
-        ir = mech.trace_inline(py.read_text(), "vpd4l", task)
+        source = py.read_text()
+        parts = steps_of(source) if max_chars and len(source) > max_chars else None
+        if parts:
+            k, size = 0, len(parts[0]) + len(parts[2])
+            while k < len(parts[1]) and size + len(parts[1][k]) <= max_chars:
+                size += len(parts[1][k])
+                k += 1
+            source = first_steps(source, k)
+        ir = mech.trace_inline(source, "vpd4l", task)
         if not ir["valid"]:
             continue
         g = ir["graph"]
@@ -880,9 +889,10 @@ def main():
     s.add_argument("--out", type=Path)
     t = sub.add_parser("tidy")
     t.add_argument("directory", type=Path)
+    t.add_argument("--max-chars", type=int, help="cut each answer to its most first steps within this many characters first")
     args = ap.parse_args()
     if args.cmd == "tidy":
-        tidy(args.directory)
+        tidy(args.directory, args.max_chars)
     else:
         search(args.split, args.n, args.offset, args.stride, args.out)
 
