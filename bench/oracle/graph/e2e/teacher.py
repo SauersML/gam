@@ -2,18 +2,22 @@
 behavior's variables from the label search, scored by the checker (the model's choice between the behavior's answers,
 everything left out running on the changed prompt), the best kept.
 
-Per behavior: each set the pruning search kept (runs/prune_v4/<behavior>.json, k = 8 ... 256 subcomponents) becomes a
-graph, one node per block reading the input and every earlier block, the residual writers writing the output
+Per behavior: each set the pruning search kept within the behavior's listed subcomponents (runs/prune_v5/<behavior>.json,
+prune.py --listed 1024; k = 8 ... 256 subcomponents) becomes a graph, one node per block reading the input and every earlier block, the residual writers writing the output
 (explain.chain). The best of them by total score is the base. Then, for each variable the behavior's changed prompts
-change, each label-search group (runs/labels_v4/<behavior>.<variable>.json) becomes a node carrying it: reading the
+change, each label-search group (runs/labels_v4/<behavior>.<variable>.json) cut to the listed subcomponents becomes a
+node carrying it: reading the
 input where its subcomponents read the residual stream, read by every later node of the base, writing the output
 where it writes the residual stream; its subcomponents leave the base's nodes. Every candidate is scored at
 --experiments on seed 0; the lowest total is rescored on seed 1 and written with its English:
 
-  teacher.py [BEHAVIOR...] [--experiments 64] [--out ~/mpd-data/graph_oracle/teacher_v4] [--heldout]
+Every node lists its subcomponents in the order of the prompt's list (prompt.LISTED, atlas.text), so an answer is a
+selection from what the prompt shows.
+
+  teacher.py [BEHAVIOR...] [--experiments 64] [--out ~/mpd-data/graph_oracle/teacher_v5] [--heldout]
 writes OUT/<behavior>.py, OUT/<behavior>.answer.txt (the program in a python block, then the English) and appends
 OUT/manifest.jsonl. --heldout does the held-out behaviors instead, into ~/mpd-data/graph_oracle/teacher_heldout by
-default: the search baseline of the evaluation, never training input. A held-out behavior has no variables to place,
+default (teacher_heldout_v5): the search baseline of the evaluation, never training input. A held-out behavior has no variables to place,
 so its answer is the search's own best set by total on seed 0, from the scores the search wrote (no checker runs).
 """
 
@@ -132,7 +136,7 @@ def baseline(b: str, behavior: dict, path: Path, searched: dict, a, log):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("behaviors", nargs="*", help="default: every behavior with a pruning run")
-    ap.add_argument("--prune", type=Path, default=DATA / "runs/prune_v4")
+    ap.add_argument("--prune", type=Path, default=DATA / "runs/prune_v5")
     ap.add_argument("--labels", type=Path, default=DATA / "runs/labels_v4")
     ap.add_argument("--behaviors-dir", type=Path, default=DATA / "behaviors_v3/vpd4l")
     ap.add_argument("--device", default="gpu")
@@ -141,7 +145,7 @@ def main():
     ap.add_argument("--out", type=Path)
     ap.add_argument("--heldout", action="store_true", help="the held-out behaviors (evaluation baselines) instead of the training ones")
     a = ap.parse_args()
-    a.out = a.out or DATA / ("teacher_heldout" if a.heldout else "teacher_v4")
+    a.out = a.out or DATA / ("teacher_heldout_v5" if a.heldout else "teacher_v5")
     a.out.mkdir(parents=True, exist_ok=True)
     for b in a.behaviors or sorted(p.stem for p in a.prune.glob("*.json")):
         t0 = time.time()
@@ -150,7 +154,9 @@ def main():
         if (behavior.get("split") == "train") == a.heldout:
             continue
         searched = json.loads((a.prune / f"{b}.json").read_text())
-        sets = searched["sets"]
+        rank = {p: i for i, p in enumerate(atlas.listed(behavior, prompt.LISTED))}
+        sets = {k: sorted(v, key=lambda p: rank.get(p, len(rank))) for k, v in searched["sets"].items()}
+        searched = {**searched, "sets": sets}
         log = lambda m: print(f"{b}: {m}", flush=True)  # noqa: E731
         if a.heldout:
             baseline(b, behavior, path, searched, a, log)
@@ -179,7 +185,8 @@ def main():
                 if not found.exists():
                     continue
                 for g in json.loads(found.read_text())["groups"]:
-                    graph = with_label((nodes, edges), v, explain.units_of(" ".join(g["units"])))
+                    kept = sorted((p for p in g["units"] if p in rank), key=rank.__getitem__)
+                    graph = with_label((nodes, edges), v, explain.units_of(" ".join(kept)))
                     if graph:
                         labeled.append((*graph, {v: v}))
             if labeled:

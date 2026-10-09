@@ -23,7 +23,7 @@ import atlas  # noqa: E402
 import family  # noqa: E402
 import mech  # noqa: E402
 
-TEACHER = Path.home() / "mpd-data/graph_oracle/teacher_v4/manifest.jsonl"
+TEACHER = Path.home() / "mpd-data/graph_oracle/teacher_v5/manifest.jsonl"
 LISTED = 1024  # subcomponents listed per behavior (atlas.text); the teacher answers name only these
 
 REFERENCE = """\
