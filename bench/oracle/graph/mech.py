@@ -7,7 +7,9 @@ matrix S in q k v o fc down: query, key, value, attention output, MLP input, MLP
 position; its parents are the subcomponents whose outputs it reads, written as one string of subcomponents at the
 reader's own position, or as {position: string} (an attention output reading values at positions). "out" lists what
 the prediction at the targets reads. Every edge must be a connection the model has (connects()). Nodes are the
-readers and their parents.
+readers and their parents. "claims" (optional) lists interchange claims (position, replacement token, predicted top
+token): replacing the token at that position changes the model's top prediction to the given token, and the graph's
+pathway from that position alone reproduces the change (score.py checks them on the model).
 
     def graph(tokens, targets):
         t = targets[0]
@@ -15,11 +17,13 @@ readers and their parents.
             (t, "<p:3.o.281>"): {3: "<p:3.v.676>"},
             (3, "<p:3.v.676>"): "<p:0.down.3473>",
             "out": "<p:3.o.281><p:2.down.773>",
+            "claims": [(1, " prince", " his")],
         }
 
 trace(source, model, behavior=...) runs a source in a sandboxed child (restricted syntax and builtins, CPU and memory
 limits) and returns the IR: {"graph": {"nodes": [[layer, matrix, position, index], ...], "parents": [[reader, writer],
-...], "out": [writer, ...]}} with nodes as indices, and "valid" / "error".
+...], "out": [writer, ...], "claims": [[position, replacement, top], ...]}} with nodes as indices, and "valid" /
+"error" (the scorer reads the claims' strings as tokens).
 """
 
 from __future__ import annotations
@@ -146,8 +150,17 @@ def graph(fn, model: str, behavior: dict | None) -> dict:
             return [node(p, tok) for p, names in value.items() for tok in _names(names)]
         return [node(p, tok) for p in at for tok in _names(value)]
 
-    edges, reads = [], []
+    edges, reads, claims = [], [], []
     for key, value in out.items():
+        if key == "claims":
+            if not isinstance(value, (list, tuple)):
+                raise MechError("claims: a list of (position, replacement token, predicted top token)")
+            for c in value:
+                if not (isinstance(c, (list, tuple)) and len(c) == 3 and isinstance(c[0], int) and not isinstance(c[0], bool) and 0 <= c[0] < T
+                        and isinstance(c[1], str) and isinstance(c[2], str)):
+                    raise MechError(f"claims: {c!r} is not (position 0..{T - 1}, replacement token, predicted top token)")
+                claims.append([c[0], c[1], c[2]])
+            continue
         if key == "out":
             for w in parents(value, list(targets)):
                 wl, wk, wt, _ = nodes[w]
@@ -166,7 +179,7 @@ def graph(fn, model: str, behavior: dict | None) -> dict:
                                 "into a later query, key, value or MLP input at its position; a value into the same layer's attention "
                                 "output at that or a later position; an MLP input into the same MLP's output)")
             edges.append([r, w])
-    return {"nodes": nodes, "parents": edges, "out": reads}
+    return {"nodes": nodes, "parents": edges, "out": reads, "claims": claims}
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -221,7 +234,7 @@ def _line_of(exc: BaseException) -> int | None:
 
 
 def _empty(source: str, model: str) -> dict:
-    return {"model": model, "source": source, "graph": {"nodes": [], "parents": [], "out": []}, "valid": False, "error": None}
+    return {"model": model, "source": source, "graph": {"nodes": [], "parents": [], "out": [], "claims": []}, "valid": False, "error": None}
 
 
 def _trace(source: str, model: str, behavior: dict | None = None) -> dict:
@@ -249,7 +262,7 @@ def _trace(source: str, model: str, behavior: dict | None = None) -> dict:
         line = _line_of(e)
         ir["error"] = (f"line {line}: " if line else "") + f"{type(e).__name__}: {e}"
     if not ir["valid"]:
-        ir["graph"] = {"nodes": [], "parents": [], "out": []}
+        ir["graph"] = {"nodes": [], "parents": [], "out": [], "claims": []}
     return ir
 
 

@@ -49,6 +49,7 @@ import mech  # noqa: E402
 
 TEXTS = Path.home() / "mpd-data/graph_oracle/texts"
 RANDOM = 8  # random draws per score
+CANDIDATES = 32  # replacement tokens the teacher tries per source position for an interchange claim
 TEACH_STEPS, EDGE_STEPS, TEACH_LR = 2000, 600, 0.05  # the teacher's optimization (Adam on the strengths' logits)
 LN2 = math.log(2)
 
@@ -273,13 +274,15 @@ class Native:
         return ew, ow
 
     def run(self, ids: list[int], targets: list[int], plan: dict, u: dict, ur: dict, ew: dict | None = None, ow: dict | None = None,
-            qk: dict | None = None) -> torch.Tensor:
+            qk: dict | None = None, patch: dict | None = None, record: dict | None = None) -> torch.Tensor:
         """log q at the targets [B, len(targets), V] of each graph under one ablation: u[matrix] [Bu, S, C] and
         ur[matrix] [Bu, S] in [0, 1], Bu = B or 1, S = T or 1. A subcomponent outside a graph runs at mask u; a graph
         node at 1. An output reaches a reader through a declared edge of strength e at e + (1 - e) u (e = 1 unless ew
         / ow give it) and through every other connection at its writer's u. A complete graph's nodes read each other
         in full. qk[matrix] [Bu, T, C] gives a query or key node a strength e: it enters the attention pattern at
-        e + (1 - e) u (1 without qk). The token embedding always enters in full; remainders W - V U run at ur."""
+        e + (1 - e) u (1 without qk). The token embedding always enters in full; remainders W - V U run at ur.
+        patch[matrix] = (mask [B, T, C], values [B, T, C]) replaces those subcomponents' activations (an interchange);
+        record, a dict, receives every matrix's activations [B, T, C]."""
         import vpd_model
 
         tg, dev = self.target, self.dev
@@ -306,6 +309,13 @@ class Native:
 
         def strength(key, w, table):
             return 1.0 if table is None or key not in table else table[key]
+
+        def fixed(n, A):  # an activation tensor after patching, recorded
+            if patch is not None and n in patch:
+                A = torch.where(patch[n][0], patch[n][1], A)
+            if record is not None:
+                record[n] = A.detach()
+            return A
 
         emb = tg.wte[torch.tensor(ids, device=dev)]
         x = emb[None].expand(B, T, -1).clone()  # every output at its scale
@@ -341,7 +351,7 @@ class Native:
             n1, n2 = tg.norms[2 * i], tg.norms[2 * i + 1]
             z, zg = rms(x, n1, eps), rms(xg, n1, eps)
             for k in ("q_proj", "k_proj", "v_proj"):
-                acts[nm[k]] = read_resid(nm[k], n1, z, zg, x)
+                acts[nm[k]] = fixed(nm[k], read_resid(nm[k], n1, z, zg, x))
             qv = (acts[nm["q_proj"]] * scale(nm["q_proj"])) @ tg.site(nm["q_proj"]).U + rest(nm["q_proj"], z)
             kv = (acts[nm["k_proj"]] * scale(nm["k_proj"])) @ tg.site(nm["k_proj"]).U + rest(nm["k_proj"], z)
             Uv = tg.site(nm["v_proj"]).U
@@ -368,14 +378,14 @@ class Native:
                     pat = P[wb, :, t[ri], wt]  # [E, H]: how much the reader's position attends to the writer's
                     extra = extra.index_add(0, ri, share[:, None] * (pat.repeat_interleave(hd, dim=1) * Uv[wc]))
                 Ao = Ao.index_put((b, t, c), ((att_s[b, t] + extra) * Vo.T[c]).sum(-1))
-            acts[no] = Ao
+            acts[no] = Ao = fixed(no, Ao)
             Uo = tg.site(no).U
             ro = rest(no, att_s)
             x = x + (Ao * ux(no)) @ Uo + ro
             xg = xg + (Ao * scale(no)) @ Uo + ro
             z2, zg2 = rms(x, n2, eps), rms(xg, n2, eps)
             nf, nd = nm["c_fc"], nm["down_proj"]
-            acts[nf] = read_resid(nf, n2, z2, zg2, x)
+            acts[nf] = fixed(nf, read_resid(nf, n2, z2, zg2, x))
             Uf = tg.site(nf).U
             rf = rest(nf, z2)
             pre_s = (acts[nf] * ux(nf)) @ Uf + rf
@@ -389,7 +399,7 @@ class Native:
                     _, _, wc, a, uw = writer_out(wn, wi, None)
                     return (e * (1 - uw) * a)[:, None] * Uf[wc]
                 Ad = Ad.index_put((b, t, c), (gelu(pre_s[b, t] + topup(nd, Uf.shape[1], mlp_contrib)) * Vd.T[c]).sum(-1))
-            acts[nd] = Ad
+            acts[nd] = Ad = fixed(nd, Ad)
             Ud = tg.site(nd).U
             rd = rest(nd, gelu(pre_s))
             x = x + (Ad * ux(nd)) @ Ud + rd
@@ -424,6 +434,51 @@ class Native:
         total = torch.maximum(deleted, random)
         return [{"kl_bits": float(total[b]), "kl_deleted_bits": float(deleted[b]), "kl_random_bits": float(random[b]), "nodes": graphs[b].count(),
                  "edges": None if graphs[b].complete else graphs[b].edges(), "size": None if graphs[b].complete else graphs[b].size()} for b in range(B)]
+
+    # ---- interchanges
+
+    @torch.no_grad()
+    def interchange(self, ids: list[int], edited: list[list[int]], targets: list[int], nodes: set) -> list[dict]:
+        """For each edited sequence (same length): the model's prediction at the targets on the original text, on the
+        edited text, and on the original text with only `nodes`' activations taken from the edited run (everything
+        downstream recomputed): their top tokens, and the KLs in bits of the edited prediction from the original's
+        and from the patched one's."""
+        T = len(ids)
+        plan = self._plan([self.everything(T)], T)
+        one = ({n: torch.ones(1, 1, self.C[n], device=self.dev) for n in self.names}, {n: torch.ones(1, 1, device=self.dev) for n in self.names})
+        lp = self.run(ids, targets, plan, *one)
+        masks = {}
+        for n, t, c in nodes:
+            masks.setdefault(n, torch.zeros(1, T, self.C[n], dtype=torch.bool, device=self.dev))[0, t, c] = True
+        out = []
+        for e in edited:
+            rec = {}
+            le = self.run(e, targets, plan, *one, record=rec)
+            lq = self.run(ids, targets, plan, *one, patch={n: (m, rec[n]) for n, m in masks.items()})
+            out.append({"top": lp.argmax(-1)[0].tolist(), "edited_top": le.argmax(-1)[0].tolist(), "patched_top": lq.argmax(-1)[0].tolist(),
+                        "edit_kl_bits": float(self._kl(le, lp)[0]), "residual_kl_bits": float(self._kl(le, lq)[0])})
+        return out
+
+    @torch.no_grad()
+    def claims(self, ids: list[int], targets: list[int], g: Graph, candidates: int = CANDIDATES) -> list[tuple[int, int, int]]:
+        """The teacher's interchange claims about graph g, one per source position p of its pathways (pathways()):
+        among the `candidates` tokens whose embeddings are nearest the token at p, the replacement that changes the
+        model's top prediction the most (edit KL) while the pathway from p alone reproduces the new top prediction when
+        its activations come from the edited run. (p, replacement token id, the new top token id) per claim."""
+        wte = self.target.wte
+        unit = wte / wte.norm(dim=1, keepdim=True)
+        out = []
+        for p, nodes in pathways(g, targets).items():
+            near = (unit @ unit[ids[p]]).topk(candidates + 1).indices.tolist()
+            subs = [c for c in near if c != ids[p]][:candidates]
+            edited = [ids[:p] + [c] + ids[p + 1:] for c in subs]
+            res = self.interchange(ids, edited, targets, nodes)
+            ok = [(r["edit_kl_bits"], c, r["edited_top"][0]) for c, r in zip(subs, res)
+                  if r["edited_top"] != r["top"] and r["patched_top"] == r["edited_top"]]
+            if ok:
+                _, c, top = max(ok)
+                out.append((p, c, top))
+        return out
 
     # ---- the teacher
 
@@ -535,10 +590,49 @@ class Native:
             keep = min(n_items, max(keep + 1, int(keep * 1.25)))
 
 
-def program(g: Graph) -> str:
+def pathways(g: Graph, targets: list[int]) -> dict[int, set]:
+    """Per source position p, the graph's nodes on a path from a node at p (which reads token p) to the prediction: a
+    reader's parents feed it, a query feeds its layer's attention outputs at its position, a key those at its position
+    and later."""
+    children: dict = {}
+    for r, ws in g.parents.items():
+        for w in ws:
+            children.setdefault(w, set()).add(r)
+    outs = [nd for nd in g.nodes if _layer_kind(nd)[1] == "o_proj"]
+    for nd in g.nodes:
+        layer, kind = _layer_kind(nd)
+        if kind in ("q_proj", "k_proj"):
+            for o in outs:
+                if _layer_kind(o)[0] == layer and (o[1] == nd[1] if kind == "q_proj" else o[1] >= nd[1]):
+                    children.setdefault(nd, set()).add(o)
+    parents: dict = {}
+    for w, rs in children.items():
+        for r in rs:
+            parents.setdefault(r, set()).add(w)
+    ancestors, stack = set(g.out), list(g.out)
+    while stack:
+        for w in parents.get(stack.pop(), ()):
+            if w not in ancestors:
+                ancestors.add(w)
+                stack.append(w)
+    out = {}
+    for p in sorted({nd[1] for nd in ancestors}):
+        seen, stack = set(), [nd for nd in ancestors if nd[1] == p]
+        while stack:
+            nd = stack.pop()
+            if nd in seen or nd not in ancestors:
+                continue
+            seen.add(nd)
+            stack += list(children.get(nd, ()))
+        out[p] = seen
+    return out
+
+
+def program(g: Graph, claims: list | None = None) -> str:
     """A graph as an answer: graph(tokens, targets) returning {(position, reader): its parents, "out": the
-    prediction's parents}; parents at the reader's own position are one string of subcomponents, an attention
-    output's parents (values) a {position: string}; a node with no parents is listed with "" when nothing reads it."""
+    prediction's parents, "claims": [(position, replacement, top), ...]}; parents at the reader's own position are one
+    string of subcomponents, an attention output's parents (values) a {position: string}; a node with no parents is
+    listed with "" when nothing reads it; claims hold token strings."""
     sites = list(mech.SITES.values())
     codes = {v: k for k, v in mech.SITES.items()}
 
@@ -564,7 +658,20 @@ def program(g: Graph) -> str:
             val = '"' + "".join(tok(w) for w in ws) + '"'
         lines.append(f'        ({r[1]}, "{tok(r)}"): {val},')
     lines.append('        "out": "' + "".join(tok(w) for w in sorted(g.out, key=key)) + '",')
+    if claims:
+        lines.append('        "claims": [' + ", ".join(f"({p}, {a!r}, {b!r})" for p, a, b in claims) + "],")
     return "def graph(tokens, targets):\n    return {\n" + "\n".join(lines) + "\n    }\n"
+
+
+def token_claims(claims: list[tuple[int, int, int]]) -> list[tuple[int, str, str]]:
+    """Claims with their tokens as strings, keeping those whose strings read back as the same single tokens."""
+    tk = mech.tokenizer("vpd4l")
+    out = []
+    for p, a, b in claims:
+        sa, sb = tk.decode([a]), tk.decode([b])
+        if tk.encode(sa, add_special_tokens=False).ids == [a] and tk.encode(sb, add_special_tokens=False).ids == [b]:
+            out.append((p, sa, sb))
+    return out
 
 
 def tasks(split: str) -> list[Path]:
@@ -591,9 +698,10 @@ def teach(split: str, n: int, offset: int = 0, stride: int = 1, epsilons=(0.25, 
                 continue
             t0 = time.time()
             g, s = nat.teach(ids, targets, eps)
-            (out / f"{stem}.py").write_text(program(g))
-            (out / f"{stem}.json").write_text(json.dumps({"score": s, "eps": eps, "seconds": round(time.time() - t0, 1)}))
-            print(f"{stem}: {s['nodes']} nodes, {s['edges']} edges, kl {s['kl_bits']:.3f} (eps {eps}), {time.time() - t0:.0f} s", flush=True)
+            claims = token_claims(nat.claims(ids, targets, g))
+            (out / f"{stem}.py").write_text(program(g, claims))
+            (out / f"{stem}.json").write_text(json.dumps({"score": s, "eps": eps, "claims": claims, "seconds": round(time.time() - t0, 1)}))
+            print(f"{stem}: {s['nodes']} nodes, {s['edges']} edges, kl {s['kl_bits']:.3f} (eps {eps}), {len(claims)} claims, {time.time() - t0:.0f} s", flush=True)
 
 
 def main():

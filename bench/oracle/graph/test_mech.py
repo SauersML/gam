@@ -47,6 +47,12 @@ def test_a_graph_answer():
     assert {nodes[w] for w in g["out"]} == {(3, "o_proj", 3, 281), (2, "down_proj", 3, 773)}
 
 
+def test_claims():
+    ir = mech._trace(GRAPH.replace('"out": "<p:3.o.281><p:2.down.773>",', '"out": "<p:3.o.281><p:2.down.773>",\n        "claims": [(p, " prince", " his")],'), "vpd4l", BEHAVIOR)
+    assert ir["valid"], ir["error"] and ir["graph"]["claims"] == [[1, " prince", " his"]]
+    assert "claims" in error(GRAPH.replace('"out": "<p:3.o.281><p:2.down.773>",', '"out": "<p:3.o.281><p:2.down.773>",\n        "claims": [(9, " prince", " his")],'))
+
+
 def test_the_connection_rule():
     assert mech.connects(0, "down_proj", 1, 3, "v_proj", 1, [3])  # an MLP output into a later value at its position
     assert not mech.connects(3, "o_proj", 1, 3, "v_proj", 1, [3])  # not into its own layer's value (it is written after)

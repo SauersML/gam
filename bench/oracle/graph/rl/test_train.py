@@ -348,9 +348,11 @@ def check_rl2_pieces():
     seeds = [train.step_seed(args, s) for s in range(10)]
     assert len(set(seeds)) == 10 and 5 not in seeds
     assert train.step_seed(argparse.Namespace(seed=1, eval_seed=5), 0) == 1 << 20
-    assert train.key({"eps": 0.5}, {"valid": True, "kl_bits": 0.4, "size": 7}) == (0, 0.0, 7)
-    assert train.key({"eps": 0.5}, {"valid": True, "kl_bits": 0.75, "size": 2}) == (0, 0.25, 2)
-    assert train.key({"eps": 0.5}, {"valid": False}) == (1, math.inf, math.inf)
+    assert train.key({"eps": 0.5}, {"valid": True, "kl_bits": 0.4, "size": 7}) == (0, 0.0, 0, 0, 7)
+    assert train.key({"eps": 0.5}, {"valid": True, "kl_bits": 0.75, "size": 2}) == (0, 0.25, 0, 0, 2)
+    assert train.key({"eps": 0.5}, {"valid": True, "kl_bits": 0.4, "size": 9, "claims_wrong": 0, "claims_explained": 2}) < \
+        train.key({"eps": 0.5}, {"valid": True, "kl_bits": 0.4, "size": 7, "claims_wrong": 0, "claims_explained": 1})  # explaining more beats smaller
+    assert train.key({"eps": 0.5}, {"valid": False}) == (1, math.inf, math.inf, 0, math.inf)
     import json
 
     with tempfile.TemporaryDirectory() as d:  # teacher_v3.py's manifest, written on another machine; the held-out refusal
