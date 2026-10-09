@@ -96,11 +96,12 @@ class Scorer:
                 g.nodes |= {w, r}
         return g
 
-    def score(self, task: dict, sources: list[str], seed: int = 0) -> list[dict]:
+    def score(self, task: dict, sources: list[str], seed: int = 0, interchange: bool = False) -> list[dict]:
         """Each answer's score on a task (a text task record) under one draw of changed prompts (seed): {"valid",
         "error", "curve": [[bits, kl], ...] (the empty graph, then each step), "lo" and "hi": one subcomponent's and
         the whole model's description lengths, "kl_bits" and "bits" (the whole answer), "steps", "nodes", "edges",
-        "explanation", "notes", "dropped": what the answer wrote that is not part of its graph (mech; its description
+        "explanation", "notes", "interchange_kl_bits" (with interchange: native.interchange of the whole answer, its
+        steps as the groups; an evaluation measure), "dropped": what the answer wrote that is not part of its graph (mech; its description
         length still counts), "events": the changed prompts' token changes and whether each flips the model's top next
         token (native.flips, the same for every answer)}; the
         source "vpd" stands for VPD's own answer (complete, one step)."""
@@ -145,6 +146,11 @@ class Scorer:
                     graphs.append(g)
                     owners.append(j)
                     own_bits.append(bits)
+                if interchange and mine:
+                    whole = mine[-1][0]
+                    steps = [self.native.prefix(ir, k)[0].node_set() for k in range(1, out[-1]["steps"] + 1)]
+                    groups = [b - a for a, b in zip([set()] + steps[:-1], steps) if b - a]
+                    out[-1]["interchange_kl_bits"] = nat.interchange(ids, targets, whole, groups, prompts, seed)
         kl = nat.faithfulness(ids, targets, graphs, prompts)
         lo = math.log2(positions * total)
         events = nat.flips(ids, targets, prompts)  # what the English reader is asked about (reader.py)

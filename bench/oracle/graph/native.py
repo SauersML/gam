@@ -511,6 +511,35 @@ class Native:
                 out.append({"position": diff[0], "old": ids[diff[0]], "new": x[diff[0]], "flipped": int(self.reference([x], [last])[0, 0].argmax()) != top})
         return out
 
+    @torch.no_grad()
+    def interchange(self, ids: list[int], targets: list[int], g: Graph, groups: list[set], prompts: list[list[int]], seed: int = 0) -> float:
+        """Interchange tests of a graph whose nodes come in groups (an answer's steps: its variables): per changed
+        prompt x', each group taken from x' with probability 1/2 (every subset of groups equally likely), the rest from
+        the text. Graph side: the graph runs alone on the text with those groups' activations set to their values when
+        the graph runs alone on x'. Model side: the full model runs on the text with the same subcomponents set to their
+        values in the full model on x'. The mean over the prompts of the KL in bits of the model side's next-token
+        distribution from the graph side's: whether the graph computes from its parts what the model computes from
+        them."""
+        T = len(ids)
+        gen = torch.Generator(device="cpu").manual_seed(seed)
+        plan_g, plan_m = self._plan([g], T), self._plan([self.everything(T)], T)
+        zero = self._zero()
+        one = ({n: torch.ones(1, 1, self.C[n], device=self.dev) for n in self.names}, {n: torch.ones(1, 1, device=self.dev) for n in self.names})
+        total = 0.0
+        for x in prompts:
+            take = [grp for grp in groups if torch.rand(1, generator=gen).item() < 0.5]
+            nodes = set().union(*take) if take else set()
+            rec_g, rec_m = {}, {}
+            self.run(x, targets, plan_g, *zero, record=rec_g)
+            self.run(x, targets, plan_m, *one, record=rec_m)
+            mask = {}
+            for n, t, c in nodes:
+                mask.setdefault(n, torch.zeros(1, T, self.C[n], dtype=torch.bool, device=self.dev))[0, t, c] = True
+            lq = self.run(ids, targets, plan_g, *zero, patch={n: (m, rec_g[n]) for n, m in mask.items()})
+            lp = self.run(ids, targets, plan_m, *one, patch={n: (m, rec_m[n]) for n, m in mask.items()})
+            total += float(self._kl(lp, lq)[0])
+        return total / len(prompts)
+
     def positions(self, targets: list[int]) -> int:
         """The positions a graph's nodes can sit at: 0 to the last target."""
         return max(targets) + 1
