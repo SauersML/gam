@@ -509,6 +509,18 @@ class Native:
         return [{"kl_bits": k, "bits": g.bits(self.positions(targets), total), "nodes": g.count(), "edges": None if g.complete else g.edges()}
                 for g, k in zip(graphs, kl)]
 
+    @torch.no_grad()
+    def lens(self, nodes, k: int = 3) -> dict:
+        """Per residual writer (attention or MLP output) among `nodes`: the k tokens its write vector raises most at the
+        prediction, (U_c * final norm weight) @ embedding^T (the logit lens of what it writes)."""
+        tk = mech.tokenizer("vpd4l")
+        out = {}
+        for nd in nodes:
+            if _layer_kind(nd)[1] in mech.RESID_WRITERS:
+                logits = (self.target.site(nd[0]).U[nd[2]] * self.target.ln_f) @ self.target.wte.T
+                out[nd] = [tk.decode([int(i)]) for i in logits.topk(k).indices.tolist()]
+        return out
+
     # ---- the bootstrap search
 
     def _node_ranking(self, ids: list[int], targets: list[int], prompts: list[list[int]], reach: dict) -> tuple:
