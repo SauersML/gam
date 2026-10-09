@@ -167,6 +167,32 @@ class Scorer:
                 s.update(kl_bits=kl[0], bits=0.0, nodes=0, edges=0)
         return out
 
+    def adversarial(self, tasks: list[dict], sources: list[str], seed: int = 0) -> list[float | None]:
+        """native.adversarial over one answer per task (an answer's whole graph, library entries expanded; "vpd" for VPD's
+        answer), one adversary shared by all of them: each task's KL in bits, None where the answer is invalid."""
+        import mech
+
+        cases, where = [], []
+        for j, (task, src) in enumerate(zip(tasks, sources)):
+            prompt = task["prompts"][0]
+            ids, targets = prompt["token_ids"], prompt["target_positions"]
+            if src == "vpd":
+                g = self.nat.vpd_answer(ids)
+            else:
+                ir = mech.trace(src, "vpd4l", behavior=task)
+                if not ir["valid"] or not ir["graph"]["steps"]:
+                    continue
+                g, uses = self.native.prefix(ir, ir["graph"]["steps"])
+                g = self.expand(g, uses, targets, len(ids)) if uses else g
+                if g is None:
+                    continue
+            cases.append((ids, targets, g))
+            where.append(j)
+        out = [None] * len(tasks)
+        for j, k in zip(where, self.nat.adversarial(cases, seed=seed) if cases else []):
+            out[j] = k
+        return out
+
 
 def main():
     import argparse

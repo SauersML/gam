@@ -58,6 +58,7 @@ TEXTS = Path.home() / "mpd-data/graph_oracle/texts"
 CHANGES = 16  # changed prompts per text: draws of the average that defines faithfulness (they set its precision, not what it is)
 MAX_CONNECTIONS = 150000  # the search's memory: the connections it ranks at once
 IG_STEPS = 16  # the search's integration points along each ranking's path
+ADV_STEPS, ADV_STEP = 20, 0.1  # Native.adversarial (evaluation only): VPD's headline setting is 20 steps shared across its batch
 LN2 = math.log(2)
 
 
@@ -593,6 +594,42 @@ class Native:
             plan_x = {**plan, "G": none}  # no node held at 1: every subcomponent runs at its u
             total += getattr(x, "weight", 1.0) * float(self._kl(logp, self.run(x, targets, plan_x, u, ur)))
         return total / len(prompts)
+
+    def adversarial(self, cases: list[tuple], steps: int = ADV_STEPS, step_size: float = ADV_STEP, seed: int = 0) -> list[float]:
+        """VPD's adversarial test of graphs, an evaluation measure: every subcomponent outside a graph (and every
+        remainder) at a mask in [0, 1] chosen to maximize the summed KL in bits of the model's next-token distribution at
+        the targets from the graph's, one mask per subcomponent shared by every position and every case (VPD's tying
+        across a batch: the adversary must exploit systematic weaknesses), by `steps` signed-gradient steps of size
+        step_size projected onto [0, 1] from a uniform draw (VPD's PGD). cases: (ids, targets, graph). The KL of each case
+        at the final masks. Compare graphs only against others under the same adversary (VPD's own answer): no
+        decomposition survives it outright."""
+        g = torch.Generator(device="cpu").manual_seed(seed)
+        u = {n: torch.rand(self.C[n], generator=g).to(self.dev) for n in self.names}
+        ur = {n: torch.rand(1, generator=g).to(self.dev) for n in self.names}
+        prepared = [(ids, targets, self._plan([gr], len(ids)), self.reference([ids], targets)) for ids, targets, gr in cases]
+
+        def kls(grad: bool):
+            out = []
+            for ids, targets, plan, logp in prepared:
+                uu = {n: u[n].view(1, 1, -1) for n in self.names}
+                rr = {n: ur[n].view(1, 1) for n in self.names}
+                with torch.set_grad_enabled(grad):
+                    k = self._kl(logp, self.run(ids, targets, plan, uu, rr))[0]
+                    if grad:
+                        k.backward()
+                out.append(float(k.detach()))
+            return out
+
+        for _ in range(steps):
+            for n in self.names:
+                u[n].requires_grad_(True)
+                ur[n].requires_grad_(True)
+            kls(True)
+            with torch.no_grad():
+                for n in self.names:
+                    u[n] = (u[n] + step_size * u[n].grad.sign()).clamp(0, 1).detach()
+                    ur[n] = (ur[n] + step_size * ur[n].grad.sign()).clamp(0, 1).detach()
+        return kls(False)
 
     def positions(self, targets: list[int]) -> int:
         """The positions a graph's nodes can sit at: 0 to the last target."""

@@ -34,6 +34,15 @@ def native(items: list[dict]) -> list[dict]:
     return out
 
 
+def adversarial(tasks: list[dict], sources: list[str], seed: int = 0) -> list:
+    """score.Scorer.adversarial on the native scorer's Scorer (evaluation only)."""
+    import score
+
+    if not _SCORER:
+        _SCORER.append(score.Scorer(DEVICE))
+    return _SCORER[0].adversarial(tasks, sources, seed)
+
+
 def mock(items: list[dict]) -> list[dict]:
     import mech
 

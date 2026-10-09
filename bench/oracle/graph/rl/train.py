@@ -1150,10 +1150,10 @@ def shares(x: dict) -> dict:
     """An answer in the reporting terms: area (score.key: score.area over the question's range), kl (the whole answer's
     run-alone KL in bits), reproduces = 1 - kl / the empty graph's, bits (its description length), steps, nodes, edges."""
     if not x.get("valid", True) or not x.get("curve"):
-        return {"area": None, "kl": None, "reproduces": None, "bits": None, "steps": None, "nodes": None, "edges": None, "necessity": None}
+        return {"area": None, "kl": None, "reproduces": None, "bits": None, "steps": None, "nodes": None, "edges": None, "necessity": None, "adversarial": None}
     kl, empty = x.get("kl_bits"), x["curve"][0][1]
     return {"area": score_module.key(x)[1], "kl": kl, "reproduces": 1.0 - kl / empty if empty else None, "bits": x.get("bits"), "steps": x.get("steps"),
-            "nodes": x.get("nodes"), "edges": x.get("edges"), "necessity": x.get("necessity_kl_bits")}
+            "nodes": x.get("nodes"), "edges": x.get("edges"), "necessity": x.get("necessity_kl_bits"), "adversarial": x.get("adversarial_kl_bits")}
 
 
 def summarize(name: str, step: int, groups: list[tuple[dict, list, dict]], log) -> dict:
@@ -1178,12 +1178,15 @@ def summarize(name: str, step: int, groups: list[tuple[dict, list, dict]], log) 
         for n in ("search", "vpd"):
             if n in base and base[n].get("valid") and keys[j][0] == 0:
                 row[f"beats_{n}"] = keys[j][1] < key(base[n])[1]
+        if best.get("adversarial_kl_bits") is not None and (base.get("vpd") or {}).get("adversarial_kl_bits") is not None:
+            row["adversarial_minus_vpd"] = best["adversarial_kl_bits"] - base["vpd"]["adversarial_kl_bits"]  # the same adversary, VPD's answer the reference
         rows.append(row)
         log.write(json.dumps(row) + "\n")
-    keys_ = ("area", "kl", "reproduces", "bits", "steps", "nodes", "edges", "necessity")
+    keys_ = ("area", "kl", "reproduces", "bits", "steps", "nodes", "edges", "necessity", "adversarial")
     return {"questions": len(rows), "valid_fraction": mean([r["valid_fraction"] for r in rows]), "best_first_area": mean([r["best_first_area"] for r in rows]),
             "best_is_revision": mean([r["best_is_revision"] for r in rows]),
             "best_beats_search": mean([r.get("beats_search") for r in rows]), "best_beats_vpd": mean([r.get("beats_vpd") for r in rows]),
+            "adversarial_minus_vpd": mean([r.get("adversarial_minus_vpd") for r in rows]),
             "best": {k: mean([r["best"][k] for r in rows]) for k in keys_},
             "baselines": {n: {k: mean([r["baselines"][n][k] for r in rows if n in r["baselines"]]) for k in keys_} for n in sorted({n for _, _, base in groups for n in base})}}
 
@@ -1232,6 +1235,17 @@ def evaluate(sets: dict[str, list[dict]], pol, sampler, score, args, adapter: Pa
                 (runs / f"{b['id']}.{run}.json").write_text(json.dumps({"behavior": b["id"], "model": b.get("model"), "source": src, "score": x,
                                                                                "baselines": per_base.get(b["id"], {}), "seed": args.eval_seed, "set": name, "step": step}))
                 out.append((b, mine, per_base.get(b["id"], {})))
+            if out and getattr(args, "adversarial", False):  # VPD's adversary, one per method shared across the set's questions
+                import scorer as scorer_module
+
+                tasks = [b for b, _, _ in out]
+                best = [min(mine, key=lambda m: score_module.key(m[1])) for _, mine, _ in out]
+                mine_adv = scorer_module.adversarial(tasks, [src for src, _ in best], args.eval_seed)
+                vpd_adv = scorer_module.adversarial(tasks, ["vpd"] * len(tasks), args.eval_seed)
+                for (_, x), (_, _, base), a, v in zip(best, out, mine_adv, vpd_adv):
+                    x["adversarial_kl_bits"] = a
+                    if "vpd" in base:
+                        base["vpd"]["adversarial_kl_bits"] = v
             if out:
                 summary[name] = summarize(name, step, out, log)
             if getattr(sampler, "stats", None):
@@ -1289,6 +1303,7 @@ def main():
     ap.add_argument("--micro", type=int, default=2)
     ap.add_argument("--sampler", choices=["auto", "vllm", "hf"], default="auto")
     ap.add_argument("--evidence", action="store_true", help="the oracle also reads the model's activations: one input token per position and weight matrix, the subcomponents' features weighted by their activations through the part-token maps (needs --part-tokens)")
+    ap.add_argument("--adversarial", action="store_true", help="eval: VPD's adversary (native.adversarial), one shared across the set for the oracle's best answers and one for VPD's answers; reported, never trained on")
     ap.add_argument("--necessity", action="store_true", help="eval: also measure each answer's necessity (native.necessity: the model with the answer's subcomponents removed)")
     ap.add_argument("--swap-evidence", action="store_true", help="eval: give each held-out question another text's activations (if answers do not get worse, the oracle does not read them)")
     ap.add_argument("--part-tokens", help="part tokens: the registry file of part_tokens.py build; the projections train with the LoRA and vLLM gets the rows in place")
