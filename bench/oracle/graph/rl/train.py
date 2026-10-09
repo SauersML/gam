@@ -1026,20 +1026,18 @@ def sft_examples(args, pol, pool: list[dict]) -> tuple[list, list]:
     return keep(programs), keep(questions)
 
 
-def fit(tok, text: str, budget: int, encode=None) -> list[int]:
-    """An answer's tokens, its program cut to the most first steps (native.first_steps) whose answer fits `budget`
-    tokens (the oracle's output limit): a search answer is as long as its search ran, the oracle's as long as it may
-    write. encode: text -> token ids (default tok.encode without special tokens)."""
+def cut(text: str, budget: int, encode) -> str:
+    """An answer with its program cut to the most first steps (native.first_steps) whose answer fits `budget` tokens
+    (the oracle's output limit; encode: text -> token ids): a search answer is as long as its search ran, the
+    oracle's as long as it may write."""
     import native
 
-    encode = encode or (lambda t: tok.encode(t, add_special_tokens=False))
-    ids = encode(text)
-    if len(ids) <= budget:
-        return ids
+    if len(encode(text)) <= budget:
+        return text
     source, _ = split_answer(text)
     parts = native.steps_of(source)
     if parts is None:
-        return ids
+        return text
     lo, hi = 0, len(parts[1])  # the most steps that fit, by bisection (length grows with steps)
     while lo < hi:
         mid = (lo + hi + 1) // 2
@@ -1047,7 +1045,14 @@ def fit(tok, text: str, budget: int, encode=None) -> list[int]:
             lo = mid
         else:
             hi = mid - 1
-    return encode(text.replace(source, native.first_steps(source, lo)))
+    return text.replace(source, native.first_steps(source, lo))
+
+
+def fit(tok, text: str, budget: int) -> list[int]:
+    """cut()'s answer as the oracle's tokens."""
+    def encode(t):
+        return tok.encode(t, add_special_tokens=False)
+    return encode(cut(text, budget, encode))
 
 
 def sft(args, pol, pool, learner: Learner, log) -> dict:
@@ -1293,7 +1298,7 @@ def main():
     adapter = out / "adapter"
     if args.search_heldout:  # the search's baseline at the oracle's output budget
         for bid, text in list(HELDOUT_SEARCH.items()):
-            HELDOUT_SEARCH[bid] = pol.tok.decode(fit(pol.tok, text, args.max_tokens))
+            HELDOUT_SEARCH[bid] = cut(text, args.max_tokens, lambda t: pol.tok.encode(t, add_special_tokens=False))
     if args.mode == "eval":
         pol.save(adapter)
         print(json.dumps(evaluate(sets, pol, sampler, score, args, adapter, 0, open(out / "eval.jsonl", "a"), 0)))

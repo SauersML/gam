@@ -41,24 +41,35 @@ def words(nd, strings: list[str], lens: dict) -> str:
     return w + (f", which writes toward {', '.join(map(repr, lens[nd]))}" if nd in lens else "")
 
 
-def render(steps: list, strings: list[str], lens: dict) -> str:
-    lines, prev = [], native.Graph()
+def render(steps: list, strings: list[str], lens: dict, budget: int, count) -> str:
+    """Each step's new connections in words, in step order, while the rendering stays within `budget` tokens (count:
+    text -> its token count; the describer's context is the limit); a step past it is summarized by how many
+    connections it adds and where."""
+    lines, prev, full = [], native.Graph(), True
     for k, g in enumerate(steps):
         seen = {(r, w) for r, ws in prev.parents.items() for w in ws}
         new = [(r, w) for r, ws in g.parents.items() for w in ws if (r, w) not in seen] + [(None, w) for w in g.out if w not in prev.out]
-        lines.append(f"Step {k + 1}:")
-        for r, w in new:
-            lines.append(f"  the prediction reads {words(w, strings, lens)}" if r is None else f"  {words(r, strings, lens)} reads {words(w, strings, lens)}")
+        body = [f"  the prediction reads {words(w, strings, lens)}" if r is None else f"  {words(r, strings, lens)} reads {words(w, strings, lens)}" for r, w in new]
+        if full and count("\n".join(lines + body)) > budget:
+            full = False
+        if full:
+            lines += [f"Step {k + 1}:"] + body
+        else:
+            where = sorted({nd[1] for r, w in new for nd in (r, w) if nd is not None})
+            layers = sorted({native._layer_kind(nd)[0] for r, w in new for nd in (r, w) if nd is not None})
+            lines.append(f"Step {k + 1}: adds {len(new)} more connections, among subcomponents of layers {layers} at positions {where[:40]}"
+                         + (" ..." if len(where) > 40 else ""))
         prev = g
     return "\n".join(lines)
 
 
 def parse(text: str, n: int) -> tuple[str, list[str]] | None:
+    """(the explanation, a sentence per step, "" where the writer gave none); None without an explanation."""
     m = re.search(r"EXPLANATION:\s*(.+?)(?=\nSTEP 1:|\Z)", text, re.S)
-    notes = [re.search(rf"STEP {k + 1}:\s*(.+?)(?=\nSTEP {k + 2}:|\Z)", text, re.S) for k in range(n)]
-    if not m or not all(notes):
+    if not m or not m[1].strip():
         return None
-    return m[1].strip(), [x[1].strip().split("\n")[0] for x in notes]
+    notes = [re.search(rf"STEP {k + 1}:\s*(.+?)(?=\nSTEP {k + 2}:|\Z)", text, re.S) for k in range(n)]
+    return m[1].strip(), [x[1].strip().split("\n")[0] if x else "" for x in notes]
 
 
 def main():
@@ -69,6 +80,7 @@ def main():
     ap.add_argument("--base", default="Qwen/Qwen3-4B")
     ap.add_argument("--max-tokens", type=int, default=12288, help="the oracle's output budget the answers are cut to")
     ap.add_argument("--write-tokens", type=int, default=1536)
+    ap.add_argument("--describe-tokens", type=int, default=6000, help="the graph's rendering in words stays within this many tokens (the describer's context)")
     a = ap.parse_args()
     from transformers import AutoTokenizer
 
@@ -84,7 +96,7 @@ def main():
             continue
         task = json.loads(p.read_text())
         answer = "```python\n" + src_path.read_text() + "```"
-        cut = train.split_answer(tok.decode(train.fit(tok, answer, a.max_tokens, count)) if len(count(answer)) > a.max_tokens else answer)[0]
+        cut = train.split_answer(train.cut(answer, a.max_tokens, count))[0]
         ir = mech.trace_inline(cut, "vpd4l", task)
         if not ir["valid"] or not ir["graph"]["steps"]:
             continue
@@ -93,7 +105,7 @@ def main():
         prompt = task["prompts"][0]
         t = prompt["target_positions"][0]
         text = "\n".join(f"{i}: {s!r}" for i, s in enumerate(strings))
-        ask = ASK.format(t=t, top=", ".join(repr(x) for x, _ in prompt["model_top"][0]), text=text, graph=render(steps, strings, nat.lens(steps[-1].nodes)))
+        ask = ASK.format(t=t, top=", ".join(repr(x) for x, _ in prompt["model_top"][0]), text=text, graph=render(steps, strings, nat.lens(steps[-1].nodes), a.describe_tokens, lambda t: len(tok.encode(t, add_special_tokens=False))))
         jobs.append((p.stem, steps, tok.apply_chat_template([{"role": "user", "content": ask}], add_generation_prompt=True, enable_thinking=False, tokenize=False)))
     print(f"{len(jobs)} answers to describe", flush=True)
     a.out.mkdir(parents=True, exist_ok=True)
@@ -107,7 +119,7 @@ def main():
         from transformers import AutoModelForCausalLM
 
         dev = "cuda" if torch.cuda.is_available() else "mps"
-        model = AutoModelForCausalLM.from_pretrained(a.base, dtype=torch.bfloat16).to(dev)
+        model = AutoModelForCausalLM.from_pretrained(a.base, dtype=torch.bfloat16, attn_implementation="sdpa").to(dev)
         outs = []
         for _, _, chat in jobs:
             ids = tok(chat, return_tensors="pt").input_ids.to(dev)
@@ -115,7 +127,9 @@ def main():
     done = 0
     for (stem, steps, _), text in zip(jobs, outs):
         got = parse(text, len(steps))
-        if got is None:
+        if got is None:  # kept for inspection
+            (a.out / "unparsed").mkdir(exist_ok=True)
+            (a.out / "unparsed" / f"{stem}.txt").write_text(text)
             continue
         explanation, notes = got
         (a.out / f"{stem}.py").write_text(native.program(steps, notes=notes, explanation=explanation))
