@@ -621,6 +621,139 @@ class Native:
             best = (g_n, s_n)
         return self.clean(ids, targets, *best, eps, seed, logp)
 
+    # ---- the search by ranking and measuring
+
+    def _smallest_prefix(self, n: int, passes, batch: int = 8) -> int:
+        """The smallest k in 1..n with passes(k) true, assuming it is monotone in k (n is taken to pass): rounds of
+        `batch` evenly spaced trials narrow the interval; passes takes a list of k and returns a list of bools."""
+        lo, hi = 0, n  # lo fails (or is 0), hi passes
+        while hi - lo > 1:
+            ks = sorted({lo + max(1, (hi - lo) * (j + 1) // (batch + 1)) for j in range(batch)} - {hi})
+            ks = [k for k in ks if lo < k < hi] or [(lo + hi) // 2]
+            ok = passes(ks)
+            for k, o in zip(ks, ok):
+                if o:
+                    hi = min(hi, k)
+                    break
+                lo = max(lo, k)
+        return hi
+
+    def _node_ranking(self, ids: list[int], targets: list[int], logp, reach: dict, steps: int = 16) -> tuple:
+        """Every reachable (matrix, position, subcomponent), most important first: integrated gradients of the deleted
+        model's KL along the path that scales every subcomponent (and remainder) from 1 to 0 together,
+        -integral of d KL / d m_c, the share of the full removal's KL each one accounts for. Only an order."""
+        T = len(ids)
+        ids_b = torch.tensor([ids], device=self.dev)
+        total = {n: torch.zeros(T, self.C[n], device=self.dev) for n in self.names}
+        for k in range(steps):
+            a = (k + 0.5) / steps
+            masks = {n: torch.full((1, T, self.C[n]), a, device=self.dev, requires_grad=True) for n in self.names}
+            rest = {n: torch.full((1, T), a, device=self.dev) for n in self.names}
+            with torch.enable_grad():
+                lq = torch.log_softmax(self.vpd.masked(ids_b, masks, rest)[:, targets].float(), -1)
+                grads = torch.autograd.grad(self._kl(logp, lq)[0], [masks[n] for n in self.names])
+            for n, gr in zip(self.names, grads):
+                total[n] -= gr[0] / steps
+        mi, ti, ci, val = [], [], [], []
+        for j, n in enumerate(self.names):
+            t, c = reach[n].nonzero(as_tuple=True)
+            mi.append(torch.full_like(t, j))
+            ti.append(t)
+            ci.append(c)
+            val.append(total[n][t, c])
+        mi, ti, ci, val = torch.cat(mi), torch.cat(ti), torch.cat(ci), torch.cat(val)
+        o = (-val).argsort()
+        return mi[o], ti[o], ci[o]
+
+    def search(self, ids: list[int], targets: list[int], eps: float, seed: int = 0, log=None) -> tuple[Graph | None, dict]:
+        """(one prediction's graph at precision eps, its score), by ranking and measuring. Subcomponents: rank every
+        reachable one (_node_ranking) and keep the smallest top-k whose complete graph passes the tests at eps / 2.
+        Connections: rank every connection the model has between them, and their queries and keys, by integrated
+        gradients of the KL as all their strengths go from 1 to 0, and keep the smallest top-k that passes at eps.
+        Then drop what lies on no path to the prediction. None (with the reason) when the connections between the kept
+        subcomponents exceed MAX_CONNECTIONS."""
+        T = len(ids)
+        logp = self.reference([ids], targets)
+        reach = self.reachable(T, targets)
+        mi, ti, ci = self._node_ranking(ids, targets, logp, reach)
+        names = self.names
+
+        def masks_of(k):
+            out = {n: torch.zeros(T, self.C[n], dtype=torch.bool, device=self.dev) for n in names}
+            for j, n in enumerate(names):
+                sel = mi[:k] == j
+                out[n][ti[:k][sel], ci[:k][sel]] = True
+            return out
+
+        def nodes_pass(ks):
+            res = self.score(ids, targets, [Graph(masks=masks_of(k)) for k in ks], seed, logp)
+            return [r["kl_bits"] <= eps / 2 for r in res]
+
+        k = self._smallest_prefix(len(mi), nodes_pass)
+        nodes = {(names[int(mi[i])], int(ti[i]), int(ci[i])) for i in range(k)}
+        parents, out = all_edges(nodes, targets)
+        n_conn = sum(len(w) for w in parents.values()) + len(out)
+        if log:
+            log(f"{k} subcomponents pass at {eps / 2}; {n_conn} connections between them")
+        if n_conn > MAX_CONNECTIONS:
+            return None, {"skipped": f"{k} subcomponents with {n_conn} connections between them"}
+        full = Graph(nodes, parents, out)
+        plan = self._plan([full], T)
+        n_edges = len(plan["order"])
+        edge_list = [(r, w) for r, ws in parents.items() for w in ws] + [(None, w) for w in out]  # plan order
+        qk_nodes = sorted(nd for nd in nodes if _layer_kind(nd)[1] in ("q_proj", "k_proj"))
+        qk_sites = sorted({nd[0] for nd in qk_nodes})
+
+        def qk_of(w):
+            res = {}
+            for n in qk_sites:
+                js = [j for j, nd in enumerate(qk_nodes) if nd[0] == n]
+                t = torch.tensor([qk_nodes[j][1] for j in js], device=self.dev)
+                c = torch.tensor([qk_nodes[j][2] for j in js], device=self.dev)
+                res[n] = torch.zeros(1, T, self.C[n], device=self.dev).index_put((torch.zeros_like(t), t, c), w[torch.tensor(js, device=self.dev)])
+            return res
+
+        n_items = n_edges + len(qk_nodes)
+        zero = ({n: torch.zeros(1, 1, self.C[n], device=self.dev) for n in names}, {n: torch.zeros(1, 1, device=self.dev) for n in names})
+        ig = torch.zeros(n_items, device=self.dev)
+        steps = 16
+        for s in range(steps):
+            w = torch.full((n_items,), (s + 0.5) / steps, device=self.dev, requires_grad=True)
+            with torch.enable_grad():
+                ew, ow = self.edge_weights(plan, w[:n_edges])
+                kl = self._kl(logp, self.run(ids, targets, plan, *zero, ew, ow, qk_of(w[n_edges:])))[0]
+                (gr,) = torch.autograd.grad(kl, w)
+            ig -= gr / steps
+        ranked = (-ig).argsort().tolist()
+
+        def build(js):
+            par, o, used = {}, [], set()
+            for j in js:
+                if j >= n_edges:
+                    used.add(qk_nodes[j - n_edges])
+                    continue
+                r, w = edge_list[j]
+                used.add(w)
+                if r is None:
+                    o.append(w)
+                else:
+                    par.setdefault(r, []).append(w)
+                    used.add(r)
+            return Graph(used, par, o)
+
+        def edges_pass(ks):
+            res = self.score(ids, targets, [build(ranked[:k]) for k in ks], seed, logp)
+            return [r["kl_bits"] <= eps for r in res]
+
+        if not edges_pass([n_items])[0]:
+            return None, {"skipped": f"{k} subcomponents and all {n_items} of their connections miss eps"}
+        k_e = self._smallest_prefix(n_items, edges_pass)
+        g = build(ranked[:k_e])
+        s = self.score(ids, targets, [g], seed, logp)[0]
+        if log:
+            log(f"{k_e} of {n_items} connections and query/key nodes pass at {eps}")
+        return self.clean(ids, targets, g, s, eps, seed, logp)
+
     def clean(self, ids: list[int], targets: list[int], g: Graph, s: dict, eps: float, seed: int = 0, logp=None) -> tuple[Graph, dict]:
         """g without what lies on no path to the prediction (pathways()), kept when it still passes the tests at eps."""
         on_path = set().union(*pathways(g, targets).values()) if g.out else set()
