@@ -9,7 +9,9 @@ reader's own position, or as {position: string} (an attention output reading val
 the prediction at the targets reads. Every edge must be a connection the model has (connects()). Nodes are the
 readers and their parents. "claims" (optional) lists interchange claims (position, replacement token, predicted top
 token): replacing the token at that position changes the model's top prediction to the given token, and the graph's
-pathway from that position alone reproduces the change (score.py checks them on the model).
+pathway from that position alone reproduces the change (score.py checks them on the model). "uses" (optional) lists
+library entries (score.py's LIBRARY: recurring mechanisms, sets of edges at positions relative to the target) the
+graph includes without writing them out.
 
     def graph(tokens, targets):
         t = targets[0]
@@ -150,8 +152,13 @@ def graph(fn, model: str, behavior: dict | None) -> dict:
             return [node(p, tok) for p, names in value.items() for tok in _names(names)]
         return [node(p, tok) for p in at for tok in _names(value)]
 
-    edges, reads, claims = [], [], []
+    edges, reads, claims, uses = [], [], [], []
     for key, value in out.items():
+        if key == "uses":
+            if not (isinstance(value, (list, tuple)) and all(isinstance(u, str) for u in value)):
+                raise MechError("uses: a list of library entry names")
+            uses += list(value)
+            continue
         if key == "claims":
             if not isinstance(value, (list, tuple)):
                 raise MechError("claims: a list of (position, replacement token, predicted top token)")
@@ -179,7 +186,7 @@ def graph(fn, model: str, behavior: dict | None) -> dict:
                                 "into a later query, key, value or MLP input at its position; a value into the same layer's attention "
                                 "output at that or a later position; an MLP input into the same MLP's output)")
             edges.append([r, w])
-    return {"nodes": nodes, "parents": edges, "out": reads, "claims": claims}
+    return {"nodes": nodes, "parents": edges, "out": reads, "claims": claims, "uses": uses}
 
 
 # ---------------------------------------------------------------------------------------------------
