@@ -89,7 +89,7 @@ class Checker:
         self.behavior_record = json.loads(path.read_text())
         return self.request({"op": "behavior", "path": str(path)})
 
-    def score(self, program, experiments=32, seed=0, N=None, stand_in="counterfactual", metric=None):
+    def score(self, program, experiments=0, seed=0, N=None, stand_in="delete", metric=None):
         """Every score term. `program` is a source, an IR dict, or {"source", "explanation"} (the oracle's answer split
         by prompt.split_answer). An untraceable source is scored as naming nothing, flagged invalid."""
         return self.score_batch([program], experiments, seed, N, stand_in, metric=metric)[0]
