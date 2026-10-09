@@ -1,7 +1,8 @@
 """Scoring graph answers (#2951 graph oracle): the verifier's numbers for each answer.
 
-An answer (mech.py) is traced into ordered steps. The graph of its first k steps runs alone on the model (native.py)
-over the text's changed prompts, giving its faithfulness (KL in bits) and its description length (bits); with the empty
+An answer (mech.py) is traced into ordered steps. The graph of its first k steps is tested on the model (native.py) over
+experiments on the text's changed prompts, its steps the variables of interchange interventions, giving its faithfulness
+(KL in bits) and its description length (bits); with the empty
 graph at 0 bits these points are the answer's curve. One curve is better than another at a description length when its
 best point within that length has the lower KL. An answer's score (key) is area(): the mean KL its curve reaches within a
 description length drawn log-uniformly from one subcomponent's ("lo") to the whole model's, every subcomponent at every
@@ -96,12 +97,12 @@ class Scorer:
                 g.nodes |= {w, r}
         return g
 
-    def score(self, task: dict, sources: list[str], seed: int = 0, interchange: bool = False) -> list[dict]:
+    def score(self, task: dict, sources: list[str], seed: int = 0, necessity: bool = False) -> list[dict]:
         """Each answer's score on a task (a text task record) under one draw of changed prompts (seed): {"valid",
         "error", "curve": [[bits, kl], ...] (the empty graph, then each step), "lo" and "hi": one subcomponent's and
         the whole model's description lengths, "kl_bits" and "bits" (the whole answer), "steps", "nodes", "edges",
-        "explanation", "notes", "interchange_kl_bits" (with interchange: native.interchange of the whole answer, its
-        steps as the groups; an evaluation measure), "dropped": what the answer wrote that is not part of its graph (mech; its description
+        "explanation", "notes", "necessity_kl_bits" (with necessity: native.necessity of the whole answer, an
+        evaluation measure), "dropped": what the answer wrote that is not part of its graph (mech; its description
         length still counts), "events": the changed prompts' token changes and whether each flips the model's top next
         token (native.flips, the same for every answer)}; the
         source "vpd" stands for VPD's own answer (complete, one step)."""
@@ -113,7 +114,7 @@ class Scorer:
         prompts = nat.changes(ids, targets, seed=(self.native.task_seed(task["id"]) + 1_000_003 * seed) % (1 << 31))
         positions, total = nat.positions(targets), sum(nat.C.values())
         ref_bits = math.log2(max(len(self.library), 1))  # a library reference: one choice among the entries
-        graphs, owners, own_bits = [self.native.Graph()], [None], [0.0]  # every graph to run, which answer it belongs to, its description length
+        graphs, owners, own_bits, groups = [self.native.Graph()], [None], [0.0], [[]]  # every graph to run, its answer, description length, steps
         out = []
         for j, src in enumerate(sources):
             if src == "vpd":
@@ -121,6 +122,7 @@ class Scorer:
                 graphs.append(g)
                 owners.append(j)
                 own_bits.append(g.bits(positions, total))
+                groups.append([g.node_set()])
                 out.append({"valid": True, "error": None, "steps": 1, "explanation": "", "notes": []})
                 continue
             ir = mech.trace(src, "vpd4l", behavior=task)
@@ -142,16 +144,16 @@ class Scorer:
                         break
                 mine.append((g, bits))
             if out[-1]["valid"]:
-                for g, bits in mine:
+                steps = [g.node_set() for g, _ in mine]
+                step_groups = [b - a for a, b in zip([set()] + steps[:-1], steps)]  # the nodes each step adds, written order
+                for k, (g, bits) in enumerate(mine):
                     graphs.append(g)
                     owners.append(j)
                     own_bits.append(bits)
-                if interchange and mine:
-                    whole = mine[-1][0]
-                    steps = [self.native.prefix(ir, k)[0].node_set() for k in range(1, out[-1]["steps"] + 1)]
-                    groups = [b - a for a, b in zip([set()] + steps[:-1], steps) if b - a]
-                    out[-1]["interchange_kl_bits"] = nat.interchange(ids, targets, whole, groups, prompts, seed)
-        kl = nat.faithfulness(ids, targets, graphs, prompts)
+                    groups.append(step_groups[:k + 1])
+                if necessity and mine:
+                    out[-1]["necessity_kl_bits"] = nat.necessity(ids, targets, mine[-1][0], prompts)
+        kl = nat.faithfulness(ids, targets, graphs, prompts, groups, seed)
         lo = math.log2(positions * total)
         events = nat.flips(ids, targets, prompts)  # what the English reader is asked about (reader.py)
         for s in out:

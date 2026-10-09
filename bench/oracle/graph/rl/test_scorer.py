@@ -19,7 +19,7 @@ class Scorer:
     def __init__(self, dev=None):
         pass
 
-    def score(self, task, sources, seed=0, interchange=False):
+    def score(self, task, sources, seed=0, necessity=False):
         calls.append((task["path"], seed, len(sources)))
         return [{"kl_bits": len(x) + seed, "size": 1, "valid": True, "task": task["path"]} for x in sources]
 

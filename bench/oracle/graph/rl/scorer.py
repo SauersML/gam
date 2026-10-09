@@ -25,11 +25,11 @@ def native(items: list[dict]) -> list[dict]:
         _SCORER.append(score.Scorer(DEVICE))
     groups = {}
     for k, it in enumerate(items):
-        groups.setdefault((it["behavior"]["path"], it.get("seed", 0), bool((it.get("options") or {}).get("interchange"))), []).append(k)
+        groups.setdefault((it["behavior"]["path"], it.get("seed", 0), bool((it.get("options") or {}).get("necessity"))), []).append(k)
     out = [None] * len(items)
     for (_, seed, _), ks in groups.items():
         for k, r in zip(ks, _SCORER[0].score(items[ks[0]]["behavior"], [items[k]["source"] for k in ks], seed,
-                                              interchange=bool((items[ks[0]].get("options") or {}).get("interchange")))):
+                                              necessity=bool((items[ks[0]].get("options") or {}).get("necessity")))):
             out[k] = r
     return out
 

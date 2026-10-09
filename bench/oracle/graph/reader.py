@@ -58,8 +58,8 @@ class Reader:
             return [ASK.format(top=top, tokens=repr(strings), english=head, position=e["position"], old=repr(strings[e["position"]]),
                                new=repr(self.tokens_of([e["new"]])[0])) for e in events]
 
-        def loss(ps: list[float]) -> float:
-            return sum(-math.log2(max(p if e["flipped"] else 1 - p, 1e-12)) for p, e in zip(ps, events)) / len(events)
+        def loss(ps: list[float]) -> float:  # the events' mean, by their importance weights
+            return sum(e.get("weight", 1.0) * -math.log2(max(p if e["flipped"] else 1 - p, 1e-12)) for p, e in zip(ps, events)) / sum(e.get("weight", 1.0) for e in events)
 
         flat = asks("") + [q for t in texts for q in asks(t)]
         ps = self._p_yes(flat)

@@ -10,13 +10,17 @@ receives its declared parents' outputs in full and every other output scaled by 
 which VPD does not decompose, in full. With u = 1 everywhere this is the model; with u = 0 (the verifier's setting) the
 graph runs alone: nothing it leaves out, remainders included, contributes.
 
-Faithfulness (Native.faithfulness), in bits: the KL of the model's next-token distribution at the target from the
-graph's run alone, averaged over changed prompts of the text (Native.changes): the token at one position, drawn
-uniformly from the positions whose token the model predicts (1 to the target), replaced by a draw from the model's own
-prediction there; a draw can return the original token, so the text itself is among them. The verifier draws them,
-never the answer. A graph that leaves out a path by which a token affects the prediction fails on the prompts that
-change that token, and one more confident than the model fails because the KL is of the whole distribution. No test
-proves a graph is the model's mechanism; this measures how far its outputs are from the model's on these experiments.
+Faithfulness (Native.faithfulness), in bits: the mean KL of the model's next-token distribution at the target from the
+graph's over experiments, one per changed prompt of the text (Native.changes: the token at one position, drawn
+uniformly from the positions whose token the model predicts, 1 to the target, replaced by a draw from the model's own
+prediction there; a draw can return the original token). In each experiment the answer's steps, its variables, are each
+held at their values on the original text with probability 1/2: the graph runs alone on the changed prompt with the
+held steps' activations from its own run on the text, the whole model on the changed prompt with the same subcomponents
+from its run on the text. So every experiment tests that nothing outside the graph matters (the model side has it, the
+graph side does not), and those that hold steps test that the graph computes from its parts what the model computes
+from the same parts: interchange interventions on the answer's own variables. The verifier draws the experiments, never
+the answer. A graph more confident than the model fails too, the KL being of the whole distribution. No test proves a
+graph is the model's mechanism; this measures how far it is from the model on these experiments.
 
 Description length (Graph.bits), in bits: the nodes listed, each one choice among the text's positions times the
 model's 38,912 subcomponents, then each edge as its reader's and its writer's index in that list, and each edge into the
@@ -97,6 +101,14 @@ def model(dev: str):
         st.delta_T = (st.W - (st.V @ st.U).T).T.contiguous()
         st._forward = types.MethodType(_forward_cached, st)
     return target, vpd
+
+
+class Changed(list):
+    """A changed prompt: its token ids, and .weight, its importance weight (Native.changes)."""
+
+    def __init__(self, ids, weight: float):
+        super().__init__(ids)
+        self.weight = weight
 
 
 class Graph:
@@ -466,89 +478,131 @@ class Native:
         return ({n: torch.zeros(1, 1, self.C[n], device=self.dev) for n in self.names}, {n: torch.zeros(1, 1, device=self.dev) for n in self.names})
 
     @torch.no_grad()
-    def changes(self, ids: list[int], targets: list[int], n: int = CHANGES, seed: int = 0) -> list[list[int]]:
-        """n changed prompts of a text: each replaces the token at a position drawn uniformly from 1 to the last target
-        (the positions whose token the model predicts) by a draw from the model's prediction there."""
+    def changes(self, ids: list[int], targets: list[int], n: int = CHANGES, seed: int = 0, chunk: int = 64) -> list[Changed]:
+        """n changed prompts of a text, each the token at one position replaced by a draw from the model's prediction
+        there, the positions being 1 to the last target (those whose token the model predicts). The average they
+        estimate gives every position the same weight; they are drawn by importance sampling, half the probability
+        uniform and half in proportion to how far one draw at that position moves the model's prediction at the last
+        target (a probe per position), and each carries its weight (uniform probability / drawing probability), so
+        weighted means keep that average while more experiments fall where the prediction depends on the text."""
         last = max(targets)
         if last < 1:
-            return [list(ids)] * n
-        probs = self.vpd.target_forward(torch.tensor([ids], device=self.dev))[0, :last].float().softmax(-1).cpu()
+            return [Changed(ids, 1.0) for _ in range(n)]
         g = torch.Generator(device="cpu").manual_seed(seed)
-        out = []
-        for _ in range(n):
-            p = int(torch.randint(1, last + 1, (1,), generator=g))
+        probs = self.vpd.target_forward(torch.tensor([ids], device=self.dev))[0].float().softmax(-1).cpu()
+        base = torch.log(probs[last].clamp_min(1e-30))
+        probe = []
+        for p in range(1, last + 1):
             x = list(ids)
             x[p] = int(torch.multinomial(probs[p - 1], 1, generator=g))
-            out.append(x)
+            probe.append(x)
+        moved = []
+        for s0 in range(0, len(probe), chunk):
+            lq = torch.log_softmax(self.vpd.target_forward(torch.tensor(probe[s0:s0 + chunk], device=self.dev))[:, last].float(), -1).cpu()
+            moved.append((base.exp() * (base - lq)).sum(-1).clamp_min(0))
+        moved = torch.cat(moved)
+        uniform = torch.full((last,), 1.0 / last)
+        q = 0.5 * uniform + 0.5 * (moved / moved.sum() if moved.sum() > 0 else uniform)
+        out = []
+        for _ in range(n):
+            j = int(torch.multinomial(q, 1, generator=g))
+            x = list(ids)
+            x[j + 1] = int(torch.multinomial(probs[j], 1, generator=g))
+            out.append(Changed(x, float(uniform[j] / q[j])))
         return out
 
-    def faithfulness(self, ids: list[int], targets: list[int], graphs: list[Graph], prompts: list[list[int]], chunk: int = 16) -> list[float]:
-        """Per graph, the mean over `prompts` (changed prompts of ids) of the KL in bits of the model's next-token
-        distribution at the targets from the graph's run alone."""
+    def faithfulness(self, ids: list[int], targets: list[int], graphs: list[Graph], prompts: list[list[int]], groups: list[list[set]] | None = None,
+                     seed: int = 0, chunk: int = 16) -> list[float]:
+        """Per graph, the mean KL in bits of the model side's next-token distribution at the targets from the graph
+        side's over experiments, one per changed prompt x' of the text (weighted by its importance weight, Changed): the graph's groups (an answer's steps, its
+        variables; groups[b] for graph b) each held at its value on the text with probability 1/2, every subset equally
+        likely, the draws shared across graphs by group index. Graph side: the graph runs alone on x', the held groups'
+        activations set to their values when it runs alone on the text. Model side: the whole model runs on x', the same
+        subcomponents set to their values in the whole model on the text. With no group held this is the graph alone
+        against the model on x'. Every experiment tests that nothing outside the graph matters (the model side has it,
+        the graph side does not) and, with groups held, that the graph computes from its parts what the model computes
+        from them (interchange interventions on the answer's variables)."""
         if not graphs:
             return []
         T = len(ids)
+        groups = groups or [[] for _ in graphs]
+        width = max([len(gs) for gs in groups] + [0])
+        held = torch.rand(len(prompts), width, generator=torch.Generator(device="cpu").manual_seed(seed)) < 0.5
         refs = [self.reference([x], targets) for x in prompts]
-        total = torch.zeros(len(graphs), device=self.dev)
         zero = self._zero()
-        for s in range(0, len(graphs), chunk):
-            part = graphs[s:s + chunk]
+        one = ({n: torch.ones(1, 1, self.C[n], device=self.dev) for n in self.names}, {n: torch.ones(1, 1, device=self.dev) for n in self.names})
+        rec_m = {}
+        self.run(ids, targets, self._plan([self.everything(T)], T), *one, record=rec_m)
+        total = torch.zeros(len(graphs), device=self.dev)
+        for s0 in range(0, len(graphs), chunk):
+            part, gp = graphs[s0:s0 + chunk], groups[s0:s0 + chunk]
+            B = len(part)
             plan = self._plan(part, T)
             with torch.no_grad():
-                for x, logp in zip(prompts, refs):
-                    total[s:s + len(part)] += self._kl(logp, self.run(x, targets, plan, *zero))
+                rec_g = {}
+                if any(gp):
+                    self.run(ids, targets, plan, *zero, record=rec_g)
+                    plan_m = self._plan([self.everything(T)] * B, T)
+                for i, (x, logp) in enumerate(zip(prompts, refs)):
+                    mask = {}
+                    for b, gs in enumerate(gp):
+                        for k, grp in enumerate(gs):
+                            if held[i, k]:
+                                for n, t, c in grp:
+                                    mask.setdefault(n, torch.zeros(B, T, self.C[n], dtype=torch.bool, device=self.dev))[b, t, c] = True
+                    w = getattr(x, "weight", 1.0)
+                    if not mask:
+                        total[s0:s0 + B] += w * self._kl(logp, self.run(x, targets, plan, *zero))
+                        continue
+                    lq = self.run(x, targets, plan, *zero, patch={n: (m, rec_g[n]) for n, m in mask.items()})
+                    lp = self.run(x, targets, plan_m, *one, patch={n: (m, rec_m[n].expand(B, -1, -1)) for n, m in mask.items()})
+                    total[s0:s0 + B] += w * (lp.exp() * (lp - lq)).sum(-1).sum(-1) / LN2
         return (total / len(prompts)).tolist()
 
     @torch.no_grad()
     def flips(self, ids: list[int], targets: list[int], prompts: list[list[int]]) -> list[dict]:
         """For each changed prompt that changes a token: {"position", "old", "new" (token ids), "flipped": whether the
-        model's most likely next token at the last target differs from its most likely one on the text}."""
+        model's most likely next token at the last target differs from its most likely one on the text, "weight": its
+        importance weight}."""
         last = max(targets)
         top = int(self.reference([ids], [last])[0, 0].argmax())
         out = []
         for x in prompts:
             diff = [p for p in range(len(ids)) if x[p] != ids[p]]
             if diff:
-                out.append({"position": diff[0], "old": ids[diff[0]], "new": x[diff[0]], "flipped": int(self.reference([x], [last])[0, 0].argmax()) != top})
+                out.append({"position": diff[0], "old": ids[diff[0]], "new": x[diff[0]], "flipped": int(self.reference([x], [last])[0, 0].argmax()) != top,
+                            "weight": getattr(x, "weight", 1.0)})
         return out
 
     @torch.no_grad()
-    def interchange(self, ids: list[int], targets: list[int], g: Graph, groups: list[set], prompts: list[list[int]], seed: int = 0) -> float:
-        """Interchange tests of a graph whose nodes come in groups (an answer's steps: its variables): per changed
-        prompt x', each group taken from x' with probability 1/2 (every subset of groups equally likely), the rest from
-        the text. Graph side: the graph runs alone on the text with those groups' activations set to their values when
-        the graph runs alone on x'. Model side: the full model runs on the text with the same subcomponents set to their
-        values in the full model on x'. The mean over the prompts of the KL in bits of the model side's next-token
-        distribution from the graph side's: whether the graph computes from its parts what the model computes from
-        them."""
+    def necessity(self, ids: list[int], targets: list[int], g: Graph, prompts: list[list[int]]) -> float:
+        """The mean over the text's changed prompts of the KL in bits of the model's next-token distribution from the
+        model's with the graph's subcomponents removed (everything else kept): how much the prediction depends on the
+        graph's parts, the test an edit or unlearning relies on. A part with a backup elsewhere lowers it; it is not a
+        verdict on the graph."""
         T = len(ids)
-        gen = torch.Generator(device="cpu").manual_seed(seed)
-        plan_g, plan_m = self._plan([g], T), self._plan([self.everything(T)], T)
-        zero = self._zero()
-        one = ({n: torch.ones(1, 1, self.C[n], device=self.dev) for n in self.names}, {n: torch.ones(1, 1, device=self.dev) for n in self.names})
+        plan = self._plan([self.everything(T)], T)
+        u = {n: torch.ones(1, T, self.C[n], device=self.dev) for n in self.names}
+        for n, t, c in g.node_set():
+            u[n][0, t, c] = 0.0
+        ur = {n: torch.ones(1, T, device=self.dev) for n in self.names}
+        none = ({n: torch.zeros(1, T, self.C[n], dtype=torch.bool, device=self.dev) for n in self.names})
         total = 0.0
         for x in prompts:
-            take = [grp for grp in groups if torch.rand(1, generator=gen).item() < 0.5]
-            nodes = set().union(*take) if take else set()
-            rec_g, rec_m = {}, {}
-            self.run(x, targets, plan_g, *zero, record=rec_g)
-            self.run(x, targets, plan_m, *one, record=rec_m)
-            mask = {}
-            for n, t, c in nodes:
-                mask.setdefault(n, torch.zeros(1, T, self.C[n], dtype=torch.bool, device=self.dev))[0, t, c] = True
-            lq = self.run(ids, targets, plan_g, *zero, patch={n: (m, rec_g[n]) for n, m in mask.items()})
-            lp = self.run(ids, targets, plan_m, *one, patch={n: (m, rec_m[n]) for n, m in mask.items()})
-            total += float(self._kl(lp, lq)[0])
+            logp = self.reference([x], targets)
+            plan_x = {**plan, "G": none}  # no node held at 1: every subcomponent runs at its u
+            total += getattr(x, "weight", 1.0) * float(self._kl(logp, self.run(x, targets, plan_x, u, ur)))
         return total / len(prompts)
 
     def positions(self, targets: list[int]) -> int:
         """The positions a graph's nodes can sit at: 0 to the last target."""
         return max(targets) + 1
 
-    def score(self, ids: list[int], targets: list[int], graphs: list[Graph], prompts: list[list[int]]) -> list[dict]:
-        """{"kl_bits", "bits", "nodes", "edges"} per graph: its faithfulness and description length."""
+    def score(self, ids: list[int], targets: list[int], graphs: list[Graph], prompts: list[list[int]], groups: list[list[set]] | None = None,
+              seed: int = 0) -> list[dict]:
+        """{"kl_bits", "bits", "nodes", "edges"} per graph: its faithfulness (with its groups) and description length."""
         total = sum(self.C.values())
-        kl = self.faithfulness(ids, targets, graphs, prompts)
+        kl = self.faithfulness(ids, targets, graphs, prompts, groups, seed)
         return [{"kl_bits": k, "bits": g.bits(self.positions(targets), total), "nodes": g.count(), "edges": None if g.complete else g.edges()}
                 for g, k in zip(graphs, kl)]
 
@@ -581,7 +635,7 @@ class Native:
                 rest = {n: torch.full((1, T), a, device=self.dev) for n in self.names}
                 with torch.enable_grad():
                     lq = torch.log_softmax(self.vpd.masked(xb, masks, rest)[:, targets].float(), -1)
-                    grads = torch.autograd.grad(self._kl(logp, lq)[0], [masks[n] for n in self.names])
+                    grads = torch.autograd.grad(getattr(x, "weight", 1.0) * self._kl(logp, lq)[0], [masks[n] for n in self.names])
                 for n, gr in zip(self.names, grads):
                     total[n] -= gr[0]
         mi, ti, ci, val = [], [], [], []
@@ -626,7 +680,7 @@ class Native:
                 w = torch.full((n_edges + len(qk),), (k + 0.5) / IG_STEPS, device=self.dev, requires_grad=True)
                 with torch.enable_grad():
                     ew, ow = self.edge_weights(plan, w[:n_edges])
-                    kl = self._kl(logp, self.run(x, targets, plan, *zero, ew, ow, qk_of(w[n_edges:])))[0]
+                    kl = getattr(x, "weight", 1.0) * self._kl(logp, self.run(x, targets, plan, *zero, ew, ow, qk_of(w[n_edges:])))[0]
                     (gr,) = torch.autograd.grad(kl, w)
                 ig -= gr
         allitems = items + [(nd, None) for nd in qk]
@@ -660,7 +714,8 @@ class Native:
             if k >= len(items):
                 break
             k = min(2 * k, len(items))
-        scores = self.score(ids, targets, graphs, prompts)
+        steps = [[b.node_set() - a.node_set() for a, b in zip([Graph()] + graphs[:k], graphs[:k + 1])] for k in range(len(graphs))]
+        scores = self.score(ids, targets, graphs, prompts, [[grp for grp in gs if grp] for gs in steps], seed=task_seed(str(ids[:8])))
         keep = min(range(len(scores)), key=lambda j: scores[j]["kl_bits"]) + 1  # a connection does nothing until its path to the
         return graphs[:keep], scores[:keep]  # input is in, so a step may lower nothing and a later one a lot: end at the lowest KL
 
