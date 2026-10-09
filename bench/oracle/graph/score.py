@@ -30,7 +30,7 @@ class Checker:
         views to attach ({"vpd": DIR}, the model's VPD decomposition by default); device: "gpu" runs the large products
         on the single-precision device (float32, so compare scores within one device); memo_dir: the server's
         --memo-dir (GRAPH_MEMO_DIR when unset), per-behavior memos of the targets that later runs reuse."""
-        memory_gib = memory_gib or float(os.environ.get("GRAPH_MEM_GIB", 16))
+        memory_gib = int(memory_gib or os.environ.get("GRAPH_MEM_GIB", 16))  # mem-lease takes whole GiB
         env = dict(os.environ)
         env.setdefault("RAYON_NUM_THREADS", str(threads or 6))
         self.model = model
