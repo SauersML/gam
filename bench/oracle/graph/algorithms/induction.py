@@ -2,7 +2,6 @@
 its earlier copy ("A B ... A -> B"). A previous-token step writes, at each position, the token before it;
 an induction step attends from the current token to the position whose previous token matches it and
 copies the token there."""
-from mech import align, claim
 
 
 def back(tokens):

@@ -1,6 +1,5 @@
 """Python variable reuse: the code names again the variable it bound last: a function's parameter, a loop
 variable, or a local just assigned. After a call's name it is the call's argument, after return the value."""
-from mech import align, claim
 
 
 def bound(tokens):

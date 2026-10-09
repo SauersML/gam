@@ -1,5 +1,4 @@
 """Hypernym: the category a named thing belongs to. The table is what the model recalls."""
-from mech import align, claim
 
 KIND = {
     'English': ' language', 'French': ' language', 'January': ' month', 'Jupiter': ' planet',

@@ -1,6 +1,5 @@
 """Number patterns: consecutive squares (n*n) or triangular numbers (n(n+1)/2) continue with the next
 one: a square's root grows by one; a triangular number's step grows by one."""
-from mech import align, claim
 
 
 def numbers(tokens):

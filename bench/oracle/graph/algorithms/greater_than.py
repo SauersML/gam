@@ -1,6 +1,5 @@
 """Greater-than: "from 1816 to 18" -> a year after the start within its century: the end year's last two
 digits exceed the start year's. Any such year is right."""
-from mech import align, claim
 
 
 def start(tokens):

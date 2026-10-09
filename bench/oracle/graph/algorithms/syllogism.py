@@ -1,5 +1,4 @@
 """Syllogism: "All X are Ys. N is one of the X. Therefore N is a" -> " Y": the category, singular."""
-from mech import align, claim
 
 
 def category(tokens):

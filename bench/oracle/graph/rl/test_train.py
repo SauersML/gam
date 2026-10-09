@@ -76,7 +76,6 @@ def main():
         for a, b in zip(got, (p.grad for p in pol.params)):
             assert torch.allclose(a, b, atol=1e-6)
         check_left_padding(pol)
-        check_init_adapter(Path(d))
         check_part_vocab(Path(d))
         check_registry_parts(Path(d))
         check_ppo(pol)
@@ -85,7 +84,7 @@ def main():
     check_split_prompts()
     check_rl2_pieces()
     print("ok: token log-probabilities, KL 0 and DPO ln 2 at the reference, GRPO gradient = summed log-probability policy gradient, "
-          "left-padded batched generation, g-predict's adapters = their PEFT conversion, prompt split, part tokens (stand-in and registry), "
+          "left-padded batched generation, prompt split, part tokens (stand-in and registry), "
           "RL v2: RLOO at a fixed scale, step seeds, PPO epoch 0 = the GRPO gradient, clipping, token credit (canonical and other tokenizations), a whole step on stand-ins")
 
 
@@ -193,9 +192,9 @@ def check_registry_parts(base: Path):
         with part_vocab.rows_once(causal):
             once = causal(input_ids=ids).logits
     assert torch.allclose(plain, once, atol=1e-6)
-    text = "```python\nfrom mech import align\ndef x(tokens):\n    return tokens\nalign(x, <p:2.v.7>, <p:0.fc.12>)\n```\nThe value head."
-    it = train.item(text, {}, 0, 0, 16)  # part tokens reach the checker as written (one Python token each)
-    assert "align(x, <p:2.v.7>, <p:0.fc.12>)" in it["source"] and it["explanation"] == "The value head."
+    text = '```python\ngroups = {"answer": {"subcomponents": ["<p:2.v.7>", "<p:0.fc.12>"], "reads": ["input"], "writes": "output"}}\n```\nThe value head.'
+    it = train.item(text, {}, 0, 0, 16)  # part tokens reach the checker as written
+    assert '["<p:2.v.7>", "<p:0.fc.12>"]' in it["source"] and it["explanation"] == "The value head."
     assert pol.parts.reg.rewrite("node(PD[1].v_proj[3], PD.vpd[2].v_proj[7])") == "node(<p:1.v.3>, <p:2.v.7>)"  # either spelling
     assert pol.tok.decode([first + 4]) == "<p:0.fc.12>"
     groups = pol.param_groups(1e-4)  # the LoRA at lr, each projection at lr * rank / its feature width
@@ -210,36 +209,6 @@ def check_registry_parts(base: Path):
         again = train.Policy(argparse.Namespace(base=str(base), init=d, lora_rank=4, part_tokens=str(path)), torch.device("cpu"))
     (f0, i0, o0), (f1, i1, o1) = pol.part_rows(), again.part_rows()
     assert f0 == f1 and torch.equal(i0, i1) and torch.equal(o0, o1)
-
-
-def check_init_adapter(base: Path):
-    """g-predict's sft.py adapters (its own wrap) and their PEFT conversion give the same logits."""
-    import json
-
-    from safetensors.torch import save_file
-    from transformers import AutoModelForCausalLM
-
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "predict"))
-    import sft
-
-    model = AutoModelForCausalLM.from_pretrained(base, dtype=torch.float32)
-    adapters = sft.wrap(model, 4, 8.0)
-    torch.manual_seed(2)
-    for a in adapters.values():
-        torch.nn.init.normal_(a.B, std=0.05)
-    ids = torch.randint(0, 1000, (1, 12))
-    with torch.no_grad():
-        want = model(input_ids=ids).logits
-    with tempfile.TemporaryDirectory() as d:
-        src = Path(d) / "sft"
-        src.mkdir()
-        save_file({f"{k}.{n}": getattr(a, n).detach().contiguous() for k, a in adapters.items() for n in ("A", "B")}, str(src / "adapters.safetensors"))
-        (src / "meta.json").write_text(json.dumps({"args": {"rank": 4, "alpha": 8.0, "model": str(base)}}))
-        pol = train.Policy(argparse.Namespace(base=str(base), init=train.init_adapter(str(src), Path(d)), lora_rank=4), torch.device("cpu"))
-        pol.model.float()
-        with torch.no_grad():
-            got = pol.model(input_ids=ids).logits
-    assert torch.allclose(got, want, atol=1e-4), float((got - want).abs().max())
 
 
 def check_split_prompts():
@@ -324,26 +293,23 @@ def check_ppo(pol):
 
 ANSWER = """I look at the previous token.
 ```python
-def answer(tokens):
-    # the copy
-    return tokens
-
-
-align(answer, <p:2.v.559>, <p:2.o.735>)
-claim(answer, <p:1.q.3>)
+groups = {
+    "quote": {"subcomponents": ["<p:1.o.4>"], "reads": [], "label": "inside"},
+    "answer": {"subcomponents": ["<p:2.v.559>", "<p:2.o.735>"], "reads": ["input", "quote"], "writes": "output"},
+}
 ```
 The answer is copied by layer 2's value and output parts."""
 
 
 def check_credit_advantages(pol):
-    """credit_advantages: a part's tokens get dS(drop it) / scale, the rest of its statement dS(drop the statement) / scale
-    (+inf: 1), the other tokens the episode advantage; the same with a tokenization that re-encoding does not give."""
+    """credit_advantages: a subcomponent's tokens get dS(drop it) / scale, the rest of its group's line dS(drop the group)
+    / scale (+inf: 1), the other tokens the episode advantage; the same with a tokenization that re-encoding does not give."""
     from edits import Edit
 
     tok = pol.tok
     source = train.split_answer(ANSWER)[0]
     assert ANSWER[train.program_offset(ANSWER, source):].startswith(source)
-    dS = {Edit("drop", "answer", "align", "<p:2.v.559>"): 3.0, Edit("unalign", "answer", "align"): float("inf"), Edit("unalign", "answer", "claim"): -1.0}
+    dS = {Edit("drop", "answer", part="<p:2.v.559>"): 3.0, Edit("unalign", "answer"): float("inf"), Edit("unalign", "quote"): -1.0}
     canonical = tok.encode(ANSWER, add_special_tokens=False) + [pol.end]
     chars = [i for ch in ANSWER for i in tok.encode(ch, add_special_tokens=False)] + [pol.end]
     assert chars != canonical[: len(chars)]
@@ -352,8 +318,8 @@ def check_credit_advantages(pol):
         spans = train.token_spans(tok, completion, ANSWER)
         assert len(adv) == len(completion) == len(spans)
         part = ANSWER.index("<p:2.v.559>")
-        line = ANSWER.index("align(answer")
-        claim = ANSWER.index("claim(answer")
+        line = ANSWER.index('    "answer"')
+        quote = ANSWER.index('    "quote"')
         for (c0, c1), a in zip(spans, adv):
             if c1 <= c0:
                 assert a == -0.25
@@ -361,9 +327,9 @@ def check_credit_advantages(pol):
                 assert a == 1.5, (ANSWER[c0:c1], a)
             elif c0 >= line and c1 <= ANSWER.index("\n", line):
                 assert a == 1.0, (ANSWER[c0:c1], a)
-            elif c0 >= claim and c1 <= ANSWER.index("\n", claim):
+            elif c0 >= quote and c1 <= ANSWER.index("\n", quote):
                 assert a == -0.5, (ANSWER[c0:c1], a)
-            elif c1 <= line - 1 or c0 >= ANSWER.index("```\nThe"):
+            elif c1 <= quote - 1 or c0 >= ANSWER.index("}\n```\nThe") + 1:
                 assert a == -0.25, (ANSWER[c0:c1], a)
 
 
@@ -386,15 +352,11 @@ def check_rl2_pieces():
     assert abs(sc.gap["a"] - 1.1) < 1e-12 and sc.gap["b"] == sc.FLOOR
     import random
 
-    wrapped = train.with_alignment(lambda items: [{"valid": True, "total_bits": 1.0} for _ in items])
-    out = wrapped([{"source": "def answer(t):\n    return t\n", "require_align": True}, {"source": "def answer(t):\n    return t\n"},
-                   {"source": "align(answer, <p:2.v.5>)\n", "require_align": True}, {"source": "claim(answer, <p:1.q.3>)\n", "require_align": True}])
-    assert [r["valid"] for r in out] == [False, True, True, False], out  # an oracle answer must align something; baselines are exempt
     picks = [sc.draw([{"id": "a"}, {"id": "b"}], 1, random.Random(i))[0]["id"] for i in range(400)]
     assert picks.count("a") > 300, picks.count("a")
     import json
 
-    with tempfile.TemporaryDirectory() as d:  # teacher_run.py's manifest, written on another machine; the held-out refusal
+    with tempfile.TemporaryDirectory() as d:  # teacher_v3.py's manifest, written on another machine; the held-out refusal
         (Path(d) / "x.answer.txt").write_text("answer x")
         lines = [{"behavior": "x", "answer": "/elsewhere/old.answer.txt"}, {"behavior": "x", "answer": "/elsewhere/x.answer.txt"}, {"behavior": "y", "answer": "/elsewhere/y.answer.txt"}]
         (Path(d) / "manifest.jsonl").write_text("".join(json.dumps(r) + "\n" for r in lines))
@@ -410,8 +372,8 @@ def check_rl2_pieces():
 
 
 def check_rl2_step(pol):
-    """A whole rl2 step on stand-ins: a sampler that writes fixed answers and the score of test_edits (10 bits per needed
-    part missing, 1 per part named; invalid without an answer statement). Behavior "x" gets answers of different
+    """A whole rl2 step on stand-ins: a sampler that writes fixed answers and a stand-in score (10 bits per needed
+    subcomponent missing, 1 per subcomponent named; invalid without an output group that names one). Behavior "x" gets answers of different
     scores, "y" only invalid ones (dropped, refilled by "z"); credit marks tokens, refine improves the best answers
     (expert iteration), and the PPO epochs and the expert-iteration step run."""
     import json
@@ -426,12 +388,12 @@ def check_rl2_step(pol):
         for it in items:
             a = Answer.parse(it["source"])
             named = {q for st in a.statements for q in st.parts}
-            valid = any(st.variable == "answer" and st.kind == "align" for st in a.statements)
+            valid = any(st.writes == "output" and st.parts for st in a.statements)
             out.append({"total_bits": 10.0 * len(needed - named) + len(named) if valid else 1e4, "valid": valid})
         return out
 
     def answer_with(parts):
-        return ANSWER.replace("<p:2.v.559>, <p:2.o.735>", ", ".join(parts)) if parts else ANSWER.replace("align(answer, <p:2.v.559>, <p:2.o.735>)\n", "")
+        return ANSWER.replace('"<p:2.v.559>", "<p:2.o.735>"', ", ".join(f'"{p}"' for p in parts))
 
     texts = {"x": [answer_with(["<p:2.v.559>", "<p:2.o.735>"]), answer_with(["<p:2.v.559>"]), answer_with(["<p:2.v.559>", "<p:3.o.1>"]), answer_with([])],
              "y": [answer_with([])] * 4, "z": [answer_with(["<p:2.v.9>"]), answer_with(["<p:2.v.9>", "<p:2.o.735>"]), answer_with(["<p:2.v.9>"]), answer_with([])]}
@@ -484,7 +446,8 @@ def check_rl2_step(pol):
             assert len(rows) == 12 and credited and all(r["kept"] == (r["behavior"] != "y") for r in rows)
             improved = [json.loads(line) for line in open(Path(d) / "improved.jsonl")]
             assert all(r["bits"] < r["sampled_bits"] for r in improved), improved
-            assert any(set(Answer.parse(train.split_answer(r["text"])[0]).statements[0].parts) == needed for r in improved if r["behavior"] == "x"), improved
+            assert any(set(next(st for st in Answer.parse(train.split_answer(r["text"])[0]).statements if st.variable == "answer").parts) == needed
+                       for r in improved if r["behavior"] == "x"), improved
             assert np.isfinite(first["mean_bits"])
             logs2 = {k: open(Path(d) / f"async_{k}.jsonl", "w") for k in ("train", "samples", "improved")}
             asked.clear()

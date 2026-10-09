@@ -1,6 +1,5 @@
 """Object tracking: "X put the A in the P and the B in the Q. The A is in the" -> P: the place named three
 tokens after the earlier mention of the object asked about."""
-from mech import align, claim
 
 
 def asked(tokens):

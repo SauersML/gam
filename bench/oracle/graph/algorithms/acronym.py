@@ -1,5 +1,4 @@
 """Acronym: after a capitalized three-word name and "(", the next tokens spell its initials."""
-from mech import align, claim
 
 
 def initials(tokens):

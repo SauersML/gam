@@ -1,5 +1,4 @@
 """Associative recall: after "word=number" pairs, "word=" is followed by that word's number."""
-from mech import align, claim
 
 
 def pairs(tokens):

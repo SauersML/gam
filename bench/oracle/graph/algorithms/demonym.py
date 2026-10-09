@@ -1,5 +1,4 @@
 """Factual recall: the nationality adjective of the named country. The table is what the model recalls."""
-from mech import align, claim
 
 DEMONYM = {
     'Afghanistan': ' Afghan', 'Argentina': ' Argentine', 'Australia': ' Australian',

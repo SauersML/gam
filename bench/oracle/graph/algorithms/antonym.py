@@ -1,5 +1,4 @@
 """Antonym: the opposite of a common word. The table is what the model recalls."""
-from mech import align, claim
 
 OPPOSITE = {
     'above': ' below', 'accept': ' reject', 'alive': ' dead', 'always': ' never',

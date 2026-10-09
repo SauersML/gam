@@ -1,7 +1,6 @@
 """Part tokens (#2951): every part of the target's attached view is one token of the oracle, whose input
 embedding and output logit row are computed from the part's own weight vectors, so naming a part in a
-question or emitting one in a program is sensing it. Shared by predict/sft.py, predict/eval_kl.py and
-rl/train.py.
+question or emitting one in an explanation is sensing it. Used by rl/train.py.
 
 Tokens (mech addresses in brackets; token_of / address_of convert both ways):
   <p:L.S.I>      part I of layer L's site S: VPD S in q k v o fc down (PD[L].v_proj[I] ...), library S in
@@ -17,7 +16,6 @@ Native heads and blocks are parts only where nothing decomposes them (the regist
 Features. A part's feature vector is fixed by its kind:
   VPD subcomponent u v^T of a site (read v in R^d_in, write u in R^d_out):
       [v / |v| * sqrt(d_in), u / |u| * sqrt(d_out), log |v|, log |u|]
-  native head, attention or MLP: predict/vectors.py's 8 directions with their log singular values, flattened.
 Maps. Per kind, P_in (linear of rank 256, rescaled to the RMS of the oracle's token embeddings) gives the token's input
 embedding and P_out (linear) its output row: the logit of part p after hidden state h is h . P_out(f_p),
 next to the base vocabulary's logits, so choosing a part is a softmax over the parts' own vectors. There
@@ -27,7 +25,7 @@ choice (site, then part) can sit on top without changing the rows.
 vLLM: materialize() writes the extended embedding and lm_head (base vocabulary plus one row per part) and the
 tokenizer with the part tokens added, for the sampler to reload after each training round.
 
-  part_tokens.py build --out REGISTRY.safetensors [--native MODEL_DIR --pieces PIECES.json] [--vpd UV.safetensors]
+  part_tokens.py build --out REGISTRY.safetensors --vpd UV.safetensors
 """
 
 from __future__ import annotations
@@ -291,33 +289,20 @@ class PartTokens(nn.Module):
         return emb.shape[0]
 
 
-def build(native: str | None, pieces: str | None, vpd: str | None) -> Registry:
+def build(vpd: str) -> Registry:
+    """The registry of a VPD decomposition's subcomponents (UV.safetensors: per site its U and V)."""
+    from safetensors.torch import load_file
+
     addresses, features = [], {}
-    if native:
-        sys.path.insert(0, str(HERE / "predict"))
-        from transformers import AutoModelForCausalLM
-
-        import vectors
-
-        dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        model = AutoModelForCausalLM.from_pretrained(native, dtype=torch.bfloat16).to(dev).float().eval()
-        with torch.no_grad():
-            for a in json.load(open(pieces)):
-                features.setdefault(kind_of(a), []).append(vectors.part_vectors(model, a).flatten().cpu())
-                addresses.append(a)
-    if vpd:
-        from safetensors.torch import load_file
-
-        uv = load_file(vpd)
-        for name in sorted({k.rsplit(".", 1)[0] for k in uv}):
-            layer, site = int(name.split(".")[1]), name.split(".")[3]
-            U, V = uv[f"{name}.U"].float(), uv[f"{name}.V"].float()  # [C, d_out], [d_in, C]
-            nu, nv = U.norm(dim=1), V.norm(dim=0)
-            f = torch.cat([(V / nv).T * V.shape[0] ** 0.5, U / nu[:, None] * U.shape[1] ** 0.5, nv.log()[:, None], nu.log()[:, None]], dim=1)
-            features.setdefault(f"pd.{SITES[site]}", []).append(f)
-            addresses += [f"PD[{layer}].{site}[{c}]" for c in range(U.shape[0])]
-    feats = {k: torch.cat(v) if v[0].dim() == 2 else torch.stack(v) for k, v in features.items()}
-    return Registry(addresses, feats)
+    uv = load_file(vpd)
+    for name in sorted({k.rsplit(".", 1)[0] for k in uv}):
+        layer, site = int(name.split(".")[1]), name.split(".")[3]
+        U, V = uv[f"{name}.U"].float(), uv[f"{name}.V"].float()  # [C, d_out], [d_in, C]
+        nu, nv = U.norm(dim=1), V.norm(dim=0)
+        f = torch.cat([(V / nv).T * V.shape[0] ** 0.5, U / nu[:, None] * U.shape[1] ** 0.5, nv.log()[:, None], nu.log()[:, None]], dim=1)
+        features.setdefault(f"pd.{SITES[site]}", []).append(f)
+        addresses += [f"PD[{layer}].{site}[{c}]" for c in range(U.shape[0])]
+    return Registry(addresses, {k: torch.cat(v) for k, v in features.items()})
 
 
 def main():
@@ -325,11 +310,9 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     b = sub.add_parser("build")
     b.add_argument("--out", required=True)
-    b.add_argument("--native", default="")
-    b.add_argument("--pieces", default="")
-    b.add_argument("--vpd", default="")
+    b.add_argument("--vpd", required=True)
     args = ap.parse_args()
-    reg = build(args.native or None, args.pieces or None, args.vpd or None)
+    reg = build(args.vpd)
     reg.save(args.out)
     print(json.dumps({"parts": len(reg.addresses), "kinds": {k: list(v.shape) for k, v in reg.features.items()}}))
 

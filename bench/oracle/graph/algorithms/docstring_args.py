@@ -1,6 +1,5 @@
 """Docstring arguments: after documenting the first arguments of a function, the next documented line names
 the next argument of its signature."""
-from mech import align, claim
 
 
 def params(tokens):

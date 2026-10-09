@@ -1,5 +1,4 @@
 """Factual recall: the atomic number of a named element. The table is what the model recalls."""
-from mech import align, claim
 
 NUMBER = {
     'aluminum': ' 13', 'argon': ' 18', 'beryllium': ' 4', 'boron': ' 5', 'calcium': ' 20',

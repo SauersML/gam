@@ -1,5 +1,4 @@
 """Factual recall: the chemical symbol of a named element. The table is what the model recalls."""
-from mech import align, claim
 
 SYMBOL = {
     'aluminum': ' Al', 'argon': ' Ar', 'boron': ' B', 'calcium': ' Ca', 'carbon': ' C',

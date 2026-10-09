@@ -1,8 +1,9 @@
-"""grammar.py: the number rules give exactly 0 .. n - 1; with xgrammar installed (pods; the Mac venv lacks it), the
-answer grammar accepts answers whose parts sit in align/claim statements and rejects parts elsewhere, unknown parts
-and a second fence.  python -m pytest -q test_grammar.py"""
+"""grammar.py: the number rules give exactly 0 .. n - 1; with xgrammar installed (pods; the Mac venv lacks it), the answer
+grammar accepts the teacher answers' form and rejects other forms, unknown subcomponents, a second fence and English
+after the line.  python -m pytest -q test_grammar.py"""
 
 import importlib.util
+import itertools
 import re
 import sys
 from pathlib import Path
@@ -13,16 +14,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import grammar  # noqa: E402
 
 GOOD = """```python
-def answer(tokens):
-    # x<val, a < b, `code`, x < prev, a <= b
-    return tokens
-
-
-align(answer, <p:2.v.559>, <p:2.o.735>)
-claim(answer, <p:1.q.3>, <p:1.k.rest>)
+groups = {
+    "quote": {"subcomponents": ["<p:0.fc.225>", "<p:0.down.663>"], "reads": ["input"], "label": "inside"},
+    "answer": {"subcomponents": ["<p:2.v.559>", "<p:2.o.735>", "<p:3.down.rest>"], "reads": ["input", "quote", "quote:value"], "writes": "output"},
+}
 ```
 
-Layer 2's value and output subcomponents copy it; `a < b`."""
+Group quote carries whether a quotation is open; `a < b`."""
+
+xgrammar_only = pytest.mark.skipif(importlib.util.find_spec("xgrammar") is None, reason="xgrammar is not installed")
 
 
 def test_number_below_is_exact():
@@ -33,13 +33,12 @@ def test_number_below_is_exact():
 
 
 def test_part_rule_compresses_ranges():
-    rule = grammar.part_rule(["<p:0.q.0>", "<p:0.q.1>", "<p:0.q.2>", "<p:1.v.5>", "<p:1.m>"])
-    assert '"<p:0.q." (' in rule and '"<p:1.v.5>"' in rule and '"<p:1.v.rest>"' in rule and '"<p:1.m>"' in rule
+    rule = grammar.part_rule(["<p:0.q.0>", "<p:0.q.1>", "<p:0.q.2>", "<p:1.v.5>"])
+    assert '"<p:0.q." (' in rule and '"<p:1.v.5>"' in rule and '"<p:1.v.rest>"' in rule
     assert len(grammar.vpd_tokens("vpd4l")) == 38_912
 
 
-@pytest.mark.skipif(importlib.util.find_spec("xgrammar") is None, reason="xgrammar is not installed")
-def test_answers_against_the_grammar():
+def acceptor():
     import xgrammar as xgr
     from transformers import AutoTokenizer
 
@@ -50,27 +49,32 @@ def test_answers_against_the_grammar():
         m = xgr.GrammarMatcher(compiled)
         return all(m.accept_token(t) for t in tok.encode(text, add_special_tokens=False)) and m.accept_token(tok.convert_tokens_to_ids("<|im_end|>"))
 
+    return accepts
+
+
+@xgrammar_only
+def test_answers_against_the_grammar():
+    accepts = acceptor()
     assert accepts(GOOD)
-    assert not accepts("I copy the previous token.\n" + GOOD)  # no prose before the block (the teacher answers have none)
-    assert not accepts(GOOD + "\nA second line of English.")  # the explanation is one line, then the answer ends
-    assert not accepts(GOOD.replace("# x<val", "# <p:2.v.559> x<val"))  # a part in a comment
+    assert accepts(GOOD.replace('    "quote": {"subcomponents": ["<p:0.fc.225>", "<p:0.down.663>"], "reads": ["input"], "label": "inside"},\n', ""))
+    assert not accepts("I explain it.\n" + GOOD)  # no prose before the block
+    assert not accepts(GOOD + "\nA second line of English.")  # one line of English, then the answer ends
     assert not accepts(GOOD.replace("<p:2.v.559>", "<p:2.v.1024>"))  # beyond v_proj's 1,024 subcomponents
     assert not accepts(GOOD.replace("<p:2.v.559>", "<p:7.v.5>"))  # no layer 7
+    assert not accepts(GOOD.replace('"subcomponents": ["<p:0.fc.225>", "<p:0.down.663>"]', '"subcomponents": []'))  # an empty group
+    assert not accepts(GOOD.replace(', "writes": "output"', ', "label": "x"'))  # no group writes the output
     assert not accepts(GOOD + "\n```python\nx = 1\n```")  # a second block
-    assert not accepts(GOOD.replace("copy it;", "copy <p:2.v.559>;"))  # a part in the English
-    assert not accepts(GOOD.replace("```\n\nLayer", "Layer"))  # the block never closes
+    assert not accepts(GOOD.replace("open;", "open <p:2.v.559>;"))  # a part in the English
 
 
-@pytest.mark.skipif(importlib.util.find_spec("xgrammar") is None, reason="xgrammar is not installed")
 def free_text(s: str) -> bool:
-    """grammar.free's language: "<" never followed by "p", "<" or "`", "`" never by "`" or "<", no newline (a code line)."""
+    """grammar.free's language: "<" never followed by "p", "<" or "`", "`" never by "`" or "<", no newline."""
     return "\n" not in s and all(not (a == "<" and b in "p<`") and not (a == "`" and b in "`<") for a, b in zip(s, s[1:]))
 
 
+@xgrammar_only
 def test_free_text_is_exactly_its_language():
     """Every string of up to 6 characters over a < p : ` and a newline; the language has neither a part nor a fence."""
-    import itertools
-
     import xgrammar as xgr
     from transformers import AutoTokenizer
 
@@ -82,36 +86,3 @@ def test_free_text_is_exactly_its_language():
             m = xgr.GrammarMatcher(compiled)
             got = all(m.accept_token(t) for t in tok.encode(s + "!", add_special_tokens=False)) and m.is_terminated() is False and m.accept_token(tok.convert_tokens_to_ids("<|im_end|>"))
             assert got == free_text(s), repr(s)
-            assert not got or ("<p:" not in s and "```" not in s)
-
-
-@pytest.mark.skipif(importlib.util.find_spec("xgrammar") is None, reason="xgrammar is not installed")
-def test_no_tabs_in_code():
-    import xgrammar as xgr
-    from transformers import AutoTokenizer
-
-    tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
-    compiled = xgr.GrammarCompiler(xgr.TokenizerInfo.from_huggingface(tok)).compile_grammar(grammar.model_grammar("vpd4l"))
-
-    def accepts(text):
-        m = xgr.GrammarMatcher(compiled)
-        return all(m.accept_token(t) for t in tok.encode(text, add_special_tokens=False)) and m.accept_token(tok.convert_tokens_to_ids("<|im_end|>"))
-
-    assert accepts(GOOD) and not accepts(GOOD.replace("    return tokens", "\treturn tokens"))
-
-
-@pytest.mark.skipif(importlib.util.find_spec("xgrammar") is None, reason="xgrammar is not installed")
-def test_an_answer_must_align_something():
-    import xgrammar as xgr
-    from transformers import AutoTokenizer
-
-    tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
-    compiled = xgr.GrammarCompiler(xgr.TokenizerInfo.from_huggingface(tok)).compile_grammar(grammar.model_grammar("vpd4l"))
-
-    def accepts(text):
-        m = xgr.GrammarMatcher(compiled)
-        return all(m.accept_token(t) for t in tok.encode(text, add_special_tokens=False)) and m.accept_token(tok.convert_tokens_to_ids("<|im_end|>"))
-
-    assert accepts(GOOD)
-    assert not accepts(GOOD.replace("align(answer, <p:2.v.559>, <p:2.o.735>)\n", ""))  # only a claim: aligns nothing
-    assert not accepts(GOOD.replace("align(answer, <p:2.v.559>, <p:2.o.735>)\nclaim(answer, <p:1.q.3>, <p:1.k.rest>)\n", ""))  # code only

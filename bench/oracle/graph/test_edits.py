@@ -1,4 +1,7 @@
-"""edits.py on a stand-in score: parsing keeps the source, credit signs, refine reaches the optimum."""
+"""edits: parsing a format v3 explanation into groups, one-edit neighbours, credit and refinement under a stand-in score.
+
+  ~/mpd-data/venv/bin/python -m pytest bench/oracle/graph/test_edits.py
+"""
 
 import random
 import sys
@@ -7,94 +10,53 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
-from edits import Answer, Edit, adds, apply, credit, refine  # noqa: E402
+import edits  # noqa: E402
+from edits import Answer, Edit  # noqa: E402
 
-SOURCE = '''"""doc"""
-from mech import align, claim
-
-
-def prev(tokens):
-    # the token before each position
-    return [tokens[t - 1] if t else None for t in range(len(tokens))]
-
-
-def answer(tokens, prev):
-    return prev
-
-
-claim(prev, <p:1.q.316>, <p:1.k.329>)
-align(prev, <p:1.v.228>, <p:1.o.311>)
-align(answer, <p:2.v.559>, <p:2.o.735>, <p:3.o.806>)
+SOURCE = '''groups = {
+    "quote": {"subcomponents": ["<p:0.fc.225>", "<p:0.down.663>"], "reads": ["input"], "label": "inside"},
+    "answer": {"subcomponents": ["<p:2.v.80>", "<p:2.o.63>", "<p:3.down.885>"], "reads": ["input", "quote"], "writes": "output"},
+}
 '''
 
-NEEDED = {"<p:1.v.228>", "<p:1.o.311>", "<p:2.v.559>", "<p:2.o.735>", "<p:2.v.9>"}
 
-
-def stand_in(sources):
-    """Total bits: 10 per needed part missing, 1 per part named (a part's name), invalid without the answer."""
-    out = []
-    for src in sources:
-        a = Answer.parse(src)
-        named = {p for s in a.statements for p in s.parts}
-        valid = any(s.variable == "answer" for s in a.statements)
-        out.append({"total_bits": 10.0 * len(NEEDED - named) + len(named), "valid": valid})
-    return out
-
-
-def test_parse_keeps_the_source():
+def test_parse_and_source_round_trip():
     a = Answer.parse(SOURCE)
+    assert [(s.line, s.variable, s.label, s.writes) for s in a.statements] == [(1, "quote", "inside", None), (2, "answer", None, "output")]
+    assert a.statements[1].parts == ("<p:2.v.80>", "<p:2.o.63>", "<p:3.down.885>")
     assert a.source() == SOURCE
-    assert [s.variable for s in a.statements] == ["prev", "prev", "answer"]
+    assert Answer.parse("groups = {1: 2}\n").statements == () and Answer.parse("def f(:\n").statements == ()
 
 
 def test_edits():
     a = Answer.parse(SOURCE)
-    dropped = apply(a, Edit("drop", "answer", "align", "<p:3.o.806>"))
-    assert "<p:3.o.806>" not in dropped.source() and "<p:2.o.735>" in dropped.source()
-    gone = apply(a, Edit("unalign", "prev", "claim"))
-    assert "claim(" not in gone.source() and "align(prev" in gone.source()
-    added = apply(a, Edit("add", "fresh", "align", "<p:0.v.1>"))
-    assert added.source().rstrip().endswith("align(fresh, <p:0.v.1>)")
+    dropped = edits.apply(a, Edit("drop", "answer", part="<p:2.v.80>"))
+    assert dropped.statements[1].parts == ("<p:2.o.63>", "<p:3.down.885>")
+    gone = edits.apply(a, Edit("unalign", "quote"))
+    assert [s.variable for s in gone.statements] == ["answer"] and gone.statements[0].reads == ("input",)
+    emptied = edits.apply(edits.apply(a, Edit("drop", "quote", part="<p:0.fc.225>")), Edit("drop", "quote", part="<p:0.down.663>"))
+    assert [s.variable for s in emptied.statements] == ["answer"] and emptied.statements[0].reads == ("input",)
+    added = edits.apply(a, Edit("add", "answer", part="<p:3.fc.7>"))
+    assert added.statements[1].parts[-1] == "<p:3.fc.7>"
+    assert edits.adds(a, {"answer": ["<p:2.v.80>", "<p:3.fc.7>", "<p:3.fc.8>"], "nope": ["<p:1.v.1>"]}, 1) == [Edit("add", "answer", part="<p:3.fc.7>")]
 
 
-def test_credit_signs():
+def stand_in(sources):
+    """A score: 10 bits per subcomponent, 100 more without <p:2.o.63>, invalid without an output group."""
+    out = []
+    for src in sources:
+        a = Answer.parse(src)
+        parts = [p for s in a.statements for p in s.parts]
+        valid = any(s.writes == "output" for s in a.statements)
+        out.append({"total_bits": 10 * len(parts) + (0 if "<p:2.o.63>" in parts else 100), "valid": valid})
+    return out
+
+
+def test_credit_and_refine():
     a = Answer.parse(SOURCE)
-    s, dS = credit(a, stand_in, k=100, rng=random.Random(0))
-    assert dS[Edit("drop", "answer", "align", "<p:3.o.806>")] == -1  # not needed: dropping saves its name
-    assert dS[Edit("drop", "answer", "align", "<p:2.v.559>")] == 9  # needed
-    assert dS[Edit("unalign", "answer", "align")] == float("inf")  # the answer must stay aligned
-
-
-def test_dropping_a_blocks_last_writer_drops_the_block():
-    a = Answer.parse(SOURCE)
-    gone = apply(a, Edit("drop", "answer", "align", "<p:2.o.735>"))  # 2.v.559 writes only layer 2's own stream
-    assert [s.parts for s in gone.statements if s.variable == "answer"] == [("<p:3.o.806>",)]
-    kept = apply(a, Edit("drop", "answer", "align", "<p:2.v.559>"))
-    assert [s.parts for s in kept.statements if s.variable == "answer"] == [("<p:2.o.735>", "<p:3.o.806>")]
-    claimed = apply(a, Edit("drop", "prev", "claim", "<p:1.q.316>"))  # a claim's parts need no writer
-    assert [s.parts for s in claimed.statements if s.kind == "claim"] == [("<p:1.k.329>",)]
-
-
-def test_named_groups_are_choices():
-    src = SOURCE.replace("align(prev, <p:1.v.228>, <p:1.o.311>)", "align(prev, G.prev_l1, <p:1.v.228>, <p:1.o.311>)")
-    a = Answer.parse(src)
-    assert a.source() == src and ("prev", "G.prev_l1") in [(a.statements[j].variable, p) for j, p in a.parts()]
-    gone = apply(a, Edit("drop", "prev", "align", "G.prev_l1"))
-    assert "align(prev, <p:1.v.228>, <p:1.o.311>)" in gone.source()
-    kept = apply(a, Edit("drop", "prev", "align", "<p:1.o.311>"))  # the group may write layer 1: no cascade
-    assert "align(prev, G.prev_l1, <p:1.v.228>)" in kept.source()
-
-
-def test_refine_reaches_the_optimum():
-    a = Answer.parse(SOURCE)
-    best, s, accepted = refine(a, stand_in, {"answer": ["<p:0.m.0>", "<p:2.v.9>"]}, rounds=8, per_variable=2)
-    named = {p for st in best.statements for p in st.parts}
-    assert named == NEEDED, named
-    assert s == len(NEEDED)
-
-
-def test_adds_go_to_the_align_statement():
-    a = Answer.parse("align(answer, <p:2.v.559>)\nclaim(answer, <p:1.q.3>)\n")
-    edit = adds(a, {"answer": ["<p:2.v.9>"]}, 1)[0]
-    assert edit.kind == "align", edit
-    assert apply(a, edit).statements[0].parts == ("<p:2.v.559>", "<p:2.v.9>")
+    total, dS = edits.credit(a, stand_in, k=16, rng=random.Random(0))
+    assert total == 50
+    assert dS[Edit("drop", "answer", part="<p:2.v.80>")] == -10 and dS[Edit("drop", "answer", part="<p:2.o.63>")] == 90
+    assert dS[Edit("unalign", "answer")] == float("inf")  # no output group: invalid
+    best, bits, accepted = edits.refine(a, stand_in, rounds=4)
+    assert bits == 10 and [p for s in best.statements for p in s.parts] == ["<p:2.o.63>"]

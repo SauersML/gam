@@ -1,20 +1,18 @@
-"""Scorers for the oracle's program training (#2951): a batch of (program source, behavior) -> score
-dicts in design.txt section 5's format ({"total_bits", "exec_error_bits", "reader_error_bits",
-"code_bits", "python_tokens", "opaque_numbers", "opaque_bits", "valid", "error", ...}).
+"""Scorers for the oracle's training (#2951): a batch of items (an explanation's source, or an IR, and its behavior) ->
+the checker's score dicts ({"total_bits", "exec_error_bits", "necessity_error_bits", "alignment_error_bits",
+"complexity_bits", "valid", "error", ...}).
 
-  checker  g-exec's score.py (the Rust checker's execution error + g-reader's reader error + code and
-           opaque-number bits): the score the oracle is trained on.
-  mock     until the checker runs: code bits from mech.trace (python_tokens x log2(token_types)) and no
-           execution or reader error; an invalid program pays MOCK_EMPTY_BITS, standing in for the empty
-           program's execution error, so validity and length are the only signal. Plumbing only:
-           its optimum is the shortest valid program.
+  checker  score.py's Checker: the score the oracle is trained on. An item with "ir" (the nothing-named baseline) is
+           scored as that IR.
+  mock     no checker: code bits from mech.trace and no error terms; an invalid explanation pays MOCK_EMPTY_BITS.
+           Plumbing only: its optimum is the shortest valid explanation.
+  none     no score: evaluation only samples and saves (train.py --mode rescore scores later).
 """
 
 from __future__ import annotations
 
 import json
 import math
-import os
 import sys
 from pathlib import Path
 
@@ -33,11 +31,10 @@ def mock(items: list[dict]) -> list[dict]:
         irs = list(ex.map(lambda it: mech.trace(it["source"], it["behavior"]["model"]), items))
     out = []
     for ir in irs:
-        valid, error, tokens, types = ir["valid"], ir.get("error"), ir.get("python_tokens", 0), ir.get("token_types", 1)
+        valid, tokens, types = ir["valid"], ir.get("python_tokens", 0), ir.get("token_types", 1)
         code = tokens * math.log2(max(types, 2)) if valid else 0.0
-        out.append({"total_bits": code if valid else MOCK_EMPTY_BITS, "exec_error_bits": 0.0 if valid else MOCK_EMPTY_BITS, "reader_error_bits": 0.0,
-                    "code_bits": code, "python_tokens": tokens if valid else 0, "opaque_numbers": 0, "opaque_bits": 0.0, "valid": valid, "error": error,
-                    "scorer": "mock"})
+        out.append({"total_bits": code if valid else MOCK_EMPTY_BITS, "exec_error_bits": 0.0 if valid else MOCK_EMPTY_BITS,
+                    "code_bits": code, "python_tokens": tokens if valid else 0, "valid": valid, "error": ir.get("error"), "scorer": "mock"})
     return out
 
 
@@ -46,18 +43,14 @@ WORKERS = 1
 EXPORT = None
 BATCH = 4  # programs per score request (vpd4l: 11 programs of 16 experiments passed a 20 GiB lease on the Mac)
 MEMORY_GIB = None  # the checker server's lease (score.py's default when None)
-VIEWS = None  # decomposition views the checker attaches ({"vpd": DIR}; score.Checker's views)
+VIEWS = None  # decomposition views the checker attaches (score.Checker's default when None)
 DEVICE = None  # "gpu": the checker's single-precision device path
-ITEMS_EVERY = 0  # keep the reader items of every ITEMS_EVERY-th scored program (0: none)
-ITEM_STRIDE = 1  # of a kept program's reader items, keep every ITEM_STRIDE-th
 
 
 def checker(items: list[dict]) -> list[dict]:
-    """score.py's Checker: WORKERS long-lived servers per target model, each taking whole behaviors (it loads
-    a behavior once and caches M's outcomes on its seed-shared experiments) and scoring a behavior's
-    programs of one seed in one score_batch request; the reader term when
-    GRAPH_READER (reader_score.py serve's HOST:PORT) is set. Programs of one behavior and step share the
-    experiments' seed, so a group's scores differ by the programs only."""
+    """score.py's Checker: WORKERS long-lived servers per target model, each taking whole behaviors (it loads a behavior
+    once and caches M's outcomes on its experiments) and scoring a behavior's programs of one seed in one score_batch
+    request, so a group's scores differ by the programs only."""
     from concurrent.futures import ThreadPoolExecutor
 
     import score
@@ -67,37 +60,30 @@ def checker(items: list[dict]) -> list[dict]:
         groups.setdefault((it["behavior"]["model"], it["behavior"]["path"]), []).append(k)
     out = [None] * len(items)
 
+    def key(k):
+        it = items[k]
+        return it.get("seed", 0), it.get("uniform_seeds") or 0, it.get("experiments") or 32, json.dumps(it.get("options"), sort_keys=True)
+
     def run(w: int, model: str, path: str, ks: list[int]):
         c = _CHECKERS.get((model, w))
         if c is None:
             c = _CHECKERS[(model, w)] = score.Checker(model, EXPORT, memory_gib=MEMORY_GIB, views=VIEWS, **({"device": DEVICE} if DEVICE else {}))
             c.loaded = None
-        if c.loaded != path:  # with the checker's default site-operation manifest, as the teacher's scores (teacher_run.py, edits.py)
+        if c.loaded != path:
             c.behavior(path)
             c.loaded = path
-        def key(k):  # an item with "reader": False is scored without the reader term (an edit keeps the answer's explanation)
-            return (items[k].get("seed", 0), items[k].get("uniform_seeds") or 0, items[k].get("experiments") or 32, json.dumps(items[k].get("options"), sort_keys=True),
-                    items[k].get("reader", True))
-
-        for seed, uniform, experiments, options, reader in sorted({key(k) for k in ks}):  # one batch request per seed: M once per experiment, the programs in parallel
-            batch = [k for k in ks if key(k) == (seed, uniform, experiments, options, reader)]
-            extra = {"options": json.loads(options)} if json.loads(options) else {}
+        for seed, uniform, experiments, options in sorted({key(k) for k in ks}):  # one request per seed: M once per experiment
+            batch = [k for k in ks if key(k) == (seed, uniform, experiments, options)]
             for s in range(0, len(batch), BATCH):  # a server's memory grows with the programs of one request
-                chunk = batch[s : s + BATCH]
-                # without a reader server the reader items (13 MB per vpd4l score) are kept only for every
-                # ITEMS_EVERY-th program (g-reader scores those offline), dropped otherwise
-                programs = [{"source": items[k]["source"], "explanation": items[k].get("explanation", "")} for k in chunk]  # the reader reads the explanation alone
-                for k, r in zip(chunk, c.score_batch(programs, experiments=experiments, seed=seed, uniform_seeds=uniform or None, reader=reader, **extra)):
-                    if not os.environ.get("GRAPH_READER") and not (ITEMS_EVERY and k % ITEMS_EVERY == 0):
-                        r.pop("items", None)
-                    elif ITEM_STRIDE > 1 and r.get("items"):  # every ITEM_STRIDE-th item: the reader term's mean stays unbiased
-                        r["items"] = r["items"][::ITEM_STRIDE]
-                        r["item_stride"] = ITEM_STRIDE
+                chunk = batch[s: s + BATCH]
+                programs = [items[k].get("ir") or {"source": items[k]["source"], "explanation": items[k].get("explanation", "")} for k in chunk]
+                for k, r in zip(chunk, c.score_batch(programs, experiments=experiments, seed=seed, uniform_seeds=uniform or None,
+                                                     options=json.loads(options))):
                     out[k] = r
 
     per_worker = [[] for _ in range(WORKERS)]
-    for g, (key, ks) in enumerate(groups.items()):
-        per_worker[g % WORKERS].append((key, ks))
+    for g, (key_, ks) in enumerate(groups.items()):
+        per_worker[g % WORKERS].append((key_, ks))
 
     def worker(w: int):
         for (model, path), ks in per_worker[w]:
@@ -109,8 +95,6 @@ def checker(items: list[dict]) -> list[dict]:
 
 
 def none(items: list[dict]) -> list[dict]:
-    """No score: the evaluation only samples and saves programs (a GPU pod without the checker); train.py
-    --mode rescore scores them later where the checker runs."""
     return [{"total_bits": float("nan"), "valid": None, "scorer": "none"} for _ in items]
 
 

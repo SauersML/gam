@@ -1,19 +1,22 @@
-"""The oracle answer's grammar for guided decoding (#2951 graph oracle, RL v2 item 6): vLLM samples only answers of
+"""The oracle answer's grammar for guided decoding (#2951 graph oracle, format v3): vLLM samples only answers of
 the form
 
   ```python
-  <lines of code>
+  groups = {
+      "<name>": {"subcomponents": ["<p:L.S.I>", ...], "reads": [...], "label": "<variable>"},   (zero or more)
+      "<name>": {"subcomponents": ["<p:L.S.I>", ...], "reads": [...], "writes": "output"},     (exactly one, last)
+  }
   ```
 
   <the English explanation, one line>  (then the turn ends: the grammar admits nothing more)
 
-in which a part (<p:L.S.I>) appears only as an argument of a one-line align(variable, part, ...) or claim(variable,
-part, ...) statement, at least one align statement is written (an answer that aligns nothing is valid to mech and
-scores as the empty program plus its code: the loophole the 10-08 SFT fell into) and only as a part of the attached decomposition (the registry's part tokens, plus each
-site's remainder <p:L.S.rest>). Every other code line and the explanation are free text with neither "<p:"
-nor three backticks in a row (the explanation also without a newline: an answer cannot ramble on after it), so split_answer finds this block and mech reads every part where it can. The
-grammar is xgrammar's EBNF; a part token and its spelling in ordinary tokens both match (a part token's text is
-its name). Validity redraws (train.py --resample) stay for what a grammar cannot see (unknown names, rules).
+the form edits.Answer.source and the teacher answers write: one group per line, groups carrying a behavior variable
+first, the group that writes the output last; at least one subcomponent per group, each a part of the attached
+decomposition (the registry's part tokens, plus each site's remainder <p:L.S.rest>); reads "input" or a group name,
+optionally with :query, :key or :value. The explanation is free text without a newline or three backticks in a row.
+mech still checks what a grammar cannot see (names, variables of the behavior, connections), and validity redraws
+(train.py --resample) cover those. The grammar is xgrammar's EBNF; a part token and its spelling in ordinary tokens
+both match (a part token's text is its name).
 
   grammar.py MODEL [--registry REG.safetensors] [--check ANSWER.txt ...]   (prints the grammar, or checks answers with xgrammar)
 """
@@ -84,16 +87,18 @@ def vpd_tokens(model: str) -> list[str]:
 
 def answer_grammar(tokens: list[str]) -> str:
     """The answer's EBNF (module docstring) with parts drawn from `tokens`."""
+    q = json.dumps
+    group = lambda tail: f'"    \\"" name {q(chr(34) + ": {" + chr(34) + "subcomponents" + chr(34) + ": [")} parts {q("], " + chr(34) + "reads" + chr(34) + ": [")} reads? {q("], ")} {tail} {q("},")} "\\n"'  # noqa: E731
     return "\n".join([
-        'root ::= "```python\\n" code "```\\n\\n" explanation',  # the teacher answers' form: the block, a blank line, one line of English, the end
-        free("explanation", "\\n"),
-        "code ::= free_code (claim free_code)* align free_code (statement free_code)*",  # at least one align with a part
-        free("free_code", "\\t"),  # no tabs in code: the teacher answers indent with spaces, and tab runs were a runaway
-        "statement ::= align | claim",
-        'align ::= "align(" [ ]* name [ ]* ("," [ ]* part [ ]*)+ ")"',
-        'claim ::= "claim(" [ ]* name [ ]* ("," [ ]* part [ ]*)+ ")"',
+        'root ::= "```python\\ngroups = {\\n" labeled* output "}\\n```\\n\\n" explanation',
+        "labeled ::= " + group(f'{q(chr(34) + "label" + chr(34) + ": " + chr(34))} name "\\""'),
+        "output ::= " + group(q(chr(34) + "writes" + chr(34) + ": " + chr(34) + "output" + chr(34))),
+        'parts ::= part (", " part)*',
+        'part ::= "\\"" (' + part_rule(tokens) + ') "\\""',
+        'reads ::= read (", " read)*',
+        'read ::= "\\"" ("input" | name (":" ("query" | "key" | "value"))?) "\\""',
         "name ::= [A-Za-z_] [A-Za-z0-9_]*",
-        "part ::= " + part_rule(tokens),
+        free("explanation", "\\n"),
     ])
 
 

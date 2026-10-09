@@ -26,7 +26,7 @@ def test_induction_items_reorder_the_first_copy():
     behavior["prompts"] = [p for p in behavior["prompts"] if "of" not in p][:12]
     new, counts = vary.vary(behavior, random.Random(0))
     assert counts == {"tokens": 12} and new and all(p["varies"] == ["match"] and p["edit"][0] == "swap" for p in new)
-    alg = vary.Algorithm(behavior)
+    alg = vary.family.Algorithm(behavior["family"])
     for p in new:
         o = behavior["prompts"][p["of"]]
         t = p["target_positions"][0]

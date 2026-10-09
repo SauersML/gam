@@ -1,6 +1,5 @@
 """Word succession: in a run of ordinal ("fourth, fifth") or cardinal ("four, five") words the next word is
 the next one of the same list."""
-from mech import align, claim
 
 LISTS = [["first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth", "ninth", "tenth",
           "eleventh", "twelfth"],

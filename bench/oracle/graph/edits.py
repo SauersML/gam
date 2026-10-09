@@ -1,32 +1,31 @@
-"""One-edit neighbours of an oracle answer, scored by the checker (#2951 graph oracle): the edit step shared by
-teacher refinement (teacher.py), the search's refinement (e2e/vpd_min.py) and RL credit (rl/train.py).
+"""One-edit neighbours of a format v3 explanation, scored by the checker (#2951 graph oracle): the edit step shared by
+the teacher search's refinement and RL credit (rl/train.py).
 
-An answer's choices are its statements align(variable, parts...) and claim(variable, parts...). An edit changes one
-choice: drop one part from a statement (a statement left without parts is removed), drop a variable's statement, or
-add a candidate part to a variable's statement (a new align statement when the variable has none). The checker
-scores a batch of edited answers on the current behavior under the same experiments, and
-dS = S(edited) - S(answer) is the edit's measured effect given the rest of the answer: a removal measured by
-running M, never a gradient. An invalid answer scores +inf.
+An explanation's choices are its groups' subcomponents. An edit changes one choice: drop one subcomponent from a group
+(a group left without subcomponents is removed), drop a whole group (its name leaves every other group's reads), or
+add a candidate subcomponent to a group. The checker scores a batch of edited explanations on the current behavior
+under the same experiments, and dS = S(edited) - S(explanation) is the edit's measured effect given the rest of the
+explanation: a removal measured by running M, never a gradient. An invalid explanation scores +inf.
 
-  credit(answer, score, k, rng)        -> {edit: dS} for k sampled part drops and every statement drop
-  refine(answer, score, candidates, R) -> the best answer found, its score and the accepted edits
+  credit(answer, score, k, rng)        -> {edit: dS} for k sampled subcomponent drops and every group drop
+  refine(answer, score, candidates, R) -> the best explanation found, its score and the accepted edits
 
-`score` takes a list of answer sources and returns their checker results (dicts with total_bits and valid), all
-under one experiment draw: Checker.score_batch with fixed experiments and seed and the reader off (an edit leaves
-the English explanation as it is).
+`score` takes a list of sources and returns their checker results (dicts with total_bits and valid), all under one
+experiment draw: Checker.score_batch with fixed experiments and seed (an edit leaves the English
+explanation as it is).
 
   edits.py credit ANSWER.py BEHAVIOR.json [--k 16] [--experiments 16] [--seed 0] [--vpd DIR]
   edits.py refine ANSWER.py BEHAVIOR.json --candidates CAND.json [--rounds 8] [--adds 8] [--out OUT.py]
-CAND.json: {variable: [part token, ...]} best first (for example VPD importance on the variable's interchange pairs).
+CAND.json: {group: [subcomponent token, ...]} best first.
 """
 
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import math
 import random
-import re
 import sys
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -34,113 +33,130 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
-PART = re.compile(r"<p:[^>]+>|\bG\.\w+")  # a part token or a named group of the model's library (mech's G)
-SITE = re.compile(r"<p:(\d+)\.(\w+)")  # a part token's layer and site code
-WRITERS = {"o", "down", "h", "a", "m", "attn", "mlp"}  # site codes whose parts write the residual stream
-STATEMENT = re.compile(r"^(\s*)(align|claim)\(\s*(\w+)\s*,(.*)\)\s*$")
+import mech  # noqa: E402
+
+PART = mech.PART
+KIND = "group"  # the kind of every choice holder (rl/train.py's credit marks name it)
 
 
 @dataclass(frozen=True)
 class Statement:
-    line: int  # its line in the source (-1: added by an edit, written after the last statement)
-    kind: str  # align / claim
-    variable: str
+    """One group: its line in the source (its key's line; -1 when an edit wrote it), name and fields."""
+
+    line: int
+    variable: str  # the group's name
     parts: tuple[str, ...]
+    reads: tuple[str, ...]
+    label: str | None
+    writes: str | None
+    kind: str = KIND
 
 
 @dataclass(frozen=True)
 class Answer:
-    """An answer's source, split into the lines no edit touches and its statements."""
+    """An explanation: the lines before its `groups` statement, its groups, and the lines after."""
 
-    lines: tuple[str, ...]
+    head: tuple[str, ...]
     statements: tuple[Statement, ...]
+    tail: tuple[str, ...]
 
     @staticmethod
     def parse(source: str) -> "Answer":
+        """The groups of a source whose `groups` statement is a literal dict; none when it is not."""
         lines = tuple(source.rstrip("\n").split("\n"))
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            return Answer(lines, (), ())
+        node = next((n for n in tree.body if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "groups" for t in n.targets)), None)
+        if node is None or not isinstance(node.value, ast.Dict):
+            return Answer(lines, (), ())
+        try:
+            groups = ast.literal_eval(node.value)
+        except (ValueError, SyntaxError):
+            return Answer(lines, (), ())
         statements = []
-        for i, text in enumerate(lines):
-            m = STATEMENT.match(text)
-            if m and PART.search(m[4]):
-                statements.append(Statement(i, m[2], m[3], tuple(PART.findall(m[4]))))
-        return Answer(lines, tuple(statements))
+        for key, value in zip(node.value.keys, node.value.values):
+            name = getattr(key, "value", None)
+            g = groups.get(name)
+            if not isinstance(name, str) or not isinstance(g, dict):
+                return Answer(lines, (), ())
+            parts = g.get("subcomponents")
+            reads = g.get("reads") or []
+            if not isinstance(parts, (list, tuple)) or not isinstance(reads, (list, tuple)):
+                return Answer(lines, (), ())
+            statements.append(Statement(key.lineno - 1, name, tuple(map(str, parts)), tuple(map(str, reads)),
+                                        g.get("label"), g.get("writes")))
+        return Answer(lines[: node.lineno - 1], tuple(statements), lines[node.end_lineno:])
 
     def source(self) -> str:
-        by_line = {s.line: s for s in self.statements if s.line >= 0}
-        out = []
-        for i, text in enumerate(self.lines):
-            if i in by_line:
-                s = by_line[i]
-                out.append(f"{s.kind}({s.variable}, {', '.join(s.parts)})")
-            elif not STATEMENT.match(text) or not PART.search(text):
-                out.append(text)
-        out += [f"{s.kind}({s.variable}, {', '.join(s.parts)})" for s in self.statements if s.line < 0]
-        return "\n".join(out) + "\n"
+        """The explanation with its groups written one per line (explain.source's form)."""
+        rows = ["groups = {"]
+        for s in self.statements:
+            fields = [f'"subcomponents": [{", ".join(json.dumps(p) for p in s.parts)}]',
+                      f'"reads": [{", ".join(json.dumps(r) for r in s.reads)}]']
+            if s.label:
+                fields.append(f'"label": {json.dumps(s.label)}')
+            if s.writes:
+                fields.append(f'"writes": {json.dumps(s.writes)}')
+            rows.append(f'    {json.dumps(s.variable)}: {{{", ".join(fields)}}},')
+        rows.append("}")
+        return "\n".join(list(self.head) + rows + list(self.tail)) + "\n"
 
     def parts(self) -> list[tuple[int, str]]:
-        """Every (statement index, part) choice."""
+        """Every (group index, subcomponent) choice."""
         return [(j, p) for j, s in enumerate(self.statements) for p in s.parts]
 
 
 @dataclass(frozen=True)
 class Edit:
-    op: str  # drop / unalign / add
-    variable: str
-    kind: str
+    op: str  # drop / unalign (drop the whole group) / add
+    variable: str  # the group's name
+    kind: str = KIND
     part: str | None = None
 
     def __str__(self) -> str:
-        return f"{self.op} {self.kind}({self.variable}{', ' + self.part if self.part else ''})"
+        return f"{self.op} {self.variable}{' ' + self.part if self.part else ''}"
+
+
+def without_group(statements: list[Statement], name: str) -> list[Statement]:
+    """`statements` less group `name`, its name gone from every other group's reads (a read of name:route too)."""
+    return [replace(s, reads=tuple(r for r in s.reads if r.split(":")[0] != name)) for s in statements if s.variable != name]
 
 
 def apply(answer: Answer, edit: Edit) -> Answer:
-    """The answer with one edit made."""
+    """The explanation with one edit made."""
     statements = list(answer.statements)
-    j = next((j for j, s in enumerate(statements) if s.variable == edit.variable and s.kind == edit.kind), None)
+    j = next((j for j, s in enumerate(statements) if s.variable == edit.variable), None)
+    if j is None:
+        return answer
     if edit.op == "add":
-        if j is None:
-            statements.append(Statement(-1, edit.kind, edit.variable, (edit.part,)))
-        elif edit.part not in statements[j].parts:
+        if edit.part not in statements[j].parts:
             statements[j] = replace(statements[j], parts=statements[j].parts + (edit.part,))
-    elif j is not None and edit.op == "unalign":
-        del statements[j]
-    elif j is not None and edit.op == "drop":
+    elif edit.op == "unalign":
+        statements = without_group(statements, edit.variable)
+    elif edit.op == "drop":
         kept = tuple(p for p in statements[j].parts if p != edit.part)
-        if edit.kind == "align" and SITE.match(edit.part) and not any(
-                not SITE.match(p) or block(p) == block(edit.part) and SITE.match(p)[2] in WRITERS for p in kept):  # a group may hold a writer
-            # the block's last residual writer gone: its q/k/v_proj or c_fc parts write only that block's own
-            # stream, which nothing of the variable reads any more (each node computes alone), so they go too
-            kept = tuple(p for p in kept if block(p) != block(edit.part))
-        if kept:
-            statements[j] = replace(statements[j], parts=kept)
-        else:
-            del statements[j]
+        statements = without_group(statements, edit.variable) if not kept else statements[:j] + [replace(statements[j], parts=kept)] + statements[j + 1:]
     return replace(answer, statements=tuple(statements))
 
 
-def block(part: str) -> tuple[int, str]:
-    """A part token's layer and block (attention or MLP)."""
-    layer, code = SITE.match(part).groups()
-    return int(layer), "mlp" if code in ("fc", "down", "m", "mlp") else "attn"
-
-
 def drops(answer: Answer) -> list[Edit]:
-    return [Edit("drop", answer.statements[j].variable, answer.statements[j].kind, p) for j, p in answer.parts()]
+    return [Edit("drop", answer.statements[j].variable, part=p) for j, p in answer.parts()]
 
 
 def unaligns(answer: Answer) -> list[Edit]:
-    return [Edit("unalign", s.variable, s.kind) for s in answer.statements]
+    return [Edit("unalign", s.variable) for s in answer.statements]
 
 
 def adds(answer: Answer, candidates: dict[str, list[str]], per_variable: int) -> list[Edit]:
-    """The first `per_variable` candidates of each variable that its statement does not name yet."""
-    named = {(s.variable, s.kind): set(s.parts) for s in answer.statements}
-    kinds = {s.variable: s.kind for s in answer.statements if s.kind != "claim"}  # a variable's align statement, not its claim (attention parts)
+    """The first `per_variable` candidates of each group that no group names yet."""
+    named = {p for s in answer.statements for p in s.parts}
+    groups = {s.variable for s in answer.statements}
     out = []
-    for variable, ranked in candidates.items():
-        kind = kinds.get(variable, "align")
-        fresh = [p for p in ranked if p not in named.get((variable, kind), ())]
-        out += [Edit("add", variable, kind, p) for p in fresh[:per_variable]]
+    for name, ranked in candidates.items():
+        if name in groups:
+            out += [Edit("add", name, part=p) for p in [p for p in ranked if p not in named][:per_variable]]
     return out
 
 
@@ -149,7 +165,7 @@ def totals(results: list[dict]) -> list[float]:
 
 
 def credit_edits(answer: Answer, k: int = 16, rng: random.Random | None = None) -> list[Edit]:
-    """credit's edits: k part drops sampled uniformly (all when fewer), then every statement drop."""
+    """credit's edits: k subcomponent drops sampled uniformly (all when fewer), then every group drop."""
     rng = rng or random.Random(0)
     part_drops = drops(answer)
     if len(part_drops) > k:
@@ -158,8 +174,7 @@ def credit_edits(answer: Answer, k: int = 16, rng: random.Random | None = None) 
 
 
 def credit(answer: Answer, score, k: int = 16, rng: random.Random | None = None) -> tuple[float, dict[Edit, float]]:
-    """The answer's score and dS for k part drops sampled uniformly (all when fewer) and every statement drop,
-    one checker batch."""
+    """The explanation's score and dS for k subcomponent drops sampled uniformly and every group drop, one batch."""
     edits = credit_edits(answer, k, rng)
     s = totals(score([answer.source()] + [apply(answer, e).source() for e in edits]))
     return s[0], {e: v - s[0] for e, v in zip(edits, s[1:])}
@@ -168,11 +183,10 @@ def credit(answer: Answer, score, k: int = 16, rng: random.Random | None = None)
 def refine(answer: Answer, score, candidates: dict[str, list[str]] | None = None, rounds: int = 8,
            per_variable: int = 8, log=None, max_drops: int | None = None,
            rng: random.Random | None = None) -> tuple[Answer, float, list[Edit]]:
-    """Greedy improvement: each round scores every part drop (`max_drops` of them sampled uniformly when the answer
-    has more, for answers of hundreds of parts) and the next `per_variable` candidates of each variable in one
-    batch, then makes the improving edits jointly in order of dS, trying all of them, half, a quarter, ... and the
-    best single one in a second batch, and keeps the lowest score. Stops when no edit improves or after `rounds`
-    rounds."""
+    """Greedy improvement: each round scores every subcomponent drop (`max_drops` of them sampled uniformly when the
+    explanation has more) and the next `per_variable` candidates of each group in one batch, then makes the improving
+    edits jointly in order of dS, trying all of them, half, a quarter, ... and the best single one in a second batch,
+    and keeps the lowest score. Stops when no edit improves or after `rounds` rounds."""
     rng = rng or random.Random(0)
     current = totals(score([answer.source()]))[0]
     accepted: list[Edit] = []
@@ -204,31 +218,30 @@ def refine(answer: Answer, score, candidates: dict[str, list[str]] | None = None
 
 
 def checker_score(behavior_path: Path, vpd: Path, experiments: int, seed: int, device: str | None = "gpu"):
-    """A Checker on the behavior and its score function (the caller closes the checker); device "gpu" runs on
-    the single-precision device (None: the host, float64)."""
+    """A Checker on the behavior and its score function (the caller closes the checker); device "gpu" runs on the
+    single-precision device (None: the host, float64)."""
     import score as score_module
 
     behavior = json.loads(behavior_path.read_text())
-    views = {"vpd": vpd} if behavior["model"] == "vpd4l" else None
-    c = score_module.Checker(behavior["model"], views=views, device=device)
+    c = score_module.Checker(behavior["model"], views={"vpd": vpd}, device=device)
     c.behavior(behavior_path)
-    return c, lambda sources: c.score_batch(sources, experiments=experiments, seed=seed, reader=False)
+    return c, lambda sources: c.score_batch(sources, experiments=experiments, seed=seed)
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("command", choices=["credit", "refine"])
-    ap.add_argument("answer", type=Path, help="the answer's program source (.py)")
+    ap.add_argument("answer", type=Path, help="the explanation's source (.py)")
     ap.add_argument("behavior", type=Path)
-    ap.add_argument("--candidates", type=Path, help="refine: {variable: [part token, ...]} best first")
-    ap.add_argument("--k", type=int, default=16, help="credit: part drops sampled")
+    ap.add_argument("--candidates", type=Path, help="refine: {group: [subcomponent token, ...]} best first")
+    ap.add_argument("--k", type=int, default=16, help="credit: subcomponent drops sampled")
     ap.add_argument("--rounds", type=int, default=8)
-    ap.add_argument("--adds", type=int, default=8, help="refine: candidates tried per variable per round")
+    ap.add_argument("--adds", type=int, default=8, help="refine: candidates tried per group per round")
     ap.add_argument("--experiments", type=int, default=16)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--vpd", type=Path, default=Path.home() / "mpd-data/engine/vpd4l_decomposition")
     ap.add_argument("--device", default="gpu", help="gpu (the single-precision device) or host")
-    ap.add_argument("--out", type=Path, help="refine: where the refined program goes")
+    ap.add_argument("--out", type=Path, help="refine: where the refined explanation goes")
     a = ap.parse_args()
     answer = Answer.parse(a.answer.read_text())
     checker, score = checker_score(a.behavior, a.vpd, a.experiments, a.seed, None if a.device == "host" else a.device)

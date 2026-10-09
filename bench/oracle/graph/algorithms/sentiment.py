@@ -1,5 +1,4 @@
 """Sentiment: the label of the last review follows from its adjective. The table is what the model recalls."""
-from mech import align, claim
 
 LABEL = {
     'amazing': ' positive', 'awful': ' negative', 'bad': ' negative', 'boring': ' negative',

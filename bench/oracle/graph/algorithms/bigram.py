@@ -1,5 +1,4 @@
 """Frequent bigram: the second word of a common multiword name follows its first word. The table is what the model recalls."""
-from mech import align, claim
 
 SECOND = {
     'Abraham': ' Lincoln', 'Abu': ' Dhabi', 'Air': ' Force', 'Albert': ' Einstein',

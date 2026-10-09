@@ -34,48 +34,37 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent))
 
+import family  # noqa: E402
 import mech  # noqa: E402
-import teacher  # noqa: E402
 
 
-class Algorithm:
-    """A family algorithm: its variables' values on a token list, and which variables the answer reads."""
+def varies(alg, base: dict, other: dict) -> list[str]:
+    """The variables the answer reads whose value differs between two evaluations at one target."""
+    return [v for v in sorted(alg.upstream["answer"]) if base[v] != other[v]] or ["tokens"]
 
-    def __init__(self, behavior: dict):
-        source = teacher.algorithm_of(behavior)
-        model = behavior["model"]
-        ir = mech.trace_inline(source + f"\nalign(answer, {teacher.ANY[model]})\n", model)
-        self.reads = {v["name"]: [r for r in v["reads"] if r != "tokens"] for v in ir["variables"]}
-        self.names = list(self.reads)
-        namespace = {"__builtins__": mech.SAFE_BUILTINS}
-        tree = mech.ast.fix_missing_locations(mech._NoImports().visit(mech.ast.parse(mech.quote_parts(source))))
-        exec(compile(tree, "<algorithm>", "exec"), namespace)
-        self.algorithm = mech._Algorithm(namespace, self.names)
-        self.upstream = {v: self._upstream(v) for v in self.names}  # the variables v reads, directly or not
 
-    def _upstream(self, v: str) -> set[str]:
-        out, todo = set(), list(self.reads[v])
-        while todo:
-            u = todo.pop()
-            if u not in out:
-                out.add(u)
-                todo += self.reads[u]
-        return out
+def alone(alg, v: str, base: dict, other: dict) -> bool:
+    """v varies, and so does the answer, while every variable v does not feed keeps its value."""
+    fed = {u for u in alg.names if v in alg.upstream[u]}
+    return base[v] != other[v] and base["answer"] != other["answer"] and other["answer"] is not None and all(
+        base[u] == other[u] for u in alg.upstream["answer"] if u != v and u not in fed)
 
-    def at(self, tokens: list[str], t: int) -> dict:
-        """Every variable's value at position t of the prompt cut after t."""
-        values = self.algorithm.values(tokens[: t + 1], self.names)
-        return {v: values[v][t] for v in self.names}
 
-    def varies(self, base: dict, other: dict) -> list[str]:
-        """The variables the answer reads whose value differs between two evaluations at one target."""
-        return [v for v in sorted(self.upstream["answer"]) if base[v] != other[v]] or ["tokens"]
+_VOCABULARIES: dict = {}
 
-    def alone(self, v: str, base: dict, other: dict) -> bool:
-        """v varies, and so does the answer, while every variable v does not feed keeps its value."""
-        fed = {u for u in self.names if v in self.upstream[u]}
-        return base[v] != other[v] and base["answer"] != other["answer"] and other["answer"] is not None and all(
-            base[u] == other[u] for u in self.upstream["answer"] if u != v and u not in fed)
+
+def token_id(model: str, text: str) -> int | None:
+    """The token an answer `text` is (the lowest id that decodes to it), else the first token it splits into."""
+    tk = mech.tokenizer(model)
+    if model not in _VOCABULARIES:
+        vocabulary: dict[str, int] = {}
+        for i, s in enumerate(tk.decode_batch([[i] for i in range(tk.get_vocab_size())], skip_special_tokens=False)):
+            vocabulary.setdefault(s, i)
+        _VOCABULARIES[model] = vocabulary
+    if text in _VOCABULARIES[model]:
+        return _VOCABULARIES[model][text]
+    ids = tk.encode(text, add_special_tokens=False).ids if text else []
+    return ids[0] if ids else None
 
 
 def context(ids: list[int], lo: int, t: int) -> int:
@@ -108,7 +97,7 @@ def vary(behavior: dict, rng: random.Random, tries: int = 4000) -> tuple[list[di
     """(new items, counts): items varying each variable the prompts' own counterfactuals leave fixed; labels every
     existing item's "varies" in place."""
     model = behavior["model"]
-    alg = Algorithm(behavior)
+    alg = family.Algorithm(behavior["family"])
     tk = mech.tokenizer(model)
     strings = {}
 
@@ -125,7 +114,7 @@ def vary(behavior: dict, rng: random.Random, tries: int = 4000) -> tuple[list[di
         t = p["target_positions"][0]
         base = alg.at(text_of(p["token_ids"]), t)
         if p.get("counterfactual"):
-            p["varies"] = alg.varies(base, alg.at(text_of(p["counterfactual"]["token_ids"]), t))
+            p["varies"] = varies(alg, base, alg.at(text_of(p["counterfactual"]["token_ids"]), t))
             for v in p["varies"]:
                 counts[v] = counts.get(v, 0) + 1
         if len(p["target_positions"]) != 1 or not isinstance(base["answer"], str):
@@ -136,8 +125,8 @@ def vary(behavior: dict, rng: random.Random, tries: int = 4000) -> tuple[list[di
             if not wanted or n >= tries:
                 break
             other = alg.at(text_of(ids), t)
-            for v in [v for v in wanted if alg.alone(v, base, other)]:
-                answer_id = mech._token_id(model, other["answer"], {})
+            for v in [v for v in wanted if alone(alg, v, base, other)]:
+                answer_id = token_id(model, other["answer"])
                 if answer_id is None:
                     continue
                 made = ids[: t + 1] + [answer_id] + ids[t + 2:]

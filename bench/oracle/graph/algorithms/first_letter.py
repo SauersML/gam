@@ -1,5 +1,4 @@
 """Spelling: 'The word "wallet" starts with the letter' -> " W": the quoted word's first letter, capital."""
-from mech import align, claim
 
 
 def word(tokens):

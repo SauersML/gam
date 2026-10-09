@@ -1,5 +1,4 @@
 """Gendered pronoun: the next word is the subject pronoun for the named person. The names' genders are what the model recalls."""
-from mech import align, claim
 
 FEMALE = {
     'Alice', 'Amy', 'Anna', 'Claire', 'Diana', 'Emily', 'Emma', 'Grace', 'Helen', 'Jane', 'Julia',

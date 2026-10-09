@@ -35,7 +35,7 @@ of the expected score. The sum is the episode's log-probability; times the advan
 gradient. One gradient step per sampled batch, on the policy that sampled it, so the importance ratio is
 1 and needs no clipping (vLLM's bf16 log-probabilities differ from the trainer's by rounding only).
 
-The reference pi_ref is the SFT policy: --init ADAPTER (g-predict's SFT adapter) is loaded twice, as the
+The reference pi_ref is the SFT policy: --init ADAPTER (a PEFT adapter, e.g. --mode sft's) is loaded twice, as the
 trainable policy and as a frozen reference; without --init the policy is a fresh LoRA on the base and
 pi_ref is the base (adapter disabled). The loop writes the adapter every step (vLLM loads it by path).
 
@@ -48,9 +48,8 @@ pi_ref is the base (adapter disabled). The loop writes the adapter every step (v
 Evaluation (--mode eval, or every --eval-every steps of training) samples N programs per behavior on two
 sets and scores them under one experiment seed that no training step uses: the held-out behaviors (whole
 families held out by g-behaviors' split) and the held-out prompts of the training behaviors (every
---prompt-holdout-th prompt, never shown or scored in training). Baselines on the same experiments: the
-empty and the full program (e2e/programs.py) and g-int's search programs (e2e/search.py's outputs).
---init takes a PEFT adapter or g-predict's sft.py output directory (converted to PEFT's layout).
+--prompt-holdout-th prompt, never shown or scored in training). Baselines on the same experiments: nothing
+named (the behavior's signal) and the teacher answer (--teacher).
 
 Outputs: DIR/train.jsonl (a line per step: scores, validity, loss, KL, seconds sampling / scoring /
 training), DIR/eval.jsonl (a line per evaluated behavior and a summary per evaluation), DIR/samples.jsonl (every program with its score, for repair data and offline SFT),
@@ -77,43 +76,24 @@ HERE = Path(__file__).resolve().parent
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")  # CUDA may be initialized here (torch.cuda.is_available) before vLLM starts its engine process
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent))
-sys.path.insert(0, str(HERE.parent / "predict"))  # g-predict's part_tokens
 import edits  # noqa: E402
 from prompt import program_of, render, split_answer  # noqa: E402
 import scorer  # noqa: E402
 from scorer import SCORERS  # noqa: E402
 
-BEHAVIORS = Path.home() / "mpd-data/graph_oracle/behaviors"
-SEARCH = Path.home() / "mpd-data/graph_oracle/runs/search"
+BEHAVIORS = Path.home() / "mpd-data/graph_oracle/behaviors_v3"  # train behaviors with their variables (behaviors_vary) and held-out ones
 TEACHER: dict[str, str] = {}  # --teacher's answers by behavior id (teacher_answers): training behaviors
 HELDOUT_TEACHER: dict[str, str] = {}  # --teacher-heldout's: evaluation baselines only, never SFT or RL
 
 
-def aligned(source: str) -> bool:
-    """Whether a program aligns some variable to at least one part (an align statement with a part token)."""
-    return any(st.kind != "claim" and st.parts for st in edits.Answer.parse(source).statements)
-
-
-def with_alignment(score):
-    """score, with an oracle answer (an item with "require_align") that aligns nothing marked invalid: such an answer
-    is valid to mech and scores as the empty program plus its code, so without this rule an oracle that writes no
-    alignment looks like an answer (the 10-08 SFT's valid held-out answers were all part-less). Baselines (the empty
-    program, the teacher) carry no flag."""
-    def run(items):
-        out = score(items)
-        return [dict(r, valid=False, error="no align statement with a part: an answer must align something")
-                if it.get("require_align") and r.get("valid") and not aligned(it["source"]) else r for it, r in zip(items, out)]
-
-    return run
-
-
-def item(answer: str, behavior: dict, seed: int, uniform_seeds: int, experiments: int, require_align: bool = True) -> dict:
-    """A scoring item from an oracle answer: prompt.split_answer's program (the last python block that
-    parses) and explanation (the plain English after it, which alone the reader reads). Part tokens stay as
-    written: mech parses them, and each counts as one Python token of the program's size."""
+def item(answer, behavior: dict, seed: int, uniform_seeds: int, experiments: int) -> dict:
+    """A scoring item from an oracle answer: prompt.split_answer's program (the last python block that parses) and
+    explanation (the plain English after it); an IR dict (the nothing-named baseline)
+    is scored as it is."""
+    if isinstance(answer, dict):
+        return {"source": "", "ir": answer, "explanation": "", "behavior": behavior, "seed": seed, "uniform_seeds": uniform_seeds, "experiments": experiments}
     source, explanation = split_answer(answer)
-    return {"source": source, "explanation": explanation, "behavior": behavior, "seed": seed, "uniform_seeds": uniform_seeds, "experiments": experiments,
-            "require_align": require_align}
+    return {"source": source, "explanation": explanation, "behavior": behavior, "seed": seed, "uniform_seeds": uniform_seeds, "experiments": experiments}
 
 
 def behaviors(root: Path, model: str, split: str) -> list[dict]:
@@ -144,49 +124,26 @@ def split_prompts(pool: list[dict], every: int, root: Path) -> tuple[list[dict],
     return views
 
 
-def init_adapter(path: str | None, out: Path) -> str | None:
-    """--init as a PEFT adapter directory: itself, or g-predict's sft.py output (adapters.safetensors with
-    '<module>.A' (r x in) and '<module>.B' (out x r), scale alpha / r, meta.json's args) rewritten in PEFT's
-    layout, which computes the same W x + (alpha / r) B A x."""
-    if path is None or (Path(path) / "adapter_config.json").exists():
-        return path
-    from safetensors.torch import load_file, save_file
-
-    src = Path(path)
-    meta = json.loads((src / "meta.json").read_text())["args"]
-    tensors = load_file(str(src / "adapters.safetensors"))
-    dst = out / "init_adapter"
-    dst.mkdir(parents=True, exist_ok=True)
-    save_file({f"base_model.model.{k.rsplit('.', 1)[0]}.lora_{k.rsplit('.', 1)[1]}.weight": v.contiguous() for k, v in tensors.items()}, str(dst / "adapter_model.safetensors"))
-    targets = sorted({k.rsplit(".", 2)[1] for k in tensors})
-    (dst / "adapter_config.json").write_text(json.dumps({"peft_type": "LORA", "task_type": "CAUSAL_LM", "r": meta["rank"], "lora_alpha": meta["alpha"], "target_modules": targets,
-                                                         "lora_dropout": 0.0, "bias": "none", "base_model_name_or_path": meta["model"], "fan_in_fan_out": False, "inference_mode": True}))
-    return str(dst)
-
-
-def baselines(b: dict) -> dict[str, str]:
-    """Answers the oracle is compared with on behavior b, scored on the same experiments: g-int's
-    references (the empty and the full program, e2e/programs.py), g-mech's example programs for b
-    (examples/index.json), the search baseline's final programs (runs/search/<behavior>.<mode>.json) and the
-    teacher answer (--teacher, program and English)."""
-    sys.path.insert(0, str(HERE.parent / "e2e"))
-    import programs
-
-    refs = programs.references(b["model"])
-    out = {"empty": refs["empty"], "full": refs["full"]}
-    index = json.loads((HERE.parent / "examples/index.json").read_text())
-    for name, entry in sorted(index.items()):  # g-mech's hand-written or measured example programs for this behavior
-        if entry.get("behavior") == b["id"] and entry.get("model") == b.get("model"):
-            out["example_" + name] = (HERE.parent / "examples" / f"{name}.py").read_text()
-    for p in sorted(SEARCH.glob(f"{b['id']}.*.json")):
-        out["search_" + p.stem[len(b["id"]) + 1 :]] = json.loads(p.read_text())["source"]
+def baselines(b: dict) -> dict:
+    """What the oracle's answers on behavior b are compared with, scored on the same experiments: nothing named (an IR
+    without nodes: every part on the changed prompt, the behavior's signal) and the teacher answer (--teacher, program
+    and English)."""
+    out = {"empty": empty_ir(b["model"])}
     if b["id"] in TEACHER or b["id"] in HELDOUT_TEACHER:
         out["teacher"] = TEACHER.get(b["id"]) or HELDOUT_TEACHER[b["id"]]
     return out
 
 
+def empty_ir(model: str) -> dict:
+    """The IR naming nothing (e2e/explain.ir of no units)."""
+    sys.path.insert(0, str(HERE.parent / "e2e"))
+    import explain
+
+    return explain.ir([], model)
+
+
 def load_parts(spec: str, init: str | None, model, base_vocab: int, dev):
-    """g-predict's part_tokens.PartTokens over the registry at SPEC (part_tokens.py build), scaled to the
+    """part_tokens.PartTokens over the registry at SPEC (part_tokens.py build), scaled to the
     mean RMS of the base token embeddings, with projections resumed from an --init adapter's part_tokens.pt."""
     import part_tokens
 
@@ -500,7 +457,7 @@ class VllmSampler:
 
 class ValidSampler:
     """Draws n * (rounds + 1) programs per prompt in ONE sampling call and keeps n of each prompt's: its valid ones
-    first (mech.trace: syntax, unknown names, an index beyond its site's size, a rule broken), in sampling order, then
+    first (mech.trace: syntax, unknown names, an index beyond its site's size, a broken connection), in sampling order, then
     invalid ones; so the policy is sampled restricted to the programs it can write validly (rejection sampling).
     Redraw rounds in sequence each cost the longest answer's generation (round 3: 4 rounds of up to 2,048 tokens, 232 s
     for 32 answers); one call of more sequences runs at vLLM's batched throughput. stats: the valid share of every draw
@@ -516,7 +473,7 @@ class ValidSampler:
 
         def ok(c):
             source = program_of(self.tok.decode(c, skip_special_tokens=True))
-            return bool(mech.trace(source, self.model)["valid"]) and aligned(source)  # an answer must align something (with_alignment)
+            return bool(mech.trace(source, self.model)["valid"])
 
         with ThreadPoolExecutor(8) as ex:  # each trace is a fork of a tracer server
             return list(ex.map(ok, completions))
@@ -615,7 +572,7 @@ def step_seed(args, step: int) -> int:
 
 
 def teacher_answers(root) -> dict[str, str]:
-    """g-int's teacher answers by behavior id: DIR/manifest.jsonl's "answer" files (e2e/teacher_run.py; a behavior's
+    """Teacher answers by behavior id: DIR/manifest.jsonl's "answer" files (e2e/teacher_v3.py; a behavior's
     last line wins; a path that does not exist here, e.g. on a pod, is read from DIR by its name), else every
     DIR/<behavior>.answer.txt, else a bare DIR/<behavior>.py program as the answer's python block."""
     out = {}
@@ -652,16 +609,13 @@ class Scales:
 
     def items(self, chosen: list[dict], seed: int, experiments: int) -> list[tuple[str, str, dict]]:
         """(behavior id, "teacher" | "empty", scoring item) for the behaviors without a scale yet."""
-        sys.path.insert(0, str(HERE.parent / "e2e"))
-        import programs
-
         out = []
         for b in chosen:
             if b["id"] in self.scale:
                 continue
             if b["id"] in self.teacher:
-                out.append((b["id"], "teacher", item(self.teacher[b["id"]], b, seed, 0, experiments, require_align=False)))
-            out.append((b["id"], "empty", item(programs.empty(b["model"]), b, seed, 0, experiments, require_align=False)))
+                out.append((b["id"], "teacher", item(self.teacher[b["id"]], b, seed, 0, experiments)))
+            out.append((b["id"], "empty", item(empty_ir(b["model"]), b, seed, 0, experiments)))
         return out
 
     def take(self, entries: list[tuple[str, str, dict]], scores: list[dict]):
@@ -742,8 +696,8 @@ def token_spans(tok, completion: list[int], text: str) -> list[tuple[int, int]]:
 
 def credit_advantages(tok, completion: list[int], text: str, source: str, episode: float, dS: dict, scale: float) -> list[float]:
     """(1) Per-token advantages of one answer from its measured edits (edits.credit: dS = S(edited) - S(answer), so
-    dS > 0 means the choice lowers the score): the tokens of a part in an align/claim statement get dS(drop the part) /
-    scale_b, the statement's other tokens (and its parts whose drop was not sampled) dS(drop the statement) / scale_b,
+    dS > 0 means the choice lowers the score): the tokens of a subcomponent in a group's line get dS(drop it) /
+    scale_b, the line's other tokens (and its subcomponents whose drop was not sampled) dS(drop the group) / scale_b,
     and every other token the episode's advantage. An edit that makes the answer invalid (dS = +inf) counts as
     dS = scale_b."""
     adv = [episode] * len(completion)
@@ -780,18 +734,18 @@ def credit_advantages(tok, completion: list[int], text: str, source: str, episod
 
 
 def edit_item(source: str, behavior: dict, seed: int, experiments: int) -> dict:
-    """A scoring item of an edited answer: the reader off, since an edit keeps the answer's explanation."""
-    return {"source": source, "explanation": "", "behavior": behavior, "seed": seed, "experiments": experiments, "reader": False, "require_align": True}
+    """A scoring item of an edited answer (an edit keeps the answer's explanation, so its length is left out)."""
+    return {"source": source, "explanation": "", "behavior": behavior, "seed": seed, "experiments": experiments}
 
 
 def memo(score):
-    """score with every distinct item (behavior, program, explanation, seed, experiments, reader, options) scored once:
+    """score with every distinct item (behavior, program, explanation, seed, experiments, options) scored once:
     within one step the credit's base answers, refinement's start and edits that coincide repeat."""
     cache, hits = {}, [0]
 
     def key(it):
         return (it["behavior"].get("path", it["behavior"]["id"]), it["source"], it.get("explanation", ""), it.get("seed"), it.get("uniform_seeds") or 0, it.get("experiments"),
-                it.get("reader", True), json.dumps(it.get("options"), sort_keys=True), it.get("require_align", False))
+                json.dumps(it.get("options"), sort_keys=True), json.dumps(it.get("ir"), sort_keys=True))
 
     def run(items):
         keys = [key(it) for it in items]
@@ -820,7 +774,7 @@ def timed(clock: dict, key: str, fn, *a, **kw):
 
 
 def credit_groups(groups: list[dict], seed: int, args, tok, score, scales: Scales, clock: dict):
-    """(1) The credit edits (edits.credit_edits: --credit part drops sampled, every statement drop) of each group's
+    """(1) The credit edits (edits.credit_edits: --credit subcomponent drops sampled, every group drop) of each group's
     distinct valid answers (--credit-answers: the best and K - 1 others at random), scored in one call under the step's
     seed, then each credited answer's token advantages."""
     requests, entries = [], []
@@ -864,7 +818,7 @@ def rl2_sample(chosen: list[dict], step: int, args, pol, sampler, adapter: Path,
 def rl2_score(groups: list[dict], step: int, args, tok, score, scales: Scales, clock: dict) -> list[dict]:
     """The checker half of rl2_groups, in place: every answer scored under the step's seed (with the teacher's and the
     empty program's scores of behaviors seen for the first time, for their scale); every sampled token gets its
-    advantage: the episode's RLOO advantage (3), replaced on align/claim statements by the measured credit (1, --credit
+    advantage: the episode's RLOO advantage (3), replaced on group lines by the measured credit (1, --credit
     > 0). An invalid answer counts as the group's worst valid one (a group with no valid answer has no signal)."""
     seed, n = step_seed(args, step), args.samples
     for grp in groups:
@@ -897,7 +851,7 @@ def informative(group: dict) -> bool:
 
 
 def expert_iteration(groups: list[dict], step: int, args, pol, score, candidates: dict, clock: dict) -> list[dict]:
-    """(2) edits.refine from each group's best valid answer under the step's seed, reader off (--refine rounds, the next
+    """(2) edits.refine from each group's best valid answer under the step's seed (--refine rounds, the next
     --refine-adds candidates per variable from --candidates, --credit part drops sampled per round): an answer it
     improves comes back as the sampled answer with the program block replaced, for the SFT term and the DPO pair."""
     seed, out = step_seed(args, step), []
@@ -1161,7 +1115,7 @@ def repair_prompt(behavior: dict, source: str, result: dict) -> str:
     """The oracle's input for a revision: the behavior's input, a program and what the checker measured
     of it (its terms, its error, its worst experiment families)."""
     lines = [render(behavior), "", "A program for this behavior:", "```python", source.rstrip(), "```",
-             f"Its score: {result['total_bits']:.6g} bits (execution error {result.get('exec_error_bits')}, reader error {result.get('reader_error_bits')}, code {result.get('code_bits')})."]
+             f"Its score: {result['total_bits']:.6g} bits (execution error {result.get('exec_error_bits')}, necessity error {result.get('necessity_error_bits')}, variables {result.get('alignment_error_bits')}, complexity {result.get('complexity_bits')})."]
     if not result.get("valid", True):
         lines.append(f"It is invalid: {result.get('error')}")
     families = result.get("per_family") or {}
@@ -1198,7 +1152,7 @@ def sft_examples(args, pol, pool: list[dict]) -> tuple[list, list]:
     source as a python block followed by its "explanation") plus every unscored one (printed examples); behaviors outside
     the training pool are never used; and
     --data examples (JSONL of {"messages": [user, assistant]} or {"prompt", "completion"}, e.g.
-    g-predict's prediction questions). The completion ends with <|im_end|>."""
+    other question sets). The completion ends with <|im_end|>."""
     import glob
 
     by_id = {b["id"]: b for b in pool}
@@ -1308,7 +1262,7 @@ def evaluate(sets: dict[str, list[dict]], pol, sampler, score, args, adapter: Pa
     """Programs of the current policy on each evaluation set (N samples per behavior at temperature 1)
     and the baselines, all under one experiment seed (--eval-seed, never a training step's). Every program
     and its full score go to eval_samples.jsonl; each behavior's best program to
-    runs/oracle/<behavior>.<run>.json (g-int's oracle-vs-search table); summarize gives the numbers."""
+    runs/oracle/<behavior>.<run>.json (the oracle-vs-search table); summarize gives the numbers."""
     summary = {}
     run = args.run_name or Path(args.out).name
     runs = Path(args.oracle_runs) if getattr(args, "oracle_runs", None) else ORACLE_RUNS
@@ -1322,7 +1276,7 @@ def evaluate(sets: dict[str, list[dict]], pol, sampler, score, args, adapter: Pa
             answers = [(b, pol.tok.decode(c, skip_special_tokens=True)) for b, g in zip(pool, groups) for c in g]
             items = [item(t, b, args.eval_seed, 0, args.eval_experiments) for b, t in answers]
             base = [(b, n, src) for b in pool for n, src in (baselines(b).items() if args.baselines else [])]
-            scores = score(items + [item(src, b, args.eval_seed, 0, args.eval_experiments, require_align=False) for b, _, src in base])  # a bare source is its own program
+            scores = score(items + [item(src, b, args.eval_seed, 0, args.eval_experiments) for b, _, src in base])
             per_base = {}
             for (b, n, src), x in zip(base, scores[len(items) :]):
                 per_base.setdefault(b["id"], {})[n] = x
@@ -1348,13 +1302,14 @@ def evaluate(sets: dict[str, list[dict]], pol, sampler, score, args, adapter: Pa
     return summary
 
 
-def ir_signature(source: str, model: str) -> str:
-    """What the checker's score depends on without a reader: the traced program (nodes, edges, Python
-    token count and types, validity and error)."""
+def ir_signature(source: str, explanation: str, model: str) -> str:
+    """What the checker's score depends on: the traced program (nodes, edges, labels, Python token count and types,
+    validity and error) and the explanation (its length is charged)."""
     import mech
 
     ir = mech.trace(source, model)
-    return json.dumps({k: ir.get(k) for k in ("valid", "error", "nodes", "edges", "python_tokens", "token_types", "standin")}, sort_keys=True)
+    return json.dumps({**{k: ir.get(k) for k in ("valid", "error", "nodes", "edges", "labels", "python_tokens", "token_types")},
+                       "explanation": explanation}, sort_keys=True)
 
 
 def rescore(args, score) -> dict:
@@ -1383,15 +1338,17 @@ def rescore(args, score) -> dict:
         if not todo:
             continue
         reps, rep_of = {}, []
-        for r in todo:  # programs with the same traced IR get the same checker score (no reader term)
-            sig = ir_signature(r["source"], behaviors_by_path[bpath]["model"]) if not os.environ.get("GRAPH_READER") else r["source"]
+        for r in todo:  # programs with the same traced IR get the same checker score
+            sig = (json.dumps(r["source"], sort_keys=True) if isinstance(r["source"], dict) else
+                   ir_signature(r["source"], r.get("explanation", ""), behaviors_by_path[bpath]["model"]))
             rep_of.append(reps.setdefault(sig, len(reps)))
         firsts = {}
         for i, j in enumerate(rep_of):
             firsts.setdefault(j, i)
         unique = [todo[firsts[j]] for j in range(len(reps))]
-        scored = score([{"source": r["source"], "explanation": r.get("explanation", ""), "behavior": behaviors_by_path[bpath], "seed": args.eval_seed, "experiments": args.eval_experiments,
-                         "options": options, "require_align": r["program"] == "oracle"} for r in unique])
+        scored = score([{"source": "" if isinstance(r["source"], dict) else r["source"], **({"ir": r["source"]} if isinstance(r["source"], dict) else {}),
+                         "explanation": r.get("explanation", ""), "behavior": behaviors_by_path[bpath], "seed": args.eval_seed, "experiments": args.eval_experiments,
+                         "options": options} for r in unique])
         scores = [scored[j] for j in rep_of]
         with open(done_path, "a") as f:
             for r, x in zip(todo, scores):
@@ -1450,7 +1407,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--mode", choices=["grpo", "rl2", "dpo", "bestofn", "sft", "eval", "rescore"], required=True)
     ap.add_argument("--base", default="Qwen/Qwen3-8B")
-    ap.add_argument("--init", help="SFT adapter the policy starts from and is held to (pi_ref): a PEFT directory or g-predict's sft.py output")
+    ap.add_argument("--init", help="SFT adapter the policy starts from and is held to (pi_ref): a PEFT directory")
     ap.add_argument("--model", required=True, help="target model whose behaviors are explained: qwen3-0.6b | vpd4l")
     ap.add_argument("--behaviors", default=str(BEHAVIORS))
     ap.add_argument("--scorer", choices=sorted(SCORERS), default="checker")
@@ -1458,8 +1415,6 @@ def main():
     ap.add_argument("--checker", help="the checker binary (mpd_graph_2951; score.py's GRAPH_CHECKER); on MATS name target/release/examples/mpd_graph_2951 so the job builds it")
     ap.add_argument("--vpd-view", help="VPD's decomposition export for the checker's vpd view (programs naming VPD parts are invalid without it; vpd4l: ~/mpd-data/engine/vpd4l_decomposition)")
     ap.add_argument("--checker-device", choices=["gpu"], help="run the checker's large products on the single-precision device (float32; compare scores only within one device)")
-    ap.add_argument("--reader-items", type=int, default=0, help="without a reader server, keep the reader items of every K-th scored program for offline reader scoring (0: none)")
-    ap.add_argument("--reader-item-stride", type=int, default=1, help="of a kept program's reader items, keep every S-th (an unbiased subsample of the reader term's mean)")
     ap.add_argument("--score-batch", type=int, default=4, help="programs per checker request (a server's memory grows with it)")
     ap.add_argument("--checker-gib", type=int, help="the checker server's memory lease on the Mac (score.py's default otherwise)")
     ap.add_argument("--export", help="the target model's export directory for the checker (score.py's EXPORTS entry otherwise)")
@@ -1480,11 +1435,10 @@ def main():
     ap.add_argument("--micro", type=int, default=2)
     ap.add_argument("--sampler", choices=["auto", "vllm", "hf"], default="auto")
     ap.add_argument("--resample", type=int, default=0, help="redraw each invalid program (mech.trace) up to R times at sampling time")
-    ap.add_argument("--grammar", action="store_true", help="vLLM decodes every answer under rl/grammar.py's grammar (parts only inside align/claim statements, only the decomposition's); --resample stays the fallback")
-    ap.add_argument("--part-tokens", help="part tokens: the registry file of g-predict's part_tokens.py build; the projections train with the LoRA and vLLM gets the rows in place")
+    ap.add_argument("--grammar", action="store_true", help="vLLM decodes every answer under rl/grammar.py's grammar (the groups dict, one group per line, only the decomposition's subcomponents); --resample stays the fallback")
+    ap.add_argument("--part-tokens", help="part tokens: the registry file of part_tokens.py build; the projections train with the LoRA and vLLM gets the rows in place")
     ap.add_argument("--materialize-every", type=int, default=0, help="with --part-tokens: also rewrite the checkpoint and restart vLLM every K steps (0: only at the start; the rows are copied in place before every sampling call)")
     ap.add_argument("--share-gpu", action="store_true", help="one GPU for vLLM and the trainer: vLLM sleeps (weights to host) while training and the trainer moves to the host while sampling, so --gpu-memory can be 0.8")
-    ap.add_argument("--no-reader", action="store_true", help="score without the reader term (required when GRAPH_READER is unset and the checker scores); execution, necessity, alignment, claims and complexity stay on")
     ap.add_argument("--hf-batch", type=int, default=16, help="sequences per transformers generate call (the Mac / CPU sampler)")
     ap.add_argument("--gpu-memory", type=float, default=0.85, help="vLLM's share of its GPU (lower it when the trainer shares the GPU)")
     ap.add_argument("--prompt-holdout", type=int, default=4, help="every K-th prompt of each training behavior is held out for evaluation (0: none)")
@@ -1495,7 +1449,7 @@ def main():
     ap.add_argument("--eval-experiments", type=int, help="experiments per evaluation score (default: --experiments; the team keeps search, RL and evaluation at one setting)")
     ap.add_argument("--eval-behaviors", type=int, default=0, help="evaluate a fixed random subset of this many behaviors per set (0: all)")
     ap.add_argument("--uniform-seeds", type=int, default=0, help="training draws experiments from step mod M (the checker's uniform_seeds: M's outcomes cached after M steps); the evaluation never")
-    ap.add_argument("--no-baselines", dest="baselines", action="store_false", help="skip scoring the empty, full and search programs in evaluation")
+    ap.add_argument("--no-baselines", dest="baselines", action="store_false", help="skip scoring the baselines (nothing named, the teacher answer) in evaluation")
     ap.add_argument("--programs", nargs="*", help="sft: program files (globs or directories of .json) in g-int's layout")
     ap.add_argument("--data", nargs="*", help="sft: JSONL question files ({'messages': [user, assistant]})")
     ap.add_argument("--program-share", type=float, default=0.3, help="sft: probability that a batch example is a program example")
@@ -1509,7 +1463,7 @@ def main():
     ap.add_argument("--run-name", help="the run's name in runs/oracle/<behavior>.<run>.json (default: the --out directory's name)")
     ap.add_argument("--teacher", help="teacher answers (DIR/manifest.jsonl, <behavior>.answer.txt or .py): rl2's reward scale, an evaluation baseline, and SFT answers for training behaviors")
     ap.add_argument("--teacher-heldout", help="held-out behaviors' teacher answers (~/mpd-data/graph_oracle/teacher_heldout): evaluation baselines only")
-    ap.add_argument("--credit", type=int, default=16, help="rl2: part drops sampled per answer for per-token credit (every statement drop is scored too; 0: episode advantages only)")
+    ap.add_argument("--credit", type=int, default=16, help="rl2: subcomponent drops sampled per answer for per-token credit (every group drop is scored too; 0: episode advantages only)")
     ap.add_argument("--credit-answers", type=int, default=0, help="rl2: answers credited per group: the best valid one and K - 1 other distinct valid ones drawn at random (0: every distinct valid answer)")
     ap.add_argument("--refill", type=int, default=1, help="rl2: sampling rounds that replace groups without signal by behaviors drawn by gap to the teacher")
     ap.add_argument("--refine", type=int, default=2, help="rl2: rounds of edits.refine from each group's best answer for expert iteration (0: off)")
@@ -1524,8 +1478,6 @@ def main():
     ap.add_argument("--exit-beta", type=float, default=0.1, help="rl2: inverse temperature of expert iteration's DPO pair")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
-    if args.scorer == "checker" and not os.environ.get("GRAPH_READER") and not args.no_reader:
-        raise SystemExit("the score includes the reader term: set GRAPH_READER (reader_score.py serve) or pass --no-reader")
     lr = args.lr if args.lr is not None else {"bestofn": 1e-4, "sft": 1e-4}.get(args.mode, 1e-5)
     beta = args.beta if args.beta is not None else {"dpo": 0.1}.get(args.mode, 0.04)
     args.beta = beta
@@ -1537,14 +1489,13 @@ def main():
     torch.manual_seed(args.seed)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    args.init = init_adapter(args.init, out)
     (out / "config.json").write_text(json.dumps({**vars(args), "lr": lr, "beta": beta}, indent=1))
 
     if args.mode == "rescore":  # no policy: scores saved programs again
         if args.checker:
             os.environ["GRAPH_CHECKER"] = str(Path(args.checker).resolve())
-        scorer.WORKERS, scorer.EXPORT, scorer.MEMORY_GIB, scorer.VIEWS, scorer.DEVICE, scorer.BATCH, scorer.ITEMS_EVERY, scorer.ITEM_STRIDE = args.score_workers, args.export, args.checker_gib, views_of(args), args.checker_device, args.score_batch, args.reader_items, args.reader_item_stride
-        print(json.dumps(rescore(args, with_alignment(SCORERS[args.scorer]))))
+        scorer.WORKERS, scorer.EXPORT, scorer.MEMORY_GIB, scorer.VIEWS, scorer.DEVICE, scorer.BATCH = args.score_workers, args.export, args.checker_gib, views_of(args), args.checker_device, args.score_batch
+        print(json.dumps(rescore(args, SCORERS[args.scorer])))
         return
     if args.part_tokens:  # in-process vLLM engine: part rows are copied into its weights before each sampling call
         os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
@@ -1557,7 +1508,7 @@ def main():
 
         rank = json.loads((Path(args.init) / "adapter_config.json").read_text())["r"] if args.init else args.lora_rank
         answers = None
-        if args.grammar:  # guided decoding: parts only in align/claim statements, only the attached decomposition's (rl/grammar.py)
+        if args.grammar:  # guided decoding: the groups dict, only the attached decomposition's subcomponents (rl/grammar.py)
             import grammar
 
             answers = grammar.model_grammar(args.model, args.part_tokens)
@@ -1577,8 +1528,8 @@ def main():
         sampler = ValidSampler(sampler, pol.tok, args.model, args.resample)
     if args.checker:
         os.environ["GRAPH_CHECKER"] = str(Path(args.checker).resolve())
-    score = with_alignment(SCORERS[args.scorer])
-    scorer.WORKERS, scorer.EXPORT, scorer.MEMORY_GIB, scorer.VIEWS, scorer.DEVICE, scorer.BATCH, scorer.ITEMS_EVERY, scorer.ITEM_STRIDE = args.score_workers, args.export, args.checker_gib, views_of(args), args.checker_device, args.score_batch, args.reader_items, args.reader_item_stride
+    score = SCORERS[args.scorer]
+    scorer.WORKERS, scorer.EXPORT, scorer.MEMORY_GIB, scorer.VIEWS, scorer.DEVICE, scorer.BATCH = args.score_workers, args.export, args.checker_gib, views_of(args), args.checker_device, args.score_batch
     root = Path(args.behaviors)
     pool, heldout_prompts = split_prompts(behaviors(root, args.model, "train"), args.prompt_holdout, out / "behaviors")
     sets = {"heldout_behaviors": behaviors(root, args.model, "heldout"), "heldout_prompts": heldout_prompts}

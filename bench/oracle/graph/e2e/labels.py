@@ -27,9 +27,9 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 sys.path.insert(0, str(HERE))
 
-import contrast  # noqa: E402
+import explain  # noqa: E402
+import mech  # noqa: E402
 import score as score_module  # noqa: E402
-import search  # noqa: E402
 
 DATA = Path.home() / "mpd-data/graph_oracle"
 
@@ -41,13 +41,18 @@ def items_of(behavior: dict, variable: str) -> dict:
             "targets": sum(len(p["target_positions"]) for p in prompts)}  # its own id: the checker's memos are keyed by it
 
 
+def units(chunks) -> list[tuple]:
+    """The units (layer, site, index) of chunks (layer, site, start, stop)."""
+    return [(l, s, i) for l, s, i0, j in chunks for i in range(i0, j)]
+
+
 def search_variable(checker, sizes: dict, a, log) -> dict:
     """Leaves ranked by the share of the signal their swap moves, and the groups joining the best of them."""
     def moved(groups):
-        programs = [contrast.nodes_program(contrast.kept_of(g)) if g else contrast.nodes_program({}) for g in groups]
+        programs = [explain.ir(units(g)) for g in groups]
         results = []
         for k in range(0, len(programs), a.batch):
-            results += checker.score_batch(programs[k:k + a.batch], experiments=0, seed=0, reader=False, stand_in="counterfactual")
+            results += checker.score_batch(programs[k:k + a.batch], experiments=0, seed=0, stand_in="counterfactual")
         return [r["necessity_error_bits"] if r.get("valid", True) else float("inf") for r in results]
 
     signal = moved([[]])[0]
@@ -73,10 +78,9 @@ def search_variable(checker, sizes: dict, a, log) -> dict:
             groups.append(list(joined))
     shares = [share(e) for e in moved(groups)]
     log("groups: " + ", ".join(f"{sum(j - i for _, _, i, j in g)}:{s:.1%}" for g, s in zip(groups, shares)))
-    units = lambda g: [search.name(("sub", l, s, i)) for l, s, i0, j in g for i in range(i0, j)]  # noqa: E731
     return {"signal_bits": signal,
             "leaves": [{"chunk": list(c), "share": effect[c]} for c in leaves],
-            "groups": [{"parts": len(units(g)), "units": units(g), "share": s} for g, s in zip(groups, shares)],
+            "groups": [{"parts": len(units(g)), "units": [explain.token(u) for u in units(g)], "share": s} for g, s in zip(groups, shares)],
             "chunks": [{"chunk": list(c), "share": effect[c]} for c in sorted(effect, key=lambda c: -effect[c])[:256]]}
 
 
@@ -86,7 +90,6 @@ def main():
     ap.add_argument("--behaviors-dir", type=Path, default=DATA / "behaviors_vary/vpd4l")
     ap.add_argument("--export", type=Path, default=Path.home() / "mpd-data/engine/vpd4l")
     ap.add_argument("--vpd", type=Path, default=Path.home() / "mpd-data/engine/vpd4l_decomposition")
-    ap.add_argument("--importance", type=Path, default=DATA / "experiments/importance", help="site sizes")
     ap.add_argument("--device")
     ap.add_argument("--chunk", type=int, default=256)
     ap.add_argument("--leaf", type=int, default=8)
@@ -100,8 +103,7 @@ def main():
     work.mkdir(exist_ok=True)
     for b in a.behaviors:
         behavior = json.loads((a.behaviors_dir / f"{b}.json").read_text())
-        table = json.loads((a.importance / f"{b}.json").read_text())["sites"]
-        sizes = {(site["layer"], key.split(".")[-1]): len(site["mean"]) for key, site in table.items()}
+        sizes = {(l, site): n for l, row in enumerate(mech.shapes(behavior["model"])["views"]["vpd"]) for site, n in row.items()}
         for v in [v for v in behavior.get("varies", {}) if v != "tokens"]:
             t0 = time.time()
             sub = items_of(behavior, v)

@@ -1,5 +1,4 @@
 """HTML tag closing: after "</" the next tag closes the innermost element still open."""
-from mech import align, claim
 
 
 def open_tags(tokens):

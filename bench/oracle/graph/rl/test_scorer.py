@@ -149,7 +149,7 @@ def check_rescore():
         seen.extend((it["seed"], it["experiments"], json.dumps(it["options"])) for it in items)
         return [{"valid": True, "total_bits": 2 * float(it["source"].split("=")[1]), "exec_error_bits": 2 * float(it["source"].split("=")[1])} for it in items]
 
-    train.ir_signature = lambda source, model: source  # stand-in programs: each its own score
+    train.ir_signature = lambda source, explanation, model: source  # stand-in programs: each its own score
     args = types.SimpleNamespace(samples_from=[str(d / "eval_samples.jsonl")], score_options='{"families": ["swap"]}', eval_seed=5, eval_experiments=16, out=str(d), rescore_tag="t",
                                  behaviors=str(d), model="vpd4l", summary_only=False)
     s = train.rescore(args, score)["heldout_behaviors/r"]
@@ -164,7 +164,7 @@ def check_valid_sampler():
     log-probabilities; stats report the valid share of every draw and of the kept ones."""
     import train
 
-    good = "from mech import align\n\n\ndef answer(tokens):\n    return tokens\n\n\nalign(answer, <p:3.v.5>, <p:3.o.7>)\n"
+    good = 'groups = {"answer": {"subcomponents": ["<p:3.v.5>", "<p:3.o.7>"], "reads": ["input"], "writes": "output"}}\n'
     tok = types.SimpleNamespace(decode=lambda c, skip_special_tokens=True: good if c[0] > 0 else "nonsense(")
     calls = []
 
@@ -217,7 +217,7 @@ def check_redraws_share_wake():
     try:
         inner = train.VllmSampler(types.SimpleNamespace(share_gpu=True, max_tokens=8), 4, 0)
         inner.llm, inner.policy = Engine(), types.SimpleNamespace(model=Model(), dev="cuda:0")
-        good = "from mech import align\n\n\ndef answer(tokens):\n    return tokens\n\n\nalign(answer, <p:3.v.5>, <p:3.o.7>)\n"
+        good = 'groups = {"answer": {"subcomponents": ["<p:3.v.5>", "<p:3.o.7>"], "reads": ["input"], "writes": "output"}}\n'
         tok = types.SimpleNamespace(decode=lambda c, skip_special_tokens=True: "nonsense(" if c[0] == 1 else good)
         train.ValidSampler(inner, tok, "vpd4l", 2)([[0], [0]], 2, Path("."), 0)
     finally:

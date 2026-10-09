@@ -1,6 +1,5 @@
 """Past tense: an irregular verb's past form is recalled; a regular verb adds -ed (with -d after e, -ied
 after a consonant and y, and a doubled final consonant after a short vowel)."""
-from mech import align, claim
 
 IRREGULAR = {
     'break': ' broke', 'bring': ' brought', 'buy': ' bought', 'catch': ' caught',
