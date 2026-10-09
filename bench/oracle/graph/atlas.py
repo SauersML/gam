@@ -127,7 +127,7 @@ def load(path: Path = ATLAS) -> dict:
     return json.loads(path.read_text())
 
 
-def describe(token: str, entry: dict, examples: int = 3) -> str:
+def describe(entry: dict, examples: int = 3) -> str:
     """One line: where the subcomponent fires most in text, and, for a residual writer, its logit lens."""
     fires = ", ".join(f"{(before[-24:] + '[' + tok + ']')!r} {z:+.0f}" for before, tok, z in entry["top"][:examples])
     line = f"fires on {fires}"
@@ -156,17 +156,15 @@ def importance(ids: list[int], device: str = "mps") -> dict[str, torch.Tensor]:
 
 
 def scores(behavior: dict, device: str = "mps", prompts: int = 32) -> dict[str, dict]:
-    """Per subcomponent over the behavior's first `prompts` prompts: `need`, its causal importance summed over the
-    positions up to the last target (VPD's measure of how much of it the model needs there), mean over prompts; `at`,
-    where its importance peaks most often ("target" or the token there); `target` and `changed`, its mean activation at
-    the targets on the prompts and on the changed prompts in units of its typical size in text; `moved`, the largest
-    change of that activation between prompt and changed prompt at any position, `moved_need`, the same weighted by
-    the larger importance of the two, and `moved_at`, where `moved_need` peaks most often."""
+    """Per subcomponent, means over the behavior's first `prompts` prompts: `need`, its causal importance summed over
+    the positions up to the last target (VPD's measure of how much of it the model needs there); `moved`, the largest
+    change of its activation between prompt and changed prompt at any position, in units of its typical activation in
+    text; `moved_need`, that change weighted by the larger importance of the two; and `moved_at`, where `moved_need`
+    peaks most often ("target" or the token there)."""
     rms = {n: torch.tensor([load()["parts"][part(*site_of(n), c)]["rms"] for c in range(C)], device=device).clamp_min(1e-12)
            for n, C in model(device)[1].C.items()}
     tk = mech.tokenizer(behavior["model"])
     sums: dict[str, dict[str, torch.Tensor]] = {}
-    peaks: dict[str, list[dict]] = {}
     shifts: dict[str, list[dict]] = {}
     seqs = sequences(behavior)[:prompts]
     for ids, targets, changed in seqs:
@@ -175,11 +173,9 @@ def scores(behavior: dict, device: str = "mps", prompts: int = 32) -> dict[str, 
         b = activations(torch.tensor([changed]), device) if changed else None
         cb = importance(changed, device) if changed else None
         for n, c in ci.items():
-            s = sums.setdefault(n, {k: torch.zeros(c.shape[1], device=device) for k in ("need", "target", "changed", "moved", "moved_need")})
+            s = sums.setdefault(n, {k: torch.zeros(c.shape[1], device=device) for k in ("need", "moved", "moved_need")})
             s["need"] += c.sum(0)
-            s["target"] += (a[n][0][targets] / rms[n]).mean(0)
             if b is not None:
-                s["changed"] += (b[n][0][targets] / rms[n]).mean(0)
                 moved = ((a[n][0] - b[n][0]) / rms[n]).abs()
                 weighted = moved * torch.maximum(c, cb[n])
                 s["moved"] += moved.max(0).values
@@ -188,15 +184,11 @@ def scores(behavior: dict, device: str = "mps", prompts: int = 32) -> dict[str, 
                 for k, t in enumerate(weighted.argmax(0).tolist()):
                     w = "target" if t in targets else name(tk, ids[t])
                     words[k][w] = words[k].get(w, 0) + 1
-            words = peaks.setdefault(n, [dict() for _ in range(c.shape[1])])
-            for k, t in enumerate(c.argmax(0).tolist()):
-                w = "target" if t in targets else name(tk, ids[t])
-                words[k][w] = words[k].get(w, 0) + 1
     out = {}
     for n, s in sums.items():
         values = {k: (v / len(seqs)).tolist() for k, v in s.items()}
         for c in range(len(values["need"])):
-            out[part(*site_of(n), c)] = {**{k: values[k][c] for k in values}, "at": max(peaks[n][c].items(), key=lambda kv: kv[1])[0],
+            out[part(*site_of(n), c)] = {**{k: values[k][c] for k in values},
                                          "moved_at": max(shifts[n][c].items(), key=lambda kv: kv[1])[0] if n in shifts else ""}
     return out
 
@@ -229,7 +221,7 @@ def text(behavior: dict, top: int = 48, more: int = 208, device: str = "mps") ->
              " where it is largest; VPD's causal importance summed over positions; what it does in text):"]
     for p in ranked[:top]:
         s = table_[p]
-        lines.append(f"  {p} moves {s['moved']:.1f} at {s['moved_at']!r}, need {s['need']:.1f}: {describe(p, atlas[p])}")
+        lines.append(f"  {p} moves {s['moved']:.1f} at {s['moved_at']!r}, need {s['need']:.1f}: {describe(atlas[p])}")
     if more:
         lines.append("Next (subcomponent, difference, token):")
         rest = [f"{p} {table_[p]['moved']:.1f} {table_[p]['moved_at']!r}" for p in ranked[top:top + more]]

@@ -3,18 +3,20 @@ keeping the set at each size k. The search behind the teacher answers.
 
 Every error is the execution error of the explanation naming the set (one output group, e2e/explain.ir; everything
 left out runs on the changed prompt), scored on the behavior's first --search-prompts prompts and their changed
-prompts alone (--rank-experiments 0) with necessity off; the signal is the error of naming nothing. Removing chunks
-from the whole model by their single removals fails here: the difference between prompt and changed prompt travels many parallel paths, so each chunk's
-removal alone costs little and their joint removal costs everything. Growing from nothing named fails too: what is
-left out runs on the changed prompt, so a named block reaches the output only directly until a whole path from the
-input to the output is named, and no single block or matrix lowers the error. So, from the whole model (the eight
-blocks, one layer's attention or MLP each):
+prompts alone (--rank-experiments 0) with necessity off; the signal is the error of naming nothing. Removing half
+the model per round by single removals fails here: the difference between prompt and changed prompt travels many
+parallel paths, so each chunk's removal alone costs little and their joint removal costs everything. Growing from
+nothing named fails too: what is left out runs on the changed prompt, so a named block reaches the output only
+directly until a whole path from the input to the output is named, and no single block or matrix lowers the error.
+So, from the whole model (the eight blocks, one layer's attention or MLP each):
 
   refine  halve every piece, measure each half's removal, and drop the halves of least effect, as many as can go
           together for at most --tol of the signal more error (found by bisection on their order); repeat down to
-          single subcomponents, then keep dropping the least costly one at a time until the smallest k. (Halving only
-          when nothing can go is cheaper and much worse: each round's budget goes to coarse pieces that each carry
-          part of the mechanism; bigram.mixed kept 0.6% at 208 subcomponents.)
+          single subcomponents, then keep dropping the least costly one at a time until the smallest k. Cheaper
+          rounds were tried and lose the mechanism: halving only when nothing can go, or pricing each subcomponent,
+          spends the error on coarse pieces that each carry part of it (bigram.mixed kept 0.6% of its signal at 208
+          subcomponents); measuring only the pieces the atlas rates least, or reusing a parent's effect, spends it
+          on a stale order.
 
 The set at each k in --ks is the first set of at most k subcomponents, and "knee" the set where refining stopped
 within the tolerance. Each kept set is then scored in full as an explanation (--experiments, seeds 0 and 1):
@@ -36,7 +38,6 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 sys.path.insert(0, str(HERE))
 
-import atlas  # noqa: E402
 import explain  # noqa: E402
 import mech  # noqa: E402
 import score as score_module  # noqa: E402
@@ -114,7 +115,6 @@ def main():
     ap.add_argument("--tol", type=float, default=0.01, help="the share of the signal a refining round may lose")
     ap.add_argument("--ks", type=int, nargs="+", default=[8, 16, 32, 64, 128, 256])
     ap.add_argument("--batch", type=int, default=3)
-    ap.add_argument("--candidates", type=int, default=0, help="refine the atlas's first N subcomponents of the behavior instead, one per piece")
     ap.add_argument("--out", type=Path, default=DATA / "runs/prune_v4")
     a = ap.parse_args()
     a.out.mkdir(parents=True, exist_ok=True)
@@ -124,10 +124,7 @@ def main():
         t0 = time.time()
         path = a.behaviors_dir / f"{b}.json"
         behavior = json.loads(path.read_text())
-        if a.candidates:
-            chunks = [(u,) for u in explain.units_of(" ".join(atlas.ranking(atlas.table(behavior))[:a.candidates]))]
-        else:
-            chunks = blocks(behavior["model"])
+        chunks = blocks(behavior["model"])
         log = lambda m: print(f"{b}: {m}", flush=True)  # noqa: E731
         searched = a.out / "search" / f"{b}.json"  # the prompts the search scores on
         searched.parent.mkdir(exist_ok=True)
