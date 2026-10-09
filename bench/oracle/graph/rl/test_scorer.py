@@ -56,7 +56,7 @@ def check_evaluate():
     train.render = lambda b: b["id"]
     train.baselines = lambda b: {"empty": "K = 100; S = 0", "teacher": "K = 0; S = 50"}
     tok = types.SimpleNamespace(decode=lambda c, skip_special_tokens=True: f"```python\nK = {c[0]}; S = {c[1]}\n```")
-    pol = types.SimpleNamespace(tok=tok, prompt_ids=lambda text: [0])
+    pol = types.SimpleNamespace(tok=tok, prompt_ids=lambda text: [0], question_ids=lambda b: [0])
     answers = {"a": [[0, 40], [0, 60]], "b": [[2, 10], [3, 1]]}
     sampler = lambda prompts, n, adapter, version: [answers["a"], answers["b"]]  # noqa: E731
 
@@ -98,7 +98,7 @@ def check_sft_examples():
     train.TEACHER.update({"a": "```python\nA\n```", "z": "```python\nZ\n```"})
     train.render = lambda b: "input " + b["id"]
     tok = types.SimpleNamespace(encode=lambda text, add_special_tokens=False: [len(text)])
-    pol = types.SimpleNamespace(tok=tok, end=0, prompt_ids=lambda text: [hash(text) % 97], parts=None)
+    pol = types.SimpleNamespace(tok=tok, end=0, prompt_ids=lambda text: [hash(text) % 97], parts=None, question_ids=lambda b: [hash("input " + b["id"]) % 97])
     args = types.SimpleNamespace(data=[str(d / "q.jsonl")], max_model_len=100)
     programs, questions = train.sft_examples(args, pol, [{"id": "a"}, {"id": "b"}])
     assert programs == [([hash("input a") % 97], [len("```python\nA\n```"), 0])], programs
