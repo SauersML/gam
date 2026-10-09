@@ -212,6 +212,12 @@ pub struct Positions {
 }
 
 impl Positions {
+    /// The share of the listed sequences' positions the node acts at (1 when it lists none).
+    pub fn activity(&self) -> f64 {
+        let (on, all) = self.by_tokens.values().fold((0usize, 0usize), |(on, all), mask| (on + mask.iter().filter(|&&m| m).count(), all + mask.len()));
+        if all == 0 { 1.0 } else { on as f64 / all as f64 }
+    }
+
     /// Per row of `batch` whether the node acts there; `invert`: everywhere but at its positions
     /// (nowhere in a sequence it does not list).
     pub fn rows(&self, batch: &Batch, invert: bool) -> Vec<bool> {
@@ -1653,7 +1659,10 @@ impl Graph {
     /// parity): each part a node lists costs `log2 V` bits to name (`V` = [`Weights::vocabulary`]), a
     /// VPD remainder its matrix's rank in names (it holds that many directions), a named group's use
     /// one name; the rest is code, `token` bits per code token (the program's `log2` token types),
-    /// counted from the graph whatever the syntax wrote it: [`NODE_TOKENS`] per node,
+    /// counted from the graph whatever the syntax wrote it: a node's names cost in proportion to the
+    /// share of the behavior's positions it acts at ([`Positions::activity`]; VPD's count of
+    /// subcomponents active per token, in bits: what acts everywhere costs its names in full),
+    /// [`NODE_TOKENS`] per node,
     /// [`LABEL_TOKENS`] per label (an alignment with pairs, or a claim), [`EDGE_TOKENS`] per edge and
     /// [`ROUTE_TOKENS`] more for a query, key or value route. So the same subcomponents with the same
     /// data flow cost the same in every format (mech's code tokens leave these statements out). The
@@ -1684,7 +1693,8 @@ impl Graph {
             parts += count;
             let claim = if self.claims.get(k).is_some_and(Option::is_some) { LABEL_TOKENS } else { 0 };
             let node = if self.model_wiring { claim } else { NODE_TOKENS + claim };
-            *(if base.contains(&k) { &mut base_bits } else { &mut bits }) += count as f64 * name + node as f64 * token;
+            let activity = self.positions.get(k).and_then(|p| p.as_ref()).map_or(1.0, |p| p.activity());
+            *(if base.contains(&k) { &mut base_bits } else { &mut bits }) += count as f64 * name * activity + node as f64 * token;
         }
         // Each named group used: one name; each label (an alignment tested by pairs; the answer's,
         // aligned by construction, has none): its code.

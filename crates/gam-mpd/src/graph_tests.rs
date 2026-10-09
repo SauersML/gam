@@ -938,6 +938,9 @@ fn model_wiring_runs_as_the_declared_full_wiring_and_prices_no_structure() {
                 "wired as the model = every edge declared: {} {} / {} {}", s[d].exec_error_bits, s[w].exec_error_bits, s[d].necessity_error_bits, s[w].necessity_error_bits);
         assert!(s[w].structure_bits < s[d].structure_bits && s[w].parts == s[d].parts, "no node or edge bits, the same names: {} {} {} {}", s[w].structure_bits, s[d].structure_bits, s[w].parts, s[d].parts);
     }
+    // Names cost in proportion to where they act: at odd positions, about half of everywhere.
+    let half = s[3].structure_bits / s[1].structure_bits;
+    assert!(half > 0.3 && half < 0.6, "names at odd positions cost about half: {half}");
     let bad = Program { wiring: Some("all".into()), ..wired };
     assert!(!checker.score_batch(&[bad], 4, 3, true, None, 0).expect("scores")[0].0.valid, "only \"model\" is a wiring");
 }
