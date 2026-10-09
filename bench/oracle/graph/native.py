@@ -52,7 +52,7 @@ RANDOM = 8  # random draws per score
 CANDIDATES = 32  # replacement tokens the teacher tries per source position for an interchange claim
 MAX_NODES, MAX_CONNECTIONS = 5000, 150000  # the edge stage's compute: beyond these the node stage could not prune it
 TEACH_STEPS, EDGE_STEPS, TEACH_LR = 2000, 600, 0.05  # the teacher's optimization (Adam on the strengths' logits)
-TEACH_INIT = 6.0  # the strengths' starting logit: 0.9975, near the model, so the constraint binds as strengths fall
+TEACH_INIT = 2.0  # the strengths' starting logit (0.88): from 6 (0.9975) 2000 steps end mid-decay (text9000 at 1 bit: 1966 nodes vs 710)
 LN2 = math.log(2)
 
 
