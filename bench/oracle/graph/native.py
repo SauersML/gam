@@ -669,7 +669,7 @@ def pathways(g: Graph, targets: list[int]) -> dict[int, set]:
     return out
 
 
-def program(g: Graph, claims: list | None = None) -> str:
+def program(g: Graph, claims: list | None = None, uses: list | None = None) -> str:
     """A graph as an answer: graph(tokens, targets) returning {(position, reader): its parents, "out": the
     prediction's parents, "claims": [(position, replacement, top), ...]}; parents at the reader's own position are one
     string of subcomponents, an attention output's parents (values) a {position: string}; a node with no parents is
@@ -699,6 +699,8 @@ def program(g: Graph, claims: list | None = None) -> str:
             val = '"' + "".join(tok(w) for w in ws) + '"'
         lines.append(f'        ({r[1]}, "{tok(r)}"): {val},')
     lines.append('        "out": "' + "".join(tok(w) for w in sorted(g.out, key=key)) + '",')
+    if uses:
+        lines.append('        "uses": [' + ", ".join(repr(u) for u in uses) + "],")
     if claims:
         lines.append('        "claims": [' + ", ".join(f"({p}, {a!r}, {b!r})" for p, a, b in claims) + "],")
     return "def graph(tokens, targets):\n    return {\n" + "\n".join(lines) + "\n    }\n"
