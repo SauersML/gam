@@ -611,8 +611,10 @@ pub(crate) fn per_copy(execution: Execution, count: usize) -> Result<Vec<Array2<
 /// `circuit` run on the process's device ([`use_device`]), or `None` when there is none or the
 /// circuit holds a block the device path does not cover.
 pub(crate) fn run(weights: &Weights, circuit: &Circuit, job: &Run) -> Option<Result<Execution, String>> {
-    // Nodes acting at some positions (`Unit::at`, a swap at positions) run on the host.
-    if circuit.units.iter().any(|u| u.at.is_some()) || (!job.swaps.is_empty() && circuit.places.iter().any(Option::is_some)) {
+    // Native blocks acting at some positions (`Unit::at`) and swaps at positions run on the host; a
+    // VPD view's nodes at positions run here ([`vpd_site`]).
+    let vpd = |b: &Block| matches!(b, Block::Slices { .. } | Block::AttnSlices { .. });
+    if circuit.units.iter().any(|u| u.at.is_some() && !vpd(&u.block)) || (!job.swaps.is_empty() && circuit.places.iter().any(Option::is_some)) {
         return None;
     }
     // A VPD-view attention's heads attend together (alike).
@@ -1158,6 +1160,36 @@ fn vpd_site(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, job: &Run
     let (rows, width, ops) = (job.tokens.len(), weights.width(), job.ops);
     let mut writes = BTreeMap::new();
     let computing = |u: &usize| circuit.units[*u].computes && !job.swaps.contains_key(u);
+    // A unit acting at some positions (`Unit::at`): per row 1 where it acts, else 0, `cols` wide. Its
+    // query, key, value and MLP-input deltas are zero elsewhere, and its write there is its stand-in.
+    let acts = |u: usize| circuit.units[u].at.as_ref().map(|(p, invert)| p.rows_of(job.tokens, job.spans, *invert));
+    if copies.is_some() && units.iter().any(|&u| circuit.units[u].at.is_some()) {
+        return Err("a stacked run of nodes at positions".into());
+    }
+    let row_mask = |s: &DeviceState, on: &[bool], cols: usize, value: f64| -> Result<Tensor, GpuError> {
+        s.device.upload(Array2::from_shape_fn((rows, cols), |(r, _)| if on[r] { value } else { 1.0 - value }).view())
+    };
+    let at_rows = |s: &DeviceState, u: usize, delta: Tensor| -> Result<Tensor, GpuError> {
+        match acts(u) {
+            Some(on) => {
+                let mut out = s.device.zeros(rows, delta.cols())?;
+                s.device.hadamard(&mut out, &row_mask(s, &on, delta.cols(), 1.0)?, &delta, false)?;
+                Ok(out)
+            }
+            None => Ok(delta),
+        }
+    };
+    let finish = |s: &DeviceState, u: usize, write: Tensor| -> Result<Tensor, GpuError> {
+        match acts(u) {
+            Some(on) => {
+                let mut out = s.device.zeros(rows, write.cols())?;
+                s.device.hadamard(&mut out, &row_mask(s, &on, write.cols(), 1.0)?, &write, false)?;
+                s.device.hadamard(&mut out, &row_mask(s, &on, write.cols(), 0.0)?, &st.standins[u], true)?;
+                Ok(out)
+            }
+            None => Ok(write),
+        }
+    };
     // A unit's route inputs (after the cuts into the site) and their normed values under `norm`, the
     // operations on the site's input applied, less the counterfactual normed input `x_ref`.
     let normed_deltas = |s: &mut DeviceState, u: usize, norm: &crate::graph::Norm, x_ref: Option<&Tensor>, kept: &mut BTreeMap<(usize, usize), Array2<f64>>| -> Result<Vec<Tensor>, GpuError> {
@@ -1212,14 +1244,16 @@ fn vpd_site(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, job: &Run
         for &u in slices.iter().filter(|u| computing(u)) {
             let Block::Slices { fc, rest, .. } = &circuit.units[u].block else { return Err("a VPD-view unit of another block".into()) };
             let x = normed_deltas(s, u, &lw.mlp_norm, x_ref.as_ref(), kept).map_err(e)?;
-            deltas.insert(u, sliced(s, (&vpd.fc_u, &vpd.fc_v), Matrix::Host(&mlp.gate), fc, *rest, &x[0], mask(u, 0)).map_err(e)?);
+            let delta = sliced(s, (&vpd.fc_u, &vpd.fc_v), Matrix::Host(&mlp.gate), fc, *rest, &x[0], mask(u, 0)).map_err(e)?;
+            deltas.insert(u, at_rows(s, u, delta).map_err(e)?);
         }
         let codes = s.device.upload_indices(&vec![law_of(mlp.law).code(); mlp.gate.nrows()]).map_err(e)?;
         for &u in slices.iter().filter(|u| computing(u)) {
             let unit = &circuit.units[u];
             let Block::Slices { down, rest, .. } = &unit.block else { return Err("a VPD-view unit of another block".into()) };
             if down.is_empty() && !rest {
-                writes.insert(u, s.device.zeros(rows, width).map_err(e)?);
+                let none = s.device.zeros(rows, width).map_err(e)?;
+                writes.insert(u, finish(s, u, none).map_err(e)?);
                 continue;
             }
             let mut pre = s.device.copy(&pre_ref).map_err(e)?;
@@ -1227,7 +1261,8 @@ fn vpd_site(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, job: &Run
                 s.device.axpy(&mut pre, 1.0, delta).map_err(e)?;
             }
             let h = s.device.law_values(&pre, &codes, gelu_tanh_constant()).map_err(e)?;
-            writes.insert(u, sliced(s, (&vpd.down_u, &vpd.down_v), Matrix::Host(&mlp.out), down, *rest, &h, mask(u, 1)).map_err(e)?);
+            let write = sliced(s, (&vpd.down_u, &vpd.down_v), Matrix::Host(&mlp.out), down, *rest, &h, mask(u, 1)).map_err(e)?;
+            writes.insert(u, finish(s, u, write).map_err(e)?);
         }
     }
     let attention: Vec<usize> = units.iter().copied().filter(|&u| matches!(circuit.units[u].block, Block::AttnSlices { .. })).collect();
@@ -1262,7 +1297,8 @@ fn vpd_site(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, job: &Run
             let x = normed_deltas(s, u, &lw.attention, x_ref.as_ref(), kept).map_err(e)?;
             let mut ds = Vec::with_capacity(3);
             for (m, list) in [q, k, v].into_iter().enumerate() {
-                ds.push(sliced(s, (&factors[m].0, &factors[m].1), Matrix::Device(&maps[m]), list, *rest, &x[m], mask(u, m)).map_err(e)?);
+                let delta = sliced(s, (&factors[m].0, &factors[m].1), Matrix::Device(&maps[m]), list, *rest, &x[m], mask(u, m)).map_err(e)?;
+                ds.push(at_rows(s, u, delta).map_err(e)?);
             }
             deltas.insert(u, ds);
         }
@@ -1270,7 +1306,8 @@ fn vpd_site(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, job: &Run
             let unit = &circuit.units[u];
             let Block::AttnSlices { o, rest, .. } = &unit.block else { return Err("a VPD-view unit of another block".into()) };
             if o.is_empty() && !rest {
-                writes.insert(u, s.device.zeros(rows, width).map_err(e)?);
+                let none = s.device.zeros(rows, width).map_err(e)?;
+                writes.insert(u, finish(s, u, none).map_err(e)?);
                 continue;
             }
             let mut qkv = refs.iter().map(|x| s.device.copy(x)).collect::<Result<Vec<_>, _>>().map_err(e)?;
@@ -1287,7 +1324,8 @@ fn vpd_site(s: &mut DeviceState, weights: &Weights, circuit: &Circuit, job: &Run
                 ops.head_reads_of(site, u, lw, &mut host, reads_kept);
                 z = s.device.upload(host.view()).map_err(e)?;
             }
-            writes.insert(u, sliced(s, (&a.o.0, &a.o.1), Matrix::Device(&maps[3]), o, *rest, &z, mask(u, 3)).map_err(e)?);
+            let write = sliced(s, (&a.o.0, &a.o.1), Matrix::Device(&maps[3]), o, *rest, &z, mask(u, 3)).map_err(e)?;
+            writes.insert(u, finish(s, u, write).map_err(e)?);
         }
     }
     Ok(writes)

@@ -221,9 +221,14 @@ impl Positions {
     /// Per row of `batch` whether the node acts there; `invert`: everywhere but at its positions
     /// (nowhere in a sequence it does not list).
     pub fn rows(&self, batch: &Batch, invert: bool) -> Vec<bool> {
-        let mut out = vec![!invert; batch.tokens.len()];
-        for &(start, length) in &batch.spans {
-            if let Some(mask) = self.by_tokens.get(&batch.tokens[start..start + length]) {
+        self.rows_of(&batch.tokens, &batch.spans, invert)
+    }
+
+    /// [`Positions::rows`] of a batch given by its tokens and its sequences' spans.
+    pub fn rows_of(&self, tokens: &[u32], spans: &[(usize, usize)], invert: bool) -> Vec<bool> {
+        let mut out = vec![!invert; tokens.len()];
+        for &(start, length) in spans {
+            if let Some(mask) = self.by_tokens.get(&tokens[start..start + length]) {
                 for (row, &acts) in out[start..start + length].iter_mut().zip(mask) {
                     *row = acts != invert;
                 }

@@ -1127,6 +1127,29 @@ fn device_path_runs_vpd_views_as_the_host() {
         let kl = max(&kl_bits(&host.log_probabilities, &device.log_probabilities));
         assert!(kl < 1e-9, "{name}: KL(host ‖ device) with VPD views = {kl:e} bits");
     }
+    // Nodes at positions (odd positions for the attention's, even for the MLP's) run on the device as
+    // on the host, and so do their complements (the positions inverted, as necessity runs them).
+    let sequences: Vec<&Vec<u32>> = f.sequences.iter().chain(&cf).collect();
+    let at = |parity: usize| -> Vec<crate::graph::SequenceAt> {
+        sequences.iter().map(|s| crate::graph::SequenceAt { tokens: (*s).clone(), positions: (0..s.len()).filter(|p| p % 2 == parity).collect() }).collect()
+    };
+    let mut placed = program.clone();
+    for n in &mut placed.nodes {
+        n.at = match n.id.as_str() {
+            "QK" | "V" | "O" => at(1),
+            "F" | "D" => at(0),
+            _ => Vec::new(),
+        };
+    }
+    let placed = Graph::parse(&placed, &weights).expect("parse placed");
+    for (name, circuit) in [("placed", placed.program(&weights, true)), ("placed complement", placed.complement_model(&weights))] {
+        assert!(circuit.units.iter().any(|u| u.at.is_some()), "{name}: nodes at positions");
+        let host = execute(&weights, &circuit, &with_reference, &rows, &BTreeMap::new()).expect("host");
+        let job = crate::graph_device::Run { tokens: &with_reference.tokens, spans: &with_reference.spans, scored: &rows, swaps: &BTreeMap::new(), capture: false, reference: with_reference.reference.as_deref(), ops: &crate::graph::Interventions::default() };
+        let device = run_on(&mut state, &weights, &circuit, &job).expect("device");
+        let kl = max(&kl_bits(&host.log_probabilities, &device.log_probabilities));
+        assert!(kl < 1e-9, "{name}: KL(host ‖ device) with VPD nodes at positions = {kl:e} bits");
+    }
     // The program is not M: its undeclared subcomponents and edges carry the counterfactual.
     let clean = execute(&weights, &graph.model(&weights), &plain, &rows, &BTreeMap::new()).expect("M").log_probabilities;
     let open = execute(&weights, &graph.program(&weights, true), &with_reference, &rows, &BTreeMap::new()).expect("program").log_probabilities;
