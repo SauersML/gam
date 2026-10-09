@@ -611,6 +611,10 @@ pub(crate) fn per_copy(execution: Execution, count: usize) -> Result<Vec<Array2<
 /// `circuit` run on the process's device ([`use_device`]), or `None` when there is none or the
 /// circuit holds a block the device path does not cover.
 pub(crate) fn run(weights: &Weights, circuit: &Circuit, job: &Run) -> Option<Result<Execution, String>> {
+    // Nodes acting at some positions (`Unit::at`, a swap at positions) run on the host.
+    if circuit.units.iter().any(|u| u.at.is_some()) || (!job.swaps.is_empty() && circuit.places.iter().any(Option::is_some)) {
+        return None;
+    }
     // A VPD-view attention's heads attend together (alike).
     let covered = |b: &Block| match b {
         Block::Heads { .. } | Block::Neurons { .. } | Block::Slices { .. } | Block::Features { .. } => true,

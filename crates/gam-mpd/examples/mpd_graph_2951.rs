@@ -19,7 +19,8 @@
 //!   `{"ok", "scores": [...], "seconds"}`), with `"experiments": 32, "seed": 0, "routing": "edges" |
 //!   "nodes", "N": null, "reader_top": 0, "uniform_seeds": null, "stand_in": null` ("delete" or
 //!   "counterfactual" for programs that name no `standin`; by default VPD-view checkers delete),
-//!   `"necessity": true` (false skips the necessity runs):
+//!   `"necessity": true` (false skips the necessity runs), `"metric": "full"` ("answer": each error
+//!   compares the answer's two-outcome distribution per scored row, the token M puts first):
 //!   every score term (`graph::Score`)
 //!   per program, all programs under one seed (`Checker::score_batch`: the behavior's half of the
 //!   experiments shared, `M` once per experiment, runs on parallel threads); with `reader_top` k > 0,
@@ -46,7 +47,7 @@
 use gam_gpu::tensor::Device;
 use gam_mpd::{
     engine::log_to_stderr,
-    graph::{Behavior, Checker, Experiment, Measured, Program, SiteUnits, WeightEdit, Weights},
+    graph::{Behavior, Checker, Experiment, Measured, Metric, Program, SiteUnits, WeightEdit, Weights},
     import::{hugging_face_language_model, import_language_model},
     run_check::{layer_nodes, split_sites},
 };
@@ -378,6 +379,13 @@ fn handle(request: &Value, weights: &mut Option<Weights>, checker: &mut Option<C
             c.uniform_seeds = request["uniform_seeds"].as_u64();
             // "necessity": false skips the necessity runs (necessity_error_bits 0).
             c.necessity = request["necessity"].as_bool().unwrap_or(true);
+            // "metric": "answer" compares the answer's two-outcome distribution per scored row, "full"
+            // (the default) the whole next-token distribution.
+            c.metric = match request["metric"].as_str().unwrap_or("full") {
+                "answer" => Metric::Answer,
+                "full" => Metric::Full,
+                other => return Err(format!("metric {other}: \"full\" or \"answer\"")),
+            };
             let k = request["reader_top"].as_u64().unwrap_or(0) as usize;
             let started = std::time::Instant::now();
             let scored = c.score_batch(&programs, count, seed, edges, n, k)?;

@@ -181,6 +181,43 @@ pub struct NodeIr {
     /// An attention claim about the node's parts ([`Claim`]; "rule" in older programs).
     #[serde(default, alias = "rule")]
     pub claim: Option<serde_json::Value>,
+    /// Where the node acts ([`Positions`]): per sequence (a prompt or a counterfactual, by its
+    /// tokens) the positions; empty, everywhere.
+    #[serde(default)]
+    pub at: Vec<SequenceAt>,
+}
+
+/// One sequence's positions of a node: its tokens and the positions (from 0) the node acts at.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SequenceAt {
+    pub tokens: Vec<u32>,
+    pub positions: Vec<usize>,
+}
+
+/// Where a program's node acts: per sequence, by its tokens, the positions. At the others its parts
+/// write their stand-ins (their counterfactual values, or zero when deleted), and so do its query,
+/// key, value and MLP-input contributions there: a reader at another position reads the node's
+/// stand-in from those positions. A sequence it does not list (an experiment's edited prompt) it
+/// acts at everywhere.
+#[derive(Clone, Debug, Default)]
+pub struct Positions {
+    pub by_tokens: std::collections::HashMap<Vec<u32>, Vec<bool>>,
+}
+
+impl Positions {
+    /// Per row of `batch` whether the node acts there; `invert`: everywhere but at its positions
+    /// (nowhere in a sequence it does not list).
+    pub fn rows(&self, batch: &Batch, invert: bool) -> Vec<bool> {
+        let mut out = vec![!invert; batch.tokens.len()];
+        for &(start, length) in &batch.spans {
+            if let Some(mask) = self.by_tokens.get(&batch.tokens[start..start + length]) {
+                for (row, &acts) in out[start..start + length].iter_mut().zip(mask) {
+                    *row = acts != invert;
+                }
+            }
+        }
+        out
+    }
 }
 
 /// One address: `index` a unit, a list of units, or absent for every unit of `kind` in the layer.
@@ -828,6 +865,9 @@ impl Incoming {
 pub struct Unit {
     pub block: Block,
     pub computes: bool,
+    /// A computing unit that acts only at some positions ([`Positions`], and whether inverted: a
+    /// complement model's node, computing everywhere but at its positions); none, everywhere.
+    pub at: Option<(Arc<Positions>, bool)>,
     /// Per route slot, what it reads.
     pub routes: [Incoming; 3],
     /// For a VPD MLP block: the units of its site whose `c_fc` writes its `down_proj` subcomponents
@@ -844,6 +884,9 @@ pub struct Circuit {
     pub nodes: usize,
     /// Stand-ins are zero ([`Graph::delete`]): `Checker::referenced` attaches [`Reference::zeros`].
     pub delete: bool,
+    /// Per node unit its positions ([`Positions`]; none: everywhere): a swap of a node's writes
+    /// ([`execute`]'s `swaps`) replaces them at those positions only.
+    pub places: Vec<Option<Arc<Positions>>>,
 }
 
 
@@ -872,6 +915,8 @@ pub struct Graph {
     pub internal: Vec<(usize, usize)>,
     /// The program's alignments with their nodes as indices ([`Checker::alignment_error`]).
     pub alignments: Vec<(AlignmentIr, Vec<usize>)>,
+    /// Per node where it acts ([`Positions`]; none: everywhere).
+    pub positions: Vec<Option<Arc<Positions>>>,
     /// The shared base's nodes (`Program::base`): always on, connected to every node, kept by
     /// necessity's deletion, priced apart.
     pub base: BTreeSet<usize>,
@@ -1438,12 +1483,28 @@ impl Graph {
             let parts = g.parts.iter().map(|t| group_part(weights, t)).collect::<Result<BTreeSet<_>, _>>()?;
             groups.push(GroupUse { name: g.name.clone(), parts, nodes });
         }
-        Ok(Self { delete, ids, blocks, claims, edges, internal, alignments, base, implied, groups })
+        let mut positions = Vec::with_capacity(program.nodes.len());
+        for node in &program.nodes {
+            if node.at.is_empty() {
+                positions.push(None);
+                continue;
+            }
+            let mut by_tokens = std::collections::HashMap::new();
+            for seq in &node.at {
+                let mut mask = vec![false; seq.tokens.len()];
+                for &t in &seq.positions {
+                    *mask.get_mut(t).ok_or_else(|| format!("{}: position {t} past a sequence of {} tokens", node.id, seq.tokens.len()))? = true;
+                }
+                by_tokens.insert(seq.tokens.clone(), mask);
+            }
+            positions.push(Some(Arc::new(Positions { by_tokens })));
+        }
+        Ok(Self { delete, ids, blocks, claims, edges, internal, alignments, positions, base, implied, groups })
     }
 
     /// The empty program: every piece a stand-in.
     pub fn empty() -> Self {
-        Self { delete: false, ids: Vec::new(), blocks: Vec::new(), claims: Vec::new(), edges: Vec::new(), internal: Vec::new(), alignments: Vec::new(), base: BTreeSet::new(), implied: (0, 0), groups: Vec::new() }
+        Self { delete: false, ids: Vec::new(), blocks: Vec::new(), claims: Vec::new(), edges: Vec::new(), internal: Vec::new(), alignments: Vec::new(), positions: Vec::new(), base: BTreeSet::new(), implied: (0, 0), groups: Vec::new() }
     }
 
     /// Every piece of `weights` not in a node, per site: the heads of each layer, then its neurons.
@@ -1533,23 +1594,26 @@ impl Graph {
                 }
                 // A node reads its own c_fc subcomponents; others' through declared same-site edges.
                 let hidden = if edges { Incoming::Only(self.internal.iter().filter(|(_, r)| *r == n).map(|(w, _)| Writer::Unit(*w)).chain([Writer::Unit(n)]).collect()) } else { Incoming::all() };
-                Unit { block: block.clone(), computes: true, routes, hidden }
+                Unit { block: block.clone(), computes: true, at: self.positions[n].clone().map(|p| (p, false)), routes, hidden }
             })
             .collect();
-        units.extend(self.complement(weights).into_iter().map(|block| Unit { block, computes: false, routes: [Incoming::all(), Incoming::all(), Incoming::all()], hidden: Incoming::all() }));
-        Circuit { units, logits: routed(None, Route::Input), nodes: self.blocks.len(), delete: self.delete }
+        units.extend(self.complement(weights).into_iter().map(|block| Unit { block, computes: false, at: None, routes: [Incoming::all(), Incoming::all(), Incoming::all()], hidden: Incoming::all() }));
+        Circuit { units, logits: routed(None, Route::Input), nodes: self.blocks.len(), delete: self.delete, places: self.positions.clone() }
     }
 
     /// `M` with the program's nodes writing their stand-ins (their values on the counterfactual, or
-    /// zero when deleted) and every other piece computing on the prompt, every edge kept; the logits
-    /// read `embed`'s stand-in when the program routes `embed` to them. The necessity experiments'
-    /// `M`.
+    /// zero when deleted) at their positions (everywhere for a node without positions) and every
+    /// other piece computing on the prompt, every edge kept; the logits read `embed`'s stand-in when
+    /// the program routes `embed` to them. The necessity experiments' `M`.
     pub fn complement_model(&self, weights: &Weights) -> Circuit {
         let mut circuit = self.model(weights);
         circuit.delete = self.delete;
         // The shared base stays: necessity takes out the program's own nodes.
         for (k, unit) in circuit.units.iter_mut().take(self.blocks.len()).enumerate() {
-            unit.computes = self.base.contains(&k);
+            unit.computes = self.base.contains(&k) || self.positions[k].is_some();
+            if !self.base.contains(&k) {
+                unit.at = self.positions[k].clone().map(|p| (p, true));
+            }
         }
         if self.edges.iter().any(|(w, r, _)| *w == Writer::Embed && r.is_none()) {
             circuit.logits = Incoming::AllBut([Writer::Embed].into());
@@ -1557,13 +1621,14 @@ impl Graph {
         circuit
     }
 
-    /// `M` as a circuit with the program's nodes as its first units: every piece computing, every
-    /// edge kept.
+    /// `M` as a circuit with the program's nodes as its first units: every piece computing at every
+    /// position, every edge kept (the nodes' positions kept for swaps, `Circuit::places`).
     pub fn model(&self, weights: &Weights) -> Circuit {
         let mut circuit = self.program(weights, false);
         circuit.delete = false;
         for unit in &mut circuit.units {
             unit.computes = true;
+            unit.at = None;
         }
         circuit
     }
@@ -2015,6 +2080,9 @@ const STACKED_ROWS: usize = 1 << 12;
 /// stand-ins are then the counterfactual writes of the parts it does not name) and no transcoder
 /// features stand in. Under these routes a unit's input is the stream itself either way.
 pub(crate) fn stacks(weights: &Weights, circuit: &Circuit) -> bool {
+    if circuit.units.iter().any(|u| u.at.is_some()) {
+        return false;
+    }
     if !circuit.delete && ((0..weights.layers.len()).any(|l| !weights.vpd.contains_key(&l) || !weights.vpd_attention.contains_key(&l)) || circuit.units.iter().any(|u| matches!(u.block, Block::Features { .. }))) {
         return false;
     }
@@ -2270,16 +2338,16 @@ fn stack_sites(weights: &Weights, circuits: &[&Circuit], batch: &Batch, scored: 
         let standin_unit = (!delete).then(|| flipped(!complement));
         let block = if complement { flipped(true) } else { block.clone() };
         let at = units.len();
-        units.push(Unit { block, computes: true, routes: [Incoming::all(), Incoming::all(), Incoming::all()], hidden: Incoming::all() });
+        units.push(Unit { block, computes: true, at: None, routes: [Incoming::all(), Incoming::all(), Incoming::all()], hidden: Incoming::all() });
         if let Some(block) = standin_unit {
             let slot = if site % 2 == 0 { 3 } else { 1 };
             if let Some(m) = masks.get(&(at, slot)).cloned() {
                 masks.insert((at + 1, slot), m);
             }
-            units.push(Unit { block, computes: false, routes: [Incoming::all(), Incoming::all(), Incoming::all()], hidden: Incoming::all() });
+            units.push(Unit { block, computes: false, at: None, routes: [Incoming::all(), Incoming::all(), Incoming::all()], hidden: Incoming::all() });
         }
     }
-    let merged = Circuit { nodes: units.len(), units, logits: Incoming::all(), delete: true };
+    let merged = Circuit { nodes: units.len(), units, logits: Incoming::all(), delete: true, places: Vec::new() };
     let copies = crate::graph_device::Copies { count: circuits.len(), rows, masks, standin, resume: None, halt: None, embed_out: Vec::new() };
     let tokens: Vec<u32> = (0..circuits.len()).flat_map(|_| batch.tokens.iter().copied()).collect();
     let spans: Vec<(usize, usize)> = (0..circuits.len()).flat_map(|j| batch.spans.iter().map(move |&(start, n)| (j * rows + start, n))).collect();
@@ -2376,6 +2444,41 @@ fn run(weights: &Weights, circuit: &Circuit, batch: &Batch, scored: &[usize], sw
     };
     let mut normed_kept = BTreeMap::new();
     let mut reads_kept = BTreeMap::new();
+    // Positions ([`Positions`]): per unit the rows it acts at (none: every row), and per swapped
+    // node the rows its swap replaces (none: every row).
+    let acts: Vec<Option<Vec<bool>>> = circuit.units.iter().map(|u| u.at.as_ref().map(|(p, invert)| p.rows(batch, *invert))).collect();
+    let swapped_at: Vec<Option<Vec<bool>>> = (0..units).map(|u| if swaps.contains_key(&u) { circuit.places.get(u).and_then(Option::as_ref).map(|p| p.rows(batch, false)) } else { None }).collect();
+    let full_swap = |u: usize| swaps.contains_key(&u) && swapped_at[u].is_none();
+    // A unit's contribution to queries, keys, values or a hidden pre-activation (actual minus
+    // stand-in) is zero at the rows it does not act at.
+    let at_rows = |u: usize, mut delta: Array2<f64>| -> Array2<f64> {
+        if let Some(rows) = &acts[u] {
+            for (mut row, &on) in delta.outer_iter_mut().zip(rows) {
+                if !on {
+                    row.fill(0.0);
+                }
+            }
+        }
+        delta
+    };
+    // A unit's write: the swap's rows where it is swapped, its stand-in's where it does not act.
+    let finish = |u: usize, mut write: Array2<f64>| -> Array2<f64> {
+        if let (Some(rows), Some(value)) = (&swapped_at[u], swaps.get(&u)) {
+            for ((mut row, &on), v) in write.outer_iter_mut().zip(rows).zip(value.outer_iter()) {
+                if on {
+                    row.assign(&v);
+                }
+            }
+        }
+        if let Some(rows) = &acts[u] {
+            for ((mut row, &on), v) in write.outer_iter_mut().zip(rows).zip(standins[u].outer_iter()) {
+                if !on {
+                    row.assign(&v);
+                }
+            }
+        }
+        write
+    };
     let input = |incoming: &Incoming, st: &Streams| -> Array2<f64> {
         match incoming {
             Incoming::AllBut(cut) => {
@@ -2425,7 +2528,7 @@ fn run(weights: &Weights, circuit: &Circuit, batch: &Batch, scored: &[usize], sw
             let mut deltas: BTreeMap<usize, Array2<f64>> = BTreeMap::new();
             for &u in &slices {
                 let unit = &circuit.units[u];
-                if !unit.computes || swaps.contains_key(&u) {
+                if !unit.computes || full_swap(u) {
                     continue;
                 }
                 let routes = unit.block.routes();
@@ -2433,11 +2536,11 @@ fn run(weights: &Weights, circuit: &Circuit, batch: &Batch, scored: &[usize], sw
                 ops.cut_inputs(site, unit, routes, &mut inputs, &st)?;
                 let mut x_hat = norm.apply(&inputs[0]);
                 ops.normed(site, u, 0, &mut x_hat, &mut normed_kept);
-                deltas.insert(u, fc_of(&unit.block, &x_hat)? - fc_of(&unit.block, &x_ref)?);
+                deltas.insert(u, at_rows(u, fc_of(&unit.block, &x_hat)? - fc_of(&unit.block, &x_ref)?));
             }
             for &u in &slices {
                 let unit = &circuit.units[u];
-                if !unit.computes || swaps.contains_key(&u) {
+                if !unit.computes || full_swap(u) {
                     continue;
                 }
                 let Block::Slices { down, rest, .. } = &unit.block else { return Err("a VPD-view unit of another block".into()) };
@@ -2479,7 +2582,7 @@ fn run(weights: &Weights, circuit: &Circuit, batch: &Batch, scored: &[usize], sw
             let mut deltas: BTreeMap<usize, Vec<Array2<f64>>> = BTreeMap::new();
             for &u in &attention {
                 let unit = &circuit.units[u];
-                if !unit.computes || swaps.contains_key(&u) {
+                if !unit.computes || full_swap(u) {
                     continue;
                 }
                 let Block::AttnSlices { q, k, v, rest, .. } = &unit.block else { return Err("a VPD-view unit of another block".into()) };
@@ -2490,13 +2593,13 @@ fn run(weights: &Weights, circuit: &Circuit, batch: &Batch, scored: &[usize], sw
                 for (m, list) in [q, k, v].into_iter().enumerate() {
                     let mut x_hat = lw.attention.apply(&inputs[m]);
                     ops.normed(site, u, m, &mut x_hat, &mut normed_kept);
-                    ds.push(sliced(factors[m], &maps[m], list, *rest, &x_hat) - sliced(factors[m], &maps[m], list, *rest, &x_ref));
+                    ds.push(at_rows(u, sliced(factors[m], &maps[m], list, *rest, &x_hat) - sliced(factors[m], &maps[m], list, *rest, &x_ref)));
                 }
                 deltas.insert(u, ds);
             }
             for &u in &attention {
                 let unit = &circuit.units[u];
-                if !unit.computes || swaps.contains_key(&u) {
+                if !unit.computes || full_swap(u) {
                     continue;
                 }
                 let Block::AttnSlices { o, rest, .. } = &unit.block else { return Err("a VPD-view unit of another block".into()) };
@@ -2543,12 +2646,12 @@ fn run(weights: &Weights, circuit: &Circuit, batch: &Batch, scored: &[usize], sw
             if !unit.computes {
                 continue;
             }
-            if let Some(value) = swaps.get(&u) {
-                st.writes[u] = Some(value.clone());
+            if full_swap(u) {
+                st.writes[u] = Some(swaps[&u].clone());
                 continue;
             }
             if let Some(w) = slice_writes.remove(&u) {
-                st.writes[u] = Some(w);
+                st.writes[u] = Some(finish(u, w));
                 continue;
             }
             let routes = unit.block.routes();
@@ -2590,7 +2693,7 @@ fn run(weights: &Weights, circuit: &Circuit, batch: &Batch, scored: &[usize], sw
                 }
                 Block::Slices { .. } | Block::AttnSlices { .. } => return Err("a VPD block outside its site's pass".into()),
             };
-            st.writes[u] = Some(write);
+            st.writes[u] = Some(finish(u, write));
         }
         for &u in &order[at..end] {
             match &st.writes[u] {
@@ -2654,6 +2757,36 @@ pub fn log_probabilities(weights: &Weights, last: &Array2<f64>) -> Result<Array2
 /// `KL(p ‖ q)` in bits per row of two log-probability tables.
 pub fn kl_bits(p: &Array2<f64>, q: &Array2<f64>) -> Vec<f64> {
     p.outer_iter().zip(q.outer_iter()).map(|(p, q)| p.iter().zip(q.iter()).map(|(a, b)| if a.is_finite() { a.exp() * (a - b) } else { 0.0 }).sum::<f64>() / std::f64::consts::LN_2).collect()
+}
+
+/// What an error compares in each scored row ([`Checker::metric`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Metric {
+    /// The whole next-token distribution: `KL(p ‖ q)`.
+    #[default]
+    Full,
+    /// The behavior's answer: per row the token `by` puts first, `a`, and the two-outcome
+    /// distribution (a, any other token) under `p` and `q`, compared by `KL` (a VPD subnetwork's
+    /// standard: the target prediction kept, not the whole distribution).
+    Answer,
+}
+
+/// Per row, `KL` between the two-outcome distributions (the answer `a`, any other token) of `p` and
+/// `q`, in bits, `a` being the token `by` puts first in that row.
+pub fn answer_kl_bits(p: &Array2<f64>, q: &Array2<f64>, by: &Array2<f64>) -> Vec<f64> {
+    let binary = |pa: f64, qa: f64| {
+        let (pa, qa) = (pa.clamp(1e-12, 1.0 - 1e-12), qa.clamp(1e-12, 1.0 - 1e-12));
+        (pa * (pa / qa).ln() + (1.0 - pa) * ((1.0 - pa) / (1.0 - qa)).ln()) / std::f64::consts::LN_2
+    };
+    p.outer_iter()
+        .zip(q.outer_iter())
+        .zip(by.outer_iter())
+        .map(|((p, q), by)| {
+            let a = by.iter().enumerate().fold((0, f64::NEG_INFINITY), |best, (i, &v)| if v > best.1 { (i, v) } else { best }).0;
+            binary(p[a].exp(), q[a].exp())
+        })
+        .collect()
 }
 
 // ------------------------------------------------------------------------------ experiments
@@ -3988,6 +4121,8 @@ pub struct Checker {
     /// Whether scores measure necessity (`Score::necessity_error_bits`; true by default): a search
     /// ranking candidates by sufficiency alone may skip its runs.
     pub necessity: bool,
+    /// What every error compares per scored row ([`Metric`]; the whole distribution by default).
+    pub metric: Metric,
     /// The model's shared base (generic machinery, design_v2 section 2): its nodes join every scored
     /// program ([`Checker::with_base`]), always on and priced apart (`Score::base_bits`).
     pub base: Option<Program>,
@@ -4147,6 +4282,7 @@ impl Checker {
             site_references: std::sync::Mutex::new(Vec::new()),
             reference_bytes: 3 << 30,
             necessity: true,
+            metric: Metric::Full,
             base: None,
             zeros: std::sync::Mutex::new(BTreeMap::new()),
             claim_inputs: BTreeMap::new(),
@@ -4215,7 +4351,7 @@ impl Checker {
             }
             if !pieces.is_empty() {
                 kept.push(node.id.clone());
-                out.nodes.push(NodeIr { id: node.id.clone(), pieces, claim: None });
+                out.nodes.push(NodeIr { id: node.id.clone(), pieces, claim: None, at: Vec::new() });
             }
         }
         let present = |id: &str| id == "embed" || id == "logits" || kept.iter().any(|k| k == id) || program.nodes.iter().any(|n| n.id == id);
@@ -4340,6 +4476,21 @@ impl Checker {
         Ok(x)
     }
 
+    /// Whether `graph`'s necessity is collapse toward the counterfactual: the behavior has
+    /// counterfactuals, and the program takes counterfactual values or is scored on the answer.
+    pub fn collapses(&self, graph: &Graph) -> bool {
+        self.counterfactual.is_some() && (!graph.delete || self.metric == Metric::Answer)
+    }
+
+    /// The error of `q` against `p` per scored row under [`Checker::metric`]: `KL(p ‖ q)`, or the
+    /// answer's two-outcome `KL` with the answer `by`'s first token.
+    pub fn divergence(&self, p: &Array2<f64>, q: &Array2<f64>, by: &Array2<f64>) -> Vec<f64> {
+        match self.metric {
+            Metric::Full => kl_bits(p, q),
+            Metric::Answer => answer_kl_bits(p, q, by),
+        }
+    }
+
     /// The error of `graph`'s alignments, bits per target: for each alignment the mean, over its pairs'
     /// base targets, of `KL(M(source) ‖ M_swap)`, where `M_swap` is `M` on the base with the aligned
     /// nodes' writes taken from its run on the source (every other piece computing on the base,
@@ -4384,7 +4535,7 @@ impl Checker {
             let unswapped = execute(&self.weights, &circuit, &base, &rows, &BTreeMap::new())?.log_probabilities;
             let swaps: BTreeMap<usize, Array2<f64>> = nodes.iter().map(|&u| written.get(u).cloned().flatten().map(|w| (u, w)).ok_or_else(|| format!("alignment {}: an aligned node wrote nothing", alignment.variable))).collect::<Result<_, _>>()?;
             let swapped = if swaps.is_empty() { unswapped.clone() } else { execute(&self.weights, &circuit, &base, &rows, &swaps)?.log_probabilities };
-            let (errors, signal) = (kl_bits(&target, &swapped), kl_bits(&target, &unswapped));
+            let (errors, signal) = (self.divergence(&target, &swapped, &target), self.divergence(&target, &unswapped, &target));
             let cost: f64 = errors.iter().zip(&signal).map(|(e, s)| e.min(*s)).sum();
             total += cost / rows.len().max(1) as f64;
         }
@@ -4726,8 +4877,8 @@ impl Checker {
         self.measure_runs(plan, &mut measured)?;
         // Necessity, for each program with nodes: the same complement experiments for every program.
         let complements = complements(&experiments);
-        // (Counterfactual programs of no nodes too: their parts' collapse is the whole signal.)
-        let named: Vec<usize> = (0..parsed.len()).filter(|&i| self.necessity && (!parsed[i].0.delete || parsed[i].0.blocks.len() > parsed[i].0.base.len())).collect();
+        // (Programs of no nodes too where necessity is collapse: their parts' collapse is the whole signal.)
+        let named: Vec<usize> = (0..parsed.len()).filter(|&i| self.necessity && (self.collapses(&parsed[i].0) || parsed[i].0.blocks.len() > parsed[i].0.base.len())).collect();
         let necessity_kl = self.necessity_runs(&named.iter().map(|&i| (&parsed[i].0, &circuits[i])).collect::<Vec<_>>(), &complements)?;
         let mut necessity = vec![(0.0, BTreeMap::new()); parsed.len()];
         for (&i, kls) in named.iter().zip(&necessity_kl) {
@@ -4812,24 +4963,25 @@ impl Checker {
     /// program's nodes taken out and every other piece computing on the prompt
     /// ([`Graph::complement_model`]).
     ///
-    /// With counterfactual stand-ins the nodes take their counterfactual values and necessity is
-    /// collapse, the mirror of sufficiency (the lead, 10-08): taking out the named parts together
-    /// should make `M` behave as on the counterfactual. The error is
-    /// `min(KL(M(x') ‖ M_c), KL(M(x') ‖ M(x)))` with `M(x')` `M`'s own output on the counterfactual
-    /// and `M(x)` on the prompt under the same experiment (weight edit or site operation): at most
-    /// the signal, which the empty program pays (its `M_c` is `M`), about zero for a complete
-    /// mechanism. Deleting programs ([`Graph::delete`]; clean and weight edits) compare `M_c` with
-    /// their prediction, `M`'s own run less the program's parts, nothing recomputed
-    /// ([`Checker::without_parts`]).
+    /// Where necessity is collapse ([`Checker::collapses`]), the mirror of sufficiency: taking out
+    /// the named parts together (at their counterfactual values, or deleted for a deleting program
+    /// scored on the answer) should make `M` behave as on the counterfactual. The error is
+    /// `min(D(M(x'), M_c), D(M(x'), M(x)))` ([`Checker::divergence`]: the whole distribution, or the
+    /// prompt's answer) with `M(x')` `M`'s own output on the counterfactual and `M(x)` on the prompt
+    /// under the same experiment (weight edit or site operation): at most the signal, which the
+    /// empty program pays (its `M_c` is `M`), about zero for a complete mechanism. Without
+    /// counterfactuals, or scored on the whole distribution (deleting every part makes noise, not the
+    /// counterfactual's distribution), deleting programs ([`Graph::delete`]; clean and weight edits)
+    /// compare `M_c` with their prediction, `M`'s own run less the program's parts, nothing
+    /// recomputed ([`Checker::without_parts`]).
     pub(crate) fn necessity_runs(&mut self, programs: &[(&Graph, &Circuit)], complements: &[Experiment]) -> Result<Vec<Vec<Option<Vec<f64>>>>, String> {
         let mut out = vec![Vec::with_capacity(complements.len()); programs.len()];
         if programs.is_empty() {
             return Ok(out);
         }
         let native = Graph::empty().model(&self.weights);
-        let counterfactual = self.counterfactual.is_some();
         for e in complements {
-            let measured: Vec<bool> = programs.iter().map(|(g, _)| if g.delete { !matches!(e, Experiment::Sites { .. }) } else { counterfactual }).collect();
+            let measured: Vec<bool> = programs.iter().map(|(g, _)| self.collapses(g) || (g.delete && !matches!(e, Experiment::Sites { .. }))).collect();
             self.set_edit(e);
             // Every run with the experiment's edit applied to M's weights.
             let restore = match e {
@@ -4839,7 +4991,7 @@ impl Checker {
             let result = (|| -> Result<Vec<Option<Vec<f64>>>, String> {
                 // With counterfactual stand-ins: M on the counterfactuals and on the prompts under the
                 // experiment, shared by every program.
-                let collapse = programs.iter().zip(&measured).any(|((g, _), &m)| m && !g.delete);
+                let collapse = programs.iter().zip(&measured).any(|((g, _), &m)| m && self.collapses(g));
                 let (target, prompt) = if collapse { (Some(self.run_swapped(&native, e)?), Some(self.run(&native, e)?)) } else { (None, None) };
                 // The complement models of counterfactual programs that stack, as one batch
                 // (`run_complements`), site experiments aside.
@@ -4862,14 +5014,14 @@ impl Checker {
                         kls.push(None);
                         continue;
                     }
-                    if let (false, Some(target), Some(prompt)) = (g.delete, &target, &prompt) {
+                    if let (true, Some(target), Some(prompt)) = (self.collapses(g), &target, &prompt) {
                         // A program of no nodes outside its base takes nothing out: M_c is M.
                         let model = match complemented[k].take() {
                             Some(m) => m,
                             None if g.blocks.len() <= g.base.len() => prompt.clone(),
                             None => self.run(&g.complement_model(&self.weights), e)?,
                         };
-                        kls.push(Some(kl_bits(target, &model).into_iter().zip(kl_bits(target, prompt)).map(|(c, s)| c.min(s)).collect()));
+                        kls.push(Some(self.divergence(target, &model, prompt).into_iter().zip(self.divergence(target, prompt, prompt)).map(|(c, s)| c.min(s)).collect()));
                         continue;
                     }
                     let model = self.run(&g.complement_model(&self.weights), e)?;
@@ -4891,6 +5043,9 @@ impl Checker {
     /// `M`'s own run (and `embed`'s, unless the program routes it to the logits) through the final
     /// norm, at the scored rows. A deleting program's prediction of `M` with its parts deleted.
     fn without_parts(&self, graph: &Graph) -> Result<Array2<f64>, String> {
+        if graph.positions.iter().any(Option::is_some) {
+            return Err("a program whose nodes act at positions needs the behavior's counterfactuals for necessity".into());
+        }
         let (batch, rows) = &self.clean;
         let cell = cached_run(&self.references, format!("{} own", self.edit.as_deref().unwrap_or("")), self.reference_bytes)?;
         let r = cell
@@ -5036,7 +5191,7 @@ impl Checker {
                         let (i, e, key) = &runs[r];
                         let m = outcomes.get(key).ok_or("M's outcome went missing")?;
                         let p = this.run(&circuits[*i], e)?;
-                        let kl = kl_bits(m, &p);
+                        let kl = this.divergence(m, &p, m);
                         let candidates = clean.map(|c| Candidates::of(c, m, &p, &this.rows_of(e), &this.rows_of(&Experiment::Clean), top));
                         Ok((r, kl, candidates))
                     };
@@ -5085,7 +5240,7 @@ impl Checker {
                                         let (_, e, key) = &runs[r];
                                         let m = outcomes.get(key).ok_or("M's outcome went missing")?;
                                         let candidates = clean.map(|c| Candidates::of(c, m, &p, &this.rows_of(e), &this.rows_of(&Experiment::Clean), top));
-                                        Ok((r, kl_bits(m, &p), candidates))
+                                        Ok((r, this.divergence(m, &p, m), candidates))
                                     })
                                     .collect();
                             }

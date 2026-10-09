@@ -52,8 +52,8 @@ fn piece(layer: usize, kind: &str) -> PieceIr {
 fn full_program() -> Program {
     let mut nodes = Vec::new();
     for l in 0..LAYERS {
-        nodes.push(NodeIr { id: format!("a{l}"), pieces: vec![piece(l, "head")], claim: None });
-        nodes.push(NodeIr { id: format!("m{l}"), pieces: vec![piece(l, "mlp")], claim: None });
+        nodes.push(NodeIr { id: format!("a{l}"), pieces: vec![piece(l, "head")], claim: None, at: Vec::new() });
+        nodes.push(NodeIr { id: format!("m{l}"), pieces: vec![piece(l, "mlp")], claim: None, at: Vec::new() });
     }
     let order: Vec<String> = nodes.iter().map(|n| n.id.clone()).collect();
     let mut edges = Vec::new();
@@ -347,7 +347,7 @@ fn batch_scores_equal_single_scores() {
         draw(Family::Push, &[(SharedSite::Stream(1), Operation::Push { direction: 0, size: 1 })], 5, false),
     ];
     checker.sites = SiteUnits { pool, ..units };
-    let node = |id: &str, layer: usize, kind: &str, index: usize| NodeIr { id: id.into(), pieces: vec![PieceIr { view: "native".into(), layer, kind: kind.into(), index: Some(crate::graph::Index::One(index)) }], claim: None };
+    let node = |id: &str, layer: usize, kind: &str, index: usize| NodeIr { id: id.into(), pieces: vec![PieceIr { view: "native".into(), layer, kind: kind.into(), index: Some(crate::graph::Index::One(index)) }], claim: None, at: Vec::new() };
     let mut partial = Program { model: "tiny".into(), valid: true, ..Program::default() };
     partial.nodes = vec![node("h", 1, "head", 0), node("m", 0, "mlp", 2)];
     partial.edges = vec![EdgeIr { from: "embed".into(), to: "m".into(), route: "input".into() }, EdgeIr { from: "m".into(), to: "h".into(), route: "value".into() }, EdgeIr { from: "h".into(), to: "logits".into(), route: "input".into() }];
@@ -541,7 +541,7 @@ fn head_operations_reach_a_vpd_view_attention() {
     let qkv = (wave(3, heads * dh, 0.2), wave(width, 3, 0.9));
     s.weights.vpd_attention.insert(0, crate::graph::VpdAttention { q: qkv.clone(), k: qkv.clone(), v: qkv, o: (wave(3, width, 1.3), wave(heads * dh, 3, 0.4)) });
     let mut program = Program { model: "tiny".into(), valid: true, ..Program::default() };
-    program.nodes = vec![NodeIr { id: "o".into(), pieces: vec![PieceIr { view: "vpd".into(), layer: 0, kind: "o_proj".into(), index: Some(crate::graph::Index::One(0)) }], claim: None }];
+    program.nodes = vec![NodeIr { id: "o".into(), pieces: vec![PieceIr { view: "vpd".into(), layer: 0, kind: "o_proj".into(), index: Some(crate::graph::Index::One(0)) }], claim: None, at: Vec::new() }];
     program.edges = vec![EdgeIr { from: "o".into(), to: "logits".into(), route: "input".into() }];
     let graph = Graph::parse(&program, &s.weights).expect("parse");
     let circuit = graph.program(&s.weights, true);
@@ -605,7 +605,7 @@ fn memos_serve_a_later_checker() {
         std::fs::remove_dir_all(&dir).expect("the memo directory is removed");
     }
     let mut program = Program { model: "tiny".into(), valid: true, ..Program::default() };
-    program.nodes = vec![NodeIr { id: "h".into(), pieces: vec![PieceIr { view: "native".into(), layer: 0, kind: "head".into(), index: Some(crate::graph::Index::One(0)) }], claim: None }];
+    program.nodes = vec![NodeIr { id: "h".into(), pieces: vec![PieceIr { view: "native".into(), layer: 0, kind: "head".into(), index: Some(crate::graph::Index::One(0)) }], claim: None, at: Vec::new() }];
     program.edges = vec![EdgeIr { from: "embed".into(), to: "h".into(), route: "input".into() }, EdgeIr { from: "h".into(), to: "logits".into(), route: "input".into() }];
     let mut first = Checker::new(weights.clone(), behavior(&sequences)).expect("checker");
     first.memo_dir = Some(dir.clone());
@@ -687,7 +687,7 @@ fn necessity_pays_for_left_out_mediators() {
 /// The program naming layer 0's heads alone (`necessity_pays_for_left_out_mediators`'s partial).
 fn partial_program() -> Program {
     let mut partial = Program { model: "tiny".into(), valid: true, ..Program::default() };
-    partial.nodes = vec![NodeIr { id: "a0".into(), pieces: vec![piece(0, "head")], claim: None }];
+    partial.nodes = vec![NodeIr { id: "a0".into(), pieces: vec![piece(0, "head")], claim: None, at: Vec::new() }];
     partial.edges = ["query", "key", "value"].iter().map(|r| EdgeIr { from: "embed".into(), to: "a0".into(), route: (*r).into() }).chain(["embed", "a0"].iter().map(|w| EdgeIr { from: (*w).into(), to: "logits".into(), route: "input".into() })).collect();
     partial
 }
@@ -709,7 +709,7 @@ fn deleting_programs_score_named_parts_alone() {
     let mut full = full_program();
     full.nodes.iter_mut().find(|n| n.id == "m0").expect("m0").pieces = ["c_fc", "down_proj"].iter().flat_map(|k| [vpd(k, crate::graph::Index::Many((0..if *k == "c_fc" { 5 } else { 4 }).collect())), vpd(k, crate::graph::Index::Name("rest".into()))]).collect();
     let mut partial = Program { model: "tiny".into(), valid: true, ..Program::default() };
-    partial.nodes = vec![NodeIr { id: "a0".into(), pieces: vec![piece(0, "head")], claim: None }];
+    partial.nodes = vec![NodeIr { id: "a0".into(), pieces: vec![piece(0, "head")], claim: None, at: Vec::new() }];
     partial.edges = ["query", "key", "value"].iter().map(|r| EdgeIr { from: "embed".into(), to: "a0".into(), route: (*r).into() }).chain(["embed", "a0"].iter().map(|w| EdgeIr { from: (*w).into(), to: "logits".into(), route: "input".into() })).collect();
     let counterfactual = Program { standin: Some("counterfactual".into()), ..partial.clone() };
     let empty = Program { model: "tiny".into(), valid: true, ..Program::default() };
@@ -744,8 +744,8 @@ fn complexity_is_what_a_reader_takes_in() {
     let vpd = |kind: &str, index: crate::graph::Index| PieceIr { view: "vpd".into(), layer: 0, kind: kind.into(), index: Some(index) };
     let mut program = Program { model: "tiny".into(), valid: true, ..Program::default() };
     program.nodes = vec![
-        NodeIr { id: "f".into(), pieces: vec![vpd("c_fc", crate::graph::Index::Many(vec![0, 3])), vpd("down_proj", crate::graph::Index::Name("rest".into()))], claim: None },
-        NodeIr { id: "h".into(), pieces: vec![PieceIr { view: "native".into(), layer: 1, kind: "head".into(), index: Some(crate::graph::Index::One(1)) }], claim: None },
+        NodeIr { id: "f".into(), pieces: vec![vpd("c_fc", crate::graph::Index::Many(vec![0, 3])), vpd("down_proj", crate::graph::Index::Name("rest".into()))], claim: None, at: Vec::new() },
+        NodeIr { id: "h".into(), pieces: vec![PieceIr { view: "native".into(), layer: 1, kind: "head".into(), index: Some(crate::graph::Index::One(1)) }], claim: None, at: Vec::new() },
     ];
     program.edges = vec![EdgeIr { from: "embed".into(), to: "f".into(), route: "input".into() }, EdgeIr { from: "f".into(), to: "logits".into(), route: "input".into() }, EdgeIr { from: "f".into(), to: "h".into(), route: "value".into() }, EdgeIr { from: "h".into(), to: "logits".into(), route: "input".into() }];
     // 64 code token types: 6 bits per token.
@@ -755,7 +755,7 @@ fn complexity_is_what_a_reader_takes_in() {
     // The model's shared base holds f's parts, so the program may list f as base (each program that
     // names them takes them over from the shared base node, which is then dropped).
     let mut library = Program { model: "tiny".into(), valid: true, ..Program::default() };
-    library.nodes = vec![NodeIr { id: "lib".into(), pieces: program.nodes[0].pieces.clone(), claim: None }];
+    library.nodes = vec![NodeIr { id: "lib".into(), pieces: program.nodes[0].pieces.clone(), claim: None, at: Vec::new() }];
     checker.set_base(Some(library)).expect("shared base");
     let scores = checker.score_batch(&[program, with_base], 6, 2, true, None, 0).expect("scores");
     let (plain, based) = (&scores[0].0, &scores[1].0);
@@ -796,10 +796,10 @@ fn a_shared_base_joins_every_program() {
     let empty = Program { model: "tiny".into(), valid: true, ..Program::default() };
     // Two c_fc subcomponents the base also holds, fed by embed (the base's earlier nodes feed it by implication).
     let mut taking = empty.clone();
-    taking.nodes = vec![NodeIr { id: "p".into(), pieces: vec![vpd("c_fc", crate::graph::Index::Many(vec![0, 1]))], claim: None }];
+    taking.nodes = vec![NodeIr { id: "p".into(), pieces: vec![vpd("c_fc", crate::graph::Index::Many(vec![0, 1]))], claim: None, at: Vec::new() }];
     taking.edges = vec![EdgeIr { from: "embed".into(), to: "p".into(), route: "input".into() }];
     let mut clash = empty.clone();
-    clash.nodes = vec![NodeIr { id: "a1".into(), pieces: vec![piece(1, "head")], claim: None }];
+    clash.nodes = vec![NodeIr { id: "a1".into(), pieces: vec![piece(1, "head")], claim: None, at: Vec::new() }];
     let invalid = Program { valid: false, error: Some("untraceable".into()), ..empty.clone() };
     let mut checker = Checker::new(weights, behavior(&sequences)).expect("checker");
     let (bits, parts) = checker.set_base(Some(base.clone())).expect("base");
@@ -832,7 +832,7 @@ fn deleting_programs_need_no_counterfactuals() {
     }
     let mut checker = Checker::new(weights, plain).expect("checker");
     let mut partial = Program { model: "tiny".into(), valid: true, standin: Some("delete".into()), ..Program::default() };
-    partial.nodes = vec![NodeIr { id: "a0".into(), pieces: vec![piece(0, "head")], claim: None }];
+    partial.nodes = vec![NodeIr { id: "a0".into(), pieces: vec![piece(0, "head")], claim: None, at: Vec::new() }];
     partial.edges = ["query", "key", "value"].iter().map(|r| EdgeIr { from: "embed".into(), to: "a0".into(), route: (*r).into() }).chain(["embed", "a0"].iter().map(|w| EdgeIr { from: (*w).into(), to: "logits".into(), route: "input".into() })).collect();
     let full = Program { standin: Some("delete".into()), ..full_program() };
     let scores = checker.score_batch(&[partial, full], 4, 1, true, None, 0).expect("scores");
@@ -845,7 +845,7 @@ fn deleting_programs_need_no_counterfactuals() {
 #[test]
 fn a_program_base_holds_only_shared_base_parts() {
     let (weights, sequences) = model("graph_sites_base_parts");
-    let node = |id: &str, layer: usize, index: usize| NodeIr { id: id.into(), pieces: vec![PieceIr { view: "native".into(), layer, kind: "head".into(), index: Some(crate::graph::Index::One(index)) }], claim: None };
+    let node = |id: &str, layer: usize, index: usize| NodeIr { id: id.into(), pieces: vec![PieceIr { view: "native".into(), layer, kind: "head".into(), index: Some(crate::graph::Index::One(index)) }], claim: None, at: Vec::new() };
     let mut own = Program { model: "tiny".into(), valid: true, ..Program::default() };
     own.nodes = vec![node("b", 0, 0)];
     own.base = vec!["b".into()];

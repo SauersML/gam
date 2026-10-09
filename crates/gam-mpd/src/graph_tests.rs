@@ -49,8 +49,8 @@ fn piece(layer: usize, kind: &str) -> PieceIr {
 fn full_program() -> Program {
     let mut nodes = Vec::new();
     for l in 0..LAYERS {
-        nodes.push(NodeIr { id: format!("a{l}"), pieces: vec![piece(l, "head")], claim: None });
-        nodes.push(NodeIr { id: format!("m{l}"), pieces: vec![piece(l, "mlp")], claim: None });
+        nodes.push(NodeIr { id: format!("a{l}"), pieces: vec![piece(l, "head")], claim: None, at: Vec::new() });
+        nodes.push(NodeIr { id: format!("m{l}"), pieces: vec![piece(l, "mlp")], claim: None, at: Vec::new() });
     }
     let order: Vec<String> = nodes.iter().map(|n| n.id.clone()).collect();
     let mut edges = Vec::new();
@@ -117,7 +117,7 @@ fn parse_rejects_bad_programs() {
     let f = fixture("graph_parse");
     let library = Library::new(&f.device, &f.device, &f.native, &f.layers, &f.artifact, 1 << 28, 64).expect("library");
     let weights = Weights::of(&library);
-    let node = |id: &str, layer: usize, kind: &str, index: Option<Index>| NodeIr { id: id.into(), pieces: vec![PieceIr { view: "native".into(), layer, kind: kind.into(), index }], claim: None };
+    let node = |id: &str, layer: usize, kind: &str, index: Option<Index>| NodeIr { id: id.into(), pieces: vec![PieceIr { view: "native".into(), layer, kind: kind.into(), index }], claim: None, at: Vec::new() };
     let mut program = Program { model: "tiny".into(), valid: true, ..Program::default() };
     program.nodes = vec![node("a", 0, "head", Some(Index::One(1))), node("b", 0, "head", Some(Index::Many(vec![0, 1])))];
     assert!(Graph::parse(&program, &weights).is_err(), "a head in two nodes");
@@ -189,7 +189,7 @@ fn counterfactual_undeclared_head_is_patched_from_the_counterfactual() {
     // Head (1, 0) (library head 2) reads its counterfactual read; everything else runs on the prompt.
     let z = library.run(&cf, &BTreeMap::new()).expect("cf run").reads[2].clone();
     let expected = library.log_probabilities(&library.run(&f.sequences, &[(2, z)].into()).expect("patched").last).expect("log p");
-    let node = |id: &str, layer: usize, kind: &str, index: Option<Index>| NodeIr { id: id.into(), pieces: vec![PieceIr { view: "native".into(), layer, kind: kind.into(), index }], claim: None };
+    let node = |id: &str, layer: usize, kind: &str, index: Option<Index>| NodeIr { id: id.into(), pieces: vec![PieceIr { view: "native".into(), layer, kind: kind.into(), index }], claim: None, at: Vec::new() };
     let program = Program {
         model: "tiny".into(),
         valid: true,
@@ -268,7 +268,7 @@ fn transcoder_features_write_the_transcoder_and_the_rest_is_exact() {
     std::fs::create_dir_all(&dir).expect("dir");
     crate::test_support::transcoder_file(&dir.join("layer_1.safetensors"), 6, 8, 5);
     assert_eq!(weights.attach_transcoders(&dir).expect("attach"), 1);
-    let feature = |id: &str, index: Index| NodeIr { id: id.into(), pieces: vec![PieceIr { view: "transcoder".into(), layer: 1, kind: "feature".into(), index: Some(index) }], claim: None };
+    let feature = |id: &str, index: Index| NodeIr { id: id.into(), pieces: vec![PieceIr { view: "transcoder".into(), layer: 1, kind: "feature".into(), index: Some(index) }], claim: None, at: Vec::new() };
     let program = Program { model: "tiny".into(), valid: true, nodes: vec![feature("f", Index::Many((0..6).collect()))], ..Program::default() };
     let graph = Graph::parse(&program, &weights).expect("parse");
     weights.load_features(&graph).expect("features");
@@ -298,7 +298,7 @@ fn transcoder_features_write_the_transcoder_and_the_rest_is_exact() {
     assert!(gap < 1e-6, "feature writes differ from the transcoder by {gap:e}");
     // One view per site; features in range.
     let mut both = program.clone();
-    both.nodes.push(NodeIr { id: "n".into(), pieces: vec![PieceIr { view: "native".into(), layer: 1, kind: "mlp".into(), index: Some(Index::One(0)) }], claim: None });
+    both.nodes.push(NodeIr { id: "n".into(), pieces: vec![PieceIr { view: "native".into(), layer: 1, kind: "mlp".into(), index: Some(Index::One(0)) }], claim: None, at: Vec::new() });
     assert!(Graph::parse(&both, &weights).is_err(), "neurons and features of one MLP");
     let far = Program { nodes: vec![feature("f", Index::One(6))], ..program.clone() };
     assert!(Graph::parse(&far, &weights).is_err(), "feature out of range");
@@ -340,7 +340,7 @@ fn vpd_mlp_view_reads_the_hidden_stream_through_its_edges() {
     let vpd = exact_vpd(&weights);
     weights.vpd.insert(1, vpd);
     let piece = |layer: usize, view: &str, kind: &str, index: Option<Index>| PieceIr { view: view.into(), layer, kind: kind.into(), index };
-    let node = |id: &str, p: PieceIr| NodeIr { id: id.into(), pieces: vec![p], claim: None };
+    let node = |id: &str, p: PieceIr| NodeIr { id: id.into(), pieces: vec![p], claim: None, at: Vec::new() };
     let all: Vec<usize> = (0..16).collect();
     let nodes = vec![
         node("a0", piece(0, "native", "head", None)),
@@ -411,11 +411,11 @@ fn vpd_attention_view_reads_queries_keys_values_through_its_edges() {
     let piece = |layer: usize, view: &str, kind: &str, index: Option<Index>| PieceIr { view: view.into(), layer, kind: kind.into(), index };
     let all = |n: usize| Some(Index::Many((0..n).collect()));
     let nodes = vec![
-        NodeIr { id: "a0".into(), pieces: vec![piece(0, "native", "head", None)], claim: None },
-        NodeIr { id: "m0".into(), pieces: vec![piece(0, "native", "mlp", None)], claim: None },
-        NodeIr { id: "QKV".into(), pieces: vec![piece(1, "vpd", "q_proj", all(wq.nrows())), piece(1, "vpd", "k_proj", all(wk.nrows())), piece(1, "vpd", "v_proj", all(wv.nrows()))], claim: None },
-        NodeIr { id: "O".into(), pieces: vec![piece(1, "vpd", "o_proj", all(wo.ncols()))], claim: None },
-        NodeIr { id: "m1".into(), pieces: vec![piece(1, "native", "mlp", None)], claim: None },
+        NodeIr { id: "a0".into(), pieces: vec![piece(0, "native", "head", None)], claim: None, at: Vec::new() },
+        NodeIr { id: "m0".into(), pieces: vec![piece(0, "native", "mlp", None)], claim: None, at: Vec::new() },
+        NodeIr { id: "QKV".into(), pieces: vec![piece(1, "vpd", "q_proj", all(wq.nrows())), piece(1, "vpd", "k_proj", all(wk.nrows())), piece(1, "vpd", "v_proj", all(wv.nrows()))], claim: None, at: Vec::new() },
+        NodeIr { id: "O".into(), pieces: vec![piece(1, "vpd", "o_proj", all(wo.ncols()))], claim: None, at: Vec::new() },
+        NodeIr { id: "m1".into(), pieces: vec![piece(1, "native", "mlp", None)], claim: None, at: Vec::new() },
     ];
     let edge = |from: &str, to: &str| EdgeIr { from: from.into(), to: to.into(), route: "input".into() };
     let mut edges = Vec::new();
@@ -448,7 +448,7 @@ fn vpd_attention_view_reads_queries_keys_values_through_its_edges() {
     bad.edges.push(edge("QKV", "logits"));
     assert!(Graph::parse(&bad, &weights).is_err(), "q/k/v subcomponents write no residual");
     let mut mixed = cut.clone();
-    mixed.nodes.push(NodeIr { id: "h".into(), pieces: vec![piece(1, "native", "head", Some(Index::One(0)))], claim: None });
+    mixed.nodes.push(NodeIr { id: "h".into(), pieces: vec![piece(1, "native", "head", Some(Index::One(0)))], claim: None, at: Vec::new() });
     assert!(Graph::parse(&mixed, &weights).is_err(), "heads and VPD subcomponents of one attention");
 }
 
@@ -474,7 +474,7 @@ fn library_parts_resolve_to_their_vpd_subcomponents() {
     std::fs::write(&path, start.to_string()).expect("write");
     assert_eq!(weights.attach_library(&path, "test").expect("attach"), 4);
     let piece = |view: &str, kind: &str, index: Index| PieceIr { view: view.into(), layer: 1, kind: kind.into(), index: Some(index) };
-    let node = |id: &str, pieces: Vec<PieceIr>| NodeIr { id: id.into(), pieces, claim: None };
+    let node = |id: &str, pieces: Vec<PieceIr>| NodeIr { id: id.into(), pieces, claim: None, at: Vec::new() };
     let all = |n: usize| Index::Many((0..n).collect());
     let lib = Program { model: "tiny".into(), valid: true, nodes: vec![node("QKV", vec![piece("library", "attn", Index::One(0))]), node("O", vec![piece("library", "attn", Index::One(1))]), node("F", vec![piece("library", "mlp", Index::One(0))]), node("D", vec![piece("library", "mlp", Index::One(1))])], ..Program::default() };
     let vpd = Program {
@@ -513,7 +513,7 @@ fn qwen3_like_model_full_graph_and_counterfactual_empty_graph() {
         assert!(kl < 1e-9, "{name}: KL = {kl:e} bits");
     }
     // Opaque numbers count a key-value pair shared by two query heads once.
-    let one = Program { model: "tiny".into(), valid: true, nodes: vec![NodeIr { id: "h".into(), pieces: vec![PieceIr { view: "native".into(), layer: 0, kind: "head".into(), index: None }], claim: None }], ..Program::default() };
+    let one = Program { model: "tiny".into(), valid: true, nodes: vec![NodeIr { id: "h".into(), pieces: vec![PieceIr { view: "native".into(), layer: 0, kind: "head".into(), index: None }], claim: None, at: Vec::new() }], ..Program::default() };
     let g = Graph::parse(&one, &weights).expect("parse");
     let h = &weights.layers[0].heads[0];
     let per_query = h.query.len() + h.output.len() + h.query_norm.as_ref().map_or(0, |(g, _)| g.len());
@@ -533,7 +533,7 @@ fn device_path_on_the_host_backend_is_the_host_run() {
     let mut with_reference = plain.clone();
     with_reference.reference = Some(counterfactual.clone());
     let rows: Vec<usize> = (0..plain.tokens.len()).collect();
-    let node = |id: &str, layer: usize, kind: &str, index: Option<Index>| NodeIr { id: id.into(), pieces: vec![PieceIr { view: "native".into(), layer, kind: kind.into(), index }], claim: None };
+    let node = |id: &str, layer: usize, kind: &str, index: Option<Index>| NodeIr { id: id.into(), pieces: vec![PieceIr { view: "native".into(), layer, kind: kind.into(), index }], claim: None, at: Vec::new() };
     let partial = Program { model: "tiny".into(), valid: true, nodes: vec![node("h", 1, "head", Some(Index::One(0))), node("n", 0, "mlp", Some(Index::Many(vec![1, 4, 9]))), node("big", 1, "mlp", Some(Index::Many((0..14).collect())))], ..Program::default() };
     let full = Graph::parse(&full_program(), &weights).expect("full");
     let some = Graph::parse(&partial, &weights).expect("partial");
@@ -574,7 +574,7 @@ fn device_site_operations_on_the_host_backend_are_the_host_run() {
     let mut batch = Batch::new(&f.sequences).expect("batch");
     batch.reference = Some(counterfactual);
     let rows: Vec<usize> = (0..batch.tokens.len()).collect();
-    let node = |id: &str, layer: usize, kind: &str, index: Option<Index>| NodeIr { id: id.into(), pieces: vec![PieceIr { view: "native".into(), layer, kind: kind.into(), index }], claim: None };
+    let node = |id: &str, layer: usize, kind: &str, index: Option<Index>| NodeIr { id: id.into(), pieces: vec![PieceIr { view: "native".into(), layer, kind: kind.into(), index }], claim: None, at: Vec::new() };
     let program = Program { model: "tiny".into(), valid: true, nodes: vec![node("h", 1, "head", Some(Index::One(0))), node("n", 0, "mlp", Some(Index::Many(vec![1, 4, 9])))], ..Program::default() };
     let graph = Graph::parse(&program, &weights).expect("parse");
     let mut state = crate::graph_device::DeviceState::new(Device::host());
@@ -661,7 +661,7 @@ fn device_path_on_a_qwen3_like_model_is_the_host_run() {
     let mut batch = Batch::new(&sequences).expect("batch");
     batch.reference = Some(std::sync::Arc::new(reference(&weights, &Batch::new(&cf).expect("cf batch")).expect("reference")));
     let rows: Vec<usize> = (0..batch.tokens.len()).collect();
-    let node = |id: &str, layer: usize, kind: &str, index: Option<Index>| NodeIr { id: id.into(), pieces: vec![PieceIr { view: "native".into(), layer, kind: kind.into(), index }], claim: None };
+    let node = |id: &str, layer: usize, kind: &str, index: Option<Index>| NodeIr { id: id.into(), pieces: vec![PieceIr { view: "native".into(), layer, kind: kind.into(), index }], claim: None, at: Vec::new() };
     let partial = Program { model: "tiny".into(), valid: true, nodes: vec![node("h", 1, "head", Some(Index::One(0))), node("n", 0, "mlp", Some(Index::Many(vec![1, 4, 9])))], ..Program::default() };
     let graph = Graph::parse(&partial, &weights).expect("partial");
     let mut state = crate::graph_device::DeviceState::new(Device::host());
@@ -744,11 +744,11 @@ pub(crate) fn stacking_programs(weights: &Weights, standin: &str) -> Vec<Graph> 
                 // An edge on each route the node's parts read.
                 let read = |kind: &str| a.iter().any(|p| p.kind == kind);
                 edges.extend([("q_proj", "query"), ("k_proj", "key"), ("v_proj", "value")].iter().filter(|(k, _)| read(k)).map(|(_, r)| edge("embed", "A", r)));
-                nodes.push(NodeIr { id: "A".into(), pieces: a, claim: None });
+                nodes.push(NodeIr { id: "A".into(), pieces: a, claim: None, at: Vec::new() });
                 writers.push("A");
             }
             if !m.is_empty() {
-                nodes.push(NodeIr { id: "M".into(), pieces: m, claim: None });
+                nodes.push(NodeIr { id: "M".into(), pieces: m, claim: None, at: Vec::new() });
                 edges.extend(writers.iter().map(|w| edge(w, "M", "input")));
                 writers.push("M");
             }
@@ -807,8 +807,8 @@ fn old_and_v3_forms_of_an_answer_score_alike() {
     let pairs: Vec<PairIr> = (0..f.sequences.len() - 1).map(|i| PairIr { base: i, source: i + 1, changed: false }).collect();
     let form = |(prev, answer): (&str, &str), answer_alignment: bool| {
         let nodes = vec![
-            NodeIr { id: prev.into(), pieces: vec![piece("v_proj", vec![1, 2]), piece("o_proj", vec![0, 3])], claim: None },
-            NodeIr { id: answer.into(), pieces: vec![piece("c_fc", vec![0, 2, 7]), piece("down_proj", vec![1, 3])], claim: None },
+            NodeIr { id: prev.into(), pieces: vec![piece("v_proj", vec![1, 2]), piece("o_proj", vec![0, 3])], claim: None, at: Vec::new() },
+            NodeIr { id: answer.into(), pieces: vec![piece("c_fc", vec![0, 2, 7]), piece("down_proj", vec![1, 3])], claim: None, at: Vec::new() },
         ];
         let edges = vec![edge("embed", prev, "value"), edge("embed", answer, "input"), edge(prev, answer, "input"), edge(answer, "logits", "input"), edge("embed", "logits", "input")];
         let mut alignments = vec![AlignmentIr { variable: "prev".into(), nodes: vec![prev.into()], pairs: pairs.clone() }];
@@ -848,7 +848,7 @@ fn a_changed_pair_reads_the_base_prompts_changed_prompt() {
     let program = |pairs: Vec<PairIr>| Program {
         model: "tiny".into(),
         valid: true,
-        nodes: vec![NodeIr { id: "g".into(), pieces: vec![piece("v_proj", vec![1, 2]), piece("o_proj", vec![0, 3])], claim: None }],
+        nodes: vec![NodeIr { id: "g".into(), pieces: vec![piece("v_proj", vec![1, 2]), piece("o_proj", vec![0, 3])], claim: None, at: Vec::new() }],
         edges: vec![edge("embed", "g"), edge("g", "logits"), edge("embed", "logits")],
         alignments: vec![AlignmentIr { variable: "label".into(), nodes: vec!["g".into()], pairs }],
         standin: Some("counterfactual".into()),
@@ -870,6 +870,59 @@ fn a_changed_pair_reads_the_base_prompts_changed_prompt() {
     assert!(signal >= a && signal > 0.0, "unplaced {signal} bits vs placed {a} bits");
 }
 
+/// Node positions on the full program (every head and MLP a node, every edge kept: `M` itself): with
+/// every node acting at every position of every sequence it scores as without positions (`M`), with
+/// every node acting nowhere as naming nothing, for sufficiency and necessity alike; at a subset of
+/// positions it differs from both.
+#[test]
+fn node_positions_bound_where_a_node_acts() {
+    use crate::graph::{Score, SequenceAt};
+    let f = fixture("graph_positions");
+    let library = Library::new(&f.device, &f.device, &f.native, &f.layers, &f.artifact, 1 << 28, 64).expect("library");
+    let weights = Weights::of(&library);
+    let cf = counterfactuals(&f.sequences);
+    let sequences: Vec<&Vec<u32>> = f.sequences.iter().chain(&cf).collect();
+    let everywhere: Vec<SequenceAt> = sequences.iter().map(|s| SequenceAt { tokens: (*s).clone(), positions: (0..s.len()).collect() }).collect();
+    let nowhere: Vec<SequenceAt> = sequences.iter().map(|s| SequenceAt { tokens: (*s).clone(), positions: Vec::new() }).collect();
+    let odd: Vec<SequenceAt> = sequences.iter().map(|s| SequenceAt { tokens: (*s).clone(), positions: (1..s.len()).step_by(2).collect() }).collect();
+    let at = |positions: &Vec<SequenceAt>| {
+        let mut p = Program { standin: Some("counterfactual".into()), ..full_program() };
+        for n in &mut p.nodes {
+            n.at = positions.clone();
+        }
+        p
+    };
+    let plain = Program { standin: Some("counterfactual".into()), ..full_program() };
+    let none = Program { nodes: Vec::new(), edges: vec![EdgeIr { from: "embed".into(), to: "logits".into(), route: "input".into() }], ..plain.clone() };
+    let programs = [plain, at(&everywhere), at(&nowhere), none, at(&odd)];
+    let mut checker = Checker::new(weights, claims_behavior(&f.sequences, &cf)).expect("checker");
+    let scores = checker.score_batch(&programs, 4, 3, true, None, 0).expect("scores");
+    let s: Vec<&Score> = scores.iter().map(|(s, _)| s).collect();
+    let terms: Vec<(f64, f64)> = s.iter().map(|x| (x.exec_error_bits, x.necessity_error_bits)).collect();
+    let close = |a: f64, b: f64| (a - b).abs() <= 1e-9 * a.abs().max(b.abs()).max(1.0);
+    assert!(s.iter().all(|x| x.valid), "every program scores");
+    assert!(close(terms[0].0, terms[1].0) && close(terms[0].1, terms[1].1), "everywhere = no positions: {terms:?}");
+    assert!(close(terms[2].0, terms[3].0) && close(terms[2].1, terms[3].1), "nowhere = nothing named: {terms:?}");
+    assert!(!close(terms[4].0, terms[0].0) && !close(terms[4].0, terms[3].0), "a subset of positions is neither: {terms:?}");
+}
+
+/// The answer metric: per row the two-outcome `KL` of the token the reference puts first; zero for equal
+/// rows, zero when only other tokens move, positive when the answer's probability moves.
+#[test]
+fn the_answer_metric_compares_the_answers_probability() {
+    use crate::graph::answer_kl_bits;
+    use ndarray::Array2;
+    let logs = |rows: &[[f64; 3]]| Array2::from_shape_fn((rows.len(), 3), |(r, c)| rows[r][c].ln());
+    let p = logs(&[[0.7, 0.2, 0.1], [0.5, 0.25, 0.25]]);
+    let other = logs(&[[0.7, 0.1, 0.2], [0.5, 0.4, 0.1]]);
+    let moved = logs(&[[0.4, 0.4, 0.2], [0.9, 0.05, 0.05]]);
+    assert!(answer_kl_bits(&p, &p, &p).iter().all(|&e| e.abs() < 1e-12));
+    assert!(answer_kl_bits(&p, &other, &p).iter().all(|&e| e.abs() < 1e-12), "only other tokens move");
+    let e = answer_kl_bits(&p, &moved, &p);
+    let binary = |a: f64, b: f64| (a * (a / b).ln() + (1.0 - a) * ((1.0 - a) / (1.0 - b)).ln()) / std::f64::consts::LN_2;
+    assert!((e[0] - binary(0.7, 0.4)).abs() < 1e-9 && (e[1] - binary(0.5, 0.9)).abs() < 1e-9, "{e:?}");
+}
+
 /// A named group's use costs one name in the structure and its parts there none; its definition
 /// (its parts' names, a remainder its rank) is reported apart as group_bits.
 #[test]
@@ -883,7 +936,7 @@ fn named_groups_cost_one_name_and_report_their_definition() {
     let piece = |kind: &str, index: Index| PieceIr { view: "vpd".into(), layer: 1, kind: kind.into(), index: Some(index) };
     program.model = "tiny".into();
     program.valid = true;
-    program.nodes = vec![NodeIr { id: "M".into(), pieces: vec![piece("c_fc", Index::Many(vec![0, 2, 7])), piece("c_fc", Index::Name("rest".into())), piece("down_proj", Index::Many(vec![1, 3]))], claim: None }];
+    program.nodes = vec![NodeIr { id: "M".into(), pieces: vec![piece("c_fc", Index::Many(vec![0, 2, 7])), piece("c_fc", Index::Name("rest".into())), piece("down_proj", Index::Many(vec![1, 3]))], claim: None, at: Vec::new() }];
     program.edges = vec![EdgeIr { from: "embed".into(), to: "M".into(), route: "input".into() }, EdgeIr { from: "M".into(), to: "logits".into(), route: "input".into() }];
     let name = (weights.vocabulary().max(2) as f64).log2();
     let vpd = &weights.vpd[&1];
@@ -991,13 +1044,13 @@ fn device_path_runs_vpd_views_as_the_host() {
     let piece = |kind: &str, index: Index| PieceIr { view: "vpd".into(), layer: 1, kind: kind.into(), index: Some(index) };
     let rest = || Index::Name("rest".into());
     let nodes = vec![
-        NodeIr { id: "a0".into(), pieces: vec![PieceIr { view: "native".into(), layer: 0, kind: "head".into(), index: None }], claim: None },
-        NodeIr { id: "m0".into(), pieces: vec![PieceIr { view: "native".into(), layer: 0, kind: "mlp".into(), index: None }], claim: None },
-        NodeIr { id: "QK".into(), pieces: vec![piece("q_proj", Index::Many(vec![0, 3])), piece("k_proj", Index::One(1)), piece("k_proj", rest())], claim: None },
-        NodeIr { id: "V".into(), pieces: vec![piece("v_proj", Index::Many(vec![2, 5]))], claim: None },
-        NodeIr { id: "O".into(), pieces: vec![piece("o_proj", Index::Many(vec![0, 1, 4]))], claim: None },
-        NodeIr { id: "F".into(), pieces: vec![piece("c_fc", Index::Many(vec![0, 2, 7])), piece("c_fc", rest())], claim: None },
-        NodeIr { id: "D".into(), pieces: vec![piece("down_proj", Index::Many(vec![1, 3, 5]))], claim: None },
+        NodeIr { id: "a0".into(), pieces: vec![PieceIr { view: "native".into(), layer: 0, kind: "head".into(), index: None }], claim: None, at: Vec::new() },
+        NodeIr { id: "m0".into(), pieces: vec![PieceIr { view: "native".into(), layer: 0, kind: "mlp".into(), index: None }], claim: None, at: Vec::new() },
+        NodeIr { id: "QK".into(), pieces: vec![piece("q_proj", Index::Many(vec![0, 3])), piece("k_proj", Index::One(1)), piece("k_proj", rest())], claim: None, at: Vec::new() },
+        NodeIr { id: "V".into(), pieces: vec![piece("v_proj", Index::Many(vec![2, 5]))], claim: None, at: Vec::new() },
+        NodeIr { id: "O".into(), pieces: vec![piece("o_proj", Index::Many(vec![0, 1, 4]))], claim: None, at: Vec::new() },
+        NodeIr { id: "F".into(), pieces: vec![piece("c_fc", Index::Many(vec![0, 2, 7])), piece("c_fc", rest())], claim: None, at: Vec::new() },
+        NodeIr { id: "D".into(), pieces: vec![piece("down_proj", Index::Many(vec![1, 3, 5]))], claim: None, at: Vec::new() },
     ];
     let edge = |from: &str, to: &str| EdgeIr { from: from.into(), to: to.into(), route: "input".into() };
     let mut edges = vec![edge("QK", "O"), edge("F", "D")];
@@ -1153,7 +1206,7 @@ fn attention_claims_on_vpd_parts_weigh_the_heads_they_reach() {
     weights.vpd_attention.insert(1, crate::graph::VpdAttention { q: exact(&wq), k: exact(&wk), v: exact(&wv), o: (wo.t().to_owned(), Array2::<f64>::eye(wo.ncols())) });
     let cf = counterfactuals(&f.sequences);
     let vpd = |kind: &str, index: Vec<usize>| PieceIr { view: "vpd".into(), layer: 1, kind: kind.into(), index: Some(Index::Many(index)) };
-    let program = |claim: Option<serde_json::Value>| Program { model: "tiny".into(), valid: true, nodes: vec![NodeIr { id: "QK".into(), pieces: vec![vpd("q_proj", (0..width).collect()), vpd("k_proj", (0..width / 2).collect())], claim }], ..Program::default() };
+    let program = |claim: Option<serde_json::Value>| Program { model: "tiny".into(), valid: true, nodes: vec![NodeIr { id: "QK".into(), pieces: vec![vpd("q_proj", (0..width).collect()), vpd("k_proj", (0..width / 2).collect())], claim, at: Vec::new() }], ..Program::default() };
     let plain = Graph::parse(&program(None), &weights).expect("parse");
     // Only head 0 is reached (the other heads' query and key subcomponents are not named).
     let (x_hat, batch) = attention_input(&weights, &f.sequences, 1);
@@ -1176,7 +1229,7 @@ fn attention_claims_on_vpd_parts_weigh_the_heads_they_reach() {
     let device = run_on(&mut state, &weights, &offset.program(&weights, true), &job).expect("device").log_probabilities;
     assert!(max(&kl_bits(&base, &device)) < 1e-9, "device");
     // A claim on value and output subcomponents alone has no pattern to check.
-    let vo = Program { nodes: vec![NodeIr { id: "VO".into(), pieces: vec![vpd("v_proj", vec![0]), vpd("o_proj", vec![0])], claim: Some(serde_json::json!({"op": "attend", "offset": 1})) }], ..program(None) };
+    let vo = Program { nodes: vec![NodeIr { id: "VO".into(), pieces: vec![vpd("v_proj", vec![0]), vpd("o_proj", vec![0])], claim: Some(serde_json::json!({"op": "attend", "offset": 1})), at: Vec::new() }], ..program(None) };
     assert!(Graph::parse(&vo, &weights).is_err());
 }
 
@@ -1242,9 +1295,9 @@ fn device_path_runs_head_operations_on_a_vpd_attention_as_the_host() {
     let piece = |layer: usize, view: &str, kind: &str, index: Option<Index>| PieceIr { view: view.into(), layer, kind: kind.into(), index };
     let all = |n: usize| Some(Index::Many((0..n).collect()));
     let nodes = vec![
-        NodeIr { id: "a0".into(), pieces: vec![piece(0, "native", "head", None)], claim: None },
-        NodeIr { id: "QKV".into(), pieces: vec![piece(1, "vpd", "q_proj", all(wq.nrows())), piece(1, "vpd", "k_proj", all(wk.nrows())), piece(1, "vpd", "v_proj", all(wv.nrows()))], claim: None },
-        NodeIr { id: "O".into(), pieces: vec![piece(1, "vpd", "o_proj", all(wo.ncols()))], claim: None },
+        NodeIr { id: "a0".into(), pieces: vec![piece(0, "native", "head", None)], claim: None, at: Vec::new() },
+        NodeIr { id: "QKV".into(), pieces: vec![piece(1, "vpd", "q_proj", all(wq.nrows())), piece(1, "vpd", "k_proj", all(wk.nrows())), piece(1, "vpd", "v_proj", all(wv.nrows()))], claim: None, at: Vec::new() },
+        NodeIr { id: "O".into(), pieces: vec![piece(1, "vpd", "o_proj", all(wo.ncols()))], claim: None, at: Vec::new() },
     ];
     let edge = |from: &str, to: &str| EdgeIr { from: from.into(), to: to.into(), route: "input".into() };
     let edges = vec![edge("embed", "a0"), edge("embed", "QKV"), edge("a0", "QKV"), edge("QKV", "O"), edge("embed", "logits"), edge("O", "logits")];
