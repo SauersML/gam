@@ -2,8 +2,8 @@
 
     ~/mpd-data/venv/bin/python -m pytest bench/oracle/graph/test_score.py
 
-Twelve closing-quote prompts with their changed prompts (each changes the variable inside), scored on the behavior's
-answers with everything left out deleted: a graph whose middle node carries inside, the same graph without the label,
+Twelve closing-quote prompts with their changed prompts (each changes the variable inside), scored on the model's
+choice between the behavior's answers with everything left out running on the changed prompt: a graph whose middle node carries inside, the same graph without the label,
 the same nodes at the target positions only, nothing named, and an invalid explanation.
 """
 import json

@@ -46,7 +46,7 @@ def edges(ir):
 def test_nodes_edges_and_positions():
     ir = mech._trace(QUOTE, "vpd4l", BEHAVIOR)
     assert ir["valid"], ir["error"]
-    assert ir["standin"] == "delete" and [n["id"] for n in ir["nodes"]] == ["mark", "carry", "close"]
+    assert ir["standin"] == "counterfactual" and [n["id"] for n in ir["nodes"]] == ["mark", "carry", "close"]
     mark, carry, close = ir["nodes"]
     assert [s["positions"] for s in mark["at"]] == [[1], [], [], []], "marks: the quote token, in each sequence"
     assert [s["positions"] for s in carry["at"]] == [[3], [3], [3], [3]] and close["at"] == [], "targets; everywhere"

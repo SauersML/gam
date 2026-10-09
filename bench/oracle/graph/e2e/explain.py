@@ -73,11 +73,11 @@ def writes(units) -> bool:
     return any(u[1] in ("o_proj", "down_proj") for u in units)
 
 
-def ir(units, model: str = "vpd4l", standin: str = "delete") -> dict:
+def ir(units, model: str = "vpd4l", standin: str = "counterfactual") -> dict:
     """The IR of one node naming `units` that reads the input and writes the output (mech.build's edges: the
     embedding into each subcomponent that reads, each earlier block into each later one, each residual writer
-    into the logits, and the embedding into the logits); everything else `standin` ("delete", or "counterfactual":
-    its values on the changed prompt)."""
+    into the logits, and the embedding into the logits); everything else `standin` ("counterfactual": its values on
+    the changed prompt, or "delete")."""
     layers = mech.shapes(model)["layers"]
     blocks: dict[tuple, dict] = {}
     for layer, site, index in units:

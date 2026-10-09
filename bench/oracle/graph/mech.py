@@ -21,8 +21,8 @@ Closing quotes on vpd4l (one behavior variable, inside: whether a quotation is o
           W - sum of its subcomponents. A subcomponent belongs to one node. "at" (default "all"): "all", "targets"
           (the positions whose next token the behavior asks for), "last", or a function of the file taking `tokens`
           (the sequence as the model's token strings) and returning a list of bools or of positions. A node acts
-          only there; elsewhere its subcomponents contribute nothing, and what a reader at another position reads
-          from them through attention is nothing too.
+          only there; elsewhere its subcomponents carry their values on the changed prompt, and so does what a
+          reader at another position reads from them through attention.
   edges   (writer, reader) or (writer, reader, route): the writer a node or "input" (the token embedding), the
           reader a node or "output" (the next-token logits), the route "query", "key" or "value" for an attention
           reader (default: every input the reader has). A writer must write before the reader reads. A node
@@ -30,7 +30,8 @@ Closing quotes on vpd4l (one behavior variable, inside: whether a quotation is o
   labels  optional: node -> the behavior variable it carries (each variable at most one node). A variable is
           tested on the prompts whose changed prompt changes it, by swapping the node's output from the changed
           prompt; a variable no node carries pays its whole signal.
-Everything an explanation leaves out is deleted (VPD's ablation), and the embedding always reaches the output.
+Everything an explanation leaves out runs on the changed prompt (only what it names sees the prompt), and the
+embedding always reaches the output.
 
 trace(source, model, behavior=...) runs a source in a sandboxed child (restricted syntax and builtins, CPU and
 memory limits) and returns the IR the checker reads: nodes (one per node and block, a block being one layer's
@@ -350,7 +351,7 @@ def _line_of(exc: BaseException) -> int | None:
 
 
 def _empty(source: str, model: str) -> dict:
-    return {"model": model, "decomposition": "vpd", "standin": "delete", "nodes": [], "edges": [], "alignments": [],
+    return {"model": model, "decomposition": "vpd", "standin": "counterfactual", "nodes": [], "edges": [], "alignments": [],
             "groups": [], "node_ids": {}, "labels": {}, "python_tokens": 0, "token_types": 0, "source": source,
             "valid": False, "error": None}
 

@@ -1,6 +1,6 @@
 """Teacher answers (#2951 graph oracle, format v4): the pruning search's sets as causal graphs, with nodes carrying the
-behavior's variables from the label search, scored by the checker (the behavior's answers, everything left out
-deleted), the best kept.
+behavior's variables from the label search, scored by the checker (the model's choice between the behavior's answers,
+everything left out running on the changed prompt), the best kept.
 
 Per behavior: each set the pruning search kept (runs/prune_v4/<behavior>.json, k = 8 ... 256 subcomponents) becomes a
 graph, one node per block reading the input and every earlier block, the residual writers writing the output

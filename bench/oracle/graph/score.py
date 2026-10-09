@@ -1,4 +1,4 @@
-"""One call: an explanation (format v3 source through mech's tracer, or its IR) and a behavior -> every score term in
+"""One call: an explanation (format v4 source through mech's tracer, or its IR) and a behavior -> every score term in
 bits, from the Rust checker (crates/gam-mpd/examples/mpd_graph_2951.rs, a JSON-lines server).
 
     from score import Checker
@@ -16,6 +16,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 EXPORTS = {"vpd4l": Path.home() / "mpd-data/engine/vpd4l"}
 VIEWS = {"vpd4l": {"vpd": Path.home() / "mpd-data/engine/vpd4l_decomposition"}}
+METRIC = "choice"  # the behavior is the model's choice between the prompt's answer and the changed prompt's
 # The published checker build (each release build of the graph checker is copied there).
 PUBLISHED = Path.home() / "mpd-data/graph_oracle/bin/mpd_graph_2951"
 # On MATS (mats-run with MATS_BUILD=1) or a pod: the job's own build, $MPD_BIN/mpd_graph_2951 (Linux, CUDA with device "gpu").
@@ -61,22 +62,23 @@ class Checker:
         self.behavior_record = json.loads(path.read_text())
         return self.request({"op": "behavior", "path": str(path)})
 
-    def score(self, program, experiments=32, seed=0, N=None, stand_in="delete", metric="answer"):
+    def score(self, program, experiments=32, seed=0, N=None, stand_in="counterfactual", metric=None):
         """Every score term. `program` is a source, an IR dict, or {"source", "explanation"} (the oracle's answer split
         by prompt.split_answer). An untraceable source is scored as naming nothing, flagged invalid."""
         return self.score_batch([program], experiments, seed, N, stand_in, metric=metric)[0]
 
-    def score_batch(self, programs, experiments=32, seed=0, N=None, stand_in="delete", uniform_seeds=None, options=None, metric="answer"):
+    def score_batch(self, programs, experiments=32, seed=0, N=None, stand_in="counterfactual", uniform_seeds=None, options=None, metric=None):
         """score() for many programs of the current behavior under one seed, in one checker request (the server runs M
         once per experiment it has not cached and the programs in parallel). uniform_seeds m: the experiments are drawn
         from seed mod m, so m collections recur across a caller's seeds. options: further request keys passed to the
         server as they are (e.g. {"necessity": False}). stand_in: what the parts a program does not name carry when its
-        IR names none: "delete" (VPD's ablation) or "counterfactual" (their values on the prompt's changed prompt).
-        metric: "answer" (each error compares the answer's probability, the token the model puts first, as a VPD
-        subnetwork is judged) or "full" (the whole next-token distribution)."""
+        IR names none: "counterfactual" (their values on the prompt's changed prompt) or "delete" (VPD's ablation).
+        metric: "choice" (METRIC: each error compares the model's choice between the prompt's answer and the changed
+        prompt's), "answer" (the distribution over those answers and any other token) or "full" (the whole next-token
+        distribution)."""
         irs = [self.ir(p) for p in programs]
         request = {"op": "score", "programs": irs, "experiments": experiments, "seed": seed, "routing": "edges", "N": N,
-                   "reader_top": 0, "stand_in": stand_in, "metric": metric, **(options or {})}
+                   "reader_top": 0, "stand_in": stand_in, "metric": metric or METRIC, **(options or {})}
         if uniform_seeds:
             request["uniform_seeds"] = uniform_seeds
         return self.request(request)["scores"]

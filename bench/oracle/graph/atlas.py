@@ -29,6 +29,7 @@ sys.path.insert(0, str(HERE.parents[1] / "vpd_2951"))
 import mech  # noqa: E402
 
 ATLAS = Path.home() / "mpd-data/graph_oracle/atlas/vpd4l.json"
+TABLES = Path.home() / "mpd-data/graph_oracle/atlas/tables"  # <behavior id>.json: scores() per behavior
 CODES = {site: code for code, site in mech.SITES.items()}
 WRITERS = ("o_proj", "down_proj")
 TOP = 8  # strongest activations kept per subcomponent
@@ -157,7 +158,9 @@ def scores(behavior: dict, device: str = "mps", prompts: int = 32) -> dict[str, 
     """Per subcomponent over the behavior's first `prompts` prompts: `need`, its causal importance summed over the
     positions up to the last target (VPD's measure of how much of it the model needs there), mean over prompts; `at`,
     where its importance peaks most often ("target" or the token there); `target` and `changed`, its mean activation at
-    the targets on the prompts and on the changed prompts in units of its typical size in text."""
+    the targets on the prompts and on the changed prompts in units of its typical size in text; `moved`, the largest
+    change of that activation between prompt and changed prompt at any position, and `moved_need`, the same weighted by
+    the larger importance of the two."""
     rms = {n: torch.tensor([load()["parts"][part(*site_of(n), c)]["rms"] for c in range(C)], device=device).clamp_min(1e-12)
            for n, C in model(device)[1].C.items()}
     tk = mech.tokenizer(behavior["model"])
@@ -168,12 +171,16 @@ def scores(behavior: dict, device: str = "mps", prompts: int = 32) -> dict[str, 
         ci = importance(ids, device)
         a = activations(torch.tensor([ids]), device)
         b = activations(torch.tensor([changed]), device) if changed else None
+        cb = importance(changed, device) if changed else None
         for n, c in ci.items():
-            s = sums.setdefault(n, {k: torch.zeros(c.shape[1], device=device) for k in ("need", "target", "changed")})
+            s = sums.setdefault(n, {k: torch.zeros(c.shape[1], device=device) for k in ("need", "target", "changed", "moved", "moved_need")})
             s["need"] += c.sum(0)
             s["target"] += (a[n][0][targets] / rms[n]).mean(0)
             if b is not None:
                 s["changed"] += (b[n][0][targets] / rms[n]).mean(0)
+                moved = ((a[n][0] - b[n][0]) / rms[n]).abs()
+                s["moved"] += moved.max(0).values
+                s["moved_need"] += (moved * torch.maximum(c, cb[n])).max(0).values
             words = peaks.setdefault(n, [dict() for _ in range(c.shape[1])])
             for k, t in enumerate(c.argmax(0).tolist()):
                 w = "target" if t in targets else tk.decode([ids[t]])
@@ -191,15 +198,21 @@ def ranking(table: dict[str, dict]) -> list[str]:
     return sorted(table, key=lambda p: -table[p]["need"])
 
 
+def table(behavior: dict, device: str = "mps") -> dict[str, dict]:
+    """scores() of the behavior, from TABLES when written there."""
+    path = TABLES / f"{behavior['id']}.json"
+    return json.loads(path.read_text()) if path.exists() else scores(behavior, device)
+
+
 def text(behavior: dict, top: int = 48, device: str = "mps") -> str:
     """The behavior's subcomponent table for the oracle's prompt."""
-    table = scores(behavior, device)
+    table_ = table(behavior, device)
     atlas = load()["parts"]
     lines = ["Subcomponents the model needs most on these prompts (VPD's causal importance summed over positions; where it"
              " peaks; activation at the targets on the prompts / the changed prompts, in units of its typical size in text;"
              " what it does in text):"]
-    for p in ranking(table)[:top]:
-        s = table[p]
+    for p in ranking(table_)[:top]:
+        s = table_[p]
         lines.append(f"  {p} need {s['need']:.1f} at {s['at']!r}, {s['target']:+.1f}/{s['changed']:+.1f}: {describe(p, atlas[p])}")
     return "\n".join(lines)
 
@@ -213,6 +226,9 @@ def main():
     b.add_argument("--batch", type=int, default=8)
     b.add_argument("--device", default="mps")
     b.add_argument("--out", type=Path, default=ATLAS)
+    t = sub.add_parser("tables", help="write scores() of every behavior in a directory to TABLES")
+    t.add_argument("behaviors", type=Path)
+    t.add_argument("--device", default="mps")
     s = sub.add_parser("show")
     s.add_argument("behavior", type=Path)
     s.add_argument("--top", type=int, default=48)
@@ -222,6 +238,13 @@ def main():
         a.out.parent.mkdir(parents=True, exist_ok=True)
         a.out.write_text(json.dumps(build(a.rows, a.seq, a.batch, a.device)))
         print(f"wrote {a.out}")
+    elif a.cmd == "tables":
+        TABLES.mkdir(parents=True, exist_ok=True)
+        for path in sorted(a.behaviors.glob("*.json")):
+            behavior = json.loads(path.read_text())
+            (TABLES / f"{behavior['id']}.json").write_text(json.dumps({p: {k: round(v, 3) if isinstance(v, float) else v for k, v in s.items()}
+                                                                       for p, s in scores(behavior, a.device).items()}))
+            print(f"{behavior['id']}", flush=True)
     else:
         print(text(json.loads(a.behavior.read_text()), a.top, a.device))
 
