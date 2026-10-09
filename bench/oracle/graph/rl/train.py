@@ -159,13 +159,14 @@ class Policy:
 
     def question_ids(self, b: dict) -> list[int]:
         """The oracle's input for question b: the rendered question, and with --evidence (acts_fn set) one placeholder
-        per position and weight matrix, whose embeddings become the model's activations there (embed())."""
+        per position and weight matrix, whose embeddings become the model's activations there (embed()); with
+        --swap-evidence (self.swap) another text's activations instead (an evaluation of whether the oracle reads them)."""
         text = render(b)
         if getattr(self, "acts_fn", None) is not None:
             ids = b["prompts"][0]["token_ids"]
             text += "\nactivations: " + self.EVIDENCE * (len(ids) * len(self.parts.ev_order))
             q = self.prompt_ids(text)
-            self.evidence[tuple(q)] = self.acts_fn(ids)
+            self.evidence[tuple(q)] = self.acts_fn(getattr(self, "swap", {}).get(b["id"], ids))
             return q
         return self.prompt_ids(text)
 
@@ -1203,6 +1204,7 @@ def main():
     ap.add_argument("--micro", type=int, default=2)
     ap.add_argument("--sampler", choices=["auto", "vllm", "hf"], default="auto")
     ap.add_argument("--evidence", action="store_true", help="the oracle also reads the model's activations: one input token per position and weight matrix, the subcomponents' features weighted by their activations through the part-token maps (needs --part-tokens)")
+    ap.add_argument("--swap-evidence", action="store_true", help="eval: give each held-out question another text's activations (if answers do not get worse, the oracle does not read them)")
     ap.add_argument("--part-tokens", help="part tokens: the registry file of part_tokens.py build; the projections train with the LoRA and vLLM gets the rows in place")
     ap.add_argument("--materialize-every", type=int, default=0, help="with --part-tokens: also rewrite the checkpoint and restart vLLM every K steps (0: only at the start; the rows are copied in place before every sampling call)")
     ap.add_argument("--share-gpu", action="store_true", help="one GPU for vLLM and the trainer: vLLM sleeps (weights to host) while training and the trainer moves to the host while sampling, so --gpu-memory can be 0.8")
@@ -1280,6 +1282,14 @@ def main():
     sets = {"heldout": behaviors(root, args.model, "heldout")}
     if args.eval_behaviors:  # one fixed subset, the same at every evaluation
         sets = {k: random.Random(args.seed).sample(v, min(args.eval_behaviors, len(v))) for k, v in sets.items()}
+    if args.swap_evidence:  # each held-out question reads the activations of the next held-out text at least as long, cut to its length
+        held = sets["heldout"]
+        pol.swap = {}
+        for i, b in enumerate(held):
+            T = len(b["prompts"][0]["token_ids"])
+            other = next((o for o in held[i + 1:] + held[:i] if len(o["prompts"][0]["token_ids"]) >= T), None)
+            if other is not None:
+                pol.swap[b["id"]] = other["prompts"][0]["token_ids"][:T]
     adapter = out / "adapter"
     if args.search_heldout:  # the search's baseline at the oracle's output budget
         for bid, text in list(HELDOUT_SEARCH.items()):
