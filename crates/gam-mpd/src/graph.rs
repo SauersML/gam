@@ -87,6 +87,13 @@ pub struct Program {
     /// The named groups of parts the program uses ([`GroupIr`]).
     #[serde(default)]
     pub groups: Vec<GroupIr>,
+    /// "model": the program declares no edges; every node is connected as the model connects it (it
+    /// reads the embedding and every earlier residual write, the logits and every later node read
+    /// its write, and it joins the nodes of its own site), and neither nodes nor those connections
+    /// cost structure bits: what the program names is priced by its names and its code. Absent: the
+    /// declared edges (and a shared base's) are the graph.
+    #[serde(default)]
+    pub wiring: Option<String>,
 }
 
 /// A named group of parts a program uses (mech's `G.<name>`, from the model's shared library of
@@ -925,6 +932,8 @@ pub struct Graph {
     pub implied: (usize, usize),
     /// The named groups the program uses ([`GroupIr`]).
     pub groups: Vec<GroupUse>,
+    /// Wired as the model wires it (`Program::wiring` "model"): nodes cost no structure tokens.
+    pub model_wiring: bool,
 }
 
 /// Whether a same-site edge from `writer` to `reader` joins two parts of one VPD site: c_fc
@@ -1431,13 +1440,20 @@ impl Graph {
         // (`embed` and every residual writer before its site), every later node and the logits read
         // its write, and within its site it joins every other node either way (c_fc to down_proj,
         // q/k/v to o_proj); the logits read `embed` too, as in the model's residual stream. These
-        // edges are implied by the base, not declared.
+        // edges are implied by the base, not declared; a program wired as the model has every node
+        // connected so.
         let base: BTreeSet<usize> = ids.iter().enumerate().filter(|(_, id)| program.base.contains(id)).map(|(k, _)| k).collect();
+        let model_wiring = match program.wiring.as_deref() {
+            None => false,
+            Some("model") => true,
+            Some(other) => return Err(format!("wiring {other}: \"model\" or absent")),
+        };
+        let wired: BTreeSet<usize> = if model_wiring { (0..ids.len()).collect() } else { base.clone() };
         let declared = (edges.len(), internal.len());
-        if !base.is_empty() && !edges.contains(&(Writer::Embed, None, Route::Input)) {
+        if !wired.is_empty() && !edges.contains(&(Writer::Embed, None, Route::Input)) {
             edges.push((Writer::Embed, None, Route::Input));
         }
-        for &b in &base {
+        for &b in &wired {
             let site = blocks[b].site();
             let mut implied: Vec<(Writer, Option<usize>, Route)> = blocks[b].reads().into_iter().map(|route| (Writer::Embed, Some(b), route)).collect();
             if blocks[b].writes_residual() {
@@ -1499,12 +1515,12 @@ impl Graph {
             }
             positions.push(Some(Arc::new(Positions { by_tokens })));
         }
-        Ok(Self { delete, ids, blocks, claims, edges, internal, alignments, positions, base, implied, groups })
+        Ok(Self { delete, ids, blocks, claims, edges, internal, alignments, positions, base, implied, groups, model_wiring })
     }
 
     /// The empty program: every piece a stand-in.
     pub fn empty() -> Self {
-        Self { delete: false, ids: Vec::new(), blocks: Vec::new(), claims: Vec::new(), edges: Vec::new(), internal: Vec::new(), alignments: Vec::new(), positions: Vec::new(), base: BTreeSet::new(), implied: (0, 0), groups: Vec::new() }
+        Self { delete: false, ids: Vec::new(), blocks: Vec::new(), claims: Vec::new(), edges: Vec::new(), internal: Vec::new(), alignments: Vec::new(), positions: Vec::new(), base: BTreeSet::new(), implied: (0, 0), groups: Vec::new(), model_wiring: false }
     }
 
     /// Every piece of `weights` not in a node, per site: the heads of each layer, then its neurons.
@@ -1667,7 +1683,8 @@ impl Graph {
             };
             parts += count;
             let claim = if self.claims.get(k).is_some_and(Option::is_some) { LABEL_TOKENS } else { 0 };
-            *(if base.contains(&k) { &mut base_bits } else { &mut bits }) += count as f64 * name + (NODE_TOKENS + claim) as f64 * token;
+            let node = if self.model_wiring { claim } else { NODE_TOKENS + claim };
+            *(if base.contains(&k) { &mut base_bits } else { &mut bits }) += count as f64 * name + node as f64 * token;
         }
         // Each named group used: one name; each label (an alignment tested by pairs; the answer's,
         // aligned by construction, has none): its code.

@@ -63,7 +63,7 @@ fn full_program() -> Program {
             }
         }
     }
-    Program { model: "tiny".into(), nodes, edges, python_tokens: 0, token_types: 0, source: String::new(), valid: true, error: None, standin: None, base: Vec::new(), explanation_tokens: 0, explanation_token_types: 0, alignments: Vec::new(), groups: Vec::new() }
+    Program { model: "tiny".into(), nodes, edges, python_tokens: 0, token_types: 0, source: String::new(), valid: true, error: None, standin: None, base: Vec::new(), explanation_tokens: 0, explanation_token_types: 0, alignments: Vec::new(), groups: Vec::new(), wiring: None }
 }
 
 /// The Checker keeps `M`'s log-probabilities in float32 (relative rounding `2^-24`): on
@@ -904,6 +904,42 @@ fn node_positions_bound_where_a_node_acts() {
     assert!(close(terms[0].0, terms[1].0) && close(terms[0].1, terms[1].1), "everywhere = no positions: {terms:?}");
     assert!(close(terms[2].0, terms[3].0) && close(terms[2].1, terms[3].1), "nowhere = nothing named: {terms:?}");
     assert!(!close(terms[4].0, terms[0].0) && !close(terms[4].0, terms[3].0), "a subset of positions is neither: {terms:?}");
+}
+
+/// A program wired as the model (`Program::wiring` "model") declares no edges and runs as the same
+/// nodes with every edge the model's residual stream gives them declared, at every position or at
+/// some; its nodes and connections cost no structure bits, its names the same.
+#[test]
+fn model_wiring_runs_as_the_declared_full_wiring_and_prices_no_structure() {
+    use crate::graph::{Score, SequenceAt};
+    let f = fixture("graph_positions");
+    let library = Library::new(&f.device, &f.device, &f.native, &f.layers, &f.artifact, 1 << 28, 64).expect("library");
+    let weights = Weights::of(&library);
+    let cf = counterfactuals(&f.sequences);
+    let sequences: Vec<&Vec<u32>> = f.sequences.iter().chain(&cf).collect();
+    let odd: Vec<SequenceAt> = sequences.iter().map(|s| SequenceAt { tokens: (*s).clone(), positions: (1..s.len()).step_by(2).collect() }).collect();
+    let declared = Program { standin: Some("counterfactual".into()), token_types: 1 << 10, ..full_program() };  // 10 bits a structure token
+    let wired = Program { edges: Vec::new(), wiring: Some("model".into()), ..declared.clone() };
+    let at = |p: &Program| {
+        let mut p = p.clone();
+        for n in &mut p.nodes {
+            n.at = odd.clone();
+        }
+        p
+    };
+    let programs = [declared.clone(), wired.clone(), at(&declared), at(&wired)];
+    let mut checker = Checker::new(weights, claims_behavior(&f.sequences, &cf)).expect("checker");
+    let scores = checker.score_batch(&programs, 4, 3, true, None, 0).expect("scores");
+    let s: Vec<&Score> = scores.iter().map(|(s, _)| s).collect();
+    let close = |a: f64, b: f64| (a - b).abs() <= 1e-9 * a.abs().max(b.abs()).max(1.0);
+    assert!(s.iter().all(|x| x.valid), "every program scores: {:?}", s.iter().map(|x| x.error.clone()).collect::<Vec<_>>());
+    for (d, w) in [(0, 1), (2, 3)] {
+        assert!(close(s[d].exec_error_bits, s[w].exec_error_bits) && close(s[d].necessity_error_bits, s[w].necessity_error_bits),
+                "wired as the model = every edge declared: {} {} / {} {}", s[d].exec_error_bits, s[w].exec_error_bits, s[d].necessity_error_bits, s[w].necessity_error_bits);
+        assert!(s[w].structure_bits < s[d].structure_bits && s[w].parts == s[d].parts, "no node or edge bits, the same names: {} {} {} {}", s[w].structure_bits, s[d].structure_bits, s[w].parts, s[d].parts);
+    }
+    let bad = Program { wiring: Some("all".into()), ..wired };
+    assert!(!checker.score_batch(&[bad], 4, 3, true, None, 0).expect("scores")[0].0.valid, "only \"model\" is a wiring");
 }
 
 /// The answer metric: per row the `KL` over the picked answers and any other token (the token the
