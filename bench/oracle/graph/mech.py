@@ -9,7 +9,9 @@ above a step says in English what it adds. A reader is a subcomponent "<p:L.S.I>
 o fc down: query, key, value, attention output, MLP input, MLP output; subcomponent I) at a position; its parents are
 the subcomponents whose outputs it reads, written as one string of subcomponents at the reader's own position, or as
 {position: string} (an attention output reading values at positions). "out" lists what the prediction at the targets
-reads. Every edge must be a connection the model has (connects()). Nodes are the readers and their parents. "uses"
+reads. An edge must be a connection the model has (connects()) and a node a subcomponent at a position of the text;
+whatever is written that is neither is left out of the graph and listed in the IR's "dropped" (score.py still counts its
+description length: it was written and explains nothing). Nodes are the readers and their parents. "uses"
 lists library entries (score.py's LIBRARY: recurring mechanisms, sets of edges at positions relative to the target)
 the step includes without writing them out. A single dict is an answer of one step.
 
@@ -26,8 +28,8 @@ the step includes without writing them out. A single dict is an answer of one st
 trace(source, model, behavior=...) runs a source in a sandboxed child (restricted syntax and builtins, CPU and memory
 limits) and returns the IR: {"graph": {"nodes": [[layer, matrix, position, index], ...], "parents": [[reader, writer],
 ...], "out": [writer, ...], "uses": [entry, ...], "node_step", "parent_step", "out_step", "uses_step": the step that
-added each, "explanation": the docstring, "notes": the comment lines in order}} with nodes as indices, and "valid" /
-"error".
+added each, "dropped": [[step, why], ...], "explanation": the docstring, "notes": the comment lines in order}} with nodes
+as indices, and "valid" / "error" (an answer that cannot run, or not in the format).
 """
 
 from __future__ import annotations
@@ -140,27 +142,38 @@ def graph(fn, model: str, behavior: dict | None) -> dict:
     node_step: list[int] = []
     step = 0
 
-    def node(position, token) -> int:
-        if not isinstance(position, int) or isinstance(position, bool) or not 0 <= position < T:
-            raise MechError(f"position {position!r}: positions are 0..{T - 1}")
-        layer, kind, i = _part(token, shape)
-        if i == "rest":
-            raise MechError(f"{token}: a remainder is not a graph node")
-        key = (layer, kind, position, i)
+    dropped: list[list] = []  # [step, why]: what an answer writes that is not part of its graph
+
+    def ref(position, token):
+        """The node key of a written subcomponent at a position, or None (recorded in dropped) when there is no such
+        node."""
+        try:
+            if not isinstance(position, int) or isinstance(position, bool) or not 0 <= position < T:
+                raise MechError(f"position {position!r}: positions are 0..{T - 1}")
+            layer, kind, i = _part(token, shape)
+            if i == "rest":
+                raise MechError(f"{token}: a remainder is not a graph node")
+        except MechError as e:
+            dropped.append([step, str(e)])
+            return None
+        return (layer, kind, position, i)
+
+    def add(key) -> int:
         if key not in index:
             index[key] = len(nodes)
             nodes.append(list(key))
             node_step.append(step)
         return index[key]
 
-    def parents(value, at: list[int]) -> list[int]:
+    def parents(value, at: list[int]) -> list:
         if isinstance(value, dict):
-            return [node(p, tok) for p, names in value.items() for tok in _names(names)]
-        return [node(p, tok) for p in at for tok in _names(value)]
+            return [ref(p, tok) for p, names in value.items() for tok in _names(names)]
+        return [ref(p, tok) for p in at for tok in _names(value)]
 
     edges, reads, uses = [], [], []
     edge_step, read_step, uses_step = [], [], []
     seen_edges, seen_reads = set(), set()
+    step = 0
     for step, st in enumerate(steps):
         for key, value in st.items():
             if key == "uses":
@@ -173,30 +186,44 @@ def graph(fn, model: str, behavior: dict | None) -> dict:
                 continue
             if key == "out":
                 for w in parents(value, list(targets)):
-                    wl, wk, wt, _ = nodes[w]
+                    if w is None:
+                        continue
+                    wl, wk, wt, _ = w
                     if not connects(wl, wk, wt, None, None, None, list(targets)):
-                        raise MechError(f"\"out\": the prediction reads attention and MLP outputs at the targets {list(targets)}, not layer {wl}'s {wk} at {wt}")
-                    if w not in seen_reads:
-                        seen_reads.add(w)
-                        reads.append(w)
+                        dropped.append([step, f"\"out\": the prediction reads attention and MLP outputs at the targets {list(targets)}, not layer {wl}'s {wk} at {wt}"])
+                        continue
+                    wi = add(w)
+                    if wi not in seen_reads:
+                        seen_reads.add(wi)
+                        reads.append(wi)
                         read_step.append(step)
                 continue
             if not (isinstance(key, tuple) and len(key) == 2):
                 raise MechError(f"key {key!r}: (position, subcomponent), \"out\" or \"uses\"")
-            r = node(*key)
-            rl, rk, rt, _ = nodes[r]
-            for w in parents(value, [rt]):
-                wl, wk, wt, _ = nodes[w]
+            r = ref(*key)
+            ws = parents(value, [key[0]] if isinstance(key[0], int) else [])
+            if r is None:
+                dropped += [[step, f"{key!r} is not a subcomponent at a position, so what it reads is not in the graph"] for w in ws if w is not None]
+                continue
+            rl, rk, rt, _ = r
+            ri = add(r)
+            for w in ws:
+                if w is None:
+                    continue
+                wl, wk, wt, _ = w
                 if not connects(wl, wk, wt, rl, rk, rt, list(targets)):
-                    raise MechError(f"{key!r} reads layer {wl}'s {wk} at {wt}: the model has no such connection (an attention or MLP output "
-                                    "into a later query, key, value or MLP input at its position; a value into the same layer's attention "
-                                    "output at that or a later position; an MLP input into the same MLP's output)")
-                if (r, w) not in seen_edges:
-                    seen_edges.add((r, w))
-                    edges.append([r, w])
+                    dropped.append([step, f"{key!r} reads layer {wl}'s {wk} at {wt}: the model has no such connection (an attention or MLP output "
+                                          "into a later query, key, value or MLP input at its position; a value into the same layer's attention "
+                                          "output at that or a later position; an MLP input into the same MLP's output)"])
+                    continue
+                wi = add(w)
+                if (ri, wi) not in seen_edges:
+                    seen_edges.add((ri, wi))
+                    edges.append([ri, wi])
                     edge_step.append(step)
     return {"nodes": nodes, "parents": edges, "out": reads, "uses": uses, "node_step": node_step, "parent_step": edge_step,
-            "out_step": read_step, "uses_step": uses_step, "steps": len(steps), "explanation": (getattr(fn, "__doc__", None) or "").strip()}
+            "out_step": read_step, "uses_step": uses_step, "steps": len(steps), "dropped": dropped,
+            "explanation": (getattr(fn, "__doc__", None) or "").strip()}
 
 
 def notes(source: str) -> list[str]:
@@ -262,7 +289,7 @@ def _line_of(exc: BaseException) -> int | None:
 
 
 EMPTY_GRAPH = {"nodes": [], "parents": [], "out": [], "uses": [], "node_step": [], "parent_step": [], "out_step": [], "uses_step": [], "steps": 0,
-               "explanation": "", "notes": []}
+               "dropped": [], "explanation": "", "notes": []}
 
 
 def _empty(source: str, model: str) -> dict:

@@ -93,14 +93,25 @@ def test_the_connection_rule():
     assert mech.connects(2, "down_proj", 3, None, None, None, [3]) and not mech.connects(2, "down_proj", 2, None, None, None, [3])
 
 
+def dropped(source, behavior=BEHAVIOR):
+    ir = mech._trace(source, "vpd4l", behavior)
+    assert ir["valid"], ir["error"]
+    return " | ".join(why for _, why in ir["graph"]["dropped"]), ir["graph"]
+
+
 def test_a_graph_answer_says_what_is_wrong():
-    assert "no such connection" in error(GRAPH.replace('(p, "<p:3.v.676>"): "<p:0.down.3473>"', '(p, "<p:3.v.676>"): "<p:3.down.3473>"'))
-    assert "the prediction reads" in error(GRAPH.replace('"out": "<p:3.o.281><p:2.down.773>"', '"out": "<p:2.fc.40>"'))
+    """What is not a node or a connection the model has is left out of the graph and listed; an answer that is not in
+    the format is invalid."""
+    why, g = dropped(GRAPH.replace('(p, "<p:3.v.676>"): "<p:0.down.3473>"', '(p, "<p:3.v.676>"): "<p:3.down.3473>"'))
+    assert "no such connection" in why and len(g["parents"]) == 3 and [3, "down_proj", 1, 3473] not in g["nodes"]  # the writer is not added
+    why, g = dropped(GRAPH.replace('"out": "<p:3.o.281><p:2.down.773>"', '"out": "<p:2.fc.40><p:3.o.281>"'))
+    assert "the prediction reads" in why and len(g["out"]) == 1
+    assert "is not a subcomponent" in dropped(GRAPH.replace('["<p:2.fc.40>"]', '["<p:2.h.40>"]'))[0]
+    assert "subcomponents 0.." in dropped(GRAPH.replace("<p:3.v.5>", "<p:3.v.4096>"))[0]
+    assert "positions are 0..3" in dropped(GRAPH.replace("{p: ", "{9: "))[0]
+    assert "a remainder is not a graph node" in dropped(GRAPH.replace("<p:3.v.5>", "<p:3.v.rest>"))[0]
+    assert dropped(GRAPH)[0] == ""
     assert "holds only" in error(GRAPH.replace("<p:3.v.5>", "<p:3.x.5>"))
-    assert "is not a subcomponent" in error(GRAPH.replace('["<p:2.fc.40>"]', '["<p:2.h.40>"]'))
-    assert "subcomponents 0.." in error(GRAPH.replace("<p:3.v.5>", "<p:3.v.4096>"))
-    assert "positions are 0..3" in error(GRAPH.replace("{p: ", "{9: "))
-    assert "a remainder is not a graph node" in error(GRAPH.replace("<p:3.v.5>", "<p:3.v.rest>"))
     assert "needs the task" in error(GRAPH, behavior=None)
     assert "defines no function graph" in error("x = 1\n")
     assert "imports nothing" in error("import os\n" + GRAPH)

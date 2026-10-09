@@ -100,8 +100,9 @@ class Scorer:
         """Each answer's score on a task (a text task record) under one draw of changed prompts (seed): {"valid",
         "error", "curve": [[bits, kl], ...] (the empty graph, then each step), "lo" and "hi": one subcomponent's and
         the whole model's description lengths, "kl_bits" and "bits" (the whole answer), "steps", "nodes", "edges",
-        "explanation", "notes", "events": the changed prompts' token changes and whether each flips the model's top
-        next token (native.flips, the same for every answer)}; the
+        "explanation", "notes", "dropped": what the answer wrote that is not part of its graph (mech; its description
+        length still counts), "events": the changed prompts' token changes and whether each flips the model's top next
+        token (native.flips, the same for every answer)}; the
         source "vpd" stands for VPD's own answer (complete, one step)."""
         import mech
 
@@ -127,9 +128,12 @@ class Scorer:
             if not ir["valid"]:
                 continue
             mine = []
+            dropped = ir["graph"].get("dropped", [])
+            out[-1]["dropped"] = [why for _, why in dropped]
             for k in range(1, out[-1]["steps"] + 1):
                 g, uses = self.native.prefix(ir, k)
-                bits = g.bits(positions, total) + ref_bits * len(uses)
+                written = sum(1 for st, _ in dropped if st < k)  # written, not in the graph: each costs a subcomponent's description
+                bits = g.bits(positions, total) + ref_bits * len(uses) + written * math.log2(positions * total)
                 if uses:
                     g = self.expand(g, uses, targets, len(ids))
                     if g is None:
