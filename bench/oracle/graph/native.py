@@ -1,29 +1,29 @@
-"""Native scoring of circuits on vpd4l (#2951 graph oracle), in torch.
+"""Computational graphs of vpd4l's predictions (#2951 graph oracle), run natively in torch.
 
-The model runs with every site's weight replaced by VPD's subcomponents and remainder,
+The model runs with every weight matrix replaced by VPD's subcomponents and remainder,
     y = ((x V) * m) U + m_delta x (W - V U)^T,
-masks m in [0, 1] per position. A circuit names, per position, the subcomponents (and remainders "<p:L.S.rest>") that act
-there; they are held at 1. Its claim is that everything it leaves out can be ablated in any combination not tuned to this
-input. It is tested against ablation patterns fixed before the input is seen, and kl_bits is the largest KL in bits of the
-model's next-token distribution at the targets from the circuit's over them:
-  deletion   every left-out mask 0 (kl_deleted_bits);
-  random     masks drawn uniformly in [0, 1] per position (VPD's stochastic test), the mean over RANDOM draws of the
-             step's seed (kl_random_bits);
-  universal  adversarial patterns, a mask per position and subcomponent shared by every text, each found by PGD against
-             VPD's own answers at every position of a panel of 128 training texts (VPD's evaluation: a source shared
-             across a batch of 128 sequences, the KL averaged over all their positions, a uniform start, 20
-             sign-gradient steps of 0.1), the largest over the pool (kl_universal_bits).
-A pattern tuned to one input can exploit interference noise in circuitry the computation does not use, and then breaks
-VPD's own answer too (91.7 bits on text9000, against 101.1 for naming nothing): VPD's appendix A.3.4 shares its
-adversary across a batch of inputs for this reason, and so do these patterns.
+masks m in [0, 1] per position. An answer is a graph: nodes are subcomponents at positions; edges are connections the
+model has (an attention or MLP output into a later query, key, value or MLP input at its position, or into the
+prediction; a value into the same layer's attention output at that or a later position; an MLP input into the same
+MLP's output). Running a graph (Native.run): its nodes at mask 1; every other subcomponent at an ablation mask u; a node
+receives its declared parents' outputs in full and every other output scaled by that output's u; the token embedding,
+which VPD does not decompose, in full. With u = 1 everywhere this is the model.
 
-The bar is VPD's answer's mean kl_bits on training texts outside the panels. prune() finds a circuit for one prediction:
-from VPD's answer (causal importance > 0 at every position) it removes what cannot reach the target, then removes
-(subcomponent, position) pairs while kl_bits stays within the bar, testing removals in batches.
+A graph is correct within eps when the KL in bits of the model's next-token distribution at the targets from the
+graph's stays at most eps under every ablation of what it leaves out (Native.score, kl_bits the largest of):
+  deletion     u = 0;
+  random       u drawn uniformly per position and subcomponent, the mean over RANDOM draws (VPD's stochastic test);
+  adversarial  u chosen for this text to maximize the KL, by PGD from a uniform start, 20 sign-gradient steps of 0.1
+               (VPD's evaluation PGD; VPD prunes its per-prediction graphs under a per-prompt adversary).
+Among correct graphs, fewer nodes plus edges is better (score.order).
 
-  native.py universal          the pool of universal patterns -> texts/universal.pt
-  native.py bar --n 200        VPD's answer's mean kl_bits on N training texts after the panels -> texts/bar.json
-  native.py teach --split train --n N [--offset K --stride S]   prune() -> texts/circuits[_heldout]/<id>.py, .json
+teach() finds a graph for one prediction and precision eps: node strengths g in (0, 1) over every subcomponent at every
+position that can reach the target, minimizing their sum subject to the KL tests at eps / 2 with VPD's masks
+m = g + (1 - g) r (r random, persistently adversarial, or 0), the multiplier set by the constraint (dual ascent); the
+nodes with g > 1/2; then edge strengths over every connection the model has between them, the same way at eps; the
+edges with strength > 1/2; then the exact tests, adding back the strongest dropped edges until the graph is correct.
+
+  native.py teach --split train --n N [--offset K --stride S] [--eps 0.25 1]   -> texts/graphs[_heldout]/<id>.<eps>.py, .json
 """
 
 from __future__ import annotations
@@ -48,8 +48,7 @@ import mech  # noqa: E402
 TEXTS = Path.home() / "mpd-data/graph_oracle/texts"
 PGD_STEPS, PGD_STEP = 20, 0.1  # VPD's evaluation PGD (run s-55ea3f9b's PGDReconLoss)
 RANDOM = 8  # random draws per score
-POOL, PANEL = 4, 128  # universal patterns, and the training texts each is found on (VPD's evaluation batch)
-CHUNK = 32  # panel texts per forward pass
+TEACH_STEPS, TEACH_LR = 400, 0.05  # the teacher's optimization (Adam on the strengths' logits)
 LN2 = math.log(2)
 
 
@@ -73,7 +72,7 @@ def _forward_cached(self, x):
 
 @lru_cache(None)
 def model(dev: str):
-    """vpd4l with VPD's decomposition installed, each site's remainder cached."""
+    """vpd4l with VPD's decomposition installed, each matrix's remainder cached."""
     import vpd_model
 
     target = vpd_model.load_target(dev)
@@ -89,10 +88,11 @@ class Graph:
     """One answer's computational graph on one text. nodes: (weight matrix, position, subcomponent) triples; parents:
     reader node -> the writer nodes whose outputs it reads; out: the writer nodes the prediction at the targets reads.
     complete=True instead means every connection the model has between the graph's nodes (and from each of its
-    residual writers at a target to the prediction): the graph claims nodes but no structure."""
+    residual writers at a target to the prediction): the graph claims nodes but no structure; masks holds a complete
+    graph's nodes as matrix -> bool [T, C] in place of `nodes`."""
 
     def __init__(self, nodes=(), parents=None, out=None, complete: bool = False, masks: dict | None = None):
-        self.masks = masks  # a complete graph's nodes as weight matrix -> bool [T, C], in place of `nodes`
+        self.masks = masks
         self.nodes = set(nodes)
         self.parents = {r: list(w) for r, w in (parents or {}).items()}
         self.out = list(out or [])
@@ -113,43 +113,30 @@ class Graph:
         return self.count() + self.edges()
 
 
-RESID_WRITERS = ("o_proj", "down_proj")
-RESID_READERS = ("q_proj", "k_proj", "v_proj", "c_fc")
-
-
-def stage(layer: int, kind: str) -> float:
-    """A residual writer's place in its position's residual stream: attention output of layer l at l + 0.5, MLP
-    output at l + 1; a reader reads what was written before its own place (q, k, v at l, MLP input at l + 0.5)."""
-    return layer + (0.5 if kind in ("o_proj", "c_fc") else (1.0 if kind == "down_proj" else 0.0))
+def _layer_kind(nd) -> tuple[int, str]:
+    return int(nd[0].split(".")[1]), nd[0].split(".")[-1]
 
 
 def connects(writer: tuple, reader: tuple | None, targets: list[int]) -> bool:
-    """Whether the model connects a writer node to a reader node (None: the prediction at the targets): the residual
-    stream at one position (an attention or MLP output into a later query, key, value or MLP input, or into the
-    prediction), attention (a value at a position into the same layer's attention output at that or a later
-    position), or one MLP (an MLP input into the same MLP's output). Nodes are (weight matrix name, position, index)."""
-    wt, wl, wk = writer[1], int(writer[0].split(".")[1]), writer[0].split(".")[-1]
+    """Whether the model connects a writer node to a reader node (None: the prediction at the targets); nodes are
+    (matrix name, position, index). mech.connects holds the rule."""
+    wl, wk = _layer_kind(writer)
     if reader is None:
-        return wk in RESID_WRITERS and wt in targets
-    rt, rl, rk = reader[1], int(reader[0].split(".")[1]), reader[0].split(".")[-1]
-    if wk in RESID_WRITERS and rk in RESID_READERS:
-        return wt == rt and stage(wl, wk) <= stage(rl, rk)
-    if wk == "v_proj" and rk == "o_proj":
-        return wl == rl and wt <= rt
-    if wk == "c_fc" and rk == "down_proj":
-        return wl == rl and wt == rt
-    return False
+        return mech.connects(wl, wk, writer[1], None, None, None, targets)
+    rl, rk = _layer_kind(reader)
+    return mech.connects(wl, wk, writer[1], rl, rk, reader[1], targets)
 
 
 def all_edges(nodes, targets: list[int]) -> tuple[dict, list]:
     """Every connection the model has between `nodes`: (parents, out)."""
     by = {}
     for nd in nodes:
-        by.setdefault(nd[0].split(".")[-1], []).append(nd)
+        by.setdefault(_layer_kind(nd)[1], []).append(nd)
     parents = {}
     for r in nodes:
-        rk = r[0].split(".")[-1]
-        cand = by.get("o_proj", []) + by.get("down_proj", []) if rk in RESID_READERS else (by.get("v_proj", []) if rk == "o_proj" else (by.get("c_fc", []) if rk == "down_proj" else []))
+        rk = _layer_kind(r)[1]
+        cand = (by.get("o_proj", []) + by.get("down_proj", []) if rk in mech.RESID_READERS
+                else by.get("v_proj", []) if rk == "o_proj" else by.get("c_fc", []) if rk == "down_proj" else [])
         ws = [w for w in cand if connects(w, r, targets)]
         if ws:
             parents[r] = ws
@@ -158,17 +145,13 @@ def all_edges(nodes, targets: list[int]) -> tuple[dict, list]:
 
 
 class Native:
-    """Runs and scores graphs on one device."""
+    """Runs, scores and finds graphs on one device."""
 
-    def __init__(self, dev: str | None = None, universal: Path | None = TEXTS / "universal.pt"):
+    def __init__(self, dev: str | None = None):
         self.dev = dev or device()
         self.target, self.vpd = model(self.dev)
         self.names = self.vpd.names
         self.C = self.vpd.C
-        self.pool = None
-        if universal is not None and Path(universal).exists():
-            raw = torch.load(universal, map_location=self.dev)
-            self.pool = {"parts": raw["parts"], "rest": raw["rest"]}  # matrix -> [POOL, T, C], [POOL, T]
 
     # ---- graphs from answers and from VPD
 
@@ -183,12 +166,36 @@ class Native:
         return Graph(nodes, parents, [nodes[w] for w in g["out"]])
 
     @torch.no_grad()
-    def vpd_answer(self, ids: list[int]) -> Graph:
-        """VPD's answer: at every position, the subcomponents whose causal importance there is above zero; complete."""
+    def importance(self, ids: list[int]) -> dict:
+        """VPD's causal importance [T, C] per weight matrix on one sequence."""
         _, ci = self.vpd.target_and_ci(torch.tensor([ids], device=self.dev))
-        return Graph(masks={n: ci[n][0] > 0 for n in self.names})
+        return {n: ci[n][0] for n in self.names}
 
-    # ---- running a batch of graphs under one ablation pattern
+    def vpd_answer(self, ids: list[int]) -> Graph:
+        """VPD's own answer, for comparison: at every position the subcomponents whose causal importance there is above
+        zero, complete."""
+        return Graph(masks={n: m > 0 for n, m in self.importance(ids).items()})
+
+    def everything(self, T: int) -> Graph:
+        """Every subcomponent at every position, complete: the model itself."""
+        return Graph(masks={n: torch.ones(T, self.C[n], dtype=torch.bool, device=self.dev) for n in self.names})
+
+    def reachable(self, T: int, targets: list[int]) -> dict:
+        """[T, C] per matrix: the subcomponents at positions that can affect the targets (none after the last target,
+        and before the first none of the last layer's other than key and value, whose outputs reach no later
+        position's input)."""
+        last, first, final = self.target.n_layer - 1, min(targets), max(targets)
+        out = {}
+        for n in self.names:
+            m = torch.ones(T, self.C[n], dtype=torch.bool, device=self.dev)
+            m[final + 1:] = False
+            layer, kind = int(n.split(".")[1]), n.split(".")[-1]
+            if layer == last and kind not in ("k_proj", "v_proj"):
+                m[:first] = False
+            out[n] = m
+        return out
+
+    # ---- running graphs
 
     @torch.no_grad()
     def reference(self, ids: list[list[int]], targets: list[int]) -> torch.Tensor:
@@ -197,8 +204,9 @@ class Native:
         return torch.log_softmax(logits.float(), -1)
 
     def _plan(self, graphs: list[Graph], T: int) -> dict:
-        """Index tensors for a batch of graphs: per weight matrix the [B, T, C] node mask, and for the graphs that are
-        not complete, the reader nodes with parents, the writer nodes with children, and the edges between them."""
+        """Index tensors for a batch of graphs: per matrix the [B, T, C] node mask, and for the graphs that are not
+        complete, the reader nodes with parents, the writer nodes with children, and the edges between them (in the
+        order of each graph's parents lists, then its out list)."""
         dev = self.dev
         G = {n: torch.zeros(len(graphs), T, self.C[n], dtype=torch.bool, device=dev) for n in self.names}
         for b, g in enumerate(graphs):
@@ -213,7 +221,7 @@ class Native:
                 per[n][1].append(c)
             for n, (ts, cs) in per.items():
                 G[n][b, torch.tensor(ts, device=dev), torch.tensor(cs, device=dev)] = True
-        readers, writers, edges, out = {}, {}, {}, {}
+        readers, writers, edges, out, order = {}, {}, {}, {}, []
 
         def row(table, node, b):
             rows = table.setdefault(node[0], {})
@@ -225,9 +233,13 @@ class Native:
             for r, ws in g.parents.items():
                 ri = row(readers, r, b)
                 for w in ws:
-                    edges.setdefault((r[0], w[0]), []).append((ri, row(writers, w, b)))
+                    lst = edges.setdefault((r[0], w[0]), [])
+                    order.append(("edge", (r[0], w[0]), len(lst)))
+                    lst.append((ri, row(writers, w, b)))
             for w in g.out:
-                out.setdefault(w[0], []).append((b, w[1], row(writers, w, b)))
+                lst = out.setdefault(w[0], [])
+                order.append(("out", w[0], len(lst)))
+                lst.append((b, w[1], row(writers, w, b)))
 
         def cols(rows):
             keys = sorted(rows, key=rows.get)
@@ -236,15 +248,25 @@ class Native:
         return {"G": G, "complete": torch.tensor([g.complete for g in graphs], device=dev)[:, None, None],
                 "readers": {n: cols(r) for n, r in readers.items()}, "writers": {n: cols(w) for n, w in writers.items()},
                 "edges": {k: (torch.tensor([e[0] for e in v], device=dev), torch.tensor([e[1] for e in v], device=dev)) for k, v in edges.items()},
-                "out": {n: tuple(torch.tensor([e[i] for e in v], device=dev) for i in range(3)) for n, v in out.items()}}
+                "out": {n: tuple(torch.tensor([e[i] for e in v], device=dev) for i in range(3)) for n, v in out.items()},
+                "order": order}
 
-    def run(self, ids: list[int], targets: list[int], plan: dict, u: dict, ur: dict) -> torch.Tensor:
-        """log q at the targets [B, len(targets), V] of each graph under one ablation pattern: u[matrix] [S, C] and
-        ur[matrix] [S] in [0, 1] with S = T or 1 (the same at every position). A subcomponent outside a graph runs at
-        mask u; a graph node at 1. An output reaches a reader through a declared edge in full and through every other
-        connection scaled by its writer's u (so a graph's node outside every edge still writes at u to readers it does
-        not declare). A complete graph's nodes read each other in full. The token embedding, which VPD does not
-        decompose, always enters in full; remainders W - V U run at ur. With u = 1 everywhere this is the model."""
+    def edge_weights(self, plan: dict, w: torch.Tensor) -> tuple[dict, dict]:
+        """Per-edge strengths in plan order (a vector over every edge of every graph) -> run()'s ew and ow."""
+        src_e = {k: [] for k in plan["edges"]}
+        src_o = {k: [] for k in plan["out"]}
+        for j, (kind, key, _) in enumerate(plan["order"]):
+            (src_e if kind == "edge" else src_o)[key].append(j)
+        ew = {k: w[torch.tensor(src_e[k], device=self.dev)] for k in src_e}
+        ow = {k: w[torch.tensor(src_o[k], device=self.dev)] for k in src_o}
+        return ew, ow
+
+    def run(self, ids: list[int], targets: list[int], plan: dict, u: dict, ur: dict, ew: dict | None = None, ow: dict | None = None) -> torch.Tensor:
+        """log q at the targets [B, len(targets), V] of each graph under one ablation: u[matrix] [Bu, S, C] and
+        ur[matrix] [Bu, S] in [0, 1], Bu = B or 1, S = T or 1. A subcomponent outside a graph runs at mask u; a graph
+        node at 1. An output reaches a reader through a declared edge of strength e at e + (1 - e) u (e = 1 unless ew
+        / ow give it) and through every other connection at its writer's u. A complete graph's nodes read each other
+        in full. The token embedding always enters in full; remainders W - V U run at ur."""
         import vpd_model
 
         tg, dev = self.target, self.dev
@@ -254,35 +276,42 @@ class Native:
         H, hd, eps = tg.n_head, tg.hd, tg.eps
         rms, gelu = vpd_model.rms, vpd_model.gelu_tanh
 
-        def scale(n):  # [B or 1, T, C] mask of every subcomponent: 1 in the graph, u outside
-            return torch.where(G[n], 1.0, u[n].expand(T, -1)[None])
+        def ux(n):  # [B, T, C]
+            return u[n].expand(B, T, -1)
 
-        def uat(n, t, c):  # u at given positions and indices
-            return u[n][t if u[n].shape[0] > 1 else torch.zeros_like(t), c]
+        def scale(n):  # 1 in the graph, u outside
+            return torch.where(G[n], 1.0, ux(n))
+
+        def uat(n, b, t, c):
+            return u[n][b if u[n].shape[0] > 1 else torch.zeros_like(b), t if u[n].shape[1] > 1 else torch.zeros_like(t), c]
 
         def rest(n, z):
-            st = tg.site(n)
-            return ur[n].expand(T)[None, :, None] * (z @ st.delta_T)
+            return ur[n].expand(B, T)[..., None] * (z @ tg.site(n).delta_T)
+
+        def strength(key, w, table):
+            return 1.0 if table is None or key not in table else table[key]
 
         emb = tg.wte[torch.tensor(ids, device=dev)]
         x = emb[None].expand(B, T, -1).clone()  # every output at its scale
         xg = x.clone()  # complete graphs: their nodes' outputs in full
         acts = {}
 
-        def topup(n, width, contrib):  # sum over n's reader nodes of their declared parents' extra (1 - u) share
+        def writer_out(wn, wi, space_U):  # (b, t, the writer's activation, its u) of writer rows wi
+            b, t, c = Wr[wn][0][wi], Wr[wn][1][wi], Wr[wn][2][wi]
+            return b, t, c, acts[wn][b, t, c], uat(wn, b, t, c)
+
+        def topup(n, width, contrib):  # each reader node's declared parents' extra share
             out = torch.zeros(len(R[n][0]), width, device=dev)
             for (rn, wn), (ri, wi) in E.items():
                 if rn == n:
-                    out.index_add_(0, ri, contrib(wn, wi))
+                    out = out.index_add(0, ri, contrib(wn, wi, strength((rn, wn), wi, ew)))
             return out
 
-        def resid_contrib(wn, wi):
-            b, t, c = Wr[wn][0][wi], Wr[wn][1][wi], Wr[wn][2][wi]
-            return ((1 - uat(wn, t, c)) * acts[wn][b, t, c])[:, None] * tg.site(wn).U[c]
+        def resid_contrib(wn, wi, e):
+            _, _, c, a, uw = writer_out(wn, wi, None)
+            return (e * (1 - uw) * a)[:, None] * tg.site(wn).U[c]
 
         def read_resid(n, norm, z, zg, xs):
-            """Activations [B, T, C] of a matrix reading the residual stream: from z (every output at its scale) outside
-            graphs, zg inside complete graphs, and for a graph's reader node the stream plus its parents' full outputs."""
             V = tg.site(n).V
             A = torch.where(G[n] & comp, zg @ V, z @ V)
             if n in R:
@@ -300,8 +329,9 @@ class Native:
             qv = (acts[nm["q_proj"]] * scale(nm["q_proj"])) @ tg.site(nm["q_proj"]).U + rest(nm["q_proj"], z)
             kv = (acts[nm["k_proj"]] * scale(nm["k_proj"])) @ tg.site(nm["k_proj"]).U + rest(nm["k_proj"], z)
             Uv = tg.site(nm["v_proj"]).U
-            vs = (acts[nm["v_proj"]] * u[nm["v_proj"]].expand(T, -1)[None]) @ Uv + rest(nm["v_proj"], z)
-            vg = (acts[nm["v_proj"]] * scale(nm["v_proj"])) @ Uv + rest(nm["v_proj"], z)
+            rv = rest(nm["v_proj"], z)
+            vs = (acts[nm["v_proj"]] * ux(nm["v_proj"])) @ Uv + rv
+            vg = (acts[nm["v_proj"]] * scale(nm["v_proj"])) @ Uv + rv
             heads = lambda y: y.view(B, T, H, hd).transpose(1, 2)  # noqa: E731
             q, kk = tg._rope(heads(qv), T), tg._rope(heads(kv), T)
             causal = torch.ones(T, T, dtype=torch.bool, device=dev).tril()
@@ -317,303 +347,222 @@ class Native:
                 for (rn, wn), (ri, wi) in E.items():
                     if rn != no:
                         continue
-                    wb, wt, wc = Wr[wn][0][wi], Wr[wn][1][wi], Wr[wn][2][wi]
-                    share = ((1 - uat(wn, wt, wc)) * acts[wn][wb, wt, wc])  # [E]
+                    wb, wt, wc, a, uw = writer_out(wn, wi, None)
+                    share = strength((rn, wn), wi, ew) * (1 - uw) * a
                     pat = P[wb, :, t[ri], wt]  # [E, H]: how much the reader's position attends to the writer's
-                    extra.index_add_(0, ri, share[:, None] * (pat.repeat_interleave(hd, dim=1) * Uv[wc]))
+                    extra = extra.index_add(0, ri, share[:, None] * (pat.repeat_interleave(hd, dim=1) * Uv[wc]))
                 Ao = Ao.index_put((b, t, c), ((att_s[b, t] + extra) * Vo.T[c]).sum(-1))
             acts[no] = Ao
             Uo = tg.site(no).U
             ro = rest(no, att_s)
-            x = x + (Ao * u[no].expand(T, -1)[None]) @ Uo + ro
+            x = x + (Ao * ux(no)) @ Uo + ro
             xg = xg + (Ao * scale(no)) @ Uo + ro
             z2, zg2 = rms(x, n2, eps), rms(xg, n2, eps)
             nf, nd = nm["c_fc"], nm["down_proj"]
             acts[nf] = read_resid(nf, n2, z2, zg2, x)
             Uf = tg.site(nf).U
             rf = rest(nf, z2)
-            pre_s = (acts[nf] * u[nf].expand(T, -1)[None]) @ Uf + rf
+            pre_s = (acts[nf] * ux(nf)) @ Uf + rf
             pre_g = (acts[nf] * scale(nf)) @ Uf + rf
             Vd = tg.site(nd).V
             Ad = torch.where(G[nd] & comp, gelu(pre_g) @ Vd, gelu(pre_s) @ Vd)
             if nd in R:
                 b, t, c = R[nd][0], R[nd][1], R[nd][2]
 
-                def mlp_contrib(wn, wi):
-                    wb, wt, wc = Wr[wn][0][wi], Wr[wn][1][wi], Wr[wn][2][wi]
-                    return ((1 - uat(wn, wt, wc)) * acts[wn][wb, wt, wc])[:, None] * Uf[wc]
+                def mlp_contrib(wn, wi, e):
+                    _, _, wc, a, uw = writer_out(wn, wi, None)
+                    return (e * (1 - uw) * a)[:, None] * Uf[wc]
                 Ad = Ad.index_put((b, t, c), (gelu(pre_s[b, t] + topup(nd, Uf.shape[1], mlp_contrib)) * Vd.T[c]).sum(-1))
             acts[nd] = Ad
             Ud = tg.site(nd).U
             rd = rest(nd, gelu(pre_s))
-            x = x + (Ad * u[nd].expand(T, -1)[None]) @ Ud + rd
+            x = x + (Ad * ux(nd)) @ Ud + rd
             xg = xg + (Ad * scale(nd)) @ Ud + rd
         zt = torch.where(comp[:, :, :1].expand(B, 1, 1), xg[:, targets], x[:, targets])
         for wn, (b, t, wi) in O.items():
             pos = torch.tensor([targets.index(int(a)) for a in t.tolist()], device=dev)
-            zt = zt.index_put((b, pos), resid_contrib(wn, wi), accumulate=True)
+            zt = zt.index_put((b, pos), resid_contrib(wn, wi, strength(wn, wi, ow)), accumulate=True)
         return torch.log_softmax((rms(zt, tg.ln_f, eps) @ tg.wte.T).float(), -1)
 
-    # ---- the faithfulness tests
+    # ---- the tests
 
-    def patterns(self, T: int, seed: int) -> list[tuple[dict, dict]]:
-        """The ablation patterns of a score: deletion, RANDOM uniform draws of `seed`, and the universal pool."""
-        zero = ({n: torch.zeros(1, self.C[n], device=self.dev) for n in self.names}, {n: torch.zeros(1, device=self.dev) for n in self.names})
+    def _uniform(self, T: int, seed: int) -> tuple[dict, dict]:
         g = torch.Generator(device="cpu").manual_seed(seed)
-        rand = [({n: torch.rand(T, self.C[n], generator=g).to(self.dev) for n in self.names},
-                 {n: torch.rand(T, generator=g).to(self.dev) for n in self.names}) for _ in range(RANDOM)]
-        uni = []
-        if self.pool is not None:
-            P = next(iter(self.pool["rest"].values())).shape[0]
-            uni = [({n: self.pool["parts"][n][j][:T] for n in self.names}, {n: self.pool["rest"][n][j][:T] for n in self.names}) for j in range(P)]
-        return [zero] + rand + uni
+        return ({n: torch.rand(1, T, self.C[n], generator=g).to(self.dev) for n in self.names},
+                {n: torch.rand(1, T, generator=g).to(self.dev) for n in self.names})
 
-    @torch.no_grad()
+    def _kl(self, logp: torch.Tensor, logq: torch.Tensor) -> torch.Tensor:
+        return (logp.exp() * (logp - logq)).sum(-1).sum(-1) / LN2
+
     def score(self, ids: list[int], targets: list[int], graphs: list[Graph], seed: int = 0, logp: torch.Tensor | None = None) -> list[dict]:
-        """{"kl_bits", "kl_deleted_bits", "kl_random_bits", "kl_universal_bits", "nodes", "edges", "size"} per graph."""
+        """{"kl_bits", "kl_deleted_bits", "kl_random_bits", "kl_adversarial_bits", "nodes", "edges", "size"} per graph."""
         B, T = len(graphs), len(ids)
         if B == 0:
             return []
         logp = self.reference([ids], targets) if logp is None else logp
         plan = self._plan(graphs, T)
-        kls = []
-        for u, ur in self.patterns(T, seed):
-            logq = self.run(ids, targets, plan, u, ur)
-            kls.append((logp.exp() * (logp - logq)).sum(-1).sum(-1) / LN2)
-        kls = torch.stack(kls)  # [patterns, B]
-        deleted, random = kls[0], kls[1:1 + RANDOM].mean(0)
-        universal = kls[1 + RANDOM:].max(0).values if len(kls) > 1 + RANDOM else torch.zeros_like(deleted)
-        total = torch.stack([deleted, random, universal]).max(0).values
-        return [{"kl_bits": float(total[b]), "kl_deleted_bits": float(deleted[b]), "kl_random_bits": float(random[b]),
-                 "kl_universal_bits": float(universal[b]), "nodes": graphs[b].count(),
-                 "edges": None if graphs[b].complete else graphs[b].edges(), "size": None if graphs[b].complete else graphs[b].size()} for b in range(B)]
-
-    def find_universal(self, texts: list[tuple[list[int], list[int]]], seed: int) -> tuple[dict, dict, float]:
-        """One universal pattern: a mask per position and subcomponent (and per position and remainder), shared by every
-        text, maximizing the KL of VPD's answers averaged over every position of `texts` (sequences of one length) by
-        PGD from a uniform start; the step with the largest mean KL is kept."""
-        T = len(texts[0][0])
-        everywhere = list(range(T))
-        chunks = []
-        for k in range(0, len(texts), CHUNK):
-            part = texts[k:k + CHUNK]
-            chunks.append([(i, self.reference([i], everywhere), self._plan([self.vpd_answer(i)], T)) for i, _ in part])
-        g = torch.Generator(device="cpu").manual_seed(seed)
-        u = {n: torch.rand(T, self.C[n], generator=g).to(self.dev) for n in self.names}
-        ur = {n: torch.rand(T, generator=g).to(self.dev) for n in self.names}
-        best, best_u, best_ur = -1.0, None, None
+        with torch.no_grad():
+            zero = ({n: torch.zeros(1, 1, self.C[n], device=self.dev) for n in self.names}, {n: torch.zeros(1, 1, device=self.dev) for n in self.names})
+            deleted = self._kl(logp, self.run(ids, targets, plan, *zero))
+            random = torch.stack([self._kl(logp, self.run(ids, targets, plan, *self._uniform(T, seed * 1000 + j))) for j in range(RANDOM)]).mean(0)
+        u0, ur0 = self._uniform(T, seed * 1000 + RANDOM)  # one start for every graph: a graph's score is its own
+        u = {n: u0[n].expand(B, T, -1).clone() for n in self.names}
+        ur = {n: ur0[n].expand(B, T).clone() for n in self.names}
+        adversarial = torch.full((B,), -1.0, device=self.dev)
         for k in range(PGD_STEPS + 1):
-            total, grads = 0.0, None
             for n in self.names:
                 u[n].requires_grad_(True)
                 ur[n].requires_grad_(True)
-            for chunk in chunks:
-                with torch.enable_grad():
-                    kl = sum(((lp.exp() * (lp - self.run(i, everywhere, plan, u, ur))).sum() / LN2) for i, lp, plan in chunk) / (len(texts) * T)
-                total += float(kl)
-                if k < PGD_STEPS:
-                    gs = torch.autograd.grad(kl, [u[n] for n in self.names] + [ur[n] for n in self.names])
-                    grads = list(gs) if grads is None else [a + b for a, b in zip(grads, gs)]
-            if total > best:
-                best, best_u, best_ur = total, {n: u[n].detach().clone() for n in self.names}, {n: ur[n].detach().clone() for n in self.names}
-            if k == PGD_STEPS:
-                break
+            with torch.enable_grad():
+                kl = self._kl(logp, self.run(ids, targets, plan, u, ur))
+                adversarial = torch.maximum(adversarial, kl.detach())
+                if k == PGD_STEPS:
+                    break
+                grads = torch.autograd.grad(kl.sum(), [u[n] for n in self.names] + [ur[n] for n in self.names])
             with torch.no_grad():
                 for n, gr in zip(self.names, grads[: len(self.names)]):
                     u[n] = (u[n] + PGD_STEP * gr.sign()).clamp(0, 1)
                 for n, gr in zip(self.names, grads[len(self.names):]):
                     ur[n] = (ur[n] + PGD_STEP * gr.sign()).clamp(0, 1)
-        return best_u, best_ur, best
+        total = torch.stack([deleted, random, adversarial]).max(0).values
+        return [{"kl_bits": float(total[b]), "kl_deleted_bits": float(deleted[b]), "kl_random_bits": float(random[b]),
+                 "kl_adversarial_bits": float(adversarial[b]), "nodes": graphs[b].count(),
+                 "edges": None if graphs[b].complete else graphs[b].edges(), "size": None if graphs[b].complete else graphs[b].size()} for b in range(B)]
 
-    # ---- one prediction's graph
+    # ---- the teacher
 
-    def everything(self, T: int) -> Graph:
-        """Every subcomponent at every position, complete: the model itself."""
-        return Graph(masks={n: torch.ones(T, self.C[n], dtype=torch.bool, device=self.dev) for n in self.names})
+    def _strength_loop(self, forward, logits: torch.Tensor, target: float, log=None, what: str = "") -> torch.Tensor:
+        """Minimize mean(sigmoid(logits)) subject to max(KL_deleted, KL_random, KL_adversarial) <= target by Adam on
+        the logits and dual ascent on the multiplier; forward(strengths, r) -> KL for an ablation r ("zero", "random"
+        or the persistent adversarial sources, which take one sign-gradient step of PGD_STEP per step). Returns the
+        final strengths."""
+        logits = logits.clone().requires_grad_(True)
+        opt = torch.optim.Adam([logits], lr=TEACH_LR)
+        mu = 0.0
+        adv = None
+        for step in range(TEACH_STEPS):
+            with torch.enable_grad():
+                g = torch.sigmoid(logits)
+                kd = forward(g, "zero")
+                kr = forward(g, "random")
+                ka, adv_src = forward(g, "adversarial" if adv is None else adv)
+                up = torch.autograd.grad(ka, adv_src, retain_graph=True)  # the adversary ascends its own KL
+                k = torch.stack([kd, kr, ka]).max()
+                loss = g.mean() + mu * (k - target)
+                opt.zero_grad()
+                loss.backward()
+            opt.step()
+            with torch.no_grad():
+                adv = [(s + PGD_STEP * d.sign()).clamp(0, 1).requires_grad_(True) for s, d in zip(adv_src, up)]
+            mu = max(0.0, mu + float(k) - target)
+            if log and (step % 50 == 0 or step == TEACH_STEPS - 1):
+                log(f"{what} step {step}: kl {float(k):.4f} (target {target}), mean strength {float(g.mean()):.4f}, above 1/2: {int((g > 0.5).sum())}, mu {mu:.3f}")
+        return torch.sigmoid(logits.detach())
 
-    def reachable(self, g: Graph, targets: list[int]) -> Graph:
-        """g's nodes (a mask graph) that can affect the targets: none after the last target, and before the first
-        target none of the last layer's other than key and value (their outputs reach no later position's input)."""
-        last, first, final = self.target.n_layer - 1, min(targets), max(targets)
-        masks = {}
-        for n in self.names:
-            m = g.masks[n].clone()
-            m[final + 1:] = False
-            layer, kind = int(n.split(".")[1]), n.split(".")[-1]
-            if layer == last and kind not in ("k_proj", "v_proj"):
-                m[:first] = False
-            masks[n] = m
-        return Graph(masks=masks)
-
-    def _ladder(self, items: list, ok, batch: int, log=None, what: str = "") -> list:
-        """Greedy removal from `items` (each a removable unit, in the order to try): each round tests, in one batch,
-        dropping the first k untested units for k = n/2, n/4, ..., 2 and each of the next units alone; it keeps the
-        largest prefix drop that passes ok, else the first single that does, and marks failed singles as kept. ok:
-        a list of candidate remainders -> a list of (passes, score). Returns the remaining units and their score."""
-        kept, rounds, score = set(), 0, None
-        current = list(items)
-        while True:
-            rounds += 1
-            order = [x for x in current if x not in kept]
-            if not order:
-                break
-            ladder, k = [], len(order) // 2
-            while k >= 2:
-                ladder.append(k)
-                k //= 2
-            singles = order[: max(1, batch - len(ladder))]
-            drops = [set(order[:k]) for k in ladder] + [{x} for x in singles]
-            results = ok([[x for x in current if x not in d] for d in drops])
-            passing = [j for j, (p, _) in enumerate(results) if p]
-            prefix = [j for j in passing if j < len(ladder)]
-            if prefix:
-                j = prefix[0]
-            else:
-                kept |= {singles[j - len(ladder)] for j in range(len(ladder), len(drops)) if j not in passing}
-                single = [j for j in passing if j >= len(ladder)]
-                if not single:
-                    continue
-                j = single[0]
-            current = [x for x in current if x not in drops[j]]
-            score = results[j][1]
-            if log:
-                log(f"{what} round {rounds}: dropped {len(drops[j])}, {len(current)} left, {len(kept)} kept")
-        return current, score
-
-    def prune(self, ids: list[int], targets: list[int], bar: float, batch: int = 32, seed: int = 0, log=None) -> tuple[Graph, dict]:
-        """(one prediction's graph, its score). Nodes first: every subcomponent at every position that can reach the
-        targets (the model itself), then greedy removal of nodes (as a complete graph) within the bar, tried in order of
-        VPD's causal importance there (lowest first; only an order, every removal is measured); then edges: every
-        connection the model has between the kept nodes, removed greedily within the bar (nodes left without edges are
-        dropped). A start over the bar comes back as it is."""
+    def teach(self, ids: list[int], targets: list[int], eps: float, seed: int = 0, log=None) -> tuple[Graph, dict]:
+        """(one prediction's graph at precision eps, its score); see the module docstring."""
+        T = len(ids)
         logp = self.reference([ids], targets)
-        start = self.reachable(self.everything(len(ids)), targets)
-        s = self.score(ids, targets, [start], seed, logp)[0]
-        if s["kl_bits"] > bar:
-            return start, s
-        nodes = self._prune_nodes(ids, targets, start, bar, batch, seed, logp, log)
-        parents, out = all_edges(nodes, targets)
-        edge_list = [(r, w) for r, ws in parents.items() for w in ws] + [(None, w) for w in out]
+        ids_b = torch.tensor([ids], device=self.dev)
+        reach = self.reachable(T, targets)
+        names = self.names
+        flat = torch.cat([reach[n].flatten() for n in names])
+        sizes = [T * self.C[n] for n in names]
+        gen = torch.Generator(device="cpu").manual_seed(seed)
 
-        def build(es):
+        def split(v):  # a vector over the reachable (matrix, position, index) slots -> [T, C] per matrix
+            full = torch.zeros(len(flat), device=self.dev)
+            full[flat] = v
+            return {n: p.view(T, self.C[n]) for n, p in zip(names, torch.split(full, sizes))}
+
+        def node_forward(g, r):
+            m = split(g)
+            if r == "zero":
+                masks, rest = {n: m[n][None] for n in names}, {n: torch.zeros(1, T, device=self.dev) for n in names}
+            elif r == "random":
+                rr = {n: torch.rand(T, self.C[n], generator=gen).to(self.dev) for n in names}
+                masks = {n: (m[n] + (1 - m[n]) * rr[n])[None] for n in names}
+                rest = {n: torch.rand(1, T, generator=gen).to(self.dev) for n in names}
+            else:
+                src = [torch.rand(T, self.C[n], generator=gen).to(self.dev).requires_grad_(True) for n in names] + \
+                      [torch.rand(1, T, generator=gen).to(self.dev).requires_grad_(True) for n in names] if r == "adversarial" else r
+                masks = {n: (m[n] + (1 - m[n]) * s)[None] for n, s in zip(names, src[: len(names)])}
+                rest = dict(zip(names, src[len(names):]))
+            lq = torch.log_softmax(self.vpd.masked(ids_b, masks, rest)[:, targets].float(), -1)
+            k = self._kl(logp, lq)[0]
+            if r == "zero" or r == "random":
+                return k
+            return k, src
+
+        g = self._strength_loop(node_forward, torch.full((int(flat.sum()),), 2.0, device=self.dev), eps / 2, log, "nodes")
+        sel = split(g)
+        nodes = {(n, t, c) for n in names for t, c in (sel[n] > 0.5).nonzero().tolist()}
+        parents, out = all_edges(nodes, targets)
+        full = Graph(nodes, parents, out)
+        plan = self._plan([full], T)
+        n_edges = len(plan["order"])
+
+        def edge_forward(e, r):
+            ew, ow = self.edge_weights(plan, e)
+            if r == "zero":
+                u = ({n: torch.zeros(1, 1, self.C[n], device=self.dev) for n in names}, {n: torch.zeros(1, 1, device=self.dev) for n in names})
+                return self._kl(logp, self.run(ids, targets, plan, *u, ew, ow))[0]
+            if r == "random":
+                u = self._uniform(T, int(torch.randint(1 << 30, (1,), generator=gen)))
+                return self._kl(logp, self.run(ids, targets, plan, *u, ew, ow))[0]
+            if r == "adversarial":
+                u0, ur0 = self._uniform(T, int(torch.randint(1 << 30, (1,), generator=gen)))
+                src = [u0[n].clone().requires_grad_(True) for n in names] + [ur0[n].clone().requires_grad_(True) for n in names]
+            else:
+                src = r
+            k = self._kl(logp, self.run(ids, targets, plan, dict(zip(names, src[: len(names)])), dict(zip(names, src[len(names):])), ew, ow))[0]
+            return k, src
+
+        e = self._strength_loop(edge_forward, torch.full((n_edges,), 2.0, device=self.dev), eps, log, "edges")
+        order = plan["order"]
+        edge_list = [(r, w) for r, ws in parents.items() for w in ws] + [(None, w) for w in out]  # plan order
+        assert len(edge_list) == len(order)
+        ranked = sorted(range(n_edges), key=lambda j: -float(e[j]))
+        keep = int((e > 0.5).sum())
+
+        def build(js):
             par, o = {}, []
-            for r, w in es:
+            for j in js:
+                r, w = edge_list[j]
                 if r is None:
                     o.append(w)
                 else:
                     par.setdefault(r, []).append(w)
-            used = {w for _, w in es} | {r for r, _ in es if r is not None}
+            used = {w for j in js for w in [edge_list[j][1]]} | {edge_list[j][0] for j in js if edge_list[j][0] is not None}
+            used |= {nd for nd in nodes if _layer_kind(nd)[1] in ("q_proj", "k_proj")}  # queries and keys act through the attention pattern
             return Graph(used, par, o)
 
-        def ok_edges(cands):
-            res = self.score(ids, targets, [build(c) for c in cands], seed, logp)
-            return [(r["kl_bits"] <= bar, r) for r in res]
-
-        full = build(edge_list)
-        s_full = self.score(ids, targets, [full], seed, logp)[0]
-        if s_full["kl_bits"] > bar:  # the kept nodes need connections beyond the model's own between them
-            g = Graph(nodes, complete=True)
-            return g, self.score(ids, targets, [g], seed, logp)[0]
-        es, score = self._ladder(edge_list, ok_edges, batch, log, "edges")
-        return build(es), score or s_full
-
-    def _prune_nodes(self, ids, targets, start: Graph, bar: float, batch: int, seed: int, logp, log=None) -> set:
-        """The node stage of prune() on masks: the ladder of _ladder over the nodes of `start` in _node_order."""
-        names = self.names
-        order = self._node_order(ids, targets, start)  # (matrix index, position, index) tensors, lowest first
-        mi, ti, ci = order
-        N = len(mi)
-        alive = torch.ones(N, dtype=torch.bool, device=self.dev)
-        kept = torch.zeros(N, dtype=torch.bool, device=self.dev)
-        T = len(ids)
-
-        def masks_of(a):
-            out = {n: torch.zeros(T, self.C[n], dtype=torch.bool, device=self.dev) for n in names}
-            for j, n in enumerate(names):
-                sel = a & (mi == j)
-                out[n][ti[sel], ci[sel]] = True
-            return out
-
-        rounds = 0
-        while True:
-            rounds += 1
-            untested = (alive & ~kept).nonzero().flatten()
-            if len(untested) == 0:
-                break
-            ladder, k = [], len(untested) // 2
-            while k >= 2:
-                ladder.append(k)
-                k //= 2
-            singles = untested[: max(1, batch - len(ladder))]
-            cands = []
-            for k in ladder:
-                a = alive.clone()
-                a[untested[:k]] = False
-                cands.append(a)
-            for j in singles:
-                a = alive.clone()
-                a[j] = False
-                cands.append(a)
-            res = self.score(ids, targets, [Graph(masks=masks_of(a)) for a in cands], seed, logp)
-            passing = [j for j, r in enumerate(res) if r["kl_bits"] <= bar]
-            prefix = [j for j in passing if j < len(ladder)]
-            if prefix:
-                j = prefix[0]
-            else:
-                failed = [int(singles[j - len(ladder)]) for j in range(len(ladder), len(cands)) if j not in passing]
-                kept[failed] = True
-                single = [j for j in passing if j >= len(ladder)]
-                if not single:
-                    continue
-                j = single[0]
-            alive = cands[j]
-            if log:
-                log(f"nodes round {rounds}: {int(alive.sum())} left, {int(kept.sum())} kept, kl {res[j]['kl_bits']:.4f}")
-        idx = alive.nonzero().flatten()
-        return {(names[int(mi[i])], int(ti[i]), int(ci[i])) for i in idx}
-
-    @torch.no_grad()
-    def _node_order(self, ids: list[int], targets: list[int], g: Graph) -> tuple:
-        """g's nodes (a mask graph) as (matrix index, position, index) tensors ordered by VPD's causal importance at
-        their position, lowest first, ties by the size of what they write (|activation| |u|) on the model's run: the
-        order removals are tried in (only an order; every removal is measured)."""
-        ids_b = torch.tensor([ids], device=self.dev)
-        _, ci = self.vpd.target_and_ci(ids_b)
-        for n in self.names:
-            self.target.site(n).cache_input = True
-        self.target(ids_b)
-        mis, tis, cis, keys = [], [], [], []
-        for j, n in enumerate(self.names):
-            st = self.target.site(n)
-            size = ((st.last_input[0] @ st.V).abs() * st.U.norm(dim=1)).float()
-            t, c = g.masks[n].nonzero(as_tuple=True)
-            mis.append(torch.full_like(t, j))
-            tis.append(t)
-            cis.append(c)
-            keys.append(ci[n][0][t, c].float() * 1e6 + size[t, c] / (1 + size.max()))
-        self.vpd.clear()
-        mi, ti, cc, key = torch.cat(mis), torch.cat(tis), torch.cat(cis), torch.cat(keys)
-        o = key.argsort()
-        return mi[o], ti[o], cc[o]
+        while True:  # the strongest edges, more of them until the exact tests pass
+            g_out = build(ranked[:keep])
+            s = self.score(ids, targets, [g_out], seed, logp)[0]
+            if s["kl_bits"] <= eps or keep >= n_edges:
+                return g_out, s
+            keep = min(n_edges, max(keep + 1, int(keep * 1.25)))
 
 
 def program(g: Graph) -> str:
     """A graph as an answer: graph(tokens, targets) returning {(position, reader): its parents, "out": the
-    prediction's parents}, parents at the reader's own position as one string of subcomponents, an attention output's
-    parents (values) as {position: string}; nodes without parents but with children are not listed as readers."""
+    prediction's parents}; parents at the reader's own position are one string of subcomponents, an attention
+    output's parents (values) a {position: string}; a node with no parents is listed with "" when nothing reads it."""
     sites = list(mech.SITES.values())
     codes = {v: k for k, v in mech.SITES.items()}
 
     def tok(nd):
-        layer, kind = int(nd[0].split(".")[1]), nd[0].split(".")[-1]
+        layer, kind = _layer_kind(nd)
         return f"<p:{layer}.{codes[kind]}.{nd[2]}>"
 
     def key(nd):
-        layer, kind = int(nd[0].split(".")[1]), nd[0].split(".")[-1]
+        layer, kind = _layer_kind(nd)
         return (nd[1], layer, sites.index(kind), nd[2])
 
+    written = {w for ws in g.parents.values() for w in ws} | set(g.out)
+    readers = set(g.parents) | {nd for nd in g.nodes if nd not in written}
     lines = []
-    readers = set(g.parents) | {nd for nd in g.nodes if not any(nd in ws for ws in g.parents.values()) and nd not in g.out}
     for r in sorted(readers, key=key):
         ws = sorted(g.parents.get(r, []), key=key)
         if r[0].endswith("o_proj"):
@@ -638,72 +587,36 @@ def text(p: Path) -> tuple[list[int], list[int]]:
     return task["token_ids"], task["target_positions"]
 
 
-def universal() -> dict:
-    """POOL universal patterns, pattern j found on training texts j * PANEL ... (j + 1) * PANEL - 1."""
-    nat = Native(universal=None)
-    train = tasks("train")
-    parts = {n: [] for n in nat.names}
-    rest = {n: [] for n in nat.names}
-    kls = []
-    for j in range(POOL):
-        u, ur, kl = nat.find_universal([text(p) for p in train[j * PANEL:(j + 1) * PANEL]], seed=j)
-        for n in nat.names:
-            parts[n].append(u[n])
-            rest[n].append(ur[n])
-        kls.append(kl)
-        print(f"pattern {j}: VPD's answers' KL {kl:.3f} bits per position on its panel", flush=True)
-    torch.save({"parts": {n: torch.stack(v) for n, v in parts.items()}, "rest": {n: torch.stack(v) for n, v in rest.items()},
-                "panel_kl_bits": kls, "panel": PANEL}, TEXTS / "universal.pt")
-    return {"panel_kl_bits": kls}
-
-
-def bar(n: int) -> dict:
-    """VPD's answer's mean kl_bits on n training texts after the panels."""
+def teach(split: str, n: int, offset: int = 0, stride: int = 1, epsilons=(0.25, 1.0)) -> None:
+    """Native.teach on the split's texts offset, offset + stride, ... of its first n, at each eps ->
+    texts/graphs[_heldout]/<id>.<eps>.py and .json (its score, VPD's answer's, the seconds)."""
     nat = Native()
-    rows = [nat.score(*text(p), [nat.vpd_answer(text(p)[0])])[0] for p in tasks("train")[POOL * PANEL:POOL * PANEL + n]]
-    out = {k: sum(r[k] for r in rows) / len(rows) for k in ("kl_bits", "kl_deleted_bits", "kl_random_bits", "kl_universal_bits", "nodes")}
-    out.update(texts=len(rows), random=RANDOM, pool=POOL, panel=PANEL)
-    (TEXTS / "bar.json").write_text(json.dumps(out))
-    return out
-
-
-def teach(split: str, n: int, offset: int = 0, stride: int = 1) -> None:
-    """prune() on the split's texts offset, offset + stride, ... of its first n -> texts/circuits[_heldout]/<id>.py and
-    <id>.json (its score and VPD's answer's)."""
-    nat = Native()
-    b = json.loads((TEXTS / "bar.json").read_text())["kl_bits"]
-    out = TEXTS / ("circuits" if split == "train" else "circuits_heldout")
+    out = TEXTS / ("graphs" if split == "train" else "graphs_heldout")
     out.mkdir(exist_ok=True)
     for p in tasks(split)[:n][offset::stride]:
-        if (out / f"{p.stem}.py").exists():
-            continue
         ids, targets = text(p)
-        t0 = time.time()
-        full = nat.score(ids, targets, [nat.vpd_answer(ids)])[0]
-        g, s = nat.prune(ids, targets, b)
-        (out / f"{p.stem}.py").write_text(program(g) if not g.complete else "")
-        (out / f"{p.stem}.json").write_text(json.dumps({"score": s, "vpd": full, "bar": b, "complete": g.complete, "seconds": round(time.time() - t0, 1)}))
-        print(f"{p.stem}: VPD {full['nodes']} nodes kl {full['kl_bits']:.3f} -> {s['nodes']} nodes, {s['edges']} edges, kl {s['kl_bits']:.3f} (bar {b:.3f}), {time.time() - t0:.0f} s", flush=True)
+        for eps in epsilons:
+            stem = f"{p.stem}.{eps:g}"
+            if (out / f"{stem}.json").exists():
+                continue
+            t0 = time.time()
+            g, s = nat.teach(ids, targets, eps)
+            (out / f"{stem}.py").write_text(program(g))
+            (out / f"{stem}.json").write_text(json.dumps({"score": s, "eps": eps, "seconds": round(time.time() - t0, 1)}))
+            print(f"{stem}: {s['nodes']} nodes, {s['edges']} edges, kl {s['kl_bits']:.3f} (eps {eps}), {time.time() - t0:.0f} s", flush=True)
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("universal")
-    a = sub.add_parser("bar")
-    a.add_argument("--n", type=int, default=200)
     t = sub.add_parser("teach")
     t.add_argument("--split", choices=("train", "heldout"), required=True)
     t.add_argument("--n", type=int, required=True)
     t.add_argument("--offset", type=int, default=0)
     t.add_argument("--stride", type=int, default=1)
+    t.add_argument("--eps", type=float, nargs="+", default=[0.25, 1.0])
     args = ap.parse_args()
-    if args.cmd == "universal":
-        print(json.dumps(universal()))
-    elif args.cmd == "bar":
-        print(json.dumps(bar(args.n)))
-    else:
-        teach(args.split, args.n, args.offset, args.stride)
+    teach(args.split, args.n, args.offset, args.stride, tuple(args.eps))
 
 
 if __name__ == "__main__":

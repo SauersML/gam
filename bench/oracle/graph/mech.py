@@ -39,6 +39,32 @@ SITES = {"q": "q_proj", "k": "k_proj", "v": "v_proj", "o": "o_proj", "fc": "c_fc
 PART = re.compile(r"<p:(\d+)\.(q|k|v|o|fc|down)\.(\d+|rest)>")
 
 
+RESID_WRITERS = ("o_proj", "down_proj")
+RESID_READERS = ("q_proj", "k_proj", "v_proj", "c_fc")
+
+
+def stage(layer: int, kind: str) -> float:
+    """A residual writer's place in its position's residual stream (attention output of layer l at l + 0.5, MLP output
+    at l + 1) or a reader's (query, key, value at l, MLP input at l + 0.5): a reader reads what was written before."""
+    return layer + (0.5 if kind in ("o_proj", "c_fc") else (1.0 if kind == "down_proj" else 0.0))
+
+
+def connects(wl: int, wk: str, wt: int, rl: int | None, rk: str | None, rt: int | None, targets: list[int]) -> bool:
+    """Whether the model connects a writer subcomponent (layer wl, matrix wk, position wt) to a reader (rl, rk, rt; rk
+    None: the prediction at the targets): the residual stream at one position (an attention or MLP output into a later
+    query, key, value or MLP input, or into the prediction), attention (a value into the same layer's attention output
+    at that or a later position), or one MLP (an MLP input into the same MLP's output)."""
+    if rk is None:
+        return wk in RESID_WRITERS and wt in targets
+    if wk in RESID_WRITERS and rk in RESID_READERS:
+        return wt == rt and stage(wl, wk) <= stage(rl, rk)
+    if wk == "v_proj" and rk == "o_proj":
+        return wl == rl and wt <= rt
+    if wk == "c_fc" and rk == "down_proj":
+        return wl == rl and wt == rt
+    return False
+
+
 class MechError(Exception):
     """An invalid explanation."""
 
