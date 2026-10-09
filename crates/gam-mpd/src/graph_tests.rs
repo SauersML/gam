@@ -863,6 +863,11 @@ fn a_changed_pair_reads_the_base_prompts_changed_prompt() {
     let mut both = Checker::new(weights.clone(), claims_behavior(&listed, &counterfactuals(&listed))).expect("checker");
     let b = both.alignment_error(&Graph::parse(&explicit, &weights).expect("parse")).expect("explicit pairs");
     assert!(a > 0.0 && (a - b).abs() <= 1e-9 * a.max(1.0), "changed pairs {a} bits vs explicit {b} bits");
+    // A variable placed in no group swaps nothing and costs the signal, more than any placement.
+    let mut unplaced = changed.clone();
+    unplaced.alignments[0].nodes.clear();
+    let signal = own.alignment_error(&Graph::parse(&unplaced, &weights).expect("parse")).expect("unplaced");
+    assert!(signal >= a && signal > 0.0, "unplaced {signal} bits vs placed {a} bits");
 }
 
 /// A named group's use costs one name in the structure and its parts there none; its definition

@@ -1424,9 +1424,8 @@ impl Graph {
         let mut alignments = Vec::with_capacity(program.alignments.len());
         for b in &program.alignments {
             let nodes: Vec<usize> = b.nodes.iter().map(|id| ids.iter().position(|i| i == id).ok_or_else(|| format!("alignment {}: unknown node {id}", b.variable))).collect::<Result<_, _>>()?;
-            if nodes.is_empty() {
-                return Err(format!("alignment {}: no nodes", b.variable));
-            }
+            // No nodes: a variable of the behavior the program does not place; its test swaps nothing
+            // and costs the signal.
             if let Some(&n) = nodes.iter().find(|&&n| !blocks[n].writes_residual()) {
                 return Err(format!("alignment {}: node {} writes no residual stream (an interchange swaps a node's write)", b.variable, ids[n]));
             }
@@ -1608,7 +1607,7 @@ impl Graph {
         // Each named group used: one name; each label (an alignment tested by pairs; the answer's,
         // aligned by construction, has none): its code.
         parts += self.groups.len();
-        let labels = self.alignments.iter().filter(|(a, _)| !a.pairs.is_empty()).count();
+        let labels = self.alignments.iter().filter(|(a, nodes)| !a.pairs.is_empty() && !nodes.is_empty()).count();
         bits += self.groups.len() as f64 * name + (LABEL_TOKENS * labels) as f64 * token;
         let touches = |w: &Writer, r: Option<usize>| matches!(w, Writer::Unit(u) if base.contains(u)) || r.is_some_and(|r| base.contains(&r));
         for (w, r, route) in &self.edges[..self.edges.len() - self.implied.0] {
