@@ -25,7 +25,7 @@ prediction as its writer's index.
 Native.ordered is a search that bootstraps the oracle, not the method: integrated-gradients rankings of subcomponents
 and then of the connections between the top ones, averaged over the changed prompts; the answer adds the ranked
 connections in order in steps that double their number, each step keeping what lies on a path to the prediction, and
-ends at the first step that lowers the KL no further.
+ends at the step with the lowest KL.
 
   native.py search --split train --n N [--offset K --stride S] [--out DIR]   -> DIR/<task>.py, .json
 """
@@ -606,10 +606,8 @@ class Native:
                 break
             k = min(2 * k, len(items))
         scores = self.score(ids, targets, graphs, prompts)
-        keep = 1
-        while keep < len(graphs) and scores[keep]["kl_bits"] < scores[keep - 1]["kl_bits"]:
-            keep += 1
-        return graphs[:keep], scores[:keep]
+        keep = min(range(len(scores)), key=lambda j: scores[j]["kl_bits"]) + 1  # a connection does nothing until its path to the
+        return graphs[:keep], scores[:keep]  # input is in, so a step may lower nothing and a later one a lot: end at the lowest KL
 
 
 def prefix(ir: dict, k: int) -> tuple[Graph, list[str]]:
@@ -717,6 +715,35 @@ def program(steps: list[Graph], uses: list[list[str]] | None = None, notes: list
         prev = g
     lines.append("    ]")
     return "\n".join(lines) + "\n"
+
+
+def steps_of(source: str) -> tuple[str, list[str], str] | None:
+    """An answer in program()'s layout split into (its head through "return [", each step's text with its comment
+    line, its tail); None for any other layout."""
+    lines = source.splitlines(keepends=True)
+    try:
+        start = next(i for i, x in enumerate(lines) if x.strip() == "return [")
+        end = max(i for i, x in enumerate(lines) if x.strip() == "]")
+    except (StopIteration, ValueError):
+        return None
+    steps, cur = [], []
+    for x in lines[start + 1:end]:
+        cur.append(x)
+        if x.strip() == "},":
+            steps.append("".join(cur))
+            cur = []
+    if cur:
+        return None
+    return "".join(lines[:start + 1]), steps, "".join(lines[end:])
+
+
+def first_steps(source: str, k: int) -> str:
+    """An answer in program()'s layout cut to its first k steps (the whole source in any other layout)."""
+    parts = steps_of(source)
+    if parts is None:
+        return source
+    head, steps, tail = parts
+    return head + "".join(steps[:k]) + tail
 
 
 def tasks(split: str) -> list[Path]:

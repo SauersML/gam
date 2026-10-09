@@ -941,7 +941,7 @@ def sft_examples(args, pol, pool: list[dict]) -> tuple[list, list]:
     by_id = {b["id"]: b for b in pool}
     end = [pol.end]
     target = (lambda text: pol.parts.reg.rewrite(text)) if getattr(pol, "parts", None) is not None else (lambda text: text)  # noqa: E731  addresses -> part tokens
-    programs = [(pol.question_ids(by_id[bid]), pol.tok.encode(target(text.strip()), add_special_tokens=False) + end) for bid, text in sorted(SEARCH.items()) if bid in by_id]
+    programs = [(pol.question_ids(by_id[bid]), fit(pol.tok, target(text.strip()), args.max_tokens) + end) for bid, text in sorted(SEARCH.items()) if bid in by_id]
     questions = []
     for path in args.data or []:
         for line in open(os.path.expanduser(path)):
@@ -950,6 +950,30 @@ def sft_examples(args, pol, pool: list[dict]) -> tuple[list, list]:
             questions.append((pol.prompt_ids(user), pol.tok.encode(target(answer), add_special_tokens=False) + end))
     keep = lambda xs: [(p, c) for p, c in xs if len(p) + len(c) <= args.max_model_len]  # noqa: E731
     return keep(programs), keep(questions)
+
+
+def fit(tok, text: str, budget: int, encode=None) -> list[int]:
+    """An answer's tokens, its program cut to the most first steps (native.first_steps) whose answer fits `budget`
+    tokens (the oracle's output limit): a search answer is as long as its search ran, the oracle's as long as it may
+    write. encode: text -> token ids (default tok.encode without special tokens)."""
+    import native
+
+    encode = encode or (lambda t: tok.encode(t, add_special_tokens=False))
+    ids = encode(text)
+    if len(ids) <= budget:
+        return ids
+    source, _ = split_answer(text)
+    parts = native.steps_of(source)
+    if parts is None:
+        return ids
+    lo, hi = 0, len(parts[1])  # the most steps that fit, by bisection (length grows with steps)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if len(encode(text.replace(source, native.first_steps(source, mid)))) <= budget:
+            lo = mid
+        else:
+            hi = mid - 1
+    return encode(text.replace(source, native.first_steps(source, lo)))
 
 
 def sft(args, pol, pool, learner: Learner, log) -> dict:
@@ -1181,6 +1205,9 @@ def main():
     if args.eval_behaviors:  # one fixed subset, the same at every evaluation
         sets = {k: random.Random(args.seed).sample(v, min(args.eval_behaviors, len(v))) for k, v in sets.items()}
     adapter = out / "adapter"
+    if args.search_heldout:  # the search's baseline at the oracle's output budget
+        for bid, text in list(HELDOUT_SEARCH.items()):
+            HELDOUT_SEARCH[bid] = pol.tok.decode(fit(pol.tok, text, args.max_tokens))
     if args.mode == "eval":
         pol.save(adapter)
         print(json.dumps(evaluate(sets, pol, sampler, score, args, adapter, 0, open(out / "eval.jsonl", "a"), 0)))
