@@ -790,6 +790,48 @@ fn stacked_equals_own(weights: &Weights, circuits: &[crate::graph::Circuit], bat
     copies
 }
 
+/// Format v3's pricing parity: an answer in the old form (an algorithm's variables aligned to parts,
+/// the answer variable's pairs stripped) and its v3 conversion (one node per block it uses, labels
+/// on the non-answer nodes, the same data flow and code) score the same total; the structure is
+/// priced from the graph (names per part, code tokens per node, label and edge), not from the
+/// syntax.
+#[test]
+fn old_and_v3_forms_of_an_answer_score_alike() {
+    use crate::graph::{AlignmentIr, PairIr};
+    let f = fixture("graph_v3_parity");
+    let library = Library::new(&f.device, &f.device, &f.native, &f.layers, &f.artifact, 1 << 28, 64).expect("library");
+    let mut weights = Weights::of(&library);
+    inexact_vpd_views(&mut weights, 1);
+    let piece = |kind: &str, index: Vec<usize>| PieceIr { view: "vpd".into(), layer: 1, kind: kind.into(), index: Some(Index::Many(index)) };
+    let edge = |from: &str, to: &str, route: &str| EdgeIr { from: from.into(), to: to.into(), route: route.into() };
+    let pairs: Vec<PairIr> = (0..f.sequences.len() - 1).map(|i| PairIr { base: i, source: i + 1 }).collect();
+    let form = |(prev, answer): (&str, &str), answer_alignment: bool| {
+        let nodes = vec![
+            NodeIr { id: prev.into(), pieces: vec![piece("v_proj", vec![1, 2]), piece("o_proj", vec![0, 3])], claim: None },
+            NodeIr { id: answer.into(), pieces: vec![piece("c_fc", vec![0, 2, 7]), piece("down_proj", vec![1, 3])], claim: None },
+        ];
+        let edges = vec![edge("embed", prev, "value"), edge("embed", answer, "input"), edge(prev, answer, "input"), edge(answer, "logits", "input"), edge("embed", "logits", "input")];
+        let mut alignments = vec![AlignmentIr { variable: "prev".into(), nodes: vec![prev.into()], pairs: pairs.clone() }];
+        if answer_alignment {
+            alignments.push(AlignmentIr { variable: "answer".into(), nodes: vec![answer.into()], pairs: Vec::new() });
+        }
+        Program { model: "tiny".into(), valid: true, nodes, edges, alignments, python_tokens: 41, token_types: 37, standin: Some("counterfactual".into()), ..Program::default() }
+    };
+    // Old form: tracer node ids per variable and block, the answer variable aligned (no pairs).
+    let old = form(("prev.1.attn", "answer.1.mlp"), true);
+    let v3 = form(("prev_g", "answer"), false);
+    let mut checker = Checker::new(weights.clone(), claims_behavior(&f.sequences, &counterfactuals(&f.sequences))).expect("checker");
+    let scores = checker.score_batch(&[old, v3], 6, 2, true, None, 0).expect("scores");
+    let (a, b) = (&scores[0].0, &scores[1].0);
+    assert!(a.valid && b.valid && a.alignment_error_bits > 0.0, "both score, the label is tested");
+    assert!((a.total_bits - b.total_bits).abs() <= 1e-6 * a.total_bits, "old form {} bits vs v3 {} bits", a.total_bits, b.total_bits);
+    assert!((a.complexity_bits - b.complexity_bits).abs() <= 1e-9 * a.complexity_bits);
+    // The structure as code tokens at log2 37 bits: 2 nodes x 5, 1 label x 3, 5 edges x 2 and a value route 2.
+    let token = 37f64.log2();
+    let names = 9.0 * (weights.vocabulary() as f64).log2();
+    assert!((a.structure_bits - (names + (2.0 * 5.0 + 3.0 + 5.0 * 2.0 + 2.0) * token)).abs() < 1e-9, "structure {} bits", a.structure_bits);
+}
+
 /// A named group's use costs one name in the structure and its parts there none; its definition
 /// (its parts' names, a remainder its rank) is reported apart as group_bits.
 #[test]
@@ -809,13 +851,13 @@ fn named_groups_cost_one_name_and_report_their_definition() {
     let vpd = &weights.vpd[&1];
     let rank = vpd.fc_u.ncols().min(vpd.fc_v.nrows());
     let plain = Graph::parse(&program, &weights).expect("parse");
-    let (parts, bits, _) = plain.structure(&weights, &BTreeSet::new());
+    let (parts, bits, _) = plain.structure(&weights, &BTreeSet::new(), 0.0);
     assert_eq!(parts, 3 + rank + 2);
     assert_eq!(plain.group_bits(&weights), 0.0);
     // The group names c_fc 0 and 2, the c_fc remainder and down_proj 3, all held by M.
     program.groups = vec![GroupIr { name: "g".into(), parts: vec!["<p:1.fc.0>".into(), "<p:1.fc.2>".into(), "<p:1.fc.rest>".into(), "<p:1.down.3>".into()], nodes: vec!["M".into()] }];
     let grouped = Graph::parse(&program, &weights).expect("parse");
-    let (grouped_parts, grouped_bits, _) = grouped.structure(&weights, &BTreeSet::new());
+    let (grouped_parts, grouped_bits, _) = grouped.structure(&weights, &BTreeSet::new(), 0.0);
     assert_eq!(grouped_parts, 2 + 1, "c_fc 7 and down_proj 1 by name, the group by one");
     assert!((bits - grouped_bits - (rank + 3 - 1) as f64 * name).abs() < 1e-9, "the group's parts cost nothing, its use one name");
     assert!((grouped.group_bits(&weights) - (3 + rank) as f64 * name).abs() < 1e-9, "the definition: three subcomponents and a remainder of rank {rank}");

@@ -747,7 +747,9 @@ fn complexity_is_what_a_reader_takes_in() {
         NodeIr { id: "f".into(), pieces: vec![vpd("c_fc", crate::graph::Index::Many(vec![0, 3])), vpd("down_proj", crate::graph::Index::Name("rest".into()))], claim: None },
         NodeIr { id: "h".into(), pieces: vec![PieceIr { view: "native".into(), layer: 1, kind: "head".into(), index: Some(crate::graph::Index::One(1)) }], claim: None },
     ];
-    program.edges = vec![EdgeIr { from: "embed".into(), to: "f".into(), route: "input".into() }, EdgeIr { from: "f".into(), to: "logits".into(), route: "input".into() }, EdgeIr { from: "h".into(), to: "logits".into(), route: "input".into() }];
+    program.edges = vec![EdgeIr { from: "embed".into(), to: "f".into(), route: "input".into() }, EdgeIr { from: "f".into(), to: "logits".into(), route: "input".into() }, EdgeIr { from: "f".into(), to: "h".into(), route: "value".into() }, EdgeIr { from: "h".into(), to: "logits".into(), route: "input".into() }];
+    // 64 code token types: 6 bits per token.
+    program.token_types = 64;
     let with_base = Program { base: vec!["f".into()], ..program.clone() };
     let mut checker = Checker::new(weights, behavior(&sequences)).expect("checker");
     // The model's shared base holds f's parts, so the program may list f as base (each program that
@@ -758,13 +760,15 @@ fn complexity_is_what_a_reader_takes_in() {
     let scores = checker.score_batch(&[program, with_base], 6, 2, true, None, 0).expect("scores");
     let (plain, based) = (&scores[0].0, &scores[1].0);
     let name = (vocabulary as f64).log2();
-    let edge = (3.0 * 9.0f64).log2();
+    // Code tokens at 6 bits: a node 5, an edge 2, a value route 2 more.
+    let (node, edge, route) = (5.0 * 6.0, 2.0 * 6.0, 2.0 * 6.0);
     // Two c_fc subcomponents, the down_proj remainder (rank min(width, hidden)) and one head.
     assert_eq!(plain.parts, 2 + width.min(hidden) + 1);
-    assert!((plain.structure_bits - (plain.parts as f64 * name + 3.0 * edge)).abs() < 1e-9, "structure {} bits", plain.structure_bits);
+    assert!((plain.structure_bits - (plain.parts as f64 * name + 2.0 * node + 4.0 * edge + route)).abs() < 1e-9, "structure {} bits", plain.structure_bits);
     assert_eq!(plain.base_bits, 0.0);
-    // The base node f, its edges and the edge into it are charged apart.
-    assert!((based.base_bits - ((2 + width.min(hidden)) as f64 * name + 2.0 * edge)).abs() < 1e-9 && (based.structure_bits - (name + edge)).abs() < 1e-9);
+    // The base node f, the edges touching it (into f, f to the logits, f to h's values) are charged apart.
+    assert!((based.base_bits - ((2 + width.min(hidden)) as f64 * name + node + 3.0 * edge + route)).abs() < 1e-9, "base {} bits", based.base_bits);
+    assert!((based.structure_bits - (name + node + edge)).abs() < 1e-9, "structure {} bits", based.structure_bits);
     assert!((plain.total_bits - plain.exec_error_bits - plain.necessity_error_bits - plain.claim_error_bits - plain.alignment_error_bits - plain.complexity_bits).abs() < 1e-6 * plain.total_bits);
     assert!(plain.opaque_numbers > 0);
     let scored: usize = scores[0].1.iter().map(|m| m.1.len()).sum();

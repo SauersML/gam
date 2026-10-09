@@ -123,6 +123,20 @@ fn group_part(weights: &Weights, token: &str) -> Result<GroupPart, String> {
     Ok((layer, matrix, index))
 }
 
+/// The code tokens [`Graph::structure`] counts for a program's structure, as format v3 writes it:
+/// a node (`name = node( … )`), a label on it (`means = function`, or a claim), an edge (the writer
+/// in the reader's list and its separator), and a route other than the input (`. query`).
+pub const NODE_TOKENS: usize = 5;
+pub const LABEL_TOKENS: usize = 3;
+pub const EDGE_TOKENS: usize = 2;
+pub const ROUTE_TOKENS: usize = 2;
+
+/// The bits of one code token of a program of `types` token types (none below two types, as its
+/// code bits).
+pub fn token_bits(types: usize) -> f64 {
+    if types > 1 { (types as f64).log2() } else { 0.0 }
+}
+
 /// A named group a program uses: its name, parts and the nodes (indices) holding them.
 #[derive(Clone, Debug)]
 pub struct GroupUse {
@@ -1550,13 +1564,18 @@ impl Graph {
         circuit
     }
 
-    /// What a reader takes in from the program's structure (design_v2 section 2): each part a node
-    /// lists costs `log2 V` bits to name (`V` = [`Weights::vocabulary`]), a VPD remainder its
-    /// matrix's rank in names (it holds that many directions), and each edge `log2(3 (n + 1)²)`
-    /// bits for `n` nodes (its writer, reader and route); the edges a base implies cost nothing.
-    /// Returns the part names, the bits of every part and edge outside `base`, and the bits of
-    /// `base`'s nodes and the declared edges that touch them.
-    pub fn structure(&self, weights: &Weights, base: &BTreeSet<usize>) -> (usize, f64, f64) {
+    /// What a reader takes in from the program's structure (design_v2 section 2; format v3's pricing
+    /// parity): each part a node lists costs `log2 V` bits to name (`V` = [`Weights::vocabulary`]), a
+    /// VPD remainder its matrix's rank in names (it holds that many directions), a named group's use
+    /// one name; the rest is code, `token` bits per code token (the program's `log2` token types),
+    /// counted from the graph whatever the syntax wrote it: [`NODE_TOKENS`] per node,
+    /// [`LABEL_TOKENS`] per label (an alignment with pairs, or a claim), [`EDGE_TOKENS`] per edge and
+    /// [`ROUTE_TOKENS`] more for a query, key or value route. So the same subcomponents with the same
+    /// data flow cost the same in every format (mech's code tokens leave these statements out). The
+    /// edges a base implies cost nothing. Returns the part names, the bits of every part, node,
+    /// label and edge outside `base`, and the bits of `base`'s nodes and the declared edges that
+    /// touch them.
+    pub fn structure(&self, weights: &Weights, base: &BTreeSet<usize>, token: f64) -> (usize, f64, f64) {
         let name = (weights.vocabulary().max(2) as f64).log2();
         // Names in one site's list (matrix `m` of `layer`, at node `k`): one per subcomponent, the
         // rank for the remainder (index `count`), none for a part a named group the node holds
@@ -1578,19 +1597,21 @@ impl Graph {
                 },
             };
             parts += count;
-            *(if base.contains(&k) { &mut base_bits } else { &mut bits }) += count as f64 * name;
+            let claim = if self.claims.get(k).is_some_and(Option::is_some) { LABEL_TOKENS } else { 0 };
+            *(if base.contains(&k) { &mut base_bits } else { &mut bits }) += count as f64 * name + (NODE_TOKENS + claim) as f64 * token;
         }
-        // Each named group used: one name.
+        // Each named group used: one name; each label (an alignment tested by pairs; the answer's,
+        // aligned by construction, has none): its code.
         parts += self.groups.len();
-        bits += self.groups.len() as f64 * name;
-        let n = self.blocks.len() as f64;
-        let edge = (3.0 * (n + 1.0) * (n + 1.0)).log2();
+        let labels = self.alignments.iter().filter(|(a, _)| !a.pairs.is_empty()).count();
+        bits += self.groups.len() as f64 * name + (LABEL_TOKENS * labels) as f64 * token;
         let touches = |w: &Writer, r: Option<usize>| matches!(w, Writer::Unit(u) if base.contains(u)) || r.is_some_and(|r| base.contains(&r));
-        for (w, r, _) in &self.edges[..self.edges.len() - self.implied.0] {
-            *(if touches(w, *r) { &mut base_bits } else { &mut bits }) += edge;
+        for (w, r, route) in &self.edges[..self.edges.len() - self.implied.0] {
+            let tokens = EDGE_TOKENS + if *route == Route::Input { 0 } else { ROUTE_TOKENS };
+            *(if touches(w, *r) { &mut base_bits } else { &mut bits }) += tokens as f64 * token;
         }
         for &(w, r) in &self.internal[..self.internal.len() - self.implied.1] {
-            *(if base.contains(&w) || base.contains(&r) { &mut base_bits } else { &mut bits }) += edge;
+            *(if base.contains(&w) || base.contains(&r) { &mut base_bits } else { &mut bits }) += EDGE_TOKENS as f64 * token;
         }
         (parts, bits, base_bits)
     }
@@ -4009,7 +4030,7 @@ pub struct Score {
     pub reader_error_bits: f64,
     /// What a reader takes in (design_v2 section 2): `structure_bits + code_bits + explanation_bits`.
     pub complexity_bits: f64,
-    /// The program's parts and edges ([`Graph::structure`]), its shared base's apart.
+    /// The program's parts, nodes, labels and edges ([`Graph::structure`]), its shared base's apart.
     pub structure_bits: f64,
     /// The algorithm's tokens without comments (`Program::python_tokens` times `log2` of its token
     /// types).
@@ -4242,7 +4263,8 @@ impl Checker {
         let previous = std::mem::replace(&mut self.base, base);
         match self.empty_graph() {
             Ok(g) => {
-                let (parts, _, bits) = g.structure(&self.weights, &g.base);
+                let token = token_bits(self.base.as_ref().map_or(0, |b| b.token_types));
+                let (parts, _, bits) = g.structure(&self.weights, &g.base, token);
                 Ok((bits, parts))
             }
             Err(e) => {
@@ -4738,11 +4760,12 @@ impl Checker {
             let (necessity_error_bits, necessity_families) = std::mem::take(&mut necessity[i]);
             per_family.extend(necessity_families);
             let exec_error_bits = n * total.0 / total.1.max(1) as f64;
-            let code_bits = if *valid && program.token_types > 1 { program.python_tokens as f64 * (program.token_types as f64).log2() } else { 0.0 };
+            let token = if *valid { token_bits(program.token_types) } else { 0.0 };
+            let code_bits = program.python_tokens as f64 * token;
             let explanation_bits = if *valid && program.explanation_token_types > 1 { program.explanation_tokens as f64 * (program.explanation_token_types as f64).log2() } else { 0.0 };
             let opaque_numbers = graph.opaque_numbers(&self.weights);
             // A shared base library's nodes are priced apart, for the caller to charge once.
-            let (parts, structure_bits, base_bits) = graph.structure(&self.weights, &graph.base);
+            let (parts, structure_bits, base_bits) = graph.structure(&self.weights, &graph.base, token);
             let complexity_bits = structure_bits + code_bits + explanation_bits;
             let claim_error_bits = n * self.claim_error(graph)?;
             let alignment_error_bits = n * self.alignment_error(graph)?;
