@@ -24,10 +24,11 @@ prediction as its writer's index.
 
 Native.ordered is a search that bootstraps the oracle, not the method: integrated-gradients rankings of subcomponents
 and then of the connections between the top ones, averaged over the changed prompts; the answer adds the ranked
-connections in order in steps that double their number, each step keeping what lies on a path to the prediction, and
-ends at the step with the lowest KL.
+connections in order in steps that double their number, each step keeping what computes something and lies on a path
+to the prediction (live), and ends at the step with the lowest KL.
 
   native.py search --split train --n N [--offset K --stride S] [--out DIR]   -> DIR/<task>.py, .json
+  native.py tidy DIR      every answer in DIR made live (live()), in place
 """
 
 from __future__ import annotations
@@ -653,7 +654,7 @@ class Native:
             log(f"{lo} subcomponents ranked first; {len(items)} connections and query/key nodes between them")
         graphs, k = [], 1
         while True:
-            g = on_path(build(items[:k]), targets)
+            g = live(build(items[:k]), targets)
             if g.count() and (not graphs or g.size() > graphs[-1].size()):
                 graphs.append(g)
             if k >= len(items):
@@ -716,6 +717,39 @@ def on_path(g: Graph, targets: list[int]) -> Graph:
                 stack.append(w)
     par = {r: [w for w in ws if w in keep] for r, ws in g.parents.items() if r in keep}
     return Graph(keep, {r: ws for r, ws in par.items() if ws}, [w for w in g.out if w in keep])
+
+
+def live(g: Graph, targets: list[int]) -> Graph:
+    """g without what computes nothing when it runs alone: an attention output with no value among its parents and an
+    MLP output with no MLP input among them are zero (a query, key, value or MLP input reads the embedding at least),
+    then whatever lies on no path to the prediction (on_path), until nothing changes. Its run alone is the same."""
+    while True:
+        h = on_path(g, targets)
+        dead = {nd for nd in h.nodes if _layer_kind(nd)[1] in ("o_proj", "down_proj") and not h.parents.get(nd)}
+        if not dead:
+            return h
+        par = {r: [w for w in ws if w not in dead] for r, ws in h.parents.items() if r not in dead}
+        g = Graph(h.nodes - dead, {r: ws for r, ws in par.items() if ws}, [w for w in h.out if w not in dead])
+
+
+def tidy(directory: Path) -> None:
+    """Every answer DIR/<task>.py rewritten with each step's graph made live (live()), steps that add nothing dropped,
+    comments and docstring kept: the same runs alone, shorter descriptions."""
+    for py in sorted(Path(directory).glob("*.py")):
+        task = json.loads((TEXTS / "vpd4l" / f"{py.stem.split('.')[0]}.json").read_text())
+        targets = task["prompts"][0]["target_positions"]
+        ir = mech.trace_inline(py.read_text(), "vpd4l", task)
+        if not ir["valid"]:
+            continue
+        g = ir["graph"]
+        steps, notes, prev = [], [], None
+        for k in range(1, g["steps"] + 1):
+            h = live(prefix(ir, k)[0], targets)
+            if h.count() and (prev is None or h.size() > prev.size()):
+                steps.append(h)
+                notes.append(g["notes"][k - 1] if k - 1 < len(g["notes"]) else "")
+                prev = h
+        py.write_text(program(steps, notes=notes if any(notes) else None, explanation=g.get("explanation") or None))
 
 
 def program(steps: list[Graph], uses: list[list[str]] | None = None, notes: list[str] | None = None, explanation: str | None = None) -> str:
@@ -844,8 +878,13 @@ def main():
     s.add_argument("--offset", type=int, default=0)
     s.add_argument("--stride", type=int, default=1)
     s.add_argument("--out", type=Path)
+    t = sub.add_parser("tidy")
+    t.add_argument("directory", type=Path)
     args = ap.parse_args()
-    search(args.split, args.n, args.offset, args.stride, args.out)
+    if args.cmd == "tidy":
+        tidy(args.directory)
+    else:
+        search(args.split, args.n, args.offset, args.stride, args.out)
 
 
 if __name__ == "__main__":
