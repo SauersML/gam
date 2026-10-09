@@ -1,6 +1,6 @@
-"""The graph oracle's input (#2951, format v3): a short reference, example answers, then the behavior as text. The
-oracle answers with a program (the `groups` dict, scored by the checker) and one line of English after it; split_answer
-separates the two. No weights or vectors: the behavior's description, a few of its prompts with the model M's top next
+"""The graph oracle's input (#2951, format v4): a short reference, example answers, then the behavior as text. The
+oracle answers with a program (the `nodes`, `edges` and `labels`, scored by the checker) and English after it;
+split_answer separates the two. No weights or vectors: the behavior's description, a few of its prompts with the model M's top next
 tokens and probabilities (the behavior file's `model_top`), the behavior's variables, and the parts of M it may name.
 
   prompt.py BEHAVIOR.json [--prompts 4] [--shots 1]      prints the prompt
@@ -21,30 +21,34 @@ sys.path.insert(0, str(HERE))
 import family  # noqa: E402
 import mech  # noqa: E402
 
-TEACHER = Path.home() / "mpd-data/graph_oracle/teacher_v3/manifest.jsonl"
+TEACHER = Path.home() / "mpd-data/graph_oracle/teacher_v4/manifest.jsonl"
 
 REFERENCE = """\
-Explain how the model computes the behavior below. Answer with one Python program in a ```python block, then one
-line of plain English after the block. The program is a single dict, `groups`: named groups of the model's
-subcomponents and which groups read which. The model's own weights do all of the computing.
-- Each group: {{"subcomponents": [...], "reads": [...], "label": "<variable>"}}, or for the one group that writes
-  the next-token prediction {{"subcomponents": [...], "reads": [...], "writes": "output"}}.
-- subcomponents are part tokens in quotes, e.g. "<p:1.v.531>"; a subcomponent belongs to one group.
-{parts}- reads: "input" (the prompt's tokens) and other groups ("name:query", "name:key" or "name:value" for an
-  attention read). A group reads only what earlier layers write.
-- label: the behavior variable the group carries (listed with the behavior). Every group except the output group
-  carries one. A variable is tested on prompt pairs that change it: the group's output under the changed prompt is
-  swapped in, and the model's prediction should change the same way. A variable no group carries costs its whole
-  effect.
-- Everything you do not name runs on the prompt's changed prompt (the prompt with the deciding information
-  changed), so the groups you name must carry that information. Name those subcomponents and nothing more.
-- The score in bits (lower is better) adds: how far the named groups alone are from the model, how much of the
-  behavior survives when only the named groups run on the changed prompt, each variable's test, and the size
-  (subcomponents, groups, reads, explanation)."""
+Explain how the model computes the behavior below. Answer with one Python program in a ```python block, then plain
+English after the block. The program is a causal graph of the model's subcomponents: `nodes`, `edges` and, optionally,
+`labels`. The model's own weights do all of the computing; the program says which subcomponents, where, and which
+read which.
+- nodes = {{name: {{"subcomponents": [...], "at": where}}}}. Subcomponents are part tokens in quotes, e.g. "<p:1.v.531>";
+  a subcomponent belongs to one node. "at" says at which positions the node acts: "all", "targets" (the positions
+  whose next token the behavior asks for), "last", or the name of a function you define that takes `tokens` (the
+  sequence as the model's token strings) and returns a list of bools or of positions.
+{parts}- edges = [(writer, reader) or (writer, reader, route)]: the writer a node or "input" (the tokens), the reader a node
+  or "output" (the next-token prediction); route "query", "key" or "value" for an attention reader (default: all of
+  its inputs). A writer must write before the reader reads (an earlier layer, or attention before the MLP of its
+  layer); an attention reader at one position reads its writers' outputs at other positions.
+- labels = {{node: variable}}, optional: the behavior variable a node carries (listed with the behavior). A variable is
+  tested by swapping its node's output from a changed prompt that changes it; a variable no node carries costs its
+  whole effect.
+- Everything you leave out is removed from the model, so the nodes and edges you name must produce the behavior's
+  answers alone, and removing them must take the answers away. Name what is needed and nothing more.
+- The score in bits (lower is better) adds: how far the graph's prediction of the behavior's answers (the prompt's
+  and the changed prompt's) is from the model's, how much of the answer survives when only the graph is removed,
+  each variable's test, and the size (subcomponents, nodes, edges, code, explanation)."""
 
 PARTS = ("- <p:L.S.I> is subcomponent I (rank one) of VPD's decomposition of layer L's weight matrix S: q, k, v, o\n"
-         "  (attention query, key, value, output) or fc, down (MLP input, output); per layer {sizes}; <p:L.S.rest> is\n"
-         "  what that matrix holds beyond its subcomponents (it costs as many names as the matrix's rank).\n")
+         "  (attention query, key, value, output) or fc, down (MLP input, output); per layer {sizes}; only o and down\n"
+         "  subcomponents write the residual stream. <p:L.S.rest> is what that matrix holds beyond its subcomponents (it\n"
+         "  costs as many names as the matrix's rank).\n")
 
 
 @lru_cache(None)
@@ -83,8 +87,7 @@ def behavior_text(behavior: dict, prompts: int) -> str:
             if cf and cf.get("model_top"):
                 lines.append("    changed: " + show(model, cf["token_ids"], t, cf["model_top"][k]))
     named = variables(behavior)
-    lines.append("Variables: " + ("; ".join(f"{v} ({note})" if note else v for v, note in named.items()) if named else
-                                  "none (one group, writing the output)"))
+    lines.append("Variables: " + ("; ".join(f"{v} ({note})" if note else v for v, note in named.items()) if named else "none"))
     return "\n".join(lines)
 
 

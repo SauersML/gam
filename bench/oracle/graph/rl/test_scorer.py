@@ -164,7 +164,7 @@ def check_valid_sampler():
     log-probabilities; stats report the valid share of every draw and of the kept ones."""
     import train
 
-    good = 'groups = {"answer": {"subcomponents": ["<p:3.v.5>", "<p:3.o.7>"], "reads": ["input"], "writes": "output"}}\n'
+    good = 'nodes = {"copy": {"subcomponents": ["<p:3.v.5>", "<p:3.o.7>"]}}\nedges = [("input", "copy"), ("copy", "output")]\n'
     tok = types.SimpleNamespace(decode=lambda c, skip_special_tokens=True: good if c[0] > 0 else "nonsense(")
     calls = []
 
@@ -217,7 +217,7 @@ def check_redraws_share_wake():
     try:
         inner = train.VllmSampler(types.SimpleNamespace(share_gpu=True, max_tokens=8), 4, 0)
         inner.llm, inner.policy = Engine(), types.SimpleNamespace(model=Model(), dev="cuda:0")
-        good = 'groups = {"answer": {"subcomponents": ["<p:3.v.5>", "<p:3.o.7>"], "reads": ["input"], "writes": "output"}}\n'
+        good = 'nodes = {"copy": {"subcomponents": ["<p:3.v.5>", "<p:3.o.7>"]}}\nedges = [("input", "copy"), ("copy", "output")]\n'
         tok = types.SimpleNamespace(decode=lambda c, skip_special_tokens=True: "nonsense(" if c[0] == 1 else good)
         train.ValidSampler(inner, tok, "vpd4l", 2)([[0], [0]], 2, Path("."), 0)
     finally:

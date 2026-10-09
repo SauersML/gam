@@ -1,36 +1,42 @@
-"""The loader of graph-oracle explanations (#2951, format v3): plain Python, no imports.
+"""The loader of graph-oracle explanations (#2951, format v4): plain Python, no imports.
 
-An explanation names groups of the target model's VPD subcomponents and which groups read which; the model's
-own weights do every computation. Closing quotes on vpd4l, whose behavior has one variable, inside (whether a
-quotation is open):
+An explanation is a causal graph of the target model's VPD subcomponents: named nodes, each a set of subcomponents
+acting at some positions, and edges saying which node reads which. The model's own weights do every computation.
+Closing quotes on vpd4l (one behavior variable, inside: whether a quotation is open):
 
-    groups = {
-        "quote": {"subcomponents": ["<p:0.fc.225>", "<p:0.down.663>"], "reads": ["input"], "label": "inside"},
-        "answer": {"subcomponents": ["<p:3.fc.1013>", "<p:3.down.885>"], "reads": ["quote"], "writes": "output"},
+    def quote_marks(tokens):
+        return [t == '"' for t in tokens]
+
+    nodes = {
+        "mark":  {"subcomponents": ["<p:0.fc.225>", "<p:0.down.663>"], "at": quote_marks},
+        "carry": {"subcomponents": ["<p:2.v.80>", "<p:2.o.63>"], "at": "targets"},
+        "close": {"subcomponents": ["<p:3.fc.1013>", "<p:3.down.885>"], "at": "targets"},
     }
+    edges = [("input", "mark"), ("mark", "carry", "value"), ("input", "carry", "query"), ("input", "carry", "key"),
+             ("carry", "close"), ("close", "output")]
+    labels = {"carry": "inside"}
 
-`groups` maps a name to:
-  subcomponents  VPD subcomponents, "<p:L.S.I>": layer L, site S (q k v o fc down: q_proj k_proj v_proj o_proj
-                 c_fc down_proj), subcomponent I; "<p:L.S.rest>" is the site's remainder W - sum of its
-                 subcomponents. A subcomponent belongs to one group.
-  reads          "input" (the token embedding) and other groups, a group's attention read as "name:query",
-                 "name:key" or "name:value". A read connects every pair of subcomponents where the writer
-                 writes before the reader reads.
-  writes         "output": the group writes the next-token logits.
-  label          the behavior variable the group carries. Every group that does not write the output carries
-                 one, a variable belongs to at most one group, and a group that writes the output carries none.
-Everything an explanation leaves out runs on the prompt's changed prompt (the checker's default stand-ins).
-
-A behavior's variables are what its changed prompts change (each prompt's "varies"; "tokens", the input itself,
-is not one). A variable is tested on the prompts whose changed prompt changes it: the group's output on the
-changed prompt is swapped into the model's run on the prompt, and the model's output there should become its
-output on the changed prompt (the checker's alignment term). A variable no group carries costs its whole signal.
+  nodes   name -> {"subcomponents": [...], "at": where}. A subcomponent is "<p:L.S.I>": layer L, site S (q k v o fc
+          down: q_proj k_proj v_proj o_proj c_fc down_proj), subcomponent I; "<p:L.S.rest>" is the site's remainder
+          W - sum of its subcomponents. A subcomponent belongs to one node. "at" (default "all"): "all", "targets"
+          (the positions whose next token the behavior asks for), "last", or a function of the file taking `tokens`
+          (the sequence as the model's token strings) and returning a list of bools or of positions. A node acts
+          only there; elsewhere its subcomponents contribute nothing, and what a reader at another position reads
+          from them through attention is nothing too.
+  edges   (writer, reader) or (writer, reader, route): the writer a node or "input" (the token embedding), the
+          reader a node or "output" (the next-token logits), the route "query", "key" or "value" for an attention
+          reader (default: every input the reader has). A writer must write before the reader reads. A node
+          spanning several blocks feeds its own later blocks.
+  labels  optional: node -> the behavior variable it carries (each variable at most one node). A variable is
+          tested on the prompts whose changed prompt changes it, by swapping the node's output from the changed
+          prompt; a variable no node carries pays its whole signal.
+Everything an explanation leaves out is deleted (VPD's ablation), and the embedding always reaches the output.
 
 trace(source, model, behavior=...) runs a source in a sandboxed child (restricted syntax and builtins, CPU and
-memory limits) and returns the IR the checker reads: nodes (one per group and block, a block being one layer's
-attention or MLP), edges, alignments (one per behavior variable, with its prompt pairs), and python_tokens and
-token_types of any code beside the `groups` statement (the structure, which the checker prices). code_length
-and explanation_length count what the score charges.
+memory limits) and returns the IR the checker reads: nodes (one per node and block, a block being one layer's
+attention or MLP, with its positions per prompt and changed prompt), edges, alignments (one per behavior variable),
+and python_tokens and token_types of the code beside the nodes, edges and labels statements (the structure, which
+the checker prices). code_length and explanation_length count what the score charges.
 """
 
 from __future__ import annotations
@@ -57,7 +63,6 @@ VPD4L_TOKENIZER = Path.home() / "mpd-data/vpd/t-9d2b8f02/tokenizer.json"
 SITES = {"q": "q_proj", "k": "k_proj", "v": "v_proj", "o": "o_proj", "fc": "c_fc", "down": "down_proj"}
 PART = re.compile(r"<p:(\d+)\.(q|k|v|o|fc|down)\.(\d+|rest)>")
 ROUTES = ("query", "key", "value")
-KEYS = {"subcomponents", "reads", "writes", "label"}
 INPUT, OUTPUT = "input", "output"
 
 
@@ -150,64 +155,66 @@ def _part(token, group: str, shape: dict) -> tuple[int, str, object]:
     return layer, site, int(m[3])
 
 
-def build(groups, model: str, variables: list[str] | None = None) -> tuple[dict, dict[str, list[Node]], dict[str, str]]:
-    """The IR's nodes and edges of a `groups` value, its nodes per group, and the variable each labeled group
-    carries (`variables`: the behavior's, checked when given)."""
+def _where(at, name: str, namespace: dict):
+    """A node's "at" as a function (tokens, targets) -> positions."""
+    if at is None or at == "all":
+        return lambda tokens, targets: range(len(tokens))
+    if at == "targets":
+        return lambda tokens, targets: targets
+    if at == "last":
+        return lambda tokens, targets: [len(tokens) - 1] if tokens else []
+    if callable(at) and getattr(at, "__name__", "") in namespace and namespace[at.__name__] is at:
+        def positions(tokens, targets):
+            try:
+                out = at(list(tokens))
+            except MechError:
+                raise
+            except RecursionError:
+                raise
+            except Exception as e:
+                line = _line_of(e)
+                raise MechError((f"line {line}: " if line else "") + f"node {name}: at {at.__name__}: {type(e).__name__}: {e}") from None
+            if not isinstance(out, (list, tuple)):
+                raise MechError(f"node {name}: at {at.__name__} returned {out!r}, not a list of bools or positions")
+            if out and all(isinstance(x, bool) for x in out):
+                if len(out) != len(tokens):
+                    raise MechError(f"node {name}: at {at.__name__} returned {len(out)} bools for {len(tokens)} tokens")
+                return [t for t, on in enumerate(out) if on]
+            if not all(isinstance(x, int) and not isinstance(x, bool) and 0 <= x < len(tokens) for x in out):
+                raise MechError(f"node {name}: at {at.__name__} returned {out!r}, not positions 0..{len(tokens) - 1}")
+            return sorted(set(out))
+        return positions
+    raise MechError(f"node {name}: \"at\" is \"all\", \"targets\", \"last\" or a function the file defines with def")
+
+
+def build(nodes_value, edges_value, labels_value, namespace: dict, model: str, behavior: dict | None = None) -> tuple[dict, dict[str, list[Node]], dict[str, str]]:
+    """The IR's nodes (with their positions on the behavior's prompts and changed prompts) and edges, the IR nodes
+    per explanation node, and the variable each labeled node carries (checked against the behavior's)."""
     shape = shapes(model)
-    if not isinstance(groups, dict) or not groups:
-        raise MechError("`groups` must be a non-empty dict {name: {\"subcomponents\": [...], ...}}")
+    if not isinstance(nodes_value, dict) or not nodes_value:
+        raise MechError("`nodes` must be a non-empty dict {name: {\"subcomponents\": [...], \"at\": ...}}")
     nodes: dict[str, list[Node]] = {}
-    labels: dict[str, str] = {}
+    where: dict[str, object] = {}
     owner: dict[tuple, str] = {}
-    for name, g in groups.items():
+    for name, g in nodes_value.items():
         if not isinstance(name, str) or not name.isidentifier() or name in (INPUT, OUTPUT):
-            raise MechError(f"group name {name!r}: an identifier other than input and output")
-        if not isinstance(g, dict):
-            raise MechError(f"group {name}: a dict with keys {', '.join(sorted(KEYS))}")
-        if set(g) - KEYS:
-            raise MechError(f"group {name}: unknown keys {', '.join(sorted(map(str, set(g) - KEYS)))}; keys: {', '.join(sorted(KEYS))}")
+            raise MechError(f"node name {name!r}: an identifier other than input and output")
+        if not isinstance(g, dict) or set(g) - {"subcomponents", "at"}:
+            raise MechError(f"node {name}: a dict with keys subcomponents and at")
         parts = g.get("subcomponents")
         if not isinstance(parts, (list, tuple)) or not parts:
-            raise MechError(f"group {name}: \"subcomponents\" must be a non-empty list")
+            raise MechError(f"node {name}: \"subcomponents\" must be a non-empty list")
         blocks: dict[tuple, dict[str, set]] = {}
         for token in parts:
             layer, site, index = _part(token, name, shape)
             o = owner.setdefault((layer, site, index), name)
             if o != name:
-                raise MechError(f"{token} is in groups {o} and {name}; a subcomponent belongs to one group")
+                raise MechError(f"{token} is in nodes {o} and {name}; a subcomponent belongs to one node")
             block = "mlp" if site in ("c_fc", "down_proj") else "attn"
             blocks.setdefault((layer, block), {}).setdefault(site, set()).add(index)
         keys = sorted(blocks)
         nodes[name] = [Node(name if len(keys) == 1 else f"{name}.{l}.{b}", l, b, blocks[(l, b)]) for l, b in keys]
-        label = g.get("label")
-        if label is not None:
-            if not isinstance(label, str) or not label:
-                raise MechError(f"group {name}: \"label\" is the name of the behavior variable it carries")
-            if variables is not None and label not in variables:
-                raise MechError(f"group {name}: {label!r} is not a variable of this behavior; its variables: "
-                                + (", ".join(variables) or "none"))
-            if label in labels.values():
-                raise MechError(f"variable {label} is carried by two groups; a variable belongs to one group")
-            for n in nodes[name]:  # a label test swaps what the group writes into the residual stream
-                if not any(w[0] == "resid" for w in n.writes()):
-                    raise MechError(f"group {name} carries {label}, but its subcomponents in layer {n.layer}'s "
-                                    f"{'attention' if n.block == 'attn' else 'MLP'} include no "
-                                    f"{'o' if n.block == 'attn' else 'down'} subcomponent, so they write nothing a "
-                                    "swap can carry; add one or move them to another group")
-            labels[name] = label
-        writes = g.get("writes")
-        if writes not in (None, OUTPUT):
-            raise MechError(f"group {name}: \"writes\" can only be \"output\"")
-        if writes is None and label is None:
-            raise MechError(f"group {name} does not write the output, so it carries a behavior variable (\"label\")")
-        if writes == OUTPUT and label is not None:
-            raise MechError(f"group {name} writes the output, so it carries no variable; put the subcomponents "
-                            f"that carry {label} in a group of their own")
-    if not any(g.get("writes") == OUTPUT for g in groups.values()):
-        raise MechError("no group writes the output; mark the group that writes the next-token logits with \"writes\": \"output\"")
-    ids = {n.id for ns in nodes.values() for n in ns}
-    if len(ids) != sum(map(len, nodes.values())):
-        raise MechError("two groups make the same node name; rename one")
+        where[name] = None if g.get("at", "all") == "all" else _where(g.get("at"), name, namespace)
     edges: dict[tuple, dict] = {}
 
     def edge(src: str, writes: list[tuple], dst: Node | None, route: str) -> bool:
@@ -218,41 +225,65 @@ def build(groups, model: str, variables: list[str] | None = None) -> tuple[dict,
         edges.setdefault(key, {"from": key[0], "to": key[1], "route": route})
         return True
 
-    for name, g in groups.items():
-        reads = g.get("reads") or []
-        if not isinstance(reads, (list, tuple)):
-            raise MechError(f"group {name}: \"reads\" must be a list")
-        for r in reads:
-            source, _, route = (r if isinstance(r, str) else "").partition(":")
-            route = route or INPUT
-            if source != INPUT and source not in groups or route not in ROUTES + (INPUT,) or source == INPUT and route != INPUT:
-                raise MechError(f"group {name} reads {r!r}: \"input\", a group's name, or a group's \"name:query\", "
-                                "\"name:key\" or \"name:value\"")
-            if source == name:
-                raise MechError(f"group {name} cannot read itself")
-            writers = [("embed", [("resid", -1)])] if source == INPUT else [(n.id, n.writes()) for n in nodes[source]]
-            if not any([edge(w, ws, n, route) for w, ws in writers for n in nodes[name]]):
-                raise MechError(f"group {name} reads {r}, but no subcomponent of " +
-                                ("the input" if source == INPUT else source) +
-                                f" writes where a subcomponent of {name} reads it later (writers must come first)")
-        ns = sorted(nodes[name], key=lambda n: (n.layer, n.block))
-        for a in ns:  # a group spanning blocks feeds its own later subcomponents
+    if not isinstance(edges_value, (list, tuple)) or not edges_value:
+        raise MechError("`edges` must be a non-empty list of (writer, reader) or (writer, reader, route)")
+    for e in edges_value:
+        if not isinstance(e, (list, tuple)) or len(e) not in (2, 3) or not all(isinstance(x, str) for x in e):
+            raise MechError(f"edge {e!r}: (writer, reader) or (writer, reader, route)")
+        src, dst, route = e[0], e[1], (e[2] if len(e) == 3 else INPUT)
+        if src != INPUT and src not in nodes or dst != OUTPUT and dst not in nodes or route not in ROUTES + (INPUT,):
+            raise MechError(f"edge {e!r}: the writer a node or \"input\", the reader a node or \"output\", the route "
+                            "\"query\", \"key\" or \"value\"")
+        if src == dst:
+            raise MechError(f"edge {e!r}: a node cannot read itself")
+        writers = [("embed", [("resid", -1)])] if src == INPUT else [(n.id, n.writes()) for n in nodes[src]]
+        readers = [None] if dst == OUTPUT else nodes[dst]
+        if not any([edge(w, ws, n, route) for w, ws in writers for n in readers]):
+            raise MechError(f"edge {e!r} connects nothing: no subcomponent of the writer writes where a subcomponent "
+                            "of the reader reads it later (writers must come first; only o and down subcomponents "
+                            "write the residual stream)")
+    if not any(k[1] == "logits" and k[0] != "embed" for k in edges):
+        raise MechError("no node writes the output; add an edge (node, \"output\")")
+    for ns in nodes.values():  # a node spanning blocks feeds its own later subcomponents
+        for a in ns:
             for b in ns:
                 if (a.layer, a.block) < (b.layer, b.block):
                     edge(a.id, a.writes(), b, INPUT)
-        if g.get("writes") == OUTPUT and not any([edge(n.id, n.writes(), None, INPUT) for n in ns]):
-            raise MechError(f"group {name} writes the output, but none of its subcomponents writes the residual "
-                            "stream (an o or down subcomponent)")
-    edge("embed", [("resid", -1)], None, INPUT)
-    ir = {"nodes": [n.ir() for ns in nodes.values() for n in ns], "edges": list(edges.values())}
-    return ir, nodes, labels
+    edge("embed", [("resid", -1)], None, INPUT)  # the embedding is not decomposed: it always reaches the output
+    labels: dict[str, str] = {}
+    if labels_value is not None:
+        if not isinstance(labels_value, dict):
+            raise MechError("`labels` must be a dict {node: behavior variable}")
+        variables = behavior["variables"] if behavior is not None else None
+        for name, v in labels_value.items():
+            if name not in nodes:
+                raise MechError(f"labels: {name!r} is not a node")
+            if not isinstance(v, str) or variables is not None and v not in variables:
+                raise MechError(f"labels: {v!r} is not a variable of this behavior; its variables: " + (", ".join(variables or []) or "none"))
+            if v in labels.values():
+                raise MechError(f"labels: variable {v} is carried by two nodes")
+            for n in nodes[name]:  # a label test swaps what the node writes into the residual stream
+                if not any(w[0] == "resid" for w in n.writes()):
+                    raise MechError(f"labels: node {name} carries {v}, but its subcomponents in layer {n.layer}'s "
+                                    f"{'attention' if n.block == 'attn' else 'MLP'} include no "
+                                    f"{'o' if n.block == 'attn' else 'down'} subcomponent, so they write nothing a swap can carry")
+            labels[name] = v
+    ir_nodes = []
+    for name, ns in nodes.items():
+        at = []
+        if where[name] is not None and behavior is not None:
+            for ids, strings, targets in behavior["sequences"]:
+                at.append({"tokens": ids, "positions": list(where[name](strings, targets))})
+        for n in ns:
+            ir_nodes.append({**n.ir(), "at": at})
+    return {"nodes": ir_nodes, "edges": list(edges.values())}, nodes, labels
 
 
 # ---------------------------------------------------------------------------------------------------
 # Variables on a behavior
 
 def alignments(behavior: dict | None, nodes: dict[str, list[str]], labels: dict[str, str]) -> list[dict]:
-    """One alignment per behavior variable: the nodes of the group carrying it (none when no group does) and the
+    """One alignment per behavior variable: the IR nodes of the node carrying it (none when no node does) and the
     prompts whose changed prompt changes it, each paired with that changed prompt."""
     if behavior is None:
         return [{"variable": v, "nodes": nodes[g], "pairs": []} for g, v in labels.items()]
@@ -319,8 +350,8 @@ def _line_of(exc: BaseException) -> int | None:
 
 
 def _empty(source: str, model: str) -> dict:
-    return {"model": model, "decomposition": "vpd", "nodes": [], "edges": [], "alignments": [], "groups": [],
-            "group_nodes": {}, "labels": {}, "python_tokens": 0, "token_types": 0, "source": source,
+    return {"model": model, "decomposition": "vpd", "standin": "delete", "nodes": [], "edges": [], "alignments": [],
+            "groups": [], "node_ids": {}, "labels": {}, "python_tokens": 0, "token_types": 0, "source": source,
             "valid": False, "error": None}
 
 
@@ -339,13 +370,13 @@ def _trace(source: str, model: str, behavior: dict | None = None) -> dict:
         check(tree)
         namespace = {"__builtins__": SAFE_BUILTINS, "__name__": "explanation"}
         exec(compile(tree, "<explanation>", "exec"), namespace)
-        if "groups" not in namespace:
-            raise MechError("the explanation defines no `groups` dict")
-        built, nodes, labels = build(namespace["groups"], model, behavior["variables"] if behavior is not None else None)
+        if "nodes" not in namespace or "edges" not in namespace:
+            raise MechError("the explanation defines no `nodes` dict and `edges` list")
+        built, nodes, labels = build(namespace["nodes"], namespace["edges"], namespace.get("labels"), namespace, model, behavior)
         ir.update(built)
-        ir["group_nodes"] = {g: [n.id for n in ns] for g, ns in nodes.items()}
+        ir["node_ids"] = {g: [n.id for n in ns] for g, ns in nodes.items()}
         ir["labels"] = labels
-        ir["alignments"] = alignments(behavior, ir["group_nodes"], labels)
+        ir["alignments"] = alignments(behavior, ir["node_ids"], labels)
         ir["valid"] = True
     except MechError as e:
         line = _line_of(e)
@@ -358,7 +389,7 @@ def _trace(source: str, model: str, behavior: dict | None = None) -> dict:
         line = _line_of(e)
         ir["error"] = (f"line {line}: " if line else "") + f"{type(e).__name__}: {e}"
     if not ir["valid"]:
-        ir.update(nodes=[], edges=[], alignments=[], group_nodes={}, labels={})
+        ir.update(nodes=[], edges=[], alignments=[], node_ids={}, labels={})
     return ir
 
 
@@ -381,9 +412,10 @@ def tokenizer(model: str):
 
 
 def behavior_tokens(behavior, model: str) -> dict:
-    """What the tracer needs of a behavior: {"prompts", "counterfactuals", "targets", "varies", "variables"},
-    tokens as the model's strings (a prompt without a changed prompt gets an empty one), each prompt's variables
-    its changed prompt changes, and the behavior's variables. `behavior`: a behavior record or its file."""
+    """What the tracer needs of a behavior: {"prompts", "counterfactuals", "targets", "varies", "variables",
+    "sequences"}, tokens as the model's strings (a prompt without a changed prompt gets an empty one), each
+    prompt's variables its changed prompt changes, the behavior's variables, and every prompt and changed prompt as
+    (token ids, token strings, target positions) for node positions. `behavior`: a behavior record or its file."""
     if not isinstance(behavior, dict):
         behavior = json.loads(Path(behavior).expanduser().read_text())
     tk = tokenizer(model)
@@ -392,10 +424,12 @@ def behavior_tokens(behavior, model: str) -> dict:
     ids = sorted({i for row in prompts + changed for i in row})
     strings = dict(zip(ids, tk.decode_batch([[i] for i in ids], skip_special_tokens=True)))  # BOS: ""
     varies = [[v for v in p.get("varies") or [] if v != "tokens"] for p in behavior["prompts"]]
+    targets = [list(p["target_positions"]) for p in behavior["prompts"]]
+    sequences = [(row, [strings[i] for i in row], t) for rows in (prompts, changed) for row, t in zip(rows, targets) if row]
     return {"prompts": [[strings[i] for i in row] for row in prompts],
             "counterfactuals": [[strings[i] for i in row] for row in changed],
-            "targets": [list(p["target_positions"]) for p in behavior["prompts"]],
-            "varies": varies, "variables": sorted({v for row in varies for v in row})}
+            "targets": targets, "varies": varies, "variables": sorted({v for row in varies for v in row}),
+            "sequences": sequences}
 
 
 def trace_inline(source: str, model: str, behavior=None) -> dict:
@@ -550,14 +584,15 @@ OPERATORS = ("!", "!=", "%", "%=", "&", "&=", "(", ")", "*", "**", "**=", "*=", 
              "->", ".", "...", "/", "//", "//=", "/=", ":", ":=", ";", "<", "<<", "<<=", "<=", "=", "==", ">",
              ">=", ">>", ">>=", "@", "@=", "[", "]", "^", "^=", "{", "|", "|=", "}", "~")
 LITERAL_CHARACTERS = {chr(c) for c in range(32, 127)} | {"\t", "\n"}
-FIXED_NAMES = set(SAFE_BUILTINS) | {"groups"}
+STRUCTURE = ("nodes", "edges", "labels")  # the statements the checker prices as structure
+FIXED_NAMES = set(SAFE_BUILTINS) | set(STRUCTURE) | {"tokens"}
 SKIPPED = {tokenize.COMMENT, tokenize.NL, tokenize.NEWLINE, tokenize.INDENT, tokenize.DEDENT,
            tokenize.ENCODING, tokenize.ENDMARKER}
 
 
 def code_length(source: str) -> tuple[int, int]:
     """(python_tokens, token_types) of the code a reader must read beyond the structure: every statement but
-    the `groups` assignment (the checker prices groups, reads and labels as structure), without comments and
+    the nodes, edges and labels assignments (the checker prices nodes, edges and labels), without comments and
     docstrings. A name, keyword or operator is one token, a number or string literal one token per character
     as written. token_types = keywords + operators + builtin names + names the file defines + literal
     characters."""
@@ -565,7 +600,7 @@ def code_length(source: str) -> tuple[int, int]:
     docs = [((n.lineno, n.col_offset), (n.end_lineno, n.end_col_offset)) for n in ast.walk(tree)
             if isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant) and isinstance(n.value.value, str)]
     structure = [(n.lineno, n.end_lineno) for n in tree.body
-                 if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "groups" for t in n.targets)]
+                 if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id in STRUCTURE for t in n.targets)]
     tokens, names, characters = 0, set(), set(LITERAL_CHARACTERS)
     for t in tokenize.generate_tokens(io.StringIO(source).readline):
         if t.type in SKIPPED or not t.string or any(a <= t.start[0] <= b for a, b in structure):

@@ -696,8 +696,9 @@ def token_spans(tok, completion: list[int], text: str) -> list[tuple[int, int]]:
 
 def credit_advantages(tok, completion: list[int], text: str, source: str, episode: float, dS: dict, scale: float) -> list[float]:
     """(1) Per-token advantages of one answer from its measured edits (edits.credit: dS = S(edited) - S(answer), so
-    dS > 0 means the choice lowers the score): the tokens of a subcomponent in a group's line get dS(drop it) /
-    scale_b, the line's other tokens (and its subcomponents whose drop was not sampled) dS(drop the group) / scale_b,
+    dS > 0 means the choice lowers the score): the tokens of a subcomponent in a node's line get dS(drop it) /
+    scale_b, the line's other tokens (and its subcomponents whose drop was not sampled) dS(drop the node) / scale_b,
+    an edge's line dS(cut the edge) / scale_b,
     and every other token the episode's advantage. An edit that makes the answer invalid (dS = +inf) counts as
     dS = scale_b."""
     adv = [episode] * len(completion)
@@ -725,11 +726,15 @@ def credit_advantages(tok, completion: list[int], text: str, source: str, episod
 
     lines = source.rstrip("\n").split("\n")
     starts = np.cumsum([0] + [len(line) + 1 for line in lines])
-    for s in edits.Answer.parse(source).statements:
+    answer = edits.Answer.parse(source)
+    for s in answer.statements:
         a0, line = offset + int(starts[s.line]), lines[s.line]
         mark(a0, a0 + len(line), value(edits.Edit("unalign", s.variable, s.kind)))
         for m in edits.PART.finditer(line):
             mark(a0 + m.start(), a0 + m.end(), value(edits.Edit("drop", s.variable, s.kind, m.group())))
+    for e, k in zip(answer.edges, answer.edge_lines):
+        a0 = offset + int(starts[k])
+        mark(a0, a0 + len(lines[k]), value(edits.Edit("cut", edits.edge_name(e))))
     return adv
 
 
@@ -774,7 +779,7 @@ def timed(clock: dict, key: str, fn, *a, **kw):
 
 
 def credit_groups(groups: list[dict], seed: int, args, tok, score, scales: Scales, clock: dict):
-    """(1) The credit edits (edits.credit_edits: --credit subcomponent drops sampled, every group drop) of each group's
+    """(1) The credit edits (edits.credit_edits: --credit subcomponent drops sampled, every node drop and edge cut) of each group's
     distinct valid answers (--credit-answers: the best and K - 1 others at random), scored in one call under the step's
     seed, then each credited answer's token advantages."""
     requests, entries = [], []
@@ -818,7 +823,7 @@ def rl2_sample(chosen: list[dict], step: int, args, pol, sampler, adapter: Path,
 def rl2_score(groups: list[dict], step: int, args, tok, score, scales: Scales, clock: dict) -> list[dict]:
     """The checker half of rl2_groups, in place: every answer scored under the step's seed (with the teacher's and the
     empty program's scores of behaviors seen for the first time, for their scale); every sampled token gets its
-    advantage: the episode's RLOO advantage (3), replaced on group lines by the measured credit (1, --credit
+    advantage: the episode's RLOO advantage (3), replaced on node and edge lines by the measured credit (1, --credit
     > 0). An invalid answer counts as the group's worst valid one (a group with no valid answer has no signal)."""
     seed, n = step_seed(args, step), args.samples
     for grp in groups:
@@ -1435,7 +1440,7 @@ def main():
     ap.add_argument("--micro", type=int, default=2)
     ap.add_argument("--sampler", choices=["auto", "vllm", "hf"], default="auto")
     ap.add_argument("--resample", type=int, default=0, help="redraw each invalid program (mech.trace) up to R times at sampling time")
-    ap.add_argument("--grammar", action="store_true", help="vLLM decodes every answer under rl/grammar.py's grammar (the groups dict, one group per line, only the decomposition's subcomponents); --resample stays the fallback")
+    ap.add_argument("--grammar", action="store_true", help="vLLM decodes every answer under rl/grammar.py's grammar (the canonical nodes, edges and labels, only the decomposition's subcomponents); --resample stays the fallback")
     ap.add_argument("--part-tokens", help="part tokens: the registry file of part_tokens.py build; the projections train with the LoRA and vLLM gets the rows in place")
     ap.add_argument("--materialize-every", type=int, default=0, help="with --part-tokens: also rewrite the checkpoint and restart vLLM every K steps (0: only at the start; the rows are copied in place before every sampling call)")
     ap.add_argument("--share-gpu", action="store_true", help="one GPU for vLLM and the trainer: vLLM sleeps (weights to host) while training and the trainer moves to the host while sampling, so --gpu-memory can be 0.8")
@@ -1463,7 +1468,7 @@ def main():
     ap.add_argument("--run-name", help="the run's name in runs/oracle/<behavior>.<run>.json (default: the --out directory's name)")
     ap.add_argument("--teacher", help="teacher answers (DIR/manifest.jsonl, <behavior>.answer.txt or .py): rl2's reward scale, an evaluation baseline, and SFT answers for training behaviors")
     ap.add_argument("--teacher-heldout", help="held-out behaviors' teacher answers (~/mpd-data/graph_oracle/teacher_heldout): evaluation baselines only")
-    ap.add_argument("--credit", type=int, default=16, help="rl2: subcomponent drops sampled per answer for per-token credit (every group drop is scored too; 0: episode advantages only)")
+    ap.add_argument("--credit", type=int, default=16, help="rl2: subcomponent drops sampled per answer for per-token credit (every node drop and edge cut is scored too; 0: episode advantages only)")
     ap.add_argument("--credit-answers", type=int, default=0, help="rl2: answers credited per group: the best valid one and K - 1 other distinct valid ones drawn at random (0: every distinct valid answer)")
     ap.add_argument("--refill", type=int, default=1, help="rl2: sampling rounds that replace groups without signal by behaviors drawn by gap to the teacher")
     ap.add_argument("--refine", type=int, default=2, help="rl2: rounds of edits.refine from each group's best answer for expert iteration (0: off)")
@@ -1508,7 +1513,7 @@ def main():
 
         rank = json.loads((Path(args.init) / "adapter_config.json").read_text())["r"] if args.init else args.lora_rank
         answers = None
-        if args.grammar:  # guided decoding: the groups dict, only the attached decomposition's subcomponents (rl/grammar.py)
+        if args.grammar:  # guided decoding: the canonical nodes, edges and labels, only the decomposition's subcomponents (rl/grammar.py)
             import grammar
 
             answers = grammar.model_grammar(args.model, args.part_tokens)

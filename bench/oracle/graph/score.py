@@ -61,20 +61,22 @@ class Checker:
         self.behavior_record = json.loads(path.read_text())
         return self.request({"op": "behavior", "path": str(path)})
 
-    def score(self, program, experiments=32, seed=0, N=None, stand_in="counterfactual"):
+    def score(self, program, experiments=32, seed=0, N=None, stand_in="delete", metric="answer"):
         """Every score term. `program` is a source, an IR dict, or {"source", "explanation"} (the oracle's answer split
         by prompt.split_answer). An untraceable source is scored as naming nothing, flagged invalid."""
-        return self.score_batch([program], experiments, seed, N, stand_in)[0]
+        return self.score_batch([program], experiments, seed, N, stand_in, metric=metric)[0]
 
-    def score_batch(self, programs, experiments=32, seed=0, N=None, stand_in="counterfactual", uniform_seeds=None, options=None):
+    def score_batch(self, programs, experiments=32, seed=0, N=None, stand_in="delete", uniform_seeds=None, options=None, metric="answer"):
         """score() for many programs of the current behavior under one seed, in one checker request (the server runs M
         once per experiment it has not cached and the programs in parallel). uniform_seeds m: the experiments are drawn
         from seed mod m, so m collections recur across a caller's seeds. options: further request keys passed to the
-        server as they are (e.g. {"necessity": False}). stand_in: what the parts a program does not name carry:
-        "counterfactual" (their values on the prompt's changed prompt) or "delete"."""
+        server as they are (e.g. {"necessity": False}). stand_in: what the parts a program does not name carry when its
+        IR names none: "delete" (VPD's ablation) or "counterfactual" (their values on the prompt's changed prompt).
+        metric: "answer" (each error compares the answer's probability, the token the model puts first, as a VPD
+        subnetwork is judged) or "full" (the whole next-token distribution)."""
         irs = [self.ir(p) for p in programs]
         request = {"op": "score", "programs": irs, "experiments": experiments, "seed": seed, "routing": "edges", "N": N,
-                   "reader_top": 0, "stand_in": stand_in, **(options or {})}
+                   "reader_top": 0, "stand_in": stand_in, "metric": metric, **(options or {})}
         if uniform_seeds:
             request["uniform_seeds"] = uniform_seeds
         return self.request(request)["scores"]

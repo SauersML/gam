@@ -1,5 +1,5 @@
-"""Label search (#2951 graph oracle, format v3): for each intermediate variable of a behavior's family algorithm, the
-groups of VPD subcomponents whose output carries it, found by interchange.
+"""Label search (#2951 graph oracle): for each variable of a behavior, the groups of VPD subcomponents whose output
+carries it, found by interchange (the label test), scored on the behavior's answers.
 
 A variable's items are the behavior's items whose changed prompt varies it (vary.py's "varies"). On them, swapping a
 group's output from the changed prompt into the prompt's run is v3's label test of a node labeled with the variable,
@@ -10,7 +10,7 @@ alone, the --keep largest shares split in half and measured again down to --leaf
 joined into groups of k = --ks subcomponents, each measured as a whole. Scored on the clean prompts alone (no
 experiments drawn), necessity on, everything else off.
 
-  labels.py BEHAVIOR_ID... [--behaviors-dir ~/mpd-data/graph_oracle/behaviors_vary/vpd4l] [--out runs/labels]
+  labels.py BEHAVIOR_ID... [--behaviors-dir ~/mpd-data/graph_oracle/behaviors_v3/vpd4l] [--out runs/labels_v4]
 writes OUT/<behavior>.<variable>.json {"variable", "items", "signal_bits", "leaves", "groups", "chunks"}.
 """
 
@@ -49,10 +49,10 @@ def units(chunks) -> list[tuple]:
 def search_variable(checker, sizes: dict, a, log) -> dict:
     """Leaves ranked by the share of the signal their swap moves, and the groups joining the best of them."""
     def moved(groups):
-        programs = [explain.ir(units(g)) for g in groups]
+        programs = [explain.ir(units(g), standin="counterfactual") for g in groups]
         results = []
         for k in range(0, len(programs), a.batch):
-            results += checker.score_batch(programs[k:k + a.batch], experiments=0, seed=0, stand_in="counterfactual")
+            results += checker.score_batch(programs[k:k + a.batch], experiments=0, seed=0)
         return [r["necessity_error_bits"] if r.get("valid", True) else float("inf") for r in results]
 
     signal = moved([[]])[0]
@@ -87,7 +87,7 @@ def search_variable(checker, sizes: dict, a, log) -> dict:
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("behaviors", nargs="+")
-    ap.add_argument("--behaviors-dir", type=Path, default=DATA / "behaviors_vary/vpd4l")
+    ap.add_argument("--behaviors-dir", type=Path, default=DATA / "behaviors_v3/vpd4l")
     ap.add_argument("--export", type=Path, default=Path.home() / "mpd-data/engine/vpd4l")
     ap.add_argument("--vpd", type=Path, default=Path.home() / "mpd-data/engine/vpd4l_decomposition")
     ap.add_argument("--device")
@@ -96,7 +96,7 @@ def main():
     ap.add_argument("--keep", type=int, default=32)
     ap.add_argument("--ks", type=int, nargs="+", default=[8, 16, 32, 64, 128, 256])
     ap.add_argument("--batch", type=int, default=12)
-    ap.add_argument("--out", type=Path, default=DATA / "runs/labels")
+    ap.add_argument("--out", type=Path, default=DATA / "runs/labels_v4")
     a = ap.parse_args()
     a.out.mkdir(parents=True, exist_ok=True)
     work = a.out / "items"

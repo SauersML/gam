@@ -1,6 +1,7 @@
 """grammar.py: the number rules give exactly 0 .. n - 1; with xgrammar installed (pods; the Mac venv lacks it), the answer
-grammar accepts the teacher answers' form and rejects other forms, unknown subcomponents, a second fence and English
-after the line.  python -m pytest -q test_grammar.py"""
+grammar accepts the canonical form (functions and labels optional, English of any length) and rejects prose before
+the block, unknown subcomponents, empty nodes, unknown positions and routes, and a second block.
+  python -m pytest -q test_grammar.py"""
 
 import importlib.util
 import itertools
@@ -14,13 +15,24 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import grammar  # noqa: E402
 
 GOOD = """```python
-groups = {
-    "quote": {"subcomponents": ["<p:0.fc.225>", "<p:0.down.663>"], "reads": ["input"], "label": "inside"},
-    "answer": {"subcomponents": ["<p:2.v.559>", "<p:2.o.735>", "<p:3.down.rest>"], "reads": ["input", "quote", "quote:value"], "writes": "output"},
+def marks(tokens):
+    return ['"' in t and len(t) < 3 for t in tokens]
+
+
+nodes = {
+    "mark": {"subcomponents": ["<p:0.fc.225>", "<p:0.down.663>"], "at": marks},
+    "close": {"subcomponents": ["<p:2.v.559>", "<p:2.o.735>", "<p:3.down.rest>"], "at": "targets"},
 }
+edges = [
+    ("input", "mark"),
+    ("mark", "close", "value"),
+    ("close", "output"),
+]
+labels = {"mark": "inside"}
 ```
 
-Group quote carries whether a quotation is open; `a < b`."""
+mark reads the quote marks; `a < b`.
+close writes the closing quote."""
 
 xgrammar_only = pytest.mark.skipif(importlib.util.find_spec("xgrammar") is None, reason="xgrammar is not installed")
 
@@ -56,15 +68,16 @@ def acceptor():
 def test_answers_against_the_grammar():
     accepts = acceptor()
     assert accepts(GOOD)
-    assert accepts(GOOD.replace('    "quote": {"subcomponents": ["<p:0.fc.225>", "<p:0.down.663>"], "reads": ["input"], "label": "inside"},\n', ""))
+    assert accepts(GOOD.replace('labels = {"mark": "inside"}\n', ""))  # labels are optional
+    assert accepts(GOOD[GOOD.index("nodes = {"):].join(["```python\n", ""]))  # functions are optional
     assert not accepts("I explain it.\n" + GOOD)  # no prose before the block
-    assert not accepts(GOOD + "\nA second line of English.")  # one line of English, then the answer ends
     assert not accepts(GOOD.replace("<p:2.v.559>", "<p:2.v.1024>"))  # beyond v_proj's 1,024 subcomponents
     assert not accepts(GOOD.replace("<p:2.v.559>", "<p:7.v.5>"))  # no layer 7
-    assert not accepts(GOOD.replace('"subcomponents": ["<p:0.fc.225>", "<p:0.down.663>"]', '"subcomponents": []'))  # an empty group
-    assert not accepts(GOOD.replace(', "writes": "output"', ', "label": "x"'))  # no group writes the output
+    assert not accepts(GOOD.replace('"subcomponents": ["<p:0.fc.225>", "<p:0.down.663>"]', '"subcomponents": []'))  # an empty node
+    assert not accepts(GOOD.replace('"at": "targets"', '"at": "middle"'))  # positions are all, targets, last or a function
+    assert not accepts(GOOD.replace('"value"', '"output"'))  # routes are query, key or value
     assert not accepts(GOOD + "\n```python\nx = 1\n```")  # a second block
-    assert not accepts(GOOD.replace("open;", "open <p:2.v.559>;"))  # a part in the English
+    assert not accepts(GOOD.replace("quote marks;", "quote marks <p:2.v.559>;"))  # a part in the English
 
 
 def free_text(s: str) -> bool:

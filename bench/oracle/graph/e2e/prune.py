@@ -7,8 +7,8 @@ changed prompts alone (--rank-experiments 0) with necessity off. The chunks of l
 --drop of the subcomponents is gone (or the next k remains), and the rest are split in half. Then each kept set is
 scored in full as an explanation (--experiments, seeds 0 and 1): reproduces and removes against nothing named.
 
-  prune.py BEHAVIOR_ID... [--behaviors-dir ~/mpd-data/graph_oracle/behaviors_v3/vpd4l] [--out runs/prune_v3]
-writes OUT/<behavior>.json {"rounds", "sets": {k: [part token, ...]}, "curve": [{"k", "score", "shares"}]}.
+  prune.py BEHAVIOR_ID... [--behaviors-dir ~/mpd-data/graph_oracle/behaviors_v3/vpd4l] [--out runs/prune_v4]
+writes OUT/<behavior>.json {"rounds", "sets": {k: [part token, ...]}, "curve": [{"k", "score", "shares"}]} (default runs/prune_v4).
 """
 
 from __future__ import annotations
@@ -78,7 +78,7 @@ def main():
     ap.add_argument("--chunk", type=int, default=256, help="subcomponents per first chunk")
     ap.add_argument("--ks", type=int, nargs="+", default=[8, 16, 32, 64, 128, 256])
     ap.add_argument("--batch", type=int, default=3)
-    ap.add_argument("--out", type=Path, default=DATA / "runs/prune_v3")
+    ap.add_argument("--out", type=Path, default=DATA / "runs/prune_v4")
     a = ap.parse_args()
     a.out.mkdir(parents=True, exist_ok=True)
     for b in a.behaviors:

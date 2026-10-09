@@ -192,7 +192,7 @@ def check_registry_parts(base: Path):
         with part_vocab.rows_once(causal):
             once = causal(input_ids=ids).logits
     assert torch.allclose(plain, once, atol=1e-6)
-    text = '```python\ngroups = {"answer": {"subcomponents": ["<p:2.v.7>", "<p:0.fc.12>"], "reads": ["input"], "writes": "output"}}\n```\nThe value head.'
+    text = '```python\nnodes = {"copy": {"subcomponents": ["<p:2.v.7>", "<p:0.fc.12>"]}}\nedges = [("input", "copy"), ("copy", "output")]\n```\nThe value head.'
     it = train.item(text, {}, 0, 0, 16)  # part tokens reach the checker as written
     assert '["<p:2.v.7>", "<p:0.fc.12>"]' in it["source"] and it["explanation"] == "The value head."
     assert pol.parts.reg.rewrite("node(PD[1].v_proj[3], PD.vpd[2].v_proj[7])") == "node(<p:1.v.3>, <p:2.v.7>)"  # either spelling
@@ -293,23 +293,31 @@ def check_ppo(pol):
 
 ANSWER = """I look at the previous token.
 ```python
-groups = {
-    "quote": {"subcomponents": ["<p:1.o.4>"], "reads": [], "label": "inside"},
-    "answer": {"subcomponents": ["<p:2.v.559>", "<p:2.o.735>"], "reads": ["input", "quote"], "writes": "output"},
+nodes = {
+    "quote": {"subcomponents": ["<p:1.o.4>"], "at": "all"},
+    "answer": {"subcomponents": ["<p:2.v.559>", "<p:2.o.735>"], "at": "targets"},
 }
+edges = [
+    ("input", "answer"),
+    ("quote", "answer"),
+    ("answer", "output"),
+]
+labels = {"quote": "inside"}
 ```
 The answer is copied by layer 2's value and output parts."""
 
 
 def check_credit_advantages(pol):
-    """credit_advantages: a subcomponent's tokens get dS(drop it) / scale, the rest of its group's line dS(drop the group)
-    / scale (+inf: 1), the other tokens the episode advantage; the same with a tokenization that re-encoding does not give."""
+    """credit_advantages: a subcomponent's tokens get dS(drop it) / scale, the rest of its node's line dS(drop the node)
+    / scale (+inf: 1), an edge's line dS(cut it) / scale, the other tokens the episode advantage; the same with a
+    tokenization that re-encoding does not give."""
     from edits import Edit
 
     tok = pol.tok
     source = train.split_answer(ANSWER)[0]
     assert ANSWER[train.program_offset(ANSWER, source):].startswith(source)
-    dS = {Edit("drop", "answer", part="<p:2.v.559>"): 3.0, Edit("unalign", "answer"): float("inf"), Edit("unalign", "quote"): -1.0}
+    dS = {Edit("drop", "answer", part="<p:2.v.559>"): 3.0, Edit("unalign", "answer"): float("inf"), Edit("unalign", "quote"): -1.0,
+          Edit("cut", "quote>answer"): 0.5}
     canonical = tok.encode(ANSWER, add_special_tokens=False) + [pol.end]
     chars = [i for ch in ANSWER for i in tok.encode(ch, add_special_tokens=False)] + [pol.end]
     assert chars != canonical[: len(chars)]
@@ -320,6 +328,7 @@ def check_credit_advantages(pol):
         part = ANSWER.index("<p:2.v.559>")
         line = ANSWER.index('    "answer"')
         quote = ANSWER.index('    "quote"')
+        cut = ANSWER.index('    ("quote", "answer")')
         for (c0, c1), a in zip(spans, adv):
             if c1 <= c0:
                 assert a == -0.25
@@ -329,7 +338,9 @@ def check_credit_advantages(pol):
                 assert a == 1.0, (ANSWER[c0:c1], a)
             elif c0 >= quote and c1 <= ANSWER.index("\n", quote):
                 assert a == -0.5, (ANSWER[c0:c1], a)
-            elif c1 <= quote - 1 or c0 >= ANSWER.index("}\n```\nThe") + 1:
+            elif c0 >= cut and c1 <= ANSWER.index("\n", cut):
+                assert a == 0.25, (ANSWER[c0:c1], a)
+            elif c1 <= ANSWER.index("```python") + 9 or c0 >= ANSWER.index("```\nThe") + 3:
                 assert a == -0.25, (ANSWER[c0:c1], a)
 
 
@@ -373,7 +384,7 @@ def check_rl2_pieces():
 
 def check_rl2_step(pol):
     """A whole rl2 step on stand-ins: a sampler that writes fixed answers and a stand-in score (10 bits per needed
-    subcomponent missing, 1 per subcomponent named; invalid without an output group that names one). Behavior "x" gets answers of different
+    subcomponent missing, 1 per subcomponent named; invalid unless a node that writes the output names one). Behavior "x" gets answers of different
     scores, "y" only invalid ones (dropped, refilled by "z"); credit marks tokens, refine improves the best answers
     (expert iteration), and the PPO epochs and the expert-iteration step run."""
     import json
@@ -388,7 +399,7 @@ def check_rl2_step(pol):
         for it in items:
             a = Answer.parse(it["source"])
             named = {q for st in a.statements for q in st.parts}
-            valid = any(st.writes == "output" and st.parts for st in a.statements)
+            valid = any(st.parts for st in a.statements if any(w == st.variable and r == "output" for w, r, *_ in a.edges))
             out.append({"total_bits": 10.0 * len(needed - named) + len(named) if valid else 1e4, "valid": valid})
         return out
 
