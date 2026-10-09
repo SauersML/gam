@@ -1215,10 +1215,10 @@ ORACLE_RUNS = Path.home() / "mpd-data/graph_oracle/runs/oracle"
 
 
 def shares(x: dict, empty: dict | None) -> dict:
-    """An answer in the user's reporting terms (10-08): reproduces = 1 - its execution error / the empty program's (the
-    share of the behavior kept when every other subcomponent takes counterfactual values), removes = 1 - its necessity
-    error / the empty program's (the share lost when only its subcomponents take counterfactual values), size = its
-    subcomponents; both errors on the same experiments. The empty program is the denominator only, never a bar."""
+    """An answer in the reporting terms: reproduces = 1 - its execution error / nothing named's (the share of the behavior
+    kept when every other subcomponent runs on the changed prompt), removes = 1 - its necessity error / nothing named's
+    (the share lost when only its subcomponents run on the changed prompt), size = its subcomponents; both errors on the
+    same experiments. Nothing named is the denominator only, never a bar."""
     def share(key):
         return 1.0 - x[key] / empty[key] if empty and empty.get(key) and x.get(key) is not None else None
 
