@@ -49,7 +49,7 @@ import mech  # noqa: E402
 
 TEXTS = Path.home() / "mpd-data/graph_oracle/texts"
 RANDOM = 8  # random draws per score
-TEACH_STEPS, TEACH_LR = 2000, 0.05  # the teacher's optimization (Adam on the strengths' logits)
+TEACH_STEPS, EDGE_STEPS, TEACH_LR = 2000, 600, 0.05  # the teacher's optimization (Adam on the strengths' logits)
 LN2 = math.log(2)
 
 
@@ -71,13 +71,23 @@ def _forward_cached(self, x):
     return out
 
 
+UV = Path.home() / "mpd-data/oracle/vpd/uv.safetensors"  # VPD's subcomponents alone (published for pods)
+
+
 @lru_cache(None)
 def model(dev: str):
-    """vpd4l with VPD's decomposition installed, each matrix's remainder cached."""
+    """vpd4l with VPD's decomposition installed, each matrix's remainder cached. Without VPD's checkpoint (a pod), the
+    subcomponents come from UV, identical to the checkpoint's, and there is no causal-importance network."""
     import vpd_model
 
     target = vpd_model.load_target(dev)
-    vpd = vpd_model.load_vpd(target, dev)
+    if vpd_model.VPD_PTH.exists():
+        vpd = vpd_model.load_vpd(target, dev)
+    else:
+        from safetensors.torch import load_file
+
+        uv = load_file(str(UV))
+        vpd = vpd_model.VPD(target, None, {n: (uv[f"{n}.U"].float().to(dev), uv[f"{n}.V"].float().to(dev)) for n in vpd_model.site_names()})
     for n in vpd.names:
         st = target.site(n)
         st.delta_T = (st.W - (st.V @ st.U).T).T.contiguous()
@@ -412,13 +422,13 @@ class Native:
 
     # ---- the teacher
 
-    def _strength_loop(self, forward, logits: torch.Tensor, target: float, log=None, what: str = "") -> torch.Tensor:
+    def _strength_loop(self, forward, logits: torch.Tensor, target: float, log=None, what: str = "", steps: int = TEACH_STEPS) -> torch.Tensor:
         """Minimize mean(sigmoid(logits)) subject to max(KL_deleted, KL_random) <= target by Adam on the logits and dual
         ascent on the multiplier; forward(strengths, "zero" or "random") -> KL. Returns the final strengths."""
         logits = logits.clone().requires_grad_(True)
         opt = torch.optim.Adam([logits], lr=TEACH_LR)
         mu = 0.0
-        for step in range(TEACH_STEPS):
+        for step in range(steps):
             with torch.enable_grad():
                 g = torch.sigmoid(logits)
                 k = torch.maximum(forward(g, "zero"), forward(g, "random"))
@@ -427,7 +437,7 @@ class Native:
                 loss.backward()
             opt.step()
             mu = max(0.0, mu + float(k) - target)
-            if log and (step % 50 == 0 or step == TEACH_STEPS - 1):
+            if log and (step % 50 == 0 or step == steps - 1):
                 log(f"{what} step {step}: kl {float(k):.4f} (target {target}), mean strength {float(g.mean()):.4f}, above 1/2: {int((g > 0.5).sum())}, mu {mu:.3f}")
         return torch.sigmoid(logits.detach())
 
@@ -476,7 +486,7 @@ class Native:
             u = self._uniform(T, int(torch.randint(1 << 30, (1,), generator=gen)))
             return self._kl(logp, self.run(ids, targets, plan, *u, ew, ow))[0]
 
-        e = self._strength_loop(edge_forward, torch.full((n_edges,), 2.0, device=self.dev), eps, log, "edges")
+        e = self._strength_loop(edge_forward, torch.full((n_edges,), 2.0, device=self.dev), eps, log, "edges", EDGE_STEPS)
         order = plan["order"]
         edge_list = [(r, w) for r, ws in parents.items() for w in ws] + [(None, w) for w in out]  # plan order
         assert len(edge_list) == len(order)
@@ -545,12 +555,12 @@ def text(p: Path) -> tuple[list[int], list[int]]:
     return task["token_ids"], task["target_positions"]
 
 
-def teach(split: str, n: int, offset: int = 0, stride: int = 1, epsilons=(0.25, 1.0)) -> None:
+def teach(split: str, n: int, offset: int = 0, stride: int = 1, epsilons=(0.25, 1.0), out: Path | None = None) -> None:
     """Native.teach on the split's texts offset, offset + stride, ... of its first n, at each eps ->
-    texts/graphs[_heldout]/<id>.<eps>.py and .json (its score, VPD's answer's, the seconds)."""
+    OUT/<id>.<eps>.py and .json (its score and the seconds); OUT defaults to texts/graphs[_heldout]."""
     nat = Native()
-    out = TEXTS / ("graphs" if split == "train" else "graphs_heldout")
-    out.mkdir(exist_ok=True)
+    out = Path(out) if out else TEXTS / ("graphs" if split == "train" else "graphs_heldout")
+    out.mkdir(parents=True, exist_ok=True)
     for p in tasks(split)[:n][offset::stride]:
         ids, targets = text(p)
         for eps in epsilons:
@@ -573,8 +583,9 @@ def main():
     t.add_argument("--offset", type=int, default=0)
     t.add_argument("--stride", type=int, default=1)
     t.add_argument("--eps", type=float, nargs="+", default=[0.25, 1.0])
+    t.add_argument("--out", type=Path)
     args = ap.parse_args()
-    teach(args.split, args.n, args.offset, args.stride, tuple(args.eps))
+    teach(args.split, args.n, args.offset, args.stride, tuple(args.eps), args.out)
 
 
 if __name__ == "__main__":
