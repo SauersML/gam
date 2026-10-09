@@ -2,8 +2,8 @@
 keeping the set at each size k. The search behind the teacher answers.
 
 Every error is the execution error of the explanation naming the set (one output group, e2e/explain.ir; everything
-left out runs on the changed prompt), scored on the clean and changed prompts alone (--rank-experiments 0) with
-necessity off; the signal is the error of naming nothing. Removing chunks from the whole model by their single
+left out runs on the changed prompt), scored on the behavior's first --search-prompts prompts and their changed
+prompts alone (--rank-experiments 0) with necessity off; the signal is the error of naming nothing. Removing chunks from the whole model by their single
 removals fails here: the difference between prompt and changed prompt travels many parallel paths, so each chunk's
 removal alone costs little and their joint removal costs everything. Growing from nothing named fails too: what is
 left out runs on the changed prompt, so a named block reaches the output only directly until a whole path from the
@@ -108,6 +108,7 @@ def main():
     ap.add_argument("--device", default="gpu")
     ap.add_argument("--experiments", type=int, default=64)
     ap.add_argument("--rank-experiments", type=int, default=0)
+    ap.add_argument("--search-prompts", type=int, default=24, help="the prompts the search scores on (the kept sets are scored on all)")
     ap.add_argument("--tol", type=float, default=0.01, help="the share of the signal a refining round may lose")
     ap.add_argument("--ks", type=int, nargs="+", default=[8, 16, 32, 64, 128, 256])
     ap.add_argument("--batch", type=int, default=3)
@@ -124,10 +125,14 @@ def main():
         else:
             chunks = blocks(behavior["model"])
         log = lambda m: print(f"{b}: {m}", flush=True)  # noqa: E731
+        searched = a.out / "search" / f"{b}.json"  # the prompts the search scores on
+        searched.parent.mkdir(exist_ok=True)
+        searched.write_text(json.dumps({**behavior, "prompts": behavior["prompts"][:a.search_prompts]}))
         with score_module.Checker(behavior["model"], device=a.device) as checker:
-            checker.behavior(path)
+            checker.behavior(searched)
             signal, error = errors(checker, [[], chunks], a)
             sets, rounds = refine(checker, chunks, error, signal, a, log)
+            checker.behavior(path)
             curve = []
             for seed in (0, 1):
                 empty = checker.score_batch([explain.ir([])], experiments=a.experiments, seed=seed)[0]

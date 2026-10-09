@@ -10,9 +10,10 @@ input where its subcomponents read the residual stream, read by every later node
 where it writes the residual stream; its subcomponents leave the base's nodes. Every candidate is scored at
 --experiments on seed 0; the lowest total is rescored on seed 1 and written with its English:
 
-  teacher.py [BEHAVIOR...] [--experiments 64] [--out ~/mpd-data/graph_oracle/teacher_v4]
+  teacher.py [BEHAVIOR...] [--experiments 64] [--out ~/mpd-data/graph_oracle/teacher_v4] [--heldout]
 writes OUT/<behavior>.py, OUT/<behavior>.answer.txt (the program in a python block, then the English) and appends
-OUT/manifest.jsonl.
+OUT/manifest.jsonl. --heldout does the held-out behaviors instead, into ~/mpd-data/graph_oracle/teacher_heldout by
+default: the search baseline of the evaluation, never training input.
 """
 
 from __future__ import annotations
@@ -124,15 +125,16 @@ def main():
     ap.add_argument("--device", default="gpu")
     ap.add_argument("--experiments", type=int, default=64)
     ap.add_argument("--batch", type=int, default=2)
-    ap.add_argument("--out", type=Path, default=DATA / "teacher_v4")
+    ap.add_argument("--out", type=Path)
+    ap.add_argument("--heldout", action="store_true", help="the held-out behaviors (evaluation baselines) instead of the training ones")
     a = ap.parse_args()
+    a.out = a.out or DATA / ("teacher_heldout" if a.heldout else "teacher_v4")
     a.out.mkdir(parents=True, exist_ok=True)
     for b in a.behaviors or sorted(p.stem for p in a.prune.glob("*.json")):
         t0 = time.time()
         path = a.behaviors_dir / f"{b}.json"
         behavior = json.loads(path.read_text())
-        if behavior.get("split") != "train":
-            print(f"{b}: held out; no teacher answer", flush=True)
+        if (behavior.get("split") == "train") == a.heldout:
             continue
         sets = json.loads((a.prune / f"{b}.json").read_text())["sets"]
         log = lambda m: print(f"{b}: {m}", flush=True)  # noqa: E731
