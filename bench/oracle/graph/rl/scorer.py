@@ -52,7 +52,7 @@ def checker(items: list[dict]) -> list[dict]:
 
     def key(k):
         it = items[k]
-        return it.get("seed", 0), it.get("uniform_seeds") or 0, it.get("experiments") or 32, json.dumps(it.get("options"), sort_keys=True)
+        return it.get("seed", 0), it.get("uniform_seeds") or 0, it.get("experiments", 0), json.dumps(it.get("options"), sort_keys=True)
 
     def run(w: int, model: str, path: str, ks: list[int]):
         c = _CHECKERS.get((model, w))
