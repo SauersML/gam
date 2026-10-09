@@ -272,12 +272,14 @@ class Native:
         ow = {k: w[torch.tensor(src_o[k], device=self.dev)] for k in src_o}
         return ew, ow
 
-    def run(self, ids: list[int], targets: list[int], plan: dict, u: dict, ur: dict, ew: dict | None = None, ow: dict | None = None) -> torch.Tensor:
+    def run(self, ids: list[int], targets: list[int], plan: dict, u: dict, ur: dict, ew: dict | None = None, ow: dict | None = None,
+            qk: dict | None = None) -> torch.Tensor:
         """log q at the targets [B, len(targets), V] of each graph under one ablation: u[matrix] [Bu, S, C] and
         ur[matrix] [Bu, S] in [0, 1], Bu = B or 1, S = T or 1. A subcomponent outside a graph runs at mask u; a graph
         node at 1. An output reaches a reader through a declared edge of strength e at e + (1 - e) u (e = 1 unless ew
         / ow give it) and through every other connection at its writer's u. A complete graph's nodes read each other
-        in full. The token embedding always enters in full; remainders W - V U run at ur."""
+        in full. qk[matrix] [Bu, T, C] gives a query or key node a strength e: it enters the attention pattern at
+        e + (1 - e) u (1 without qk). The token embedding always enters in full; remainders W - V U run at ur."""
         import vpd_model
 
         tg, dev = self.target, self.dev
@@ -290,7 +292,10 @@ class Native:
         def ux(n):  # [B, T, C]
             return u[n].expand(B, T, -1)
 
-        def scale(n):  # 1 in the graph, u outside
+        def scale(n):  # 1 in the graph (a query or key node's strength under qk), u outside
+            if qk is not None and n in qk:
+                w = qk[n].expand(B, T, -1)
+                return torch.where(G[n], w + (1 - w) * ux(n), ux(n))
             return torch.where(G[n], 1.0, ux(n))
 
         def uat(n, b, t, c):
@@ -478,39 +483,56 @@ class Native:
         plan = self._plan([full], T)
         n_edges = len(plan["order"])
 
+        qk_nodes = sorted(nd for nd in nodes if _layer_kind(nd)[1] in ("q_proj", "k_proj"))  # they act through attention patterns
+        qk_sites = sorted({nd[0] for nd in qk_nodes})
+        qk_idx = {n: [j for j, nd in enumerate(qk_nodes) if nd[0] == n] for n in qk_sites}
+
+        def qk_of(w):
+            out_ = {}
+            for n in qk_sites:
+                js = qk_idx[n]
+                t = torch.tensor([qk_nodes[j][1] for j in js], device=self.dev)
+                c = torch.tensor([qk_nodes[j][2] for j in js], device=self.dev)
+                out_[n] = torch.zeros(1, T, self.C[n], device=self.dev).index_put((torch.zeros_like(t), t, c), w[torch.tensor(js, device=self.dev)])
+            return out_
+
         def edge_forward(e, r):
-            ew, ow = self.edge_weights(plan, e)
+            ew, ow = self.edge_weights(plan, e[:n_edges])
+            qk = qk_of(e[n_edges:])
             if r == "zero":
                 u = ({n: torch.zeros(1, 1, self.C[n], device=self.dev) for n in names}, {n: torch.zeros(1, 1, device=self.dev) for n in names})
-                return self._kl(logp, self.run(ids, targets, plan, *u, ew, ow))[0]
-            u = self._uniform(T, int(torch.randint(1 << 30, (1,), generator=gen)))
-            return self._kl(logp, self.run(ids, targets, plan, *u, ew, ow))[0]
+            else:
+                u = self._uniform(T, int(torch.randint(1 << 30, (1,), generator=gen)))
+            return self._kl(logp, self.run(ids, targets, plan, *u, ew, ow, qk))[0]
 
-        e = self._strength_loop(edge_forward, torch.full((n_edges,), 2.0, device=self.dev), eps, log, "edges", EDGE_STEPS)
-        order = plan["order"]
+        n_items = n_edges + len(qk_nodes)
+        e = self._strength_loop(edge_forward, torch.full((n_items,), 2.0, device=self.dev), eps, log, "edges", EDGE_STEPS)
         edge_list = [(r, w) for r, ws in parents.items() for w in ws] + [(None, w) for w in out]  # plan order
-        assert len(edge_list) == len(order)
-        ranked = sorted(range(n_edges), key=lambda j: -float(e[j]))
+        assert len(edge_list) == n_edges
+        ranked = sorted(range(n_items), key=lambda j: -float(e[j]))
         keep = int((e > 0.5).sum())
 
         def build(js):
-            par, o = {}, []
+            par, o, used = {}, [], set()
             for j in js:
+                if j >= n_edges:
+                    used.add(qk_nodes[j - n_edges])
+                    continue
                 r, w = edge_list[j]
+                used.add(w)
                 if r is None:
                     o.append(w)
                 else:
                     par.setdefault(r, []).append(w)
-            used = {w for j in js for w in [edge_list[j][1]]} | {edge_list[j][0] for j in js if edge_list[j][0] is not None}
-            used |= {nd for nd in nodes if _layer_kind(nd)[1] in ("q_proj", "k_proj")}  # queries and keys act through the attention pattern
+                    used.add(r)
             return Graph(used, par, o)
 
-        while True:  # the strongest edges, more of them until the exact tests pass
+        while True:  # the strongest edges and query and key nodes, more of them until the exact tests pass
             g_out = build(ranked[:keep])
             s = self.score(ids, targets, [g_out], seed, logp)[0]
-            if s["kl_bits"] <= eps or keep >= n_edges:
+            if s["kl_bits"] <= eps or keep >= n_items:
                 return g_out, s
-            keep = min(n_edges, max(keep + 1, int(keep * 1.25)))
+            keep = min(n_items, max(keep + 1, int(keep * 1.25)))
 
 
 def program(g: Graph) -> str:
