@@ -22,6 +22,7 @@ import argparse
 import json
 import random
 import sys
+from functools import lru_cache
 from pathlib import Path
 
 import torch
@@ -30,28 +31,44 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parents[1] / "vpd_2951"))
 
-import atlas  # noqa: E402
 import mech  # noqa: E402
 
 TEXTS = Path.home() / "mpd-data/graph_oracle/texts"
 LENGTH = 32
+CODES = {site: code for code, site in mech.SITES.items()}  # "v_proj" -> "v"
+
+
+@lru_cache(None)
+def model(device: str = "mps"):
+    """vpd4l and its VPD decomposition."""
+    import vpd_model
+
+    target = vpd_model.load_target(device)
+    return target, vpd_model.load_vpd(target, device)
+
+
+def importance(ids: list[int], device: str = "mps") -> dict[str, torch.Tensor]:
+    """VPD's causal importance [T, C] per site name ("h.2.attn.v_proj"), clamped to [0, 1], on one sequence."""
+    _, vpd = model(device)
+    _, ci = vpd.target_and_ci(torch.tensor([ids], device=device))
+    return {n: c[0].clamp(0, 1) for n, c in ci.items()}
 
 
 def teacher(ids: list[int], device: str = "mps") -> str:
     """VPD's answer: at every position, the subcomponents whose causal importance there is above zero (by layer, site
     and index)."""
     per: dict[int, list[tuple]] = {}
-    for site, m in atlas.importance(ids, device).items():
-        layer, kind = atlas.site_of(site)
+    for site, m in importance(ids, device).items():
+        _, layer, _, kind = site.split(".")
         for t, i in (m > 0).nonzero().tolist():
-            per.setdefault(t, []).append((layer, list(mech.SITES.values()).index(kind), i, atlas.part(layer, kind, i)))
+            per.setdefault(t, []).append((int(layer), list(mech.SITES.values()).index(kind), i, f"<p:{layer}.{CODES[kind]}.{i}>"))
     lines = [f'        {t}: "' + "".join(p for *_, p in sorted(per[t])) + '",' for t in sorted(per)]
     return "def on(tokens, targets):\n    return {\n" + "\n".join(lines) + "\n    }\n"
 
 
 def top(ids: list[int], k: int = 3, device: str = "mps") -> list[list]:
     """The model's k most probable next tokens after `ids`, with their probabilities."""
-    target, _ = atlas.model(device)
+    target, _ = model(device)
     with torch.no_grad():
         p = target(torch.tensor([ids], device=device))[0, -1].softmax(-1)
     tk = mech.tokenizer("vpd4l")

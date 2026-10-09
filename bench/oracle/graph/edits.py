@@ -1,8 +1,8 @@
 """Edits of an oracle answer (#2951 graph oracle): dropping a subcomponent its gate program names, the move RL's credit
 and refinement measure.
 
-A gate program names subcomponents as quoted part names ("<p:L.S.I>"); an edit drops occurrences of them from the
-program text (and tidies the lists they stood in). credit() compares a sample of single drops with the answer;
+A gate program names subcomponents as part names ("<p:L.S.I>"), in strings of names or as list items; an edit drops
+occurrences of them from the program text (and tidies the lists they stood in). credit() compares a sample of single drops with the answer;
 refine() repeats rounds of credit, keeping the drops that improve it. Both rank scores by a key (score.order against
 the task's reference: lower is better).
 """
@@ -12,11 +12,12 @@ from __future__ import annotations
 import random
 import re
 
-NAME = re.compile(r'"<p:\d+\.(?:q|k|v|o|fc|down)\.(?:\d+|rest)>"')
+NAME = re.compile(r"<p:\d+\.(?:q|k|v|o|fc|down)\.(?:\d+|rest)>")
+EMPTY_ITEM = re.compile(r'(?<=[\[,])(\s*)(?:""|\'\')(?=\s*[,\]])')  # a list item left empty by a drop
 
 
 def names(source: str) -> list[tuple[int, int]]:
-    """The spans [start, end) of the quoted subcomponent names in `source`."""
+    """The spans [start, end) of the subcomponent names in `source`."""
     return [m.span() for m in NAME.finditer(source)]
 
 
@@ -27,8 +28,8 @@ def drop(source: str, spans) -> str:
         out.append(source[last:a])
         last = b
     out.append(source[last:])
-    text = "".join(out)
-    for pattern, repl in ((r",(\s*),", r",\1"), (r"\[(\s*),\s*", r"[\1"), (r",(\s*)\]", r"\1]")):
+    text = EMPTY_ITEM.sub(r"\1", "".join(out))
+    for pattern, repl in ((r",(\s*),", r",\1"), (r"\[(\s*),\s*", r"[\1"), (r",(\s*)\]", lambda m: (m[1] if "\n" in m[1] else "") + "]")):
         while re.search(pattern, text):
             text = re.sub(pattern, repl, text)
     return text

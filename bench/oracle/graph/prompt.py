@@ -3,8 +3,7 @@
 the model's prediction at the targets.
 
 A task (text.py) is shown as what on() receives, the token strings and the positions whose next token is asked, with
-the model's most probable next tokens there. A text example (activity()) asks instead which subcomponents act most
-strongly at each position.
+the model's most probable next tokens there.
 
   prompt.py TASK.json      prints the prompt
 """
@@ -25,7 +24,6 @@ import mech  # noqa: E402
 ASK = ("Which of {model}'s subcomponents, at which positions, compute its prediction of the next token at the targets "
        "of this text? Answer with a Python function on(tokens, targets) returning, for each position, the subcomponents "
        "acting there.")
-ACTIVITY = "Which of {model}'s subcomponents act most strongly at each position of this sequence? Answer with on(tokens, targets)."
 
 
 def tokens_of(model: str, ids: list[int]) -> list[str]:
@@ -43,11 +41,6 @@ def render(task: dict) -> str:
     """The oracle's prompt for a task: the ask, then each of its texts as on() receives it."""
     model = task["model"]
     return "\n".join([ASK.format(model=model)] + [line(model, p["token_ids"], p["target_positions"], p["model_top"]) for p in task["prompts"]])
-
-
-def activity(model: str, ids: list[int]) -> str:
-    """The prompt of a text example: which subcomponents act most strongly at each position of `ids`."""
-    return ACTIVITY.format(model=model) + f"\ntokens = {tokens_of(model, ids)!r}, targets = []"
 
 
 def split_answer(answer: str) -> tuple[str, str]:
