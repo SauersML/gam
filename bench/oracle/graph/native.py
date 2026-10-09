@@ -1,31 +1,33 @@
-"""Computational graphs of vpd4l's predictions (#2951 graph oracle), run natively in torch.
+"""Computational graphs of vpd4l's predictions (#2951 graph oracle), run natively in torch: the verifier.
 
 The model runs with every weight matrix replaced by VPD's subcomponents and remainder,
     y = ((x V) * m) U + m_delta x (W - V U)^T,
 masks m in [0, 1] per position. An answer is a graph: nodes are subcomponents at positions; edges are connections the
 model has (an attention or MLP output into a later query, key, value or MLP input at its position, or into the
 prediction; a value into the same layer's attention output at that or a later position; an MLP input into the same
-MLP's output). Running a graph (Native.run): its nodes at mask 1; every other subcomponent at an ablation mask u; a node
+MLP's output). Native.run runs graphs: their nodes at mask 1; every other subcomponent at an ablation mask u; a node
 receives its declared parents' outputs in full and every other output scaled by that output's u; the token embedding,
-which VPD does not decompose, in full. With u = 1 everywhere this is the model.
+which VPD does not decompose, in full. With u = 1 everywhere this is the model; with u = 0 (the verifier's setting) the
+graph runs alone: nothing it leaves out, remainders included, contributes.
 
-A graph is correct within eps when the KL in bits of the model's next-token distribution at the targets from the
-graph's stays at most eps under both ablations of what it leaves out (Native.score, kl_bits the larger):
-  deletion     u = 0;
-  random       u drawn uniformly per position and subcomponent, the mean over RANDOM draws (VPD's stochastic test).
-The KL is of the whole distribution, so a graph that makes the prediction more confident than the model fails too.
-An adversary choosing u for one text breaks VPD's own answer (91.7 bits on text9000, 101.1 for an empty graph), and
-one shared across 32 texts still breaks it by 14 to 17 bits at their predictions: as a constraint it would make
-every graph nearly the whole model (VPD's appendix A.3.4 finds per-input adversaries too strict for the same reason).
-Among correct graphs, fewer nodes plus edges is better (score.order).
+Faithfulness (Native.faithfulness), in bits: the KL of the model's next-token distribution at the target from the
+graph's run alone, averaged over changed prompts of the text (Native.changes): the token at one position, drawn
+uniformly from the positions whose token the model predicts (1 to the target), replaced by a draw from the model's own
+prediction there; a draw can return the original token, so the text itself is among them. The verifier draws them,
+never the answer. A graph that leaves out a path by which a token affects the prediction fails on the prompts that
+change that token, and one more confident than the model fails because the KL is of the whole distribution. No test
+proves a graph is the model's mechanism; this measures how far its outputs are from the model's on these experiments.
 
-teach() finds a graph for one prediction and precision eps: node strengths g in (0, 1) over every subcomponent at every
-position that can reach the target, minimizing their mean subject to the KL tests at eps / 2 with VPD's masks
-m = g + (1 - g) r (r uniform or 0), the multiplier set by the constraint (dual ascent); the nodes with g > 1/2; then
-edge strengths over every connection the model has between them, the same way at eps; the edges with strength > 1/2;
-then the exact tests, adding back the strongest dropped edges until the graph is correct.
+Description length (Graph.bits), in bits: the nodes listed, each one choice among the text's positions times the
+model's 38,912 subcomponents, then each edge as its reader's and its writer's index in that list, and each edge into the
+prediction as its writer's index.
 
-  native.py teach --split train --n N [--offset K --stride S] [--eps 0.25 1]   -> texts/graphs[_heldout]/<id>.<eps>.py, .json
+Native.ordered is a search that bootstraps the oracle, not the method: integrated-gradients rankings of subcomponents
+and then of the connections between the top ones, averaged over the changed prompts; the answer adds the ranked
+connections in order in steps that double their number, each step keeping what lies on a path to the prediction, and
+ends at the first step that lowers the KL no further.
+
+  native.py search --split train --n N [--offset K --stride S] [--out DIR]   -> DIR/<task>.py, .json
 """
 
 from __future__ import annotations
@@ -48,11 +50,9 @@ sys.path.insert(0, str(HERE.parents[1] / "vpd_2951"))
 import mech  # noqa: E402
 
 TEXTS = Path.home() / "mpd-data/graph_oracle/texts"
-RANDOM = 8  # random draws per score
-CANDIDATES = 32  # replacement tokens the teacher tries per source position for an interchange claim
-MAX_NODES, MAX_CONNECTIONS = 5000, 150000  # the edge stage's compute: beyond these the node stage could not prune it
-TEACH_STEPS, EDGE_STEPS, TEACH_LR = 2000, 600, 0.05  # the teacher's optimization (Adam on the strengths' logits)
-TEACH_INIT = 2.0  # the strengths' starting logit (0.88): from 6 (0.9975) 2000 steps end mid-decay (text9000 at 1 bit: 1966 nodes vs 710)
+CHANGES = 16  # changed prompts per text: draws of the average that defines faithfulness (they set its precision, not what it is)
+MAX_CONNECTIONS = 150000  # the search's memory: the connections it ranks at once
+IG_STEPS = 16  # the search's integration points along each ranking's path
 LN2 = math.log(2)
 
 
@@ -126,6 +126,19 @@ class Graph:
     def size(self) -> int:
         return self.count() + self.edges()
 
+    def bits(self, positions: int, subcomponents: int) -> float:
+        """Description length: each node one choice among positions x subcomponents, each edge its reader's and
+        writer's indices among the nodes, each edge into the prediction its writer's index (a complete graph states
+        no edges)."""
+        n = self.count()
+        if n == 0:
+            return 0.0
+        nodes = n * math.log2(positions * subcomponents)
+        if self.complete:
+            return nodes
+        index = math.log2(n)
+        return nodes + index * (2 * sum(len(w) for w in self.parents.values()) + len(self.out))
+
 
 def _layer_kind(nd) -> tuple[int, str]:
     return int(nd[0].split(".")[1]), nd[0].split(".")[-1]
@@ -141,21 +154,41 @@ def connects(writer: tuple, reader: tuple | None, targets: list[int]) -> bool:
     return mech.connects(wl, wk, writer[1], rl, rk, reader[1], targets)
 
 
+def _candidates(nodes) -> dict:
+    """Per reader node, the nodes among `nodes` the model connects into it (mech.connects): residual writers at its
+    position written before it, values of its layer at its position or earlier, its MLP's input at its position."""
+    resid, values, inputs = {}, {}, {}
+    for nd in nodes:
+        layer, kind = _layer_kind(nd)
+        if kind in mech.RESID_WRITERS:
+            resid.setdefault(nd[1], []).append((mech.stage(layer, kind), nd))
+        elif kind == "v_proj":
+            values.setdefault(layer, []).append(nd)
+        elif kind == "c_fc":
+            inputs.setdefault((layer, nd[1]), []).append(nd)
+    out = {}
+    for r in nodes:
+        layer, kind = _layer_kind(r)
+        if kind in mech.RESID_READERS:
+            s = mech.stage(layer, kind)
+            out[r] = [w for st, w in resid.get(r[1], ()) if st <= s]
+        elif kind == "o_proj":
+            out[r] = [w for w in values.get(layer, ()) if w[1] <= r[1]]
+        elif kind == "down_proj":
+            out[r] = list(inputs.get((layer, r[1]), ()))
+    return out
+
+
 def all_edges(nodes, targets: list[int]) -> tuple[dict, list]:
     """Every connection the model has between `nodes`: (parents, out)."""
-    by = {}
-    for nd in nodes:
-        by.setdefault(_layer_kind(nd)[1], []).append(nd)
-    parents = {}
-    for r in nodes:
-        rk = _layer_kind(r)[1]
-        cand = (by.get("o_proj", []) + by.get("down_proj", []) if rk in mech.RESID_READERS
-                else by.get("v_proj", []) if rk == "o_proj" else by.get("c_fc", []) if rk == "down_proj" else [])
-        ws = [w for w in cand if connects(w, r, targets)]
-        if ws:
-            parents[r] = ws
-    out = [w for w in by.get("o_proj", []) + by.get("down_proj", []) if connects(w, None, targets)]
+    parents = {r: ws for r, ws in _candidates(nodes).items() if ws}
+    out = [w for w in nodes if _layer_kind(w)[1] in mech.RESID_WRITERS and w[1] in targets]
     return parents, out
+
+
+def count_edges(nodes, targets: list[int]) -> int:
+    """How many connections all_edges would give."""
+    return sum(len(ws) for ws in _candidates(nodes).values()) + sum(1 for w in nodes if _layer_kind(w)[1] in mech.RESID_WRITERS and w[1] in targets)
 
 
 class Native:
@@ -423,237 +456,79 @@ class Native:
             zt = zt.index_put((b, pos), resid_contrib(wn, wi, strength(wn, wi, ow)), accumulate=True)
         return torch.log_softmax((rms(zt, tg.ln_f, eps) @ tg.wte.T).float(), -1)
 
-    # ---- the tests
-
-    def _uniform(self, T: int, seed: int) -> tuple[dict, dict]:
-        g = torch.Generator(device="cpu").manual_seed(seed)
-        return ({n: torch.rand(1, T, self.C[n], generator=g).to(self.dev) for n in self.names},
-                {n: torch.rand(1, T, generator=g).to(self.dev) for n in self.names})
+    # ---- the verifier
 
     def _kl(self, logp: torch.Tensor, logq: torch.Tensor) -> torch.Tensor:
         return (logp.exp() * (logp - logq)).sum(-1).sum(-1) / LN2
 
-    def score(self, ids: list[int], targets: list[int], graphs: list[Graph], seed: int = 0, logp: torch.Tensor | None = None) -> list[dict]:
-        """{"kl_bits", "kl_deleted_bits", "kl_random_bits", "nodes", "edges", "size"} per graph."""
-        B, T = len(graphs), len(ids)
-        if B == 0:
+    def _zero(self) -> tuple[dict, dict]:
+        return ({n: torch.zeros(1, 1, self.C[n], device=self.dev) for n in self.names}, {n: torch.zeros(1, 1, device=self.dev) for n in self.names})
+
+    @torch.no_grad()
+    def changes(self, ids: list[int], targets: list[int], n: int = CHANGES, seed: int = 0) -> list[list[int]]:
+        """n changed prompts of a text: each replaces the token at a position drawn uniformly from 1 to the last target
+        (the positions whose token the model predicts) by a draw from the model's prediction there."""
+        last = max(targets)
+        if last < 1:
+            return [list(ids)] * n
+        probs = self.vpd.target_forward(torch.tensor([ids], device=self.dev))[0, :last].float().softmax(-1).cpu()
+        g = torch.Generator(device="cpu").manual_seed(seed)
+        out = []
+        for _ in range(n):
+            p = int(torch.randint(1, last + 1, (1,), generator=g))
+            x = list(ids)
+            x[p] = int(torch.multinomial(probs[p - 1], 1, generator=g))
+            out.append(x)
+        return out
+
+    def faithfulness(self, ids: list[int], targets: list[int], graphs: list[Graph], prompts: list[list[int]], chunk: int = 16) -> list[float]:
+        """Per graph, the mean over `prompts` (changed prompts of ids) of the KL in bits of the model's next-token
+        distribution at the targets from the graph's run alone."""
+        if not graphs:
             return []
-        logp = self.reference([ids], targets) if logp is None else logp
-        plan = self._plan(graphs, T)
-        with torch.no_grad():
-            zero = ({n: torch.zeros(1, 1, self.C[n], device=self.dev) for n in self.names}, {n: torch.zeros(1, 1, device=self.dev) for n in self.names})
-            deleted = self._kl(logp, self.run(ids, targets, plan, *zero))
-            random = torch.stack([self._kl(logp, self.run(ids, targets, plan, *self._uniform(T, seed * 1000 + j))) for j in range(RANDOM)]).mean(0)
-        total = torch.maximum(deleted, random)
-        return [{"kl_bits": float(total[b]), "kl_deleted_bits": float(deleted[b]), "kl_random_bits": float(random[b]), "nodes": graphs[b].count(),
-                 "edges": None if graphs[b].complete else graphs[b].edges(), "size": None if graphs[b].complete else graphs[b].size()} for b in range(B)]
-
-    # ---- interchanges
-
-    @torch.no_grad()
-    def interchange(self, ids: list[int], edited: list[list[int]], targets: list[int], nodes: set) -> list[dict]:
-        """For each edited sequence (same length): the model's prediction at the targets on the original text, on the
-        edited text, and on the original text with only `nodes`' activations taken from the edited run (everything
-        downstream recomputed): their top tokens, and the KLs in bits of the edited prediction from the original's
-        and from the patched one's."""
         T = len(ids)
-        plan = self._plan([self.everything(T)], T)
-        one = ({n: torch.ones(1, 1, self.C[n], device=self.dev) for n in self.names}, {n: torch.ones(1, 1, device=self.dev) for n in self.names})
-        lp = self.run(ids, targets, plan, *one)
-        masks = {}
-        for n, t, c in nodes:
-            masks.setdefault(n, torch.zeros(1, T, self.C[n], dtype=torch.bool, device=self.dev))[0, t, c] = True
-        out = []
-        for e in edited:
-            rec = {}
-            le = self.run(e, targets, plan, *one, record=rec)
-            lq = self.run(ids, targets, plan, *one, patch={n: (m, rec[n]) for n, m in masks.items()})
-            out.append({"top": lp.argmax(-1)[0].tolist(), "edited_top": le.argmax(-1)[0].tolist(), "patched_top": lq.argmax(-1)[0].tolist(),
-                        "edit_kl_bits": float(self._kl(le, lp)[0]), "residual_kl_bits": float(self._kl(le, lq)[0])})
-        return out
+        refs = [self.reference([x], targets) for x in prompts]
+        total = torch.zeros(len(graphs), device=self.dev)
+        zero = self._zero()
+        for s in range(0, len(graphs), chunk):
+            part = graphs[s:s + chunk]
+            plan = self._plan(part, T)
+            with torch.no_grad():
+                for x, logp in zip(prompts, refs):
+                    total[s:s + len(part)] += self._kl(logp, self.run(x, targets, plan, *zero))
+        return (total / len(prompts)).tolist()
 
-    @torch.no_grad()
-    def claims(self, ids: list[int], targets: list[int], g: Graph, candidates: int = CANDIDATES) -> list[tuple[int, int, int]]:
-        """The teacher's interchange claims about graph g, one per source position p of its pathways (pathways()):
-        among the `candidates` tokens whose embeddings are nearest the token at p, the replacement that changes the
-        model's top prediction the most (edit KL) while the pathway from p alone reproduces the new top prediction when
-        its activations come from the edited run. (p, replacement token id, the new top token id) per claim."""
-        wte = self.target.wte
-        unit = wte / wte.norm(dim=1, keepdim=True)
-        out = []
-        for p, nodes in pathways(g, targets).items():
-            near = (unit @ unit[ids[p]]).topk(candidates + 1).indices.tolist()
-            subs = [c for c in near if c != ids[p]][:candidates]
-            edited = [ids[:p] + [c] + ids[p + 1:] for c in subs]
-            res = self.interchange(ids, edited, targets, nodes)
-            ok = [(r["edit_kl_bits"], c, r["edited_top"][0]) for c, r in zip(subs, res)
-                  if r["edited_top"] != r["top"] and r["patched_top"] == r["edited_top"]]
-            if ok:
-                _, c, top = max(ok)
-                out.append((p, c, top))
-        return out
+    def positions(self, targets: list[int]) -> int:
+        """The positions a graph's nodes can sit at: 0 to the last target."""
+        return max(targets) + 1
 
-    # ---- the teacher
+    def score(self, ids: list[int], targets: list[int], graphs: list[Graph], prompts: list[list[int]]) -> list[dict]:
+        """{"kl_bits", "bits", "nodes", "edges"} per graph: its faithfulness and description length."""
+        total = sum(self.C.values())
+        kl = self.faithfulness(ids, targets, graphs, prompts)
+        return [{"kl_bits": k, "bits": g.bits(self.positions(targets), total), "nodes": g.count(), "edges": None if g.complete else g.edges()}
+                for g, k in zip(graphs, kl)]
 
-    def _strength_loop(self, forward, logits: torch.Tensor, target: float, log=None, what: str = "", steps: int = TEACH_STEPS) -> torch.Tensor:
-        """Minimize mean(sigmoid(logits)) subject to max(KL_deleted, KL_random) <= target by Adam on the logits and dual
-        ascent on the multiplier; forward(strengths, "zero" or "random") -> KL. Returns the final strengths."""
-        logits = logits.clone().requires_grad_(True)
-        opt = torch.optim.Adam([logits], lr=TEACH_LR, eps=1e-15)  # the mean's gradient (about 1e-9 per strength) must not drown in eps
-        mu = 0.0
-        for step in range(steps):
-            with torch.enable_grad():
-                g = torch.sigmoid(logits)
-                k = torch.maximum(forward(g, "zero"), forward(g, "random"))
-                loss = g.mean() + mu * (k - target)
-                opt.zero_grad()
-                loss.backward()
-            opt.step()
-            mu = max(0.0, mu + float(k) - target)
-            if log and (step % 50 == 0 or step == steps - 1):
-                log(f"{what} step {step}: kl {float(k):.4f} (target {target}), mean strength {float(g.mean()):.4f}, above 1/2: {int((g > 0.5).sum())}, mu {mu:.3f}")
-        return torch.sigmoid(logits.detach())
+    # ---- the bootstrap search
 
-    def teach(self, ids: list[int], targets: list[int], eps: float, seed: int = 0, log=None) -> tuple[Graph, dict]:
-        """(one prediction's graph at precision eps, its score); see the module docstring."""
+    def _node_ranking(self, ids: list[int], targets: list[int], prompts: list[list[int]], reach: dict) -> tuple:
+        """Every reachable (matrix, position, subcomponent), most important first: integrated gradients of the run-alone
+        KL along the path that scales every subcomponent (and remainder) from 1 to 0 together, summed over the changed
+        prompts: minus the integral of d KL / d m, each one's share of the KL of removing everything. Only an order."""
         T = len(ids)
-        logp = self.reference([ids], targets)
-        ids_b = torch.tensor([ids], device=self.dev)
-        reach = self.reachable(T, targets)
-        names = self.names
-        flat = torch.cat([reach[n].flatten() for n in names])
-        sizes = [T * self.C[n] for n in names]
-        gen = torch.Generator(device="cpu").manual_seed(seed)
-
-        def split(v):  # a vector over the reachable (matrix, position, index) slots -> [T, C] per matrix
-            full = torch.zeros(len(flat), device=self.dev)
-            full[flat] = v
-            return {n: p.view(T, self.C[n]) for n, p in zip(names, torch.split(full, sizes))}
-
-        def node_forward(g, r):
-            m = split(g)
-            if r == "zero":
-                masks, rest = {n: m[n][None] for n in names}, {n: torch.zeros(1, T, device=self.dev) for n in names}
-            else:
-                rr = {n: torch.rand(T, self.C[n], generator=gen).to(self.dev) for n in names}
-                masks = {n: (m[n] + (1 - m[n]) * rr[n])[None] for n in names}
-                rest = {n: torch.rand(1, T, generator=gen).to(self.dev) for n in names}
-            lq = torch.log_softmax(self.vpd.masked(ids_b, masks, rest)[:, targets].float(), -1)
-            return self._kl(logp, lq)[0]
-
-        g = self._strength_loop(node_forward, torch.full((int(flat.sum()),), TEACH_INIT, device=self.dev), eps / 2, log, "nodes")
-        sel = split(g)
-        nodes = {(n, t, c) for n in names for t, c in (sel[n] > 0.5).nonzero().tolist()}
-        if len(nodes) > MAX_NODES:
-            return None, {"skipped": f"the node stage kept {len(nodes)} nodes"}
-        parents, out = all_edges(nodes, targets)
-        if sum(len(w) for w in parents.values()) + len(out) > MAX_CONNECTIONS:
-            return None, {"skipped": f"{len(nodes)} nodes with {sum(len(w) for w in parents.values()) + len(out)} connections between them"}
-        if log:
-            log(f"nodes kept: {len(nodes)}; connections between them: {sum(len(w) for w in parents.values()) + len(out)}")
-        full = Graph(nodes, parents, out)
-        plan = self._plan([full], T)
-        n_edges = len(plan["order"])
-
-        qk_nodes = sorted(nd for nd in nodes if _layer_kind(nd)[1] in ("q_proj", "k_proj"))  # they act through attention patterns
-        qk_sites = sorted({nd[0] for nd in qk_nodes})
-        qk_idx = {n: [j for j, nd in enumerate(qk_nodes) if nd[0] == n] for n in qk_sites}
-
-        def qk_of(w):
-            out_ = {}
-            for n in qk_sites:
-                js = qk_idx[n]
-                t = torch.tensor([qk_nodes[j][1] for j in js], device=self.dev)
-                c = torch.tensor([qk_nodes[j][2] for j in js], device=self.dev)
-                out_[n] = torch.zeros(1, T, self.C[n], device=self.dev).index_put((torch.zeros_like(t), t, c), w[torch.tensor(js, device=self.dev)])
-            return out_
-
-        def edge_forward(e, r):
-            ew, ow = self.edge_weights(plan, e[:n_edges])
-            qk = qk_of(e[n_edges:])
-            if r == "zero":
-                u = ({n: torch.zeros(1, 1, self.C[n], device=self.dev) for n in names}, {n: torch.zeros(1, 1, device=self.dev) for n in names})
-            else:
-                u = self._uniform(T, int(torch.randint(1 << 30, (1,), generator=gen)))
-            return self._kl(logp, self.run(ids, targets, plan, *u, ew, ow, qk))[0]
-
-        n_items = n_edges + len(qk_nodes)
-        e = self._strength_loop(edge_forward, torch.full((n_items,), TEACH_INIT, device=self.dev), eps, log, "edges", EDGE_STEPS)
-        edge_list = [(r, w) for r, ws in parents.items() for w in ws] + [(None, w) for w in out]  # plan order
-        assert len(edge_list) == n_edges
-        ranked = sorted(range(n_items), key=lambda j: -float(e[j]))
-        keep = int((e > 0.5).sum())
-
-        def build(js):
-            par, o, used = {}, [], set()
-            for j in js:
-                if j >= n_edges:
-                    used.add(qk_nodes[j - n_edges])
-                    continue
-                r, w = edge_list[j]
-                used.add(w)
-                if r is None:
-                    o.append(w)
-                else:
-                    par.setdefault(r, []).append(w)
-                    used.add(r)
-            return Graph(used, par, o)
-
-        def passes(k):
-            g_k = build(ranked[:k])
-            s_k = self.score(ids, targets, [g_k], seed, logp)[0]
-            return s_k["kl_bits"] <= eps, g_k, s_k
-
-        # the fewest of the strongest edges and query/key nodes that pass the exact tests, by bisection from the
-        # rounded set (the strengths above 1/2)
-        ok, g_out, s = passes(keep)
-        lo, hi = (0, keep) if ok else (keep, n_items)
-        best = (g_out, s) if ok else None
-        while hi - lo > 1:
-            mid = (lo + hi) // 2
-            ok, g_mid, s_mid = passes(mid)
-            if ok:
-                hi, best = mid, (g_mid, s_mid)
-            else:
-                lo = mid
-        if best is None:
-            ok, g_n, s_n = passes(n_items)
-            best = (g_n, s_n)
-        return self.clean(ids, targets, *best, eps, seed, logp)
-
-    # ---- the search by ranking and measuring
-
-    def _smallest_prefix(self, n: int, passes, batch: int = 8) -> int:
-        """The smallest k in 1..n with passes(k) true, assuming it is monotone in k (n is taken to pass): rounds of
-        `batch` evenly spaced trials narrow the interval; passes takes a list of k and returns a list of bools."""
-        lo, hi = 0, n  # lo fails (or is 0), hi passes
-        while hi - lo > 1:
-            ks = sorted({lo + max(1, (hi - lo) * (j + 1) // (batch + 1)) for j in range(batch)} - {hi})
-            ks = [k for k in ks if lo < k < hi] or [(lo + hi) // 2]
-            ok = passes(ks)
-            for k, o in zip(ks, ok):
-                if o:
-                    hi = min(hi, k)
-                    break
-                lo = max(lo, k)
-        return hi
-
-    def _node_ranking(self, ids: list[int], targets: list[int], logp, reach: dict, steps: int = 16) -> tuple:
-        """Every reachable (matrix, position, subcomponent), most important first: integrated gradients of the deleted
-        model's KL along the path that scales every subcomponent (and remainder) from 1 to 0 together,
-        -integral of d KL / d m_c, the share of the full removal's KL each one accounts for. Only an order."""
-        T = len(ids)
-        ids_b = torch.tensor([ids], device=self.dev)
         total = {n: torch.zeros(T, self.C[n], device=self.dev) for n in self.names}
-        for k in range(steps):
-            a = (k + 0.5) / steps
-            masks = {n: torch.full((1, T, self.C[n]), a, device=self.dev, requires_grad=True) for n in self.names}
-            rest = {n: torch.full((1, T), a, device=self.dev) for n in self.names}
-            with torch.enable_grad():
-                lq = torch.log_softmax(self.vpd.masked(ids_b, masks, rest)[:, targets].float(), -1)
-                grads = torch.autograd.grad(self._kl(logp, lq)[0], [masks[n] for n in self.names])
-            for n, gr in zip(self.names, grads):
-                total[n] -= gr[0] / steps
+        for x in prompts:
+            logp = self.reference([x], targets)
+            xb = torch.tensor([x], device=self.dev)
+            for k in range(IG_STEPS):
+                a = (k + 0.5) / IG_STEPS
+                masks = {n: torch.full((1, T, self.C[n]), a, device=self.dev, requires_grad=True) for n in self.names}
+                rest = {n: torch.full((1, T), a, device=self.dev) for n in self.names}
+                with torch.enable_grad():
+                    lq = torch.log_softmax(self.vpd.masked(xb, masks, rest)[:, targets].float(), -1)
+                    grads = torch.autograd.grad(self._kl(logp, lq)[0], [masks[n] for n in self.names])
+                for n, gr in zip(self.names, grads):
+                    total[n] -= gr[0]
         mi, ti, ci, val = [], [], [], []
         for j, n in enumerate(self.names):
             t, c = reach[n].nonzero(as_tuple=True)
@@ -663,151 +538,127 @@ class Native:
             val.append(total[n][t, c])
         mi, ti, ci, val = torch.cat(mi), torch.cat(ti), torch.cat(ci), torch.cat(val)
         o = (-val).argsort()
-        return mi[o], ti[o], ci[o]
+        return [(self.names[int(m)], int(t), int(c)) for m, t, c in zip(mi[o].tolist(), ti[o].tolist(), ci[o].tolist())]
 
-    def search(self, ids: list[int], targets: list[int], eps: float, seed: int = 0, log=None) -> tuple[Graph | None, dict]:
-        """(one prediction's graph at precision eps, its score), by ranking and measuring. Subcomponents: rank every
-        reachable one (_node_ranking) and keep the smallest top-k whose complete graph passes the tests at eps / 2.
-        Connections: rank every connection the model has between them, and their queries and keys, by integrated
-        gradients of the KL as all their strengths go from 1 to 0, and keep the smallest top-k that passes at eps.
-        Then drop what lies on no path to the prediction. None (with the reason) when the connections between the kept
-        subcomponents exceed MAX_CONNECTIONS."""
+    def _edge_ranking(self, ids: list[int], targets: list[int], prompts: list[list[int]], nodes: set) -> list:
+        """Every connection the model has between `nodes` ((reader, writer), reader None for the prediction) and every
+        query or key node among them ((node, None)), most important first: integrated gradients of the run-alone KL
+        as all their strengths go from 1 to 0 together, summed over the changed prompts."""
         T = len(ids)
-        logp = self.reference([ids], targets)
-        reach = self.reachable(T, targets)
-        mi, ti, ci = self._node_ranking(ids, targets, logp, reach)
-        names = self.names
-
-        def masks_of(k):
-            out = {n: torch.zeros(T, self.C[n], dtype=torch.bool, device=self.dev) for n in names}
-            for j, n in enumerate(names):
-                sel = mi[:k] == j
-                out[n][ti[:k][sel], ci[:k][sel]] = True
-            return out
-
-        def nodes_pass(ks):
-            res = self.score(ids, targets, [Graph(masks=masks_of(k)) for k in ks], seed, logp)
-            return [r["kl_bits"] <= eps / 2 for r in res]
-
-        k = self._smallest_prefix(len(mi), nodes_pass)
-        nodes = {(names[int(mi[i])], int(ti[i]), int(ci[i])) for i in range(k)}
         parents, out = all_edges(nodes, targets)
-        n_conn = sum(len(w) for w in parents.values()) + len(out)
-        if log:
-            log(f"{k} subcomponents pass at {eps / 2}; {n_conn} connections between them")
-        if n_conn > MAX_CONNECTIONS:
-            return None, {"skipped": f"{k} subcomponents with {n_conn} connections between them"}
-        full = Graph(nodes, parents, out)
-        plan = self._plan([full], T)
-        n_edges = len(plan["order"])
-        edge_list = [(r, w) for r, ws in parents.items() for w in ws] + [(None, w) for w in out]  # plan order
-        qk_nodes = sorted(nd for nd in nodes if _layer_kind(nd)[1] in ("q_proj", "k_proj"))
-        qk_sites = sorted({nd[0] for nd in qk_nodes})
+        g = Graph(nodes, parents, out)
+        plan = self._plan([g], T)
+        items = [(r, w) for r, ws in parents.items() for w in ws] + [(None, w) for w in out]  # plan order
+        n_edges = len(items)
+        qk = sorted(nd for nd in nodes if _layer_kind(nd)[1] in ("q_proj", "k_proj"))
+        sites = sorted({nd[0] for nd in qk})
+        idx = {n: [j for j, nd in enumerate(qk) if nd[0] == n] for n in sites}
 
         def qk_of(w):
             res = {}
-            for n in qk_sites:
-                js = [j for j, nd in enumerate(qk_nodes) if nd[0] == n]
-                t = torch.tensor([qk_nodes[j][1] for j in js], device=self.dev)
-                c = torch.tensor([qk_nodes[j][2] for j in js], device=self.dev)
+            for n in sites:
+                js = idx[n]
+                t = torch.tensor([qk[j][1] for j in js], device=self.dev)
+                c = torch.tensor([qk[j][2] for j in js], device=self.dev)
                 res[n] = torch.zeros(1, T, self.C[n], device=self.dev).index_put((torch.zeros_like(t), t, c), w[torch.tensor(js, device=self.dev)])
             return res
 
-        n_items = n_edges + len(qk_nodes)
-        zero = ({n: torch.zeros(1, 1, self.C[n], device=self.dev) for n in names}, {n: torch.zeros(1, 1, device=self.dev) for n in names})
-        ig = torch.zeros(n_items, device=self.dev)
-        steps = 16
-        for s in range(steps):
-            w = torch.full((n_items,), (s + 0.5) / steps, device=self.dev, requires_grad=True)
-            with torch.enable_grad():
-                ew, ow = self.edge_weights(plan, w[:n_edges])
-                kl = self._kl(logp, self.run(ids, targets, plan, *zero, ew, ow, qk_of(w[n_edges:])))[0]
-                (gr,) = torch.autograd.grad(kl, w)
-            ig -= gr / steps
-        ranked = (-ig).argsort().tolist()
+        zero = self._zero()
+        ig = torch.zeros(n_edges + len(qk), device=self.dev)
+        for x in prompts:
+            logp = self.reference([x], targets)
+            for k in range(IG_STEPS):
+                w = torch.full((n_edges + len(qk),), (k + 0.5) / IG_STEPS, device=self.dev, requires_grad=True)
+                with torch.enable_grad():
+                    ew, ow = self.edge_weights(plan, w[:n_edges])
+                    kl = self._kl(logp, self.run(x, targets, plan, *zero, ew, ow, qk_of(w[n_edges:])))[0]
+                    (gr,) = torch.autograd.grad(kl, w)
+                ig -= gr
+        allitems = items + [(nd, None) for nd in qk]
+        return [allitems[j] for j in (-ig).argsort().tolist()]
 
-        def build(js):
-            par, o, used = {}, [], set()
-            for j in js:
-                if j >= n_edges:
-                    used.add(qk_nodes[j - n_edges])
-                    continue
-                r, w = edge_list[j]
-                used.add(w)
-                if r is None:
-                    o.append(w)
-                else:
-                    par.setdefault(r, []).append(w)
-                    used.add(r)
-            return Graph(used, par, o)
-
-        def edges_pass(ks):
-            res = self.score(ids, targets, [build(ranked[:k]) for k in ks], seed, logp)
-            return [r["kl_bits"] <= eps for r in res]
-
-        if not edges_pass([n_items])[0]:
-            return None, {"skipped": f"{k} subcomponents and all {n_items} of their connections miss eps"}
-        k_e = self._smallest_prefix(n_items, edges_pass)
-        g = build(ranked[:k_e])
-        s = self.score(ids, targets, [g], seed, logp)[0]
+    def ordered(self, ids: list[int], targets: list[int], prompts: list[list[int]], log=None) -> tuple[list[Graph], list[dict]]:
+        """A bootstrap answer: (the graph after each step, their scores); see the module docstring. The subcomponents
+        whose connections are ranked: the most top-ranked whose connections fit MAX_CONNECTIONS."""
+        T = len(ids)
+        ranked = self._node_ranking(ids, targets, prompts, self.reachable(T, targets))
+        lo = 1
+        while lo < len(ranked) and count_edges(ranked[:2 * lo], targets) <= MAX_CONNECTIONS:  # doubling, then bisection:
+            lo *= 2  # the largest prefix within MAX_CONNECTIONS
+        hi = min(2 * lo, len(ranked))
+        lo = min(lo, len(ranked))
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if count_edges(ranked[:mid], targets) <= MAX_CONNECTIONS:
+                lo = mid
+            else:
+                hi = mid - 1
+        nodes = set(ranked[:lo])
+        items = self._edge_ranking(ids, targets, prompts, nodes)
         if log:
-            log(f"{k_e} of {n_items} connections and query/key nodes pass at {eps}")
-        return self.clean(ids, targets, g, s, eps, seed, logp)
+            log(f"{lo} subcomponents ranked first; {len(items)} connections and query/key nodes between them")
+        graphs, k = [], 1
+        while True:
+            g = on_path(build(items[:k]), targets)
+            if g.count() and (not graphs or g.size() > graphs[-1].size()):
+                graphs.append(g)
+            if k >= len(items):
+                break
+            k = min(2 * k, len(items))
+        scores = self.score(ids, targets, graphs, prompts)
+        keep = 1
+        while keep < len(graphs) and scores[keep]["kl_bits"] < scores[keep - 1]["kl_bits"]:
+            keep += 1
+        return graphs[:keep], scores[:keep]
 
-    def clean(self, ids: list[int], targets: list[int], g: Graph, s: dict, eps: float, seed: int = 0, logp=None) -> tuple[Graph, dict]:
-        """g without what lies on no path to the prediction (pathways()), kept when it still passes the tests at eps."""
-        on_path = set().union(*pathways(g, targets).values()) if g.out else set()
-        if on_path == g.nodes:
-            return g, s
-        h = Graph(on_path, {r: [w for w in ws if w in on_path] for r, ws in g.parents.items() if r in on_path}, [w for w in g.out if w in on_path])
-        h.parents = {r: ws for r, ws in h.parents.items() if ws}
-        sh = self.score(ids, targets, [h], seed, logp)[0]
-        return (h, sh) if sh["kl_bits"] <= eps else (g, s)
+
+def build(items: list) -> Graph:
+    """The graph of ranked items: (reader, writer) connections (reader None: the prediction) and (node, None) query or
+    key nodes."""
+    par, out, used = {}, [], set()
+    for r, w in items:
+        if w is None:
+            used.add(r)
+        elif r is None:
+            out.append(w)
+            used.add(w)
+        else:
+            par.setdefault(r, []).append(w)
+            used |= {r, w}
+    return Graph(used, par, out)
 
 
-def pathways(g: Graph, targets: list[int]) -> dict[int, set]:
-    """Per source position p, the graph's nodes on a path from a node at p (which reads token p) to the prediction: a
-    reader's parents feed it, a query feeds its layer's attention outputs at its position, a key those at its position
-    and later."""
-    children: dict = {}
+def on_path(g: Graph, targets: list[int]) -> Graph:
+    """g without what lies on no path to the prediction: a reader's parents feed it, a query feeds its layer's
+    attention outputs at its position, a key those at its position and later."""
+    feeds: dict = {}
     for r, ws in g.parents.items():
         for w in ws:
-            children.setdefault(w, set()).add(r)
+            feeds.setdefault(r, set()).add(w)
     outs = [nd for nd in g.nodes if _layer_kind(nd)[1] == "o_proj"]
     for nd in g.nodes:
         layer, kind = _layer_kind(nd)
         if kind in ("q_proj", "k_proj"):
             for o in outs:
                 if _layer_kind(o)[0] == layer and (o[1] == nd[1] if kind == "q_proj" else o[1] >= nd[1]):
-                    children.setdefault(nd, set()).add(o)
-    parents: dict = {}
-    for w, rs in children.items():
-        for r in rs:
-            parents.setdefault(r, set()).add(w)
-    ancestors, stack = set(g.out), list(g.out)
+                    feeds.setdefault(o, set()).add(nd)
+    keep, stack = set(g.out), list(g.out)
     while stack:
-        for w in parents.get(stack.pop(), ()):
-            if w not in ancestors:
-                ancestors.add(w)
+        for w in feeds.get(stack.pop(), ()):
+            if w not in keep:
+                keep.add(w)
                 stack.append(w)
-    out = {}
-    for p in sorted({nd[1] for nd in ancestors}):
-        seen, stack = set(), [nd for nd in ancestors if nd[1] == p]
-        while stack:
-            nd = stack.pop()
-            if nd in seen or nd not in ancestors:
-                continue
-            seen.add(nd)
-            stack += list(children.get(nd, ()))
-        out[p] = seen
-    return out
+    par = {r: [w for w in ws if w in keep] for r, ws in g.parents.items() if r in keep}
+    return Graph(keep, {r: ws for r, ws in par.items() if ws}, [w for w in g.out if w in keep])
 
 
-def program(g: Graph, claims: list | None = None, uses: list | None = None) -> str:
-    """A graph as an answer: graph(tokens, targets) returning {(position, reader): its parents, "out": the
-    prediction's parents, "claims": [(position, replacement, top), ...]}; parents at the reader's own position are one
-    string of subcomponents, an attention output's parents (values) a {position: string}; a node with no parents is
-    listed with "" when nothing reads it; claims hold token strings."""
+def program(steps: list[Graph], uses: list[list[str]] | None = None, notes: list[str] | None = None, explanation: str | None = None) -> str:
+    """Graphs as an ordered answer: graph(tokens, targets) returning a list of steps, the k-th adding what steps[k]
+    has beyond steps[k - 1] (a step's graph contains the previous one's); a step is a dict {(position, reader): its
+    new parents, "out": the prediction's new parents, "uses": library entries}; parents at the reader's own position
+    are one string of subcomponents, an attention output's parents (values) a {position: string}; a node with no
+    parents is listed with "" when nothing reads it. notes: a comment line above each step; explanation: the
+    function's docstring."""
     sites = list(mech.SITES.values())
     codes = {v: k for k, v in mech.SITES.items()}
 
@@ -819,36 +670,39 @@ def program(g: Graph, claims: list | None = None, uses: list | None = None) -> s
         layer, kind = _layer_kind(nd)
         return (nd[1], layer, sites.index(kind), nd[2])
 
-    written = {w for ws in g.parents.values() for w in ws} | set(g.out)
-    readers = set(g.parents) | {nd for nd in g.nodes if nd not in written}
-    lines = []
-    for r in sorted(readers, key=key):
-        ws = sorted(g.parents.get(r, []), key=key)
-        if r[0].endswith("o_proj"):
-            per = {}
-            for w in ws:
-                per.setdefault(w[1], []).append(tok(w))
-            val = "{" + ", ".join(f'{t}: "' + "".join(v) + '"' for t, v in sorted(per.items())) + "}"
-        else:
-            val = '"' + "".join(tok(w) for w in ws) + '"'
-        lines.append(f'        ({r[1]}, "{tok(r)}"): {val},')
-    lines.append('        "out": "' + "".join(tok(w) for w in sorted(g.out, key=key)) + '",')
-    if uses:
-        lines.append('        "uses": [' + ", ".join(repr(u) for u in uses) + "],")
-    if claims:
-        lines.append('        "claims": [' + ", ".join(f"({p}, {a!r}, {b!r})" for p, a, b in claims) + "],")
-    return "def graph(tokens, targets):\n    return {\n" + "\n".join(lines) + "\n    }\n"
-
-
-def token_claims(claims: list[tuple[int, int, int]]) -> list[tuple[int, str, str]]:
-    """Claims with their tokens as strings, keeping those whose strings read back as the same single tokens."""
-    tk = mech.tokenizer("vpd4l")
-    out = []
-    for p, a, b in claims:
-        sa, sb = tk.decode([a]), tk.decode([b])
-        if tk.encode(sa, add_special_tokens=False).ids == [a] and tk.encode(sb, add_special_tokens=False).ids == [b]:
-            out.append((p, sa, sb))
-    return out
+    lines = ["def graph(tokens, targets):"]
+    if explanation:
+        lines.append('    """' + explanation.replace('"""', "'''").strip() + '"""')
+    lines.append("    return [")
+    prev = Graph()
+    for k, g in enumerate(steps):
+        seen = {(r, w) for r, ws in prev.parents.items() for w in ws}
+        new_par = {r: [w for w in ws if (r, w) not in seen] for r, ws in g.parents.items()}
+        new_par = {r: ws for r, ws in new_par.items() if ws}
+        new_out = [w for w in g.out if w not in prev.out]
+        written = {w for ws in g.parents.values() for w in ws} | set(g.out)
+        lone = {nd for nd in g.nodes - prev.nodes if nd not in written and nd not in g.parents}
+        body = []
+        for r in sorted(set(new_par) | lone, key=key):
+            ws = sorted(new_par.get(r, []), key=key)
+            if r[0].endswith("o_proj"):
+                per = {}
+                for w in ws:
+                    per.setdefault(w[1], []).append(tok(w))
+                val = "{" + ", ".join(f'{t}: "' + "".join(v) + '"' for t, v in sorted(per.items())) + "}"
+            else:
+                val = '"' + "".join(tok(w) for w in ws) + '"'
+            body.append(f'            ({r[1]}, "{tok(r)}"): {val},')
+        if new_out:
+            body.append('            "out": "' + "".join(tok(w) for w in sorted(new_out, key=key)) + '",')
+        if uses and k < len(uses) and uses[k]:
+            body.append('            "uses": [' + ", ".join(repr(u) for u in uses[k]) + "],")
+        if notes and k < len(notes) and notes[k]:
+            lines.append("        # " + notes[k].strip().replace("\n", " "))
+        lines += ["        {"] + body + ["        },"]
+        prev = g
+    lines.append("    ]")
+    return "\n".join(lines) + "\n"
 
 
 def tasks(split: str) -> list[Path]:
@@ -861,69 +715,42 @@ def text(p: Path) -> tuple[list[int], list[int]]:
     return task["token_ids"], task["target_positions"]
 
 
-def teach(split: str, n: int, offset: int = 0, stride: int = 1, epsilons=(0.25, 1.0), out: Path | None = None) -> None:
-    """Native.teach on the split's texts offset, offset + stride, ... of its first n, at each eps ->
-    OUT/<id>.<eps>.py and .json (its score and the seconds); OUT defaults to texts/graphs[_heldout]."""
+def task_seed(task_id: str) -> int:
+    """A text's own seed for its changed prompts (the same in every process)."""
+    return int.from_bytes(task_id.encode()[-8:].rjust(8, b"\0"), "big") % (1 << 31)
+
+
+def search(split: str, n: int, offset: int = 0, stride: int = 1, out: Path | None = None) -> None:
+    """Native.ordered on the split's texts offset, offset + stride, ... of its first n -> OUT/<id>.py (the answer) and
+    .json (each step's score and the seconds); OUT defaults to texts/search[_heldout]."""
     nat = Native()
-    out = Path(out) if out else TEXTS / ("graphs" if split == "train" else "graphs_heldout")
+    out = Path(out) if out else TEXTS / ("search" if split == "train" else "search_heldout")
     out.mkdir(parents=True, exist_ok=True)
     for p in tasks(split)[:n][offset::stride]:
+        if (out / f"{p.stem}.json").exists():
+            continue
+        t0 = time.time()
         ids, targets = text(p)
-        for eps in epsilons:
-            stem = f"{p.stem}.{eps:g}"
-            if (out / f"{stem}.json").exists():
-                continue
-            t0 = time.time()
-            g, s = nat.teach(ids, targets, eps)
-            if g is None or s["kl_bits"] > eps:  # recorded, so a rerun does not repeat it; never a training answer
-                (out / f"{stem}.json").write_text(json.dumps({"score": s, "eps": eps, "seconds": round(time.time() - t0, 1)}))
-                print(f"{stem}: no graph ({s.get('skipped') or 'KL %.3f above eps' % s['kl_bits']}), {time.time() - t0:.0f} s", flush=True)
-                continue
-            claims = token_claims(nat.claims(ids, targets, g))
-            (out / f"{stem}.py").write_text(program(g, claims))
-            (out / f"{stem}.json").write_text(json.dumps({"score": s, "eps": eps, "claims": claims, "seconds": round(time.time() - t0, 1)}))
-            print(f"{stem}: {s['nodes']} nodes, {s['edges']} edges, kl {s['kl_bits']:.3f} (eps {eps}), {len(claims)} claims, {time.time() - t0:.0f} s", flush=True)
-
-
-def clean_dir(directory: Path, split: str) -> None:
-    """Native.clean every teacher graph <task>.<eps>.py in a directory (a pod's output), rewriting it and its .json."""
-    nat = Native()
-    by = {p.stem: p for p in tasks(split)}
-    for py in sorted(Path(directory).glob("*.py")):
-        task_id = py.stem.split(".")[0]  # <task>.<eps>
-        eps = float(py.stem[len(task_id) + 1:])
-        rec = json.loads(py.with_suffix(".json").read_text())
-        ids, targets = text(by[task_id])
-        task = json.loads(by[task_id].read_text())
-        ir = mech.trace_inline(py.read_text(), "vpd4l", task)
-        g = nat.from_ir(ir)
-        h, s = nat.clean(ids, targets, g, rec["score"], eps)
-        if h is not g:
-            claims = rec.get("claims", [])
-            py.write_text(program(h, claims))
-            rec.update(score=s, cleaned=True)
-            py.with_suffix(".json").write_text(json.dumps(rec))
-            print(f"{py.stem}: {rec['score']['nodes']} nodes, {rec['score']['edges']} edges after cleaning", flush=True)
+        prompts = nat.changes(ids, targets, seed=task_seed(p.stem))
+        graphs, scores = nat.ordered(ids, targets, prompts)
+        empty = nat.score(ids, targets, [Graph()], prompts)[0]
+        (out / f"{p.stem}.py").write_text(program(graphs))
+        (out / f"{p.stem}.json").write_text(json.dumps({"empty": empty, "steps": scores, "seconds": round(time.time() - t0, 1)}))
+        print(f"{p.stem}: {len(graphs)} steps, KL {empty['kl_bits']:.1f} -> " + " -> ".join(f"{s['kl_bits']:.2f} ({s['bits']:.0f} bits)" for s in scores)
+              + f", {time.time() - t0:.0f} s", flush=True)
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
-    c = sub.add_parser("clean")
-    c.add_argument("directory", type=Path)
-    c.add_argument("--split", choices=("train", "heldout"), required=True)
-    t = sub.add_parser("teach")
-    t.add_argument("--split", choices=("train", "heldout"), required=True)
-    t.add_argument("--n", type=int, required=True)
-    t.add_argument("--offset", type=int, default=0)
-    t.add_argument("--stride", type=int, default=1)
-    t.add_argument("--eps", type=float, nargs="+", default=[0.25, 1.0])
-    t.add_argument("--out", type=Path)
+    s = sub.add_parser("search")
+    s.add_argument("--split", choices=("train", "heldout"), required=True)
+    s.add_argument("--n", type=int, required=True)
+    s.add_argument("--offset", type=int, default=0)
+    s.add_argument("--stride", type=int, default=1)
+    s.add_argument("--out", type=Path)
     args = ap.parse_args()
-    if args.cmd == "clean":
-        clean_dir(args.directory, args.split)
-    else:
-        teach(args.split, args.n, args.offset, args.stride, tuple(args.eps), args.out)
+    search(args.split, args.n, args.offset, args.stride, args.out)
 
 
 if __name__ == "__main__":

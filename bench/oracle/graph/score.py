@@ -1,14 +1,15 @@
-"""Scoring graph answers (#2951 graph oracle): an answer is traced (mech.py) into a graph of subcomponents at positions
-and run on the model (native.py), which reports its KL under deletion and random ablation of what it leaves out
-(kl_bits, the larger) and its size (nodes plus edges). Each interchange claim (position p, replacement, top) is checked
-on the model: replacing token p changes the top prediction to `top`, and the graph's pathway from p alone (its
-activations from the edited run, everything else from the original) gives `top` too (native.interchange).
+"""Scoring graph answers (#2951 graph oracle): the verifier's numbers for each answer.
 
-order(score, eps) ranks answers to one question: valid first, then KL above eps (none is best), then fewer wrong
-claims, then more source positions with a correct claim, then fewer nodes plus edges. No weight trades one for another:
-eps, the precision the question asks for, decides what is faithful.
+An answer (mech.py) is traced into ordered steps. The graph of its first k steps runs alone on the model (native.py)
+over the text's changed prompts, giving its faithfulness (KL in bits) and its description length (bits); with the empty
+graph at 0 bits these points are the answer's curve. One curve is better than another at a description length when its
+best point within that length has the lower KL. area() summarizes a curve over a range of lengths: the mean KL it reaches
+within a length drawn log-uniformly from one subcomponent's description length to the top of the range (there is no
+natural unit of explanation size, so every doubling of length counts the same). Answers compared with each other share
+the range, up to the longest of them (keys). No tolerance and no weight: an answer that explains nothing keeps the empty
+graph's KL over the whole range, the worst curve there is.
 
-  score.py ANSWER.py TASK.json [--eps 0.5]      prints the answer's score
+  score.py ANSWER.py TASK.json      prints the answer's score
 """
 
 from __future__ import annotations
@@ -21,17 +22,45 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
-EMPTY = 'def graph(tokens, targets):\n    return {"out": ""}\n'  # the graph with no nodes: the embedding alone
+EMPTY = 'def graph(tokens, targets):\n    return []\n'  # the graph with no nodes: the embedding alone
 LIBRARY = Path.home() / "mpd-data/graph_oracle/texts/library.json"  # mined recurring mechanisms (mine.py), if any
 
 
-def order(s: dict, eps: float) -> tuple:
-    """How a score ranks, lower first: valid, then its KL above eps, then its size (a complete graph, which declares no
-    edges, as large as can be)."""
-    if not s.get("valid", True):
-        return (1, math.inf, math.inf, 0, math.inf)
-    return (0, max(0.0, s["kl_bits"] - eps), s.get("claims_wrong", 0), -s.get("claims_explained", 0),
-            s["size"] if s.get("size") is not None else math.inf)
+def area(curve: list, lo: float, hi: float) -> float:
+    """The mean over description lengths s log-uniform in [lo, hi] of the lowest KL among the curve's points
+    [bits, kl] with bits <= s (the empty graph's point [0, kl] is always among them)."""
+    if hi <= lo:
+        return min(k for b, k in curve if b <= lo)
+    pts = sorted((max(b, lo), k) for b, k in curve if b <= hi)
+    total, cur, at = 0.0, math.inf, math.log(lo)
+    for b, k in pts:
+        x = math.log(b)
+        if x > at:
+            total += cur * (x - at)
+            at = x
+        cur = min(cur, k)
+    total += cur * (math.log(hi) - at)
+    return total / (math.log(hi) - math.log(lo))
+
+
+def top(scores: list[dict]) -> float:
+    """The range's top for answers compared together: the longest valid answer's description length."""
+    return max([s["curve"][-1][0] for s in scores if s.get("valid", True) and s.get("curve")] or [0.0])
+
+
+def key_at(hi: float):
+    """A score's rank (lower is better) among answers whose range tops at hi: invalid last, then area()."""
+    def key(s: dict) -> tuple:
+        if not s.get("valid", True) or not s.get("curve"):
+            return (1, math.inf)
+        return (0, area(s["curve"], s["lo"], hi))
+    return key
+
+
+def keys(scores: list[dict]) -> list[tuple]:
+    """The ranks of answers compared together (one question, one draw of changed prompts)."""
+    k = key_at(top(scores))
+    return [k(s) for s in scores]
 
 
 class Scorer:
@@ -75,65 +104,74 @@ class Scorer:
                 g.nodes |= {w, r}
         return g
 
+    def prefix(self, ir: dict, k: int):
+        """The graph of an answer's first k steps as written (library entries not expanded), and the entries those
+        steps use."""
+        g = ir["graph"]
+        nd = [(self.native.site_name(layer, kind), t, c) for layer, kind, t, c in g["nodes"]]
+        nodes = {nd[i] for i, s in enumerate(g["node_step"]) if s < k}
+        parents = {}
+        for (r, w), s in zip(g["parents"], g["parent_step"]):
+            if s < k:
+                parents.setdefault(nd[r], []).append(nd[w])
+        out = [nd[w] for w, s in zip(g["out"], g["out_step"]) if s < k]
+        return self.native.Graph(nodes, parents, out), [u for u, s in zip(g["uses"], g["uses_step"]) if s < k]
+
     def score(self, task: dict, sources: list[str], seed: int = 0) -> list[dict]:
-        """Each answer's score on a task (a text task record): {"valid", "error", "kl_bits", "kl_deleted_bits",
-        "kl_random_bits", "nodes", "edges", "size"}; the source "vpd" stands for VPD's own answer (complete)."""
+        """Each answer's score on a task (a text task record) under one draw of changed prompts (seed): {"valid",
+        "error", "curve": [[bits, kl], ...] (the empty graph, then each step), "lo": one subcomponent's description
+        length, "kl_bits" and "bits" (the whole answer), "steps", "nodes", "edges", "explanation", "notes"}; the
+        source "vpd" stands for VPD's own answer (complete, one step)."""
         import mech
 
         prompt = task["prompts"][0]
         ids, targets = prompt["token_ids"], prompt["target_positions"]
-        out, graphs, where, claims = [], [], [], []  # graphs, their places in out and their claims, aligned
-        for src in sources:
+        nat = self.nat
+        prompts = nat.changes(ids, targets, seed=(self.native.task_seed(task["id"]) + 1_000_003 * seed) % (1 << 31))
+        positions, total = nat.positions(targets), sum(nat.C.values())
+        ref_bits = math.log2(max(len(self.library), 1))  # a library reference: one choice among the entries
+        graphs, owners, own_bits = [self.native.Graph()], [None], [0.0]  # every graph to run, which answer it belongs to, its description length
+        out = []
+        for j, src in enumerate(sources):
             if src == "vpd":
-                graphs.append(self.nat.vpd_answer(ids))
-                where.append(len(out))
-                claims.append([])
-                out.append({"valid": True, "error": None})
+                g = nat.vpd_answer(ids)
+                graphs.append(g)
+                owners.append(j)
+                own_bits.append(g.bits(positions, total))
+                out.append({"valid": True, "error": None, "steps": 1, "explanation": "", "notes": []})
                 continue
             ir = mech.trace(src, "vpd4l", behavior=task)
-            out.append({"valid": ir["valid"], "error": ir.get("error")})
-            if ir["valid"]:
-                g = self.nat.from_ir(ir)
-                own, uses = g.size(), ir["graph"].get("uses", [])
+            out.append({"valid": ir["valid"], "error": ir.get("error"), "steps": ir["graph"].get("steps", 0), "explanation": ir["graph"].get("explanation", ""),
+                        "notes": ir["graph"].get("notes", [])})
+            if not ir["valid"]:
+                continue
+            mine = []
+            for k in range(1, out[-1]["steps"] + 1):
+                g, uses = self.prefix(ir, k)
+                bits = g.bits(positions, total) + ref_bits * len(uses)
                 if uses:
                     g = self.expand(g, uses, targets, len(ids))
                     if g is None:
                         out[-1].update(valid=False, error=f"uses: an entry of {uses} is unknown, outside the text or not a model connection")
-                        continue
-                out[-1].update(own_size=own + len(uses), uses=len(uses))
-                graphs.append(g)
-                where.append(len(out) - 1)
-                claims.append(ir["graph"].get("claims", []))
-        for j, s in zip(where, self.nat.score(ids, targets, graphs, seed)):
-            if "own_size" in out[j]:  # a used entry counts once, its edges are defined in the library
-                s = {**s, "size": out[j].pop("own_size")}
-            out[j].update(s)
-        for j, g, cs in zip(where, graphs, claims):
-            out[j].update(self.check_claims(ids, targets, g, cs))
+                        break
+                mine.append((g, bits))
+            if out[-1]["valid"]:
+                for g, bits in mine:
+                    graphs.append(g)
+                    owners.append(j)
+                    own_bits.append(bits)
+        kl = nat.faithfulness(ids, targets, graphs, prompts)
+        lo = math.log2(positions * total)
+        for s in out:
+            s.update(curve=[[0.0, kl[0]]], lo=lo)
+        for g, o, b, k in zip(graphs[1:], owners[1:], own_bits[1:], kl[1:]):
+            s = out[o]
+            s["curve"].append([b, k])
+            s.update(kl_bits=k, bits=b, nodes=g.count(), edges=None if g.complete else g.edges())
+        for s in out:
+            if s["valid"] and len(s["curve"]) == 1:  # no steps: the empty graph
+                s.update(kl_bits=kl[0], bits=0.0, nodes=0, edges=0)
         return out
-
-    def check_claims(self, ids: list[int], targets: list[int], g, claims: list) -> dict:
-        """{"claims", "claims_wrong", "claims_explained"}: how many claims, how many fail, and how many source
-        positions have a claim that holds."""
-        import mech
-
-        tk = mech.tokenizer("vpd4l")
-        paths = self.native.pathways(g, targets)
-        good = set()
-        wrong = 0
-        for p, rep, top in claims:
-            rep_ids, top_ids = tk.encode(rep, add_special_tokens=False).ids, tk.encode(top, add_special_tokens=False).ids
-            nodes = paths.get(p)
-            if not nodes or len(rep_ids) != 1 or len(top_ids) != 1:  # a claim must name one token each and a pathway
-                wrong += 1
-                continue
-            rep_id, top = rep_ids[0], top_ids[0]
-            r = self.nat.interchange(ids, [ids[:p] + [rep_id] + ids[p + 1:]], targets, nodes)[0]
-            if r["edited_top"][0] == top and r["patched_top"][0] == top and r["top"][0] != top:
-                good.add(p)
-            else:
-                wrong += 1
-        return {"claims": len(claims), "claims_wrong": wrong, "claims_explained": len(good)}
 
 
 def main():
@@ -142,10 +180,9 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("answer", type=Path)
     ap.add_argument("task", type=Path)
-    ap.add_argument("--eps", type=float, default=0.5)
     a = ap.parse_args()
     s = Scorer().score(json.loads(a.task.read_text()), [a.answer.read_text()])[0]
-    print(json.dumps({**s, "order": order(s, a.eps)}))
+    print(json.dumps({**s, "area": keys([s])[0][1]}))
 
 
 if __name__ == "__main__":

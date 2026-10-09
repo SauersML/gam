@@ -1,31 +1,33 @@
 """The loader of graph-oracle answers (#2951): plain Python, no imports.
 
-An answer is a computational graph of the target model's VPD subcomponents for one prediction: a function
-graph(tokens, targets) of the sequence (the model's token strings) and the positions whose next token is explained,
-returning {(position, reader): parents, ..., "out": parents}. A reader is a subcomponent "<p:L.S.I>" (layer L, weight
-matrix S in q k v o fc down: query, key, value, attention output, MLP input, MLP output; subcomponent I) at a
-position; its parents are the subcomponents whose outputs it reads, written as one string of subcomponents at the
-reader's own position, or as {position: string} (an attention output reading values at positions). "out" lists what
-the prediction at the targets reads. Every edge must be a connection the model has (connects()). Nodes are the
-readers and their parents. "claims" (optional) lists interchange claims (position, replacement token, predicted top
-token): replacing the token at that position changes the model's top prediction to the given token, and the graph's
-pathway from that position alone reproduces the change (score.py checks them on the model). "uses" (optional) lists
-library entries (score.py's LIBRARY: recurring mechanisms, sets of edges at positions relative to the target) the
-graph includes without writing them out.
+An answer explains the target model's prediction of the next token after a text: a function graph(tokens, targets)
+of the sequence (the model's token strings) and the positions whose next token is explained. Its docstring is the
+plain-English explanation. It returns a list of steps, most important first; each step is a dict
+{(position, reader): parents, ..., "out": parents, "uses": [library entries]} adding subcomponents and connections to
+the graph of the steps before it, so the first k steps are themselves a complete, smaller explanation. A comment line
+above a step says in English what it adds. A reader is a subcomponent "<p:L.S.I>" (layer L, weight matrix S in q k v
+o fc down: query, key, value, attention output, MLP input, MLP output; subcomponent I) at a position; its parents are
+the subcomponents whose outputs it reads, written as one string of subcomponents at the reader's own position, or as
+{position: string} (an attention output reading values at positions). "out" lists what the prediction at the targets
+reads. Every edge must be a connection the model has (connects()). Nodes are the readers and their parents. "uses"
+lists library entries (score.py's LIBRARY: recurring mechanisms, sets of edges at positions relative to the target)
+the step includes without writing them out. A single dict is an answer of one step.
 
     def graph(tokens, targets):
+        '''At the last position the attention output reads the value written at position 3, which ...'''
         t = targets[0]
-        return {
-            (t, "<p:3.o.281>"): {3: "<p:3.v.676>"},
-            (3, "<p:3.v.676>"): "<p:0.down.3473>",
-            "out": "<p:3.o.281><p:2.down.773>",
-            "claims": [(1, " prince", " his")],
-        }
+        return [
+            # the attention output that writes the prediction reads position 3
+            {(t, "<p:3.o.281>"): {3: "<p:3.v.676>"}, "out": "<p:3.o.281>"},
+            # what the value at position 3 reads
+            {(3, "<p:3.v.676>"): "<p:0.down.3473>", "out": "<p:2.down.773>"},
+        ]
 
 trace(source, model, behavior=...) runs a source in a sandboxed child (restricted syntax and builtins, CPU and memory
 limits) and returns the IR: {"graph": {"nodes": [[layer, matrix, position, index], ...], "parents": [[reader, writer],
-...], "out": [writer, ...], "claims": [[position, replacement, top], ...]}} with nodes as indices, and "valid" /
-"error" (the scorer reads the claims' strings as tokens).
+...], "out": [writer, ...], "uses": [entry, ...], "node_step", "parent_step", "out_step", "uses_step": the step that
+added each, "explanation": the docstring, "notes": the comment lines in order}} with nodes as indices, and "valid" /
+"error".
 """
 
 from __future__ import annotations
@@ -130,10 +132,13 @@ def graph(fn, model: str, behavior: dict | None) -> dict:
     _, strings, targets = behavior["sequences"][0]
     T = len(strings)
     out = fn(list(strings), list(targets))
-    if not isinstance(out, dict):
-        raise MechError(f"graph() returned {type(out).__name__}: a dict {{(position, reader): parents, \"out\": parents}}")
+    steps = [out] if isinstance(out, dict) else out
+    if not isinstance(steps, (list, tuple)) or not all(isinstance(st, dict) for st in steps):
+        raise MechError(f"graph() returned {type(out).__name__}: a list of steps, each a dict {{(position, reader): parents, \"out\": parents}}")
     index: dict[tuple, int] = {}
     nodes: list[list] = []
+    node_step: list[int] = []
+    step = 0
 
     def node(position, token) -> int:
         if not isinstance(position, int) or isinstance(position, bool) or not 0 <= position < T:
@@ -145,6 +150,7 @@ def graph(fn, model: str, behavior: dict | None) -> dict:
         if key not in index:
             index[key] = len(nodes)
             nodes.append(list(key))
+            node_step.append(step)
         return index[key]
 
     def parents(value, at: list[int]) -> list[int]:
@@ -152,41 +158,56 @@ def graph(fn, model: str, behavior: dict | None) -> dict:
             return [node(p, tok) for p, names in value.items() for tok in _names(names)]
         return [node(p, tok) for p in at for tok in _names(value)]
 
-    edges, reads, claims, uses = [], [], [], []
-    for key, value in out.items():
-        if key == "uses":
-            if not (isinstance(value, (list, tuple)) and all(isinstance(u, str) for u in value)):
-                raise MechError("uses: a list of library entry names")
-            uses += list(value)
-            continue
-        if key == "claims":
-            if not isinstance(value, (list, tuple)):
-                raise MechError("claims: a list of (position, replacement token, predicted top token)")
-            for c in value:
-                if not (isinstance(c, (list, tuple)) and len(c) == 3 and isinstance(c[0], int) and not isinstance(c[0], bool) and 0 <= c[0] < T
-                        and isinstance(c[1], str) and isinstance(c[2], str)):
-                    raise MechError(f"claims: {c!r} is not (position 0..{T - 1}, replacement token, predicted top token)")
-                claims.append([c[0], c[1], c[2]])
-            continue
-        if key == "out":
-            for w in parents(value, list(targets)):
+    edges, reads, uses = [], [], []
+    edge_step, read_step, uses_step = [], [], []
+    seen_edges, seen_reads = set(), set()
+    for step, st in enumerate(steps):
+        for key, value in st.items():
+            if key == "uses":
+                if not (isinstance(value, (list, tuple)) and all(isinstance(u, str) for u in value)):
+                    raise MechError("uses: a list of library entry names")
+                for u in value:
+                    if u not in uses:
+                        uses.append(u)
+                        uses_step.append(step)
+                continue
+            if key == "out":
+                for w in parents(value, list(targets)):
+                    wl, wk, wt, _ = nodes[w]
+                    if not connects(wl, wk, wt, None, None, None, list(targets)):
+                        raise MechError(f"\"out\": the prediction reads attention and MLP outputs at the targets {list(targets)}, not layer {wl}'s {wk} at {wt}")
+                    if w not in seen_reads:
+                        seen_reads.add(w)
+                        reads.append(w)
+                        read_step.append(step)
+                continue
+            if not (isinstance(key, tuple) and len(key) == 2):
+                raise MechError(f"key {key!r}: (position, subcomponent), \"out\" or \"uses\"")
+            r = node(*key)
+            rl, rk, rt, _ = nodes[r]
+            for w in parents(value, [rt]):
                 wl, wk, wt, _ = nodes[w]
-                if not connects(wl, wk, wt, None, None, None, list(targets)):
-                    raise MechError(f"\"out\": the prediction reads attention and MLP outputs at the targets {list(targets)}, not layer {wl}'s {wk} at {wt}")
-                reads.append(w)
-            continue
-        if not (isinstance(key, tuple) and len(key) == 2):
-            raise MechError(f"key {key!r}: (position, subcomponent) or \"out\"")
-        r = node(*key)
-        rl, rk, rt, _ = nodes[r]
-        for w in parents(value, [rt]):
-            wl, wk, wt, _ = nodes[w]
-            if not connects(wl, wk, wt, rl, rk, rt, list(targets)):
-                raise MechError(f"{key!r} reads layer {wl}'s {wk} at {wt}: the model has no such connection (an attention or MLP output "
-                                "into a later query, key, value or MLP input at its position; a value into the same layer's attention "
-                                "output at that or a later position; an MLP input into the same MLP's output)")
-            edges.append([r, w])
-    return {"nodes": nodes, "parents": edges, "out": reads, "claims": claims, "uses": uses}
+                if not connects(wl, wk, wt, rl, rk, rt, list(targets)):
+                    raise MechError(f"{key!r} reads layer {wl}'s {wk} at {wt}: the model has no such connection (an attention or MLP output "
+                                    "into a later query, key, value or MLP input at its position; a value into the same layer's attention "
+                                    "output at that or a later position; an MLP input into the same MLP's output)")
+                if (r, w) not in seen_edges:
+                    seen_edges.add((r, w))
+                    edges.append([r, w])
+                    edge_step.append(step)
+    return {"nodes": nodes, "parents": edges, "out": reads, "uses": uses, "node_step": node_step, "parent_step": edge_step,
+            "out_step": read_step, "uses_step": uses_step, "steps": len(steps), "explanation": (getattr(fn, "__doc__", None) or "").strip()}
+
+
+def notes(source: str) -> list[str]:
+    """The comment lines of a source, in order."""
+    import io
+    import tokenize
+
+    try:
+        return [t.string.lstrip("#").strip() for t in tokenize.generate_tokens(io.StringIO(source).readline) if t.type == tokenize.COMMENT]
+    except (tokenize.TokenError, IndentationError, SyntaxError):
+        return []
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -240,8 +261,12 @@ def _line_of(exc: BaseException) -> int | None:
     return lines[-1] if lines else None
 
 
+EMPTY_GRAPH = {"nodes": [], "parents": [], "out": [], "uses": [], "node_step": [], "parent_step": [], "out_step": [], "uses_step": [], "steps": 0,
+               "explanation": "", "notes": []}
+
+
 def _empty(source: str, model: str) -> dict:
-    return {"model": model, "source": source, "graph": {"nodes": [], "parents": [], "out": [], "claims": []}, "valid": False, "error": None}
+    return {"model": model, "source": source, "graph": dict(EMPTY_GRAPH), "valid": False, "error": None}
 
 
 def _trace(source: str, model: str, behavior: dict | None = None) -> dict:
@@ -257,7 +282,7 @@ def _trace(source: str, model: str, behavior: dict | None = None) -> dict:
         exec(compile(tree, "<explanation>", "exec"), namespace)
         if not callable(namespace.get("graph")):
             raise MechError("the answer defines no function graph(tokens, targets)")
-        ir.update(graph=graph(namespace["graph"], model, behavior), valid=True)
+        ir.update(graph={**graph(namespace["graph"], model, behavior), "notes": notes(source)}, valid=True)
     except MechError as e:
         line = _line_of(e)
         ir["error"] = (f"line {line}: " if line and not str(e).startswith("line ") else "") + str(e)
@@ -269,7 +294,7 @@ def _trace(source: str, model: str, behavior: dict | None = None) -> dict:
         line = _line_of(e)
         ir["error"] = (f"line {line}: " if line else "") + f"{type(e).__name__}: {e}"
     if not ir["valid"]:
-        ir["graph"] = {"nodes": [], "parents": [], "out": [], "claims": []}
+        ir["graph"] = dict(EMPTY_GRAPH)
     return ir
 
 
