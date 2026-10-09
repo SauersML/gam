@@ -1,9 +1,9 @@
-"""The graph oracle's input (#2951): the ask and the text, nothing else. The oracle answers with a gate program
-(mech.gates): Python defining on(tokens, targets), the subcomponents acting at each position, the circuit that computes
-the model's prediction at the targets.
+"""The graph oracle's input (#2951): the question and the text, nothing else. The oracle answers with a graph (mech.py):
+Python defining graph(tokens, targets), the subcomponents at positions that compute the model's prediction at the
+targets and which outputs each of them reads.
 
-A task (text.py) is shown as what on() receives, the token strings and the positions whose next token is asked, with
-the model's most probable next tokens there.
+A question (a task at a precision eps, rl/train.py's behaviors) is shown as what graph() receives, the token strings and
+the positions whose next token is asked, with the model's most probable next tokens there.
 
   prompt.py TASK.json      prints the prompt
 """
@@ -21,9 +21,10 @@ sys.path.insert(0, str(HERE))
 
 import mech  # noqa: E402
 
-ASK = ("Which of {model}'s subcomponents, at which positions, compute its prediction of the next token at the targets "
-       "of this text? Answer with a Python function on(tokens, targets) returning, for each position, the subcomponents "
-       "acting there.")
+ASK = ("Which computational graph of {model}'s subcomponents computes its prediction of the next token at the targets of "
+       "this text, within {eps:g} bits? Answer with a Python function graph(tokens, targets) returning, for each "
+       "subcomponent at a position in the graph, the subcomponents whose outputs it reads, and under \"out\" those the "
+       "prediction reads.")
 
 
 def tokens_of(model: str, ids: list[int]) -> list[str]:
@@ -40,7 +41,7 @@ def line(model: str, ids: list[int], targets: list[int], top: list) -> str:
 def render(task: dict) -> str:
     """The oracle's prompt for a task: the ask, then each of its texts as on() receives it."""
     model = task["model"]
-    return "\n".join([ASK.format(model=model)] + [line(model, p["token_ids"], p["target_positions"], p["model_top"]) for p in task["prompts"]])
+    return "\n".join([ASK.format(model=model, eps=task["eps"])] + [line(model, p["token_ids"], p["target_positions"], p["model_top"]) for p in task["prompts"]])
 
 
 def split_answer(answer: str) -> tuple[str, str]:

@@ -1,21 +1,21 @@
-"""The graph oracle's training (#2951): sample explanations of real text, score them, train on how they rank.
+"""The graph oracle's training (#2951): sample answers, check them on the model, train on how they rank.
 
-A task (text.py) is a window of real text; its explanation is a gate program (mech.gates) saying which subcomponents of
-the target model act at which positions to compute its next-token prediction. The checker deletes every subcomponent
-an explanation leaves out and measures the KL of the model's prediction from the circuit's, and counts the
-(subcomponent, position) pairs the explanation names. The task's reference is VPD's own answer (--teacher), scored
-alongside: score.order ranks an explanation no less faithful than the reference by fewer pairs, a less faithful one by
-its excess KL. No weight trades KL for pairs.
+A question (a task) is a window of real text (text.py), its last position's next-token prediction, and a precision eps in
+bits. An answer is a computational graph of vpd4l's VPD subcomponents (mech.py's graph(tokens, targets)): nodes are
+subcomponents at positions, edges connections the model has. native.py runs it with everything it leaves out ablated
+(deleted, and randomly) and measures the KL of the model's prediction from the graph's; score.order ranks answers:
+correct (KL at most eps) first, then fewer nodes plus edges. No weight trades KL for size.
 
-  sft   --sft-steps steps on the teacher answers of the training tasks (and --data examples):
+  sft   --sft-steps steps on the teacher graphs of the training questions (native.teach; --teacher) and --data examples:
           loss = -(1/B) sum_e sum_t log pi(y_et | x_e, y_e<t).
-  rl2   (rl2_step) each step draws --behaviors-per-step tasks and samples a group of --samples answers each (vLLM
+  rl2   (rl2_step) each step draws --behaviors-per-step questions and samples a group of --samples answers each (vLLM
         serving the current LoRA adapter on a GPU, transformers' generate otherwise; Qwen3 chat, thinking off); every
         answer is scored, its advantage A_e = (wins - losses) / (n - 1) against the other answers of its group by
-        score.order (3); the tokens of a subcomponent name get the sign of what dropping it measured, edits.credit (1);
-        --ppo-epochs clipped updates per scored batch (4); groups without signal dropped and refilled by tasks drawn
-        uniformly (5); expert iteration from each group's best answer, edits.refine (2).
-  eval  samples --samples answers per held-out task and scores them with the baselines (nothing named, VPD's answer).
+        score.order (3); the tokens of a subcomponent in a reader's parents get the sign of what dropping it (the edge)
+        measured, edits.credit (1); --ppo-epochs clipped updates per scored batch (4); groups without signal dropped and
+        refilled by questions drawn uniformly (5); expert iteration from each group's best answer, edits.refine (2).
+  eval  samples --samples answers per held-out question and scores them with the baselines: the empty graph, the
+        teacher's graph (--teacher-heldout) and VPD's own answer.
 
 Sums, not per-episode means: a per-episode mean of token log-probabilities gives each token of a long answer less
 weight than each token of a short one, so its gradient is not the policy gradient; the sum is the episode's
@@ -25,14 +25,11 @@ The reference pi_ref is the SFT policy: --init ADAPTER (a PEFT adapter, e.g. --m
 trainable policy and as a frozen reference; without --init the policy is a fresh LoRA on the base and pi_ref is the base
 (adapter disabled). The loop writes the adapter every step (vLLM loads it by path).
 
-  train.py --mode sft --teacher texts/teacher --base Qwen/Qwen3-4B --model vpd4l --behaviors texts --out DIR
-  train.py --mode rl2 --init DIR/adapter --teacher texts/teacher ... --out DIR2 --hours H
-  train.py --mode eval --init ADAPTER --teacher-heldout texts/teacher_heldout ... --out DIR
+  train.py --mode sft --teacher texts/graphs --base Qwen/Qwen3-4B --model vpd4l --behaviors texts --eps 0.25 1 --out DIR
+  train.py --mode rl2 --init DIR/adapter --teacher texts/graphs ... --out DIR2 --hours H
+  train.py --mode eval --init ADAPTER --teacher-heldout texts/graphs_heldout ... --out DIR
 
-Evaluation (--mode eval, at the end of sft, and every --eval-every steps of rl2) samples answers for every held-out
-task and scores them with the baselines: nothing named and VPD's answer (--teacher-heldout).
-
-Outputs: DIR/train.jsonl (a line per step), DIR/eval.jsonl (a line per evaluated task and a summary per evaluation),
+Outputs: DIR/train.jsonl (a line per step), DIR/eval.jsonl (a line per evaluated question and a summary per evaluation),
 DIR/samples.jsonl (every answer with its score), DIR/improved.jsonl (expert iteration's refined answers), DIR/adapter.
 """
 
@@ -66,39 +63,31 @@ TEACHER: dict[str, str] = {}  # --teacher's answers by behavior id (teacher_answ
 HELDOUT_TEACHER: dict[str, str] = {}  # --teacher-heldout's: evaluation baselines only, never SFT or RL
 
 
-def item(answer, behavior: dict, seed: int, experiments: int) -> dict:
+def item(answer: str, behavior: dict, seed: int) -> dict:
     """A scoring item from an oracle answer: prompt.split_answer's program (the last python block that parses) and the
-    text after it; an IR dict (the nothing-named baseline) is scored as it is."""
-    if isinstance(answer, dict):
-        return {"source": "", "ir": answer, "explanation": "", "behavior": behavior, "seed": seed, "experiments": experiments}
-    source, explanation = split_answer(answer)
-    return {"source": source, "explanation": explanation, "behavior": behavior, "seed": seed, "experiments": experiments}
+    text after it; the baseline sources (score.EMPTY, "vpd") pass through."""
+    source, explanation = (answer, "") if answer in (score_module.EMPTY, "vpd") else split_answer(answer)
+    return {"source": source, "explanation": explanation, "behavior": behavior, "seed": seed}
 
 
-def behaviors(root: Path, model: str, split: str) -> list[dict]:
+def behaviors(root: Path, model: str, split: str, epsilons) -> list[dict]:
+    """The split's questions: every task at every precision eps in `epsilons`, id <task>.<eps>."""
     out = []
     for p in sorted((root / model).glob("*.json")):
-        b = json.loads(p.read_text())
-        if b.get("split", "train") == split:
-            b["path"] = str(p)
-            out.append(b)
+        task = json.loads(p.read_text())
+        if task.get("split", "train") == split:
+            for eps in epsilons:
+                out.append({**task, "id": f"{task['id']}.{eps:g}", "task": task["id"], "eps": eps, "path": str(p)})
     return out
 
 
 def baselines(b: dict) -> dict:
-    """What the oracle's answers on task b are compared with, scored alongside them: nothing named (an IR without
-    nodes) and VPD's answer (--teacher or --teacher-heldout)."""
-    out = {"empty": empty_ir(b["model"])}
+    """What the oracle's answers to question b are compared with, scored alongside them: the empty graph, VPD's own
+    answer, and the teacher's graph (--teacher or --teacher-heldout)."""
+    out = {"empty": score_module.EMPTY, "vpd": "vpd"}
     if b["id"] in TEACHER or b["id"] in HELDOUT_TEACHER:
         out["teacher"] = TEACHER.get(b["id"]) or HELDOUT_TEACHER[b["id"]]
     return out
-
-
-def empty_ir(model: str) -> dict:
-    """The IR naming nothing (mech.gates of a program returning no gates): the embedding alone reaches the logits."""
-    return {"model": model, "decomposition": "vpd", "nodes": [], "edges": [{"from": "embed", "to": "logits", "route": "input"}],
-            "wiring": "model", "standin": None, "alignments": [], "groups": [], "python_tokens": 0, "token_types": 0,
-            "source": "", "valid": True, "error": None}
 
 
 def load_parts(spec: str, init: str | None, model, base_vocab: int, dev):
@@ -471,23 +460,9 @@ def refuse_heldout(paths) -> None:
             raise SystemExit(f"{path}: held-out answers are for evaluation only (--teacher-heldout), never training")
 
 
-class References:
-    """(3) Each task's reference: VPD's answer (--teacher) scored once, in the batch of the first step that draws the
-    task, by the checker and under the seed of the answers it is compared with."""
-
-    def __init__(self, teacher: dict[str, str]):
-        self.teacher, self.score = teacher, {}
-
-    def items(self, chosen: list[dict], seed: int, experiments: int) -> list[tuple[str, dict]]:
-        """(task id, scoring item) for the tasks with a teacher answer and no reference yet."""
-        return [(b["id"], item(self.teacher[b["id"]], b, seed, experiments)) for b in chosen if b["id"] in self.teacher and b["id"] not in self.score]
-
-    def take(self, entries: list[tuple[str, dict]], scores: list[dict]):
-        for (bid, _), s in zip(entries, scores):
-            self.score[bid] = s
-
-    def order(self, bid: str, s: dict) -> tuple:
-        return score_module.order(s, self.score.get(bid))
+def key(b: dict, s: dict) -> tuple:
+    """score.order of a score to question b."""
+    return score_module.order(s, b["eps"])
 
 
 def rloo(keys: list[tuple]) -> np.ndarray:
@@ -553,9 +528,9 @@ def credit_advantages(tok, completion: list[int], text: str, source: str, episod
     return adv
 
 
-def edit_item(source: str, behavior: dict, seed: int, experiments: int) -> dict:
+def edit_item(source: str, behavior: dict, seed: int) -> dict:
     """A scoring item of an edited answer."""
-    return {"source": source, "explanation": "", "behavior": behavior, "seed": seed, "experiments": experiments}
+    return {"source": source, "explanation": "", "behavior": behavior, "seed": seed}
 
 
 def memo(score):
@@ -564,7 +539,7 @@ def memo(score):
     cache, hits = {}, [0]
 
     def key(it):
-        return (it["behavior"].get("path", it["behavior"]["id"]), it["source"], it.get("seed"), it.get("experiments"),
+        return (it["behavior"].get("path", it["behavior"]["id"]), it["source"], it.get("seed"),
                 json.dumps(it.get("options"), sort_keys=True), json.dumps(it.get("ir"), sort_keys=True))
 
     def run(items):
@@ -593,7 +568,7 @@ def timed(clock: dict, key: str, fn, *a, **kw):
             TOTALS["checker_seconds"] += time.time() - t
 
 
-def credit_groups(groups: list[dict], seed: int, args, tok, score, refs: References, clock: dict):
+def credit_groups(groups: list[dict], seed: int, args, tok, score, clock: dict):
     """(1) The credit drops (edits.names: --credit names sampled) of each group's distinct valid answers
     (--credit-answers: the best and K - 1 others at random), scored in one call under the step's seed, then each
     credited answer's token advantages."""
@@ -610,19 +585,18 @@ def credit_groups(groups: list[dict], seed: int, args, tok, score, refs: Referen
                 spans = rng.sample(spans, args.credit)
             if spans:
                 entries.append((g, src, spans, len(requests)))
-                requests += [edit_item(x, grp["behavior"], seed, args.experiments) for x in [src] + [edits.drop(src, [sp]) for sp in spans]]
+                requests += [edit_item(x, grp["behavior"], seed) for x in [src] + [edits.drop(src, [sp]) for sp in spans]]
     if not requests:
         return
     scores = timed(clock, "credit", score, requests)
     for g, src, spans, k in entries:
         grp = groups[g]
-        bid = grp["behavior"]["id"]
-        base = refs.order(bid, scores[k])
+        base = key(grp["behavior"], scores[k])
         if not scores[k].get("valid", True):
             continue
         signs = {}
         for i, sp in enumerate(spans):
-            dropped = refs.order(bid, scores[k + 1 + i])
+            dropped = key(grp["behavior"], scores[k + 1 + i])
             signs[sp] = (dropped > base) - (dropped < base)
         for j, it in enumerate(grp["items"]):
             if it["source"] == src and grp["valid"][j]:
@@ -641,30 +615,28 @@ def rl2_sample(chosen: list[dict], step: int, args, pol, sampler, adapter: Path,
              "behavior_logprobs": behavior[g * n : (g + 1) * n]} for g, b in enumerate(chosen)]
 
 
-def rl2_score(groups: list[dict], step: int, args, tok, score, refs: References, clock: dict) -> list[dict]:
+def rl2_score(groups: list[dict], step: int, args, tok, score, clock: dict) -> list[dict]:
     """The checker half of rl2_groups, in place: every answer scored under the step's seed (with the teacher's answer
     of tasks seen for the first time, their reference); every sampled token gets its advantage: the episode's (3),
     replaced on credited names by the measured credit (1, --credit > 0). An invalid answer ranks below every valid one."""
     seed, n = step_seed(args, step), args.samples
     for grp in groups:
-        grp["items"] = [item(x, grp["behavior"], seed, args.experiments) for x in grp["texts"]]
-    extra = refs.items([g["behavior"] for g in groups], seed, args.experiments)
-    scores = timed(clock, "score", score, [it for g in groups for it in g["items"]] + [it for _, it in extra])
-    refs.take(extra, scores[len(groups) * n :])
+        grp["items"] = [item(x, grp["behavior"], seed) for x in grp["texts"]]
+    scores = timed(clock, "score", score, [it for g in groups for it in g["items"]])
     for g, grp in enumerate(groups):
         sc = scores[g * n : (g + 1) * n]
-        keys = [refs.order(grp["behavior"]["id"], x) for x in sc]
+        keys = [key(grp["behavior"], x) for x in sc]
         A = rloo(keys)
         grp.update({"scores": sc, "keys": keys, "valid": np.array([bool(x["valid"]) for x in sc]), "advantage": A,
                     "token_advantages": [[float(A[j])] * len(c) for j, c in enumerate(grp["completions"])], "credit": [None] * n})
     if args.credit:
-        credit_groups(groups, seed, args, tok, score, refs, clock)
+        credit_groups(groups, seed, args, tok, score, clock)
     return groups
 
 
-def rl2_groups(chosen: list[dict], step: int, args, pol, sampler, score, refs: References, adapter: Path, clock: dict) -> list[dict]:
+def rl2_groups(chosen: list[dict], step: int, args, pol, sampler, score, adapter: Path, clock: dict) -> list[dict]:
     """rl2_sample, then rl2_score."""
-    return rl2_score(rl2_sample(chosen, step, args, pol, sampler, adapter, clock), step, args, pol.tok, score, refs, clock)
+    return rl2_score(rl2_sample(chosen, step, args, pol, sampler, adapter, clock), step, args, pol.tok, score, clock)
 
 
 def informative(group: dict) -> bool:
@@ -672,7 +644,7 @@ def informative(group: dict) -> bool:
     return any(a != 0.0 for adv in group["token_advantages"] for a in adv)
 
 
-def expert_iteration(groups: list[dict], step: int, args, pol, score, refs: References, clock: dict) -> list[dict]:
+def expert_iteration(groups: list[dict], step: int, args, pol, score, clock: dict) -> list[dict]:
     """(2) edits.refine from each group's best valid answer under the step's seed (--refine rounds, --credit names
     sampled per round): an answer it improves comes back as the sampled answer with the program block replaced, for the
     SFT term and the DPO pair."""
@@ -687,9 +659,9 @@ def expert_iteration(groups: list[dict], step: int, args, pol, score, refs: Refe
             continue
 
         def run(sources, b=b):
-            return score([edit_item(x, b, seed, args.experiments) for x in sources])
+            return score([edit_item(x, b, seed) for x in sources])
 
-        best, key, dropped = timed(clock, "refine", edits.refine, src, run, lambda s, b=b: refs.order(b["id"], s), args.refine, args.credit, random.Random(seed * 1009 + g))
+        best, key, dropped = timed(clock, "refine", edits.refine, src, run, lambda s, b=b: key(b, s), args.refine, args.credit, random.Random(seed * 1009 + g))
         if not dropped:
             continue
         new = text[:offset] + best + text[offset + len(src) :]
@@ -776,7 +748,7 @@ def exit_update(pol: Policy, prompts, improved, sampled, beta: float, micro: int
     return {"exit_sft_loss": s["loss"], "exit_dpo_loss": d["loss"], "exit_dpo_margin": d["margin"]}
 
 
-def rl2_step(step: int, args, pol, sampler, score, refs: References, pool: list[dict], adapter: Path, learner: Learner, logs: dict, started: float) -> dict:
+def rl2_step(step: int, args, pol, sampler, score, pool: list[dict], adapter: Path, learner: Learner, logs: dict, started: float) -> dict:
     """One RL v2 step. --behaviors-per-step tasks drawn uniformly (by the step's seed), a group each (rl2_groups);
     groups without signal are dropped and refilled (5) by tasks drawn uniformly from the rest, up to --refill more
     sampling rounds; expert iteration (2, --refine > 0) from each group's best valid answer; --ppo-epochs clipped
@@ -785,7 +757,7 @@ def rl2_step(step: int, args, pol, sampler, score, refs: References, pool: list[
     score = memo(score)  # one experiment draw per step: a repeated program's score is the same
     rng = random.Random(step_seed(args, step))
     chosen = rng.sample(pool, min(args.behaviors_per_step, len(pool)))
-    groups = rl2_groups(chosen, step, args, pol, sampler, score, refs, adapter, clock)
+    groups = rl2_groups(chosen, step, args, pol, sampler, score, adapter, clock)
     used, refills = {b["id"] for b in chosen}, 0
     for _ in range(args.refill):
         need, rest = len(chosen) - sum(map(informative, groups)), [b for b in pool if b["id"] not in used]
@@ -793,13 +765,13 @@ def rl2_step(step: int, args, pol, sampler, score, refs: References, pool: list[
             break
         extra = rng.sample(rest, min(need, len(rest)))
         used |= {b["id"] for b in extra}
-        groups += rl2_groups(extra, step, args, pol, sampler, score, refs, adapter, clock)
+        groups += rl2_groups(extra, step, args, pol, sampler, score, adapter, clock)
         refills += 1
-    improved = expert_iteration(groups, step, args, pol, score, refs, clock) if args.refine else []
-    return rl2_update(step, groups, improved, refills, score.hits[0], clock, args, pol, sampler, refs, learner, logs, started)
+    improved = expert_iteration(groups, step, args, pol, score, clock) if args.refine else []
+    return rl2_update(step, groups, improved, refills, score.hits[0], clock, args, pol, sampler, learner, logs, started)
 
 
-def rl2_update(step: int, groups: list[dict], improved: list[dict], refills: int, repeated: int, clock: dict, args, pol, sampler, refs: References, learner: Learner,
+def rl2_update(step: int, groups: list[dict], improved: list[dict], refills: int, repeated: int, clock: dict, args, pol, sampler, learner: Learner,
                logs: dict, started: float) -> dict:
     """The update of an rl2 step on its scored groups: every answer, its score and its credit to samples.jsonl, every
     improved answer to improved.jsonl; --ppo-epochs clipped updates (4) on the groups with signal, then one
@@ -825,12 +797,11 @@ def rl2_update(step: int, groups: list[dict], improved: list[dict], refills: int
     keys = [k for g in groups for k in g["keys"]]
     scores = [x for g in groups for x in g["scores"] if x.get("valid", True)]
     best = [min(g["keys"]) for g in groups]
-    ref_pairs = [refs.score.get(g["behavior"]["id"], {}).get("pairs") for g in groups]
     row = {"step": step, "mode": "rl2", "async": bool(getattr(args, "async_rollouts", False)), "seed": step_seed(args, step), "groups": len(groups), "kept": len(kept), "refills": refills,
            "programs": len(keys), "valid_fraction": float(np.mean([k[0] == 0 for k in keys])), "faithful_fraction": float(np.mean([k[:2] == (0, 0.0) for k in keys])),
-           "mean_kl": float(np.mean([x["exec_error_bits"] for x in scores])) if scores else None, "mean_pairs": float(np.mean([x["pairs"] for x in scores])) if scores else None,
-           "best_faithful": float(np.mean([k[:2] == (0, 0.0) for k in best])),
-           "best_pairs_over_vpd": float(np.mean([k[2] / r for k, r in zip(best, ref_pairs) if k[:2] == (0, 0.0) and r])) if any(k[:2] == (0, 0.0) and r for k, r in zip(best, ref_pairs)) else None,
+           "mean_kl": float(np.mean([x["kl_bits"] for x in scores])) if scores else None, "mean_size": float(np.mean([x["size"] for x in scores])) if scores else None,
+           "best_correct": float(np.mean([k[:2] == (0, 0.0) for k in best])),
+           "best_size_when_correct": float(np.mean([k[2] for k in best if k[:2] == (0, 0.0)])) if any(k[:2] == (0, 0.0) for k in best) else None,
            "credited": sum(c is not None for g in groups for c in g["credit"]), "improved": len(improved), "repeated_scores": repeated, **stats, "sampling": getattr(sampler, "stats", {}),
            "seconds": clock, "checker_seconds_total": TOTALS["checker_seconds"], "elapsed": time.time() - started}
     logs["train"].write(json.dumps(row) + "\n")
@@ -838,7 +809,7 @@ def rl2_update(step: int, groups: list[dict], improved: list[dict], refills: int
     return row
 
 
-def rl2_async(args, pol, sampler, score, refs: References, pool: list[dict], adapter: Path, learner: Learner, logs: dict, started: float, stop) -> None:
+def rl2_async(args, pol, sampler, score, pool: list[dict], adapter: Path, learner: Learner, logs: dict, started: float, stop) -> None:
     """rl2 with the checker overlapped (--async): while a thread scores, credits and refines step t's groups, vLLM
     samples step t + 1's with the policy not yet updated on step t, so those answers lag the trained policy by one
     step (ppo_update's importance weight corrects it, as AReaL's decoupled PPO and verl's rollout correction do). A step
@@ -859,8 +830,8 @@ def rl2_async(args, pol, sampler, score, refs: References, pool: list[dict], ada
 
     def check(groups: list[dict], step: int, clock: dict):
         memo_score = memo(score)
-        rl2_score(groups, step, args, side.tok, memo_score, refs, clock)
-        improved = expert_iteration(groups, step, args, side, memo_score, refs, clock) if args.refine else []
+        rl2_score(groups, step, args, side.tok, memo_score, clock)
+        improved = expert_iteration(groups, step, args, side, memo_score, clock) if args.refine else []
         return improved, memo_score.hits[0]
 
     carry = 0
@@ -877,7 +848,7 @@ def rl2_async(args, pol, sampler, score, refs: References, pool: list[dict], ada
             upcoming = rl2_sample(draw(step + 1, carry), step + 1, args, pol, sampler, adapter, nxt) if step + 1 < args.steps else None
             improved, repeated = future.result()
             clock["overlap_wait"] = time.time() - t - nxt["sample"]  # checker time not hidden behind sampling
-            row = rl2_update(step, groups, improved, 0, repeated, clock, args, pol, sampler, refs, learner, logs, started)
+            row = rl2_update(step, groups, improved, 0, repeated, clock, args, pol, sampler, learner, logs, started)
             carry = min(args.behaviors_per_step, row["groups"] - row["kept"]) if args.refill else 0
             learner.save(adapter)
             if upcoming is None:
@@ -968,17 +939,19 @@ ORACLE_RUNS = Path.home() / "mpd-data/graph_oracle/runs/oracle"
 
 
 def shares(x: dict, empty: dict | None) -> dict:
-    """An answer in the reporting terms: kl = the KL in bits of the model's prediction from its circuit's (every other
-    subcomponent deleted), reproduces = 1 - kl / nothing named's, pairs = the (subcomponent, position) pairs it names."""
-    kl = x.get("exec_error_bits") if x.get("valid", True) else None
-    reproduces = 1.0 - kl / empty["exec_error_bits"] if empty and empty.get("exec_error_bits") and kl is not None else None
-    return {"kl": kl, "reproduces": reproduces, "pairs": x.get("pairs") if x.get("valid", True) else None}
+    """An answer in the reporting terms: kl (bits, deletion and random ablation, the larger), reproduces = 1 - kl / the
+    empty graph's, nodes, edges, size."""
+    if not x.get("valid", True):
+        return {"kl": None, "reproduces": None, "nodes": None, "edges": None, "size": None}
+    kl = x.get("kl_bits")
+    reproduces = 1.0 - kl / empty["kl_bits"] if empty and empty.get("kl_bits") and kl is not None else None
+    return {"kl": kl, "reproduces": reproduces, "nodes": x.get("nodes"), "edges": x.get("edges"), "size": x.get("size")}
 
 
 def summarize(name: str, step: int, groups: list[tuple[dict, list, dict]], log) -> dict:
-    """Rows per task and the set's summary from groups of (task, [(source, score)] of the oracle, {baseline name:
-    score}). Per task: the oracle's best answer by score.order against VPD's (the "teacher" baseline), whether it is
-    as faithful as VPD's (faithful) and smaller too (beats_vpd), and both in the reporting terms (shares)."""
+    """Rows per question and the set's summary from groups of (question, [(source, score)] of the oracle, {baseline
+    name: score}). Per question: the oracle's best answer by score.order, whether it is correct (KL at most eps),
+    whether it is also smaller than the teacher's graph (beats_teacher), and every score in the reporting terms."""
 
     def mean(xs):
         xs = [x for x in xs if x is not None]
@@ -986,24 +959,24 @@ def summarize(name: str, step: int, groups: list[tuple[dict, list, dict]], log) 
 
     rows = []
     for b, mine, base in groups:
-        ref, empty = base.get("teacher"), base.get("empty")
-        keys = [score_module.order(x, ref) for _, x in mine]
+        keys = [key(b, x) for _, x in mine]
         j = min(range(len(keys)), key=keys.__getitem__)
-        best = mine[j][1]
-        faithful = keys[j][:2] == (0, 0.0)
-        row = {"set": name, "step": step, "behavior": b["id"], "valid_fraction": float(np.mean([k[0] == 0 for k in keys])),
-               "faithful_fraction": float(np.mean([k[:2] == (0, 0.0) for k in keys])), "best": shares(best, empty), "best_excess_bits": keys[j][1],
-               "faithful": faithful, "beats_vpd": bool(faithful and ref is not None and best["pairs"] < ref["pairs"]),
+        best, empty, teacher = mine[j][1], base.get("empty"), base.get("teacher")
+        correct = keys[j][:2] == (0, 0.0)
+        row = {"set": name, "step": step, "behavior": b["id"], "eps": b["eps"], "valid_fraction": float(np.mean([k[0] == 0 for k in keys])),
+               "correct_fraction": float(np.mean([k[:2] == (0, 0.0) for k in keys])), "best": shares(best, empty), "best_excess_bits": keys[j][1],
+               "correct": correct, "beats_teacher": bool(correct and teacher is not None and teacher.get("valid") and best["size"] < teacher["size"]),
                "baselines": {n: shares(x, empty) for n, x in base.items()}, "best_source": mine[j][0]}
         rows.append(row)
         log.write(json.dumps(row) + "\n")
-    keys = ("kl", "reproduces", "pairs")
-    ratio = [r["best"]["pairs"] / r["baselines"]["teacher"]["pairs"] for r in rows if r["faithful"] and "teacher" in r["baselines"] and r["baselines"]["teacher"]["pairs"]]
-    return {"tasks": len(rows), "valid_fraction": mean([r["valid_fraction"] for r in rows]), "faithful_fraction": mean([r["faithful_fraction"] for r in rows]),
-            "best_faithful": mean([r["faithful"] for r in rows]), "best_beats_vpd": mean([r["beats_vpd"] for r in rows]),
-            "best_pairs_over_vpd_when_faithful": float(np.median(ratio)) if ratio else None, "best_excess_bits": mean([r["best_excess_bits"] for r in rows if np.isfinite(r["best_excess_bits"])]),
-            "best": {k: mean([r["best"][k] for r in rows]) for k in keys},
-            "baselines": {n: {k: mean([r["baselines"][n][k] for r in rows if n in r["baselines"]]) for k in keys} for n in sorted({n for _, _, base in groups for n in base})}}
+    keys_ = ("kl", "reproduces", "nodes", "edges", "size")
+    ratio = [r["best"]["size"] / r["baselines"]["teacher"]["size"] for r in rows if r["correct"] and (r["baselines"].get("teacher") or {}).get("size")]
+    return {"questions": len(rows), "valid_fraction": mean([r["valid_fraction"] for r in rows]), "correct_fraction": mean([r["correct_fraction"] for r in rows]),
+            "best_correct": mean([r["correct"] for r in rows]), "best_beats_teacher": mean([r["beats_teacher"] for r in rows]),
+            "best_size_over_teacher_when_correct": float(np.median(ratio)) if ratio else None,
+            "best_excess_bits": mean([r["best_excess_bits"] for r in rows if np.isfinite(r["best_excess_bits"])]),
+            "best": {k: mean([r["best"][k] for r in rows]) for k in keys_},
+            "baselines": {n: {k: mean([r["baselines"][n][k] for r in rows if n in r["baselines"]]) for k in keys_} for n in sorted({n for _, _, base in groups for n in base})}}
 
 
 def evaluate(sets: dict[str, list[dict]], pol, sampler, score, args, adapter: Path, version: int, log, step: int) -> dict:
@@ -1021,9 +994,9 @@ def evaluate(sets: dict[str, list[dict]], pol, sampler, score, args, adapter: Pa
             prompts = [pol.prompt_ids(render(b)) for b in pool]
             groups = sampler(prompts, args.samples, adapter, version)
             answers = [(b, pol.tok.decode(c, skip_special_tokens=True)) for b, g in zip(pool, groups) for c in g]
-            items = [item(t, b, args.eval_seed, args.experiments) for b, t in answers]
+            items = [item(t, b, args.eval_seed) for b, t in answers]
             base = [(b, n, src) for b in pool for n, src in (baselines(b).items() if args.baselines else [])]
-            scores = score(items + [item(src, b, args.eval_seed, args.experiments) for b, _, src in base])
+            scores = score(items + [item(src, b, args.eval_seed) for b, _, src in base])
             per_base = {}
             for (b, n, src), x in zip(base, scores[len(items) :]):
                 per_base.setdefault(b["id"], {})[n] = x
@@ -1034,10 +1007,9 @@ def evaluate(sets: dict[str, list[dict]], pol, sampler, score, args, adapter: Pa
                 for it, (src, x) in zip(items[g * args.samples : (g + 1) * args.samples], mine):
                     samples.write(json.dumps({"set": name, "step": step, "run": run, "behavior": b["id"], "behavior_path": b.get("path"), "program": "oracle", "source": src,
                                               "explanation": it["explanation"], "score": x}) + "\n")
-                ref = per_base.get(b["id"], {}).get("teacher")
-                src, x = min(mine, key=lambda m: score_module.order(m[1], ref))
-                (runs / f"{b['id']}.{run}.json").write_text(json.dumps({"behavior": b["id"], "model": b.get("model"), "source": src, "score": x, "reference": ref,
-                                                                               "seed": args.eval_seed, "set": name, "step": step}))
+                src, x = min(mine, key=lambda m, b=b: key(b, m[1]))
+                (runs / f"{b['id']}.{run}.json").write_text(json.dumps({"behavior": b["id"], "model": b.get("model"), "eps": b["eps"], "source": src, "score": x,
+                                                                               "baselines": per_base.get(b["id"], {}), "seed": args.eval_seed, "set": name, "step": step}))
                 out.append((b, mine, per_base.get(b["id"], {})))
             if out:
                 summary[name] = summarize(name, step, out, log)
@@ -1072,10 +1044,6 @@ def refresh_parts(pol, sampler, out: Path, args):
         sampler.reload(pol.materialize(vocab_dir(), args.base))
 
 
-def views_of(args) -> dict | None:
-    return {"vpd": args.vpd_view} if getattr(args, "vpd_view", None) else None
-
-
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--mode", choices=["sft", "rl2", "eval"], required=True)
@@ -1083,18 +1051,13 @@ def main():
     ap.add_argument("--init", help="SFT adapter the policy starts from and is held to (pi_ref): a PEFT directory")
     ap.add_argument("--model", required=True, help="target model whose predictions are explained: vpd4l")
     ap.add_argument("--behaviors", default=str(BEHAVIORS), help="the tasks: DIR/<model>/<id>.json (text.py)")
-    ap.add_argument("--scorer", choices=sorted(SCORERS), default="checker")
-    ap.add_argument("--score-workers", type=int, default=1, help="checker servers per target model, each scoring whole tasks in parallel")
-    ap.add_argument("--checker", help="the checker binary (mpd_graph_2951; score.py's GRAPH_CHECKER)")
-    ap.add_argument("--vpd-view", help="VPD's decomposition export for the checker's vpd view (vpd4l: ~/mpd-data/engine/vpd4l_decomposition)")
-    ap.add_argument("--checker-device", choices=["gpu"], help="run the checker's large products on the single-precision device (float32; compare scores only within one device)")
-    ap.add_argument("--score-batch", type=int, default=4, help="programs per checker request (a server's memory grows with it)")
-    ap.add_argument("--checker-gib", type=int, help="the checker server's memory lease on the Mac (score.py's default otherwise)")
-    ap.add_argument("--export", help="the target model's export directory for the checker (score.py's EXPORTS entry otherwise)")
+    ap.add_argument("--scorer", choices=sorted(SCORERS), default="native")
+    ap.add_argument("--scorer-device", help="the native scorer's torch device (default: cuda, else mps, else cpu)")
+    ap.add_argument("--eps", type=float, nargs="+", default=[0.25, 1.0], help="the precisions in bits the questions ask for (every task at each)")
     ap.add_argument("--out", required=True)
     ap.add_argument("--steps", type=int, default=1)
     ap.add_argument("--hours", type=float, help="stop and save after this many hours")
-    ap.add_argument("--checker-hours", type=float, help="stop and save once training scores (with credit and refinement) used this many checker hours")
+    ap.add_argument("--checker-hours", type=float, help="stop and save once training scores (with credit and refinement) used this many scorer hours")
     ap.add_argument("--behaviors-per-step", type=int, default=8)
     ap.add_argument("--samples", type=int, default=8, help="answers per task per step (the group)")
     ap.add_argument("--max-tokens", type=int, default=12288)
@@ -1113,7 +1076,6 @@ def main():
     ap.add_argument("--eval-every", type=int, default=0, help="rl2: evaluate every E training steps and at the end (0: only --mode eval)")
     ap.add_argument("--skip-first-eval", action="store_true", help="no evaluation at step 0 (the starting policy is evaluated once elsewhere, e.g. by its SFT run)")
     ap.add_argument("--eval-seed", type=int, default=1_000_003, help="the evaluation's seed (training steps use their index)")
-    ap.add_argument("--experiments", type=int, default=0, help="the checker's experiments per score (0: the prediction's KL only)")
     ap.add_argument("--eval-behaviors", type=int, default=0, help="evaluate a fixed random subset of this many held-out tasks (0: all)")
     ap.add_argument("--no-baselines", dest="baselines", action="store_false", help="skip scoring the baselines (nothing named, VPD's answer) in evaluation")
     ap.add_argument("--data", nargs="*", help="sft: JSONL files of further examples ({'messages': [user, assistant]} or {'prompt', 'completion'})")
@@ -1122,8 +1084,8 @@ def main():
     ap.add_argument("--batch", type=int, default=8, help="sft: examples per optimizer step")
     ap.add_argument("--oracle-runs", help="directory of the per-task best-answer files (default ~/mpd-data/graph_oracle/runs/oracle; a pod writes under its outputs)")
     ap.add_argument("--run-name", help="the run's name in runs/oracle/<task>.<run>.json (default: the --out directory's name)")
-    ap.add_argument("--teacher", help="VPD's answers of the training tasks (DIR/<id>.py): SFT answers and rl2's references")
-    ap.add_argument("--teacher-heldout", help="VPD's answers of the held-out tasks: evaluation baselines only")
+    ap.add_argument("--teacher", help="the teacher's graphs of the training questions (DIR/<task>.<eps>.py, native.teach): SFT answers")
+    ap.add_argument("--teacher-heldout", help="the teacher's graphs of the held-out questions: evaluation baselines only")
     ap.add_argument("--credit", type=int, default=16, help="rl2: subcomponent names whose drop is scored per answer for per-token credit (0: episode advantages only)")
     ap.add_argument("--credit-answers", type=int, default=0, help="rl2: answers credited per group: the best valid one and K - 1 other distinct valid ones drawn at random (0: every distinct valid answer)")
     ap.add_argument("--refill", type=int, default=1, help="rl2: sampling rounds that replace groups without signal by tasks drawn uniformly")
@@ -1166,13 +1128,11 @@ def main():
             sampler.rows = pol.part_rows
     if sampler is None:
         sampler = HfSampler(pol, args.max_tokens, args.hf_batch)
-    if args.checker:
-        os.environ["GRAPH_CHECKER"] = str(Path(args.checker).resolve())
     score = SCORERS[args.scorer]
-    scorer.WORKERS, scorer.EXPORT, scorer.MEMORY_GIB, scorer.VIEWS, scorer.DEVICE, scorer.BATCH = args.score_workers, args.export, args.checker_gib, views_of(args), args.checker_device, args.score_batch
+    scorer.DEVICE = args.scorer_device
     root = Path(args.behaviors)
-    pool = behaviors(root, args.model, "train")
-    sets = {"heldout": behaviors(root, args.model, "heldout")}
+    pool = behaviors(root, args.model, "train", args.eps)
+    sets = {"heldout": behaviors(root, args.model, "heldout", args.eps)}
     if args.eval_behaviors:  # one fixed subset, the same at every evaluation
         sets = {k: random.Random(args.seed).sample(v, min(args.eval_behaviors, len(v))) for k, v in sets.items()}
     adapter = out / "adapter"
@@ -1192,7 +1152,6 @@ def main():
         return
     eval_log = open(out / "eval.jsonl", "a")
     logs = {"train": open(out / "train.jsonl", "a"), "samples": open(out / "samples.jsonl", "a"), "improved": open(out / "improved.jsonl", "a")}
-    refs = References(TEACHER)
     started = time.time()
 
     def over() -> bool:
@@ -1207,9 +1166,9 @@ def main():
         if args.eval_every and step % args.eval_every == 0 and not (step == 0 and args.skip_first_eval):
             evaluate(sets, pol, sampler, score, args, adapter, step, eval_log, step)
         if args.async_rollouts:  # its own loop: the checker overlaps the next step's sampling
-            rl2_async(args, pol, sampler, score, refs, pool, adapter, learner, logs, started, over)
+            rl2_async(args, pol, sampler, score, pool, adapter, learner, logs, started, over)
             break
-        rl2_step(step, args, pol, sampler, score, refs, pool, adapter, learner, logs, started)
+        rl2_step(step, args, pol, sampler, score, pool, adapter, learner, logs, started)
     learner.save(adapter)
     if args.eval_every:
         evaluate(sets, pol, sampler, score, args, adapter, args.steps, eval_log, args.steps)

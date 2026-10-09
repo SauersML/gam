@@ -1,10 +1,10 @@
-"""Edits of an oracle answer (#2951 graph oracle): dropping a subcomponent its gate program names, the move RL's credit
-and refinement measure.
+"""Edits of an oracle answer (#2951 graph oracle): dropping one parent of a reader in its graph (an edge), the move RL's
+credit and refinement measure.
 
-A gate program names subcomponents as part names ("<p:L.S.I>"), in strings of names or as list items; an edit drops
-occurrences of them from the program text (and tidies the lists they stood in). credit() compares a sample of single drops with the answer;
-refine() repeats rounds of credit, keeping the drops that improve it. Both rank scores by a key (score.order against
-the task's reference: lower is better).
+A graph answer writes subcomponents as "<p:L.S.I>" tokens; the ones in a reader's parents (strings or lists, not the
+(position, reader) keys) are its edges. An edit drops occurrences of them from the program text (and tidies the lists
+they stood in). credit() compares a sample of single drops with the answer; refine() repeats rounds of credit, keeping
+the drops that improve it. Both rank scores by a key (score.order at the question's eps: lower is better).
 """
 
 from __future__ import annotations
@@ -16,9 +16,14 @@ NAME = re.compile(r"<p:\d+\.(?:q|k|v|o|fc|down)\.(?:\d+|rest)>")
 EMPTY_ITEM = re.compile(r'(?<=[\[,])(\s*)(?:""|\'\')(?=\s*[,\]])')  # a list item left empty by a drop
 
 
+KEY = re.compile(r"\(\s*[^,()]+?\s*,\s*[\"'](<p:[^>]+>)[\"']\s*\)")  # a (position, reader) key
+
+
 def names(source: str) -> list[tuple[int, int]]:
-    """The spans [start, end) of the subcomponent names in `source`."""
-    return [m.span() for m in NAME.finditer(source)]
+    """The spans [start, end) of the subcomponents in `source` that are parents (outside every (position, reader)
+    key)."""
+    keys = [m.span(1) for m in KEY.finditer(source)]
+    return [m.span() for m in NAME.finditer(source) if m.span() not in keys]
 
 
 def drop(source: str, spans) -> str:

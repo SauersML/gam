@@ -1,19 +1,25 @@
-"""The loader of graph-oracle explanations (#2951): plain Python, no imports.
+"""The loader of graph-oracle answers (#2951): plain Python, no imports.
 
-An explanation is a gate program: a function on(tokens, targets) of the sequence (the model's token strings) and the
-positions whose next token is explained, returning which of the target model's VPD subcomponents act at each position,
-{position: subcomponents} or [(position, subcomponent), ...]. A position's subcomponents are a list of names or one
-string of names written together. A name is "<p:L.S.I>": layer L, site S (q k v o fc down: q_proj k_proj v_proj
-o_proj c_fc down_proj), subcomponent I; "<p:L.S.rest>" is the site's remainder W - sum of its subcomponents. The
-model's own weights do every computation, connected as in the model; what the program names acts where it says, and
-the scorer decides what every other subcomponent carries.
+An answer is a computational graph of the target model's VPD subcomponents for one prediction: a function
+graph(tokens, targets) of the sequence (the model's token strings) and the positions whose next token is explained,
+returning {(position, reader): parents, ..., "out": parents}. A reader is a subcomponent "<p:L.S.I>" (layer L, weight
+matrix S in q k v o fc down: query, key, value, attention output, MLP input, MLP output; subcomponent I) at a
+position; its parents are the subcomponents whose outputs it reads, written as one string of subcomponents at the
+reader's own position, or as {position: string} (an attention output reading values at positions). "out" lists what
+the prediction at the targets reads. Every edge must be a connection the model has (connects()). Nodes are the
+readers and their parents.
 
-    def on(tokens, targets):
-        return {t: "<p:0.fc.225><p:2.v.80><p:2.o.63>" for t in targets}
+    def graph(tokens, targets):
+        t = targets[0]
+        return {
+            (t, "<p:3.o.281>"): {3: "<p:3.v.676>"},
+            (3, "<p:3.v.676>"): "<p:0.down.3473>",
+            "out": "<p:3.o.281><p:2.down.773>",
+        }
 
 trace(source, model, behavior=...) runs a source in a sandboxed child (restricted syntax and builtins, CPU and memory
-limits) and returns the IR the checker reads: one node per block (a layer's attention or MLP) and set of positions,
-with its positions per sequence.
+limits) and returns the IR: {"graph": {"nodes": [[layer, matrix, position, index], ...], "parents": [[reader, writer],
+...], "out": [writer, ...]}} with nodes as indices, and "valid" / "error".
 """
 
 from __future__ import annotations
@@ -83,25 +89,6 @@ def shapes(model: str) -> dict:
     return _SHAPES[model]
 
 
-class Node:
-    """Subcomponents of one block (a layer's attention or MLP)."""
-
-    def __init__(self, id: str, layer: int, block: str, parts: dict[str, set]):
-        self.id, self.layer, self.block, self.parts = id, layer, block, parts  # parts: site -> indices ("rest" too)
-
-    def ir(self) -> dict:
-        pieces = []
-        for site in sorted(self.parts, key=list(SITES.values()).index):
-            index = self.parts[site]
-            if "rest" in index:
-                pieces.append({"view": "vpd", "layer": self.layer, "kind": site, "index": "rest"})
-            numbers = sorted(i for i in index if i != "rest")
-            if numbers:
-                pieces.append({"view": "vpd", "layer": self.layer, "kind": site,
-                               "index": numbers[0] if len(numbers) == 1 else numbers})
-        return {"id": self.id, "pieces": pieces, "claim": None}
-
-
 def _part(token, shape: dict) -> tuple[int, str, object]:
     if not isinstance(token, str) or not PART.fullmatch(token):
         raise MechError(f"{token!r} is not a subcomponent \"<p:L.S.I>\" (S one of q k v o fc down)")
@@ -118,14 +105,68 @@ def _part(token, shape: dict) -> tuple[int, str, object]:
 
 
 def _names(parts) -> list:
-    """A position's subcomponents: a list of names, or one string of names written together."""
+    """Subcomponents written as a list, or as one string of them written together."""
     if isinstance(parts, str):
         if PART.sub("", parts).strip():
-            raise MechError(f"{parts[:80]!r}: a string of subcomponents holds only names \"<p:L.S.I>\"")
+            raise MechError(f"{parts[:80]!r}: a string of subcomponents holds only \"<p:L.S.I>\" tokens")
         return [m[0] for m in PART.finditer(parts)]
     if not isinstance(parts, (list, tuple, set, frozenset)):
-        raise MechError(f"on() returned {parts!r} for a position: a list of subcomponents or a string of them")
+        raise MechError(f"{parts!r}: parents are a string of subcomponents, a list of them, or {{position: string}}")
     return list(parts)
+
+
+def graph(fn, model: str, behavior: dict | None) -> dict:
+    """The IR graph of an answer: graph(tokens, targets) run on the task's sequence (behavior_tokens()'s first
+    "sequences" entry)."""
+    if not behavior or not behavior.get("sequences"):
+        raise MechError("an answer needs the task's sequence to run on")
+    shape = shapes(model)
+    _, strings, targets = behavior["sequences"][0]
+    T = len(strings)
+    out = fn(list(strings), list(targets))
+    if not isinstance(out, dict):
+        raise MechError(f"graph() returned {type(out).__name__}: a dict {{(position, reader): parents, \"out\": parents}}")
+    index: dict[tuple, int] = {}
+    nodes: list[list] = []
+
+    def node(position, token) -> int:
+        if not isinstance(position, int) or isinstance(position, bool) or not 0 <= position < T:
+            raise MechError(f"position {position!r}: positions are 0..{T - 1}")
+        layer, kind, i = _part(token, shape)
+        if i == "rest":
+            raise MechError(f"{token}: a remainder is not a graph node")
+        key = (layer, kind, position, i)
+        if key not in index:
+            index[key] = len(nodes)
+            nodes.append(list(key))
+        return index[key]
+
+    def parents(value, at: list[int]) -> list[int]:
+        if isinstance(value, dict):
+            return [node(p, tok) for p, names in value.items() for tok in _names(names)]
+        return [node(p, tok) for p in at for tok in _names(value)]
+
+    edges, reads = [], []
+    for key, value in out.items():
+        if key == "out":
+            for w in parents(value, list(targets)):
+                wl, wk, wt, _ = nodes[w]
+                if not connects(wl, wk, wt, None, None, None, list(targets)):
+                    raise MechError(f"\"out\": the prediction reads attention and MLP outputs at the targets {list(targets)}, not layer {wl}'s {wk} at {wt}")
+                reads.append(w)
+            continue
+        if not (isinstance(key, tuple) and len(key) == 2):
+            raise MechError(f"key {key!r}: (position, subcomponent) or \"out\"")
+        r = node(*key)
+        rl, rk, rt, _ = nodes[r]
+        for w in parents(value, [rt]):
+            wl, wk, wt, _ = nodes[w]
+            if not connects(wl, wk, wt, rl, rk, rt, list(targets)):
+                raise MechError(f"{key!r} reads layer {wl}'s {wk} at {wt}: the model has no such connection (an attention or MLP output "
+                                "into a later query, key, value or MLP input at its position; a value into the same layer's attention "
+                                "output at that or a later position; an MLP input into the same MLP's output)")
+            edges.append([r, w])
+    return {"nodes": nodes, "parents": edges, "out": reads}
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -179,41 +220,8 @@ def _line_of(exc: BaseException) -> int | None:
     return lines[-1] if lines else None
 
 
-def gates(on, model: str, behavior: dict | None) -> list[dict]:
-    """The IR nodes of a gate program: `on(tokens, targets)` run on every sequence of the behavior
-    (behavior_tokens()'s "sequences") returns, per position, the subcomponents that act there; subcomponents of one
-    block acting at the same positions of every sequence are one node, which acts there and nowhere else."""
-    if not behavior or not behavior.get("sequences"):
-        raise MechError("a gate program needs the behavior's sequences to run on")
-    shape = shapes(model)
-    where: dict[tuple, list[set]] = {}
-    sequences = behavior["sequences"]
-    for k, (ids, strings, targets) in enumerate(sequences):
-        out = on(list(strings), list(targets))
-        pairs = [(p, part) for p, parts in out.items() for part in _names(parts)] if isinstance(out, dict) else list(out)
-        for item in pairs:
-            if not (isinstance(item, tuple) and len(item) == 2):
-                raise MechError(f"on() returned {item!r}: positions map to lists of subcomponents, or (position, subcomponent) pairs")
-            position, token = item
-            if not isinstance(position, int) or not 0 <= position < len(strings):
-                raise MechError(f"on() returned position {position!r} for a sequence of {len(strings)} tokens")
-            unit = _part(token, shape)
-            where.setdefault(unit, [set() for _ in sequences])[k].add(position)
-    grouped: dict[tuple, dict[str, set]] = {}
-    for (layer, site, index), at in where.items():
-        key = (layer, "mlp" if site in ("c_fc", "down_proj") else "attn", tuple(tuple(sorted(a)) for a in at))
-        grouped.setdefault(key, {}).setdefault(site, set()).add(index)
-    nodes = []
-    for j, ((layer, block, at), parts) in enumerate(sorted(grouped.items(), key=lambda kv: kv[0][:2])):
-        node = Node(f"n{j}", layer, block, parts).ir()
-        node["at"] = [{"tokens": list(ids), "positions": list(a)} for (ids, _, _), a in zip(sequences, at)]
-        nodes.append(node)
-    return nodes
-
-
 def _empty(source: str, model: str) -> dict:
-    return {"model": model, "decomposition": "vpd", "nodes": [], "edges": [], "wiring": "model", "standin": None,
-            "source": source, "valid": False, "error": None}
+    return {"model": model, "source": source, "graph": {"nodes": [], "parents": [], "out": []}, "valid": False, "error": None}
 
 
 def _trace(source: str, model: str, behavior: dict | None = None) -> dict:
@@ -227,10 +235,9 @@ def _trace(source: str, model: str, behavior: dict | None = None) -> dict:
         check(tree)
         namespace = {"__builtins__": SAFE_BUILTINS, "__name__": "explanation"}
         exec(compile(tree, "<explanation>", "exec"), namespace)
-        if not callable(namespace.get("on")):
-            raise MechError("the explanation defines no function on(tokens, targets)")
-        nodes = gates(namespace["on"], model, behavior)
-        ir.update(nodes=nodes, edges=[] if nodes else [{"from": "embed", "to": "logits", "route": "input"}], valid=True)
+        if not callable(namespace.get("graph")):
+            raise MechError("the answer defines no function graph(tokens, targets)")
+        ir.update(graph=graph(namespace["graph"], model, behavior), valid=True)
     except MechError as e:
         line = _line_of(e)
         ir["error"] = (f"line {line}: " if line and not str(e).startswith("line ") else "") + str(e)
@@ -242,7 +249,7 @@ def _trace(source: str, model: str, behavior: dict | None = None) -> dict:
         line = _line_of(e)
         ir["error"] = (f"line {line}: " if line else "") + f"{type(e).__name__}: {e}"
     if not ir["valid"]:
-        ir.update(nodes=[], edges=[])
+        ir["graph"] = {"nodes": [], "parents": [], "out": []}
     return ir
 
 

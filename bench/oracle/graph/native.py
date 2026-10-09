@@ -10,18 +10,20 @@ receives its declared parents' outputs in full and every other output scaled by 
 which VPD does not decompose, in full. With u = 1 everywhere this is the model.
 
 A graph is correct within eps when the KL in bits of the model's next-token distribution at the targets from the
-graph's stays at most eps under every ablation of what it leaves out (Native.score, kl_bits the largest of):
+graph's stays at most eps under both ablations of what it leaves out (Native.score, kl_bits the larger):
   deletion     u = 0;
-  random       u drawn uniformly per position and subcomponent, the mean over RANDOM draws (VPD's stochastic test);
-  adversarial  u chosen for this text to maximize the KL, by PGD from a uniform start, 20 sign-gradient steps of 0.1
-               (VPD's evaluation PGD; VPD prunes its per-prediction graphs under a per-prompt adversary).
+  random       u drawn uniformly per position and subcomponent, the mean over RANDOM draws (VPD's stochastic test).
+The KL is of the whole distribution, so a graph that makes the prediction more confident than the model fails too.
+An adversary choosing u for one text breaks VPD's own answer (91.7 bits on text9000, 101.1 for an empty graph), and
+one shared across 32 texts still breaks it by 14 to 17 bits at their predictions: as a constraint it would make
+every graph nearly the whole model (VPD's appendix A.3.4 finds per-input adversaries too strict for the same reason).
 Among correct graphs, fewer nodes plus edges is better (score.order).
 
 teach() finds a graph for one prediction and precision eps: node strengths g in (0, 1) over every subcomponent at every
-position that can reach the target, minimizing their sum subject to the KL tests at eps / 2 with VPD's masks
-m = g + (1 - g) r (r random, persistently adversarial, or 0), the multiplier set by the constraint (dual ascent); the
-nodes with g > 1/2; then edge strengths over every connection the model has between them, the same way at eps; the
-edges with strength > 1/2; then the exact tests, adding back the strongest dropped edges until the graph is correct.
+position that can reach the target, minimizing their mean subject to the KL tests at eps / 2 with VPD's masks
+m = g + (1 - g) r (r uniform or 0), the multiplier set by the constraint (dual ascent); the nodes with g > 1/2; then
+edge strengths over every connection the model has between them, the same way at eps; the edges with strength > 1/2;
+then the exact tests, adding back the strongest dropped edges until the graph is correct.
 
   native.py teach --split train --n N [--offset K --stride S] [--eps 0.25 1]   -> texts/graphs[_heldout]/<id>.<eps>.py, .json
 """
@@ -46,9 +48,8 @@ sys.path.insert(0, str(HERE.parents[1] / "vpd_2951"))
 import mech  # noqa: E402
 
 TEXTS = Path.home() / "mpd-data/graph_oracle/texts"
-PGD_STEPS, PGD_STEP = 20, 0.1  # VPD's evaluation PGD (run s-55ea3f9b's PGDReconLoss)
 RANDOM = 8  # random draws per score
-TEACH_STEPS, TEACH_LR = 400, 0.05  # the teacher's optimization (Adam on the strengths' logits)
+TEACH_STEPS, TEACH_LR = 2000, 0.05  # the teacher's optimization (Adam on the strengths' logits)
 LN2 = math.log(2)
 
 
@@ -395,7 +396,7 @@ class Native:
         return (logp.exp() * (logp - logq)).sum(-1).sum(-1) / LN2
 
     def score(self, ids: list[int], targets: list[int], graphs: list[Graph], seed: int = 0, logp: torch.Tensor | None = None) -> list[dict]:
-        """{"kl_bits", "kl_deleted_bits", "kl_random_bits", "kl_adversarial_bits", "nodes", "edges", "size"} per graph."""
+        """{"kl_bits", "kl_deleted_bits", "kl_random_bits", "nodes", "edges", "size"} per graph."""
         B, T = len(graphs), len(ids)
         if B == 0:
             return []
@@ -405,55 +406,26 @@ class Native:
             zero = ({n: torch.zeros(1, 1, self.C[n], device=self.dev) for n in self.names}, {n: torch.zeros(1, 1, device=self.dev) for n in self.names})
             deleted = self._kl(logp, self.run(ids, targets, plan, *zero))
             random = torch.stack([self._kl(logp, self.run(ids, targets, plan, *self._uniform(T, seed * 1000 + j))) for j in range(RANDOM)]).mean(0)
-        u0, ur0 = self._uniform(T, seed * 1000 + RANDOM)  # one start for every graph: a graph's score is its own
-        u = {n: u0[n].expand(B, T, -1).clone() for n in self.names}
-        ur = {n: ur0[n].expand(B, T).clone() for n in self.names}
-        adversarial = torch.full((B,), -1.0, device=self.dev)
-        for k in range(PGD_STEPS + 1):
-            for n in self.names:
-                u[n].requires_grad_(True)
-                ur[n].requires_grad_(True)
-            with torch.enable_grad():
-                kl = self._kl(logp, self.run(ids, targets, plan, u, ur))
-                adversarial = torch.maximum(adversarial, kl.detach())
-                if k == PGD_STEPS:
-                    break
-                grads = torch.autograd.grad(kl.sum(), [u[n] for n in self.names] + [ur[n] for n in self.names])
-            with torch.no_grad():
-                for n, gr in zip(self.names, grads[: len(self.names)]):
-                    u[n] = (u[n] + PGD_STEP * gr.sign()).clamp(0, 1)
-                for n, gr in zip(self.names, grads[len(self.names):]):
-                    ur[n] = (ur[n] + PGD_STEP * gr.sign()).clamp(0, 1)
-        total = torch.stack([deleted, random, adversarial]).max(0).values
-        return [{"kl_bits": float(total[b]), "kl_deleted_bits": float(deleted[b]), "kl_random_bits": float(random[b]),
-                 "kl_adversarial_bits": float(adversarial[b]), "nodes": graphs[b].count(),
+        total = torch.maximum(deleted, random)
+        return [{"kl_bits": float(total[b]), "kl_deleted_bits": float(deleted[b]), "kl_random_bits": float(random[b]), "nodes": graphs[b].count(),
                  "edges": None if graphs[b].complete else graphs[b].edges(), "size": None if graphs[b].complete else graphs[b].size()} for b in range(B)]
 
     # ---- the teacher
 
     def _strength_loop(self, forward, logits: torch.Tensor, target: float, log=None, what: str = "") -> torch.Tensor:
-        """Minimize mean(sigmoid(logits)) subject to max(KL_deleted, KL_random, KL_adversarial) <= target by Adam on
-        the logits and dual ascent on the multiplier; forward(strengths, r) -> KL for an ablation r ("zero", "random"
-        or the persistent adversarial sources, which take one sign-gradient step of PGD_STEP per step). Returns the
-        final strengths."""
+        """Minimize mean(sigmoid(logits)) subject to max(KL_deleted, KL_random) <= target by Adam on the logits and dual
+        ascent on the multiplier; forward(strengths, "zero" or "random") -> KL. Returns the final strengths."""
         logits = logits.clone().requires_grad_(True)
         opt = torch.optim.Adam([logits], lr=TEACH_LR)
         mu = 0.0
-        adv = None
         for step in range(TEACH_STEPS):
             with torch.enable_grad():
                 g = torch.sigmoid(logits)
-                kd = forward(g, "zero")
-                kr = forward(g, "random")
-                ka, adv_src = forward(g, "adversarial" if adv is None else adv)
-                up = torch.autograd.grad(ka, adv_src, retain_graph=True)  # the adversary ascends its own KL
-                k = torch.stack([kd, kr, ka]).max()
+                k = torch.maximum(forward(g, "zero"), forward(g, "random"))
                 loss = g.mean() + mu * (k - target)
                 opt.zero_grad()
                 loss.backward()
             opt.step()
-            with torch.no_grad():
-                adv = [(s + PGD_STEP * d.sign()).clamp(0, 1).requires_grad_(True) for s, d in zip(adv_src, up)]
             mu = max(0.0, mu + float(k) - target)
             if log and (step % 50 == 0 or step == TEACH_STEPS - 1):
                 log(f"{what} step {step}: kl {float(k):.4f} (target {target}), mean strength {float(g.mean()):.4f}, above 1/2: {int((g > 0.5).sum())}, mu {mu:.3f}")
@@ -479,25 +451,19 @@ class Native:
             m = split(g)
             if r == "zero":
                 masks, rest = {n: m[n][None] for n in names}, {n: torch.zeros(1, T, device=self.dev) for n in names}
-            elif r == "random":
+            else:
                 rr = {n: torch.rand(T, self.C[n], generator=gen).to(self.dev) for n in names}
                 masks = {n: (m[n] + (1 - m[n]) * rr[n])[None] for n in names}
                 rest = {n: torch.rand(1, T, generator=gen).to(self.dev) for n in names}
-            else:
-                src = [torch.rand(T, self.C[n], generator=gen).to(self.dev).requires_grad_(True) for n in names] + \
-                      [torch.rand(1, T, generator=gen).to(self.dev).requires_grad_(True) for n in names] if r == "adversarial" else r
-                masks = {n: (m[n] + (1 - m[n]) * s)[None] for n, s in zip(names, src[: len(names)])}
-                rest = dict(zip(names, src[len(names):]))
             lq = torch.log_softmax(self.vpd.masked(ids_b, masks, rest)[:, targets].float(), -1)
-            k = self._kl(logp, lq)[0]
-            if r == "zero" or r == "random":
-                return k
-            return k, src
+            return self._kl(logp, lq)[0]
 
         g = self._strength_loop(node_forward, torch.full((int(flat.sum()),), 2.0, device=self.dev), eps / 2, log, "nodes")
         sel = split(g)
         nodes = {(n, t, c) for n in names for t, c in (sel[n] > 0.5).nonzero().tolist()}
         parents, out = all_edges(nodes, targets)
+        if log:
+            log(f"nodes kept: {len(nodes)}; connections between them: {sum(len(w) for w in parents.values()) + len(out)}")
         full = Graph(nodes, parents, out)
         plan = self._plan([full], T)
         n_edges = len(plan["order"])
@@ -507,16 +473,8 @@ class Native:
             if r == "zero":
                 u = ({n: torch.zeros(1, 1, self.C[n], device=self.dev) for n in names}, {n: torch.zeros(1, 1, device=self.dev) for n in names})
                 return self._kl(logp, self.run(ids, targets, plan, *u, ew, ow))[0]
-            if r == "random":
-                u = self._uniform(T, int(torch.randint(1 << 30, (1,), generator=gen)))
-                return self._kl(logp, self.run(ids, targets, plan, *u, ew, ow))[0]
-            if r == "adversarial":
-                u0, ur0 = self._uniform(T, int(torch.randint(1 << 30, (1,), generator=gen)))
-                src = [u0[n].clone().requires_grad_(True) for n in names] + [ur0[n].clone().requires_grad_(True) for n in names]
-            else:
-                src = r
-            k = self._kl(logp, self.run(ids, targets, plan, dict(zip(names, src[: len(names)])), dict(zip(names, src[len(names):])), ew, ow))[0]
-            return k, src
+            u = self._uniform(T, int(torch.randint(1 << 30, (1,), generator=gen)))
+            return self._kl(logp, self.run(ids, targets, plan, *u, ew, ow))[0]
 
         e = self._strength_loop(edge_forward, torch.full((n_edges,), 2.0, device=self.dev), eps, log, "edges")
         order = plan["order"]
