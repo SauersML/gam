@@ -29,7 +29,8 @@ sys.path.insert(0, str(HERE.parents[1] / "vpd_2951"))
 import mech  # noqa: E402
 
 ATLAS = Path.home() / "mpd-data/graph_oracle/atlas/vpd4l.json"
-TABLES = Path.home() / "mpd-data/graph_oracle/atlas/tables"  # <behavior id>.json: scores() per behavior
+TABLES = Path.home() / "mpd-data/graph_oracle/atlas/tables"  # <behavior id>.json: scores() per behavior, its first KEPT
+KEPT = 2048
 CODES = {site: code for code, site in mech.SITES.items()}
 WRITERS = ("o_proj", "down_proj")
 TOP = 8  # strongest activations kept per subcomponent
@@ -255,8 +256,12 @@ def main():
         TABLES.mkdir(parents=True, exist_ok=True)
         for path in sorted(a.behaviors.glob("*.json")):
             behavior = json.loads(path.read_text())
-            (TABLES / f"{behavior['id']}.json").write_text(json.dumps({p: {k: round(v, 3) if isinstance(v, float) else v for k, v in s.items()}
-                                                                       for p, s in scores(behavior, a.device).items()}))
+            out = TABLES / f"{behavior['id']}.json"
+            if out.exists() and len(json.loads(out.read_text())) <= KEPT:
+                continue
+            table_ = scores(behavior, a.device)
+            out.write_text(json.dumps({p: {k: round(v, 3) if isinstance(v, float) else v for k, v in table_[p].items()}
+                                       for p in ranking(table_)[:KEPT]}))
             print(f"{behavior['id']}", flush=True)
     else:
         print(text(json.loads(a.behavior.read_text()), a.top, a.device))

@@ -4,7 +4,7 @@ split_answer separates the two. No weights or vectors: the behavior's descriptio
 next tokens and probabilities (the behavior file's `model_top`), the behavior's variables, the parts of M it may name,
 and the subcomponents VPD's causal importance says M needs on the behavior's prompts with what each does (atlas.py).
 
-  prompt.py BEHAVIOR.json [--prompts 4] [--shots 1] [--table 48]      prints the prompt
+  prompt.py BEHAVIOR.json [--prompts 4] [--shots 0] [--table 48]      prints the prompt
 """
 
 from __future__ import annotations
@@ -107,7 +107,7 @@ def examples(behavior: dict, shots: int) -> list[tuple[str, str]]:
     return [(r["behavior"], Path(r["answer"]).read_text().strip()) for r in rows[:shots]]
 
 
-def render(behavior: dict, prompts: int = 4, shots: int = 1, table: int = 48) -> str:
+def render(behavior: dict, prompts: int = 4, shots: int = 0, table: int = 48) -> str:
     """The oracle's prompt for `behavior`, with its first `table` subcomponents (atlas.text)."""
     sizes, parts = views(behavior["model"])
     out = [REFERENCE.format(parts=parts)]
@@ -148,7 +148,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("behavior", type=Path)
     ap.add_argument("--prompts", type=int, default=4)
-    ap.add_argument("--shots", type=int, default=1)
+    ap.add_argument("--shots", type=int, default=0)
     ap.add_argument("--table", type=int, default=48)
     a = ap.parse_args()
     print(render(json.loads(a.behavior.read_text()), a.prompts, a.shots, a.table))

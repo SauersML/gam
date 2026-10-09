@@ -27,6 +27,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 sys.path.insert(0, str(HERE))
 
+import atlas  # noqa: E402
 import explain  # noqa: E402
 import prompt  # noqa: E402
 import score as score_module  # noqa: E402
@@ -47,16 +48,32 @@ def where(units) -> str:
     return names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
 
 
+def common(units, key: str, top: int = 3) -> list[str]:
+    """The tokens most often among the atlas's `key` lists ("top": where they fire most in text, "raises": what they
+    raise through the unembedding) of `units`."""
+    parts, count = atlas.load()["parts"], {}
+    for u in units:
+        for item in parts[explain.token(u)].get(key, [])[:5]:
+            tok = (item[1] if key == "top" else item).strip() or repr(item[1] if key == "top" else item)
+            count[tok] = count.get(tok, 0) + 1
+    return [t for t, _ in sorted(count.items(), key=lambda kv: -kv[1])[:top]]
+
+
 def english(description: str, nodes: list[dict], edges: list[tuple], labels: dict, notes: dict[str, str]) -> str:
-    """The explanation's English: the behavior, then per node what it is, what it reads and what it carries."""
+    """The explanation's English: the behavior, then per node what it is, what it reads, what its subcomponents fire on
+    in text and raise, whether it writes the prediction, and what it carries."""
     lines = [description.rstrip(".") + "."]
     for n in nodes:
         reads = [w if w != "input" else "the tokens" for w, r, *_ in edges if r == n["name"]]
         line = f"{n['name']}: {len(n['units'])} subcomponents in {where(n['units'])}"
         if reads:
-            line += ", reading " + ", ".join(reads)
+            line += ", reading " + " and ".join(reads)
+        line += ". They fire most on " + ", ".join(map(repr, common(n["units"], "top")))
+        raised = common([u for u in n["units"] if u[1] in ("o_proj", "down_proj")], "raises")
+        if raised:
+            line += " and raise " + ", ".join(map(repr, raised))
         if any(w == n["name"] and r == "output" for w, r, *_ in edges):
-            line += ", writing the prediction"
+            line += "; the node writes the prediction"
         if n["name"] in labels:
             v = labels[n["name"]]
             line += f"; it carries {v}" + (f" ({notes[v]})" if notes.get(v) else "")
