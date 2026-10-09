@@ -167,7 +167,7 @@ def sva(tok, rng):
     out = []
     for name, desc in [("simple", "a determiner and noun"), ("nounpp", "a noun followed by a prepositional phrase with a distractor noun"),
                        ("rc", "a noun followed by a relative clause with a distractor noun"), ("within_rc", "the verb inside a relative clause agreeing with that clause's subject")]:
-        v = Variant(name, f"Subject-verb agreement after {desc}; the counterfactual flips the subject's number.")
+        v = Variant(name, f"Subject-verb agreement after {desc}; the changed prompt flips the subject's number.")
         rows = [json.loads(l) for f in ("train", "test") for l in (SVA_DIR / f"{name}_{f}.json").read_text().splitlines()]
         rng.shuffle(rows)
         seen = set()
@@ -324,7 +324,7 @@ def pronoun_gender(tok, rng):
     # names never open the text: a text-initial name lacks the leading space and splits differently
     for vname, t in [("because", "Yesterday {N} went to the {place} because"), ("said", "After {N} finished the work at the {place},"),
                      ("thinks", "That day {N} looked tired at the {place}, so I asked if")]:
-        v = Variant(vname, "Gendered pronoun: the next word is the pronoun for the named person; the counterfactual swaps the name's gender.")
+        v = Variant(vname, "Gendered pronoun: the next word is the pronoun for the named person; the changed prompt swaps the name's gender.")
         for _ in range(200):
             a, b = rng.choice(f), rng.choice(m)
             p = rng.choice(PLACES)
@@ -364,7 +364,7 @@ def quote_close(tok, rng):
     phrases = ["I will be there soon", "this is not what I ordered", "the train leaves at noon", "we should go home",
                "please close the door", "the answer is simple", "nobody told me", "it is going to rain",
                "I love this song", "the meeting is cancelled", "we won the game", "dinner is ready"]
-    v = Variant("said", "Quote closing: after a quoted sentence ends with a period, the next token closes the quotation; the counterfactual opens a parenthesis instead.")
+    v = Variant("said", "Quote closing: after a quoted sentence ends with a period, the next token closes the quotation; the changed prompt opens a parenthesis instead.")
     for _ in range(96):
         n, p = rng.choice(subj), rng.choice(phrases)
         # counterfactual: a parenthesis opens the aside instead of a quotation mark
@@ -581,7 +581,7 @@ MC_FACTS = [("What color is the sky on a clear day?", "blue", ["green", "red", "
 @family
 def mc_letter(tok, rng):
     """Multiple-choice answering with a letter."""
-    v = Variant("abcd", "Multiple-choice letter: a question with four lettered options; the answer is the letter of the correct option. The counterfactual moves the correct option to another letter.")
+    v = Variant("abcd", "Multiple-choice letter: a question with four lettered options; the answer is the letter of the correct option. The changed prompt moves the correct option to another letter.")
     for _ in range(128):
         q, right, wrong = rng.choice(MC_FACTS)
         opts = [right] + list(wrong)
@@ -638,8 +638,8 @@ def object_color(tok, rng):
 def list_copy(tok, rng):
     """Copy a named position from a short list."""
     ws = words(tok, NOUNS)
-    v1 = Variant("first", "List indexing: given a list of four words, the first word; the counterfactual swaps the first word with another, so the same words appear.")
-    v2 = Variant("last", "List indexing: given a list of four words, the last word; the counterfactual swaps the last word with another, so the same words appear.")
+    v1 = Variant("first", "List indexing: given a list of four words, the first word; the changed prompt swaps the first word with another, so the same words appear.")
+    v2 = Variant("last", "List indexing: given a list of four words, the last word; the changed prompt swaps the last word with another, so the same words appear.")
     for _ in range(160):
         a = rng.sample(ws, 4)
         k = rng.randrange(1, 4)
@@ -699,7 +699,7 @@ def sentiment(tok, rng):
     """Few-shot sentiment labels."""
     out = []
     for vname, things in [("movie", ["movie", "film", "plot", "acting", "ending"]), ("restaurant", ["food", "service", "soup", "pizza", "dessert"])]:
-        v = Variant(vname, f"Sentiment classification ({vname} reviews): after two labeled reviews, the label of a new review; the counterfactual swaps its adjective's polarity.")
+        v = Variant(vname, f"Sentiment classification ({vname} reviews): after two labeled reviews, the label of a new review; the changed prompt swaps its adjective's polarity.")
         for _ in range(128):
             t1, t2, t3 = rng.sample(things, 3)
             shots = f"Review: The {t1} was {rng.choice(POS_ADJ)}.\nSentiment: positive\n\nReview: The {t2} was {rng.choice(NEG_ADJ)}.\nSentiment: negative\n\n"
@@ -869,7 +869,7 @@ def entity_binding(tok, rng):
     items = words(tok, BOX_ITEMS)
     out = []
     for n in (2, 3):
-        v = Variant(f"boxes{n}", f"Entity binding: {n} objects are each placed in a lettered box; asked for one object's box, the answer is its letter. The counterfactual swaps the boxes of the queried object and another.")
+        v = Variant(f"boxes{n}", f"Entity binding: {n} objects are each placed in a lettered box; asked for one object's box, the answer is its letter. The changed prompt swaps the boxes of the queried object and another.")
         for _ in range(200):
             objs = rng.sample(items, n)
             boxes = rng.sample("ABCDEFG", n)
@@ -887,7 +887,7 @@ def entity_binding(tok, rng):
 def first_letter(tok, rng):
     """The first letter of a word."""
     ws = words(tok, NOUNS)
-    v = Variant("starts_with", "Spelling: the first letter of a quoted word, as a capital; the counterfactual quotes a word with another first letter.")
+    v = Variant("starts_with", "Spelling: the first letter of a quoted word, as a capital; the changed prompt quotes a word with another first letter.")
     for _ in range(400):
         a, b = rng.sample(ws, 2)
         if a[0] == b[0]:
@@ -937,7 +937,7 @@ NOVEL = {"bracket_type", "clock_add", "json_value", "python_list_index", "roman_
 def bracket_type(tok, rng):
     """Close the innermost open bracket with the matching bracket type."""
     pairs = {"(": ")", "[": "]", "{": "}"}
-    v = Variant("mixed", "Bracket type matching: after a run of opened brackets of mixed types and one inner pair closed, the next token closes the innermost open bracket with its own type; the counterfactual changes that bracket's type.")
+    v = Variant("mixed", "Bracket type matching: after a run of opened brackets of mixed types and one inner pair closed, the next token closes the innermost open bracket with its own type; the changed prompt changes that bracket's type.")
     for _ in range(300):
         a, b = rng.sample(list(pairs), 2)
         x, y = rng.sample("abcdxyz", 2)
@@ -970,7 +970,7 @@ JSON_VALS = ["Alice", "Boston", "green", "parrot", "pizza", "Tigers", "Nike", "Y
 def json_value(tok, rng):
     """Look up a key's value in a JSON object."""
     vals = words(tok, JSON_VALS)
-    v = Variant("lookup", "JSON lookup: given a JSON object with three keys, the value of the queried key; the counterfactual queries another key.")
+    v = Variant("lookup", "JSON lookup: given a JSON object with three keys, the value of the queried key; the changed prompt queries another key.")
     for _ in range(300):
         ks = rng.sample(JSON_KEYS, 3)
         vs = rng.sample(vals, 3)
@@ -984,7 +984,7 @@ def json_value(tok, rng):
 @family
 def python_list_index(tok, rng):
     """Index into a Python list literal."""
-    v = Variant("index", "Python list indexing: the element at a given index of a four-element list literal; the counterfactual asks for another index.")
+    v = Variant("index", "Python list indexing: the element at a given index of a four-element list literal; the changed prompt asks for another index.")
     for _ in range(300):
         xs = rng.sample(range(10, 100), 4)
         i, j = rng.sample(range(4), 2)
@@ -1007,7 +1007,7 @@ def roman_numerals(tok, rng):
 def pattern_ab(tok, rng):
     """Continue an alternating pattern of two words."""
     ws = words(tok, NOUNS)
-    v = Variant("alternate", "Alternation: two words alternate several times; the next word continues the alternation; the counterfactual starts the alternation with the other word.")
+    v = Variant("alternate", "Alternation: two words alternate several times; the next word continues the alternation; the changed prompt starts the alternation with the other word.")
     for _ in range(300):
         a, b = rng.sample(ws, 2)
         n = rng.randrange(3, 6)
@@ -1050,7 +1050,7 @@ def month_number(tok, rng):
 def last_letter(tok, rng):
     """The last letter of a word."""
     ws = words(tok, NOUNS)
-    v = Variant("ends_with", "Spelling: after two worked examples, the last letter of a word as a capital; the counterfactual asks about a word with another last letter.")
+    v = Variant("ends_with", "Spelling: after two worked examples, the last letter of a word as a capital; the changed prompt asks about a word with another last letter.")
     for _ in range(400):
         a, b = rng.sample(ws, 2)
         if a[-1] == b[-1]:
@@ -1067,7 +1067,7 @@ DOMAINS = ["gmail", "yahoo", "outlook", "hotmail", "proton", "icloud"]
 def email_domain(tok, rng):
     """Copy the domain of a person's e-mail address."""
     names = words(tok, NAMES_F + NAMES_M)
-    v = Variant("domain", "Copy from a contact record: the domain of the named person's e-mail address among two contacts; the counterfactual asks for the other contact.")
+    v = Variant("domain", "Copy from a contact record: the domain of the named person's e-mail address among two contacts; the changed prompt asks for the other contact.")
     for _ in range(800):
         a, b = rng.sample(names, 2)
         da, db = rng.sample(DOMAINS, 2)
@@ -1081,7 +1081,7 @@ def email_domain(tok, rng):
 def key_value_lookup(tok, rng):
     """Associative recall of a code paired with a word."""
     ws = words(tok, NOUNS)
-    v = Variant("codes", "Associative recall: three word=number pairs, then a word; the next token is its number; the counterfactual queries another word.")
+    v = Variant("codes", "Associative recall: three word=number pairs, then a word; the next token is its number; the changed prompt queries another word.")
     for _ in range(300):
         ks = rng.sample(ws, 3)
         vs = rng.sample(range(10, 100), 3)
@@ -1094,7 +1094,7 @@ def key_value_lookup(tok, rng):
 @family
 def compare_numbers(tok, rng):
     """The larger of two numbers."""
-    v = Variant("larger", "Number comparison: the larger of two two-digit numbers; the counterfactual swaps which one is larger by changing one number.")
+    v = Variant("larger", "Number comparison: the larger of two two-digit numbers; the changed prompt swaps which one is larger by changing one number.")
     for _ in range(300):
         x, y = rng.sample(range(10, 100), 2)
         lo, hi = min(x, y), max(x, y)
@@ -1113,7 +1113,7 @@ def compare_numbers(tok, rng):
 @family
 def parity(tok, rng):
     """Whether a number is even or odd."""
-    v = Variant("even_odd", "Parity: after two worked examples, whether a number is even or odd; the counterfactual changes the last digit's parity.")
+    v = Variant("even_odd", "Parity: after two worked examples, whether a number is even or odd; the changed prompt changes the last digit's parity.")
     for _ in range(300):
         n = rng.randrange(10, 1000)
         m = n + rng.choice([-1, 1])
@@ -1127,7 +1127,7 @@ def possessive_pronoun(tok, rng):
     """The possessive pronoun for a named person."""
     f, m = words(tok, NAMES_F), words(tok, NAMES_M)
     objs = ["keys", "phone", "wallet", "umbrella", "notebook", "glasses", "jacket"]
-    v = Variant("lost", "Possessive pronoun: after a named person loses something, 'her' or 'his' follows by the name's usual gender; the counterfactual swaps the name's gender.")
+    v = Variant("lost", "Possessive pronoun: after a named person loses something, 'her' or 'his' follows by the name's usual gender; the changed prompt swaps the name's gender.")
     for _ in range(400):
         a, b, o = rng.choice(f), rng.choice(m), rng.choice(objs)
         t = rng.choice(["This morning", "Yesterday", "On Monday", "After lunch", "Last night", "Before the trip"]) + " {n} could not find"
@@ -1199,7 +1199,7 @@ YES_NO = [("Is the sun hot?", "Yes"), ("Is ice cold?", "Yes"), ("Can fish swim?"
 @family
 def yes_no_facts(tok, rng):
     """Answer a yes/no commonsense question."""
-    v = Variant("qa", "Yes/no questions about everyday facts after two answered examples; the counterfactual asks a question with the other answer after the same examples.")
+    v = Variant("qa", "Yes/no questions about everyday facts after two answered examples; the changed prompt asks a question with the other answer after the same examples.")
     yes = [q for q, a in YES_NO if a == "Yes"]
     no = [q for q, a in YES_NO if a == "No"]
     for k in range(12):  # each pair of worked examples is one template; build.py pairs questions within it
@@ -1262,7 +1262,7 @@ def musical_notes(tok, rng):
 def list_reverse(tok, rng):
     """Write a list in reverse order."""
     ws = words(tok, NOUNS)
-    v = Variant("reverse", "List reversal: a four-word list is being written in reverse; after three reversed words the next is the list's first word; the counterfactual reverses a list whose first two words are swapped.")
+    v = Variant("reverse", "List reversal: a four-word list is being written in reverse; after three reversed words the next is the list's first word; the changed prompt reverses a list whose first two words are swapped.")
     for _ in range(300):
         a = rng.sample(ws, 4)
         b = [a[1], a[0]] + a[2:]
@@ -1275,7 +1275,7 @@ def list_reverse(tok, rng):
 @family
 def min_of_list(tok, rng):
     """The smallest number in a short list."""
-    v = Variant("smallest", "Minimum: the smallest of three two-digit numbers; the counterfactual lowers another number below it.")
+    v = Variant("smallest", "Minimum: the smallest of three two-digit numbers; the changed prompt lowers another number below it.")
     for _ in range(300):
         xs = rng.sample(range(20, 100), 3)
         i = xs.index(min(xs))
@@ -1337,7 +1337,7 @@ def state_abbreviation(tok, rng):
 def markdown_close(tok, rng):
     """Close an open Markdown emphasis marker."""
     ws = words(tok, NOUNS)
-    v = Variant("emphasis", "Markdown closing: after a word opened with ** (bold) or _ (italic), the next token closes the same marker; the counterfactual opens the other marker.")
+    v = Variant("emphasis", "Markdown closing: after a word opened with ** (bold) or _ (italic), the next token closes the same marker; the changed prompt opens the other marker.")
     for _ in range(300):
         a, b = rng.sample(ws, 2)
         t = "Remember to bring the {m}{a}"
@@ -1349,7 +1349,7 @@ def markdown_close(tok, rng):
 def quote_type(tok, rng):
     """Close a quotation with the same quote mark that opened it."""
     ws = words(tok, NOUNS)
-    v = Variant("python_string", "Quote matching: a Python string opened with a single or a double quote is closed with the same mark; the counterfactual opens with the other mark.")
+    v = Variant("python_string", "Quote matching: a Python string opened with a single or a double quote is closed with the same mark; the changed prompt opens with the other mark.")
     for _ in range(300):
         a, b = rng.sample(ws, 2)
         t = "name = {q}{a}_{b}"
@@ -1404,7 +1404,7 @@ def count_repeats(tok, rng):
     """Count how many times a word is repeated."""
     ws = words(tok, NOUNS)
     nums = ["two", "three", "four", "five"]
-    v = Variant("how_many", "Counting: a word appears two to five times among six words (the rest one other word); the next word is its count; the counterfactual turns one occurrence into the other word.")
+    v = Variant("how_many", "Counting: a word appears two to five times among six words (the rest one other word); the next word is its count; the changed prompt turns one occurrence into the other word.")
     for _ in range(400):
         a, b = rng.sample(ws, 2)
         n = rng.randrange(3, 6)
@@ -1424,7 +1424,7 @@ def syllogism(tok, rng):
             ("hammers", "tool", "a"), ("violins", "instrument", "an"), ("apples", "fruit", "a"), ("sparrows", "bird", "a"),
             ("salmon", "fish", "a"), ("carrots", "vegetable", "a")]
     names = words(tok, NAMES_F + NAMES_M + ["Rex", "Fluffy", "Max", "Bella", "Spot"])
-    v = Variant("all_are", "Syllogism: 'All X are Y. N is one of the X. So N is a' is followed by Y; the counterfactual changes the category.")
+    v = Variant("all_are", "Syllogism: 'All X are Y. N is one of the X. So N is a' is followed by Y; the changed prompt changes the category.")
     for _ in range(1200):
         (x, y, art), (x2, y2, art2) = rng.sample(cats, 2)
         if art != art2:
@@ -1439,7 +1439,7 @@ def syllogism(tok, rng):
 def transitive_compare(tok, rng):
     """The extreme of a chain of comparisons."""
     names = words(tok, NAMES_F + NAMES_M)
-    v = Variant("tallest", "Transitive comparison: two 'taller than' statements chain three people; the tallest is the one at the top of the chain; the counterfactual reverses the chain.")
+    v = Variant("tallest", "Transitive comparison: two 'taller than' statements chain three people; the tallest is the one at the top of the chain; the changed prompt reverses the chain.")
     for _ in range(400):
         a, b, c = rng.sample(names, 3)
         t = "{p} is taller than {q}. {q} is taller than {r}. The tallest of the three is"
@@ -1451,7 +1451,7 @@ def transitive_compare(tok, rng):
 def variable_assignment(tok, rng):
     """Follow a chain of Python assignments."""
     names = list("abcdxyzpqr")
-    v = Variant("chain", "Variable binding: a value is assigned and copied along a chain of variables; the printed value is the original; the counterfactual changes the value.")
+    v = Variant("chain", "Variable binding: a value is assigned and copied along a chain of variables; the printed value is the original; the changed prompt changes the value.")
     for _ in range(400):
         a, b, c = rng.sample(names, 3)
         x, y = rng.sample(range(10, 100), 2)
@@ -1463,7 +1463,7 @@ def variable_assignment(tok, rng):
 @family
 def two_digit_add(tok, rng):
     """Two-digit addition without carrying into a third digit."""
-    v = Variant("add", "Two-digit addition after two worked examples; the counterfactual changes one operand by one.")
+    v = Variant("add", "Two-digit addition after two worked examples; the changed prompt changes one operand by one.")
     for _ in range(400):
         a, b = rng.randrange(10, 50), rng.randrange(10, 50)
         b2 = b + 1
@@ -1478,7 +1478,7 @@ def object_location(tok, rng):
     names = words(tok, NAMES_F + NAMES_M)
     places = ["box", "drawer", "basket", "bag", "cupboard", "closet", "fridge", "garage"]
     objs = ["ball", "book", "key", "apple", "phone", "hat", "cup", "pen"]
-    v = Variant("put", "Object tracking: two objects are put in two places; asked where one object is, the answer is its place; the counterfactual swaps the two places.")
+    v = Variant("put", "Object tracking: two objects are put in two places; asked where one object is, the answer is its place; the changed prompt swaps the two places.")
     for _ in range(400):
         n = rng.choice(names)
         o1, o2 = rng.sample(objs, 2)
@@ -1514,7 +1514,7 @@ def unit_conversion(tok, rng):
     units = [("meters", "centimeters", 100), ("kilometers", "meters", 1000), ("kilograms", "grams", 1000), ("liters", "milliliters", 1000),
              ("centimeters", "millimeters", 10), ("dollars", "cents", 100), ("hours", "minutes", 60), ("minutes", "seconds", 60),
              ("days", "hours", 24), ("weeks", "days", 7), ("feet", "inches", 12), ("dozens", "items", 12)]
-    v = Variant("scale", "Unit conversion: after one worked example of the same units, a small quantity converted to the smaller unit; the counterfactual changes the quantity.")
+    v = Variant("scale", "Unit conversion: after one worked example of the same units, a small quantity converted to the smaller unit; the changed prompt changes the quantity.")
     for _ in range(800):
         big, small, f = rng.choice(units)
         q, q2 = rng.sample(range(2, 10), 2) if rng.random() < 0.5 else rng.sample(range(11, 20), 2)
@@ -1548,7 +1548,7 @@ LATEX_ENVS = ["equation", "align", "itemize", "enumerate", "figure", "table", "t
 @family
 def latex_close(tok, rng):
     """Close a LaTeX environment with its own name."""
-    v = Variant("end", "LaTeX environment closing: after a \\begin{env} block's body and '\\end{', the environment's name; the counterfactual opens another environment.")
+    v = Variant("end", "LaTeX environment closing: after a \\begin{env} block's body and '\\end{', the environment's name; the changed prompt opens another environment.")
     bodies = ["x = y + z", "\\item first \\item second", "a^2 + b^2 = c^2", "Some text here.", "1 & 2 \\\\ 3 & 4", "f(x) = 0"]
     for _ in range(400):
         a, b = rng.sample(LATEX_ENVS, 2)
@@ -1589,7 +1589,7 @@ CATEGORY_POOLS = {"fruit": ["apple", "banana", "cherry", "grape", "mango", "lemo
 @family
 def odd_one_out(tok, rng):
     """The member of a list that belongs to another category."""
-    v = Variant("list", "Odd one out: three words of one category and one of another; the answer is the outsider; the counterfactual swaps which word is the outsider by using a different outsider at the same place.")
+    v = Variant("list", "Odd one out: three words of one category and one of another; the answer is the outsider; the changed prompt swaps which word is the outsider by using a different outsider at the same place.")
     cats = list(CATEGORY_POOLS)
     for _ in range(600):
         c1, c2, c3 = rng.sample(cats, 3)
@@ -1606,7 +1606,7 @@ def odd_one_out(tok, rng):
 @family
 def pick_category(tok, rng):
     """Pick the list member of a named category."""
-    v = Variant("which", "Category selection: among three words of different categories, the one of the named category; the counterfactual names another category.")
+    v = Variant("which", "Category selection: among three words of different categories, the one of the named category; the changed prompt names another category.")
     cats = list(CATEGORY_POOLS)
     for _ in range(600):
         cs = rng.sample(cats, 3)
@@ -1621,7 +1621,7 @@ def pick_category(tok, rng):
 def alphabetical_first(tok, rng):
     """The word that comes first alphabetically."""
     ws = words(tok, NOUNS)
-    v = Variant("pair", "Alphabetical order: of two words with different first letters, the one that comes first; the counterfactual replaces the earlier word with one that comes after the other.")
+    v = Variant("pair", "Alphabetical order: of two words with different first letters, the one that comes first; the changed prompt replaces the earlier word with one that comes after the other.")
     for _ in range(600):
         a, b, c = rng.sample(ws, 3)
         lo, hi = sorted([a, b])
@@ -1639,7 +1639,7 @@ def alphabetical_first(tok, rng):
 def repeat_after_me(tok, rng):
     """Repeat a two-word phrase on instruction."""
     ws = words(tok, NOUNS)
-    v = Variant("phrase", "Instructed copying: 'Repeat after me: A B.' then the first word; the next word is the second word of the phrase; the counterfactual changes it.")
+    v = Variant("phrase", "Instructed copying: 'Repeat after me: A B.' then the first word; the next word is the second word of the phrase; the changed prompt changes it.")
     for _ in range(400):
         a, b, c = rng.sample(ws, 3)
         t = "Repeat after me: {a} {b}.\nSure: {a}"

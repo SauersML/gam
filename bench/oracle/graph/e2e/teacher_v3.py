@@ -106,7 +106,7 @@ def main():
     ap.add_argument("behaviors", nargs="*", help="default: every behavior of teacher/manifest.jsonl")
     ap.add_argument("--manifest", type=Path, default=DATA / "teacher/manifest.jsonl")
     ap.add_argument("--labels", type=Path, default=DATA / "runs/labels_v3")
-    ap.add_argument("--behaviors-dir", type=Path, default=DATA / "behaviors_vary/vpd4l")
+    ap.add_argument("--behaviors-dir", type=Path, default=DATA / "behaviors_v3/vpd4l")
     ap.add_argument("--export", type=Path, default=Path.home() / "mpd-data/engine/vpd4l")
     ap.add_argument("--vpd", type=Path, default=Path.home() / "mpd-data/engine/vpd4l_decomposition")
     ap.add_argument("--device", default="gpu")
