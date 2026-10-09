@@ -52,20 +52,33 @@ def source(nodes: list[dict], edges: list[tuple], labels: dict | None = None, fu
                         tuple(tuple(e) for e in edges), tuple((labels or {}).items())).source()
 
 
+def block(u: tuple) -> tuple[int, int]:
+    """A unit's block in execution order: (layer, 0 for attention or 1 for the MLP)."""
+    return u[0], int(u[1] in ("c_fc", "down_proj"))
+
+
+def wire(nodes: list[dict]) -> list[tuple]:
+    """Every edge the nodes allow: the input into each node that reads the residual stream, a node into another when
+    one of its residual writers comes before one of the other's readers, and each node that writes into the output."""
+    readers = {n["name"]: [block(u) for u in n["units"] if u[1] in ("q_proj", "k_proj", "v_proj", "c_fc")] for n in nodes}
+    writers = {n["name"]: [block(u) for u in n["units"] if u[1] in ("o_proj", "down_proj")] for n in nodes}
+    edges = []
+    for n in nodes:
+        r = n["name"]
+        if readers[r]:
+            edges += [("input", r)] + [(w["name"], r) for w in nodes if w["name"] != r and writers[w["name"]]
+                                       and min(writers[w["name"]]) < max(readers[r])]
+    return edges + [(n["name"], "output") for n in nodes if writers[n["name"]]]
+
+
 def chain(units: list[tuple], at: str = "all") -> tuple[list[dict], list[tuple]]:
     """A set of units as one node per block, each reading the input and every earlier block, the residual writers
     writing the output (the edges of e2e/explain.ir, as nodes and edges)."""
     blocks: dict[tuple, list[tuple]] = {}
     for u in units:
-        blocks.setdefault((u[0], "mlp" if u[1] in ("c_fc", "down_proj") else "attn"), []).append(u)
-    names = {k: f"{'attn' if k[1] == 'attn' else 'mlp'}{k[0]}" for k in blocks}
-    nodes = [{"name": names[k], "units": blocks[k], "at": at} for k in sorted(blocks)]
-    edges = []
-    for k in sorted(blocks):
-        if any(u[1] in ("q_proj", "k_proj", "v_proj", "c_fc") for u in blocks[k]):
-            edges += [("input", names[k])] + [(names[w], names[k]) for w in sorted(blocks) if w < k and writes(blocks[w])]
-    edges += [(names[k], "output") for k in sorted(blocks) if writes(blocks[k])]
-    return nodes, edges
+        blocks.setdefault(block(u), []).append(u)
+    nodes = [{"name": f"{'mlp' if k[1] else 'attn'}{k[0]}", "units": blocks[k], "at": at} for k in sorted(blocks)]
+    return nodes, wire(nodes)
 
 
 def writes(units) -> bool:

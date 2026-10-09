@@ -84,25 +84,16 @@ def english(description: str, nodes: list[dict], edges: list[tuple], labels: dic
 
 def with_label(base: tuple[list[dict], list[tuple]], v: str, units: list) -> tuple[list[dict], list[tuple]] | None:
     """The base graph with a node carrying variable `v` made of `units` (blocks without a residual writer dropped), its
-    subcomponents taken out of the base's nodes."""
-    nodes, edges = base
+    subcomponents taken out of the base's nodes, every node wired to every other it can read or feed (explain.wire)."""
+    nodes, _ = base
     writers = {block_of(u) for u in units if u[1] in ("o_proj", "down_proj")}
     units = [u for u in units if block_of(u) in writers]
     if not units:
         return None
     taken = set(units)
     kept = [{**n, "units": [u for u in n["units"] if u not in taken]} for n in nodes]
-    gone = {n["name"] for n in kept if not n["units"]}
-    kept = [n for n in kept if n["name"] not in gone]
-    edges = [e for e in edges if e[0] not in gone and e[1] not in gone]
-    if not any(r == "output" for _, r, *_ in edges):
-        return None
-    last = max(block_of(u) for u in units)
-    new = [("input", v)] if any(u[1] in ("q_proj", "k_proj", "v_proj", "c_fc") for u in units) else []
-    new += [(v, n["name"]) for n in kept if min(block_of(u) for u in n["units"]) > last
-            and any(u[1] in ("q_proj", "k_proj", "v_proj", "c_fc") for u in n["units"])]
-    new += [(v, "output")]
-    return kept + [{"name": v, "units": units, "at": "all"}], edges + new
+    kept = [n for n in kept if n["units"]] + [{"name": v, "units": units, "at": "all"}]
+    return kept, explain.wire(kept)
 
 
 def scored(checker, sources: list[str], experiments: int, seed: int, batch: int) -> list[dict]:
