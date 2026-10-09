@@ -2766,25 +2766,31 @@ pub enum Metric {
     /// The whole next-token distribution: `KL(p ‖ q)`.
     #[default]
     Full,
-    /// The behavior's answer: per row the token `by` puts first, `a`, and the two-outcome
-    /// distribution (a, any other token) under `p` and `q`, compared by `KL` (a VPD subnetwork's
-    /// standard: the target prediction kept, not the whole distribution).
+    /// The behavior's answers: per scored row the distribution over the prompt's answer `a`, the
+    /// counterfactual's answer `a'` and any other token under `p` and `q`, compared by `KL` (a VPD
+    /// subnetwork's standard, the target prediction kept rather than the whole distribution, with the
+    /// contrast circuit metrics compare, the logit difference of `a` and `a'`, in it). Rows without
+    /// the behavior's answers ([`Prompt::answer_ids`]) take the token `by` puts first as `a`.
     Answer,
 }
 
-/// Per row, `KL` between the two-outcome distributions (the answer `a`, any other token) of `p` and
-/// `q`, in bits, `a` being the token `by` puts first in that row.
-pub fn answer_kl_bits(p: &Array2<f64>, q: &Array2<f64>, by: &Array2<f64>) -> Vec<f64> {
-    let binary = |pa: f64, qa: f64| {
-        let (pa, qa) = (pa.clamp(1e-12, 1.0 - 1e-12), qa.clamp(1e-12, 1.0 - 1e-12));
-        (pa * (pa / qa).ln() + (1.0 - pa) * ((1.0 - pa) / (1.0 - qa)).ln()) / std::f64::consts::LN_2
-    };
+/// Per row, `KL` in bits between the distributions of `p` and `q` over the outcomes `picks[row]`
+/// (distinct tokens) and any other token; a row with no picks takes the token `by` puts first.
+pub fn answer_kl_bits(p: &Array2<f64>, q: &Array2<f64>, by: &Array2<f64>, picks: &[Vec<usize>]) -> Vec<f64> {
+    let term = |a: f64, b: f64| if a > 0.0 { a * (a / b.max(1e-300)).ln() } else { 0.0 };
     p.outer_iter()
         .zip(q.outer_iter())
         .zip(by.outer_iter())
-        .map(|((p, q), by)| {
-            let a = by.iter().enumerate().fold((0, f64::NEG_INFINITY), |best, (i, &v)| if v > best.1 { (i, v) } else { best }).0;
-            binary(p[a].exp(), q[a].exp())
+        .enumerate()
+        .map(|(row, ((p, q), by))| {
+            let mut tokens: Vec<usize> = picks.get(row).cloned().unwrap_or_default();
+            tokens.dedup();
+            if tokens.is_empty() {
+                tokens.push(by.iter().enumerate().fold((0, f64::NEG_INFINITY), |best, (i, &v)| if v > best.1 { (i, v) } else { best }).0);
+            }
+            let (pa, qa): (Vec<f64>, Vec<f64>) = tokens.iter().map(|&t| (p[t].exp(), q[t].exp())).unzip();
+            let (p_rest, q_rest) = ((1.0 - pa.iter().sum::<f64>()).max(0.0), (1.0 - qa.iter().sum::<f64>()).max(1e-300));
+            (pa.iter().zip(&qa).map(|(&a, &b)| term(a, b)).sum::<f64>() + term(p_rest, q_rest)) / std::f64::consts::LN_2
         })
         .collect()
 }
@@ -3991,6 +3997,9 @@ pub struct Counterfactual {
     #[serde(default)]
     pub text: String,
     pub token_ids: Vec<u32>,
+    /// Per target position the counterfactual's answer token (the behavior's, [`Metric::Answer`]).
+    #[serde(default)]
+    pub answer_ids: Vec<u32>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -3999,6 +4008,9 @@ pub struct Prompt {
     pub text: String,
     pub token_ids: Vec<u32>,
     pub target_positions: Vec<usize>,
+    /// Per target position the prompt's answer token (the behavior's, [`Metric::Answer`]).
+    #[serde(default)]
+    pub answer_ids: Vec<u32>,
     #[serde(default)]
     pub counterfactual: Option<Counterfactual>,
     /// Token ranges whose attention is masked, `[query_start, query_end, key_start, key_end]`:
@@ -4482,13 +4494,28 @@ impl Checker {
         self.counterfactual.is_some() && (!graph.delete || self.metric == Metric::Answer)
     }
 
-    /// The error of `q` against `p` per scored row under [`Checker::metric`]: `KL(p ‖ q)`, or the
-    /// answer's two-outcome `KL` with the answer `by`'s first token.
-    pub fn divergence(&self, p: &Array2<f64>, q: &Array2<f64>, by: &Array2<f64>) -> Vec<f64> {
+    /// The error of `q` against `p` at the scored rows `rows` ((prompt, position), in the tables' row
+    /// order) under [`Checker::metric`]: `KL(p ‖ q)`, or the `KL` over the behavior's answers (the
+    /// prompt's and the counterfactual's at each target, else the token `by` puts first) and any
+    /// other token.
+    pub fn divergence(&self, p: &Array2<f64>, q: &Array2<f64>, by: &Array2<f64>, rows: &[(usize, usize)]) -> Vec<f64> {
         match self.metric {
             Metric::Full => kl_bits(p, q),
-            Metric::Answer => answer_kl_bits(p, q, by),
+            Metric::Answer => answer_kl_bits(p, q, by, &self.answers_at(rows)),
         }
+    }
+
+    /// Per scored row (prompt, position) the behavior's answers there: the prompt's and its
+    /// counterfactual's answer tokens where the behavior gives them ([`Prompt::answer_ids`]).
+    pub fn answers_at(&self, rows: &[(usize, usize)]) -> Vec<Vec<usize>> {
+        rows.iter()
+            .map(|&(i, t)| {
+                let Some(p) = self.behavior.prompts.get(i) else { return Vec::new() };
+                let Some(k) = p.target_positions.iter().position(|&x| x == t) else { return Vec::new() };
+                let changed = p.counterfactual.as_ref().and_then(|c| c.answer_ids.get(k));
+                p.answer_ids.get(k).into_iter().chain(changed).map(|&a| a as usize).collect()
+            })
+            .collect()
     }
 
     /// The error of `graph`'s alignments, bits per target: for each alignment the mean, over its pairs'
@@ -4535,7 +4562,8 @@ impl Checker {
             let unswapped = execute(&self.weights, &circuit, &base, &rows, &BTreeMap::new())?.log_probabilities;
             let swaps: BTreeMap<usize, Array2<f64>> = nodes.iter().map(|&u| written.get(u).cloned().flatten().map(|w| (u, w)).ok_or_else(|| format!("alignment {}: an aligned node wrote nothing", alignment.variable))).collect::<Result<_, _>>()?;
             let swapped = if swaps.is_empty() { unswapped.clone() } else { execute(&self.weights, &circuit, &base, &rows, &swaps)?.log_probabilities };
-            let (errors, signal) = (self.divergence(&target, &swapped, &target), self.divergence(&target, &unswapped, &target));
+            let scored: Vec<(usize, usize)> = alignment.pairs.iter().flat_map(|pair| prompts[pair.base].target_positions.iter().map(move |&t| (pair.base, t))).collect();
+            let (errors, signal) = (self.divergence(&target, &swapped, &target, &scored), self.divergence(&target, &unswapped, &target, &scored));
             let cost: f64 = errors.iter().zip(&signal).map(|(e, s)| e.min(*s)).sum();
             total += cost / rows.len().max(1) as f64;
         }
@@ -5021,7 +5049,8 @@ impl Checker {
                             None if g.blocks.len() <= g.base.len() => prompt.clone(),
                             None => self.run(&g.complement_model(&self.weights), e)?,
                         };
-                        kls.push(Some(self.divergence(target, &model, prompt).into_iter().zip(self.divergence(target, prompt, prompt)).map(|(c, s)| c.min(s)).collect()));
+                        let rows = self.rows_of(e);
+                        kls.push(Some(self.divergence(target, &model, prompt, &rows).into_iter().zip(self.divergence(target, prompt, prompt, &rows)).map(|(c, s)| c.min(s)).collect()));
                         continue;
                     }
                     let model = self.run(&g.complement_model(&self.weights), e)?;
@@ -5191,7 +5220,7 @@ impl Checker {
                         let (i, e, key) = &runs[r];
                         let m = outcomes.get(key).ok_or("M's outcome went missing")?;
                         let p = this.run(&circuits[*i], e)?;
-                        let kl = this.divergence(m, &p, m);
+                        let kl = this.divergence(m, &p, m, &this.rows_of(e));
                         let candidates = clean.map(|c| Candidates::of(c, m, &p, &this.rows_of(e), &this.rows_of(&Experiment::Clean), top));
                         Ok((r, kl, candidates))
                     };
@@ -5240,7 +5269,7 @@ impl Checker {
                                         let (_, e, key) = &runs[r];
                                         let m = outcomes.get(key).ok_or("M's outcome went missing")?;
                                         let candidates = clean.map(|c| Candidates::of(c, m, &p, &this.rows_of(e), &this.rows_of(&Experiment::Clean), top));
-                                        Ok((r, this.divergence(m, &p, m), candidates))
+                                        Ok((r, this.divergence(m, &p, m, &this.rows_of(e)), candidates))
                                     })
                                     .collect();
                             }

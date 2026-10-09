@@ -139,7 +139,7 @@ fn checker_scores_the_full_program_at_zero_error() {
     let weights = Weights::of(&library);
     // Each prompt's counterfactual is the next sequence (stand-ins come from it).
     let n = f.sequences.len();
-    let prompts = f.sequences.iter().enumerate().map(|(i, s)| Prompt { text: String::new(), token_ids: s.clone(), target_positions: vec![s.len() - 2, s.len() - 1], counterfactual: Some(Counterfactual { text: String::new(), token_ids: f.sequences[(i + 1) % n].clone() }), attention_block: Vec::new() }).collect();
+    let prompts = f.sequences.iter().enumerate().map(|(i, s)| Prompt { text: String::new(), token_ids: s.clone(), target_positions: vec![s.len() - 2, s.len() - 1], answer_ids: Vec::new(), counterfactual: Some(Counterfactual { text: String::new(), token_ids: f.sequences[(i + 1) % n].clone(), answer_ids: Vec::new() }), attention_block: Vec::new() }).collect();
     let behavior = Behavior { id: "tiny".into(), model: "tiny".into(), family: String::new(), description: String::new(), frequency: None, prompts, split: "train".into(), model_accuracy: None };
     let mut checker = Checker::new(weights, behavior).expect("checker");
     let (full, outcomes) = checker.score(&full_program(), 24, 7, true, None).expect("score");
@@ -223,7 +223,7 @@ fn checker_counterfactual_default_scores_the_empty_program_at_the_behavior_signa
         .sequences
         .iter()
         .zip(&cf)
-        .map(|(s, c)| Prompt { text: String::new(), token_ids: s.clone(), target_positions: vec![s.len() - 1], counterfactual: Some(crate::graph::Counterfactual { text: String::new(), token_ids: c.clone() }), attention_block: Vec::new() })
+        .map(|(s, c)| Prompt { text: String::new(), token_ids: s.clone(), target_positions: vec![s.len() - 1], answer_ids: Vec::new(), counterfactual: Some(crate::graph::Counterfactual { text: String::new(), token_ids: c.clone(), answer_ids: Vec::new() }), attention_block: Vec::new() })
         .collect();
     let behavior = Behavior { id: "tiny".into(), model: "tiny".into(), family: String::new(), description: String::new(), frequency: None, prompts, split: "train".into(), model_accuracy: None };
     let mut checker = Checker::new(weights, behavior).expect("checker");
@@ -251,7 +251,7 @@ fn duplicate_prompts_keep_their_own_counterfactuals() {
     let rows = [x.len() - 1, 2 * x.len() - 1];
     let signal = kl_bits(&clean.select(ndarray::Axis(0), &rows), &target.select(ndarray::Axis(0), &rows));
     assert!((signal[0] - signal[1]).abs() > 1e-6, "the two counterfactuals move M alike");
-    let prompts = partners.iter().map(|c| Prompt { text: String::new(), token_ids: x.clone(), target_positions: vec![x.len() - 1], counterfactual: Some(crate::graph::Counterfactual { text: String::new(), token_ids: c.clone() }), attention_block: Vec::new() }).collect();
+    let prompts = partners.iter().map(|c| Prompt { text: String::new(), token_ids: x.clone(), target_positions: vec![x.len() - 1], answer_ids: Vec::new(), counterfactual: Some(crate::graph::Counterfactual { text: String::new(), token_ids: c.clone(), answer_ids: Vec::new() }), attention_block: Vec::new() }).collect();
     let behavior = Behavior { id: "tiny".into(), model: "tiny".into(), family: String::new(), description: String::new(), frequency: None, prompts, split: "train".into(), model_accuracy: None };
     let mut checker = Checker::new(weights, behavior).expect("checker");
     let (_, outcomes) = checker.score(&Program { model: "tiny".into(), valid: true, ..Program::default() }, 0, 3, true, None).expect("score");
@@ -906,21 +906,24 @@ fn node_positions_bound_where_a_node_acts() {
     assert!(!close(terms[4].0, terms[0].0) && !close(terms[4].0, terms[3].0), "a subset of positions is neither: {terms:?}");
 }
 
-/// The answer metric: per row the two-outcome `KL` of the token the reference puts first; zero for equal
-/// rows, zero when only other tokens move, positive when the answer's probability moves.
+/// The answer metric: per row the `KL` over the picked answers and any other token (the token the
+/// reference puts first when a row picks none); zero for equal rows and when only unpicked tokens
+/// move, the closed form otherwise.
 #[test]
-fn the_answer_metric_compares_the_answers_probability() {
+fn the_answer_metric_compares_the_answers_probabilities() {
     use crate::graph::answer_kl_bits;
     use ndarray::Array2;
-    let logs = |rows: &[[f64; 3]]| Array2::from_shape_fn((rows.len(), 3), |(r, c)| rows[r][c].ln());
-    let p = logs(&[[0.7, 0.2, 0.1], [0.5, 0.25, 0.25]]);
-    let other = logs(&[[0.7, 0.1, 0.2], [0.5, 0.4, 0.1]]);
-    let moved = logs(&[[0.4, 0.4, 0.2], [0.9, 0.05, 0.05]]);
-    assert!(answer_kl_bits(&p, &p, &p).iter().all(|&e| e.abs() < 1e-12));
-    assert!(answer_kl_bits(&p, &other, &p).iter().all(|&e| e.abs() < 1e-12), "only other tokens move");
-    let e = answer_kl_bits(&p, &moved, &p);
-    let binary = |a: f64, b: f64| (a * (a / b).ln() + (1.0 - a) * ((1.0 - a) / (1.0 - b)).ln()) / std::f64::consts::LN_2;
-    assert!((e[0] - binary(0.7, 0.4)).abs() < 1e-9 && (e[1] - binary(0.5, 0.9)).abs() < 1e-9, "{e:?}");
+    let logs = |rows: &[[f64; 4]]| Array2::from_shape_fn((rows.len(), 4), |(r, c)| rows[r][c].ln());
+    let p = logs(&[[0.6, 0.2, 0.1, 0.1], [0.5, 0.25, 0.15, 0.1]]);
+    let other = logs(&[[0.6, 0.2, 0.15, 0.05], [0.5, 0.25, 0.05, 0.2]]);
+    let moved = logs(&[[0.3, 0.5, 0.1, 0.1], [0.9, 0.05, 0.03, 0.02]]);
+    let picks = [vec![0, 1], vec![]];
+    assert!(answer_kl_bits(&p, &p, &p, &picks).iter().all(|&e| e.abs() < 1e-12));
+    assert!(answer_kl_bits(&p, &other, &p, &picks).iter().all(|&e| e.abs() < 1e-12), "only unpicked tokens move");
+    let e = answer_kl_bits(&p, &moved, &p, &picks);
+    let kl = |a: &[f64], b: &[f64]| a.iter().zip(b).map(|(x, y)| x * (x / y).ln()).sum::<f64>() / std::f64::consts::LN_2;
+    assert!((e[0] - kl(&[0.6, 0.2, 0.2], &[0.3, 0.5, 0.2])).abs() < 1e-9, "the two answers and the rest: {e:?}");
+    assert!((e[1] - kl(&[0.5, 0.5], &[0.9, 0.1])).abs() < 1e-9, "no picks: the reference's first token and the rest: {e:?}");
 }
 
 /// A named group's use costs one name in the structure and its parts there none; its definition
@@ -1136,7 +1139,7 @@ fn produced_tables(weights: &Weights, block: &crate::graph::Block, sequences: &[
 
 /// A behavior over `sequences` with their counterfactuals.
 fn claims_behavior(sequences: &[Vec<u32>], cf: &[Vec<u32>]) -> Behavior {
-    let prompts = sequences.iter().zip(cf).map(|(s, c)| Prompt { text: String::new(), token_ids: s.clone(), target_positions: vec![s.len() - 1], counterfactual: Some(Counterfactual { text: String::new(), token_ids: c.clone() }), attention_block: Vec::new() }).collect();
+    let prompts = sequences.iter().zip(cf).map(|(s, c)| Prompt { text: String::new(), token_ids: s.clone(), target_positions: vec![s.len() - 1], answer_ids: Vec::new(), counterfactual: Some(Counterfactual { text: String::new(), token_ids: c.clone(), answer_ids: Vec::new() }), attention_block: Vec::new() }).collect();
     Behavior { id: "tiny".into(), model: "tiny".into(), family: String::new(), description: String::new(), frequency: None, prompts, split: "train".into(), model_accuracy: None }
 }
 
