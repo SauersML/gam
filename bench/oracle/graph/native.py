@@ -499,7 +499,7 @@ class Native:
         """Minimize mean(sigmoid(logits)) subject to max(KL_deleted, KL_random) <= target by Adam on the logits and dual
         ascent on the multiplier; forward(strengths, "zero" or "random") -> KL. Returns the final strengths."""
         logits = logits.clone().requires_grad_(True)
-        opt = torch.optim.Adam([logits], lr=TEACH_LR)
+        opt = torch.optim.Adam([logits], lr=TEACH_LR, eps=1e-15)  # the mean's gradient (about 1e-9 per strength) must not drown in eps
         mu = 0.0
         for step in range(steps):
             with torch.enable_grad():
