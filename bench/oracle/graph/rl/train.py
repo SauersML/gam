@@ -1290,7 +1290,7 @@ def main():
     ap.add_argument("--eval-every", type=int, default=0, help="rl2: evaluate every E training steps and at the end (0: only --mode eval)")
     ap.add_argument("--skip-first-eval", action="store_true", help="no evaluation at step 0 (the starting policy is evaluated once elsewhere, e.g. by its SFT run)")
     ap.add_argument("--eval-seed", type=int, default=1_000_003, help="the evaluation's seed (training steps use their index)")
-    ap.add_argument("--eval-behaviors", type=int, default=0, help="evaluate a fixed random subset of this many held-out tasks (0: all)")
+    ap.add_argument("--eval-behaviors", type=int, default=0, help="evaluate the first this many held-out tasks in text order (0: all)")
     ap.add_argument("--no-baselines", dest="baselines", action="store_false", help="skip scoring the baselines (the empty graph, VPD's answer, the search's) in evaluation")
     ap.add_argument("--data", nargs="*", help="sft: JSONL files of further examples ({'messages': [user, assistant]} or {'prompt', 'completion'})")
     ap.add_argument("--program-share", type=float, default=1.0, help="sft: probability that a batch example is a search answer rather than a --data example")
@@ -1360,8 +1360,8 @@ def main():
     root = Path(args.behaviors)
     pool = behaviors(root, args.model, "train")
     sets = {"heldout": behaviors(root, args.model, "heldout")}
-    if args.eval_behaviors:  # one fixed subset, the same at every evaluation
-        sets = {k: random.Random(args.seed).sample(v, min(args.eval_behaviors, len(v))) for k, v in sets.items()}
+    if args.eval_behaviors:  # the first N in text order (arbitrary Pile rows), the same at every evaluation and the ones the search answers first
+        sets = {k: sorted(v, key=lambda b: int(b["id"][4:]) if b["id"][4:].isdigit() else 0)[:args.eval_behaviors] for k, v in sets.items()}
     if args.swap_evidence:  # each held-out question reads the activations of the next held-out text at least as long, cut to its length
         held = sets["heldout"]
         pol.swap = {}
