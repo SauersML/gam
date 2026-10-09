@@ -1,7 +1,8 @@
-"""Checks of the RL scorer's checker path with a stand-in score.Checker (no binary): python test_scorer.py
+"""Checks of the RL scorer's checker path with a stand-in score.Checker (no binary), and of the evaluation, SFT data and
+vLLM wake around it: python test_scorer.py
 
-Programs keep their order across behaviors, workers and seeds; each behavior is loaded on the server
-that scores it, and each (behavior, seed) goes in one score_batch request."""
+Programs keep their order across tasks, workers and seeds; each task is loaded on the server that scores it, and each
+(task, seed) goes in one score_batch request."""
 
 from __future__ import annotations
 
@@ -27,11 +28,13 @@ class Checker:
 
     def score_batch(self, sources, experiments=32, seed=0, uniform_seeds=None, **options):
         calls.append((self.path, seed, len(sources)))
-        return [{"total_bits": len(x["source"]) + seed, "valid": True, "behavior": self.path} for x in sources]
+        return [{"total_bits": len(x) + seed, "valid": True, "behavior": self.path} for x in sources]
 
 
 def main():
-    sys.modules["score"] = types.SimpleNamespace(Checker=Checker)
+    import score
+
+    real, score.Checker = score.Checker, Checker
     scorer.WORKERS = 3
     items = [{"source": "x" * i, "behavior": {"model": "vpd4l", "path": f"b{i % 4}"}, "seed": 1 + i % 2} for i in range(16)]
     out = scorer.checker(items)
@@ -43,152 +46,81 @@ def main():
     assert [r["total_bits"] for r in scorer.checker(items)] == [i + 1 + i % 2 for i in range(16)]
     assert sorted(n for _, _, n in calls) == [1] * 4 + [3] * 4, calls
     scorer.BATCH = 4
-    check_repair()
+    score.Checker = real
     check_evaluate()
     check_sft_examples()
-    check_rescore()
-    check_valid_sampler()
-    check_redraws_share_wake()
-    print("ok: checker scorer order, behaviors and one batch per (behavior, seed); repair keeps a revision only when it lowers S; evaluation summary; SFT data uses each training behavior's best program only; rescore; valid answers kept first from one oversampled draw (one vLLM wake)")
-
-
-def check_repair():
-    """train.repair replaces a behavior's best program by a revision only when the revision is valid where
-    the best was not, or lowers S; the revision prompt carries the program and the checker's error."""
-    import train
-
-    shown = []
-    train.render = lambda b: f"input {b['id']}"
-    tok = types.SimpleNamespace(decode=lambda c, skip_special_tokens=True: f"```python\nX = {c[0]}\n```")
-    pol = types.SimpleNamespace(tok=tok, prompt_ids=lambda text: shown.append(text) or [0])
-    sampler = lambda prompts, n, adapter, version: [[[v] for v in (70, 30)] for _ in prompts]  # noqa: E731
-    score = lambda items: [{"valid": True, "total_bits": float(it["source"].split("=")[1])} for it in items]  # noqa: E731
-    best = [{"completion": [0], "text": "```python\nbad(\n```", "score": {"valid": False, "total_bits": 1e4, "error": "line 1: syntax error"}},
-            {"completion": [0], "text": "```python\nX = 10\n```", "score": {"valid": True, "total_bits": 10.0}}]
-    args = types.SimpleNamespace(repair=1, samples=2, uniform_seeds=0, experiments=16, seed=0, eval_seed=1_000_003)
-    replaced = train.repair([{"id": "a"}, {"id": "b"}], best, pol, sampler, score, args, Path("."), 0)
-    assert replaced == {0} and best[0]["score"]["total_bits"] == 30.0 and best[0]["completion"] == [30] and best[1]["score"]["total_bits"] == 10.0, (replaced, best)
-    assert "line 1: syntax error" in shown[0] and "bad(" in shown[0] and shown[0].startswith("input a")
+    check_share_wake()
+    print("ok: checker scorer order, tasks and one batch per (task, seed); evaluation ranks against VPD's answer; SFT data is the training tasks' teacher answers; one vLLM wake per sampling call")
 
 
 def check_evaluate():
-    """train.evaluate scores the policy's programs and the baselines under the evaluation seed only, and
-    its summary averages per set: mean single-sample S, best of N, each baseline over the behaviors that have it."""
+    """train.evaluate scores the policy's answers and the baselines under the evaluation seed only; per task its best
+    answer by score.order against VPD's (the teacher baseline): faithful when its KL is no larger, beating VPD when it
+    names fewer pairs too."""
     import io
     import json
+    import re
+    import tempfile
 
     import train
 
     seen = []
     train.render = lambda b: b["id"]
-    train.baselines = lambda b: {"empty": "X = 100"} if b["id"] == "a" else {}
-    tok = types.SimpleNamespace(decode=lambda c, skip_special_tokens=True: f"```python\nX = {c[0]}\n```")
+    train.baselines = lambda b: {"empty": "K = 100; P = 0", "teacher": "K = 5; P = 50"}
+    tok = types.SimpleNamespace(decode=lambda c, skip_special_tokens=True: f"```python\nK = {c[0]}; P = {c[1]}\n```")
     pol = types.SimpleNamespace(tok=tok, prompt_ids=lambda text: [0])
-    sampler = lambda prompts, n, adapter, version: [[[10], [30]] for _ in prompts]  # noqa: E731
+    answers = {"a": [[4, 40], [3, 60]], "b": [[6, 10], [9, 1]]}
+    sampler = lambda prompts, n, adapter, version: [answers["a"], answers["b"]]  # noqa: E731
 
     def score(items):
         seen.extend((it["seed"], it.get("experiments")) for it in items)
-        return [{"valid": True, "total_bits": float(it["source"].split("=")[1]), "exec_error_bits": float(it["source"].split("=")[1])} for it in items]
-
-    import tempfile
+        out = []
+        for it in items:
+            k, p = re.findall(r"\d+", it["source"])
+            out.append({"valid": True, "exec_error_bits": float(k), "pairs": int(p)})
+        return out
 
     train.ORACLE_RUNS = Path(tempfile.mkdtemp())
-    args = types.SimpleNamespace(samples=2, eval_seed=7, eval_experiments=16, baselines=True, run_name="t", out=tempfile.mkdtemp())
+    args = types.SimpleNamespace(samples=2, eval_seed=7, experiments=0, baselines=True, run_name="t", out=tempfile.mkdtemp())
     log = io.StringIO()
-    out = train.evaluate({"heldout_behaviors": [{"id": "a"}, {"id": "b"}], "heldout_prompts": []}, pol, sampler, score, args, Path("."), 0, log, 3)
-    s = out["heldout_behaviors"]
-    assert s["mean_bits"] == 20.0 and s["best_of_n_bits"] == 10.0 and s["baselines"]["empty"]["total_bits"] == 100.0, s
-    assert abs(s["best"]["reproduces"] - 0.9) < 1e-12 and s["valid_fraction"] == 1.0, s  # 1 - 10 / 100
-    best = json.loads((train.ORACLE_RUNS / "a.t.json").read_text())
-    assert best["score"]["total_bits"] == 10.0 and best["experiments"] == 16 and best["seed"] == 7
-    assert sum(1 for _ in open(Path(args.out) / "eval_samples.jsonl")) == 5  # 4 oracle programs + 1 baseline
-    assert "heldout_prompts" not in out
-    assert set(seen) == {(7, 16)}, seen
+    s = train.evaluate({"heldout": [{"id": "a"}, {"id": "b"}]}, pol, sampler, score, args, Path("."), 0, log, 3)["heldout"]
     rows = [json.loads(line) for line in log.getvalue().splitlines()]
-    assert [r.get("behavior") for r in rows[:2]] == ["a", "b"] and rows[-1]["step"] == 3
-
+    a, b = rows[0], rows[1]
+    assert a["faithful"] and a["beats_vpd"] and a["best"]["pairs"] == 40, a  # both answers as faithful as VPD: fewer pairs wins
+    assert not b["faithful"] and b["best"]["kl"] == 6.0 and b["best_excess_bits"] == 1.0, b  # the smaller excess wins
+    assert s["best_faithful"] == 0.5 and s["best_beats_vpd"] == 0.5 and s["best_pairs_over_vpd_when_faithful"] == 0.8, s
+    assert s["baselines"]["teacher"]["pairs"] == 50 and abs(a["best"]["reproduces"] - 0.96) < 1e-12, s
+    best = json.loads((train.ORACLE_RUNS / "a.t.json").read_text())
+    assert best["score"]["pairs"] == 40 and best["reference"]["pairs"] == 50 and best["seed"] == 7
+    assert set(seen) == {(7, 0)}, seen
+    assert rows[-1]["step"] == 3
 
 
 def check_sft_examples():
-    """sft_examples keeps each TRAINING behavior's lowest-S program and never a behavior outside the pool."""
+    """sft_examples: the teacher answer of every TRAINING task (never one outside the pool), with part addresses kept
+    as written, and --data examples."""
     import json
     import tempfile
 
     import train
 
     d = Path(tempfile.mkdtemp())
-    for name, behavior, bits, source in (("a1", "a", 50.0, "A1"), ("a2", "a", 20.0, "A2"), ("z", "z", 1.0, "Z")):
-        (d / f"{name}.json").write_text(json.dumps({"behavior": behavior, "source": source, "score": {"total_bits": bits}}))
     (d / "q.jsonl").write_text(json.dumps({"messages": [{"role": "user", "content": "Q"}, {"role": "assistant", "content": "ANS"}]}) + "\n")
+    train.TEACHER.clear()
+    train.TEACHER.update({"a": "```python\nA\n```", "z": "```python\nZ\n```"})
     train.render = lambda b: "input " + b["id"]
-    tok = types.SimpleNamespace(encode=lambda text, add_special_tokens=False: [len(text)] if "A1" not in text else [-1])
-    pol = types.SimpleNamespace(tok=tok, end=0, prompt_ids=lambda text: [hash(text) % 97])
-    args = types.SimpleNamespace(programs=[str(d / "*.json")], data=[str(d / "q.jsonl")], max_model_len=100)
+    tok = types.SimpleNamespace(encode=lambda text, add_special_tokens=False: [len(text)])
+    pol = types.SimpleNamespace(tok=tok, end=0, prompt_ids=lambda text: [hash(text) % 97], parts=None)
+    args = types.SimpleNamespace(data=[str(d / "q.jsonl")], max_model_len=100)
     programs, questions = train.sft_examples(args, pol, [{"id": "a"}, {"id": "b"}])
-    assert len(programs) == 1 and programs[0][1] == [len("```python\nA2\n```"), 0], programs
+    assert programs == [([hash("input a") % 97], [len("```python\nA\n```"), 0])], programs
     assert questions == [([hash("Q") % 97], [3, 0])], questions
+    train.TEACHER.clear()
 
 
-
-def check_rescore():
-    """train.rescore scores saved programs again with the given seed, experiments and checker options and
-    summarizes them against the rescored empty program."""
-    import json
-    import tempfile
-
-    import train
-
-    d = Path(tempfile.mkdtemp())
-    (d / "b.json").write_text(json.dumps({"id": "b", "model": "vpd4l", "prompts": []}))
-    rows = [{"set": "heldout_behaviors", "step": 0, "run": "r", "behavior": "b", "behavior_path": str(d / "b.json"), "program": p, "source": f"X = {v}", "score": {"total_bits": 0.0}}
-            for p, v in (("oracle", 10), ("oracle", 40), ("empty", 50))]
-    (d / "eval_samples.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
-    seen = []
-
-    def score(items):
-        seen.extend((it["seed"], it["experiments"], json.dumps(it["options"])) for it in items)
-        return [{"valid": True, "total_bits": 2 * float(it["source"].split("=")[1]), "exec_error_bits": 2 * float(it["source"].split("=")[1])} for it in items]
-
-    train.ir_signature = lambda source, explanation, model: source  # stand-in programs: each its own score
-    args = types.SimpleNamespace(samples_from=[str(d / "eval_samples.jsonl")], score_options='{"families": ["swap"]}', eval_seed=5, eval_experiments=16, out=str(d), rescore_tag="t",
-                                 behaviors=str(d), model="vpd4l", summary_only=False)
-    s = train.rescore(args, score)["heldout_behaviors/r"]
-    assert s["best_of_n_bits"] == 20.0 and s["baselines"]["empty"]["total_bits"] == 100.0 and abs(s["best"]["reproduces"] - 0.8) < 1e-12, s
-    assert set(seen) == {(5, 16, '{"families": ["swap"]}')}, seen
-    assert sum(1 for _ in open(d / "rescore_t.jsonl")) == 3
-
-
-
-def check_valid_sampler():
-    """ValidSampler draws n * (rounds + 1) per prompt in one call and keeps n per prompt, valid ones first, with their
-    log-probabilities; stats report the valid share of every draw and of the kept ones."""
-    import train
-
-    good = 'nodes = {"copy": {"subcomponents": ["<p:3.v.5>", "<p:3.o.7>"]}}\nedges = [("input", "copy"), ("copy", "output")]\n'
-    tok = types.SimpleNamespace(decode=lambda c, skip_special_tokens=True: good if c[0] > 0 else "nonsense(")
-    calls = []
-
-    class Inner:
-        def __call__(self, prompts, n, adapter, version):
-            calls.append((len(prompts), n))
-            out = [[[j % 3 == 2 and 1 or 0, j] for j in range(n)] for _ in prompts]  # every third draw valid
-            self.logprob_sums = [float(c[1]) for g in out for c in g]
-            self.token_logprobs = [[float(c[1])] * 2 for g in out for c in g]
-            return out
-
-    vs = train.ValidSampler(Inner(), tok, "vpd4l", 2)
-    out = vs([[0], [0]], 4, Path("."), 0)
-    assert calls == [(2, 12)], calls  # one call: 4 x (2 + 1) per prompt
-    assert all([c[1] for c in g] == [2, 5, 8, 11] for g in out), out  # the valid draws, in order
-    assert vs.logprob_sums == [2.0, 5.0, 8.0, 11.0] * 2 and vs.token_logprobs[1] == [5.0, 5.0], vs.logprob_sums
-    assert abs(vs.stats["first_valid"] - 1 / 3) < 1e-9 and vs.stats["final_valid"] == 1.0 and vs.stats["drawn"] == 24, vs.stats
-    out = train.ValidSampler(Inner(), tok, "vpd4l", 0)([[0]], 4, Path("."), 0)
-    assert [c[1] for c in out[0]] == [2, 0, 1, 3]  # too few valid: the valid one, then invalid ones in order
-
-
-def check_redraws_share_wake():
-    """With one GPU, the oversampled draw runs inside one vLLM wake: one generate call, the trainer moved to the host
-    and back once (a stand-in engine records the moves)."""
+def check_share_wake():
+    """With one GPU, a sampling call runs inside one vLLM wake: one generate call, the trainer moved to the host and back
+    once (a stand-in engine records the moves)."""
     import train
 
     events = []
@@ -217,16 +149,14 @@ def check_redraws_share_wake():
     try:
         inner = train.VllmSampler(types.SimpleNamespace(share_gpu=True, max_tokens=8), 4, 0)
         inner.llm, inner.policy = Engine(), types.SimpleNamespace(model=Model(), dev="cuda:0")
-        good = 'nodes = {"copy": {"subcomponents": ["<p:3.v.5>", "<p:3.o.7>"]}}\nedges = [("input", "copy"), ("copy", "output")]\n'
-        tok = types.SimpleNamespace(decode=lambda c, skip_special_tokens=True: "nonsense(" if c[0] == 1 else good)
-        train.ValidSampler(inner, tok, "vpd4l", 2)([[0], [0]], 2, Path("."), 0)
+        inner([[0], [0]], 2, Path("."), 0)
     finally:
         for k, v in saved.items():
             if v is None:
                 sys.modules.pop(k, None)
             else:
                 sys.modules[k] = v
-    assert events == ["to cpu", "wake", "generate 2x6", "sleep", "to cuda:0"], events
+    assert events == ["to cpu", "wake", "generate 2x2", "sleep", "to cuda:0"], events
 
 
 if __name__ == "__main__":
