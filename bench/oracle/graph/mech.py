@@ -406,7 +406,8 @@ def _trace(source: str, model: str, behavior: dict | None = None) -> dict:
         exec(compile(tree, "<explanation>", "exec"), namespace)
         if callable(namespace.get("on")):  # a gate program: what acts where, wired as the model
             nodes = gates(namespace["on"], model, behavior)
-            ir.update(nodes=nodes, wiring="model", edges=[] if nodes else [{"from": "embed", "to": "logits", "route": "input"}])
+            ir.update(nodes=nodes, wiring="model", edges=[] if nodes else [{"from": "embed", "to": "logits", "route": "input"}],
+                      standin=None)  # what the unnamed subcomponents carry is the scorer's choice
             ir["valid"] = True
             return ir
         if "nodes" not in namespace or "edges" not in namespace:

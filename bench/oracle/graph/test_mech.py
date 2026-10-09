@@ -112,7 +112,7 @@ def on(tokens, targets):
 def test_a_gate_program_names_what_acts_where():
     ir = mech._trace(GATES, "vpd4l", BEHAVIOR)
     assert ir["valid"], ir["error"]
-    assert ir["wiring"] == "model" and ir["edges"] == []
+    assert ir["wiring"] == "model" and ir["edges"] == [] and ir["standin"] is None
     mlp, attn = ir["nodes"]
     assert [p["kind"] for p in mlp["pieces"]] == ["c_fc", "down_proj"] and [p["kind"] for p in attn["pieces"]] == ["v_proj", "o_proj"]
     assert [s["positions"] for s in mlp["at"]] == [[], [], [1], []], "the changed token, in the one sequence holding it"

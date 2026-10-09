@@ -135,11 +135,10 @@ def baselines(b: dict) -> dict:
 
 
 def empty_ir(model: str) -> dict:
-    """The IR naming nothing (e2e/explain.ir of no units)."""
-    sys.path.insert(0, str(HERE.parent / "e2e"))
-    import explain
-
-    return explain.ir([], model)
+    """The IR naming nothing (mech.gates of a program returning no gates): the embedding alone reaches the logits."""
+    return {"model": model, "decomposition": "vpd", "nodes": [], "edges": [{"from": "embed", "to": "logits", "route": "input"}],
+            "wiring": "model", "standin": None, "alignments": [], "groups": [], "python_tokens": 0, "token_types": 0,
+            "source": "", "valid": True, "error": None}
 
 
 def load_parts(spec: str, init: str | None, model, base_vocab: int, dev):
@@ -1220,14 +1219,12 @@ ORACLE_RUNS = Path.home() / "mpd-data/graph_oracle/runs/oracle"
 
 
 def shares(x: dict, empty: dict | None) -> dict:
-    """An answer in the reporting terms: reproduces = 1 - its execution error / nothing named's (the share of the behavior
-    kept when every other subcomponent runs on the changed prompt), removes = 1 - its necessity error / nothing named's
-    (the share lost when only its subcomponents run on the changed prompt), size = its subcomponents; both errors on the
-    same experiments. Nothing named is the denominator only, never a bar."""
-    def share(key):
-        return 1.0 - x[key] / empty[key] if empty and empty.get(key) and x.get(key) is not None else None
-
-    return {"reproduces": share("exec_error_bits"), "removes": share("necessity_error_bits"), "size": x.get("parts")}
+    """An answer in the reporting terms: reproduces = 1 - its KL from the model / nothing named's (the share of the
+    prediction its circuit keeps with every other subcomponent deleted), kl = that KL in bits, pairs = the (subcomponent,
+    position) pairs it names. Nothing named is the denominator only, never a bar."""
+    kl = x.get("exec_error_bits")
+    reproduces = 1.0 - kl / empty["exec_error_bits"] if empty and empty.get("exec_error_bits") and kl is not None else None
+    return {"reproduces": reproduces, "kl": kl, "pairs": x.get("pairs", x.get("parts"))}
 
 
 def summarize(name: str, step: int, groups: list[tuple[dict, list, dict]], log) -> dict:
@@ -1250,12 +1247,12 @@ def summarize(name: str, step: int, groups: list[tuple[dict, list, dict]], log) 
         per = [shares(x, empty) for (_, x), ok in zip(mine, valid) if ok]
         row = {"set": name, "step": step, "behavior": b["id"], "valid_fraction": float(valid.mean()), "mean_bits": float(S.mean()),
                "best_bits": float(S[j]) if j is not None else None, "best": shares(mine[j][1], empty) if j is not None else None,
-               "mean_valid": {k: mean([q[k] for q in per]) for k in ("reproduces", "removes", "size")} if per else None,
+               "mean_valid": {k: mean([q[k] for q in per]) for k in ("reproduces", "kl", "pairs")} if per else None,
                "baselines": {n: {"total_bits": x["total_bits"], **shares(x, empty)} for n, x in base.items()}, "best_source": mine[j][0] if j is not None else None}
         rows.append(row)
         log.write(json.dumps(row) + "\n")
     names = sorted({n for _, _, base in groups for n in base})
-    keys = ("reproduces", "removes", "size")
+    keys = ("reproduces", "kl", "pairs")
     return {"behaviors": len(rows), "valid_fraction": mean([r["valid_fraction"] for r in rows]), "mean_bits": mean([r["mean_bits"] for r in rows]),
             "best_of_n_bits": mean([r["best_bits"] for r in rows]), "behaviors_with_a_valid_answer": sum(r["best"] is not None for r in rows),
             "best": {k: mean([r["best"][k] for r in rows if r["best"]]) for k in keys},

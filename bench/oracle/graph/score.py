@@ -1,9 +1,14 @@
-"""One call: an explanation (format v4 source through mech's tracer, or its IR) and a behavior -> every score term in
-bits, from the Rust checker (crates/gam-mpd/examples/mpd_graph_2951.rs, a JSON-lines server).
+"""One call: an explanation (a gate program through mech's tracer, or its IR) and a task -> its score in bits, from the
+Rust checker (crates/gam-mpd/examples/mpd_graph_2951.rs, a JSON-lines server).
+
+An explanation names a circuit: which subcomponents act at which positions (mech.gates). Every subcomponent it leaves
+out is deleted (VPD's ablation), and its total is the KL in bits of the model's next-token distribution at the task's
+targets from the circuit's (exec_error_bits, summed over targets) plus PAIR_BITS per (subcomponent, position) pair it
+names (pairs): a subcomponent at a position is worth naming when it cuts that KL by more than PAIR_BITS.
 
     from score import Checker
     with Checker("vpd4l") as c:
-        c.behavior("~/mpd-data/graph_oracle/behaviors_v3/vpd4l/quote_close.said.json")
+        c.behavior("~/mpd-data/graph_oracle/texts/vpd4l/text9000.json")
         print(c.score(open("explanation.py").read()))
 """
 import json
@@ -16,11 +21,23 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 EXPORTS = {"vpd4l": Path.home() / "mpd-data/engine/vpd4l"}
 VIEWS = {"vpd4l": {"vpd": Path.home() / "mpd-data/engine/vpd4l_decomposition"}}
-METRIC = "choice"  # the behavior is the model's choice between the prompt's answer and the changed prompt's
+METRIC = "full"  # the model's whole next-token distribution
+PAIR_BITS = 0.01  # bits per (subcomponent, position) pair a circuit names
 # The published checker build (each release build of the graph checker is copied there).
 PUBLISHED = Path.home() / "mpd-data/graph_oracle/bin/mpd_graph_2951"
 # On MATS (mats-run with MATS_BUILD=1) or a pod: the job's own build, $MPD_BIN/mpd_graph_2951 (Linux, CUDA with device "gpu").
 BINARY = Path(os.environ.get("GRAPH_CHECKER") or (Path(os.environ["MPD_BIN"]) / "mpd_graph_2951" if os.environ.get("MPD_BIN") else PUBLISHED))
+
+
+def pairs(ir: dict) -> int:
+    """The (subcomponent, position) pairs an IR's circuit names: per node its subcomponents times the positions it acts
+    at over every sequence (a node without positions acts at all of them, counted as one each)."""
+    total = 0
+    for node in ir.get("nodes", []):
+        count = sum(len(p["index"]) if isinstance(p.get("index"), list) else 1 for p in node["pieces"])
+        at = node.get("at") or []
+        total += count * (sum(len(s["positions"]) for s in at) if at else 1)
+    return total
 
 
 class Checker:
@@ -67,21 +84,26 @@ class Checker:
         by prompt.split_answer). An untraceable source is scored as naming nothing, flagged invalid."""
         return self.score_batch([program], experiments, seed, N, stand_in, metric=metric)[0]
 
-    def score_batch(self, programs, experiments=32, seed=0, N=None, stand_in="counterfactual", uniform_seeds=None, options=None, metric=None):
+    def score_batch(self, programs, experiments=0, seed=0, N=None, stand_in="delete", uniform_seeds=None, options=None, metric=None):
         """score() for many programs of the current behavior under one seed, in one checker request (the server runs M
         once per experiment it has not cached and the programs in parallel). uniform_seeds m: the experiments are drawn
         from seed mod m, so m collections recur across a caller's seeds. options: further request keys passed to the
-        server as they are (e.g. {"necessity": False}). stand_in: what the parts a program does not name carry when its
-        IR names none: "counterfactual" (their values on the prompt's changed prompt) or "delete" (VPD's ablation).
-        metric: "choice" (METRIC: each error compares the model's choice between the prompt's answer and the changed
-        prompt's), "answer" (the distribution over those answers and any other token) or "full" (the whole next-token
-        distribution)."""
+        server as they are). stand_in: what the subcomponents a program does not name carry: "delete" (VPD's ablation)
+        or "counterfactual". metric: "full" (METRIC) or the checker's others. Each score's total_bits is
+        exec_error_bits + PAIR_BITS * pairs (the checker's own total kept as checker_total_bits); necessity runs are
+        off unless options turn them on."""
         irs = [self.ir(p) for p in programs]
         request = {"op": "score", "programs": irs, "experiments": experiments, "seed": seed, "routing": "edges", "N": N,
-                   "reader_top": 0, "stand_in": stand_in, "metric": metric or METRIC, **(options or {})}
+                   "reader_top": 0, "stand_in": stand_in, "metric": metric or METRIC, "necessity": False, **(options or {})}
         if uniform_seeds:
             request["uniform_seeds"] = uniform_seeds
-        return self.request(request)["scores"]
+        scores = self.request(request)["scores"]
+        for s, ir in zip(scores, irs):
+            s["pairs"] = pairs(ir)
+            s["checker_total_bits"] = s.get("total_bits")
+            if s.get("valid", True):
+                s["total_bits"] = s["exec_error_bits"] + PAIR_BITS * s["pairs"]
+        return scores
 
     def ir(self, program):
         """The IR of a program (source, IR, or {"source", "explanation"}), carrying its explanation's length."""

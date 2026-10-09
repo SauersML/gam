@@ -1,11 +1,12 @@
-"""The graph oracle's input (#2951): the ask and the behavior's sequences, nothing else. The oracle answers with a gate
-program (mech.gates): Python defining on(tokens, targets), the subcomponents acting at each position of a sequence.
+"""The graph oracle's input (#2951): the ask and the text, nothing else. The oracle answers with a gate program
+(mech.gates): Python defining on(tokens, targets), the subcomponents acting at each position, the circuit that computes
+the model's prediction at the targets.
 
-A behavior is shown as what on() receives for a few of its prompts and their changed prompts (the token strings and
-the positions whose next token is asked), with the model's most probable next tokens there. A text example
-(activity()) asks instead which subcomponents act most strongly at each position of a stretch of text.
+A task (text.py) is shown as what on() receives, the token strings and the positions whose next token is asked, with
+the model's most probable next tokens there. A text example (activity()) asks instead which subcomponents act most
+strongly at each position.
 
-  prompt.py BEHAVIOR.json [--prompts 6]      prints the prompt
+  prompt.py TASK.json      prints the prompt
 """
 
 from __future__ import annotations
@@ -21,9 +22,9 @@ sys.path.insert(0, str(HERE))
 
 import mech  # noqa: E402
 
-ASK = ("Which of {model}'s subcomponents, at which positions, make it predict what it does on these sequences rather "
-       "than on their changed versions? Answer with a Python function on(tokens, targets) returning, for each position, "
-       "the subcomponents acting there.")
+ASK = ("Which of {model}'s subcomponents, at which positions, compute its prediction of the next token at the targets "
+       "of this text? Answer with a Python function on(tokens, targets) returning, for each position, the subcomponents "
+       "acting there.")
 ACTIVITY = "Which of {model}'s subcomponents act most strongly at each position of this sequence? Answer with on(tokens, targets)."
 
 
@@ -38,16 +39,10 @@ def line(model: str, ids: list[int], targets: list[int], top: list) -> str:
     return f"tokens = {tokens_of(model, ids)!r}, targets = {targets!r} -> {nexts}"
 
 
-def render(behavior: dict, prompts: int = 6) -> str:
-    """The oracle's prompt for `behavior`: the ask, then its first `prompts` prompts and their changed prompts."""
-    model = behavior["model"]
-    out = [ASK.format(model=model)]
-    for p in behavior["prompts"][:prompts]:
-        out.append(line(model, p["token_ids"], p["target_positions"], p["model_top"]))
-        cf = p.get("counterfactual")
-        if cf and cf.get("model_top"):
-            out.append("changed: " + line(model, cf["token_ids"], p["target_positions"], cf["model_top"]))
-    return "\n".join(out)
+def render(task: dict) -> str:
+    """The oracle's prompt for a task: the ask, then each of its texts as on() receives it."""
+    model = task["model"]
+    return "\n".join([ASK.format(model=model)] + [line(model, p["token_ids"], p["target_positions"], p["model_top"]) for p in task["prompts"]])
 
 
 def activity(model: str, ids: list[int]) -> str:
@@ -76,10 +71,9 @@ def program_of(answer: str) -> str:
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("behavior", type=Path)
-    ap.add_argument("--prompts", type=int, default=6)
+    ap.add_argument("task", type=Path)
     a = ap.parse_args()
-    print(render(json.loads(a.behavior.read_text()), a.prompts))
+    print(render(json.loads(a.task.read_text())))
 
 
 if __name__ == "__main__":
