@@ -213,7 +213,7 @@ def check_registry_parts(base: Path):
             once = causal(input_ids=ids).logits
     assert torch.allclose(plain, once, atol=1e-6)
     text = '```python\nnodes = {"copy": {"subcomponents": ["<p:2.v.7>", "<p:0.fc.12>"]}}\nedges = [("input", "copy"), ("copy", "output")]\n```\nThe value head.'
-    it = train.item(text, {}, 0, 0)  # part tokens reach the checker as written
+    it = train.item(text, {}, 0)  # part tokens reach the scorer as written
     assert '["<p:2.v.7>", "<p:0.fc.12>"]' in it["source"] and it["explanation"] == "The value head."
     assert pol.parts.reg.rewrite("node(PD[1].v_proj[3], PD.vpd[2].v_proj[7])") == "node(<p:1.v.3>, <p:2.v.7>)"  # either spelling
     assert pol.tok.decode([first + 4]) == "<p:0.fc.12>"
@@ -304,10 +304,10 @@ def check_ppo(pol):
 
 ANSWER = """I look at the previous token.
 ```python
-def on(tokens, targets):
-    return {t: ["<p:2.v.559>", "<p:2.o.735>"] for t in targets}
+def graph(tokens, targets):
+    return {(targets[0], "<p:2.o.735>"): {targets[0] - 1: ["<p:2.v.559>", "<p:2.v.9>"]}, "out": ["<p:2.o.735>"]}
 ```
-The answer is copied by layer 2's value and output parts."""
+Layer 2's attention output at the target reads two values at the previous token."""
 
 
 def check_credit_advantages(pol):
@@ -316,8 +316,8 @@ def check_credit_advantages(pol):
     tok = pol.tok
     source = train.split_answer(ANSWER)[0]
     assert ANSWER[train.program_offset(ANSWER, source):].startswith(source)
-    v, o = source.index('"<p:2.v.559>"'), source.index('"<p:2.o.735>"')
-    signs = {(v, v + len('"<p:2.v.559>"')): 1, (o, o + len('"<p:2.o.735>"')): -1}
+    v, o = source.index('"<p:2.v.559>"'), source.index('"<p:2.v.9>"')
+    signs = {(v, v + len('"<p:2.v.559>"')): 1, (o, o + len('"<p:2.v.9>"')): -1}
     canonical = tok.encode(ANSWER, add_special_tokens=False) + [pol.end]
     chars = [i for ch in ANSWER for i in tok.encode(ch, add_special_tokens=False)] + [pol.end]
     assert chars != canonical[: len(chars)]
@@ -331,7 +331,7 @@ def check_credit_advantages(pol):
                 assert a == -0.25
             elif c1 > offset + v and c0 < offset + v + len('"<p:2.v.559>"'):
                 assert a == 1, (ANSWER[c0:c1], a)
-            elif c1 > offset + o and c0 < offset + o + len('"<p:2.o.735>"'):
+            elif c1 > offset + o and c0 < offset + o + len('"<p:2.v.9>"'):
                 assert a == -1, (ANSWER[c0:c1], a)
             else:
                 assert a == -0.25, (ANSWER[c0:c1], a)
@@ -348,15 +348,9 @@ def check_rl2_pieces():
     seeds = [train.step_seed(args, s) for s in range(10)]
     assert len(set(seeds)) == 10 and 5 not in seeds
     assert train.step_seed(argparse.Namespace(seed=1, eval_seed=5), 0) == 1 << 20
-    refs = train.References({"a": "x"})
-    entries = refs.items([{"id": "a", "model": "vpd4l"}, {"id": "b", "model": "vpd4l"}], 0, 0)
-    assert [bid for bid, _ in entries] == ["a"]  # only a task with a teacher answer has a reference
-    refs.take(entries, [{"valid": True, "exec_error_bits": 0.5, "pairs": 10}])
-    assert refs.items([{"id": "a", "model": "vpd4l"}], 1, 0) == []  # scored once
-    assert refs.order("a", {"valid": True, "exec_error_bits": 0.4, "pairs": 7}) == (0, 0.0, 7)
-    assert refs.order("a", {"valid": True, "exec_error_bits": 0.75, "pairs": 2}) == (0, 0.25, 2)
-    assert refs.order("b", {"valid": True, "exec_error_bits": 0.75, "pairs": 2}) == (0, 0.75, 2)
-    assert refs.order("a", {"valid": False}) == (1, math.inf, math.inf)
+    assert train.key({"eps": 0.5}, {"valid": True, "kl_bits": 0.4, "size": 7}) == (0, 0.0, 7)
+    assert train.key({"eps": 0.5}, {"valid": True, "kl_bits": 0.75, "size": 2}) == (0, 0.25, 2)
+    assert train.key({"eps": 0.5}, {"valid": False}) == (1, math.inf, math.inf)
     import json
 
     with tempfile.TemporaryDirectory() as d:  # teacher_v3.py's manifest, written on another machine; the held-out refusal
@@ -376,31 +370,31 @@ def check_rl2_pieces():
 
 def check_rl2_step(pol):
     """A whole rl2 step on stand-ins: a sampler that writes fixed answers and a stand-in score (KL 10 bits per needed
-    subcomponent missing, pairs the names; invalid when it names none). Task "x" gets answers of different ranks, "y"
-    only invalid ones (dropped, refilled by "z"); credit marks tokens, refine drops what the best answers name
-    needlessly (expert iteration), and the PPO epochs and the expert-iteration step run."""
+    parent missing, size the parents; invalid without parents). Question "x" gets answers of different ranks, "y" only
+    invalid ones (dropped, refilled by "z"); credit marks tokens, refine drops the parents the best answers do not
+    need (expert iteration), and the PPO epochs and the expert-iteration step run."""
     import json
     import re
 
     import numpy as np
 
-    needed = {"<p:2.v.559>", "<p:2.o.735>", "<p:2.v.9>"}
+    needed = {"<p:2.v.559>", "<p:2.v.9>", "<p:2.v.11>"}
 
-    def named_in(source):
-        return set(re.findall(r"<p:[^>]+>", source))
+    def named_in(source):  # the parents (the reader "<p:2.o.735>" excluded)
+        return set(re.findall(r"<p:[^>]+>", source)) - {"<p:2.o.735>"}
 
     def stand_in(items):
         out = []
         for it in items:
             named = named_in(it["source"])
-            out.append({"exec_error_bits": 10.0 * len(needed - named), "pairs": len(named), "valid": bool(named)})
+            out.append({"kl_bits": 10.0 * len(needed - named), "size": len(named), "valid": bool(named)})
         return out
 
     def answer_with(parts):
-        return ANSWER.replace('"<p:2.v.559>", "<p:2.o.735>"', ", ".join(f'"{p}"' for p in parts))
+        return ANSWER.replace('"<p:2.v.559>", "<p:2.v.9>"', ", ".join(f'"{p}"' for p in parts))
 
-    texts = {"x": [answer_with(["<p:2.v.559>", "<p:2.o.735>", "<p:2.v.9>", "<p:3.o.1>"]), answer_with(["<p:2.v.559>"]), answer_with(["<p:2.v.559>", "<p:3.o.1>"]), answer_with([])],
-             "y": [answer_with([])] * 4, "z": [answer_with(["<p:2.v.9>"]), answer_with(["<p:2.v.9>", "<p:2.o.735>"]), answer_with(["<p:2.v.9>"]), answer_with([])]}
+    texts = {"x": [answer_with(["<p:2.v.559>", "<p:2.v.11>", "<p:2.v.9>", "<p:2.v.1>"]), answer_with(["<p:2.v.559>"]), answer_with(["<p:2.v.559>", "<p:2.v.1>"]), answer_with([])],
+             "y": [answer_with([])] * 4, "z": [answer_with(["<p:2.v.9>"]), answer_with(["<p:2.v.9>", "<p:2.v.11>"]), answer_with(["<p:2.v.9>"]), answer_with([])]}
     asked = []
 
     def sampler(prompts, n, adapter, version):
@@ -416,10 +410,9 @@ def check_rl2_step(pol):
     try:
         with tempfile.TemporaryDirectory() as d:
             logs = {k: open(Path(d) / f"{k}.jsonl", "w") for k in ("train", "samples", "improved")}
-            args = argparse.Namespace(seed=0, eval_seed=1_000_003, samples=4, experiments=4, credit=16, credit_answers=0, refill=1, refine=3, behaviors_per_step=2, beta=0.0,
+            args = argparse.Namespace(seed=0, eval_seed=1_000_003, samples=4, credit=16, credit_answers=0, refill=1, refine=3, behaviors_per_step=2, beta=0.0,
                                       micro=2, ppo_epochs=2, clip=0.2, clip_high=0.28, dual_clip=3.0, tis_cap=2.0, exit_beta=0.1)
-            pool = [{"id": "x", "model": "vpd4l"}, {"id": "y", "model": "vpd4l"}, {"id": "z", "model": "vpd4l"}]
-            refs = train.References({"x": answer_with(sorted(needed)), "y": answer_with(sorted(needed))})
+            pool = [{"id": "x", "model": "vpd4l", "eps": 0.0}, {"id": "y", "model": "vpd4l", "eps": 0.0}, {"id": "z", "model": "vpd4l", "eps": 0.0}]
             rec = Recorder(pol.params)
             for p in pol.params:
                 torch.nn.init.normal_(p, std=0.02)
@@ -427,20 +420,19 @@ def check_rl2_step(pol):
             first = {}
             for step in range(64):  # the first step that draws x and y
                 if set(random_pick(pool, args, step)) == {"x", "y"}:
-                    first = train.rl2_step(step, args, pol, sampler, stand_in, refs, pool, Path(d), train.Learner(pol, rec, NoWarmup()), logs, 0.0)
+                    first = train.rl2_step(step, args, pol, sampler, stand_in, pool, Path(d), train.Learner(pol, rec, NoWarmup()), logs, 0.0)
                     break
             assert first, "no step draws x and y"
             assert first["groups"] == 3 and first["kept"] == 2 and first["refills"] == 1 and asked[-1] == "z", (first, asked)
-            assert sorted(refs.score) == ["x", "y"] and refs.score["x"]["pairs"] == 3 and refs.score["x"]["exec_error_bits"] == 0.0  # z has no teacher
             assert first["improved"] >= 1 and len(first["loss"]) == 2 and "exit_sft_loss" in first, first
             assert first["repeated_scores"] > 0, first  # refinement starts from an answer the credit scored
-            texts3 = [answer_with(["<p:2.v.559>", "<p:2.o.735>"]), answer_with(["<p:2.v.559>"]), answer_with(["<p:2.v.559>", "<p:3.o.1>"]), answer_with(["<p:2.o.735>"])]
-            items = [train.item(t, pool[0], 0, 4) for t in texts3]
+            texts3 = [answer_with(["<p:2.v.559>", "<p:2.v.11>"]), answer_with(["<p:2.v.559>"]), answer_with(["<p:2.v.559>", "<p:2.v.1>"]), answer_with(["<p:2.o.735>"])]
+            items = [train.item(t, pool[0], 0) for t in texts3]
             sc3 = stand_in(items)
-            keys = [refs.order("x", x) for x in sc3]
+            keys = [train.key(pool[0], x) for x in sc3]
             grp = {"behavior": pool[0], "completions": [pol.tok.encode(t, add_special_tokens=False) for t in texts3], "texts": texts3, "items": items, "scores": sc3,
                    "keys": keys, "valid": np.array([x["valid"] for x in sc3]), "advantage": np.zeros(4), "token_advantages": [[0.0]] * 4, "credit": [None] * 4}
-            train.credit_groups([grp], 0, argparse.Namespace(**{**vars(args), "credit_answers": 2}), pol.tok, stand_in, refs, {"credit": 0.0})
+            train.credit_groups([grp], 0, argparse.Namespace(**{**vars(args), "credit_answers": 2}), pol.tok, stand_in, {"credit": 0.0})
             best = min(range(4), key=keys.__getitem__)
             assert sum(c is not None for c in grp["credit"]) == 2 and grp["credit"][best] is not None, grp["credit"]  # the best and one other
             assert len(rec.grads) == 3  # two PPO epochs and the expert-iteration step
@@ -452,10 +444,10 @@ def check_rl2_step(pol):
             improved = [json.loads(line) for line in open(Path(d) / "improved.jsonl")]
             assert all(r["key"] < r["sampled_key"] for r in improved), improved
             assert any(named_in(train.split_answer(r["text"])[0]) == needed for r in improved if r["behavior"] == "x"), improved
-            assert np.isfinite(first["mean_kl"]) and first["best_faithful"] > 0
+            assert np.isfinite(first["mean_kl"]) and first["best_correct"] > 0
             logs2 = {k: open(Path(d) / f"async_{k}.jsonl", "w") for k in ("train", "samples", "improved")}
             asked.clear()
-            train.rl2_async(argparse.Namespace(**{**vars(args), "steps": 3, "async_rollouts": True}), pol, sampler, stand_in, refs, pool, Path(d), train.Learner(pol, rec, NoWarmup()),
+            train.rl2_async(argparse.Namespace(**{**vars(args), "steps": 3, "async_rollouts": True}), pol, sampler, stand_in, pool, Path(d), train.Learner(pol, rec, NoWarmup()),
                             logs2, 0.0, lambda: False)
             for f in logs2.values():
                 f.close()

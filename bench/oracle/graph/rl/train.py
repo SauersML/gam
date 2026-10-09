@@ -661,12 +661,12 @@ def expert_iteration(groups: list[dict], step: int, args, pol, score, clock: dic
         def run(sources, b=b):
             return score([edit_item(x, b, seed) for x in sources])
 
-        best, key, dropped = timed(clock, "refine", edits.refine, src, run, lambda s, b=b: key(b, s), args.refine, args.credit, random.Random(seed * 1009 + g))
+        best, best_key, dropped = timed(clock, "refine", edits.refine, src, run, lambda s, b=b: key(b, s), args.refine, args.credit, random.Random(seed * 1009 + g))
         if not dropped:
             continue
         new = text[:offset] + best + text[offset + len(src) :]
         out.append({"behavior": b["id"], "prompt": grp["prompt"], "improved": pol.tok.encode(new, add_special_tokens=False) + [pol.end], "sampled": grp["completions"][j],
-                    "text": new, "key": list(key), "sampled_key": list(grp["keys"][j]), "dropped": dropped})
+                    "text": new, "key": list(best_key), "sampled_key": list(grp["keys"][j]), "dropped": dropped})
     return out
 
 

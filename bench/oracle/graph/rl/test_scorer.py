@@ -1,8 +1,7 @@
-"""Checks of the RL scorer's checker path with a stand-in score.Checker (no binary), and of the evaluation, SFT data and
+"""Checks of the RL scorer's native path with a stand-in score.Scorer (no model), and of the evaluation, SFT data and
 vLLM wake around it: python test_scorer.py
 
-Programs keep their order across tasks, workers and seeds; each task is loaded on the server that scores it, and each
-(task, seed) goes in one score_batch request."""
+Answers keep their order across tasks and seeds, and each (task, seed) goes to the scorer in one call."""
 
 from __future__ import annotations
 
@@ -16,47 +15,36 @@ import scorer  # noqa: E402
 calls = []
 
 
-class Checker:
-    def __init__(self, model, export=None, memory_gib=None, views=None):
-        self.model, self.path = model, None
+class Scorer:
+    def __init__(self, dev=None):
+        pass
 
-    def request(self, message):
-        self.path = message["path"]
-
-    def behavior(self, path):  # score.Checker.behavior: the server's default site-operation manifest
-        self.request({"op": "behavior", "path": path})
-
-    def score_batch(self, sources, experiments=32, seed=0, uniform_seeds=None, **options):
-        calls.append((self.path, seed, len(sources)))
-        return [{"total_bits": len(x) + seed, "valid": True, "behavior": self.path} for x in sources]
+    def score(self, task, sources, seed=0):
+        calls.append((task["path"], seed, len(sources)))
+        return [{"kl_bits": len(x) + seed, "size": 1, "valid": True, "task": task["path"]} for x in sources]
 
 
 def main():
     import score
 
-    real, score.Checker = score.Checker, Checker
-    scorer.WORKERS = 3
+    real, score.Scorer = score.Scorer, Scorer
     items = [{"source": "x" * i, "behavior": {"model": "vpd4l", "path": f"b{i % 4}"}, "seed": 1 + i % 2} for i in range(16)]
-    out = scorer.checker(items)
-    assert [r["total_bits"] for r in out] == [i + 1 + i % 2 for i in range(16)]
-    assert [r["behavior"] for r in out] == [f"b{i % 4}" for i in range(16)]
+    out = scorer.native(items)
+    assert [r["kl_bits"] for r in out] == [i + 1 + i % 2 for i in range(16)]
+    assert [r["task"] for r in out] == [f"b{i % 4}" for i in range(16)]
     assert sorted(calls) == sorted({(f"b{i % 4}", 1 + i % 2, 4) for i in range(16)}), calls
-    calls.clear()
-    scorer.BATCH = 3  # a request holds at most BATCH programs
-    assert [r["total_bits"] for r in scorer.checker(items)] == [i + 1 + i % 2 for i in range(16)]
-    assert sorted(n for _, _, n in calls) == [1] * 4 + [3] * 4, calls
-    scorer.BATCH = 4
-    score.Checker = real
+    score.Scorer = real
+    scorer._SCORER.clear()
     check_evaluate()
     check_sft_examples()
     check_share_wake()
-    print("ok: checker scorer order, tasks and one batch per (task, seed); evaluation ranks against VPD's answer; SFT data is the training tasks' teacher answers; one vLLM wake per sampling call")
+    print("ok: native scorer order, one call per (task, seed); evaluation ranks answers at each question's precision; SFT data is the training questions' teacher graphs; one vLLM wake per sampling call")
 
 
 def check_evaluate():
-    """train.evaluate scores the policy's answers and the baselines under the evaluation seed only; per task its best
-    answer by score.order against VPD's (the teacher baseline): faithful when its KL is no larger, beating VPD when it
-    names fewer pairs too."""
+    """train.evaluate scores the policy's answers and the baselines under the evaluation seed only; per question its best
+    answer by score.order at the question's eps: correct when its KL is at most eps, beating the teacher when it is
+    smaller too."""
     import io
     import json
     import re
@@ -66,33 +54,33 @@ def check_evaluate():
 
     seen = []
     train.render = lambda b: b["id"]
-    train.baselines = lambda b: {"empty": "K = 100; P = 0", "teacher": "K = 5; P = 50"}
-    tok = types.SimpleNamespace(decode=lambda c, skip_special_tokens=True: f"```python\nK = {c[0]}; P = {c[1]}\n```")
+    train.baselines = lambda b: {"empty": "K = 100; S = 0", "teacher": "K = 0; S = 50"}
+    tok = types.SimpleNamespace(decode=lambda c, skip_special_tokens=True: f"```python\nK = {c[0]}; S = {c[1]}\n```")
     pol = types.SimpleNamespace(tok=tok, prompt_ids=lambda text: [0])
-    answers = {"a": [[4, 40], [3, 60]], "b": [[6, 10], [9, 1]]}
+    answers = {"a": [[0, 40], [0, 60]], "b": [[2, 10], [3, 1]]}
     sampler = lambda prompts, n, adapter, version: [answers["a"], answers["b"]]  # noqa: E731
 
     def score(items):
-        seen.extend((it["seed"], it.get("experiments")) for it in items)
+        seen.extend(it["seed"] for it in items)
         out = []
         for it in items:
-            k, p = re.findall(r"\d+", it["source"])
-            out.append({"valid": True, "exec_error_bits": float(k), "pairs": int(p)})
+            k, sz = re.findall(r"\d+", it["source"])
+            out.append({"valid": True, "kl_bits": float(k) / 4, "size": int(sz), "nodes": int(sz), "edges": 0})
         return out
 
     train.ORACLE_RUNS = Path(tempfile.mkdtemp())
-    args = types.SimpleNamespace(samples=2, eval_seed=7, experiments=0, baselines=True, run_name="t", out=tempfile.mkdtemp())
+    args = types.SimpleNamespace(samples=2, eval_seed=7, baselines=True, run_name="t", out=tempfile.mkdtemp())
     log = io.StringIO()
-    s = train.evaluate({"heldout": [{"id": "a"}, {"id": "b"}]}, pol, sampler, score, args, Path("."), 0, log, 3)["heldout"]
+    s = train.evaluate({"heldout": [{"id": "a", "eps": 0.25}, {"id": "b", "eps": 0.25}]}, pol, sampler, score, args, Path("."), 0, log, 3)["heldout"]
     rows = [json.loads(line) for line in log.getvalue().splitlines()]
     a, b = rows[0], rows[1]
-    assert a["faithful"] and a["beats_vpd"] and a["best"]["pairs"] == 40, a  # both answers as faithful as VPD: fewer pairs wins
-    assert not b["faithful"] and b["best"]["kl"] == 6.0 and b["best_excess_bits"] == 1.0, b  # the smaller excess wins
-    assert s["best_faithful"] == 0.5 and s["best_beats_vpd"] == 0.5 and s["best_pairs_over_vpd_when_faithful"] == 0.8, s
-    assert s["baselines"]["teacher"]["pairs"] == 50 and abs(a["best"]["reproduces"] - 0.96) < 1e-12, s
+    assert a["correct"] and a["beats_teacher"] and a["best"]["size"] == 40, a  # both answers correct: the smaller wins
+    assert not b["correct"] and b["best"]["kl"] == 0.5 and b["best_excess_bits"] == 0.25, b  # the smaller excess wins
+    assert s["best_correct"] == 0.5 and s["best_beats_teacher"] == 0.5 and s["best_size_over_teacher_when_correct"] == 0.8, s
+    assert s["baselines"]["teacher"]["size"] == 50 and abs(a["best"]["reproduces"] - 1.0) < 1e-12, s
     best = json.loads((train.ORACLE_RUNS / "a.t.json").read_text())
-    assert best["score"]["pairs"] == 40 and best["reference"]["pairs"] == 50 and best["seed"] == 7
-    assert set(seen) == {(7, 0)}, seen
+    assert best["score"]["size"] == 40 and best["eps"] == 0.25 and best["seed"] == 7
+    assert set(seen) == {7}, seen
     assert rows[-1]["step"] == 3
 
 
