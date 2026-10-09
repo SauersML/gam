@@ -2769,8 +2769,8 @@ pub enum Metric {
     /// The behavior's answers: per scored row the distribution over the prompt's answer `a`, the
     /// counterfactual's answer `a'` and any other token under `p` and `q`, compared by `KL` (a VPD
     /// subnetwork's standard, the target prediction kept rather than the whole distribution, with the
-    /// contrast circuit metrics compare, the logit difference of `a` and `a'`, in it). Rows without
-    /// the behavior's answers ([`Prompt::answer_ids`]) take the token `by` puts first as `a`.
+    /// contrast circuit metrics compare, the logit difference of `a` and `a'`, in it). The answers are
+    /// the behavior's ([`Checker::answers_at`]); a row without them takes the token `by` puts first.
     Answer,
 }
 
@@ -4506,14 +4506,16 @@ impl Checker {
     }
 
     /// Per scored row (prompt, position) the behavior's answers there: the prompt's and its
-    /// counterfactual's answer tokens where the behavior gives them ([`Prompt::answer_ids`]).
+    /// counterfactual's answer tokens ([`Prompt::answer_ids`], else the token that follows the
+    /// target in each sequence: a behavior's prompts continue with their answers).
     pub fn answers_at(&self, rows: &[(usize, usize)]) -> Vec<Vec<usize>> {
+        let answer = |ids: &[u32], given: &[u32], k: usize, t: usize| given.get(k).or_else(|| ids.get(t + 1)).map(|&a| a as usize);
         rows.iter()
             .map(|&(i, t)| {
                 let Some(p) = self.behavior.prompts.get(i) else { return Vec::new() };
                 let Some(k) = p.target_positions.iter().position(|&x| x == t) else { return Vec::new() };
-                let changed = p.counterfactual.as_ref().and_then(|c| c.answer_ids.get(k));
-                p.answer_ids.get(k).into_iter().chain(changed).map(|&a| a as usize).collect()
+                let changed = p.counterfactual.as_ref().and_then(|c| answer(&c.token_ids, &c.answer_ids, k, t));
+                answer(&p.token_ids, &p.answer_ids, k, t).into_iter().chain(changed).collect()
             })
             .collect()
     }
