@@ -23,6 +23,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 sys.path.insert(0, str(HERE))
 
+import atlas  # noqa: E402
 import explain  # noqa: E402
 import mech  # noqa: E402
 import score as score_module  # noqa: E402
@@ -32,7 +33,7 @@ TERMS = ("total_bits", "exec_error_bits", "necessity_error_bits", "alignment_err
 
 
 def units(chunks) -> list[tuple]:
-    return [(l, s, i) for l, s, i0, j in chunks for i in range(i0, j)]
+    return [u for c in chunks for u in c]
 
 
 def errors(checker, sets: list[list[tuple]], a) -> list[float]:
@@ -44,18 +45,24 @@ def errors(checker, sets: list[list[tuple]], a) -> list[float]:
     return [r["exec_error_bits"] if r.get("valid", True) else float("inf") for r in out]
 
 
-def prune(checker, sizes: dict, a, log) -> tuple[dict, list]:
-    """The kept set at each k in --ks ({k: units}) and every round's (subcomponents, chunks, error)."""
-    chunks = [(l, s, i, min(i + a.chunk, n)) for (l, s), n in sorted(sizes.items()) for i in range(0, n, a.chunk)]
+def prune(checker, start: list[tuple], a, log) -> tuple[dict, list]:
+    """The kept set at each k in --ks ({k: units}) and every round's (subcomponents, chunks, error), from the units
+    `start` (in chunks of --chunk consecutive units of one matrix)."""
+    chunks = []
+    for u in start:
+        if chunks and len(chunks[-1]) < a.chunk and chunks[-1][-1][:2] == u[:2]:
+            chunks[-1] = chunks[-1] + (u,)
+        else:
+            chunks.append((u,))
     wanted, sets, rounds = sorted(a.ks, reverse=True), {}, []
     while wanted:
-        parts = sum(j - i for _, _, i, j in chunks)
+        parts = len(units(chunks))
         effect = dict(zip(chunks, errors(checker, [[d for d in chunks if d != c] for c in chunks], a)))
         target = max(int(parts * (1 - a.drop)), wanted[0])
         kept, total = [], parts
         for c in sorted(chunks, key=lambda c: effect[c]):
-            if total - (c[3] - c[2]) >= target and total > wanted[-1]:
-                total -= c[3] - c[2]
+            if total - len(c) >= target and total > wanted[-1]:
+                total -= len(c)
             else:
                 kept.append(c)
         chunks = kept
@@ -63,7 +70,7 @@ def prune(checker, sizes: dict, a, log) -> tuple[dict, list]:
         log(f"{total} subcomponents in {len(chunks)} chunks, error {rounds[-1]['error_bits']:.5g} bits")
         while wanted and total <= wanted[0]:
             sets[wanted.pop(0)] = units(chunks)
-        chunks = [h for (l, s, i, j) in chunks for h in (((l, s, i, (i + j) // 2), (l, s, (i + j) // 2, j)) if j - i > 1 else ((l, s, i, j),))]
+        chunks = [h for c in chunks for h in ((c[:len(c) // 2], c[len(c) // 2:]) if len(c) > 1 else (c,))]
     return sets, rounds
 
 
@@ -78,6 +85,7 @@ def main():
     ap.add_argument("--chunk", type=int, default=256, help="subcomponents per first chunk")
     ap.add_argument("--ks", type=int, nargs="+", default=[8, 16, 32, 64, 128, 256])
     ap.add_argument("--batch", type=int, default=3)
+    ap.add_argument("--candidates", type=int, default=0, help="search only the atlas's first N subcomponents of the behavior")
     ap.add_argument("--out", type=Path, default=DATA / "runs/prune_v4")
     a = ap.parse_args()
     a.out.mkdir(parents=True, exist_ok=True)
@@ -85,11 +93,15 @@ def main():
         t0 = time.time()
         path = a.behaviors_dir / f"{b}.json"
         behavior = json.loads(path.read_text())
-        sizes = {(l, site): n for l, row in enumerate(mech.shapes(behavior["model"])["views"]["vpd"]) for site, n in row.items()}
+        if a.candidates:  # the oracle's candidate list (atlas.py), in matrix order
+            start = explain.order(explain.units_of(" ".join(atlas.ranking(atlas.scores(behavior))[:a.candidates])))
+        else:
+            start = [(l, site, i) for l, row in enumerate(mech.shapes(behavior["model"])["views"]["vpd"]) for site, n in sorted(row.items())
+                     for i in range(n)]
         log = lambda m: print(f"{b}: {m}", flush=True)  # noqa: E731
         with score_module.Checker(behavior["model"], device=a.device) as checker:
             checker.behavior(path)
-            sets, rounds = prune(checker, sizes, a, log)
+            sets, rounds = prune(checker, start, a, log)
             curve = []
             for seed in (0, 1):
                 empty = checker.score_batch([explain.ir([])], experiments=a.experiments, seed=seed)[0]

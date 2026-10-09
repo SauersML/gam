@@ -20,7 +20,8 @@
 //!   "nodes", "N": null, "reader_top": 0, "uniform_seeds": null, "stand_in": null` ("delete" or
 //!   "counterfactual" for programs that name no `standin`; by default VPD-view checkers delete),
 //!   `"necessity": true` (false skips the necessity runs), `"metric": "full"` ("answer": each error
-//!   compares the answer's two-outcome distribution per scored row, the token M puts first):
+//!   compares the distribution over the behavior's answers and any other token per scored row,
+//!   "choice": the distribution over the prompt's and the counterfactual's answers alone):
 //!   every score term (`graph::Score`)
 //!   per program, all programs under one seed (`Checker::score_batch`: the behavior's half of the
 //!   experiments shared, `M` once per experiment, runs on parallel threads); with `reader_top` k > 0,
@@ -379,12 +380,14 @@ fn handle(request: &Value, weights: &mut Option<Weights>, checker: &mut Option<C
             c.uniform_seeds = request["uniform_seeds"].as_u64();
             // "necessity": false skips the necessity runs (necessity_error_bits 0).
             c.necessity = request["necessity"].as_bool().unwrap_or(true);
-            // "metric": "answer" compares the answer's two-outcome distribution per scored row, "full"
-            // (the default) the whole next-token distribution.
+            // "metric": "answer" compares the distribution over the behavior's answers and any other
+            // token per scored row, "choice" the one over the two answers alone, "full" (the default)
+            // the whole next-token distribution.
             c.metric = match request["metric"].as_str().unwrap_or("full") {
                 "answer" => Metric::Answer,
+                "choice" => Metric::Choice,
                 "full" => Metric::Full,
-                other => return Err(format!("metric {other}: \"full\" or \"answer\"")),
+                other => return Err(format!("metric {other}: \"full\", \"answer\" or \"choice\"")),
             };
             let k = request["reader_top"].as_u64().unwrap_or(0) as usize;
             let started = std::time::Instant::now();

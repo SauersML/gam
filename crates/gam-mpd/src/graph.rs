@@ -2772,6 +2772,30 @@ pub enum Metric {
     /// contrast circuit metrics compare, the logit difference of `a` and `a'`, in it). The answers are
     /// the behavior's ([`Checker::answers_at`]); a row without them takes the token `by` puts first.
     Answer,
+    /// The behavior's choice: per scored row the distribution over the prompt's answer `a` and the
+    /// counterfactual's answer `a'` alone (renormalized) under `p` and `q`, compared by `KL`: how far
+    /// the log odds of `a` against `a'` move, the contrast circuit metrics compare. A row whose answers
+    /// coincide or are missing scores 0.
+    Choice,
+}
+
+/// Per row, `KL` in bits between the distributions of `p` and `q` restricted to the two tokens of
+/// `picks[row]` (renormalized); 0 for a row without two distinct picks.
+pub fn choice_kl_bits(p: &Array2<f64>, q: &Array2<f64>, picks: &[Vec<usize>]) -> Vec<f64> {
+    let pair = |l: f64, m: f64| {
+        let total = l.max(m) + (-(l - m).abs()).exp().ln_1p();
+        (l - total, m - total)
+    };
+    (0..p.nrows())
+        .map(|row| match picks.get(row).map(Vec::as_slice) {
+            Some(&[a, b, ..]) if a != b => {
+                let (pa, pb) = pair(p[[row, a]], p[[row, b]]);
+                let (qa, qb) = pair(q[[row, a]], q[[row, b]]);
+                (pa.exp() * (pa - qa) + pb.exp() * (pb - qb)) / std::f64::consts::LN_2
+            }
+            _ => 0.0,
+        })
+        .collect()
 }
 
 /// Per row, `KL` in bits between the distributions of `p` and `q` over the outcomes `picks[row]`
@@ -4491,7 +4515,7 @@ impl Checker {
     /// Whether `graph`'s necessity is collapse toward the counterfactual: the behavior has
     /// counterfactuals, and the program takes counterfactual values or is scored on the answer.
     pub fn collapses(&self, graph: &Graph) -> bool {
-        self.counterfactual.is_some() && (!graph.delete || self.metric == Metric::Answer)
+        self.counterfactual.is_some() && (!graph.delete || self.metric != Metric::Full)
     }
 
     /// The error of `q` against `p` at the scored rows `rows` ((prompt, position), in the tables' row
@@ -4502,6 +4526,7 @@ impl Checker {
         match self.metric {
             Metric::Full => kl_bits(p, q),
             Metric::Answer => answer_kl_bits(p, q, by, &self.answers_at(rows)),
+            Metric::Choice => choice_kl_bits(p, q, &self.answers_at(rows)),
         }
     }
 

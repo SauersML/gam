@@ -924,6 +924,12 @@ fn the_answer_metric_compares_the_answers_probabilities() {
     let kl = |a: &[f64], b: &[f64]| a.iter().zip(b).map(|(x, y)| x * (x / y).ln()).sum::<f64>() / std::f64::consts::LN_2;
     assert!((e[0] - kl(&[0.6, 0.2, 0.2], &[0.3, 0.5, 0.2])).abs() < 1e-9, "the two answers and the rest: {e:?}");
     assert!((e[1] - kl(&[0.5, 0.5], &[0.9, 0.1])).abs() < 1e-9, "no picks: the reference's first token and the rest: {e:?}");
+    // The choice: the two answers alone, renormalized; no two distinct answers score 0.
+    use crate::graph::choice_kl_bits;
+    let c = choice_kl_bits(&p, &moved, &[vec![0, 1], vec![2, 2]]);
+    assert!((c[0] - kl(&[0.75, 0.25], &[0.375, 0.625])).abs() < 1e-9, "the choice between the answers: {c:?}");
+    assert_eq!(c[1], 0.0);
+    assert!(choice_kl_bits(&p, &other, &[vec![0, 1], vec![]]).iter().all(|&e| e.abs() < 1e-12), "only the answers' odds count");
 }
 
 /// A named group's use costs one name in the structure and its parts there none; its definition
