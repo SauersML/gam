@@ -44,11 +44,12 @@ read which.
 - Only what you name sees the prompt: every subcomponent and edge you leave out runs on the changed prompt. So the
   nodes and edges you name must carry everything that makes the model's answer the prompt's rather than the changed
   prompt's, and running only them on the changed prompt must turn the answer into the changed prompt's. Name what is
-  needed and nothing more.
+  needed and nothing more. The behavior lists the subcomponents whose activations differ most between its prompts and
+  changed prompts, with what each does; you may name any subcomponent, listed or not.
 - The behavior is the model's choice between the prompt's answer and the changed prompt's answer. The score in bits
   (lower is better) adds: how far the graph's choice is from the model's on the prompts and the changed prompts, how
-  much of the choice survives when only the graph is removed, each variable's test, and the size (subcomponents,
-  nodes, edges, code, explanation)."""
+  far the model's choice stays from the changed prompt's when only the graph runs on the changed prompt, each
+  variable's test, and the size (subcomponents, nodes, edges, code, explanation)."""
 
 PARTS = ("- <p:L.S.I> is subcomponent I (rank one) of VPD's decomposition of layer L's weight matrix S: q, k, v, o\n"
          "  (attention query, key, value, output) or fc, down (MLP input, output); per layer {sizes}; only o and down\n"
@@ -107,12 +108,12 @@ def examples(behavior: dict, shots: int) -> list[tuple[str, str]]:
     return [(r["behavior"], Path(r["answer"]).read_text().strip()) for r in rows[:shots]]
 
 
-def render(behavior: dict, prompts: int = 4, shots: int = 0, table: int = 48) -> str:
-    """The oracle's prompt for `behavior`, with its first `table` subcomponents (atlas.text)."""
+def render(behavior: dict, prompts: int = 4, shots: int = 0, table: int = 48, more: int = 208) -> str:
+    """The oracle's prompt for `behavior`, with its first `table` subcomponents described and `more` listed (atlas.text)."""
     sizes, parts = views(behavior["model"])
     out = [REFERENCE.format(parts=parts)]
     out += [f"Example answer (behavior {b}):\n{text}" for b, text in examples(behavior, shots)]
-    listed = f"\n{atlas.text(behavior, table)}" if table else ""
+    listed = f"\n{atlas.text(behavior, table, more)}" if table else ""
     out.append(f"{sizes}\n{behavior_text(behavior, prompts)}{listed}\n\nWrite the program, then the explanation.")
     return "\n\n".join(out)
 

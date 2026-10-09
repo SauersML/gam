@@ -218,16 +218,22 @@ def table(behavior: dict, device: str = "mps") -> dict[str, dict]:
     return json.loads(path.read_text()) if path.exists() else scores(behavior, device)
 
 
-def text(behavior: dict, top: int = 48, device: str = "mps") -> str:
-    """The behavior's subcomponent table for the oracle's prompt."""
+def text(behavior: dict, top: int = 48, more: int = 208, device: str = "mps") -> str:
+    """The behavior's subcomponent table for the oracle's prompt: the first `top` with what each does, then the next
+    `more` with how far and where they move."""
     table_ = table(behavior, device)
     atlas = load()["parts"]
+    ranked = ranking(table_)
     lines = ["Subcomponents whose activation differs most between the prompts and the changed prompts where the model needs"
              " them (the largest difference, in units of the subcomponent's typical activation in text, and the token"
              " where it is largest; VPD's causal importance summed over positions; what it does in text):"]
-    for p in ranking(table_)[:top]:
+    for p in ranked[:top]:
         s = table_[p]
         lines.append(f"  {p} moves {s['moved']:.1f} at {s['moved_at']!r}, need {s['need']:.1f}: {describe(p, atlas[p])}")
+    if more:
+        lines.append("Next (subcomponent, difference, token):")
+        rest = [f"{p} {table_[p]['moved']:.1f} {table_[p]['moved_at']!r}" for p in ranked[top:top + more]]
+        lines += ["  " + "; ".join(rest[i:i + 6]) for i in range(0, len(rest), 6)]
     return "\n".join(lines)
 
 
