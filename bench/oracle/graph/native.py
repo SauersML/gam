@@ -52,6 +52,7 @@ RANDOM = 8  # random draws per score
 CANDIDATES = 32  # replacement tokens the teacher tries per source position for an interchange claim
 MAX_NODES, MAX_CONNECTIONS = 5000, 60000  # the edge stage's compute: beyond these the node stage could not prune it
 TEACH_STEPS, EDGE_STEPS, TEACH_LR = 2000, 600, 0.05  # the teacher's optimization (Adam on the strengths' logits)
+TEACH_INIT = 6.0  # the strengths' starting logit: 0.9975, near the model, so the constraint binds as strengths fall
 LN2 = math.log(2)
 
 
@@ -540,7 +541,7 @@ class Native:
             lq = torch.log_softmax(self.vpd.masked(ids_b, masks, rest)[:, targets].float(), -1)
             return self._kl(logp, lq)[0]
 
-        g = self._strength_loop(node_forward, torch.full((int(flat.sum()),), 2.0, device=self.dev), eps / 2, log, "nodes")
+        g = self._strength_loop(node_forward, torch.full((int(flat.sum()),), TEACH_INIT, device=self.dev), eps / 2, log, "nodes")
         sel = split(g)
         nodes = {(n, t, c) for n in names for t, c in (sel[n] > 0.5).nonzero().tolist()}
         if len(nodes) > MAX_NODES:
@@ -577,7 +578,7 @@ class Native:
             return self._kl(logp, self.run(ids, targets, plan, *u, ew, ow, qk))[0]
 
         n_items = n_edges + len(qk_nodes)
-        e = self._strength_loop(edge_forward, torch.full((n_items,), 2.0, device=self.dev), eps, log, "edges", EDGE_STEPS)
+        e = self._strength_loop(edge_forward, torch.full((n_items,), TEACH_INIT, device=self.dev), eps, log, "edges", EDGE_STEPS)
         edge_list = [(r, w) for r, ws in parents.items() for w in ws] + [(None, w) for w in out]  # plan order
         assert len(edge_list) == n_edges
         ranked = sorted(range(n_items), key=lambda j: -float(e[j]))
