@@ -593,12 +593,27 @@ class Native:
                     used.add(r)
             return Graph(used, par, o)
 
-        while True:  # the strongest edges and query and key nodes, more of them until the exact tests pass
-            g_out = build(ranked[:keep])
-            s = self.score(ids, targets, [g_out], seed, logp)[0]
-            if s["kl_bits"] <= eps or keep >= n_items:
-                return self.clean(ids, targets, g_out, s, eps, seed, logp)
-            keep = min(n_items, max(keep + 1, int(keep * 1.25)))
+        def passes(k):
+            g_k = build(ranked[:k])
+            s_k = self.score(ids, targets, [g_k], seed, logp)[0]
+            return s_k["kl_bits"] <= eps, g_k, s_k
+
+        # the fewest of the strongest edges and query/key nodes that pass the exact tests, by bisection from the
+        # rounded set (the strengths above 1/2)
+        ok, g_out, s = passes(keep)
+        lo, hi = (0, keep) if ok else (keep, n_items)
+        best = (g_out, s) if ok else None
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            ok, g_mid, s_mid = passes(mid)
+            if ok:
+                hi, best = mid, (g_mid, s_mid)
+            else:
+                lo = mid
+        if best is None:
+            ok, g_n, s_n = passes(n_items)
+            best = (g_n, s_n)
+        return self.clean(ids, targets, *best, eps, seed, logp)
 
     def clean(self, ids: list[int], targets: list[int], g: Graph, s: dict, eps: float, seed: int = 0, logp=None) -> tuple[Graph, dict]:
         """g without what lies on no path to the prediction (pathways()), kept when it still passes the tests at eps."""
