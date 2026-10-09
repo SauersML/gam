@@ -348,19 +348,24 @@ def check_rl2_pieces():
     seeds = [train.step_seed(args, s) for s in range(10)]
     assert len(set(seeds)) == 10 and 5 not in seeds
     assert train.step_seed(argparse.Namespace(seed=1, eval_seed=5), 0) == 1 << 20
-    assert train.key({"eps": 0.5}, {"valid": True, "kl_bits": 0.4, "size": 7}) == (0, 0.0, 0, 0, 7)
-    assert train.key({"eps": 0.5}, {"valid": True, "kl_bits": 0.75, "size": 2}) == (0, 0.25, 0, 0, 2)
-    assert train.key({"eps": 0.5}, {"valid": True, "kl_bits": 0.4, "size": 9, "claims_wrong": 0, "claims_explained": 2}) < \
-        train.key({"eps": 0.5}, {"valid": True, "kl_bits": 0.4, "size": 7, "claims_wrong": 0, "claims_explained": 1})  # explaining more beats smaller
-    assert train.key({"eps": 0.5}, {"valid": False}) == (1, math.inf, math.inf, 0, math.inf)
+    import score as score_module
+
+    e = [0.0, 8.0]  # the empty graph's point
+    early = {"valid": True, "lo": 1.0, "hi": 256.0, "curve": [e, [2.0, 1.0], [16.0, 0.5]]}  # most of the KL gone at 2 bits
+    late = {"valid": True, "lo": 1.0, "hi": 256.0, "curve": [e, [8.0, 1.0], [16.0, 0.5]]}  # the same points, reached later
+    long = {"valid": True, "lo": 1.0, "hi": 256.0, "curve": [e, [2.0, 1.0], [16.0, 0.5], [64.0, 0.1]]}  # early's, then more
+    k = score_module.keys([early, late, long, {"valid": False}, {"valid": True, "lo": 1.0, "hi": 256.0, "curve": [e]}])
+    assert k[2] < k[0] < k[1] < k[4] < k[3], k  # lower at every length wins; explaining nothing is the worst valid curve
+    assert abs(score_module.area([e, [4.0, 2.0]], 1.0, 16.0) - 5.0) < 1e-12  # half the log range at 8 bits, half at 2
+    assert score_module.area([e], 1.0, 16.0) == 8.0 and score_module.area([e, [2.0, 1.0]], 1.0, 1.0) == 8.0
     import json
 
-    with tempfile.TemporaryDirectory() as d:  # teacher_v3.py's manifest, written on another machine; the held-out refusal
+    with tempfile.TemporaryDirectory() as d:  # a manifest written on another machine; the held-out refusal
         (Path(d) / "x.answer.txt").write_text("answer x")
         lines = [{"behavior": "x", "answer": "/elsewhere/old.answer.txt"}, {"behavior": "x", "answer": "/elsewhere/x.answer.txt"}, {"behavior": "y", "answer": "/elsewhere/y.answer.txt"}]
         (Path(d) / "manifest.jsonl").write_text("".join(json.dumps(r) + "\n" for r in lines))
-        assert train.teacher_answers(d) == {"x": "answer x"}
-        held = Path(d) / "teacher_heldout"
+        assert train.read_answers(d) == {"x": "answer x"}
+        held = Path(d) / "search_heldout"
         held.mkdir()
         train.refuse_heldout([d, None])
         try:
@@ -389,7 +394,8 @@ def check_rl2_step(pol):
         out = []
         for it in items:
             named = named_in(it["source"])
-            out.append({"kl_bits": 10.0 * len(needed - named), "size": len(named), "valid": bool(named)})
+            out.append({"kl_bits": 10.0 * len(needed - named), "bits": float(len(named)), "steps": 1, "valid": bool(named), "lo": 1.0, "hi": 64.0,
+                        "curve": [[0.0, 10.0 * len(needed)], [float(len(named)), 10.0 * len(needed - named)]]})
         return out
 
     def answer_with(parts):
@@ -414,7 +420,7 @@ def check_rl2_step(pol):
             logs = {k: open(Path(d) / f"{k}.jsonl", "w") for k in ("train", "samples", "improved")}
             args = argparse.Namespace(seed=0, eval_seed=1_000_003, samples=4, credit=16, credit_answers=0, refill=1, refine=3, behaviors_per_step=2, beta=0.0,
                                       micro=2, ppo_epochs=2, clip=0.2, clip_high=0.28, dual_clip=3.0, tis_cap=2.0, exit_beta=0.1)
-            pool = [{"id": "x", "model": "vpd4l", "eps": 0.0}, {"id": "y", "model": "vpd4l", "eps": 0.0}, {"id": "z", "model": "vpd4l", "eps": 0.0}]
+            pool = [{"id": "x", "model": "vpd4l"}, {"id": "y", "model": "vpd4l"}, {"id": "z", "model": "vpd4l"}]
             rec = Recorder(pol.params)
             for p in pol.params:
                 torch.nn.init.normal_(p, std=0.02)
@@ -431,7 +437,7 @@ def check_rl2_step(pol):
             texts3 = [answer_with(["<p:2.v.559>", "<p:2.v.11>"]), answer_with(["<p:2.v.559>"]), answer_with(["<p:2.v.559>", "<p:2.v.1>"]), answer_with(["<p:2.o.735>"])]
             items = [train.item(t, pool[0], 0) for t in texts3]
             sc3 = stand_in(items)
-            keys = [train.key(pool[0], x) for x in sc3]
+            keys = train.score_module.keys(sc3)
             grp = {"behavior": pool[0], "completions": [pol.tok.encode(t, add_special_tokens=False) for t in texts3], "texts": texts3, "items": items, "scores": sc3,
                    "keys": keys, "valid": np.array([x["valid"] for x in sc3]), "advantage": np.zeros(4), "token_advantages": [[0.0]] * 4, "credit": [None] * 4}
             train.credit_groups([grp], 0, argparse.Namespace(**{**vars(args), "credit_answers": 2}), pol.tok, stand_in, {"credit": 0.0})
@@ -446,7 +452,7 @@ def check_rl2_step(pol):
             improved = [json.loads(line) for line in open(Path(d) / "improved.jsonl")]
             assert all(r["key"] < r["sampled_key"] for r in improved), improved
             assert any(named_in(train.split_answer(r["text"])[0]) == needed for r in improved if r["behavior"] == "x"), improved
-            assert np.isfinite(first["mean_kl"]) and first["best_correct"] > 0
+            assert np.isfinite(first["mean_kl"]) and first["best_area"] is not None
             logs2 = {k: open(Path(d) / f"async_{k}.jsonl", "w") for k in ("train", "samples", "improved")}
             asked.clear()
             train.rl2_async(argparse.Namespace(**{**vars(args), "steps": 3, "async_rollouts": True}), pol, sampler, stand_in, pool, Path(d), train.Learner(pol, rec, NoWarmup()),

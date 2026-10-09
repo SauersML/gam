@@ -76,8 +76,9 @@ def mine(graphs: dict[str, set]) -> list[dict]:
 
 
 def rewrite(lib: list[dict], dirs: list[Path], out: Path) -> None:
-    """Each teacher answer with the library entries it holds as "uses" in place of their edges -> OUT/<stem>.py, and
-    OUT/library.json (score.py's LIBRARY: {"entries": {name: {"edges": [...]}}})."""
+    """Each answer with the library entries it holds as "uses" in place of their edges -> OUT/<stem>.py (an entry goes
+    in the first step whose graph holds all its edges), and OUT/library.json (score.py's LIBRARY: {"entries": {name:
+    {"edges": [...]}}})."""
     import native
 
     out.mkdir(parents=True, exist_ok=True)
@@ -86,7 +87,6 @@ def rewrite(lib: list[dict], dirs: list[Path], out: Path) -> None:
     for i, e in enumerate(lib):
         for k in e["graphs"]:
             holds.setdefault(k, []).append(i)
-    nat = native.Native()
     for d in dirs:
         for py in sorted(d.glob("*.py")):
             stem = py.stem
@@ -95,19 +95,25 @@ def rewrite(lib: list[dict], dirs: list[Path], out: Path) -> None:
             ir = mech.trace_inline(py.read_text(), "vpd4l", task)
             if not ir["valid"]:
                 continue
-            g = nat.from_ir(ir)
-            drop = {tuple(x) for i in holds.get(stem, []) for x in lib[i]["edges"]}
 
             def rel(nd):
                 layer, kind = int(nd[0].split(".")[1]), nd[0].split(".")[-1]
                 return token(layer, kind, nd[2]), nd[1] - t
 
-            g.parents = {r: [w for w in ws if (*rel(w), *rel(r)) not in drop] for r, ws in g.parents.items()}
-            g.parents = {r: ws for r, ws in g.parents.items() if ws}
-            g.out = [w for w in g.out if (*rel(w), "out", 0) not in drop]
-            g.nodes = {x for r, ws in g.parents.items() for x in [r, *ws]} | set(g.out) | {nd for nd in g.nodes if nd[0].split(".")[-1] in ("q_proj", "k_proj")}
-            claims = [tuple(c) for c in ir["graph"].get("claims", [])]
-            (out / f"{stem}.py").write_text(native.program(g, claims, [names[i] for i in holds.get(stem, [])]))
+            steps, uses, placed = [], [], []
+            for k in range(1, ir["graph"]["steps"] + 1):
+                g, _ = native.prefix(ir, k)
+                have = {(*rel(w), *rel(r)) for r, ws in g.parents.items() for w in ws} | {(*rel(w), "out", 0) for w in g.out}
+                now = [i for i in holds.get(stem, []) if i not in placed and all(tuple(x) in have for x in lib[i]["edges"])]
+                placed += now
+                uses.append([names[i] for i in now])
+                drop = {tuple(x) for i in placed for x in lib[i]["edges"]}
+                g.parents = {r: [w for w in ws if (*rel(w), *rel(r)) not in drop] for r, ws in g.parents.items()}
+                g.parents = {r: ws for r, ws in g.parents.items() if ws}
+                g.out = [w for w in g.out if (*rel(w), "out", 0) not in drop]
+                g.nodes = {x for r, ws in g.parents.items() for x in [r, *ws]} | set(g.out) | {nd for nd in g.nodes if nd[0].split(".")[-1] in ("q_proj", "k_proj")}
+                steps.append(g)
+            (out / f"{stem}.py").write_text(native.program(steps, uses, ir["graph"].get("notes"), ir["graph"].get("explanation")))
     (out / "library.json").write_text(json.dumps({"entries": {names[i]: {"edges": e["edges"], "graphs": len(e["graphs"])} for i, e in enumerate(lib)}}))
 
 

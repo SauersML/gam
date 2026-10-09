@@ -4,7 +4,7 @@ credit and refinement measure.
 A graph answer writes subcomponents as "<p:L.S.I>" tokens; the ones in a reader's parents (strings or lists, not the
 (position, reader) keys) are its edges. An edit drops occurrences of them from the program text (and tidies the lists
 they stood in). credit() compares a sample of single drops with the answer; refine() repeats rounds of credit, keeping
-the drops that improve it. Both rank scores by a key (score.order at the question's eps: lower is better).
+the drops that improve it. Both rank scores by a key (score.key: lower is better).
 """
 
 from __future__ import annotations

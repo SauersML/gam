@@ -47,10 +47,32 @@ def test_a_graph_answer():
     assert {nodes[w] for w in g["out"]} == {(3, "o_proj", 3, 281), (2, "down_proj", 3, 773)}
 
 
-def test_claims():
-    ir = mech._trace(GRAPH.replace('"out": "<p:3.o.281><p:2.down.773>",', '"out": "<p:3.o.281><p:2.down.773>",\n        "claims": [(p, " prince", " his")],'), "vpd4l", BEHAVIOR)
-    assert ir["valid"], ir["error"] and ir["graph"]["claims"] == [[1, " prince", " his"]]
-    assert "claims" in error(GRAPH.replace('"out": "<p:3.o.281><p:2.down.773>",', '"out": "<p:3.o.281><p:2.down.773>",\n        "claims": [(9, " prince", " his")],'))
+STEPS = '''def graph(tokens, targets):
+    """The attention output at the last position reads the value written at "princess"."""
+    t = targets[0]
+    p = tokens.index(" princess")
+    return [
+        # the prediction reads an attention output that reads "princess"
+        {(t, "<p:3.o.281>"): {p: "<p:3.v.676>"}, "out": "<p:3.o.281>"},
+        # what that value reads, and an MLP path at the last position
+        {(p, "<p:3.v.676>"): "<p:0.down.3473>", (t, "<p:2.down.773>"): "<p:2.fc.40>", "out": "<p:2.down.773><p:3.o.281>"},
+    ]
+'''
+
+
+def test_ordered_steps():
+    ir = mech._trace(STEPS, "vpd4l", BEHAVIOR)
+    assert ir["valid"], ir["error"]
+    g = ir["graph"]
+    nodes = [tuple(n) for n in g["nodes"]]
+    assert g["steps"] == 2 and g["explanation"].startswith("The attention output")
+    assert g["notes"] == ["the prediction reads an attention output that reads \"princess\"", "what that value reads, and an MLP path at the last position"]
+    first = {(nodes[r], nodes[w]) for (r, w), s in zip(g["parents"], g["parent_step"]) if s == 0}
+    assert first == {((3, "o_proj", 3, 281), (3, "v_proj", 1, 676))}
+    assert [nodes[w] for w, s in zip(g["out"], g["out_step"])] == [(3, "o_proj", 3, 281), (2, "down_proj", 3, 773)]  # a repeat is not a new edge
+    assert g["out_step"] == [0, 1] and sorted(g["node_step"]) == [0, 0, 1, 1, 1]
+    assert mech._trace(GRAPH, "vpd4l", BEHAVIOR)["graph"]["steps"] == 1  # a single dict is one step
+    assert "a list of steps" in error(STEPS.replace("return [", "return 3 or ["))
 
 
 def test_uses():

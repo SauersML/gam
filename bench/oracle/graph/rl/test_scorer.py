@@ -38,13 +38,12 @@ def main():
     check_evaluate()
     check_sft_examples()
     check_share_wake()
-    print("ok: native scorer order, one call per (task, seed); evaluation ranks answers at each question's precision; SFT data is the training questions' teacher graphs; one vLLM wake per sampling call")
+    print("ok: native scorer order, one call per (task, seed); evaluation ranks answers by their curves; SFT data is the training questions' search answers; one vLLM wake per sampling call")
 
 
 def check_evaluate():
     """train.evaluate scores the policy's answers and the baselines under the evaluation seed only; per question its best
-    answer by score.order at the question's eps: correct when its KL is at most eps, beating the teacher when it is
-    smaller too."""
+    answer by score.key (its curve's area), whether that beats the search's, and every score in the reporting terms."""
     import io
     import json
     import re
@@ -54,38 +53,38 @@ def check_evaluate():
 
     seen = []
     train.render = lambda b: b["id"]
-    train.baselines = lambda b: {"empty": "K = 100; S = 0", "teacher": "K = 0; S = 50"}
+    train.baselines = lambda b: {"empty": "K = 100; S = 0", "search": "K = 0; S = 50"}
     tok = types.SimpleNamespace(decode=lambda c, skip_special_tokens=True: f"```python\nK = {c[0]}; S = {c[1]}\n```")
     pol = types.SimpleNamespace(tok=tok, prompt_ids=lambda text: [0], question_ids=lambda b: [0])
     answers = {"a": [[0, 40], [0, 60]], "b": [[2, 10], [3, 1]]}
     sampler = lambda prompts, n, adapter, version: [answers["a"], answers["b"]]  # noqa: E731
 
-    def score(items):
+    def score(items):  # a curve from the empty graph's 25 bits to K / 4 bits at S bits
         seen.extend(it["seed"] for it in items)
         out = []
         for it in items:
-            k, sz = re.findall(r"\d+", it["source"])
-            out.append({"valid": True, "kl_bits": float(k) / 4, "size": int(sz), "nodes": int(sz), "edges": 0})
+            k, sz = (int(x) for x in re.findall(r"\d+", it["source"]))
+            curve = [[0.0, 25.0]] + ([[float(sz), k / 4]] if sz else [])
+            out.append({"valid": True, "curve": curve, "lo": 1.0, "hi": 1000.0, "kl_bits": curve[-1][1], "bits": float(sz), "steps": 1, "nodes": sz, "edges": 0})
         return out
 
     train.ORACLE_RUNS = Path(tempfile.mkdtemp())
     args = types.SimpleNamespace(samples=2, eval_seed=7, baselines=True, run_name="t", out=tempfile.mkdtemp())
     log = io.StringIO()
-    s = train.evaluate({"heldout": [{"id": "a", "eps": 0.25}, {"id": "b", "eps": 0.25}]}, pol, sampler, score, args, Path("."), 0, log, 3)["heldout"]
+    s = train.evaluate({"heldout": [{"id": "a"}, {"id": "b"}]}, pol, sampler, score, args, Path("."), 0, log, 3)["heldout"]
     rows = [json.loads(line) for line in log.getvalue().splitlines()]
     a, b = rows[0], rows[1]
-    assert a["correct"] and a["beats_teacher"] and a["best"]["size"] == 40, a  # both answers correct: the smaller wins
-    assert not b["correct"] and b["best"]["kl"] == 0.5 and b["best_excess_bits"] == 0.25, b  # the smaller excess wins
-    assert s["best_correct"] == 0.5 and s["best_beats_teacher"] == 0.5 and s["best_size_over_teacher_when_correct"] == 0.8, s
-    assert s["baselines"]["teacher"]["size"] == 50 and abs(a["best"]["reproduces"] - 1.0) < 1e-12, s
+    assert a["best"]["bits"] == 40 and a["beats_search"], a  # equally faithful: the shorter answer, and shorter than the search's
+    assert b["best"]["kl"] == 0.75 and b["beats_search"], b  # 0.75 bits from the first bit on beats 0.5 from 10 bits on, and 0 from 50
+    assert s["best_beats_search"] == 1.0 and s["baselines"]["search"]["bits"] == 50 and abs(a["best"]["reproduces"] - 1.0) < 1e-12, s
     best = json.loads((train.ORACLE_RUNS / "a.t.json").read_text())
-    assert best["score"]["size"] == 40 and best["eps"] == 0.25 and best["seed"] == 7
+    assert best["score"]["bits"] == 40 and best["seed"] == 7
     assert set(seen) == {7}, seen
     assert rows[-1]["step"] == 3
 
 
 def check_sft_examples():
-    """sft_examples: the teacher answer of every TRAINING task (never one outside the pool), with part addresses kept
+    """sft_examples: the search answer of every TRAINING task (never one outside the pool), with part addresses kept
     as written, and --data examples."""
     import json
     import tempfile
@@ -94,8 +93,8 @@ def check_sft_examples():
 
     d = Path(tempfile.mkdtemp())
     (d / "q.jsonl").write_text(json.dumps({"messages": [{"role": "user", "content": "Q"}, {"role": "assistant", "content": "ANS"}]}) + "\n")
-    train.TEACHER.clear()
-    train.TEACHER.update({"a": "```python\nA\n```", "z": "```python\nZ\n```"})
+    train.SEARCH.clear()
+    train.SEARCH.update({"a": "```python\nA\n```", "z": "```python\nZ\n```"})
     train.render = lambda b: "input " + b["id"]
     tok = types.SimpleNamespace(encode=lambda text, add_special_tokens=False: [len(text)])
     pol = types.SimpleNamespace(tok=tok, end=0, prompt_ids=lambda text: [hash(text) % 97], parts=None, question_ids=lambda b: [hash("input " + b["id"]) % 97])
@@ -103,7 +102,7 @@ def check_sft_examples():
     programs, questions = train.sft_examples(args, pol, [{"id": "a"}, {"id": "b"}])
     assert programs == [([hash("input a") % 97], [len("```python\nA\n```"), 0])], programs
     assert questions == [([hash("Q") % 97], [3, 0])], questions
-    train.TEACHER.clear()
+    train.SEARCH.clear()
 
 
 def check_share_wake():

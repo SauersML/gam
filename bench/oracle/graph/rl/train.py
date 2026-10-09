@@ -1,21 +1,23 @@
-"""The graph oracle's training (#2951): sample answers, check them on the model, train on how they rank.
+"""The graph oracle's training (#2951): sample answers, score them with the verifier, train on how they rank.
 
-A question (a task) is a window of real text (text.py), its last position's next-token prediction, and a precision eps in
-bits. An answer is a computational graph of vpd4l's VPD subcomponents (mech.py's graph(tokens, targets)): nodes are
-subcomponents at positions, edges connections the model has. native.py runs it with everything it leaves out ablated
-(deleted, and randomly) and measures the KL of the model's prediction from the graph's; score.order ranks answers:
-correct (KL at most eps) first, then fewer nodes plus edges. No weight trades KL for size.
+A question (a task) is a text (text.py) and the model's prediction of the next token after it. An answer is a
+plain-English explanation and an ordered graph of vpd4l's VPD subcomponents (mech.py's graph(tokens, targets)): a list
+of steps, most important first, each adding subcomponents at positions and connections the model has. The verifier
+(native.py, score.py) runs the graph of each answer's first k steps alone over changed prompts of the text and measures
+the KL of the model's prediction from the graph's and the graph's description length: the answer's curve. Answers to one
+question rank by score.keys: the mean KL their curves reach over a log-uniform range of description lengths shared by
+the answers compared. No tolerance and no weight.
 
-  sft   --sft-steps steps on the teacher graphs of the training questions (native.teach; --teacher) and --data examples:
-          loss = -(1/B) sum_e sum_t log pi(y_et | x_e, y_e<t).
+  sft   --sft-steps steps on bootstrap search answers of the training questions (native.py search; --search) and --data
+        examples: loss = -(1/B) sum_e sum_t log pi(y_et | x_e, y_e<t).
   rl2   (rl2_step) each step draws --behaviors-per-step questions and samples a group of --samples answers each (vLLM
         serving the current LoRA adapter on a GPU, transformers' generate otherwise; Qwen3 chat, thinking off); every
         answer is scored, its advantage A_e = (wins - losses) / (n - 1) against the other answers of its group by
-        score.order (3); the tokens of a subcomponent in a reader's parents get the sign of what dropping it (the edge)
+        score.keys (3); the tokens of a subcomponent in a reader's parents get the sign of what dropping it (the edge)
         measured, edits.credit (1); --ppo-epochs clipped updates per scored batch (4); groups without signal dropped and
         refilled by questions drawn uniformly (5); expert iteration from each group's best answer, edits.refine (2).
   eval  samples --samples answers per held-out question and scores them with the baselines: the empty graph, the
-        teacher's graph (--teacher-heldout) and VPD's own answer.
+        search's answer (--search-heldout) and VPD's own answer.
 
 Sums, not per-episode means: a per-episode mean of token log-probabilities gives each token of a long answer less
 weight than each token of a short one, so its gradient is not the policy gradient; the sum is the episode's
@@ -25,9 +27,9 @@ The reference pi_ref is the SFT policy: --init ADAPTER (a PEFT adapter, e.g. --m
 trainable policy and as a frozen reference; without --init the policy is a fresh LoRA on the base and pi_ref is the base
 (adapter disabled). The loop writes the adapter every step (vLLM loads it by path).
 
-  train.py --mode sft --teacher texts/graphs --base Qwen/Qwen3-4B --model vpd4l --behaviors texts --eps 0.25 1 --out DIR
-  train.py --mode rl2 --init DIR/adapter --teacher texts/graphs ... --out DIR2 --hours H
-  train.py --mode eval --init ADAPTER --teacher-heldout texts/graphs_heldout ... --out DIR
+  train.py --mode sft --search texts/search --base Qwen/Qwen3-4B --model vpd4l --behaviors texts --out DIR
+  train.py --mode rl2 --init DIR/adapter ... --out DIR2 --hours H
+  train.py --mode eval --init ADAPTER --search-heldout texts/search_heldout ... --out DIR
 
 Outputs: DIR/train.jsonl (a line per step), DIR/eval.jsonl (a line per evaluated question and a summary per evaluation),
 DIR/samples.jsonl (every answer with its score), DIR/improved.jsonl (expert iteration's refined answers), DIR/adapter.
@@ -59,8 +61,8 @@ import scorer  # noqa: E402
 from scorer import SCORERS  # noqa: E402
 
 BEHAVIORS = Path.home() / "mpd-data/graph_oracle/texts"  # the real-text tasks (text.py), train and held-out
-TEACHER: dict[str, str] = {}  # --teacher's answers by behavior id (teacher_answers): training behaviors
-HELDOUT_TEACHER: dict[str, str] = {}  # --teacher-heldout's: evaluation baselines only, never SFT or RL
+SEARCH: dict[str, str] = {}  # --search's answers by behavior id (read_answers): training behaviors
+HELDOUT_SEARCH: dict[str, str] = {}  # --search-heldout's: evaluation baselines only, never SFT or RL
 
 
 def item(answer: str, behavior: dict, seed: int) -> dict:
@@ -70,23 +72,22 @@ def item(answer: str, behavior: dict, seed: int) -> dict:
     return {"source": source, "explanation": explanation, "behavior": behavior, "seed": seed}
 
 
-def behaviors(root: Path, model: str, split: str, epsilons) -> list[dict]:
-    """The split's questions: every task at every precision eps in `epsilons`, id <task>.<eps>."""
+def behaviors(root: Path, model: str, split: str) -> list[dict]:
+    """The split's questions, one per task."""
     out = []
     for p in sorted((root / model).glob("*.json")):
         task = json.loads(p.read_text())
         if task.get("split", "train") == split:
-            for eps in epsilons:
-                out.append({**task, "id": f"{task['id']}.{eps:g}", "task": task["id"], "eps": eps, "path": str(p)})
+            out.append({**task, "task": task["id"], "path": str(p)})
     return out
 
 
 def baselines(b: dict) -> dict:
     """What the oracle's answers to question b are compared with, scored alongside them: the empty graph, VPD's own
-    answer, and the teacher's graph (--teacher or --teacher-heldout)."""
+    answer, and the bootstrap search's answer (--search or --search-heldout)."""
     out = {"empty": score_module.EMPTY, "vpd": "vpd"}
-    if b["id"] in TEACHER or b["id"] in HELDOUT_TEACHER:
-        out["teacher"] = TEACHER.get(b["id"]) or HELDOUT_TEACHER[b["id"]]
+    if b["id"] in SEARCH or b["id"] in HELDOUT_SEARCH:
+        out["search"] = SEARCH.get(b["id"]) or HELDOUT_SEARCH[b["id"]]
     return out
 
 
@@ -476,10 +477,10 @@ def step_seed(args, step: int) -> int:
     return seed if seed != args.eval_seed else seed + (1 << 40)
 
 
-def teacher_answers(root) -> dict[str, str]:
-    """Teacher answers by behavior id: DIR/manifest.jsonl's "answer" files (e2e/teacher_v3.py; a behavior's
-    last line wins; a path that does not exist here, e.g. on a pod, is read from DIR by its name), else every
-    DIR/<behavior>.answer.txt, else a bare DIR/<behavior>.py program as the answer's python block."""
+def read_answers(root) -> dict[str, str]:
+    """Answers by behavior id: DIR/manifest.jsonl's "answer" files (a behavior's last line wins; a path that does
+    not exist here, e.g. on a pod, is read from DIR by its name), else every DIR/<behavior>.answer.txt, else a bare
+    DIR/<behavior>.py program as the answer's python block."""
     out = {}
     if root:
         root = Path(root).expanduser()
@@ -495,19 +496,14 @@ def teacher_answers(root) -> dict[str, str]:
 
 
 def refuse_heldout(paths) -> None:
-    """Held-out answers (teacher_heldout/) are evaluation baselines: no training input may come from that directory."""
+    """Held-out answers (search_heldout/) are evaluation baselines: no training input may come from that directory."""
     for path in paths:
-        if path and "teacher_heldout" in Path(path).expanduser().resolve().parts:
-            raise SystemExit(f"{path}: held-out answers are for evaluation only (--teacher-heldout), never training")
-
-
-def key(b: dict, s: dict) -> tuple:
-    """score.order of a score to question b."""
-    return score_module.order(s, b["eps"])
+        if path and "search_heldout" in Path(path).expanduser().resolve().parts:
+            raise SystemExit(f"{path}: held-out answers are for evaluation only (--search-heldout), never training")
 
 
 def rloo(keys: list[tuple]) -> np.ndarray:
-    """(3) A_i = (wins_i - losses_i) / (n - 1): each answer against each other answer of its group by score.order
+    """(3) A_i = (wins_i - losses_i) / (n - 1): each answer against each other answer of its group by score.keys
     (leave-one-out), so equal answers get no signal and no scale enters."""
     n = len(keys)
     if n < 2:
@@ -632,12 +628,13 @@ def credit_groups(groups: list[dict], seed: int, args, tok, score, clock: dict):
     scores = timed(clock, "credit", score, requests)
     for g, src, spans, k in entries:
         grp = groups[g]
-        base = key(grp["behavior"], scores[k])
+        key = score_module.key
+        base = key(scores[k])
         if not scores[k].get("valid", True):
             continue
         signs = {}
         for i, sp in enumerate(spans):
-            dropped = key(grp["behavior"], scores[k + 1 + i])
+            dropped = key(scores[k + 1 + i])
             signs[sp] = (dropped > base) - (dropped < base)
         for j, it in enumerate(grp["items"]):
             if it["source"] == src and grp["valid"][j]:
@@ -657,16 +654,17 @@ def rl2_sample(chosen: list[dict], step: int, args, pol, sampler, adapter: Path,
 
 
 def rl2_score(groups: list[dict], step: int, args, tok, score, clock: dict) -> list[dict]:
-    """The checker half of rl2_groups, in place: every answer scored under the step's seed (with the teacher's answer
-    of tasks seen for the first time, their reference); every sampled token gets its advantage: the episode's (3),
-    replaced on credited names by the measured credit (1, --credit > 0). An invalid answer ranks below every valid one."""
+    """The verifier half of rl2_groups, in place: every answer scored under the step's seed (one draw of changed
+    prompts per question, shared by its group) and ranked within its group (score.keys);
+    every sampled token gets its advantage: the episode's (3), replaced on credited names by the measured credit (1,
+    --credit > 0). An invalid answer ranks below every valid one."""
     seed, n = step_seed(args, step), args.samples
     for grp in groups:
         grp["items"] = [item(x, grp["behavior"], seed) for x in grp["texts"]]
     scores = timed(clock, "score", score, [it for g in groups for it in g["items"]])
     for g, grp in enumerate(groups):
         sc = scores[g * n : (g + 1) * n]
-        keys = [key(grp["behavior"], x) for x in sc]
+        keys = score_module.keys(sc)
         A = rloo(keys)
         grp.update({"scores": sc, "keys": keys, "valid": np.array([bool(x["valid"]) for x in sc]), "advantage": A,
                     "token_advantages": [[float(A[j])] * len(c) for j, c in enumerate(grp["completions"])], "credit": [None] * n})
@@ -702,7 +700,7 @@ def expert_iteration(groups: list[dict], step: int, args, pol, score, clock: dic
         def run(sources, b=b):
             return score([edit_item(x, b, seed) for x in sources])
 
-        best, best_key, dropped = timed(clock, "refine", edits.refine, src, run, lambda s, b=b: key(b, s), args.refine, args.credit, random.Random(seed * 1009 + g))
+        best, best_key, dropped = timed(clock, "refine", edits.refine, src, run, score_module.key, args.refine, args.credit, random.Random(seed * 1009 + g))
         if not dropped:
             continue
         new = text[:offset] + best + text[offset + len(src) :]
@@ -839,10 +837,10 @@ def rl2_update(step: int, groups: list[dict], improved: list[dict], refills: int
     scores = [x for g in groups for x in g["scores"] if x.get("valid", True)]
     best = [min(g["keys"]) for g in groups]
     row = {"step": step, "mode": "rl2", "async": bool(getattr(args, "async_rollouts", False)), "seed": step_seed(args, step), "groups": len(groups), "kept": len(kept), "refills": refills,
-           "programs": len(keys), "valid_fraction": float(np.mean([k[0] == 0 for k in keys])), "faithful_fraction": float(np.mean([k[:2] == (0, 0.0) for k in keys])),
-           "mean_kl": float(np.mean([x["kl_bits"] for x in scores])) if scores else None, "mean_size": float(np.mean([x["size"] for x in scores])) if scores else None,
-           "best_correct": float(np.mean([k[:2] == (0, 0.0) for k in best])),
-           "best_size_when_correct": float(np.mean([k[2] for k in best if k[:2] == (0, 0.0)])) if any(k[:2] == (0, 0.0) for k in best) else None,
+           "programs": len(keys), "valid_fraction": float(np.mean([k[0] == 0 for k in keys])),
+           "mean_kl": float(np.mean([x["kl_bits"] for x in scores])) if scores else None, "mean_bits": float(np.mean([x["bits"] for x in scores])) if scores else None,
+           "mean_steps": float(np.mean([x["steps"] for x in scores])) if scores else None,
+           "best_area": float(np.mean([k[1] for k in best if k[0] == 0])) if any(k[0] == 0 for k in best) else None,
            "credited": sum(c is not None for g in groups for c in g["credit"]), "improved": len(improved), "repeated_scores": repeated, **stats, "sampling": getattr(sampler, "stats", {}),
            "seconds": clock, "checker_seconds_total": TOTALS["checker_seconds"], "elapsed": time.time() - started}
     logs["train"].write(json.dumps(row) + "\n")
@@ -937,13 +935,13 @@ class Learner:
 
 
 def sft_examples(args, pol, pool: list[dict]) -> tuple[list, list]:
-    """--mode sft's data as token ids (prompt, completion): the teacher answer of every TRAINING task (--teacher) as the
+    """--mode sft's data as token ids (prompt, completion): the search answer of every TRAINING task (--search) as the
     answer to its prompt, and --data examples (JSONL of {"messages": [user, assistant]} or {"prompt", "completion"}). The
     completion ends with <|im_end|>; an example longer than --max-model-len is left out."""
     by_id = {b["id"]: b for b in pool}
     end = [pol.end]
     target = (lambda text: pol.parts.reg.rewrite(text)) if getattr(pol, "parts", None) is not None else (lambda text: text)  # noqa: E731  addresses -> part tokens
-    programs = [(pol.question_ids(by_id[bid]), pol.tok.encode(target(text.strip()), add_special_tokens=False) + end) for bid, text in sorted(TEACHER.items()) if bid in by_id]
+    programs = [(pol.question_ids(by_id[bid]), pol.tok.encode(target(text.strip()), add_special_tokens=False) + end) for bid, text in sorted(SEARCH.items()) if bid in by_id]
     questions = []
     for path in args.data or []:
         for line in open(os.path.expanduser(path)):
@@ -959,7 +957,7 @@ def sft(args, pol, pool, learner: Learner, log) -> dict:
     --program-share and a question otherwise; loss = -(1/B) sum_e sum_t log pi(y_et) (sft_update)."""
     programs, questions = sft_examples(args, pol, pool)
     if not programs and not questions:
-        raise SystemExit("no SFT examples (--teacher, --data)")
+        raise SystemExit("no SFT examples (--search, --data)")
     rng = random.Random(args.seed)
     meta = {"program_examples": len(programs), "question_examples": len(questions), "program_behaviors": len(programs)}
     log.write(json.dumps({"sft": meta}) + "\n")
@@ -979,20 +977,20 @@ def sft(args, pol, pool, learner: Learner, log) -> dict:
 ORACLE_RUNS = Path.home() / "mpd-data/graph_oracle/runs/oracle"
 
 
-def shares(x: dict, empty: dict | None) -> dict:
-    """An answer in the reporting terms: kl (bits, deletion and random ablation, the larger), reproduces = 1 - kl / the
-    empty graph's, nodes, edges, size."""
-    if not x.get("valid", True):
-        return {"kl": None, "reproduces": None, "nodes": None, "edges": None, "size": None}
-    kl = x.get("kl_bits")
-    reproduces = 1.0 - kl / empty["kl_bits"] if empty and empty.get("kl_bits") and kl is not None else None
-    return {"kl": kl, "reproduces": reproduces, "nodes": x.get("nodes"), "edges": x.get("edges"), "size": x.get("size")}
+def shares(x: dict) -> dict:
+    """An answer in the reporting terms: area (score.key: score.area over the question's range), kl (the whole answer's
+    run-alone KL in bits), reproduces = 1 - kl / the empty graph's, bits (its description length), steps, nodes, edges."""
+    if not x.get("valid", True) or not x.get("curve"):
+        return {"area": None, "kl": None, "reproduces": None, "bits": None, "steps": None, "nodes": None, "edges": None}
+    kl, empty = x.get("kl_bits"), x["curve"][0][1]
+    return {"area": score_module.key(x)[1], "kl": kl, "reproduces": 1.0 - kl / empty if empty else None, "bits": x.get("bits"), "steps": x.get("steps"),
+            "nodes": x.get("nodes"), "edges": x.get("edges")}
 
 
 def summarize(name: str, step: int, groups: list[tuple[dict, list, dict]], log) -> dict:
     """Rows per question and the set's summary from groups of (question, [(source, score)] of the oracle, {baseline
-    name: score}). Per question: the oracle's best answer by score.order, whether it is correct (KL at most eps),
-    whether it is also smaller than the teacher's graph (beats_teacher), and every score in the reporting terms."""
+    name: score}). Per question: the oracle's best answer by score.key, and whether its curve's area is below the
+    search's (beats_search) and VPD's (beats_vpd)."""
 
     def mean(xs):
         xs = [x for x in xs if x is not None]
@@ -1000,22 +998,20 @@ def summarize(name: str, step: int, groups: list[tuple[dict, list, dict]], log) 
 
     rows = []
     for b, mine, base in groups:
-        keys = [key(b, x) for _, x in mine]
+        key = score_module.key
+        keys = [key(x) for _, x in mine]
         j = min(range(len(keys)), key=keys.__getitem__)
-        best, empty, teacher = mine[j][1], base.get("empty"), base.get("teacher")
-        correct = keys[j][:2] == (0, 0.0)
-        row = {"set": name, "step": step, "behavior": b["id"], "eps": b["eps"], "valid_fraction": float(np.mean([k[0] == 0 for k in keys])),
-               "correct_fraction": float(np.mean([k[:2] == (0, 0.0) for k in keys])), "best": shares(best, empty), "best_excess_bits": keys[j][1],
-               "correct": correct, "beats_teacher": bool(correct and teacher is not None and teacher.get("valid") and best["size"] < teacher["size"]),
-               "baselines": {n: shares(x, empty) for n, x in base.items()}, "best_source": mine[j][0]}
+        best = mine[j][1]
+        row = {"set": name, "step": step, "behavior": b["id"], "valid_fraction": float(np.mean([k[0] == 0 for k in keys])), "best": shares(best),
+               "baselines": {n: shares(x) for n, x in base.items()}, "best_source": mine[j][0]}
+        for n in ("search", "vpd"):
+            if n in base and base[n].get("valid") and keys[j][0] == 0:
+                row[f"beats_{n}"] = keys[j][1] < key(base[n])[1]
         rows.append(row)
         log.write(json.dumps(row) + "\n")
-    keys_ = ("kl", "reproduces", "nodes", "edges", "size")
-    ratio = [r["best"]["size"] / r["baselines"]["teacher"]["size"] for r in rows if r["correct"] and (r["baselines"].get("teacher") or {}).get("size")]
-    return {"questions": len(rows), "valid_fraction": mean([r["valid_fraction"] for r in rows]), "correct_fraction": mean([r["correct_fraction"] for r in rows]),
-            "best_correct": mean([r["correct"] for r in rows]), "best_beats_teacher": mean([r["beats_teacher"] for r in rows]),
-            "best_size_over_teacher_when_correct": float(np.median(ratio)) if ratio else None,
-            "best_excess_bits": mean([r["best_excess_bits"] for r in rows if np.isfinite(r["best_excess_bits"])]),
+    keys_ = ("area", "kl", "reproduces", "bits", "steps", "nodes", "edges")
+    return {"questions": len(rows), "valid_fraction": mean([r["valid_fraction"] for r in rows]),
+            "best_beats_search": mean([r.get("beats_search") for r in rows]), "best_beats_vpd": mean([r.get("beats_vpd") for r in rows]),
             "best": {k: mean([r["best"][k] for r in rows]) for k in keys_},
             "baselines": {n: {k: mean([r["baselines"][n][k] for r in rows if n in r["baselines"]]) for k in keys_} for n in sorted({n for _, _, base in groups for n in base})}}
 
@@ -1048,8 +1044,9 @@ def evaluate(sets: dict[str, list[dict]], pol, sampler, score, args, adapter: Pa
                 for it, (src, x) in zip(items[g * args.samples : (g + 1) * args.samples], mine):
                     samples.write(json.dumps({"set": name, "step": step, "run": run, "behavior": b["id"], "behavior_path": b.get("path"), "program": "oracle", "source": src,
                                               "explanation": it["explanation"], "score": x}) + "\n")
-                src, x = min(mine, key=lambda m, b=b: key(b, m[1]))
-                (runs / f"{b['id']}.{run}.json").write_text(json.dumps({"behavior": b["id"], "model": b.get("model"), "eps": b["eps"], "source": src, "score": x,
+                ks = score_module.keys([m[1] for m in mine])
+                src, x = mine[min(range(len(mine)), key=ks.__getitem__)]
+                (runs / f"{b['id']}.{run}.json").write_text(json.dumps({"behavior": b["id"], "model": b.get("model"), "source": src, "score": x,
                                                                                "baselines": per_base.get(b["id"], {}), "seed": args.eval_seed, "set": name, "step": step}))
                 out.append((b, mine, per_base.get(b["id"], {})))
             if out:
@@ -1094,7 +1091,6 @@ def main():
     ap.add_argument("--behaviors", default=str(BEHAVIORS), help="the tasks: DIR/<model>/<id>.json (text.py)")
     ap.add_argument("--scorer", choices=sorted(SCORERS), default="native")
     ap.add_argument("--scorer-device", help="the native scorer's torch device (default: cuda, else mps, else cpu)")
-    ap.add_argument("--eps", type=float, nargs="+", default=[0.25, 1.0], help="the precisions in bits the questions ask for (every task at each)")
     ap.add_argument("--out", required=True)
     ap.add_argument("--steps", type=int, default=1)
     ap.add_argument("--hours", type=float, help="stop and save after this many hours")
@@ -1119,15 +1115,15 @@ def main():
     ap.add_argument("--skip-first-eval", action="store_true", help="no evaluation at step 0 (the starting policy is evaluated once elsewhere, e.g. by its SFT run)")
     ap.add_argument("--eval-seed", type=int, default=1_000_003, help="the evaluation's seed (training steps use their index)")
     ap.add_argument("--eval-behaviors", type=int, default=0, help="evaluate a fixed random subset of this many held-out tasks (0: all)")
-    ap.add_argument("--no-baselines", dest="baselines", action="store_false", help="skip scoring the baselines (nothing named, VPD's answer) in evaluation")
+    ap.add_argument("--no-baselines", dest="baselines", action="store_false", help="skip scoring the baselines (the empty graph, VPD's answer, the search's) in evaluation")
     ap.add_argument("--data", nargs="*", help="sft: JSONL files of further examples ({'messages': [user, assistant]} or {'prompt', 'completion'})")
-    ap.add_argument("--program-share", type=float, default=1.0, help="sft: probability that a batch example is a teacher answer rather than a --data example")
+    ap.add_argument("--program-share", type=float, default=1.0, help="sft: probability that a batch example is a search answer rather than a --data example")
     ap.add_argument("--sft-steps", type=int, default=200)
     ap.add_argument("--batch", type=int, default=8, help="sft: examples per optimizer step")
     ap.add_argument("--oracle-runs", help="directory of the per-task best-answer files (default ~/mpd-data/graph_oracle/runs/oracle; a pod writes under its outputs)")
     ap.add_argument("--run-name", help="the run's name in runs/oracle/<task>.<run>.json (default: the --out directory's name)")
-    ap.add_argument("--teacher", help="the teacher's graphs of the training questions (DIR/<task>.<eps>.py, native.teach): SFT answers")
-    ap.add_argument("--teacher-heldout", help="the teacher's graphs of the held-out questions: evaluation baselines only")
+    ap.add_argument("--search", help="bootstrap search answers of the training questions (DIR/<task>.py, native.py search, or <task>.answer.txt): SFT answers")
+    ap.add_argument("--search-heldout", help="the search's answers to the held-out questions: evaluation baselines only")
     ap.add_argument("--credit", type=int, default=16, help="rl2: subcomponent names whose drop is scored per answer for per-token credit (0: episode advantages only)")
     ap.add_argument("--credit-answers", type=int, default=0, help="rl2: answers credited per group: the best valid one and K - 1 other distinct valid ones drawn at random (0: every distinct valid answer)")
     ap.add_argument("--refill", type=int, default=1, help="rl2: sampling rounds that replace groups without signal by tasks drawn uniformly")
@@ -1142,9 +1138,9 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
     lr = args.lr if args.lr is not None else {"sft": 1e-4}.get(args.mode, 1e-5)
-    refuse_heldout([args.teacher, *(args.data or [])])
-    TEACHER.update(teacher_answers(args.teacher))
-    HELDOUT_TEACHER.update(teacher_answers(args.teacher_heldout))
+    refuse_heldout([args.search, *(args.data or [])])
+    SEARCH.update(read_answers(args.search))
+    HELDOUT_SEARCH.update(read_answers(args.search_heldout))
     random.seed(args.seed)
     torch.manual_seed(args.seed)
     out = Path(args.out)
@@ -1180,8 +1176,8 @@ def main():
     score = SCORERS[args.scorer]
     scorer.DEVICE = args.scorer_device
     root = Path(args.behaviors)
-    pool = behaviors(root, args.model, "train", args.eps)
-    sets = {"heldout": behaviors(root, args.model, "heldout", args.eps)}
+    pool = behaviors(root, args.model, "train")
+    sets = {"heldout": behaviors(root, args.model, "heldout")}
     if args.eval_behaviors:  # one fixed subset, the same at every evaluation
         sets = {k: random.Random(args.seed).sample(v, min(args.eval_behaviors, len(v))) for k, v in sets.items()}
     adapter = out / "adapter"

@@ -612,6 +612,20 @@ class Native:
         return graphs[:keep], scores[:keep]
 
 
+def prefix(ir: dict, k: int) -> tuple[Graph, list[str]]:
+    """The graph of an answer's first k steps as written (library entries not expanded) and the entries those steps
+    use; ir is mech's trace of the answer."""
+    g = ir["graph"]
+    nd = [(site_name(layer, kind), t, c) for layer, kind, t, c in g["nodes"]]
+    nodes = {nd[i] for i, s in enumerate(g["node_step"]) if s < k}
+    parents = {}
+    for (r, w), s in zip(g["parents"], g["parent_step"]):
+        if s < k:
+            parents.setdefault(nd[r], []).append(nd[w])
+    out = [nd[w] for w, s in zip(g["out"], g["out_step"]) if s < k]
+    return Graph(nodes, parents, out), [u for u, s in zip(g["uses"], g["uses_step"]) if s < k]
+
+
 def build(items: list) -> Graph:
     """The graph of ranked items: (reader, writer) connections (reader None: the prediction) and (node, None) query or
     key nodes."""

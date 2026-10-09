@@ -1,9 +1,9 @@
 """Scorers for the oracle's training (#2951): a batch of items (an answer's source and its task) -> score dicts
-({"valid", "error", "kl_bits", "size", ...}; score.order ranks them against the task's eps).
+({"valid", "error", "curve", "lo", "kl_bits", "bits", ...}; score.keys ranks the answers to one question).
 
   native  score.Scorer: traced and run on the model (one Scorer per process, on its device); a task's items of one
           seed are scored in one batch.
-  mock    no model: KL 0 for a valid answer and its size from the trace. Plumbing only.
+  mock    no model: a valid answer's curve falls from 1 bit to 0 at its whole graph's size from the trace. Plumbing only.
 """
 
 from __future__ import annotations
@@ -40,8 +40,10 @@ def mock(items: list[dict]) -> list[dict]:
     for it in items:
         ir = mech.trace(it["source"], "vpd4l", behavior=it["behavior"])
         g = ir["graph"]
-        out.append({"valid": ir["valid"], "error": ir.get("error"), "kl_bits": 0.0, "nodes": len(g["nodes"]),
-                    "edges": len(g["parents"]) + len(g["out"]), "size": len(g["nodes"]) + len(g["parents"]) + len(g["out"]), "scorer": "mock"})
+        size = len(g["nodes"]) + len(g["parents"]) + len(g["out"])
+        out.append({"valid": ir["valid"], "error": ir.get("error"), "curve": [[0.0, 1.0]] + ([[float(size), 0.0]] if size else []), "lo": 1.0, "hi": 1e6,
+                    "kl_bits": 0.0 if size else 1.0, "bits": float(size), "steps": g.get("steps", 0), "nodes": len(g["nodes"]),
+                    "edges": len(g["parents"]) + len(g["out"]), "scorer": "mock"})
     return out
 
 

@@ -3,11 +3,12 @@
 An answer (mech.py) is traced into ordered steps. The graph of its first k steps runs alone on the model (native.py)
 over the text's changed prompts, giving its faithfulness (KL in bits) and its description length (bits); with the empty
 graph at 0 bits these points are the answer's curve. One curve is better than another at a description length when its
-best point within that length has the lower KL. area() summarizes a curve over a range of lengths: the mean KL it reaches
-within a length drawn log-uniformly from one subcomponent's description length to the top of the range (there is no
-natural unit of explanation size, so every doubling of length counts the same). Answers compared with each other share
-the range, up to the longest of them (keys). No tolerance and no weight: an answer that explains nothing keeps the empty
-graph's KL over the whole range, the worst curve there is.
+best point within that length has the lower KL. An answer's score (key) is area(): the mean KL its curve reaches within a
+description length drawn log-uniformly from one subcomponent's ("lo") to the whole model's, every subcomponent at every
+position ("hi"): from the smallest explanation there is to the model itself, and every doubling of length counts the
+same (there is no natural unit of explanation size). The range is the question's alone, so scores compare across
+answers, groups and baselines. No tolerance and no weight: an answer that explains nothing keeps the empty graph's KL
+over the whole range, the worst curve there is.
 
   score.py ANSWER.py TASK.json      prints the answer's score
 """
@@ -43,24 +44,15 @@ def area(curve: list, lo: float, hi: float) -> float:
     return total / (math.log(hi) - math.log(lo))
 
 
-def top(scores: list[dict]) -> float:
-    """The range's top for answers compared together: the longest valid answer's description length."""
-    return max([s["curve"][-1][0] for s in scores if s.get("valid", True) and s.get("curve")] or [0.0])
-
-
-def key_at(hi: float):
-    """A score's rank (lower is better) among answers whose range tops at hi: invalid last, then area()."""
-    def key(s: dict) -> tuple:
-        if not s.get("valid", True) or not s.get("curve"):
-            return (1, math.inf)
-        return (0, area(s["curve"], s["lo"], hi))
-    return key
+def key(s: dict) -> tuple:
+    """A score's rank, lower first: invalid last, then area() over the question's range."""
+    if not s.get("valid", True) or not s.get("curve"):
+        return (1, math.inf)
+    return (0, area(s["curve"], s["lo"], s["hi"]))
 
 
 def keys(scores: list[dict]) -> list[tuple]:
-    """The ranks of answers compared together (one question, one draw of changed prompts)."""
-    k = key_at(top(scores))
-    return [k(s) for s in scores]
+    return [key(s) for s in scores]
 
 
 class Scorer:
@@ -104,23 +96,11 @@ class Scorer:
                 g.nodes |= {w, r}
         return g
 
-    def prefix(self, ir: dict, k: int):
-        """The graph of an answer's first k steps as written (library entries not expanded), and the entries those
-        steps use."""
-        g = ir["graph"]
-        nd = [(self.native.site_name(layer, kind), t, c) for layer, kind, t, c in g["nodes"]]
-        nodes = {nd[i] for i, s in enumerate(g["node_step"]) if s < k}
-        parents = {}
-        for (r, w), s in zip(g["parents"], g["parent_step"]):
-            if s < k:
-                parents.setdefault(nd[r], []).append(nd[w])
-        out = [nd[w] for w, s in zip(g["out"], g["out_step"]) if s < k]
-        return self.native.Graph(nodes, parents, out), [u for u, s in zip(g["uses"], g["uses_step"]) if s < k]
-
     def score(self, task: dict, sources: list[str], seed: int = 0) -> list[dict]:
         """Each answer's score on a task (a text task record) under one draw of changed prompts (seed): {"valid",
-        "error", "curve": [[bits, kl], ...] (the empty graph, then each step), "lo": one subcomponent's description
-        length, "kl_bits" and "bits" (the whole answer), "steps", "nodes", "edges", "explanation", "notes"}; the
+        "error", "curve": [[bits, kl], ...] (the empty graph, then each step), "lo" and "hi": one subcomponent's and
+        the whole model's description lengths, "kl_bits" and "bits" (the whole answer), "steps", "nodes", "edges",
+        "explanation", "notes"}; the
         source "vpd" stands for VPD's own answer (complete, one step)."""
         import mech
 
@@ -147,7 +127,7 @@ class Scorer:
                 continue
             mine = []
             for k in range(1, out[-1]["steps"] + 1):
-                g, uses = self.prefix(ir, k)
+                g, uses = self.native.prefix(ir, k)
                 bits = g.bits(positions, total) + ref_bits * len(uses)
                 if uses:
                     g = self.expand(g, uses, targets, len(ids))
@@ -163,7 +143,7 @@ class Scorer:
         kl = nat.faithfulness(ids, targets, graphs, prompts)
         lo = math.log2(positions * total)
         for s in out:
-            s.update(curve=[[0.0, kl[0]]], lo=lo)
+            s.update(curve=[[0.0, kl[0]]], lo=lo, hi=positions * total * lo)
         for g, o, b, k in zip(graphs[1:], owners[1:], own_bits[1:], kl[1:]):
             s = out[o]
             s["curve"].append([b, k])
@@ -182,7 +162,7 @@ def main():
     ap.add_argument("task", type=Path)
     a = ap.parse_args()
     s = Scorer().score(json.loads(a.task.read_text()), [a.answer.read_text()])[0]
-    print(json.dumps({**s, "area": keys([s])[0][1]}))
+    print(json.dumps({**s, "area": key(s)[1]}))
 
 
 if __name__ == "__main__":

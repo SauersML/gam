@@ -1,19 +1,11 @@
-"""Real-text tasks for the graph oracle (#2951): explain the model's next-token prediction at the end of a window of
-real text by the circuit that computes it.
+"""Real-text tasks for the graph oracle (#2951): explain how the model computes its next-token prediction after a text.
 
-A task is a window of LENGTH tokens of Pile validation text; the prediction after its last token is to be explained.
-An explanation is a gate program (mech.gates): which subcomponents act at which positions. With every subcomponent it
-leaves out deleted (VPD's ablation), it is judged by the KL in bits of the model's next-token distribution there from
-the circuit's, against VPD's own answer on the same text: at every position, the subcomponents whose causal importance
-there is above zero (VPD's definition of a needed subcomponent, its ablation as published). An explanation as faithful
-as VPD's (a KL no larger) is better the fewer (subcomponent, position) pairs it names; one less faithful is worse by its
-excess (score.order). VPD's answer is the teacher and each task's reference: on 20 held-out windows it keeps 0.44 bits
-with 7,090 pairs (its importance at the predicted position alone: 1.11 bits with 182). A position's subcomponents are
-written as one string of names, one oracle token each.
+A task is a Pile validation sequence of the model's context length (512 tokens) cut after a position drawn uniformly,
+so every prediction the model makes is equally likely to be asked about; the prediction after the last token is to be
+explained. Train and held-out tasks come from disjoint rows.
 
-  text.py build --split train --n 2000 --offset 6000    writes ~/mpd-data/graph_oracle/texts/vpd4l/<id>.json (a
-  text.py build --split heldout --n 200 --offset 9000   behavior: one prompt, its target, the model's top next tokens)
-and texts/teacher/<id>.py (train) or texts/teacher_heldout/<id>.py (heldout, the evaluation's VPD baseline).
+  text.py build --split train --n 2000 --offset 6000     writes ~/mpd-data/graph_oracle/texts/vpd4l/<id>.json (a
+  text.py build --split heldout --n 200 --offset 9000    behavior: one prompt, its target, the model's top next tokens)
 """
 
 from __future__ import annotations
@@ -34,43 +26,21 @@ sys.path.insert(0, str(HERE.parents[1] / "vpd_2951"))
 import mech  # noqa: E402
 
 TEXTS = Path.home() / "mpd-data/graph_oracle/texts"
-LENGTH = 32
-CODES = {site: code for code, site in mech.SITES.items()}  # "v_proj" -> "v"
+CONTEXT = 512  # vpd4l's context length (model_config.yaml n_ctx)
 
 
 @lru_cache(None)
 def model(device: str = "mps"):
-    """vpd4l and its VPD decomposition."""
+    """vpd4l."""
     import vpd_model
 
-    target = vpd_model.load_target(device)
-    return target, vpd_model.load_vpd(target, device)
-
-
-def importance(ids: list[int], device: str = "mps") -> dict[str, torch.Tensor]:
-    """VPD's causal importance [T, C] per site name ("h.2.attn.v_proj"), clamped to [0, 1], on one sequence."""
-    _, vpd = model(device)
-    _, ci = vpd.target_and_ci(torch.tensor([ids], device=device))
-    return {n: c[0].clamp(0, 1) for n, c in ci.items()}
-
-
-def teacher(ids: list[int], device: str = "mps") -> str:
-    """VPD's answer: at every position, the subcomponents whose causal importance there is above zero (by layer, site
-    and index)."""
-    per: dict[int, list[tuple]] = {}
-    for site, m in importance(ids, device).items():
-        _, layer, _, kind = site.split(".")
-        for t, i in (m > 0).nonzero().tolist():
-            per.setdefault(t, []).append((int(layer), list(mech.SITES.values()).index(kind), i, f"<p:{layer}.{CODES[kind]}.{i}>"))
-    lines = [f'        {t}: "' + "".join(p for *_, p in sorted(per[t])) + '",' for t in sorted(per)]
-    return "def on(tokens, targets):\n    return {\n" + "\n".join(lines) + "\n    }\n"
+    return vpd_model.load_target(device)
 
 
 def top(ids: list[int], k: int = 3, device: str = "mps") -> list[list]:
     """The model's k most probable next tokens after `ids`, with their probabilities."""
-    target, _ = model(device)
     with torch.no_grad():
-        p = target(torch.tensor([ids], device=device))[0, -1].softmax(-1)
+        p = model(device)(torch.tensor([ids], device=device))[0, -1].softmax(-1)
     tk = mech.tokenizer("vpd4l")
     v, i = p.topk(k)
     return [[tk.decode([int(j)]), round(float(q), 4)] for q, j in zip(v.tolist(), i.tolist())]
@@ -80,19 +50,16 @@ def build(split: str, n: int, offset: int, seed: int, device: str = "mps") -> No
     import vpd_model
 
     rng = random.Random(seed)
-    rows = vpd_model.val_tokens(n, 512, offset)
+    rows = vpd_model.val_tokens(n, CONTEXT, offset)
     (TEXTS / "vpd4l").mkdir(parents=True, exist_ok=True)
-    answers = TEXTS / ("teacher" if split == "train" else "teacher_heldout")
-    answers.mkdir(exist_ok=True)
     tk = mech.tokenizer("vpd4l")
     for r in range(n):
-        start = rng.randrange(0, rows.shape[1] - LENGTH)
-        ids = rows[r, start:start + LENGTH].tolist()
+        t = rng.randrange(CONTEXT)
+        ids = rows[r, :t + 1].tolist()
         name = f"text{offset + r}"
-        prompt = {"text": tk.decode(ids), "token_ids": ids, "target_positions": [LENGTH - 1], "model_top": [top(ids, device=device)]}
+        prompt = {"text": tk.decode(ids), "token_ids": ids, "target_positions": [t], "model_top": [top(ids, device=device)]}
         (TEXTS / "vpd4l" / f"{name}.json").write_text(json.dumps({"id": name, "model": "vpd4l", "family": "text", "split": split,
                                                                   "description": "", "prompts": [prompt]}))
-        (answers / f"{name}.py").write_text(teacher(ids, device))
         if (r + 1) % 100 == 0:
             print(f"{split}: {r + 1}/{n}", flush=True)
 
