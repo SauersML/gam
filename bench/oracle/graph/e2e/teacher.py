@@ -55,7 +55,8 @@ def common(units, key: str, top: int = 3) -> list[str]:
     parts, count = atlas.load()["parts"], {}
     for u in units:
         for item in parts[explain.token(u)].get(key, [])[:5]:
-            tok = (item[1] if key == "top" else item).strip() or repr(item[1] if key == "top" else item)
+            text = item[1] if key == "top" else item
+            tok = text.strip() or text  # whitespace tokens as they are
             count[tok] = count.get(tok, 0) + 1
     return [t for t, _ in sorted(count.items(), key=lambda kv: -kv[1])[:top]]
 
