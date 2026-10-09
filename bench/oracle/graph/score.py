@@ -25,12 +25,12 @@ BINARY = Path(os.environ.get("GRAPH_CHECKER") or (Path(os.environ["MPD_BIN"]) / 
 
 class Checker:
     def __init__(self, model, export=None, memory_gib=None, threads=None, views=None, device=None, memo_dir=None):
-        """memory_gib: the server's mem-lease (vpd4l: a batch of 8 programs at 8 threads ran under 12 GiB and was killed
-        under 8 GiB); threads: its rayon threads (RAYON_NUM_THREADS when unset, 6 by default); views: decomposition
+        """memory_gib: the server's mem-lease (GRAPH_MEM_GIB, else 16; vpd4l: a batch of 8 programs at 8 threads ran
+        under 12 GiB and was killed under 8 GiB; one 255-subcomponent program at 64 experiments reached 12.5); threads: its rayon threads (RAYON_NUM_THREADS when unset, 6 by default); views: decomposition
         views to attach ({"vpd": DIR}, the model's VPD decomposition by default); device: "gpu" runs the large products
         on the single-precision device (float32, so compare scores within one device); memo_dir: the server's
         --memo-dir (GRAPH_MEMO_DIR when unset), per-behavior memos of the targets that later runs reuse."""
-        memory_gib = memory_gib or 12
+        memory_gib = memory_gib or float(os.environ.get("GRAPH_MEM_GIB", 16))
         env = dict(os.environ)
         env.setdefault("RAYON_NUM_THREADS", str(threads or 6))
         self.model = model
