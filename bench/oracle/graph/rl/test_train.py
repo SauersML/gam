@@ -2,8 +2,9 @@
 
 - token_logprobs = log-softmax of a plain forward pass at every completion token;
 - at the start pi = pi_ref: the KL term is 0 and the DPO loss is ln 2;
-- the GRPO loss weights an episode by its summed token log-probability: its gradient equals
-  -(1/E) sum_e A_e grad log pi(y_e), whatever the episodes' lengths.
+- PPO's first epoch is the policy gradient of summed token log-probabilities (episode_gradient), whatever the
+  episodes' lengths;
+- RL v2 on stand-ins: ranked advantages, references, credit, refinement, a whole step.
 """
 
 from __future__ import annotations
@@ -29,6 +30,26 @@ def tiny(path: Path):
     torch.manual_seed(0)
     Qwen3ForCausalLM(config).save_pretrained(path)
     tok.save_pretrained(path)
+
+
+def episode_gradient(pol, prompts, completions, advantage, beta: float, micro: int) -> dict:
+    """The policy gradient of whole episodes, accumulated in the parameters' .grad: loss = -(1/E) sum_e (A_e - beta
+    stop_grad(rho_e)) log pi(y_e), rho_e = log pi(y_e) - log pi_ref(y_e), log pi(y_e) the summed token log-probability
+    (the KL(pi || pi_ref) gradient is E[rho grad log pi])."""
+    kl = 0.0
+    for idx in train.micro_batches(len(prompts), micro):
+        ps, cs = [prompts[i] for i in idx], [completions[i] for i in idx]
+        adv = torch.tensor([advantage[i] for i in idx], dtype=torch.float32)
+        cur, mask = pol.token_logprobs(ps, cs)
+        episode = (cur * mask).sum(1)
+        loss = -(adv * episode).sum() / len(prompts)
+        if beta > 0:
+            ref, _ = pol.token_logprobs(ps, cs, ref=True)
+            ratio = ((cur - ref) * mask).sum(1).detach()
+            loss = loss + beta * (ratio * episode).sum() / len(prompts)
+            kl += float(ratio.sum()) / len(prompts)
+        loss.backward()
+    return {"kl_sum_per_episode": kl}
 
 
 def main():
@@ -58,7 +79,7 @@ def main():
             if "lora_B" in [n for n, q in pol.model.named_parameters() if q is p][0]:
                 p.data.zero_()
         pol.model.zero_grad()
-        stats = train.grpo_update(pol, prompts, comps, [0.0, 0.0], beta=1.0, micro=2)
+        stats = episode_gradient(pol, prompts, comps, [0.0, 0.0], beta=1.0, micro=2)
         assert abs(stats["kl_sum_per_episode"]) < 1e-9, stats
         pol.model.zero_grad()
         stats = train.dpo_update(pol, [prompts[0]], [comps[0]], [comps[1][:3]], beta=0.1, micro=1)
@@ -68,7 +89,7 @@ def main():
             torch.nn.init.normal_(p, std=0.02)
         adv = [1.5, -0.5]
         pol.model.zero_grad()
-        train.grpo_update(pol, prompts, comps, adv, beta=0.0, micro=1)
+        episode_gradient(pol, prompts, comps, adv, beta=0.0, micro=1)
         got = [p.grad.clone() for p in pol.params]
         pol.model.zero_grad()
         lp, mask = pol.token_logprobs(prompts, comps)
@@ -81,11 +102,10 @@ def main():
         check_ppo(pol)
         check_credit_advantages(pol)
         check_rl2_step(pol)
-    check_split_prompts()
     check_rl2_pieces()
-    print("ok: token log-probabilities, KL 0 and DPO ln 2 at the reference, GRPO gradient = summed log-probability policy gradient, "
-          "left-padded batched generation, prompt split, part tokens (stand-in and registry), "
-          "RL v2: RLOO at a fixed scale, step seeds, PPO epoch 0 = the GRPO gradient, clipping, token credit (canonical and other tokenizations), a whole step on stand-ins")
+    print("ok: token log-probabilities, KL 0 and DPO ln 2 at the reference, summed log-probability policy gradient, "
+          "left-padded batched generation, part tokens (stand-in and registry), "
+          "RL v2: ranked leave-one-out advantages, references, step seeds, PPO epoch 0 = the policy gradient, clipping, token credit (canonical and other tokenizations), a whole step on stand-ins")
 
 
 def check_left_padding(pol):
@@ -193,7 +213,7 @@ def check_registry_parts(base: Path):
             once = causal(input_ids=ids).logits
     assert torch.allclose(plain, once, atol=1e-6)
     text = '```python\nnodes = {"copy": {"subcomponents": ["<p:2.v.7>", "<p:0.fc.12>"]}}\nedges = [("input", "copy"), ("copy", "output")]\n```\nThe value head.'
-    it = train.item(text, {}, 0, 0, 16)  # part tokens reach the checker as written
+    it = train.item(text, {}, 0, 0)  # part tokens reach the checker as written
     assert '["<p:2.v.7>", "<p:0.fc.12>"]' in it["source"] and it["explanation"] == "The value head."
     assert pol.parts.reg.rewrite("node(PD[1].v_proj[3], PD.vpd[2].v_proj[7])") == "node(<p:1.v.3>, <p:2.v.7>)"  # either spelling
     assert pol.tok.decode([first + 4]) == "<p:0.fc.12>"
@@ -209,15 +229,6 @@ def check_registry_parts(base: Path):
         again = train.Policy(argparse.Namespace(base=str(base), init=d, lora_rank=4, part_tokens=str(path)), torch.device("cpu"))
     (f0, i0, o0), (f1, i1, o1) = pol.part_rows(), again.part_rows()
     assert f0 == f1 and torch.equal(i0, i1) and torch.equal(o0, o1)
-
-
-def check_split_prompts():
-    with tempfile.TemporaryDirectory() as d:
-        b = {"id": "x", "model": "vpd4l", "path": "/nowhere", "prompts": [{"text": str(i)} for i in range(10)]}
-        train_views, held = train.split_prompts([b], 4, Path(d))
-        assert [p["text"] for p in train_views[0]["prompts"]] == ["1", "2", "3", "5", "6", "7", "9"]
-        assert [p["text"] for p in held[0]["prompts"]] == ["0", "4", "8"]
-        assert Path(held[0]["path"]).exists() and "path" not in __import__("json").loads(Path(held[0]["path"]).read_text())
 
 
 class Recorder:
@@ -245,7 +256,7 @@ class NoWarmup:
 
 
 def check_ppo(pol):
-    """ppo_update's first epoch is grpo_update's gradient (constant token advantages, the KL through the advantage), a
+    """ppo_update's first epoch is episode_gradient's (constant token advantages, the KL through the advantage), a
     second epoch on an unmoved policy repeats it, behavior log-probabilities equal to the trainer's change nothing,
     ones 4x less likely give the importance weight's cap (2x the gradient), and after a large step ratios are clipped."""
     g = torch.Generator().manual_seed(6)
@@ -257,7 +268,7 @@ def check_ppo(pol):
     adv = [0.7, -1.3]
     tokens = [[a] * len(c) for a, c in zip(adv, comps)]
     pol.model.zero_grad()
-    train.grpo_update(pol, prompts, comps, adv, beta=0.3, micro=1)
+    episode_gradient(pol, prompts, comps, adv, beta=0.3, micro=1)
     want = [p.grad.clone() for p in pol.params]
     pol.model.zero_grad()
     rec = Recorder(pol.params)
@@ -300,28 +311,28 @@ The answer is copied by layer 2's value and output parts."""
 
 
 def check_credit_advantages(pol):
-    """credit_advantages: a credited subcomponent name's tokens get dS(drop it) / scale (+inf: 1), the other tokens the
-    episode advantage; the same with a tokenization that re-encoding does not give."""
+    """credit_advantages: a credited subcomponent name's tokens get the sign of its drop (+1: the drop made the answer
+    worse), the other tokens the episode advantage; the same with a tokenization that re-encoding does not give."""
     tok = pol.tok
     source = train.split_answer(ANSWER)[0]
     assert ANSWER[train.program_offset(ANSWER, source):].startswith(source)
     v, o = source.index('"<p:2.v.559>"'), source.index('"<p:2.o.735>"')
-    dS = {(v, v + len('"<p:2.v.559>"')): 3.0, (o, o + len('"<p:2.o.735>"')): float("inf")}
+    signs = {(v, v + len('"<p:2.v.559>"')): 1, (o, o + len('"<p:2.o.735>"')): -1}
     canonical = tok.encode(ANSWER, add_special_tokens=False) + [pol.end]
     chars = [i for ch in ANSWER for i in tok.encode(ch, add_special_tokens=False)] + [pol.end]
     assert chars != canonical[: len(chars)]
     offset = train.program_offset(ANSWER, source)
     for completion in (canonical, chars):
-        adv = train.credit_advantages(tok, completion, ANSWER, source, -0.25, dS, 2.0)
+        adv = train.credit_advantages(tok, completion, ANSWER, source, -0.25, signs)
         spans = train.token_spans(tok, completion, ANSWER)
         assert len(adv) == len(completion) == len(spans)
         for (c0, c1), a in zip(spans, adv):
             if c1 <= c0:
                 assert a == -0.25
             elif c1 > offset + v and c0 < offset + v + len('"<p:2.v.559>"'):
-                assert a == 1.5, (ANSWER[c0:c1], a)
+                assert a == 1, (ANSWER[c0:c1], a)
             elif c1 > offset + o and c0 < offset + o + len('"<p:2.o.735>"'):
-                assert a == 1.0, (ANSWER[c0:c1], a)
+                assert a == -1, (ANSWER[c0:c1], a)
             else:
                 assert a == -0.25, (ANSWER[c0:c1], a)
 
@@ -329,24 +340,23 @@ def check_credit_advantages(pol):
 def check_rl2_pieces():
     import numpy as np
 
-    A = train.rloo(np.array([1.0, 2.0, 3.0]), 2.0)
-    assert np.allclose(A, [0.75, 0.0, -0.75]), A
-    assert train.rloo(np.array([5.0]), 1.0).tolist() == [0.0]
-    assert train.rloo(np.array([0.1] * 7), 0.3).tolist() == [0.0] * 7
+    A = train.rloo([(0, 0.0, 3), (0, 0.0, 5), (0, 0.2, 1), (1, math.inf, math.inf)])
+    assert np.allclose(A, [1.0, 1 / 3, -1 / 3, -1.0]), A
+    assert train.rloo([(0, 0.0, 5)]).tolist() == [0.0]
+    assert train.rloo([(0, 0.1, 2)] * 7).tolist() == [0.0] * 7
     args = argparse.Namespace(seed=0, eval_seed=5)
     seeds = [train.step_seed(args, s) for s in range(10)]
     assert len(set(seeds)) == 10 and 5 not in seeds
     assert train.step_seed(argparse.Namespace(seed=1, eval_seed=5), 0) == 1 << 20
-    sc = train.Scales({"a": "x"})
-    sc.take([("a", "teacher", {}), ("a", "empty", {}), ("b", "empty", {})], [{"valid": True, "total_bits": 10.0}, {"valid": True, "total_bits": 40.0}, {"valid": True, "total_bits": 20.0}])
-    assert sc.scale == {"a": 10.0, "b": 20.0} and sc.target == {"a": 10.0, "b": 0.0}
-    sc.observe("a", np.array([12.0, 30.0, 99.0]), np.array([True, True, False]))
-    sc.observe("b", np.array([1.0]), np.array([True]))
-    assert abs(sc.gap["a"] - 1.1) < 1e-12 and sc.gap["b"] == sc.FLOOR
-    import random
-
-    picks = [sc.draw([{"id": "a"}, {"id": "b"}], 1, random.Random(i))[0]["id"] for i in range(400)]
-    assert picks.count("a") > 300, picks.count("a")
+    refs = train.References({"a": "x"})
+    entries = refs.items([{"id": "a", "model": "vpd4l"}, {"id": "b", "model": "vpd4l"}], 0, 0)
+    assert [bid for bid, _ in entries] == ["a"]  # only a task with a teacher answer has a reference
+    refs.take(entries, [{"valid": True, "exec_error_bits": 0.5, "pairs": 10}])
+    assert refs.items([{"id": "a", "model": "vpd4l"}], 1, 0) == []  # scored once
+    assert refs.order("a", {"valid": True, "exec_error_bits": 0.4, "pairs": 7}) == (0, 0.0, 7)
+    assert refs.order("a", {"valid": True, "exec_error_bits": 0.75, "pairs": 2}) == (0, 0.25, 2)
+    assert refs.order("b", {"valid": True, "exec_error_bits": 0.75, "pairs": 2}) == (0, 0.75, 2)
+    assert refs.order("a", {"valid": False}) == (1, math.inf, math.inf)
     import json
 
     with tempfile.TemporaryDirectory() as d:  # teacher_v3.py's manifest, written on another machine; the held-out refusal
@@ -365,10 +375,10 @@ def check_rl2_pieces():
 
 
 def check_rl2_step(pol):
-    """A whole rl2 step on stand-ins: a sampler that writes fixed answers and a stand-in score (10 bits per needed
-    subcomponent missing, 1 per subcomponent named; invalid when it names none). Behavior "x" gets answers of different
-    scores, "y" only invalid ones (dropped, refilled by "z"); credit marks tokens, refine drops what the best answers
-    name needlessly (expert iteration), and the PPO epochs and the expert-iteration step run."""
+    """A whole rl2 step on stand-ins: a sampler that writes fixed answers and a stand-in score (KL 10 bits per needed
+    subcomponent missing, pairs the names; invalid when it names none). Task "x" gets answers of different ranks, "y"
+    only invalid ones (dropped, refilled by "z"); credit marks tokens, refine drops what the best answers name
+    needlessly (expert iteration), and the PPO epochs and the expert-iteration step run."""
     import json
     import re
 
@@ -383,7 +393,7 @@ def check_rl2_step(pol):
         out = []
         for it in items:
             named = named_in(it["source"])
-            out.append({"total_bits": 10.0 * len(needed - named) + len(named) if named else 1e4, "valid": bool(named)})
+            out.append({"exec_error_bits": 10.0 * len(needed - named), "pairs": len(named), "valid": bool(named)})
         return out
 
     def answer_with(parts):
@@ -409,7 +419,7 @@ def check_rl2_step(pol):
             args = argparse.Namespace(seed=0, eval_seed=1_000_003, samples=4, experiments=4, credit=16, credit_answers=0, refill=1, refine=3, behaviors_per_step=2, beta=0.0,
                                       micro=2, ppo_epochs=2, clip=0.2, clip_high=0.28, dual_clip=3.0, tis_cap=2.0, exit_beta=0.1)
             pool = [{"id": "x", "model": "vpd4l"}, {"id": "y", "model": "vpd4l"}, {"id": "z", "model": "vpd4l"}]
-            scales = train.Scales({"x": answer_with(sorted(needed)), "y": answer_with(sorted(needed))})
+            refs = train.References({"x": answer_with(sorted(needed)), "y": answer_with(sorted(needed))})
             rec = Recorder(pol.params)
             for p in pol.params:
                 torch.nn.init.normal_(p, std=0.02)
@@ -417,20 +427,21 @@ def check_rl2_step(pol):
             first = {}
             for step in range(64):  # the first step that draws x and y
                 if set(random_pick(pool, args, step)) == {"x", "y"}:
-                    first = train.rl2_step(step, args, pol, sampler, stand_in, scales, pool, Path(d), train.Learner(pol, rec, NoWarmup()), logs, 0.0)
+                    first = train.rl2_step(step, args, pol, sampler, stand_in, refs, pool, Path(d), train.Learner(pol, rec, NoWarmup()), logs, 0.0)
                     break
             assert first, "no step draws x and y"
             assert first["groups"] == 3 and first["kept"] == 2 and first["refills"] == 1 and asked[-1] == "z", (first, asked)
-            assert scales.scale == {"x": 3.0, "y": 3.0, "z": 1e4} and scales.target["z"] == 0.0  # the teacher's 3 parts; z: the empty program's total
+            assert sorted(refs.score) == ["x", "y"] and refs.score["x"]["pairs"] == 3 and refs.score["x"]["exec_error_bits"] == 0.0  # z has no teacher
             assert first["improved"] >= 1 and len(first["loss"]) == 2 and "exit_sft_loss" in first, first
             assert first["repeated_scores"] > 0, first  # refinement starts from an answer the credit scored
             texts3 = [answer_with(["<p:2.v.559>", "<p:2.o.735>"]), answer_with(["<p:2.v.559>"]), answer_with(["<p:2.v.559>", "<p:3.o.1>"]), answer_with(["<p:2.o.735>"])]
-            items = [train.item(t, pool[0], 0, 0, 4) for t in texts3]
+            items = [train.item(t, pool[0], 0, 4) for t in texts3]
             sc3 = stand_in(items)
+            keys = [refs.order("x", x) for x in sc3]
             grp = {"behavior": pool[0], "completions": [pol.tok.encode(t, add_special_tokens=False) for t in texts3], "texts": texts3, "items": items, "scores": sc3,
-                   "S": np.array([x["total_bits"] for x in sc3]), "valid": np.array([x["valid"] for x in sc3]), "advantage": np.zeros(4), "token_advantages": [[0.0]] * 4, "credit": [None] * 4}
-            train.credit_groups([grp], 0, argparse.Namespace(**{**vars(args), "credit_answers": 2}), pol.tok, stand_in, scales, {"credit": 0.0})
-            best = int(np.argmin(grp["S"]))
+                   "keys": keys, "valid": np.array([x["valid"] for x in sc3]), "advantage": np.zeros(4), "token_advantages": [[0.0]] * 4, "credit": [None] * 4}
+            train.credit_groups([grp], 0, argparse.Namespace(**{**vars(args), "credit_answers": 2}), pol.tok, stand_in, refs, {"credit": 0.0})
+            best = min(range(4), key=keys.__getitem__)
             assert sum(c is not None for c in grp["credit"]) == 2 and grp["credit"][best] is not None, grp["credit"]  # the best and one other
             assert len(rec.grads) == 3  # two PPO epochs and the expert-iteration step
             for f in logs.values():
@@ -439,12 +450,12 @@ def check_rl2_step(pol):
             credited = [r for r in rows if r["credit"]]
             assert len(rows) == 12 and credited and all(r["kept"] == (r["behavior"] != "y") for r in rows)
             improved = [json.loads(line) for line in open(Path(d) / "improved.jsonl")]
-            assert all(r["bits"] < r["sampled_bits"] for r in improved), improved
+            assert all(r["key"] < r["sampled_key"] for r in improved), improved
             assert any(named_in(train.split_answer(r["text"])[0]) == needed for r in improved if r["behavior"] == "x"), improved
-            assert np.isfinite(first["mean_bits"])
+            assert np.isfinite(first["mean_kl"]) and first["best_faithful"] > 0
             logs2 = {k: open(Path(d) / f"async_{k}.jsonl", "w") for k in ("train", "samples", "improved")}
             asked.clear()
-            train.rl2_async(argparse.Namespace(**{**vars(args), "steps": 3, "async_rollouts": True}), pol, sampler, stand_in, scales, pool, Path(d), train.Learner(pol, rec, NoWarmup()),
+            train.rl2_async(argparse.Namespace(**{**vars(args), "steps": 3, "async_rollouts": True}), pol, sampler, stand_in, refs, pool, Path(d), train.Learner(pol, rec, NoWarmup()),
                             logs2, 0.0, lambda: False)
             for f in logs2.values():
                 f.close()
