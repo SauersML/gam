@@ -597,8 +597,18 @@ class Native:
             g_out = build(ranked[:keep])
             s = self.score(ids, targets, [g_out], seed, logp)[0]
             if s["kl_bits"] <= eps or keep >= n_items:
-                return g_out, s
+                return self.clean(ids, targets, g_out, s, eps, seed, logp)
             keep = min(n_items, max(keep + 1, int(keep * 1.25)))
+
+    def clean(self, ids: list[int], targets: list[int], g: Graph, s: dict, eps: float, seed: int = 0, logp=None) -> tuple[Graph, dict]:
+        """g without what lies on no path to the prediction (pathways()), kept when it still passes the tests at eps."""
+        on_path = set().union(*pathways(g, targets).values()) if g.out else set()
+        if on_path == g.nodes:
+            return g, s
+        h = Graph(on_path, {r: [w for w in ws if w in on_path] for r, ws in g.parents.items() if r in on_path}, [w for w in g.out if w in on_path])
+        h.parents = {r: ws for r, ws in h.parents.items() if ws}
+        sh = self.score(ids, targets, [h], seed, logp)[0]
+        return (h, sh) if sh["kl_bits"] <= eps else (g, s)
 
 
 def pathways(g: Graph, targets: list[int]) -> dict[int, set]:
@@ -715,9 +725,33 @@ def teach(split: str, n: int, offset: int = 0, stride: int = 1, epsilons=(0.25, 
             print(f"{stem}: {s['nodes']} nodes, {s['edges']} edges, kl {s['kl_bits']:.3f} (eps {eps}), {len(claims)} claims, {time.time() - t0:.0f} s", flush=True)
 
 
+def clean_dir(directory: Path, split: str) -> None:
+    """Native.clean every teacher graph <task>.<eps>.py in a directory (a pod's output), rewriting it and its .json."""
+    nat = Native()
+    by = {p.stem: p for p in tasks(split)}
+    for py in sorted(Path(directory).glob("*.py")):
+        task_id = py.stem.split(".")[0]  # <task>.<eps>
+        eps = float(py.stem[len(task_id) + 1:])
+        rec = json.loads(py.with_suffix(".json").read_text())
+        ids, targets = text(by[task_id])
+        task = json.loads(by[task_id].read_text())
+        ir = mech.trace_inline(py.read_text(), "vpd4l", task)
+        g = nat.from_ir(ir)
+        h, s = nat.clean(ids, targets, g, rec["score"], eps)
+        if h is not g:
+            claims = rec.get("claims", [])
+            py.write_text(program(h, claims))
+            rec.update(score=s, cleaned=True)
+            py.with_suffix(".json").write_text(json.dumps(rec))
+            print(f"{py.stem}: {rec['score']['nodes']} nodes, {rec['score']['edges']} edges after cleaning", flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
+    c = sub.add_parser("clean")
+    c.add_argument("directory", type=Path)
+    c.add_argument("--split", choices=("train", "heldout"), required=True)
     t = sub.add_parser("teach")
     t.add_argument("--split", choices=("train", "heldout"), required=True)
     t.add_argument("--n", type=int, required=True)
@@ -726,7 +760,10 @@ def main():
     t.add_argument("--eps", type=float, nargs="+", default=[0.25, 1.0])
     t.add_argument("--out", type=Path)
     args = ap.parse_args()
-    teach(args.split, args.n, args.offset, args.stride, tuple(args.eps), args.out)
+    if args.cmd == "clean":
+        clean_dir(args.directory, args.split)
+    else:
+        teach(args.split, args.n, args.offset, args.stride, tuple(args.eps), args.out)
 
 
 if __name__ == "__main__":
