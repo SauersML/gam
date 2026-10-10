@@ -25,7 +25,8 @@ def test_english_spans():
 
 
 def test_reader_bits():
-    """English that says position 3 matters saves bits on a flip at 3 and none elsewhere; no English saves 0."""
+    """English that says position 3 matters saves bits on events at 3 and none elsewhere; no English saves 0; each
+    English text can have its own events (holds of its steps)."""
     def generate(prompts):
         out = []
         for q in prompts:
@@ -36,8 +37,10 @@ def test_reader_bits():
 
     r = reader.Reader(generate, lambda ids: [f"t{i}" for i in ids])
     task = {"prompts": [{"token_ids": [10, 11, 12, 13], "model_top": [[[" her", 0.5]]]}]}
-    events = [{"position": 3, "old": 13, "new": 99, "flipped": True}, {"position": 1, "old": 11, "new": 98, "flipped": False}]
+    events = [{"position": 3, "old": 13, "new": 99, "down": True}, {"position": 1, "old": 11, "new": 98, "down": False}]
     good, empty = r.bits(task, ["position 3 decides the prediction", ""], events)
     assert abs(good - (1 - math.log2(1 / 0.9)) / 2) < 1e-9 and empty == 0.0
-    assert r.bits(task, ["x"], []) == [None]
-    assert reader.english({"explanation": "A.", "notes": ["b", ""]}) == "A.\nb"
+    assert r.bits(task, ["x"], [[]]) == [None]
+    held = r.bits(task, ["position 3 decides"], [[{**events[0], "hold": 2}]])[0]
+    assert abs(held - (1 - math.log2(1 / 0.9))) < 1e-9  # one event, its own list
+    assert reader.english({"explanation": "A.", "notes": ["b", ""]}) == "A.\nStep 1: b"

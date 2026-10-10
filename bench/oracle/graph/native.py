@@ -581,19 +581,47 @@ class Native:
         return (total / len(prompts)).tolist()
 
     @torch.no_grad()
-    def flips(self, ids: list[int], targets: list[int], prompts: list[list[int]]) -> list[dict]:
-        """For each changed prompt that changes a token: {"position", "old", "new" (token ids), "flipped": whether the
-        model's most likely next token at the last target differs from its most likely one on the text, "weight": its
-        importance weight}."""
+    def events(self, ids: list[int], targets: list[int], prompts: list[list[int]], holds: list[list[set]] | None = None, seed: int = 0) -> list:
+        """The English reader's questions (reader.py) with their answers in the model. Per changed prompt that changes
+        a token: {"position", "old", "new" (token ids), "down": whether the model's probability of its most likely next
+        token on the text (at the last target) is lower on the changed prompt, "weight": its importance weight}.
+        holds[j]: answer j's steps (node sets); then out[j] holds those events and, per changed prompt, the same question
+        with one of its steps (drawn uniformly, the draw shared across answers) held in the model at its values on the
+        text ("hold": the step's number from 1). Without holds: the input events alone."""
         last = max(targets)
-        top = int(self.reference([ids], [last])[0, 0].argmax())
-        out = []
+        T = len(ids)
+        base = self.reference([ids], [last])[0, 0]
+        top = int(base.argmax())
+        plain = []
         for x in prompts:
             diff = [p for p in range(len(ids)) if x[p] != ids[p]]
             if diff:
-                out.append({"position": diff[0], "old": ids[diff[0]], "new": x[diff[0]], "flipped": int(self.reference([x], [last])[0, 0].argmax()) != top,
-                            "weight": getattr(x, "weight", 1.0)})
+                lp = self.reference([x], [last])[0, 0]
+                plain.append((x, {"position": diff[0], "old": ids[diff[0]], "new": x[diff[0]], "down": bool(lp[top] < base[top]), "weight": getattr(x, "weight", 1.0)}))
+        if holds is None:
+            return [e for _, e in plain]
+        one = ({n: torch.ones(1, 1, self.C[n], device=self.dev) for n in self.names}, {n: torch.ones(1, 1, device=self.dev) for n in self.names})
+        rec = {}
+        self.run(ids, targets, self._plan([self.everything(T)], T), *one, record=rec)
+        g = torch.Generator(device="cpu").manual_seed(seed % (1 << 62))
+        draws = torch.rand(len(plain), generator=g)
+        out = [[e for _, e in plain] for _ in holds]
+        live = [j for j, st in enumerate(holds) if st]
+        for i, (x, e) in enumerate(plain):
+            if not live:
+                break
+            mask, ks = {}, {}
+            for b, j in enumerate(live):
+                k = min(int(draws[i] * len(holds[j])), len(holds[j]) - 1)
+                ks[j] = k
+                for n, t, c in holds[j][k]:
+                    mask.setdefault(n, torch.zeros(len(live), T, self.C[n], dtype=torch.bool, device=self.dev))[b, t, c] = True
+            lp = self.run(x, [last], self._plan([self.everything(T)] * len(live), T), *one, patch={n: (m, rec[n].expand(len(live), -1, -1)) for n, m in mask.items()})
+            for b, j in enumerate(live):
+                out[j].append({**e, "hold": ks[j] + 1, "down": bool(lp[b, 0, top] < base[top])})  # log-probabilities both
+            free(self.dev)
         return out
+
 
     @torch.no_grad()
     def necessity(self, ids: list[int], targets: list[int], g: Graph, prompts: list[list[int]]) -> float:

@@ -159,7 +159,8 @@ class Scorer:
         the whole model's description lengths, "kl_bits" and "bits" (the whole answer), "steps", "nodes", "edges",
         "explanation", "notes", "necessity_kl_bits" (with necessity: native.necessity of the whole answer on the text,
         an evaluation measure), "dropped": what the answer wrote that is not part of its graph (mech), "events": the
-        reader's questions (native.flips, the same for every answer)}. An answer's description length is its code's
+        English reader's questions with the model's answers (native.events: every changed prompt, and holds of the
+        answer's steps)}. An answer's description length is its code's
         (code_bits; library entries it uses are given, their definitions not counted); its first k steps are the same
         program with its returned list cut to k entries (prefix_code). The program runs on every changed prompt
         (instances), its graph there tested there. The source "vpd" stands for VPD's own answer (complete, one step;
@@ -174,8 +175,9 @@ class Scorer:
         lo = code_bits(EMPTY)
         P = len(prompts)
         rows = [(None, lo, [self.native.Graph()] * P)]  # (answer, description length, its graph on each prompt): the empty program first
-        out = []
+        out, step_nodes = [], []  # step_nodes[j]: answer j's graph on the text after each step (node sets)
         for j, src in enumerate(sources):
+            step_nodes.append([])
             if src == "vpd" and not nat.has_importance:
                 out.append({"valid": False, "error": "VPD's causal-importance network is not on this machine", "steps": 0, "explanation": "", "notes": []})
                 continue
@@ -209,16 +211,18 @@ class Scorer:
                     break
                 mine.append((code_bits(prefix_code(src, k)), gs))
             if out[-1]["valid"]:
+                step_nodes[j] = [gs[0].node_set() for _, gs in mine]
                 for bits, gs in mine:
                     rows.append((j, bits, gs[1:]))
                 out[-1]["base"] = mine[-1][1][0] if mine else self.native.Graph()
                 if necessity and mine:
                     out[-1]["necessity_kl_bits"] = nat.necessity(ids, targets, out[-1]["base"], prompts)
         kl = nat.faithfulness(ids, targets, [[r[2][i] for r in rows] for i in range(P)], prompts, seed)
-        events = nat.flips(ids, targets, prompts)  # what the English reader is asked about (reader.py)
+        holds = [[b - a for a, b in zip([set()] + st[:-1], st)] for st in step_nodes]  # each answer's steps: the nodes each adds
+        events = nat.events(ids, targets, prompts, [[h for h in hs if h] for hs in holds], seed)  # the English reader's questions (reader.py)
         hi = positions * total * math.log2(positions * total)
-        for s in out:
-            s.update(curve=[[lo, kl[0]]], lo=lo, hi=max(hi, 2 * lo), events=events)
+        for s, ev in zip(out, events):
+            s.update(curve=[[lo, kl[0]]], lo=lo, hi=max(hi, 2 * lo), events=ev)
         for (o, b, _), k in zip(rows[1:], kl[1:]):
             out[o]["curve"].append([b, k])
             out[o].update(kl_bits=k, bits=b)

@@ -752,14 +752,13 @@ def reader_credit(groups: list[dict], tok, reader, clock: dict):
     curve's, which the English shapes too, being written first. An answer without English saves 0 bits."""
     for grp in groups:
         sc = grp["scores"]
-        events = next((x.get("events") for x in sc if x.get("events")), [])
         texts = [reader_module.english(x) if x.get("valid", True) else "" for x in sc]
-        todo = [j for j, t in enumerate(texts) if t]
+        todo = [j for j, t in enumerate(texts) if t and sc[j].get("events")]
         bits = [0.0] * len(sc)
-        if todo and events:
-            got = timed(clock, "reader", reader.bits, grp["behavior"], [texts[j] for j in todo], events)
+        if todo:
+            got = timed(clock, "reader", reader.bits, grp["behavior"], [texts[j] for j in todo], [sc[j]["events"] for j in todo])
             for j, b in zip(todo, got):
-                bits[j] = b
+                bits[j] = b or 0.0
         A = rloo([(-b,) for b in bits])
         grp["reader_bits"], grp["reader_advantage"] = bits, A
         for j, (c, text, it) in enumerate(zip(grp["completions"], grp["texts"], grp["items"])):

@@ -1,11 +1,13 @@
 """The English reader (#2951 graph oracle): how much an answer's plain English tells about the model.
 
 A frozen copy of the base oracle model (never trained) reads the text and only the English of an answer (its docstring
-and the comment lines of its steps). For each changed prompt of the verifier that replaces a token (score.py's
-"events"), it gives its probability that the model's most likely next token changes. The English scores the bits it
-saves: the reader's mean log loss, in bits, on what the model actually does (the flips) without the English minus with
-it. English that says how the prediction depends on the text saves bits; vague English saves none; wrong English costs.
-No judge grades style, and the answer never chooses the questions.
+and its comment lines, numbered as steps). For each of the verifier's events (score.py's "events", native.events) it
+gives its probability that the model's probability of its most likely next token goes down: when one token is replaced,
+and when one token is replaced while one of the answer's steps is held at its values on the original text. The English
+scores the bits it saves: the reader's importance-weighted mean log loss, in bits, on what the model actually does
+without the English minus with it. English that says how the prediction depends on the text, and what each step
+carries, saves bits; vague English saves none; wrong English costs. No judge grades style, and the answer never chooses
+the questions.
 
   Reader(generate) with generate(prompts: list[str]) -> per prompt {token string: log-probability} of the next token.
 """
@@ -21,13 +23,15 @@ sys.path.insert(0, str(HERE))
 
 ASK = ("A language model reads this text (its tokens, by position) and predicts the next token after the last one; its "
        "most likely next token is {top}.\ntokens = {tokens}\n\n{english}"
-       "Question: if the token at position {position}, {old}, were replaced by {new}, would the model's most likely next "
-       "token change? Answer Yes or No.")
+       "Question: if the token at position {position}, {old}, were replaced by {new}{hold}, would the probability the model "
+       "gives {top} go down? Answer Yes or No.")
+HOLD = ", while the subcomponents of step {k} of the explanation kept their values on the original text"
 
 
 def english(score: dict) -> str:
-    """An answer's English: its docstring, then its step comments."""
-    parts = [score.get("explanation") or ""] + [n for n in score.get("notes") or [] if n]
+    """An answer's English: its docstring, then its comment lines numbered as steps."""
+    notes = [n for n in score.get("notes") or [] if n]
+    parts = [score.get("explanation") or ""] + [f"Step {k}: {n}" for k, n in enumerate(notes, 1)]
     return "\n".join(p for p in parts if p.strip())
 
 
@@ -45,24 +49,28 @@ class Reader:
             out.append(yes / (yes + no) if yes + no > 0 else 0.5)
         return out
 
-    def bits(self, task: dict, texts: list[str], events: list[dict]) -> list[float | None]:
-        """Per English text, the bits it saves the reader on the events (None when there are no events)."""
-        if not events:
-            return [None] * len(texts)
+    def bits(self, task: dict, texts: list[str], events) -> list[float | None]:
+        """Per English text, the bits it saves the reader on the events (events: one list for every text, or
+        events[j] text j's own; None for a text without events)."""
+        per = events if events and isinstance(events[0], list) else [events] * len(texts)
         prompt = task["prompts"][0]
         strings = self.tokens_of(prompt["token_ids"])
         top = repr(prompt["model_top"][0][0][0])
 
-        def asks(eng: str) -> list[str]:
+        def ask(eng: str, e: dict) -> str:
             head = f"An explanation of how the model computes this prediction:\n{eng}\n\n" if eng else ""
-            return [ASK.format(top=top, tokens=repr(strings), english=head, position=e["position"], old=repr(strings[e["position"]]),
-                               new=repr(self.tokens_of([e["new"]])[0])) for e in events]
+            return ASK.format(top=top, tokens=repr(strings), english=head, position=e["position"], old=repr(strings[e["position"]]),
+                              new=repr(self.tokens_of([e["new"]])[0]), hold=HOLD.format(k=e["hold"]) if e.get("hold") else "")
 
-        def loss(ps: list[float]) -> float:  # the events' mean, by their importance weights
-            return sum(e.get("weight", 1.0) * -math.log2(max(p if e["flipped"] else 1 - p, 1e-12)) for p, e in zip(ps, events)) / sum(e.get("weight", 1.0) for e in events)
+        def loss(ps: list[float], evs: list[dict]) -> float:  # the events' mean, by their importance weights
+            return sum(e.get("weight", 1.0) * -math.log2(max(p if e["down"] else 1 - p, 1e-12)) for p, e in zip(ps, evs)) / sum(e.get("weight", 1.0) for e in evs)
 
-        flat = asks("") + [q for t in texts for q in asks(t)]
-        ps = self._p_yes(flat)
-        n = len(events)
-        base = loss(ps[:n])
-        return [base - loss(ps[n * (1 + j): n * (2 + j)]) for j in range(len(texts))]
+        flat, spans = [], []
+        for t, evs in zip(texts, per):
+            spans.append((len(flat), len(evs)))
+            flat += [ask("", e) for e in evs] + [ask(t, e) for e in evs]
+        ps = self._p_yes(flat) if flat else []
+        out = []
+        for (s0, n), evs in zip(spans, per):
+            out.append(None if not n else loss(ps[s0:s0 + n], evs) - loss(ps[s0 + n:s0 + 2 * n], evs))
+        return out
