@@ -34,6 +34,7 @@ to the prediction (live), and ends at the step with the lowest KL.
 
   native.py search --split train --n N [--offset K --stride S] [--out DIR]   -> DIR/<task>.py, .json
   native.py tidy DIR [--max-chars N]      every answer in DIR made live (live()), in place
+  native.py ranked --split S [S ...] --n N [--top K]   -> texts/vpd_ranked/<task>.json, VPD's first K at the target
 """
 
 from __future__ import annotations
@@ -981,13 +982,15 @@ def tidy(directory: Path, max_chars: int | None = None) -> None:
         py.write_text(program(steps, notes=notes if any(notes) else None, explanation=g.get("explanation") or None))
 
 
+def part_token(nd) -> str:
+    """A node (matrix name, position, index) as its subcomponent token "<p:L.S.I>"."""
+    layer, kind = _layer_kind(nd)
+    return f"<p:{layer}.{({v: k for k, v in mech.SITES.items()})[kind]}.{nd[2]}>"
+
+
 def parts_program(steps: list[Graph], explanation: str | None = None) -> str:
     """Complete graphs (each containing the one before) as an answer of "parts" steps: the k-th lists the
     subcomponents steps[k] has beyond steps[k - 1], by position (mech: every connection among them is in)."""
-    def tok(nd):
-        layer, kind = _layer_kind(nd)
-        return f"<p:{layer}.{dict(q_proj='q', k_proj='k', v_proj='v', o_proj='o', c_fc='fc', down_proj='down')[kind]}.{nd[2]}>"
-
     lines = ["def graph(tokens, targets):"]
     if explanation:
         lines.append(f"    {explanation!r}")
@@ -997,7 +1000,7 @@ def parts_program(steps: list[Graph], explanation: str | None = None) -> str:
         new = sorted(g.node_set() - prev, key=lambda nd: (nd[1], nd[0], nd[2]))
         by = {}
         for nd in new:
-            by.setdefault(nd[1], []).append(tok(nd))
+            by.setdefault(nd[1], []).append(part_token(nd))
         lines.append("        {\"parts\": {" + ", ".join(f"{t}: \"{''.join(ts)}\"" for t, ts in by.items()) + "}},")
         prev |= g.node_set()
     lines.append("    ]")
@@ -1012,11 +1015,6 @@ def program(steps: list[Graph], uses: list[list[str]] | None = None, notes: list
     parents is listed with "" when nothing reads it. notes: a comment line above each step; explanation: the
     function's docstring."""
     sites = list(mech.SITES.values())
-    codes = {v: k for k, v in mech.SITES.items()}
-
-    def tok(nd):
-        layer, kind = _layer_kind(nd)
-        return f"<p:{layer}.{codes[kind]}.{nd[2]}>"
 
     def key(nd):
         layer, kind = _layer_kind(nd)
@@ -1040,13 +1038,13 @@ def program(steps: list[Graph], uses: list[list[str]] | None = None, notes: list
             if r[0].endswith("o_proj"):
                 per = {}
                 for w in ws:
-                    per.setdefault(w[1], []).append(tok(w))
+                    per.setdefault(w[1], []).append(part_token(w))
                 val = "{" + ", ".join(f'{t}: "' + "".join(v) + '"' for t, v in sorted(per.items())) + "}"
             else:
-                val = '"' + "".join(tok(w) for w in ws) + '"'
-            body.append(f'            ({r[1]}, "{tok(r)}"): {val},')
+                val = '"' + "".join(part_token(w) for w in ws) + '"'
+            body.append(f'            ({r[1]}, "{part_token(r)}"): {val},')
         if new_out:
-            body.append('            "out": "' + "".join(tok(w) for w in sorted(new_out, key=key)) + '",')
+            body.append('            "out": "' + "".join(part_token(w) for w in sorted(new_out, key=key)) + '",')
         if uses and k < len(uses) and uses[k]:
             body.append('            "uses": [' + ", ".join(repr(u) for u in uses[k]) + "],")
         if notes and k < len(notes) and notes[k]:
@@ -1122,6 +1120,24 @@ def search(split: str, n: int, offset: int = 0, stride: int = 1, out: Path | Non
               + f", {time.time() - t0:.0f} s", flush=True)
 
 
+def ranked(split: str, n: int, top: int, out: Path | None = None) -> None:
+    """VPD's ranking (vpd_steps' order) of the split's first n texts -> OUT/<id>.json, its first `top` subcomponents at
+    the predicted positions, [[position, "<p:L.S.I>"], ...] most important first (elsewhere its ranking is led by the
+    same few subcomponents at every position); OUT defaults to texts/vpd_ranked (prompt.with_vpd lists them in the
+    oracle's question)."""
+    nat = Native()
+    out = Path(out) if out else TEXTS / "vpd_ranked"
+    out.mkdir(parents=True, exist_ok=True)
+    for p in tasks(split)[:n]:
+        if (out / f"{p.stem}.json").exists():
+            continue
+        ids, targets = text(p)
+        with torch.no_grad():
+            rank = nat._vpd_rank(ids, targets)
+        best = [nd for nd in sorted(rank, key=rank.get) if nd[1] in targets][:top]
+        (out / f"{p.stem}.json").write_text(json.dumps([[nd[1], part_token(nd)] for nd in best]))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1133,12 +1149,20 @@ def main():
     s.add_argument("--out", type=Path)
     s.add_argument("--reverse", action="store_true", help="last text first")
     s.add_argument("--nodes-from", choices=("ig", "vpd"), default="ig", help="the candidate subcomponents: integrated gradients' ranking or VPD's (Native.ordered)")
+    r = sub.add_parser("ranked")
+    r.add_argument("--split", choices=("train", "heldout", "hard"), nargs="+", required=True)
+    r.add_argument("--n", type=int, required=True)
+    r.add_argument("--top", type=int, default=256)
+    r.add_argument("--out", type=Path)
     t = sub.add_parser("tidy")
     t.add_argument("directory", type=Path)
     t.add_argument("--max-chars", type=int, help="cut each answer to its most first steps within this many characters first")
     args = ap.parse_args()
     if args.cmd == "tidy":
         tidy(args.directory, args.max_chars)
+    elif args.cmd == "ranked":
+        for split in args.split:
+            ranked(split, args.n, args.top, args.out)
     else:
         search(args.split, args.n, args.offset, args.stride, args.out, args.reverse, args.nodes_from)
 

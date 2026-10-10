@@ -55,7 +55,7 @@ os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")  # CUDA may be in
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent))
 import edits  # noqa: E402
-from prompt import english_spans, render, split_answer  # noqa: E402
+from prompt import english_spans, render, split_answer, with_vpd  # noqa: E402
 import reader as reader_module  # noqa: E402
 import score as score_module  # noqa: E402
 import scorer  # noqa: E402
@@ -1358,6 +1358,7 @@ def main():
     ap.add_argument("--transfer", action="store_true", help="eval: run each question's best answer program on the next question's text (does the mechanism transfer, or only this text's circuit?)")
     ap.add_argument("--adversarial", action="store_true", help="eval: VPD's adversary (native.adversarial), one shared across the set for the oracle's best answers and one for VPD's answers; reported, never trained on")
     ap.add_argument("--necessity", action="store_true", help="eval: also measure each answer's necessity (native.necessity: the model with the answer's subcomponents removed)")
+    ap.add_argument("--vpd-list", type=int, default=0, help="the question also lists VPD's first K subcomponents in its order (BEHAVIORS/vpd_ranked, native.py ranked)")
     ap.add_argument("--swap-evidence", action="store_true", help="eval: give each held-out question another text's activations (if answers do not get worse, the oracle does not read them)")
     ap.add_argument("--part-tokens", help="part tokens: the registry file of part_tokens.py build; the projections train with the LoRA and vLLM gets the rows in place")
     ap.add_argument("--materialize-every", type=int, default=0, help="with --part-tokens: also rewrite the checkpoint and restart vLLM every K steps (0: only at the start; the rows are copied in place before every sampling call)")
@@ -1441,8 +1442,8 @@ def main():
     if args.reader:
         READER.append(make_reader(args, pol, sampler))
     root = Path(args.behaviors)
-    pool = behaviors(root, args.model, "train")
-    sets = {args.eval_split: behaviors(root, args.model, args.eval_split)}
+    pool = [with_vpd(b, root / "vpd_ranked", args.vpd_list) for b in behaviors(root, args.model, "train")]
+    sets = {args.eval_split: [with_vpd(b, root / "vpd_ranked", args.vpd_list) for b in behaviors(root, args.model, args.eval_split)]}
     if args.eval_behaviors:  # the first N in text order (arbitrary Pile rows), the same at every evaluation and the ones the search answers first
         sets = {k: sorted(v, key=lambda b: int(b["id"][4:]) if b["id"][4:].isdigit() else 0)[:args.eval_behaviors] for k, v in sets.items()}
     if args.swap_evidence:  # each held-out question reads the activations of the next held-out text at least as long, cut to its length
