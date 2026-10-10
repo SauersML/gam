@@ -5,7 +5,7 @@ It measures how far reasoning over the search's output and the verifier's report
 trained oracle must reach in one pass and the candidate teacher for its training data.
 
 Each round samples --samples answers per question from the best answer so far (the search's at first) and its report
-(rl/train.py's feedback); the best of them and the previous best is kept. The starting answer is cut to --budget tokens
+(prompt.feedback); the best of them and the previous best is kept. The starting answer is cut to --budget tokens
 of the model's own tokenizer (a subcomponent written out costs several tokens there), its output to --max-tokens.
 
 The model samples with vLLM on a CUDA GPU or with MLX on a Mac (--backend mlx, an MLX checkpoint as --base); either
@@ -262,7 +262,7 @@ def main():
     from transformers import AutoTokenizer
 
     import train
-    from prompt import render, split_answer
+    from prompt import feedback, render, split_answer
 
     a.out.mkdir(parents=True, exist_ok=True)
     tok = AutoTokenizer.from_pretrained(a.base)
@@ -320,7 +320,7 @@ def main():
         chats = []
         for t in tasks:
             src = best[t["id"]][0]
-            ask = render(t) + "\n\n" + ASK + (" " + LOOKUP if a.evidence_tokens else "") + "\n\nThe answer:\n```python\n" + src + "```\n\n" + train.feedback(best[t["id"]][1])
+            ask = render(t) + "\n\n" + ASK + (" " + LOOKUP if a.evidence_tokens else "") + "\n\nThe answer:\n```python\n" + src + "```\n\n" + feedback(best[t["id"]][1])
             if a.evidence_tokens:
                 used = nodes_of(t, src)
                 seen = set(used)

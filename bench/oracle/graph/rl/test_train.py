@@ -18,7 +18,8 @@ from pathlib import Path
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import train  # noqa: E402
+import train  # noqa: E402  (puts the graph directory on the path)
+import prompt  # noqa: E402
 
 
 def tiny(path: Path):
@@ -456,7 +457,7 @@ def check_rl2_step(pol):
             logs3 = {k: open(Path(d) / f"revise_{k}.jsonl", "w") for k in ("train", "samples", "improved")}
             rev = train.rl2_step(step, argparse.Namespace(**{**vars(args), "revise": True, "refine": 0}), pol, sampler, stand_in, pool, Path(d), train.Learner(pol, rec, NoWarmup()), logs3, 0.0)
             assert rev["groups"] == 2 * first["groups"] and rev["revision_best_area"] is not None, rev  # every group revised once, scored
-            assert "could not run" in train.feedback({"valid": False, "error": "e"}) and "first 1 steps: 0.50 bits" in train.feedback({"valid": True, "curve": [[0, 9.0], [24.0, 0.5]]})
+            assert "could not run" in prompt.feedback({"valid": False, "error": "e"}) and "first 1 steps: 0.50 bits" in prompt.feedback({"valid": True, "curve": [[0, 9.0], [24.0, 0.5]]})
             for f in logs3.values():
                 f.close()
             logs2 = {k: open(Path(d) / f"async_{k}.jsonl", "w") for k in ("train", "samples", "improved")}

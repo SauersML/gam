@@ -81,6 +81,28 @@ def with_vpd(task: dict, root: Path, k: int, positions: int = 0) -> dict:
     return out
 
 
+def feedback(s: dict) -> str:
+    """The verifier's report on an answer as the oracle reads it before revising: why it could not run, or the KL in
+    bits of the model's next-token distribution from the graph of its first k steps and that graph's description
+    length, for each k, and each distinct reason something written is not part of the graph."""
+    if not s.get("valid", True):
+        return f"The verifier could not run your answer: {s.get('error')}"
+    c = s.get("curve") or [[0.0, float("nan")]]
+    lines = [f"no steps (the empty graph): {c[0][1]:.2f} bits"] + [f"first {k} steps: {kl:.2f} bits at a description length of {b:.0f} bits" for k, (b, kl) in enumerate(c[1:], 1)]
+    report = ("The verifier ran the graph of your first k steps alone, over changed prompts of the text (one token replaced by a "
+              "draw from the model's own prediction there), and measured the KL of the model's next-token distribution from the "
+              "graph's:\n" + "\n".join(lines))
+    dropped = s.get("dropped") or []
+    if dropped:
+        report += (f"\n{len(dropped)} things you wrote are not part of the graph (they still count in its description length):\n"
+                   + "\n".join(f"- {why}" for why in dict.fromkeys(dropped)))
+    return report
+
+
+REVISE = ("Write an improved answer in the same format: as faithful as possible at every description length, the most "
+          "important steps first, with its plain-English docstring and a comment line above each step.")
+
+
 def complete_steps(source: str) -> str | None:
     """A program cut off before its end (an output limit), as far as its last complete step: the returned list closed
     after the last line "}," that leaves the program parsing. Its first steps are an answer like any prefix of one

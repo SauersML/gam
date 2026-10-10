@@ -6,9 +6,10 @@ answer to the same (text, seed, necessity).
 
   serve_scores.py [--port 8765] [--workers 4] [--device cuda] [--texts DIR]
   POST /score {"task": TASK_ID, "sources": [SRC, ...] | "answers": [REPLY, ...], "seed": 0, "necessity": false}
-      -> {"scores": [{"valid", "error", "curve", "lo", "hi", "kl_bits", "bits", "steps", "area", "reward"}, ...]}
+      -> {"scores": [{"valid", "error", "curve", "lo", "hi", "kl_bits", "bits", "steps", "area", "reward", "feedback"}, ...]}
   A reply is an oracle's whole answer, its program taken by prompt.split_answer. "reward" is minus the curve area, an
-  answer that cannot run counting as the empty answer (score.EMPTY, scored with the request and cached).
+  answer that cannot run counting as the empty answer (score.EMPTY, scored with the request and cached). "feedback" is
+  the verifier's report and the request to revise (prompt.feedback, prompt.REVISE): the second turn of a revising episode.
   GET /health -> {"workers": N, "pending": requests in flight}
 """
 
@@ -21,6 +22,7 @@ import multiprocessing as mp
 import queue
 import sys
 import threading
+import time
 import zlib
 from concurrent.futures import Future
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -29,14 +31,14 @@ from pathlib import Path
 GRAPH = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(GRAPH))
 
-KEEP = ("valid", "error", "curve", "lo", "hi", "kl_bits", "bits", "steps", "nodes", "edges", "explanation", "notes")
+KEEP = ("valid", "error", "curve", "lo", "hi", "kl_bits", "bits", "steps", "nodes", "edges", "explanation", "notes", "dropped")
 
 
 def work(device: str | None, texts: str, inbox, outbox) -> None:
     """One scoring process: take a request, then every request already queued, score them grouped by (text, seed,
     necessity), and answer each with its own scores in order."""
     import score
-    from prompt import split_answer
+    from prompt import REVISE, feedback, split_answer
 
     sc = score.Scorer(device)
     tasks = {}
@@ -66,6 +68,7 @@ def work(device: str | None, texts: str, inbox, outbox) -> None:
                 got = [{**{k: s[k] for k in KEEP if k in s}, "area": score.key(s)[1]} for s in got]
                 for s in got:  # an answer that cannot run: no area (JSON has no infinity), the empty answer's reward
                     ran = s.get("valid", True) and s["area"] < float("inf")
+                    s["feedback"] = feedback(s) + "\n\n" + REVISE
                     s["area"], s["reward"] = (s["area"], -s["area"]) if ran else (None, -empty)
                 err = None
             except Exception as e:  # a bad request answers with its error; the process keeps serving
@@ -77,33 +80,58 @@ def work(device: str | None, texts: str, inbox, outbox) -> None:
 
 
 class Pool:
-    """The scoring processes, a request id counter, and the futures of the requests in flight."""
+    """The scoring processes, a request id counter, and the futures of the requests in flight. A process that dies (out
+    of memory) is started again and its requests in flight fail with an error instead of waiting forever."""
 
     def __init__(self, workers: int, device: str | None, texts: str):
-        ctx = mp.get_context("spawn")  # CUDA in each process
-        self.out = ctx.Queue()
-        self.inboxes = [ctx.Queue() for _ in range(workers)]
-        self.procs = [ctx.Process(target=work, args=(device, texts, q, self.out), daemon=True) for q in self.inboxes]
-        for p in self.procs:
-            p.start()
-        self.ids, self.waiting, self.lock = itertools.count(), {}, threading.Lock()
+        self.ctx, self.args = mp.get_context("spawn"), (device, texts)  # spawn: CUDA in each process
+        self.out = self.ctx.Queue()
+        self.inboxes = [self.ctx.Queue() for _ in range(workers)]
+        self.procs = [self.start(q) for q in self.inboxes]
+        self.ids, self.waiting, self.owner, self.lock = itertools.count(), {}, {}, threading.Lock()
         threading.Thread(target=self.collect, daemon=True).start()
+        threading.Thread(target=self.watch, daemon=True).start()
+
+    def start(self, inbox):
+        p = self.ctx.Process(target=work, args=(*self.args, inbox, self.out), daemon=True)
+        p.start()
+        return p
 
     def collect(self) -> None:
         while True:
             rid, scores, err = self.out.get()
             with self.lock:
-                fut = self.waiting.pop(rid)
+                fut = self.waiting.pop(rid, None)
+                self.owner.pop(rid, None)
+            if fut is None:  # failed already, its process having died
+                continue
             if err:
                 fut.set_exception(RuntimeError(err))
             else:
                 fut.set_result(scores)
 
+    def watch(self) -> None:
+        while True:
+            time.sleep(5)
+            for i, p in enumerate(self.procs):
+                if p.is_alive():
+                    continue
+                with self.lock:
+                    lost = [rid for rid, w in self.owner.items() if w == i]
+                    futs = [self.waiting.pop(rid) for rid in lost if rid in self.waiting]
+                    for rid in lost:
+                        self.owner.pop(rid, None)
+                for fut in futs:
+                    fut.set_exception(RuntimeError(f"scoring process {i} died (exit code {p.exitcode})"))
+                print(f"serve_scores: scoring process {i} died (exit code {p.exitcode}); starting it again", flush=True)
+                self.procs[i] = self.start(self.inboxes[i])
+
     def submit(self, req: dict) -> Future:
         fut, rid = Future(), next(self.ids)
+        i = zlib.crc32(req["task"].encode()) % len(self.inboxes)  # a text's answers to one process
         with self.lock:
-            self.waiting[rid] = fut
-        self.inboxes[zlib.crc32(req["task"].encode()) % len(self.inboxes)].put((rid, req))  # a text's answers to one process
+            self.waiting[rid], self.owner[rid] = fut, i
+        self.inboxes[i].put((rid, req))
         return fut
 
 
