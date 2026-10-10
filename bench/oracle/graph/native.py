@@ -35,6 +35,7 @@ to the prediction (live), and ends at the step with the lowest KL.
   native.py search --split train --n N [--offset K --stride S] [--out DIR]   -> DIR/<task>.py, .json
   native.py tidy DIR [--max-chars N]      every answer in DIR made live (live()), in place
   native.py ranked --split S [S ...] --n N [--top K]   -> texts/vpd_ranked/<task>.json, VPD's first K at the target
+  native.py responses --split S [S ...] --n N [--positions K]   -> texts/vpd_responses/<task>.json (responses())
 """
 
 from __future__ import annotations
@@ -1150,6 +1151,34 @@ def ranked(split: str, n: int, top: int, out: Path | None = None) -> None:
         (out / f"{p.stem}.json").write_text(json.dumps([[nd[1], part_token(nd)] for nd in best]))
 
 
+def responses(nat: Native, ids: list[int], targets: list[int], task_id: str, positions: int) -> list:
+    """Where the prediction responds to the text, in subcomponent tokens: the predicted positions, then the `positions`
+    others whose token, changed to another the model finds likely there, moves the prediction most (sensitivity, the
+    verifier's probe), in that order; at each, per weight matrix, the subcomponent that writes most there beyond what it
+    writes on average over the text (contributions minus their mean over positions, so a subcomponent active
+    everywhere does not lead every position's list). [[position, ["<p:L.S.I>", ...]], ...]"""
+    moved, _ = nat.sensitivity(ids, targets, torch.Generator(device="cpu").manual_seed(task_seed(task_id)))
+    excess = {n: w - w.mean(0, keepdim=True) for n, w in nat.contributions(ids, targets).items()}
+    best = {n: e.argmax(-1).tolist() for n, e in excess.items()}
+    order = sorted(targets) + [p for p in (moved.argsort(descending=True) + 1).tolist() if p not in targets][:positions]
+    return [[p, [part_token((n, p, best[n][p])) for n in nat.names]] for p in order]
+
+
+def respond(split: str, n: int, positions: int, out: Path | None = None) -> None:
+    """responses() of the split's first n texts -> OUT/<id>.json (default texts/vpd_responses; prompt.with_vpd lists
+    them in the oracle's question)."""
+    nat = Native()
+    out = Path(out) if out else TEXTS / "vpd_responses"
+    out.mkdir(parents=True, exist_ok=True)
+    for p in tasks(split)[:n]:
+        if (out / f"{p.stem}.json").exists():
+            continue
+        ids, targets = text(p)
+        with torch.no_grad():
+            got = responses(nat, ids, targets, p.stem, positions)
+        (out / f"{p.stem}.json").write_text(json.dumps(got))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1166,6 +1195,11 @@ def main():
     r.add_argument("--n", type=int, required=True)
     r.add_argument("--top", type=int, default=256)
     r.add_argument("--out", type=Path)
+    e = sub.add_parser("responses")
+    e.add_argument("--split", choices=("train", "heldout", "hard"), nargs="+", required=True)
+    e.add_argument("--n", type=int, required=True)
+    e.add_argument("--positions", type=int, default=32)
+    e.add_argument("--out", type=Path)
     t = sub.add_parser("tidy")
     t.add_argument("directory", type=Path)
     t.add_argument("--max-chars", type=int, help="cut each answer to its most first steps within this many characters first")
@@ -1175,6 +1209,9 @@ def main():
     elif args.cmd == "ranked":
         for split in args.split:
             ranked(split, args.n, args.top, args.out)
+    elif args.cmd == "responses":
+        for split in args.split:
+            respond(split, args.n, args.positions, args.out)
     else:
         search(args.split, args.n, args.offset, args.stride, args.out, args.reverse, args.nodes_from)
 

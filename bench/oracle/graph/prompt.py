@@ -5,9 +5,10 @@ and the outputs they read.
 
 A question (a task, rl/train.py's behaviors) is shown as what graph() receives, the token strings and the position whose
 next token is asked, with the model's most probable next tokens there; with_vpd adds VPD's first k subcomponents at the
-predicted position (native.py ranked), which the answer may start from.
+predicted position (native.py ranked), which the answer may start from, and where the prediction responds (native.py
+responses): the oracle's input in tokens only.
 
-  prompt.py TASK.json [--vpd-list K --vpd-ranked DIR]     prints the prompt
+  prompt.py TASK.json [--vpd-list K --positions P --root TEXTS]     prints the prompt
 """
 
 from __future__ import annotations
@@ -44,11 +45,14 @@ def line(model: str, ids: list[int], targets: list[int], top: list) -> str:
 
 VPD_LIST = ("VPD's subcomponents at the predicted position, most important first (causal importance times how much each "
             "writes there): ")
+RESPONSES = ("Where the prediction responds to the text: the predicted position, then the positions whose token, changed to "
+             "another the model finds likely there, moves the prediction most, most first; at each, per weight matrix, the "
+             "subcomponent writing most there beyond its average over the text: ")
 
 
 def render(task: dict) -> str:
     """The oracle's prompt for a task: the ask, then each of its texts as on() receives it, then VPD's ranked
-    subcomponents if the task carries them (with_vpd)."""
+    subcomponents and where the prediction responds if the task carries them (with_vpd)."""
     model = task["model"]
     out = [ASK.format(model=model)] + [line(model, p["token_ids"], p["target_positions"], p["model_top"]) for p in task["prompts"]]
     if task.get("vpd_ranked"):
@@ -59,15 +63,22 @@ def render(task: dict) -> str:
             else:
                 runs.append([pos, part])
         out.append(VPD_LIST + ", ".join(f'({pos}, "{parts}")' for pos, parts in runs))
+    if task.get("responses"):
+        out.append(RESPONSES + ", ".join(f'({pos}, "{"".join(parts)}")' for pos, parts in task["responses"]))
     return "\n".join(out)
 
 
-def with_vpd(task: dict, directory: Path, k: int) -> dict:
-    """The task carrying VPD's first k subcomponents at the predicted positions (native.py ranked's
-    DIRECTORY/<id>.json), which render lists; unchanged when k is 0."""
-    if not k:
-        return task
-    return {**task, "vpd_ranked": json.loads((Path(directory) / f"{task['id']}.json").read_text())[:k]}
+def with_vpd(task: dict, root: Path, k: int, positions: int = 0) -> dict:
+    """The task carrying VPD's first k subcomponents at the predicted positions (native.py ranked, ROOT/vpd_ranked) and
+    where the prediction responds at the predicted positions and `positions` others (native.py responses,
+    ROOT/vpd_responses), which render lists; unchanged when both are 0."""
+    out = dict(task)
+    if k:
+        out["vpd_ranked"] = json.loads((Path(root) / "vpd_ranked" / f"{task['id']}.json").read_text())[:k]
+    if positions:
+        rows = json.loads((Path(root) / "vpd_responses" / f"{task['id']}.json").read_text())
+        out["responses"] = rows[:len(task["prompts"][0]["target_positions"]) + positions]
+    return out
 
 
 def complete_steps(source: str) -> str | None:
@@ -141,9 +152,10 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("task", type=Path)
     ap.add_argument("--vpd-list", type=int, default=0)
-    ap.add_argument("--vpd-ranked", type=Path, default=Path.home() / "mpd-data/graph_oracle/texts/vpd_ranked")
+    ap.add_argument("--positions", type=int, default=0)
+    ap.add_argument("--root", type=Path, default=Path.home() / "mpd-data/graph_oracle/texts")
     a = ap.parse_args()
-    print(render(with_vpd(json.loads(a.task.read_text()), a.vpd_ranked, a.vpd_list)))
+    print(render(with_vpd(json.loads(a.task.read_text()), a.root, a.vpd_list, a.positions)))
 
 
 if __name__ == "__main__":

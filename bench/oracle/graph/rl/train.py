@@ -159,16 +159,31 @@ class Policy:
 
     EVIDENCE = "<|fim_pad|>"  # the placeholder token whose input embedding an evidence vector replaces
 
+    def question_evidence(self, b: dict) -> tuple[str, dict]:
+        """Question b's evidence (--evidence, acts_fn set): the text appended to the question, one placeholder per
+        position and weight matrix, and the activations whose embeddings replace them (embed()); with --swap-evidence
+        (self.swap) another text's activations instead (an evaluation of whether the oracle reads them). With
+        --evidence-positions K (positions_fn set) only the K positions where the prediction responds most to a changed
+        token, and the predicted positions, each written before its placeholders; else every position, unlabeled."""
+        ids = b["prompts"][0]["token_ids"]
+        acts = self.acts_fn(getattr(self, "swap", {}).get(b["id"], ids))
+        per = self.EVIDENCE * len(self.parts.ev_order)
+        if getattr(self, "positions_fn", None) is None:
+            return "\nactivations: " + per * len(ids), acts
+        if b["id"] not in self.positions:
+            self.positions[b["id"]] = self.positions_fn(b)
+        at = self.positions[b["id"]]
+        idx = torch.tensor(at, device=next(iter(acts.values())).device)
+        return "\nactivations at positions:" + "".join(f" {t}:" + per for t in at), {n: a[idx] for n, a in acts.items()}
+
     def question_ids(self, b: dict) -> list[int]:
-        """The oracle's input for question b: the rendered question, and with --evidence (acts_fn set) one placeholder
-        per position and weight matrix, whose embeddings become the model's activations there (embed()); with
-        --swap-evidence (self.swap) another text's activations instead (an evaluation of whether the oracle reads them)."""
+        """The oracle's input for question b: the rendered question, with its evidence (question_evidence) under
+        --evidence."""
         text = render(b)
         if getattr(self, "acts_fn", None) is not None:
-            ids = b["prompts"][0]["token_ids"]
-            text += "\nactivations: " + self.EVIDENCE * (len(ids) * len(self.parts.ev_order))
-            q = self.prompt_ids(text)
-            self.evidence[tuple(q)] = self.acts_fn(getattr(self, "swap", {}).get(b["id"], ids))
+            more, acts = self.question_evidence(b)
+            q = self.prompt_ids(text + more)
+            self.evidence[tuple(q)] = acts
             return q
         return self.prompt_ids(text)
 
@@ -178,13 +193,13 @@ class Policy:
         text = render(b)
         evidence = getattr(self, "acts_fn", None) is not None
         if evidence:
-            ids = b["prompts"][0]["token_ids"]
-            text += "\nactivations: " + self.EVIDENCE * (len(ids) * len(self.parts.ev_order))
+            more, acts = self.question_evidence(b)
+            text += more
         chat = self.tok.apply_chat_template([{"role": "user", "content": text}, {"role": "assistant", "content": answer}, {"role": "user", "content": report}],
                                             add_generation_prompt=True, enable_thinking=False, tokenize=False)
         q = self.tok.encode(chat, add_special_tokens=False)
         if evidence:
-            self.evidence[tuple(q)] = self.acts_fn(getattr(self, "swap", {}).get(b["id"], ids))
+            self.evidence[tuple(q)] = acts
         return q
 
     def embed(self, ids: torch.Tensor, prompts: list[list[int]], starts: list[int]) -> torch.Tensor:
@@ -1382,6 +1397,8 @@ def main():
     ap.add_argument("--transfer", action="store_true", help="eval: run each question's best answer program on the next question's text (does the mechanism transfer, or only this text's circuit?)")
     ap.add_argument("--adversarial", action="store_true", help="eval: VPD's adversary (native.adversarial), one shared across the set for the oracle's best answers and one for VPD's answers; reported, never trained on")
     ap.add_argument("--necessity", action="store_true", help="eval: also measure each answer's necessity (native.necessity: the model with the answer's subcomponents removed)")
+    ap.add_argument("--evidence-positions", type=int, default=0, help="--evidence at only the K positions where the prediction responds most to a changed token (Native.sensitivity) and the predicted ones, each labeled; 0: every position")
+    ap.add_argument("--responses", type=int, default=0, help="the question also lists where the prediction responds: the predicted positions and the K others where a changed token moves it most, each with the subcomponent per weight matrix writing most there beyond its average (BEHAVIORS/vpd_responses, native.py responses)")
     ap.add_argument("--vpd-list", type=int, default=0, help="the question also lists VPD's first K subcomponents in its order (BEHAVIORS/vpd_ranked, native.py ranked)")
     ap.add_argument("--swap-evidence", action="store_true", help="eval: give each held-out question another text's activations (if answers do not get worse, the oracle does not read them)")
     ap.add_argument("--part-tokens", help="part tokens: the registry file of part_tokens.py build; the projections train with the LoRA and vLLM gets the rows in place")
@@ -1451,7 +1468,17 @@ def main():
             raise SystemExit("--evidence reads activations through the part-token maps: give --part-tokens")
         import native
 
-        pol.acts_fn = native.Native(str(dev) if dev.type != "cuda" else "cuda").activations
+        nat = native.Native(str(dev) if dev.type != "cuda" else "cuda")
+        pol.acts_fn = nat.activations
+        if args.evidence_positions:  # the positions where the prediction responds most to a changed token (the verifier's probe)
+
+            def positions(b: dict) -> list[int]:
+                ids, targets = b["prompts"][0]["token_ids"], b["prompts"][0]["target_positions"]
+                with torch.no_grad():
+                    moved, _ = nat.sensitivity(ids, targets, torch.Generator().manual_seed(native.task_seed(b["id"])))
+                return sorted(set((moved.argsort(descending=True)[: args.evidence_positions] + 1).tolist()) | set(targets))
+
+            pol.positions_fn, pol.positions = positions, {}
     if isinstance(sampler, VllmSampler):
         sampler.policy = pol
         if pol.parts is not None:  # vLLM starts once, on a checkpoint with the extended vocabulary; the rows then come in place
@@ -1465,8 +1492,8 @@ def main():
     if args.reader:
         READER.append(make_reader(args, pol, sampler))
     root = Path(args.behaviors)
-    pool = [with_vpd(b, root / "vpd_ranked", args.vpd_list) for b in behaviors(root, args.model, "train")]
-    sets = {args.eval_split: [with_vpd(b, root / "vpd_ranked", args.vpd_list) for b in behaviors(root, args.model, args.eval_split)]}
+    pool = [with_vpd(b, root, args.vpd_list, args.responses) for b in behaviors(root, args.model, "train")]
+    sets = {args.eval_split: [with_vpd(b, root, args.vpd_list, args.responses) for b in behaviors(root, args.model, args.eval_split)]}
     if args.eval_behaviors:  # the first N in text order (arbitrary Pile rows), the same at every evaluation and the ones the search answers first
         sets = {k: sorted(v, key=lambda b: int(b["id"][4:]) if b["id"][4:].isdigit() else 0)[:args.eval_behaviors] for k, v in sets.items()}
     if args.swap_evidence:  # each held-out question reads the activations of the next held-out text at least as long, cut to its length
