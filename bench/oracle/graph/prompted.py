@@ -166,7 +166,8 @@ def main():
                     "as many of the search's other subcomponents (0: none)")
     ap.add_argument("--kv-dtype", default="fp8", help="vLLM's KV cache type (auto for gpt-oss)")
     ap.add_argument("--batch", type=int, default=3, help="MLX: replies generated at once (each takes ~4.6 GB of the Mac's memory at 28k tokens)")
-    ap.add_argument("--search-dir", type=Path, default=native.TEXTS / "search_heldout")
+    ap.add_argument("--split", choices=("heldout", "hard"), default="heldout")
+    ap.add_argument("--search-dir", type=Path, help="the search's answers (default texts/search_<split>)")
     ap.add_argument("--seed", type=int, default=1_000_003, help="the verifier's experiment seed (the evaluation's)")
     ap.add_argument("--out", type=Path, required=True)
     a = ap.parse_args()
@@ -180,7 +181,8 @@ def main():
     count = lambda t: tok.encode(t, add_special_tokens=False)  # noqa: E731
     sc = score.Scorer()
     tasks = []
-    for p in native.tasks("heldout")[:a.questions]:
+    a.search_dir = a.search_dir or native.TEXTS / f"search_{a.split}"
+    for p in native.tasks(a.split)[:a.questions]:
         if (a.search_dir / f"{p.stem}.py").exists():
             t = json.loads(p.read_text())
             t["path"] = str(p)

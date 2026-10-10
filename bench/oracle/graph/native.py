@@ -1000,9 +1000,9 @@ def task_seed(task_id: str) -> int:
 
 def search(split: str, n: int, offset: int = 0, stride: int = 1, out: Path | None = None) -> None:
     """Native.ordered on the split's texts offset, offset + stride, ... of its first n -> OUT/<id>.py (the answer) and
-    .json (each step's score and the seconds); OUT defaults to texts/search[_heldout]."""
+    .json (each step's score and the seconds); OUT defaults to texts/search (train) or texts/search_<split>."""
     nat = Native()
-    out = Path(out) if out else TEXTS / ("search" if split == "train" else "search_heldout")
+    out = Path(out) if out else TEXTS / ("search" if split == "train" else f"search_{split}")
     out.mkdir(parents=True, exist_ok=True)
     for p in tasks(split)[:n][offset::stride]:
         if (out / f"{p.stem}.json").exists():
@@ -1022,7 +1022,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("search")
-    s.add_argument("--split", choices=("train", "heldout"), required=True)
+    s.add_argument("--split", choices=("train", "heldout", "hard"), required=True)
     s.add_argument("--n", type=int, required=True)
     s.add_argument("--offset", type=int, default=0)
     s.add_argument("--stride", type=int, default=1)
