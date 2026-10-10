@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Bootstrap search answers on one pod (10-09 night): native.py search for the first COUNT texts of SPLIT (train: SFT data;
-# heldout: the evaluation's search baseline), P processes sharing the GPU (vpd4l is small). The Python is origin/main's
+# heldout, hard: the evaluation's search baselines), P processes sharing the GPU (vpd4l is small). The Python is origin/main's
 # bench/oracle/graph at launch.
 #   bench/oracle/graph/pods/search_pod.sh HOURS   (env: RUN, SPLIT, COUNT, P, PRICE, VRAM, GPU)
 cd /Users/user/gam
 H=${1:-3.0}
 RUN=${RUN:-a} SPLIT=${SPLIT:-train} COUNT=${COUNT:-400} P=${P:-6}
-OUTDIR=$([ "$SPLIT" = train ] && echo search || echo search_heldout)
+OUTDIR=$([ "$SPLIT" = train ] && echo search || echo search_$SPLIT)
 S=/Users/user/mpd-data/scratch/glead/v5/src_search_$RUN
 git fetch -q origin main && rm -rf "$S" && mkdir -p "$S" && git archive origin/main bench/oracle/graph bench/vpd_2951/vpd_model.py | tar -x -C "$S" && echo "python source $(git rev-parse --short=10 origin/main)" > "$S/SOURCE"
 G=$S/bench/oracle/graph
