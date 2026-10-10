@@ -1025,13 +1025,13 @@ def task_seed(task_id: str) -> int:
     return int.from_bytes(task_id.encode()[-8:].rjust(8, b"\0"), "big") % (1 << 31)
 
 
-def search(split: str, n: int, offset: int = 0, stride: int = 1, out: Path | None = None) -> None:
+def search(split: str, n: int, offset: int = 0, stride: int = 1, out: Path | None = None, reverse: bool = False) -> None:
     """Native.ordered on the split's texts offset, offset + stride, ... of its first n -> OUT/<id>.py (the answer) and
     .json (each step's score and the seconds); OUT defaults to texts/search (train) or texts/search_<split>."""
     nat = Native()
     out = Path(out) if out else TEXTS / ("search" if split == "train" else f"search_{split}")
     out.mkdir(parents=True, exist_ok=True)
-    for p in tasks(split)[:n][offset::stride]:
+    for p in (lambda ps: ps[::-1] if reverse else ps)(tasks(split)[:n][offset::stride]):  # reverse: last text first (to meet another machine working forward)
         if (out / f"{p.stem}.json").exists():
             continue
         t0 = time.time()
@@ -1054,6 +1054,7 @@ def main():
     s.add_argument("--offset", type=int, default=0)
     s.add_argument("--stride", type=int, default=1)
     s.add_argument("--out", type=Path)
+    s.add_argument("--reverse", action="store_true", help="last text first")
     t = sub.add_parser("tidy")
     t.add_argument("directory", type=Path)
     t.add_argument("--max-chars", type=int, help="cut each answer to its most first steps within this many characters first")
@@ -1061,7 +1062,7 @@ def main():
     if args.cmd == "tidy":
         tidy(args.directory, args.max_chars)
     else:
-        search(args.split, args.n, args.offset, args.stride, args.out)
+        search(args.split, args.n, args.offset, args.stride, args.out, args.reverse)
 
 
 if __name__ == "__main__":
