@@ -200,8 +200,13 @@ class Graph:
         return nodes + index * (2 * sum(len(w) for w in self.parents.values()) + len(self.out))
 
 
+@lru_cache(None)
+def _name_layer_kind(name: str) -> tuple[int, str]:
+    return int(name.split(".")[1]), name.split(".")[-1]
+
+
 def _layer_kind(nd) -> tuple[int, str]:
-    return int(nd[0].split(".")[1]), nd[0].split(".")[-1]
+    return _name_layer_kind(nd[0])
 
 
 def connects(writer: tuple, reader: tuple | None, targets: list[int]) -> bool:
@@ -247,8 +252,32 @@ def all_edges(nodes, targets: list[int]) -> tuple[dict, list]:
 
 
 def count_edges(nodes, targets: list[int]) -> int:
-    """How many connections all_edges would give."""
-    return sum(len(ws) for ws in _candidates(nodes).values()) + sum(1 for w in nodes if _layer_kind(w)[1] in mech.RESID_WRITERS and w[1] in targets)
+    """How many connections all_edges would give (_candidates' lists counted, not built)."""
+    from bisect import bisect_right
+
+    resid, values, inputs, readers, out = {}, {}, {}, {}, 0
+    for nd in nodes:
+        layer, kind = _layer_kind(nd)
+        if kind in mech.RESID_WRITERS:
+            resid.setdefault(nd[1], []).append(mech.stage(layer, kind))
+            out += nd[1] in targets
+        elif kind == "v_proj":
+            values.setdefault(layer, []).append(nd[1])
+        elif kind == "c_fc":
+            inputs[(layer, nd[1])] = inputs.get((layer, nd[1]), 0) + 1
+        if kind in mech.RESID_READERS or kind in ("o_proj", "down_proj"):
+            readers[nd] = (layer, kind)
+    for v in list(resid.values()) + list(values.values()):
+        v.sort()
+    n = out
+    for r, (layer, kind) in readers.items():
+        if kind in mech.RESID_READERS:
+            n += bisect_right(resid.get(r[1], ()), mech.stage(layer, kind))
+        elif kind == "o_proj":
+            n += bisect_right(values.get(layer, ()), r[1])
+        else:
+            n += inputs.get((layer, r[1]), 0)
+    return n
 
 
 class Native:
@@ -303,21 +332,23 @@ class Native:
 
     def _vpd_rank(self, ids: list[int], targets: list[int]) -> dict:
         """Each subcomponent with causal importance above zero -> its place in vpd_steps' order (0 first)."""
+        return {nd: place for place, nd in enumerate(self._vpd_order(ids, targets))}
+
+    def _vpd_order(self, ids: list[int], targets: list[int]) -> list:
+        """The subcomponents with causal importance above zero, (matrix, position, index), in vpd_steps' order."""
         ci = self.importance(ids)
         writes = self.contributions(ids, targets)
         flat = torch.cat([m.flatten() for m in ci.values()])
         at_target = torch.cat([torch.isin(torch.arange(m.shape[0], device=m.device), torch.tensor(targets, device=m.device))[:, None].expand_as(m).flatten() for m in ci.values()])
         rank = torch.cat([(ci[n] * writes[n]).flatten() for n in ci])
         rank = rank + at_target * (rank.max() + 1)
-        order = rank.argsort(descending=True)[: int((flat > 0).sum())].tolist()
+        order = rank.argsort(descending=True)[: int((flat > 0).sum())].cpu().numpy().astype(np.int64)
         names, sizes = list(ci), [ci[n].numel() for n in ci]
-        starts = [sum(sizes[:i]) for i in range(len(sizes))]
-        out = {}
-        for place, i in enumerate(order):
-            j = max(k for k, st in enumerate(starts) if st <= i)
-            T, C = ci[names[j]].shape
-            out[(names[j], (i - starts[j]) // C, (i - starts[j]) % C)] = place
-        return out
+        starts = np.cumsum([0] + sizes[:-1]).astype(np.int64)
+        j = np.searchsorted(starts, order, side="right") - 1  # the matrix of each flat index
+        off = order - starts[j]
+        C = np.array([ci[n].shape[1] for n in names], dtype=np.int64)[j]
+        return [(names[a], t, c) for a, t, c in zip(j.tolist(), (off // C).tolist(), (off % C).tolist())]
 
     def vpd_steps(self, ids: list[int], targets: list[int]) -> list[Graph]:
         """VPD's answer as steps, most important first: its subcomponents with causal importance above zero, ranked by
@@ -626,16 +657,18 @@ class Native:
         x = emb[None] if empty else emb[None].expand(B, L, -1).clone()  # every output at its scale
         xg = x.clone() if both else x  # complete graphs: their nodes' outputs in full
         causal = self._const(("causal", T), lambda: torch.ones(T, T, dtype=torch.bool, device=dev).tril())
-        acts, whole = {}, {}
-
-        def writer_acts(wn):  # a writer matrix's activations at every position
-            if wn not in whole:
-                whole[wn] = full(("a", wn), acts[wn])
-            return whole[wn]
+        acts = {}
 
         def writer_out(wn, wi, space_U):  # (b, t, c, the writer's activation, its u) of writer rows wi
             b, t, c = Wr[wn][0][wi], Wr[wn][1][wi], Wr[wn][2][wi]
-            return b, t, c, writer_acts(wn)[b, t, c], uat(wn, b, t, c)
+            if cache is None:
+                if fill is not None:
+                    fill[("a", wn)] = acts[wn]
+                a = acts[wn][b, t, c]
+            else:  # before s from the reused run (kept at every position), from s on from this one
+                kept = cache[("a", wn)]
+                a = torch.where(t < s, kept[b if kept.shape[0] > 1 else torch.zeros_like(b), t, c], acts[wn][b, (t - s).clamp(min=0), c])
+            return b, t, c, a, uat(wn, b, t, c)
 
         def topup(n, width, contrib):  # each reader node's declared parents' extra share
             out = torch.zeros(len(R[n][0]), width, device=dev)
@@ -749,6 +782,9 @@ class Native:
             if not empty:
                 x = plus(x + (Ad * ux(nd)) @ Ud, rd)
             xg = plus(xg + (Ad * scale(nd)) @ Ud, rd) if both else x
+            for n in nm.values():  # only the graph's writers' activations are read after their layer
+                if n not in Wr:
+                    acts.pop(n, None)
         tw = [p - s for p in targets]
         zt = torch.where(comp[:, :, :1].expand(B, 1, 1), xg[:, tw], x[:, tw]) if both else x[:, tw].expand(B, -1, -1)
         for wn, (b, t, wi) in O.items():
@@ -783,6 +819,12 @@ class Native:
             self._rec = (tuple(ids), (rec, states), {1: states})
         return self._rec[1]
 
+    def _drop_states(self) -> None:
+        """Release the batch-sized copies of the whole model's states (_model_states), keeping the text's own."""
+        if self._rec[2]:
+            for B in [B for B in self._rec[2] if B != 1]:
+                del self._rec[2][B]
+
     @torch.no_grad()
     def _model_states(self, ids: list[int], B: int) -> dict:
         """The states (run(fill=)) of B copies of the whole model on ids, for run(reuse=) by a batch of B (a batch of
@@ -790,24 +832,26 @@ class Native:
         self._model_record(ids)
         by = self._rec[2]
         if B not in by:
-            by[B] = {}
-            self.run(ids, [len(ids) - 1], self._full_plan(len(ids), B), *self._one(), fill=by[B])
+            st = {}
+            self.run(ids, [len(ids) - 1], self._full_plan(len(ids), B), *self._one(), fill=st)
+            by[B] = {k: v[:1] for k, v in st.items()}  # the B rows are the same numbers: one kept, expanded where read
         return by[B]
 
     def _node_arrays(self, g: Graph, kept: dict) -> dict:
-        """A graph's nodes as matrix -> (positions, indices) int64 arrays; a complete graph's masks read once per
-        `kept` (keyed by the graph object, which it keeps alive)."""
-        if g.masks is not None:
-            if id(g) not in kept:
+        """A graph's nodes as matrix -> (positions, indices) int64 arrays, read once per `kept` (keyed by the graph
+        object, which it keeps alive; the graph must not change meanwhile)."""
+        if id(g) not in kept:
+            if g.masks is not None:
                 nz = {n: m.nonzero().cpu().numpy() for n, m in g.masks.items()}
                 kept[id(g)] = (g, {n: (a[:, 0].astype(np.int64), a[:, 1].astype(np.int64)) for n, a in nz.items() if len(a)})
-            return kept[id(g)][1]
-        per = {}
-        for n, t, c in g.nodes:
-            lst = per.setdefault(n, ([], []))
-            lst[0].append(t)
-            lst[1].append(c)
-        return {n: (np.array(ts, dtype=np.int64), np.array(cs, dtype=np.int64)) for n, (ts, cs) in per.items()}
+            else:
+                per = {}
+                for n, t, c in g.nodes:
+                    lst = per.setdefault(n, ([], []))
+                    lst[0].append(t)
+                    lst[1].append(c)
+                kept[id(g)] = (g, {n: (np.array(ts, dtype=np.int64), np.array(cs, dtype=np.int64)) for n, (ts, cs) in per.items()})
+        return kept[id(g)][1]
 
     def _held(self, graphs: list[Graph], T: int, seed: int, i: int, kept: dict) -> dict:
         """faithfulness' holds on prompt i: per matrix with any, the [B, T, C] mask of the graphs' subcomponents held at
@@ -824,7 +868,9 @@ class Native:
             c = np.concatenate([p[2] for p in parts])
             b = np.concatenate([np.full(len(p[1]), p[0], dtype=np.int64) for p in parts])
             j = self.names.index(n)
-            on = below_half(np.uint64(base) + np.uint64(j * 1299709) + t.astype(np.uint64) * np.uint64(15485863) + c.astype(np.uint64))
+            seeds, inv = np.unique(np.uint64(base) + np.uint64(j * 1299709) + t.astype(np.uint64) * np.uint64(15485863) + c.astype(np.uint64),
+                                   return_inverse=True)  # a subcomponent in several graphs: drawn once
+            on = below_half(seeds)[inv.reshape(-1)]
             if on.any():
                 m = torch.zeros(len(graphs), T, self.C[n], dtype=torch.bool, device=self.dev)
                 bi, ti, ci = self._ints([b[on], t[on], c[on]])
@@ -915,17 +961,24 @@ class Native:
         zero, one = self._zero(), self._one()
         rec_m = self._model_record(ids)[0]
         total = torch.zeros(nb, device=self.dev)
-        kept = {}
+        kept, plans = {}, {}  # per graph object its nodes; per chunk the last plan, reused while its graph objects are (prompts sharing graphs)
         for i, (x, logp) in enumerate(zip(prompts, refs)):
             g = torch.Generator(device="cpu").manual_seed((seed * 1_000_003 + i) % (1 << 62))
             partial = bool(torch.rand(1, generator=g) < 0.5)
-            rest = ({n: torch.rand(1, T, self.C[n], generator=g).to(self.dev) for n in self.names},
-                    {n: torch.rand(1, T, generator=g).to(self.dev) for n in self.names}) if partial else zero
+            if partial:  # drawn on the CPU in the same order, sent at once
+                drawn = [torch.rand(1, T, self.C[n], generator=g) for n in self.names] + [torch.rand(1, T, generator=g) for n in self.names]
+                sent = torch.cat([d.flatten() for d in drawn]).to(self.dev).split([d.numel() for d in drawn])
+                rest = ({n: v.view(1, T, self.C[n]) for n, v in zip(self.names, sent)}, {n: v.view(1, T) for n, v in zip(self.names, sent[len(self.names):])})
+            else:
+                rest = zero
             w = getattr(x, "weight", 1.0)
             for s0 in range(0, nb, chunk):
                 part = at[i][s0:s0 + chunk]
                 B = len(part)
-                plan = self._plan(part, T)
+                key = tuple(id(gr) for gr in part)
+                if plans.get(s0, (None,))[0] != key:
+                    plans[s0] = (key, part, self._plan(part, T))
+                plan = plans[s0][2]
                 mask = self._held(part, T, seed, i, kept)
                 with torch.no_grad():
                     if not mask:
@@ -939,6 +992,7 @@ class Native:
                     del states
                     total[s0:s0 + B] += w * (lp.exp() * (lp - lq)).sum(-1).sum(-1) / LN2
                 free(self.dev)
+        self._drop_states()
         return (total / len(prompts)).tolist()
 
     @torch.no_grad()
@@ -990,6 +1044,7 @@ class Native:
             for b, j in enumerate(live):
                 out[j].append({**e, "hold": ks[j] + 1, "down": down[b]})
             free(self.dev)
+        self._drop_states()
         return out
 
 
@@ -1128,13 +1183,13 @@ class Native:
         sites = sorted({nd[0] for nd in qk})
         idx = {n: [j for j, nd in enumerate(qk) if nd[0] == n] for n in sites}
 
+        at = {n: self._ints([[qk[j][1] for j in idx[n]], [qk[j][2] for j in idx[n]], idx[n]]) for n in sites}  # (positions, indices, rows of w)
+
         def qk_of(w):
             res = {}
             for n in sites:
-                js = idx[n]
-                t = torch.tensor([qk[j][1] for j in js], device=self.dev)
-                c = torch.tensor([qk[j][2] for j in js], device=self.dev)
-                res[n] = torch.zeros(1, T, self.C[n], device=self.dev).index_put((torch.zeros_like(t), t, c), w[torch.tensor(js, device=self.dev)])
+                t, c, js = at[n]
+                res[n] = torch.zeros(1, T, self.C[n], device=self.dev).index_put((torch.zeros_like(t), t, c), w[js])
             return res
 
         zero = self._zero()
@@ -1159,7 +1214,7 @@ class Native:
         much each writes, the predicted position first)."""
         T = len(ids)
         if nodes_from == "vpd":
-            ranked = sorted(self.vpd_steps(ids, targets)[-1].node_set(), key=self._vpd_rank(ids, targets).get)
+            ranked = self._vpd_order(ids, targets)  # vpd_steps' last step, its nodes in its order
         else:
             ranked = self._node_ranking(ids, targets, prompts, self.reachable(T, targets))
         lo = 1
@@ -1229,16 +1284,29 @@ def on_path(g: Graph, targets: list[int]) -> Graph:
     for r, ws in g.parents.items():
         for w in ws:
             feeds.setdefault(r, set()).add(w)
-    outs = [nd for nd in g.nodes if _layer_kind(nd)[1] == "o_proj"]
+    queries, keys = {}, {}  # (layer, position) -> its queries; layer -> its keys by position
     for nd in g.nodes:
         layer, kind = _layer_kind(nd)
-        if kind in ("q_proj", "k_proj"):
-            for o in outs:
-                if _layer_kind(o)[0] == layer and (o[1] == nd[1] if kind == "q_proj" else o[1] >= nd[1]):
-                    feeds.setdefault(o, set()).add(nd)
+        if kind == "q_proj":
+            queries.setdefault((layer, nd[1]), []).append(nd)
+        elif kind == "k_proj":
+            keys.setdefault(layer, []).append(nd)
+    for ks in keys.values():
+        ks.sort(key=lambda nd: nd[1])
+    reached = {}  # layer -> how many of its keys (by position) feed an attention output kept so far
     keep, stack = set(g.out), list(g.out)
     while stack:
-        for w in feeds.get(stack.pop(), ()):
+        nd = stack.pop()
+        new = list(feeds.get(nd, ()))
+        layer, kind = _layer_kind(nd)
+        if kind == "o_proj" and nd in g.nodes:
+            new += queries.get((layer, nd[1]), [])
+            ks, i = keys.get(layer, []), reached.get(layer, 0)
+            while i < len(ks) and ks[i][1] <= nd[1]:
+                new.append(ks[i])
+                i += 1
+            reached[layer] = i
+        for w in new:
             if w not in keep:
                 keep.add(w)
                 stack.append(w)

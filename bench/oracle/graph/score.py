@@ -214,10 +214,13 @@ class Scorer:
             n = out[-1]["steps"]
             mine = []
             for k in range(1, n + 1):
-                gs = []
+                gs, made = [], {}  # one graph per trace (a static answer's prompts share it: native plans it once)
                 for x_ir in [ir] + irs:
                     if x_ir is None:
                         gs.append(self.native.Graph())
+                        continue
+                    if id(x_ir) in made:
+                        gs.append(made[id(x_ir)])
                         continue
                     g, uses = self.native.prefix(x_ir, min(k, x_ir["graph"]["steps"]))
                     if uses:
@@ -225,6 +228,7 @@ class Scorer:
                         if g is None:
                             out[-1].update(valid=False, error=f"uses: an entry of {uses} is unknown, outside the text or not a model connection")
                             break
+                    made[id(x_ir)] = g
                     gs.append(g)
                 if not out[-1]["valid"]:
                     break
