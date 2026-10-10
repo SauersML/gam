@@ -62,6 +62,12 @@ ADV_STEPS, ADV_STEP = 20, 0.1  # Native.adversarial (evaluation only): VPD's hea
 LN2 = math.log(2)
 
 
+def free(dev: str) -> None:
+    """Return cached device memory (the Mac's shared memory fills with MPS's cache during the search's rankings)."""
+    if str(dev).startswith("mps"):
+        torch.mps.empty_cache()
+
+
 def device() -> str:
     return "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
 
@@ -680,6 +686,7 @@ class Native:
                     grads = torch.autograd.grad(getattr(x, "weight", 1.0) * self._kl(logp, lq)[0], [masks[n] for n in self.names])
                 for n, gr in zip(self.names, grads):
                     total[n] -= gr[0]
+            free(self.dev)
         mi, ti, ci, val = [], [], [], []
         for j, n in enumerate(self.names):
             t, c = reach[n].nonzero(as_tuple=True)
@@ -725,6 +732,7 @@ class Native:
                     kl = getattr(x, "weight", 1.0) * self._kl(logp, self.run(x, targets, plan, *zero, ew, ow, qk_of(w[n_edges:])))[0]
                     (gr,) = torch.autograd.grad(kl, w)
                 ig -= gr
+            free(self.dev)
         allitems = items + [(nd, None) for nd in qk]
         return [allitems[j] for j in (-ig).argsort().tolist()]
 
