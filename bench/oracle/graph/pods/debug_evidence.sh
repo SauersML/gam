@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Which vLLM setting breaks the evidence oracle's sampling (prompts as embeddings + LoRA): the held-out evaluation of
 # a fresh adapter on 2 questions, once per variant, each its own process (a CUDA error ends the process): as trained
-# (compiled kernels, CUDA graphs), --enforce-eager, and text only. With SFT_STEPS the adapter is first trained that
+# (compiled kernels, CUDA graphs, chunked prefill), --no-chunked-prefill, --enforce-eager, and text only. With SFT_STEPS the adapter is first trained that
 # many steps on described answers (DESCRIBED): a fresh adapter writes no subcomponent tokens and did not crash.
 # One pod, minutes.
-#   bench/oracle/graph/pods/debug_evidence.sh   (env: RUN, SFT_STEPS, DESCRIBED, GPU, PRICE)
+#   bench/oracle/graph/pods/debug_evidence.sh   (env: RUN, SFT_STEPS, DESCRIBED, QUESTIONS, SAMPLES, GPU, PRICE)
 cd /Users/user/gam
 RUN=${RUN:-dbg1}
 S=/Users/user/mpd-data/scratch/glead/v5/src_debug_$RUN
@@ -18,14 +18,14 @@ COPYFILE_DISABLE=1 tar -cf "$T" -C /Users/user/mpd-data/graph_oracle texts/vpd4l
 PT="~/mpd-data/graph_oracle/texts"
 DT=/Users/user/mpd-data/graph_oracle/described-$RUN.tar
 [ -n "$DESCRIBED" ] && COPYFILE_DISABLE=1 tar -cf "$DT" -C "$DESCRIBED" .
-BASE="--base Qwen/Qwen3-4B --model vpd4l --behaviors $PT --search $PT/search --search-heldout $PT/search_heldout --part-tokens /root/reg.safetensors --scorer native --score-workers 4 --share-gpu --gpu-memory 0.5 --micro 1 --eval-behaviors 2 --samples 2 --no-baselines"
+BASE="--base Qwen/Qwen3-4B --model vpd4l --behaviors $PT --search $PT/search --search-heldout $PT/search_heldout --part-tokens /root/reg.safetensors --scorer native --score-workers 4 --share-gpu --gpu-memory 0.5 --micro 1 --eval-behaviors ${QUESTIONS:-2} --samples ${SAMPLES:-2} --no-baselines"
 EV="--evidence --max-tokens 1024 --max-model-len 26624"
 RUNS=""; INIT=""
 if [ -n "$SFT_STEPS" ]; then
   RUNS="mkdir -p $O/sft $O/described; tar -xf $DT -C $O/described; python rl/train.py --mode sft ${BASE/--search $PT\/search/--search $O/described} $EV --sft-steps $SFT_STEPS --batch 8 --out $O/sft --run-name dbg_sft > $O/sft/log 2>&1; echo \"sft exit \$?\" >> $O/variants.txt;"
   INIT="--init $O/sft/adapter"
 fi
-for v in "compiled:$EV" "eager:$EV --enforce-eager" "text:--max-tokens 1024 --max-model-len 14336"; do
+for v in "compiled:$EV" "nochunk:$EV --no-chunked-prefill" "eager:$EV --enforce-eager" "text:--max-tokens 1024 --max-model-len 14336"; do
   name=${v%%:*}; args=${v#*:}
   RUNS="$RUNS mkdir -p $O/$name; python rl/train.py --mode eval $BASE $args $INIT --out $O/$name --run-name dbg_$name > $O/$name/log 2>&1; echo \"$name exit \$?\" >> $O/variants.txt;"
 done

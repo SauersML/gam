@@ -367,6 +367,7 @@ class VllmSampler:
         # vLLM 0.19.1 hit an illegal memory access on A100 and RTX PRO 6000 alike, so evidence runs go without it.
         self.llm = LLM(model=model, dtype="bfloat16", enable_lora=True, max_lora_rank=self.rank, max_loras=1,
                        enable_prefix_caching="enable_prompt_embeds" not in self.engine_options, enforce_eager=getattr(a, "enforce_eager", False),
+                       **({"enable_chunked_prefill": False, "max_num_batched_tokens": a.max_model_len} if getattr(a, "no_chunked_prefill", False) else {}),
                        gpu_memory_utilization=a.gpu_memory, max_model_len=a.max_model_len, seed=a.seed, enable_sleep_mode=self.share, **self.engine_options)
         if self.share:
             self.llm.sleep(level=1)  # weights to host memory, KV cache freed: the trainer loads next
@@ -1373,6 +1374,7 @@ def main():
     ap.add_argument("--search-heldout", help="the search's answers to the held-out questions: evaluation baselines only")
     ap.add_argument("--score-workers", type=int, default=1, help="processes scoring answers at once (a pod's GPU: 8)")
     ap.add_argument("--enforce-eager", action="store_true", help="vLLM without compiled kernels or CUDA graphs")
+    ap.add_argument("--no-chunked-prefill", action="store_true", help="vLLM prefills each prompt whole (no chunks)")
     ap.add_argument("--eval-split", choices=("heldout", "hard"), default="heldout", help="the questions evaluation asks (text.py's hard split: "
                     "predictions the text does not suggest; its search answers in texts/search_hard)")
     ap.add_argument("--revise", action="store_true", help="rl2: a second round in which the oracle revises each answer after reading the verifier's report on it (revise_groups)")
