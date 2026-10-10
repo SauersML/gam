@@ -42,7 +42,7 @@ elif [ -n "$DESCRIBED" ]; then  # described answers from an earlier run
 else
   START="$DESCRIBE && $SFT"
 fi
-CMD="ln -sfn $W/mpd-data ~/mpd-data; mkdir -p $O $S ~/mpd-data/graph_oracle; tar -xf $T -C ~/mpd-data/graph_oracle; tar -xf $S.tar -C $S; ls /Users/user/mpd-data/vpd/t-9d2b8f02/model_step_99999.safetensors /Users/user/mpd-data/vpd/t-9d2b8f02/model_config.yaml /Users/user/mpd-data/vpd/t-9d2b8f02/tokenizer.json /Users/user/mpd-data/oracle/vpd/uv.safetensors > /dev/null; cd $G; python part_tokens.py build --vpd /Users/user/mpd-data/oracle/vpd/uv.safetensors --out /root/reg.safetensors && { $START; }; $RL; $EVAL; ${EVIDENCE:+$SWAP;} echo done"
+CMD="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4; ln -sfn $W/mpd-data ~/mpd-data; mkdir -p $O $S ~/mpd-data/graph_oracle; tar -xf $T -C ~/mpd-data/graph_oracle; tar -xf $S.tar -C $S; ls /Users/user/mpd-data/vpd/t-9d2b8f02/model_step_99999.safetensors /Users/user/mpd-data/vpd/t-9d2b8f02/model_config.yaml /Users/user/mpd-data/vpd/t-9d2b8f02/tokenizer.json /Users/user/mpd-data/oracle/vpd/uv.safetensors > /dev/null; cd $G; python part_tokens.py build --vpd /Users/user/mpd-data/oracle/vpd/uv.safetensors --out /root/reg.safetensors && { $START; }; $RL; $EVAL; ${EVIDENCE:+$SWAP;} echo done"
 RP_OWNER=lead RP_PARALLEL=1 RP_PYENV=oracle RP_HF_MODELS="${BASE:-Qwen/Qwen3-4B}" RP_MAX_PRICE=${PRICE:-1.20} RP_MIN_VRAM_GB=${VRAM:-48} RP_MIN_RAM_GB=96 \
   bench/runpod/rp-run $N "${GPU:-auto}" $(python3 -c "print(round($RH + 2.0, 2))") -- bash -c "$CMD" > /Users/user/mpd-data/scratch/glead/v5/rp_$N.log 2>&1
 echo "$N exit $?"
