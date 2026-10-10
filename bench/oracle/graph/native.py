@@ -506,7 +506,7 @@ class Native:
         if last < 1:
             return [Changed(ids, 1.0) for _ in range(n)]
         g = torch.Generator(device="cpu").manual_seed(seed)
-        moved, other = self.sensitivity(ids, targets, g, chunk)
+        moved, other = self.sensitivity(ids, targets, g)  # 16 probes at a time: their full logits are ~1.6 GB
         uniform = torch.full((last,), 1.0 / last)
         q = 0.5 * uniform + 0.5 * (moved / moved.sum() if moved.sum() > 0 else uniform)
         out = []
@@ -517,7 +517,7 @@ class Native:
             out.append(Changed(x, 1.0))
         return out
 
-    def sensitivity(self, ids: list[int], targets: list[int], g: torch.Generator, chunk: int = 64) -> tuple[torch.Tensor, torch.Tensor]:
+    def sensitivity(self, ids: list[int], targets: list[int], g: torch.Generator, chunk: int = 16) -> tuple[torch.Tensor, torch.Tensor]:
         """(moved [last], other [T - 1, V]): moved[p - 1], the KL (nats) of the model's prediction at the last target
         after the token at position p is replaced by one draw from other[p - 1], the model's prediction for position p
         without the text's token there (changes' probe: where the prediction responds to the text)."""

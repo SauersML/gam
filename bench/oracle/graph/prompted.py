@@ -14,7 +14,7 @@ way it leaves the accelerator's memory while the verifier scores. Only the text 
 
   prompted.py --base Qwen/Qwen3-32B-FP8 --rounds 3 --samples 2 --questions 50 --out DIR
   prompted.py --backend mlx --base mlx-community/Qwen3-30B-A3B-Thinking-2507-4bit --out DIR
-A rerun into the same DIR reuses the baselines' scores already there. Outputs: DIR/eval_samples.jsonl (every answer and baseline with its score, program "search" (the starting answer),
+A rerun into the same DIR reuses the baselines' scores already there and continues after the rounds already done. Outputs: DIR/eval_samples.jsonl (every answer and baseline with its score, program "search" (the starting answer),
 "search_full" (the search's whole answer), "vpd", "empty", "prompted_r<k>"), DIR/summary.json.
 """
 
@@ -151,8 +151,8 @@ def score_all(sc, jobs: list, seed: int, workers: int) -> list:
         try:  # a worker that dies (out of memory) breaks the pool instead of hanging it; the calls then run here
             with ProcessPoolExecutor(min(workers, len(jobs)), mp_context=multiprocessing.get_context("spawn"), initializer=_start_worker) as pool:
                 return list(pool.map(_score_job, [(t, srcs, seed) for t, srcs in jobs]))
-        except BrokenProcessPool as e:
-            print(f"score_all: a worker died ({e}); scoring in this process", flush=True)
+        except (BrokenProcessPool, RuntimeError) as e:  # a dead worker, or one out of memory (torch's errors are RuntimeErrors)
+            print(f"score_all: the pool failed ({type(e).__name__}: {str(e)[:200]}); scoring in this process", flush=True)
     return [sc.score(t, srcs, seed=seed) for t, srcs in jobs]
 
 
@@ -266,11 +266,13 @@ def main():
             t["path"] = str(p)
             tasks.append(t)
     samples = a.out / "eval_samples.jsonl"
-    done = {}  # (question, baseline) -> its row, from an earlier run into the same directory
+    done, earlier = {}, []  # baselines' rows and the prompted answers' rows of an earlier run into the same directory
     if samples.exists():
         for line in open(samples):
             r = json.loads(line)
-            if not r["program"].startswith("prompted"):
+            if r["program"].startswith("prompted"):
+                earlier.append(r)
+            else:
                 done[(r["behavior"], r["program"])] = r
     log = open(samples, "a")
 
@@ -298,9 +300,13 @@ def main():
         full_area[t["id"]] = score.key(s_full)[1]
         search_nodes[t["id"]] = nodes_of(t, full) if a.evidence_tokens else []
         respond[t["id"]] = responses(sc.nat, t, a.evidence_tokens, count) if a.evidence_tokens else ""
-    llm = (Mlx if a.backend == "mlx" else Vllm)(a) if a.rounds else None  # --rounds 0: the baselines' scores only
     summary = {"search": sorted(score.key(best[t["id"]][1])[1] for t in tasks), "search_full": sorted(full_area.values())}
-    for r in range(1, a.rounds + 1):
+    first = 1 + max((int(r["program"][len("prompted_r"):]) for r in earlier), default=0)  # an earlier run's finished rounds
+    for r in earlier:  # its best answers carry on
+        if r["behavior"] in best and r["score"].get("curve") and score.key(r["score"]) < score.key(best[r["behavior"]][1]):
+            best[r["behavior"]] = (r["source"], r["score"])
+    llm = (Mlx if a.backend == "mlx" else Vllm)(a) if a.rounds >= first else None  # --rounds 0: the baselines' scores only
+    for r in range(first, a.rounds + 1):
         chats = []
         for t in tasks:
             src = best[t["id"]][0]

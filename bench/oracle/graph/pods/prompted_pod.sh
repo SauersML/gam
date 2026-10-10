@@ -4,7 +4,7 @@
 # VPD's answer is scored elsewhere: PREV, an eval_samples.jsonl with the baselines already scored (prompted.py on the
 # Mac or MATS), is copied into the output directory first and reused. The Python is origin/main's bench/oracle/graph
 # at launch.
-#   bench/oracle/graph/pods/prompted_pod.sh HOURS   (env: RUN, BASE, SPLITS ("heldout hard"), ROUNDS, SAMPLES, QUESTIONS, ARGS, PREV, GPU, VRAM, RAM, PRICE)
+#   bench/oracle/graph/pods/prompted_pod.sh HOURS   (env: RUN, BASE, SPLITS ("heldout hard"), ROUNDS, SAMPLES, QUESTIONS, ARGS, PREV, PREV_HARD (the hard split's earlier rows: its baselines and finished rounds), GPU, VRAM, RAM, PRICE)
 #   e.g. BASE=QuantTrio/Qwen3-30B-A3B-Thinking-2507-AWQ VRAM=30 GPU="NVIDIA GeForce RTX 5090" PRICE=0.70 \
 #        PREV=~/mpd-data/graph_oracle/prompted_mac1/eval_samples.jsonl ARGS="--evidence-tokens 3000 --max-tokens 16000 --gpu-memory 0.8"
 cd /Users/user/gam
@@ -25,7 +25,7 @@ for split in ${SPLITS:-heldout}; do
   RUNS="$RUNS mkdir -p $out; python prompted.py --split $split --base $BASE --rounds ${ROUNDS:-3} --samples ${SAMPLES:-2} --questions ${QUESTIONS:-50} --workers 6 ${ARGS:-} --out $out > $out/log 2>&1;"
 done
 COPYFILE_DISABLE=1 tar -cf "$S.tar" -C "$S" . && rm -rf "$S"  # the source too; rp-run uploads every existing path the command names, so only the archives exist here
-CMD="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4; ln -sfn $W/mpd-data ~/mpd-data; mkdir -p $O $S ~/mpd-data/graph_oracle; tar -xf $T -C ~/mpd-data/graph_oracle; tar -xf $S.tar -C $S; ${PREV:+cp $PREV $O/eval_samples.jsonl;} ls /Users/user/mpd-data/vpd/t-9d2b8f02/model_step_99999.safetensors /Users/user/mpd-data/vpd/t-9d2b8f02/model_config.yaml /Users/user/mpd-data/vpd/t-9d2b8f02/tokenizer.json /Users/user/mpd-data/oracle/vpd/uv.safetensors > /dev/null; cd $G; $RUNS echo done"
+CMD="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4; ln -sfn $W/mpd-data ~/mpd-data; mkdir -p $O $S ~/mpd-data/graph_oracle; tar -xf $T -C ~/mpd-data/graph_oracle; tar -xf $S.tar -C $S; ${PREV:+cp $PREV $O/eval_samples.jsonl;} ${PREV_HARD:+mkdir -p $O/hard; cp $PREV_HARD $O/hard/eval_samples.jsonl;} ls /Users/user/mpd-data/vpd/t-9d2b8f02/model_step_99999.safetensors /Users/user/mpd-data/vpd/t-9d2b8f02/model_config.yaml /Users/user/mpd-data/vpd/t-9d2b8f02/tokenizer.json /Users/user/mpd-data/oracle/vpd/uv.safetensors > /dev/null; cd $G; $RUNS echo done"
 RP_OWNER=lead RP_PARALLEL=1 RP_PYENV=oracle RP_HF_MODELS="$BASE" RP_MAX_PRICE=${PRICE:-0.80} RP_MIN_VRAM_GB=${VRAM:-44} RP_MIN_RAM_GB=${RAM:-96} \
   bench/runpod/rp-run $N "${GPU:-NVIDIA RTX A6000,NVIDIA A40,NVIDIA L40S,NVIDIA L40,NVIDIA RTX 6000 Ada Generation}" $H -- bash -c "$CMD" > /Users/user/mpd-data/scratch/glead/v5/rp_$N.log 2>&1
 echo "$N exit $?"
