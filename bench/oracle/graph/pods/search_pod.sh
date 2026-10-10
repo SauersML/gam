@@ -10,12 +10,12 @@ H=${1:-3.0}
 RUN=${RUN:-a} SPLIT=${SPLIT:-train} COUNT=${COUNT:-400} P=${P:-6}
 S=/Users/user/mpd-data/scratch/glead/v5/src_search_$RUN
 git fetch -q origin main && rm -rf "$S" "$S.tar" && mkdir -p "$S" && git archive origin/main bench/oracle/graph bench/vpd_2951/vpd_model.py | tar -x -C "$S" && echo "python source $(git rev-parse --short=10 origin/main)" > "$S/SOURCE"
-tar -cf "$S.tar" -C "$S" . && rm -rf "$S"  # rp-run uploads every existing path the command names: only the archives exist here
+COPYFILE_DISABLE=1 tar -cf "$S.tar" -C "$S" . && rm -rf "$S"  # rp-run uploads every existing path the command names: only the archives exist here
 G=$S/bench/oracle/graph
 N=oracle-graph-search-$RUN
 O=/Users/user/mpd-data/runpod/$N; W=/workspace/runs/$N
 T=/Users/user/mpd-data/graph_oracle/texts-search-$RUN.tar
-tar -cf "$T" -C /Users/user/mpd-data/graph_oracle texts/vpd4l
+COPYFILE_DISABLE=1 tar -cf "$T" -C /Users/user/mpd-data/graph_oracle texts/vpd4l
 STAGES=""
 for entry in $SPLIT; do
   split=${entry%%:*}; n=$([ "$entry" = "$split" ] && echo $COUNT || echo ${entry#*:})  # "train:124" sets that split's count

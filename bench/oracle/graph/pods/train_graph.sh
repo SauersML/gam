@@ -15,14 +15,14 @@ RUN=${RUN:-a}
 EVIDENCE=${EVIDENCE-1}  # the activation tokens by default; EVIDENCE= for the text-only oracle
 S=/Users/user/mpd-data/scratch/glead/v5/src_graph_$RUN
 git fetch -q origin main && rm -rf "$S" "$S.tar" && mkdir -p "$S" && git archive origin/main bench/oracle/graph bench/vpd_2951/vpd_model.py | tar -x -C "$S" && echo "python source $(git rev-parse --short=10 origin/main)" > "$S/SOURCE"
-tar -cf "$S.tar" -C "$S" . && rm -rf "$S"  # rp-run uploads every existing path the command names: only the archives exist here
+COPYFILE_DISABLE=1 tar -cf "$S.tar" -C "$S" . && rm -rf "$S"  # rp-run uploads every existing path the command names: only the archives exist here
 G=$S/bench/oracle/graph
 B=/Users/user/mpd-data/graph_oracle/texts
 N=oracle-graph-$RUN
 O=/Users/user/mpd-data/runpod/$N; W=/workspace/runs/$N
 T=/Users/user/mpd-data/graph_oracle/texts-$RUN.tar
-tar -cf "$T" -C /Users/user/mpd-data/graph_oracle texts/vpd4l texts/search texts/search_heldout $( [ -d $B/search_hard ] && echo texts/search_hard )
-[ -n "$DESCRIBED" ] && tar -cf "$O.described.tar" -C "$DESCRIBED" .
+COPYFILE_DISABLE=1 tar -cf "$T" -C /Users/user/mpd-data/graph_oracle texts/vpd4l texts/search texts/search_heldout $( [ -d $B/search_hard ] && echo texts/search_hard )
+[ -n "$DESCRIBED" ] && COPYFILE_DISABLE=1 tar -cf "$O.described.tar" -C "$DESCRIBED" .
 if [ -n "$EVIDENCE" ]; then LEN="--max-tokens 4096 --max-model-len 26624"; else LEN="--max-tokens 4096 --max-model-len 14336"; fi  # a revision prompt holds the first answer
 COMMON="--base ${BASE:-Qwen/Qwen3-4B} --model vpd4l --behaviors $B --search $O/described --search-heldout $B/search_heldout --part-tokens /root/reg.safetensors --scorer native ${EVIDENCE:+--evidence} $LEN --share-gpu --gpu-memory 0.5 --micro 1 --eval-behaviors 50 --oracle-runs $O/oracle"
 DESCRIBE="python describe.py $B/search --split train --out $O/described --base ${BASE:-Qwen/Qwen3-4B} --max-tokens 4096 > $O/describe.log 2>&1"

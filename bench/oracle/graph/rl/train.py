@@ -77,6 +77,8 @@ def behaviors(root: Path, model: str, split: str) -> list[dict]:
     """The split's questions, one per task."""
     out = []
     for p in sorted((root / model).glob("*.json")):
+        if p.name.startswith("."):  # macOS's ._ metadata files
+            continue
         task = json.loads(p.read_text())
         if task.get("split", "train") == split:
             out.append({**task, "task": task["id"], "path": str(p)})
@@ -510,7 +512,8 @@ def read_answers(root) -> dict[str, str]:
         for p in sorted(root.glob("*.answer.txt")):
             out[p.name[: -len(".answer.txt")]] = p.read_text()
         for p in sorted(root.glob("*.py")):
-            out.setdefault(p.stem, "```python\n" + p.read_text().strip() + "\n```")
+            if not p.name.startswith("."):  # macOS's ._ metadata files
+                out.setdefault(p.stem, "```python\n" + p.read_text().strip() + "\n```")
     return out
 
 
