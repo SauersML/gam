@@ -1,0 +1,13 @@
+[project]
+name = "graph-oracle"
+version = "0.1.0"
+description = "graph-oracle: the #2951 graph oracle's questions, rewarded by serve_scores.py (single-turn or a revision turn)."
+requires-python = ">=3.11"
+dependencies = ["httpx"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["graph_oracle"]

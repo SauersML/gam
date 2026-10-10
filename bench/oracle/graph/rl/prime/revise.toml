@@ -1,0 +1,27 @@
+# The revising episode, layered on rl.toml (`rl @ rl.toml @ revise.toml`): the answer, the verifier's feedback on it as
+# the next user turn, and the revised answer, which the reward scores. TOML layering replaces arrays, so the sources are
+# restated. Two answers and the report: a longer context.
+seq_len = 16384
+
+[inference.vllm]
+max_model_len = 16384
+
+[[orchestrator.train.source]]
+name = "graph-oracle"
+env.taskset.id = "graph-oracle"
+env.taskset.questions = "train.jsonl"
+env.taskset.task.seed = 0
+env.taskset.task.revise = true
+env.agent.harness.id = "null"
+env.agent.runtime.type = "subprocess"
+
+[[orchestrator.eval.source]]
+name = "graph-oracle-heldout"
+group_size = 2
+select.limit = 50
+env.taskset.id = "graph-oracle"
+env.taskset.questions = "heldout.jsonl"
+env.taskset.task.seed = 1000003
+env.taskset.task.revise = true
+env.agent.harness.id = "null"
+env.agent.runtime.type = "subprocess"

@@ -1,0 +1,67 @@
+# prime-rl RL of the graph oracle (#2951) on one MATS node (run_mats.sh: vLLM and serve_scores on the first GPU, the
+# trainer on the second). run_mats.sh sets model.name (export_hf.py's checkpoint) and launches from the directory holding
+# the questions files (questions.py), which the sources name relative to it.
+max_steps = 20
+seq_len = 12288
+dashboard = false
+
+[model]
+name = "Qwen/Qwen3-4B"
+
+[trainer.model.lora]  # a new LoRA on the merged oracle; embeddings and output layer (part rows) stay frozen
+rank = 32
+alpha = 64
+
+[trainer.model.ac]
+
+[trainer.optim]
+lr = 1e-5
+
+[orchestrator]
+batch_size = 32  # 4 questions x 8 answers
+
+[orchestrator.renderer]  # train.py's chat: Qwen3's template without thinking
+name = "qwen3"
+enable_thinking = false
+
+[orchestrator.train]
+group_size = 8
+
+[orchestrator.train.sampling]
+max_completion_tokens = 4096
+temperature = 1.0
+
+[[orchestrator.train.source]]
+name = "graph-oracle"
+env.taskset.id = "graph-oracle"
+env.taskset.questions = "train.jsonl"
+env.taskset.task.seed = 0
+env.agent.harness.id = "null"
+env.agent.runtime.type = "subprocess"
+
+[orchestrator.eval]
+interval = 10
+
+[orchestrator.eval.sampling]
+max_completion_tokens = 4096
+temperature = 1.0
+
+[[orchestrator.eval.source]]
+name = "graph-oracle-heldout"
+group_size = 2
+select.limit = 50
+env.taskset.id = "graph-oracle"
+env.taskset.questions = "heldout.jsonl"
+env.taskset.task.seed = 1000003
+env.agent.harness.id = "null"
+env.agent.runtime.type = "subprocess"
+
+[ckpt]
+
+[inference.vllm]
+gpu_memory_utilization = 0.45  # serve_scores' two scoring processes share this GPU (about 10 GB each)
+max_model_len = 12288
+
+[env_vars]
+# FlashInfer JIT-compiles its sampler with the node's CUDA 12.2 nvcc, which rejects CUDA 13 flags.
+VLLM_USE_FLASHINFER_SAMPLER = "0"
