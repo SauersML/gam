@@ -15,7 +15,8 @@ Native heads and blocks are parts only where nothing decomposes them (the regist
 
 Features. A part's feature vector is fixed by its kind:
   VPD subcomponent u v^T of a site (read v in R^d_in, write u in R^d_out):
-      [v / |v| * sqrt(d_in), u / |u| * sqrt(d_out), log |v|, log |u|]
+      [v / |v| * sqrt(d_in), u / |u| * sqrt(d_out), log (|u| |v|)], signed so that the largest entry of v / |v| is
+      positive: (c u)(v / c)^T and (-u)(-v)^T are the same subcomponent and get the same features
 Maps. Per kind, P_in (linear of rank 256, rescaled to the RMS of the oracle's token embeddings) gives the token's input
 embedding and P_out (linear) its output row: the logit of part p after hidden state h is h . P_out(f_p),
 next to the base vocabulary's logits, so choosing a part is a softmax over the parts' own vectors. There
@@ -323,8 +324,12 @@ def build(vpd: str) -> Registry:
     for name in sorted({k.rsplit(".", 1)[0] for k in uv}):
         layer, site = int(name.split(".")[1]), name.split(".")[3]
         U, V = uv[f"{name}.U"].float(), uv[f"{name}.V"].float()  # [C, d_out], [d_in, C]
-        nu, nv = U.norm(dim=1), V.norm(dim=0)
-        f = torch.cat([(V / nv).T * V.shape[0] ** 0.5, U / nu[:, None] * U.shape[1] ** 0.5, nv.log()[:, None], nu.log()[:, None]], dim=1)
+        tiny = torch.finfo(torch.float32).tiny
+        nu, nv = U.norm(dim=1).clamp_min(tiny), V.norm(dim=0).clamp_min(tiny)
+        vt, ut = (V / nv).T, U / nu[:, None]  # [C, d_in], [C, d_out]: the read and write directions
+        sign = torch.sign(vt.gather(1, vt.abs().argmax(1, keepdim=True)))  # u v^T = (-u)(-v)^T: the largest read entry positive
+        sign[sign == 0] = 1
+        f = torch.cat([vt * sign * V.shape[0] ** 0.5, ut * sign * U.shape[1] ** 0.5, (nu * nv).log()[:, None]], dim=1)
         features.setdefault(f"pd.{SITES[site]}", []).append(f)
         addresses += [f"PD[{layer}].{site}[{c}]" for c in range(U.shape[0])]
     return Registry(addresses, {k: torch.cat(v) for k, v in features.items()})
