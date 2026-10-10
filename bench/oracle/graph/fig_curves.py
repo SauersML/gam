@@ -4,7 +4,7 @@ every question as a point (below the diagonal: better than the search); right, a
 KL so far at each description length).
 
   fig_curves.py OUT.png --method "LABEL=EVAL_SAMPLES.jsonl:PROGRAM_PREFIX" [--method ...] [--examples 3]
-Baselines (the search's whole answer, VPD's answer) come from the first file that has them.
+Baselines (the search's whole answer, VPD's answer) come from the first file with a valid score for each question.
 """
 import argparse
 import json
@@ -47,16 +47,20 @@ def main():
     ap.add_argument("out")
     ap.add_argument("--method", action="append", default=[])
     ap.add_argument("--examples", type=int, default=3)
+    ap.add_argument("--baselines", action="append", default=[], help="more eval_samples files to take the baselines from (VPD's answer is scored only where its importance network is)")
     a = ap.parse_args()
-    methods, base = [], {}
+    methods, base = [], {"search_full": {}, "vpd": {}}
     for spec in a.method:
         label, rest = spec.split("=", 1)
         path, prefix = rest.rsplit(":", 1)
         rows = [json.loads(x) for x in open(path)]
         methods.append((label, best(rows, prefix)))
-        for name in ("search_full", "vpd"):
-            if name not in base and any(r["program"] == name for r in rows):
-                base[name] = best(rows, name)
+        for name in base:
+            base[name] = {**best(rows, name), **base[name]}
+    for path in a.baselines:
+        rows = [json.loads(x) for x in open(path)]
+        for name in base:
+            base[name] = {**best(rows, name), **base[name]}
     search = base["search_full"]
     area = lambda r: score.key(r["score"])[1]  # noqa: E731
 
@@ -92,7 +96,13 @@ def main():
     for label, color in [("search", SEARCH)] + [(lab, col) for lab, _, col in series]:
         bx.plot([], [], color=color, lw=2, label=label)
     bx.legend(fontsize=12, frameon=False)
+    from matplotlib.ticker import FuncFormatter
+
+    plain = FuncFormatter(lambda v, _: f"{v:g}")
     for axis in (ax, bx):
+        for w in (axis.xaxis, axis.yaxis):
+            w.set_major_formatter(plain)
+            w.set_minor_formatter(FuncFormatter(lambda v, _: ""))
         axis.tick_params(labelsize=13)
         for side in ("top", "right"):
             axis.spines[side].set_visible(False)
