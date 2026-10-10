@@ -4,7 +4,7 @@
 # (compiled kernels, CUDA graphs, chunked prefill), --no-chunked-prefill, --enforce-eager, and text only. With SFT_STEPS the adapter is first trained that
 # many steps on the search's programs: a fresh adapter writes no subcomponent tokens and did not crash.
 # One pod, minutes.
-#   bench/oracle/graph/pods/debug_evidence.sh   (env: RUN, SFT_STEPS, QUESTIONS, SAMPLES, VARIANTS, GPU, PRICE)
+#   bench/oracle/graph/pods/debug_evidence.sh   (env: RUN, SFT_STEPS or INIT, QUESTIONS, SAMPLES, VARIANTS, GPU, PRICE)
 cd /Users/user/gam
 RUN=${RUN:-dbg1}
 S=/Users/user/mpd-data/scratch/glead/v5/src_debug_$RUN
@@ -18,7 +18,7 @@ COPYFILE_DISABLE=1 tar -cf "$T" -C /Users/user/mpd-data/graph_oracle texts/vpd4l
 PT="~/mpd-data/graph_oracle/texts"
 BASE="--base Qwen/Qwen3-4B --model vpd4l --behaviors $PT --search $PT/search --search-heldout $PT/search_heldout --part-tokens /root/reg.safetensors --scorer native --score-workers 4 --share-gpu --gpu-memory 0.5 --micro 1 --eval-behaviors ${QUESTIONS:-2} --samples ${SAMPLES:-2} --no-baselines"
 EV="--evidence --max-tokens 1024 --max-model-len 26624"
-RUNS=""; INIT=""
+RUNS=""; INIT=${INIT:+--init $INIT}  # INIT: an adapter directory (outside runpod/, which rp-run never uploads)
 if [ -n "$SFT_STEPS" ]; then
   RUNS="mkdir -p $O/sft; python rl/train.py --mode sft $BASE $EV --sft-steps $SFT_STEPS --batch 8 --out $O/sft --run-name dbg_sft > $O/sft/log 2>&1; echo \"sft exit \$?\" >> $O/variants.txt;"
   INIT="--init $O/sft/adapter"

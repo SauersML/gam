@@ -348,7 +348,9 @@ class VllmSampler:
     first visible GPU; the trainer takes the second when there is one (--gpu-memory set accordingly)."""
 
     def __init__(self, args, rank: int, end: int, model: str | None = None):
-        self.engine_options, self.sample_options = ({"enable_prompt_embeds": True} if getattr(args, "evidence", False) else {}), {}
+        # Prompts as embeddings (--evidence): vLLM's asynchronous scheduling (the next step's inputs prepared while one
+        # runs) crashed decoding with an illegal memory access, so it is off with them.
+        self.engine_options, self.sample_options = ({"enable_prompt_embeds": True, "async_scheduling": False} if getattr(args, "evidence", False) else {}), {}
         # vLLM's sleep mode with prompts as embeddings (--evidence): after a wake, at full batch, garbage positions reach
         # the attention (a device assert, or an illegal memory access in eager mode); awake throughout it ran clean
         # (debug_evidence.sh nosleep). So with --evidence vLLM keeps its share and the trainer stays on the GPU.
