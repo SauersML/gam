@@ -1492,8 +1492,10 @@ def main():
     if args.reader:
         READER.append(make_reader(args, pol, sampler))
     root = Path(args.behaviors)
-    pool = [with_vpd(b, root, args.vpd_list, args.responses) for b in behaviors(root, args.model, "train")]
-    sets = {args.eval_split: [with_vpd(b, root, args.vpd_list, args.responses) for b in behaviors(root, args.model, args.eval_split)]}
+    lists = [d for d, k in (("vpd_ranked", args.vpd_list), ("vpd_responses", args.responses)) if k]
+    listed = lambda b: all((root / d / f"{b['id']}.json").exists() for d in lists)  # noqa: E731  (questions whose lists are computed)
+    pool = [with_vpd(b, root, args.vpd_list, args.responses) for b in behaviors(root, args.model, "train") if listed(b)]
+    sets = {args.eval_split: [with_vpd(b, root, args.vpd_list, args.responses) for b in behaviors(root, args.model, args.eval_split) if listed(b)]}
     if args.eval_behaviors:  # the first N in text order (arbitrary Pile rows), the same at every evaluation and the ones the search answers first
         sets = {k: sorted(v, key=lambda b: int(b["id"][4:]) if b["id"][4:].isdigit() else 0)[:args.eval_behaviors] for k, v in sets.items()}
     if args.swap_evidence:  # each held-out question reads the activations of the next held-out text at least as long, cut to its length
