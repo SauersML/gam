@@ -1365,7 +1365,7 @@ def responses(nat: Native, ids: list[int], targets: list[int], task_id: str, pos
     verifier's probe), in that order; at each, per weight matrix, the subcomponent that writes most there beyond what it
     writes on average over the text (contributions minus their mean over positions, so a subcomponent active
     everywhere does not lead every position's list). [[position, ["<p:L.S.I>", ...]], ...]"""
-    moved, _ = nat.sensitivity(ids, targets, torch.Generator(device="cpu").manual_seed(task_seed(task_id)))
+    moved = nat.sensitivity(ids, targets, torch.Generator(device="cpu").manual_seed(task_seed(task_id)))[0] if max(targets) >= 1 else torch.zeros(0)  # nothing before position 0
     excess = {n: w - w.mean(0, keepdim=True) for n, w in nat.contributions(ids, targets).items()}
     best = {n: e.argmax(-1).tolist() for n, e in excess.items()}
     order = sorted(targets) + [p for p in (moved.argsort(descending=True) + 1).tolist() if p not in targets][:positions]
