@@ -14,8 +14,8 @@ way it leaves the accelerator's memory while the verifier scores. Only the text 
 
   prompted.py --base Qwen/Qwen3-32B-FP8 --rounds 3 --samples 2 --questions 50 --out DIR
   prompted.py --backend mlx --base mlx-community/Qwen3-30B-A3B-Thinking-2507-4bit --out DIR
-Outputs: DIR/eval_samples.jsonl (every answer and baseline with its score, program "search", "vpd", "empty",
-"prompted_r<k>"), DIR/summary.json.
+Outputs: DIR/eval_samples.jsonl (every answer and baseline with its score, program "search" (the starting answer),
+"search_full" (the search's whole answer), "vpd", "empty", "prompted_r<k>"), DIR/summary.json.
 """
 
 from __future__ import annotations
@@ -139,16 +139,17 @@ def main():
         log.write(json.dumps({"behavior": t["id"], "program": name, "step": 0, "source": src, "score": s, **({"reply": reply} if reply is not None else {})}) + "\n")
         log.flush()
 
-    best = {}
+    best, full_area = {}, {}
     for t in tasks:
-        start = train.cut("```python\n" + (a.search_dir / f"{t['id']}.py").read_text() + "```", a.budget, count)
-        src = split_answer(start)[0]
-        s_search, s_empty, s_vpd = sc.score(t, [src, score.EMPTY, "vpd"], seed=a.seed)
-        for name, x, s in (("search", src, s_search), ("empty", score.EMPTY, s_empty), ("vpd", "vpd", s_vpd)):
+        full = (a.search_dir / f"{t['id']}.py").read_text()
+        src = split_answer(train.cut("```python\n" + full + "```", a.budget, count))[0]
+        s_search, s_full, s_empty, s_vpd = sc.score(t, [src, full, score.EMPTY, "vpd"], seed=a.seed)
+        for name, x, s in (("search", src, s_search), ("search_full", full, s_full), ("empty", score.EMPTY, s_empty), ("vpd", "vpd", s_vpd)):
             write(t, name, x, s)
         best[t["id"]] = (src, s_search)
+        full_area[t["id"]] = score.key(s_full)[1]
     llm = (Mlx if a.backend == "mlx" else Vllm)(a)
-    summary = {"search": sorted(score.key(best[t["id"]][1])[1] for t in tasks)}
+    summary = {"search": sorted(score.key(best[t["id"]][1])[1] for t in tasks), "search_full": sorted(full_area.values())}
     for r in range(1, a.rounds + 1):
         chats = [tok.apply_chat_template([{"role": "user", "content": render(t) + "\n\n" + ASK + "\n\nThe answer:\n```python\n" + best[t["id"]][0] + "```\n\n"
                                            + train.feedback(best[t["id"]][1])}], add_generation_prompt=True, enable_thinking=True, tokenize=False) for t in tasks]
@@ -164,7 +165,9 @@ def main():
                     best[t["id"]] = (src, s)
         llm.wake()
         summary[f"round_{r}"] = sorted(score.key(best[t["id"]][1])[1] for t in tasks)
-        print(f"round {r}: median best area {summary[f'round_{r}'][len(tasks) // 2]:.2f} (search {summary['search'][len(tasks) // 2]:.2f}); "
+        wins = sum(score.key(best[t["id"]][1])[1] < full_area[t["id"]] for t in tasks)
+        print(f"round {r}: median best area {summary[f'round_{r}'][len(tasks) // 2]:.2f} (search's first {a.budget} tokens "
+              f"{summary['search'][len(tasks) // 2]:.2f}, whole search {summary['search_full'][len(tasks) // 2]:.2f}, below it on {wins}/{len(tasks)}); "
               f"sampling {sampled / 60:.0f} min, scoring {(time.time() - clock - sampled) / 60:.0f} min", flush=True)
     (a.out / "summary.json").write_text(json.dumps(summary))
 
