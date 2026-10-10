@@ -215,7 +215,7 @@ def main():
         best[t["id"]] = (src, s_search)
         full_area[t["id"]] = score.key(s_full)[1]
         search_nodes[t["id"]] = nodes_of(t, full) if a.evidence_tokens else []
-    llm = (Mlx if a.backend == "mlx" else Vllm)(a)
+    llm = (Mlx if a.backend == "mlx" else Vllm)(a) if a.rounds else None  # --rounds 0: the baselines' scores only
     summary = {"search": sorted(score.key(best[t["id"]][1])[1] for t in tasks), "search_full": sorted(full_area.values())}
     for r in range(1, a.rounds + 1):
         chats = []
