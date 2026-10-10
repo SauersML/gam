@@ -22,7 +22,8 @@ N=oracle-graph-$RUN
 O=/Users/user/mpd-data/runpod/$N; W=/workspace/runs/$N
 T=/Users/user/mpd-data/graph_oracle/texts-$RUN.tar
 COPYFILE_DISABLE=1 tar -cf "$T" -C /Users/user/mpd-data/graph_oracle texts/vpd4l texts/search texts/search_heldout $( [ -d $B/search_hard ] && echo texts/search_hard )
-[ -n "$DESCRIBED" ] && COPYFILE_DISABLE=1 tar -cf "$O.described.tar" -C "$DESCRIBED" .
+DT=/Users/user/mpd-data/graph_oracle/described-$RUN.tar  # not beside $O: rp-run counts paths under the run's output name as outputs
+[ -n "$DESCRIBED" ] && COPYFILE_DISABLE=1 tar -cf "$DT" -C "$DESCRIBED" .
 if [ -n "$EVIDENCE" ]; then LEN="--max-tokens 4096 --max-model-len 26624"; else LEN="--max-tokens 4096 --max-model-len 14336"; fi  # a revision prompt holds the first answer
 PT="~/mpd-data/graph_oracle/texts"  # the texts on the pod (unpacked from $T; a Mac path here would be uploaded file by file)
 COMMON="--base ${BASE:-Qwen/Qwen3-4B} --model vpd4l --behaviors $PT --search $O/described --search-heldout $PT/search_heldout --part-tokens /root/reg.safetensors --scorer native ${EVIDENCE:+--evidence} $LEN --share-gpu --gpu-memory 0.5 --micro 1 --eval-behaviors 50 --oracle-runs $O/oracle"
@@ -37,7 +38,7 @@ if [ -n "$INIT" ]; then  # an SFT adapter from an earlier run (its directory): R
   RL=${RL/--init $O\/sft\/adapter/--init $INIT}
   START="ls $INIT > /dev/null"
 elif [ -n "$DESCRIBED" ]; then  # described answers from an earlier run
-  START="mkdir -p $O/described && tar -xf $O.described.tar -C $O/described && $SFT"
+  START="mkdir -p $O/described && tar -xf $DT -C $O/described && $SFT"
 else
   START="$DESCRIBE && $SFT"
 fi
