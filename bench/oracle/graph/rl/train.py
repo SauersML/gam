@@ -363,7 +363,10 @@ class VllmSampler:
         from vllm import LLM
 
         a = self.args
-        self.llm = LLM(model=model, dtype="bfloat16", enable_lora=True, max_lora_rank=self.rank, max_loras=1, enable_prefix_caching=True,
+        # Prefix caching keys blocks by token ids, which prompts given as embeddings (--evidence) do not have: with both,
+        # vLLM 0.19.1 hit an illegal memory access on A100 and RTX PRO 6000 alike, so evidence runs go without it.
+        self.llm = LLM(model=model, dtype="bfloat16", enable_lora=True, max_lora_rank=self.rank, max_loras=1,
+                       enable_prefix_caching="enable_prompt_embeds" not in self.engine_options,
                        gpu_memory_utilization=a.gpu_memory, max_model_len=a.max_model_len, seed=a.seed, enable_sleep_mode=self.share, **self.engine_options)
         if self.share:
             self.llm.sleep(level=1)  # weights to host memory, KV cache freed: the trainer loads next
