@@ -10,4 +10,4 @@ N=oracle-graph-$RUN
 O=/Users/user/mpd-data/cluster/$N
 PY=/mnt/nw/home/s.sauers/rl-venv/bin/python
 CMD="mkdir -p $O; cd /Users/user/gam/bench/oracle/graph; ls /Users/user/mpd-data/graph_oracle/texts > /dev/null; $PY prompted.py --base ${BASE:-Qwen/Qwen3-32B-FP8} --rounds ${ROUNDS:-3} --samples ${SAMPLES:-2} --questions ${QUESTIONS:-50} --out $O > $O/log 2>&1; echo done"
-MATS_GPUS=1 MATS_BUILD=0 bench/mats/mats-run $N 8 96 $H -- bash -c "$CMD"
+MATS_GPUS=1 MATS_BUILD=0 bench/mats/mats-run $N 8 ${MEM:-56} $H -- bash -c "$CMD"
