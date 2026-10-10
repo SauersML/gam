@@ -10,8 +10,10 @@
 # the hard evaluation; VPD_LIST=K: the question lists VPD's first K subcomponents at the target (texts/vpd_ranked);
 # RESPONSES=K: and where the prediction responds, at K positions (texts/vpd_responses); ROOT: the texts directory (default
 # graph_oracle/texts; a cluster directory holding vpd4l, vpd_ranked and vpd_responses works in place); SFT_FROM: an adapter
-# SFT starts from.
-#   bench/oracle/graph/pods/train_mats.sh RL_HOURS   (env: RUN, SFT_STEPS, BPS, SAMPLES, EVIDENCE= for text only, INIT, SEARCH, HELD, HARD, VPD_LIST, RESPONSES, ROOT, SFT_FROM)
+# SFT starts from. COPIES=N submits N copies: the first whose GPU is free (gpu_free.py within WAIT hours) claims the run
+# ($O/claimed) and the others end (on MATS, GPUs left holding another user's memory get jobs first; WAIT=0 with COPIES=3
+# skips them at once).
+#   bench/oracle/graph/pods/train_mats.sh RL_HOURS   (env: RUN, SFT_STEPS, BPS, SAMPLES, EVIDENCE= for text only, INIT, SEARCH, HELD, HARD, VPD_LIST, RESPONSES, ROOT, SFT_FROM, COPIES, WAIT)
 cd /Users/user/gam
 RH=${1:-4.0}
 RUN=${RUN:-m2}
@@ -33,10 +35,12 @@ A=${INIT:-$O/sft/adapter}  # INIT: an SFT adapter directory from an earlier run 
 [ -n "$INIT" ] && SFT="ls $INIT > /dev/null"
 EVAL_HARD=$([ -n "$HARD" ] && echo "mkdir -p $O/eval_hard; $PY rl/train.py --mode eval $BASIC --search-heldout $HARD --eval-split hard --revise --necessity --init $O/rl/adapter --samples 4 --out $O/eval_hard --run-name ${N}_hard > $O/eval_hard/log 2>&1;")
 SWAP="$PY rl/train.py --mode eval $COMMON --swap-evidence --no-baselines --init $O/rl/adapter --samples 4 --out $O/eval_swap --run-name ${N}_swap > $O/eval_swap/log 2>&1;"
-CMD="mkdir -p $T $O/sft $O/eval_sft $O/rl $O/eval_rl $O/eval_swap; export TMPDIR=$T TRITON_CACHE_DIR=$T/triton TORCHINDUCTOR_CACHE_DIR=$T/inductor OMP_NUM_THREADS=4 MKL_NUM_THREADS=4; cd $G; $PY pods/gpu_free.py --hours $WAIT > $O/gpu_free.log 2>&1 || exit 1; $PY part_tokens.py build --vpd /Users/user/mpd-data/oracle/vpd/uv.safetensors --out $O/reg.safetensors && \
+CMD="mkdir -p $T $O/sft $O/eval_sft $O/rl $O/eval_rl $O/eval_swap; export TMPDIR=$T TRITON_CACHE_DIR=$T/triton TORCHINDUCTOR_CACHE_DIR=$T/inductor OMP_NUM_THREADS=4 MKL_NUM_THREADS=4; cd $G; $PY pods/gpu_free.py --hours $WAIT >> $O/gpu_free.log 2>&1 || exit 1; mkdir $O/claimed 2> /dev/null || exit 0; $PY part_tokens.py build --vpd /Users/user/mpd-data/oracle/vpd/uv.safetensors --out $O/reg.safetensors && \
 { $SFT; }; \
 $PY rl/train.py --mode eval $COMMON --revise --necessity --init $A --samples 4 --out $O/eval_sft --run-name ${N}_sft > $O/eval_sft/log 2>&1; \
 $PY rl/train.py --mode rl2 --revise --reader $COMMON --init $A --samples ${SAMPLES:-6} --behaviors-per-step ${BPS:-2} --credit 8 --credit-answers 1 --refine 0 --steps 1000 --hours $RH --out $O/rl --run-name ${N}_rl > $O/rl/log 2>&1; \
 $PY rl/train.py --mode eval $COMMON --revise --necessity --adversarial --transfer --init $O/rl/adapter --samples 4 --out $O/eval_rl --run-name ${N}_rl > $O/eval_rl/log 2>&1; \
 $EVAL_HARD ${EVIDENCE:+$SWAP} echo done"
-MATS_GPUS=1 MATS_BUILD=0 bench/mats/mats-run $N 8 ${MEM:-40} $(python3 -c "print(round($RH + 4.0 + $WAIT, 2))") -- bash -c "$CMD"
+for i in $(seq 1 ${COPIES:-1}); do
+  MATS_GPUS=1 MATS_BUILD=0 bench/mats/mats-run $N$([ "${COPIES:-1}" -gt 1 ] && echo "-$i") 8 ${MEM:-40} $(python3 -c "print(round($RH + 4.0 + $WAIT, 2))") -- bash -c "$CMD"
+done
