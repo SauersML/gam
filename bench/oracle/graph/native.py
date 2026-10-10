@@ -506,9 +506,25 @@ class Native:
         if last < 1:
             return [Changed(ids, 1.0) for _ in range(n)]
         g = torch.Generator(device="cpu").manual_seed(seed)
+        moved, other = self.sensitivity(ids, targets, g, chunk)
+        uniform = torch.full((last,), 1.0 / last)
+        q = 0.5 * uniform + 0.5 * (moved / moved.sum() if moved.sum() > 0 else uniform)
+        out = []
+        for _ in range(n):
+            j = int(torch.multinomial(q, 1, generator=g))
+            x = list(ids)
+            x[j + 1] = int(torch.multinomial(other[j], 1, generator=g))
+            out.append(Changed(x, 1.0))
+        return out
+
+    def sensitivity(self, ids: list[int], targets: list[int], g: torch.Generator, chunk: int = 64) -> tuple[torch.Tensor, torch.Tensor]:
+        """(moved [last], other [T - 1, V]): moved[p - 1], the KL (nats) of the model's prediction at the last target
+        after the token at position p is replaced by one draw from other[p - 1], the model's prediction for position p
+        without the text's token there (changes' probe: where the prediction responds to the text)."""
+        last = max(targets)
         probs = self.vpd.target_forward(torch.tensor([ids], device=self.dev))[0].float().softmax(-1).cpu()
         base = torch.log(probs[last].clamp_min(1e-30))
-        other = probs.clone()  # other[p - 1]: the prediction for position p without the text's token there
+        other = probs.clone()
         other[torch.arange(len(ids) - 1), torch.tensor(ids[1:])] = 0.0
         probe = []
         for p in range(1, last + 1):
@@ -519,16 +535,7 @@ class Native:
         for s0 in range(0, len(probe), chunk):
             lq = torch.log_softmax(self.vpd.target_forward(torch.tensor(probe[s0:s0 + chunk], device=self.dev))[:, last].float(), -1).cpu()
             moved.append((base.exp() * (base - lq)).sum(-1).clamp_min(0))
-        moved = torch.cat(moved)
-        uniform = torch.full((last,), 1.0 / last)
-        q = 0.5 * uniform + 0.5 * (moved / moved.sum() if moved.sum() > 0 else uniform)
-        out = []
-        for _ in range(n):
-            j = int(torch.multinomial(q, 1, generator=g))
-            x = list(ids)
-            x[j + 1] = int(torch.multinomial(other[j], 1, generator=g))
-            out.append(Changed(x, 1.0))
-        return out
+        return torch.cat(moved), other
 
     def faithfulness(self, ids: list[int], targets: list[int], graphs: list[Graph] | list[list[Graph]], prompts: list[list[int]], seed: int = 0,
                      chunk: int = 16) -> list[float]:

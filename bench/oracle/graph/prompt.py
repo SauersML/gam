@@ -24,8 +24,9 @@ import mech  # noqa: E402
 ASK = ("How does {model} compute its prediction of the next token after the target of this text? Answer with a Python "
        "function graph(tokens, targets) whose docstring explains it in plain English and which returns a list of steps, "
        "most important first. Each step is a dict giving, for subcomponents at positions, the subcomponents whose outputs "
-       "they read, and under \"out\" the subcomponents the prediction reads; a comment line above each step says what it "
-       "adds. The first steps alone should explain as much as they can; later steps add detail.")
+       "they read (at the reader's own position; an attention output reads values at other positions, written "
+       "{{position: subcomponents}}), and under \"out\" the subcomponents the prediction reads; a comment line above each "
+       "step says what it adds. The first steps alone should explain as much as they can; later steps add detail.")
 
 
 def tokens_of(model: str, ids: list[int]) -> list[str]:

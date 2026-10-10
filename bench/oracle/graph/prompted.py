@@ -43,7 +43,10 @@ ASK = ("You are given an answer to the question above, found by a search, and th
 
 LOOKUP = ("After the report: the answer's subcomponents, each with its layer and weight matrix, its position and token in "
           "the text, and for an attention or MLP output the tokens its write vector raises most at the prediction (its "
-          "logit lens); then other subcomponents the search found, in the order it ranked them, which the answer may use.")
+          "logit lens); then other subcomponents the search found, in the order it ranked them, which the answer may use; "
+          "then where the prediction responds to the text: the positions whose token, changed to another the model finds "
+          "likely there, moves the prediction most, and at each of them and at the last position the subcomponents of each "
+          "kind that write most there beyond what they write elsewhere in this text.")
 
 
 def nodes_of(t, src) -> list:
@@ -74,6 +77,49 @@ def words_of(nat, t, nodes, budget, count) -> str:
         used += len(count(line)) + 1
         if used > budget:
             lines.append(f"... and {len(nodes) - len(lines)} more")
+            break
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def responses(nat, t, budget, count) -> str:
+    """Where the prediction responds to the text, measured: the last position and the positions whose token, changed
+    to another the model finds likely there, moves the prediction most (native.sensitivity), in that order; at each,
+    the two subcomponents of each kind (query, key, value, attention output, MLP input, MLP output, over the layers)
+    that write most there beyond what they write on average over the text (native.contributions; the excess, so
+    subcomponents active everywhere do not fill every position's list), in the answer's notation, while within
+    `budget` tokens."""
+    import describe
+    import mech
+    import torch
+
+    prompt = t["prompts"][0]
+    ids, targets = prompt["token_ids"], prompt["target_positions"]
+    last = max(targets)
+    if last < 1:
+        return ""
+    strings = mech.behavior_tokens(t, "vpd4l")["sequences"][0][1]
+    moved, _ = nat.sensitivity(ids, targets, torch.Generator(device="cpu").manual_seed(native.task_seed(t["id"])))
+    contrib = {n: w - w.mean(0, keepdim=True) for n, w in nat.contributions(ids, targets).items()}
+    short = {v: k for k, v in mech.SITES.items()}
+    lines, used = [], 0
+    for pos in [last] + [int(j) + 1 for j in moved.argsort(descending=True) if int(j) + 1 != last]:
+        best = {}
+        for n, w in contrib.items():
+            kind = native._layer_kind((n, 0, 0))[1]
+            v, c = w[pos].topk(2)
+            best.setdefault(kind, []).extend((float(a), (n, pos, int(b))) for a, b in zip(v, c))
+        nodes = [nd for kind in mech.SITES.values() for _, nd in sorted(best.get(kind, []), reverse=True)[:2]]
+        lens = nat.lens(nodes)
+        items = []
+        for nd in nodes:
+            layer, kind = native._layer_kind(nd)
+            items.append(f'"<p:{layer}.{short[kind]}.{nd[2]}>" (layer {layer} {describe.KINDS[kind]}'
+                         + (f", writes toward {', '.join(map(repr, lens[nd]))}" if nd in lens else "") + ")")
+        head = f"position {pos} ({strings[pos]!r})" + (", the last" if pos == last else f", changing its token moves the prediction {float(moved[pos - 1]) / 0.6931:.2f} bits")
+        line = head + "; writing most there: " + ", ".join(items)
+        used += len(count(line)) + 1
+        if used > budget:
             break
         lines.append(line)
     return "\n".join(lines)
@@ -201,7 +247,7 @@ def main():
         log.write(json.dumps({"behavior": t["id"], "program": name, "step": 0, "source": src, "score": s, **({"reply": reply} if reply is not None else {})}) + "\n")
         log.flush()
 
-    best, full_area, search_nodes = {}, {}, {}
+    best, full_area, search_nodes, respond = {}, {}, {}, {}
     for t in tasks:
         full = (a.search_dir / f"{t['id']}.py").read_text()
         src = split_answer(train.cut("```python\n" + full + "```", a.budget, count))[0]
@@ -215,6 +261,7 @@ def main():
         best[t["id"]] = (src, s_search)
         full_area[t["id"]] = score.key(s_full)[1]
         search_nodes[t["id"]] = nodes_of(t, full) if a.evidence_tokens else []
+        respond[t["id"]] = responses(sc.nat, t, a.evidence_tokens, count) if a.evidence_tokens else ""
     llm = (Mlx if a.backend == "mlx" else Vllm)(a) if a.rounds else None  # --rounds 0: the baselines' scores only
     summary = {"search": sorted(score.key(best[t["id"]][1])[1] for t in tasks), "search_full": sorted(full_area.values())}
     for r in range(1, a.rounds + 1):
@@ -226,7 +273,8 @@ def main():
                 used = nodes_of(t, src)
                 seen = set(used)
                 ask += ("\n\nThe answer's subcomponents:\n" + words_of(sc.nat, t, used, a.evidence_tokens, count)
-                        + "\n\nOther subcomponents the search found:\n" + words_of(sc.nat, t, [n for n in search_nodes[t["id"]] if n not in seen], a.evidence_tokens, count))
+                        + "\n\nOther subcomponents the search found:\n" + words_of(sc.nat, t, [n for n in search_nodes[t["id"]] if n not in seen], a.evidence_tokens, count)
+                        + "\n\nWhere the prediction responds to the text:\n" + respond[t["id"]])
             chats.append(tok.apply_chat_template([{"role": "user", "content": ask}], add_generation_prompt=True, enable_thinking=True,
                                                  reasoning_effort="high", tokenize=False))
         clock = time.time()
