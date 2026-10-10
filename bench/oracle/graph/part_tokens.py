@@ -222,6 +222,17 @@ class PartTokens(nn.Module):
         order = ["q_proj", "k_proj", "v_proj", "o_proj", "c_fc", "down_proj"]
         self.ev_order = sorted(self.ev, key=lambda n: (int(n.split(".")[1]), order.index(n.split(".")[-1])))
 
+    def _apply(self, fn, recurse=True):
+        """The feature and index tables move with the weights: with one GPU shared, the trainer's model (this module
+        inside it) goes to the host while vLLM samples, and the evidence rows are computed there."""
+        super()._apply(fn, recurse)
+        if getattr(self, "feats", None) is not None:
+            for d in (self.feats, self.idx, self.site_local, self.site_feats, self.site_global):
+                for k in d:
+                    d[k] = fn(d[k])
+            self.ev = {n: (k, fn(rows), site) for n, (k, rows, site) in self.ev.items()}
+        return self
+
     def rows(self, which: str) -> torch.Tensor:
         """[parts, hidden]: input embeddings (which = "in", RMS of the token embeddings) or output rows; each
         the part's map plus its site's."""
@@ -243,7 +254,7 @@ class PartTokens(nn.Module):
         rows = []
         for name in self.ev_order:
             k, local, site = self.ev[name]
-            a = acts[name].float()
+            a = acts[name].float().to(self.feats[k].device)
             w = a / a.abs().sum(-1, keepdim=True).clamp_min(1e-12)
             y = self.p_in[self.names[k]](w @ self.feats[k][local].float()) + self.s_in[self.names[k]](self.site_feats[k][site])
             rows.append(self.emb_rms * y / y.pow(2).mean(-1, keepdim=True).add(1e-6).sqrt())

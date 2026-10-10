@@ -188,14 +188,15 @@ class Policy:
     def embed(self, ids: torch.Tensor, prompts: list[list[int]], starts: list[int]) -> torch.Tensor:
         """Input embeddings of a batch [B, W], each prompt's placeholders (prompt r starting at starts[r]) replaced by
         its evidence (PartTokens.evidence of its activations)."""
-        emb = self.model.get_input_embeddings()(ids)
+        table = self.model.get_input_embeddings()  # on the host while vLLM samples with the GPU shared
+        emb = table(ids.to(table.weight.device))
         ev_id = self.tok.convert_tokens_to_ids(self.EVIDENCE)
         for r, (p, st) in enumerate(zip(prompts, starts)):
             acts = self.evidence.get(tuple(p))
             if acts is None:
                 continue
-            pos = st + (torch.tensor(p, device=ids.device) == ev_id).nonzero().flatten()
-            emb = emb.index_put((torch.full_like(pos, r), pos), self.parts.evidence(acts).to(emb.dtype))
+            pos = st + (torch.tensor(p, device=emb.device) == ev_id).nonzero().flatten()
+            emb = emb.index_put((torch.full_like(pos, r), pos), self.parts.evidence(acts).to(emb.device, emb.dtype))
         return emb
 
     def save(self, path: Path):

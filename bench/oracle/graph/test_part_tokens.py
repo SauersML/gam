@@ -94,3 +94,17 @@ def test_sites_and_two_level_choice():
     assert reg.index["PD[2].v_proj[559]"] in idx and logits.shape == (len(idx),)
     assert m.site_logits(h).shape == (len(reg.sites),)
     assert m.input_rows().shape == (len(ADDRESSES), 16) and m.tokens() == reg.tokens
+
+
+def test_tables_move_with_the_weights():
+    """With one GPU shared the trainer's model goes to the host while vLLM samples: the feature tables must follow."""
+    import torch
+
+    if not (torch.cuda.is_available() or torch.backends.mps.is_available()):
+        return
+    dev = "cuda" if torch.cuda.is_available() else "mps"
+    m = PT.PartTokens(registry(), hidden=16, emb_rms=1.0, base_vocab=100, dev=dev)
+    on_dev = m.input_rows().cpu()
+    m.to("cpu")
+    assert all(f.device.type == "cpu" for f in m.feats.values()) and all(rows.device.type == "cpu" for _, rows, _ in m.ev.values())
+    assert torch.allclose(m.input_rows(), on_dev, atol=1e-5)

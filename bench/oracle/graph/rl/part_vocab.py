@@ -38,7 +38,7 @@ class PartEmbedding(nn.Module):
         mask = ids >= self.first
         if not bool(mask.any()):
             return out
-        rows = (self.cached if self.cached is not None else self.parts.input_rows()).to(out.dtype)
+        rows = (self.cached if self.cached is not None else self.parts.input_rows()).to(out.device, out.dtype)
         part = rows[(ids - self.first).clamp(min=0, max=rows.shape[0] - 1)]
         return torch.where(mask[..., None], part, out)
 
