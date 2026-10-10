@@ -349,7 +349,10 @@ class VllmSampler:
 
     def __init__(self, args, rank: int, end: int, model: str | None = None):
         self.engine_options, self.sample_options = ({"enable_prompt_embeds": True} if getattr(args, "evidence", False) else {}), {}
-        self.share, self.args, self.rank = args.share_gpu, args, rank
+        # vLLM's sleep mode with prompts as embeddings (--evidence): after a wake, at full batch, garbage positions reach
+        # the attention (a device assert, or an illegal memory access in eager mode); awake throughout it ran clean
+        # (debug_evidence.sh nosleep). So with --evidence vLLM keeps its share and the trainer stays on the GPU.
+        self.share, self.args, self.rank = args.share_gpu and not getattr(args, "evidence", False), args, rank
         self.max_tokens, self.end = args.max_tokens, end
         self.policy = None  # with --share-gpu: the trainer, moved to the host while vLLM samples
         self.rows = None  # with part tokens: () -> (first id, input rows, output rows), copied into vLLM before sampling
