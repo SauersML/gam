@@ -31,8 +31,10 @@ def main():
     by = {}
     for r in map(json.loads, open(a.samples)):
         if r["program"].startswith(a.program):
-            src = r.get("reply") or r["source"]
-            src = split_answer(src if "```" in src else "```python\n" + src)[0]
+            src = r["source"]
+            if r.get("reply"):  # a reasoning model's whole reply: the answer is the part after its reasoning
+                src = prompted.final(r["reply"])
+            src = split_answer(src if "```" in src else "```python\n" + src)[0] if src else ""
             by.setdefault(r["behavior"], []).append((r["program"], src))
     tasks = {}
     for tid in by:
