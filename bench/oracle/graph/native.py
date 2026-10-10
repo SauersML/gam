@@ -47,8 +47,10 @@ import sys
 import time
 import types
 from functools import lru_cache
+from itertools import chain
 from pathlib import Path
 
+import numpy as np
 import torch
 
 HERE = Path(__file__).resolve().parent
@@ -73,6 +75,41 @@ def free(dev: str) -> None:
 
 def device() -> str:
     return "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
+
+
+def _first_draw(seeds: np.ndarray) -> np.ndarray:
+    """The 24 bits behind torch.rand(1, generator=torch.Generator(device="cpu").manual_seed(s)) for each seed s (uint64):
+    the first output of mt19937 seeded with s's low 32 bits (torch's CPU generator), rand = bits / 2^24."""
+    M = np.uint64(0xFFFFFFFF)
+    s0 = np.asarray(seeds, dtype=np.uint64) & M
+    st, s1 = s0, None
+    for j in range(1, 398):
+        st = (np.uint64(1812433253) * (st ^ (st >> np.uint64(30))) + np.uint64(j)) & M
+        if j == 1:
+            s1 = st
+    y = (s0 & np.uint64(0x80000000)) | (s1 & np.uint64(0x7FFFFFFF))
+    v = st ^ (y >> np.uint64(1)) ^ np.where((y & np.uint64(1)) == 1, np.uint64(0x9908B0DF), np.uint64(0))
+    v ^= v >> np.uint64(11)
+    v ^= (v << np.uint64(7)) & np.uint64(0x9D2C5680)
+    v ^= (v << np.uint64(15)) & np.uint64(0xEFC60000)
+    v ^= v >> np.uint64(18)
+    return v & np.uint64(0xFFFFFF)
+
+
+_DRAW_CHECKED: list = []
+
+
+def below_half(seeds: np.ndarray) -> np.ndarray:
+    """torch.rand(1, generator=torch.Generator(device="cpu").manual_seed(s)) < 0.5 for each seed s, without a generator
+    per seed (_first_draw; checked against torch once per process)."""
+    if not _DRAW_CHECKED:
+        probe = [0, 1, 12345, (1 << 32) + 7, (1 << 62) - 1] + [(k * 2654435761) % (1 << 62) for k in range(1, 60)]
+        mine = _first_draw(np.array(probe, dtype=np.uint64))
+        for s, d in zip(probe, mine.tolist()):
+            if float(torch.rand(1, generator=torch.Generator(device="cpu").manual_seed(s))) != d / float(1 << 24):
+                raise RuntimeError("torch's CPU generator no longer matches _first_draw")
+        _DRAW_CHECKED.append(True)
+    return _first_draw(seeds) < np.uint64(1 << 23)
 
 
 def site_name(layer: int, kind: str) -> str:
@@ -222,6 +259,8 @@ class Native:
         self.target, self.vpd = model(self.dev)
         self.names = self.vpd.names
         self.C = self.vpd.C
+        self._consts: dict = {}  # zero and one ablations, full plans, causal masks: built once, never written
+        self._rec: tuple = (None, None)  # (ids, the whole model's activations on them): the last text's, reused
 
     # ---- graphs from answers and from VPD
 
@@ -311,7 +350,9 @@ class Native:
 
     def everything(self, T: int) -> Graph:
         """Every subcomponent at every position, complete: the model itself."""
-        return Graph(masks={n: torch.ones(T, self.C[n], dtype=torch.bool, device=self.dev) for n in self.names})
+        g = Graph(masks={n: torch.ones(T, self.C[n], dtype=torch.bool, device=self.dev) for n in self.names})
+        g.full = True  # _plan: every node, no mask to copy
+        return g
 
     def reachable(self, T: int, targets: list[int]) -> dict:
         """[T, C] per matrix: the subcomponents at positions that can affect the targets (none after the last target,
@@ -336,24 +377,57 @@ class Native:
         logits = self.vpd.target_forward(torch.tensor(ids, device=self.dev))[:, targets]
         return torch.log_softmax(logits.float(), -1)
 
+    def _ints(self, lists: list) -> list[torch.Tensor]:
+        """Lists (or arrays) of ints -> int64 tensors on the device, sent in one transfer (slices of one buffer)."""
+        sizes = [len(x) for x in lists]
+        flat = np.fromiter(chain.from_iterable(lists), dtype=np.int64, count=sum(sizes))
+        buf = torch.from_numpy(flat).to(self.dev)
+        out, o = [], 0
+        for s in sizes:
+            out.append(buf[o:o + s])
+            o += s
+        return out
+
+    def _const(self, key, make):
+        if key not in self._consts:
+            self._consts[key] = make()
+        return self._consts[key]
+
+    def _full_plan(self, T: int, B: int) -> dict:
+        """_plan of B copies of everything(T), kept (nothing writes a plan's tensors)."""
+        return self._const(("full", T, B), lambda: self._plan([self.everything(T)] * B, T))
+
     def _plan(self, graphs: list[Graph], T: int) -> dict:
         """Index tensors for a batch of graphs: per matrix the [B, T, C] node mask, and for the graphs that are not
         complete, the reader nodes with parents, the writer nodes with children, and the edges between them (in the
-        order of each graph's parents lists, then its out list)."""
-        dev = self.dev
-        G = {n: torch.zeros(len(graphs), T, self.C[n], dtype=torch.bool, device=dev) for n in self.names}
+        order of each graph's parents lists, then its out list). A batch of complete graphs and others is planned as
+        the two batches apart ("split"; run() runs them so: only complete graphs need the stream of their nodes'
+        outputs in full, and rows are computed independently)."""
+        dev, B = self.dev, len(graphs)
+        complete = [bool(g.complete) for g in graphs]
+        if 0 < sum(complete) < B:
+            groups = [[b for b in range(B) if not complete[b]], [b for b in range(B) if complete[b]]]
+            return {"B": B, "split": [(torch.tensor(idx, device=dev), self._plan([graphs[b] for b in idx], T)) for idx in groups]}
+        full = all(getattr(g, "full", False) for g in graphs)
+        stacked = not full and all(g.masks is not None for g in graphs)
+        if full:
+            G = {n: self._const(("ones", T, n), lambda n=n: torch.ones(1, T, self.C[n], dtype=torch.bool, device=dev)).expand(B, -1, -1) for n in self.names}
+        elif stacked:
+            G = {n: torch.stack([g.masks[n] for g in graphs]) for n in self.names}
+        else:
+            G = {n: torch.zeros(B, T, self.C[n], dtype=torch.bool, device=dev) for n in self.names}
+        at = {}  # matrix -> node (graph, position, index) lists
         for b, g in enumerate(graphs):
             if g.masks is not None:
-                for n in self.names:
-                    G[n][b] = g.masks[n]
+                if not (full or stacked):
+                    for n in self.names:
+                        G[n][b] = g.masks[n]
                 continue
-            per = {}
             for n, t, c in g.nodes:
-                per.setdefault(n, ([], []))
-                per[n][0].append(t)
-                per[n][1].append(c)
-            for n, (ts, cs) in per.items():
-                G[n][b, torch.tensor(ts, device=dev), torch.tensor(cs, device=dev)] = True
+                lst = at.setdefault(n, ([], [], []))
+                lst[0].append(b)
+                lst[1].append(t)
+                lst[2].append(c)
         readers, writers, edges, out, order = {}, {}, {}, {}, []
 
         def row(table, node, b):
@@ -373,29 +447,43 @@ class Native:
                 lst = out.setdefault(w[0], [])
                 order.append(("out", w[0], len(lst)))
                 lst.append((b, w[1], row(writers, w, b)))
-
-        def cols(rows):
-            keys = sorted(rows, key=rows.get)
-            return {k: torch.tensor([x[k] for x in keys], device=dev) for k in (0, 1, 2)}
-
-        return {"G": G, "complete": torch.tensor([g.complete for g in graphs], device=dev)[:, None, None],
-                "readers": {n: cols(r) for n, r in readers.items()}, "writers": {n: cols(w) for n, w in writers.items()},
-                "edges": {k: (torch.tensor([e[0] for e in v], device=dev), torch.tensor([e[1] for e in v], device=dev)) for k, v in edges.items()},
-                "out": {n: tuple(torch.tensor([e[i] for e in v], device=dev) for i in range(3)) for n, v in out.items()},
-                "order": order}
+        lists = [[int(c) for c in complete]]  # every index list, sent at once
+        for n in at:
+            lists += list(at[n])
+        for table in (readers, writers):
+            for rows in table.values():
+                keys = list(rows)  # in order of their row numbers
+                lists += [[k[j] for k in keys] for j in (0, 1, 2)]
+        for v in edges.values():
+            lists += [[e[0] for e in v], [e[1] for e in v]]
+        for v in out.values():
+            lists += [[e[j] for e in v] for j in (0, 1, 2)]
+        it = iter(self._ints(lists))
+        comp = next(it).bool()[:, None, None]
+        for n in at:
+            bi, ti, ci = next(it), next(it), next(it)
+            G[n][bi, ti, ci] = True
+        R = {n: (next(it), next(it), next(it)) for n in readers}
+        Wr = {n: (next(it), next(it), next(it)) for n in writers}
+        E = {k: (next(it), next(it)) for k in edges}
+        O = {n: (next(it), next(it), next(it)) for n in out}
+        return {"B": B, "G": G, "complete": comp, "any_complete": any(complete), "all_complete": all(complete),
+                "readers": R, "writers": Wr, "edges": E, "out": O, "out_t": {n: [e[1] for e in v] for n, v in out.items()}, "order": order}
 
     def edge_weights(self, plan: dict, w: torch.Tensor) -> tuple[dict, dict]:
         """Per-edge strengths in plan order (a vector over every edge of every graph) -> run()'s ew and ow."""
-        src_e = {k: [] for k in plan["edges"]}
-        src_o = {k: [] for k in plan["out"]}
-        for j, (kind, key, _) in enumerate(plan["order"]):
-            (src_e if kind == "edge" else src_o)[key].append(j)
-        ew = {k: w[torch.tensor(src_e[k], device=self.dev)] for k in src_e}
-        ow = {k: w[torch.tensor(src_o[k], device=self.dev)] for k in src_o}
-        return ew, ow
+        if "_order_idx" not in plan:
+            src_e = {k: [] for k in plan["edges"]}
+            src_o = {k: [] for k in plan["out"]}
+            for j, (kind, key, _) in enumerate(plan["order"]):
+                (src_e if kind == "edge" else src_o)[key].append(j)
+            idx = self._ints(list(src_e.values()) + list(src_o.values()))
+            plan["_order_idx"] = (dict(zip(src_e, idx[:len(src_e)])), dict(zip(src_o, idx[len(src_e):])))
+        ie, io = plan["_order_idx"]
+        return {k: w[v] for k, v in ie.items()}, {k: w[v] for k, v in io.items()}
 
     def run(self, ids: list[int], targets: list[int], plan: dict, u: dict, ur: dict, ew: dict | None = None, ow: dict | None = None,
-            qk: dict | None = None, patch: dict | None = None, record: dict | None = None) -> torch.Tensor:
+            qk: dict | None = None, patch: dict | None = None, record: dict | None = None, keep=None) -> torch.Tensor:
         """log q at the targets [B, len(targets), V] of each graph under one ablation: u[matrix] [Bu, S, C] and
         ur[matrix] [Bu, S] in [0, 1], Bu = B or 1, S = T or 1. A subcomponent outside a graph runs at mask u; a graph
         node at 1. An output reaches a reader through a declared edge of strength e at e + (1 - e) u (e = 1 unless ew
@@ -403,15 +491,65 @@ class Native:
         in full. qk[matrix] [Bu, T, C] gives a query or key node a strength e: it enters the attention pattern at
         e + (1 - e) u (1 without qk). The token embedding always enters in full; remainders W - V U run at ur.
         patch[matrix] = (mask [B, T, C], values [B, T, C]) replaces those subcomponents' activations (an interchange);
-        record, a dict, receives every matrix's activations [B, T, C]."""
+        record, a dict, receives every matrix's activations [B, T, C] (keep: only those of these matrices)."""
+        import vpd_model
+
+        tg = self.target
+        return torch.log_softmax((vpd_model.rms(self._stream(ids, targets, plan, u, ur, ew, ow, qk, patch, record, keep), tg.ln_f, tg.eps) @ tg.wte.T).float(), -1)
+
+    def _stream(self, ids, targets, plan, u, ur, ew, ow, qk, patch, record, keep) -> torch.Tensor:
+        """run()'s residual stream at the targets [B, len(targets), d], before the final norm; a split plan's two batches
+        run apart and are put back in order."""
+        if "split" not in plan:
+            return self._stream1(ids, targets, plan, u, ur, ew, ow, qk, patch, record, keep)
+        if ew is not None or ow is not None or qk is not None:
+            raise ValueError("edge and query/key strengths need a plan of complete graphs or of others, not both")
+        B = plan["B"]
+
+        def rows(d, idx):  # per-graph tensors cut to a batch (the same dict when every tensor is shared by the graphs)
+            if all(v.shape[0] == 1 for v in d.values()):
+                return d
+            return {n: v[idx] if v.shape[0] > 1 else v for n, v in d.items()}
+
+        zt, recs = None, []
+        for idx, sub in plan["split"]:
+            pt = None if patch is None else {n: (m[idx], v[idx] if v.shape[0] > 1 else v) for n, (m, v) in patch.items()}
+            rec = None if record is None else {}
+            z = self._stream1(ids, targets, sub, rows(u, idx), rows(ur, idx), None, None, None, pt, rec, keep)
+            if zt is None:
+                zt = torch.empty(B, *z.shape[1:], dtype=z.dtype, device=z.device)
+            zt.index_copy_(0, idx, z)
+            recs.append((idx, rec))
+        if record is not None:
+            for n in recs[0][1]:
+                full = None
+                for idx, rec in recs:
+                    if full is None:
+                        full = torch.empty(B, *rec[n].shape[1:], dtype=rec[n].dtype, device=rec[n].device)
+                    full.index_copy_(0, idx, rec[n])
+                record[n] = full
+        return zt
+
+    def _stream1(self, ids, targets, plan, u, ur, ew, ow, qk, patch, record, keep) -> torch.Tensor:
+        """_stream for a batch of complete graphs or of others. Two residual streams: x, every output at its scale, and
+        xg, a complete graph's nodes' outputs in full. Only complete graphs read xg; when every graph is complete and
+        each node's scale is its u (u = 1 everywhere, or no node held: plan "none") the two are the same numbers and one
+        is computed. With u = 0 and the remainders off (the _zero() ablation) and no complete graph, nothing outside a
+        graph writes to x: it stays the embedding, the same for every graph, and only the graphs' nodes and the
+        queries and keys are computed; the numbers left out are exact zeros."""
         import vpd_model
 
         tg, dev = self.target, self.dev
         G, comp, R, Wr, E, O = plan["G"], plan["complete"], plan["readers"], plan["writers"], plan["edges"], plan["out"]
-        B = next(iter(G.values())).shape[0]
+        B = plan["B"]
         T = len(ids)
         H, hd, eps = tg.n_head, tg.hd, tg.eps
         rms, gelu = vpd_model.rms, vpd_model.gelu_tanh
+        zu, zur = self._zero()
+        no_rest = ur is zur  # remainders at 0: they add exact zeros
+        empty = u is zu and no_rest and not plan["any_complete"]
+        same = plan["all_complete"] and qk is None and (u is self._one()[0] or plan.get("none", False))
+        both = plan["any_complete"] and not same
 
         def ux(n):  # [B, T, C]
             return u[n].expand(B, T, -1)
@@ -426,7 +564,10 @@ class Native:
             return u[n][b if u[n].shape[0] > 1 else torch.zeros_like(b), t if u[n].shape[1] > 1 else torch.zeros_like(t), c]
 
         def rest(n, z):
-            return ur[n].expand(B, T)[..., None] * (z @ tg.site(n).delta_T)
+            return None if no_rest else ur[n].expand(B, T)[..., None] * (z @ tg.site(n).delta_T)
+
+        def plus(a, r):
+            return a if r is None else a + r
 
         def strength(key, w, table):
             return 1.0 if table is None or key not in table else table[key]
@@ -434,13 +575,14 @@ class Native:
         def fixed(n, A):  # an activation tensor after patching, recorded
             if patch is not None and n in patch:
                 A = torch.where(patch[n][0], patch[n][1], A)
-            if record is not None:
+            if record is not None and (keep is None or n in keep):
                 record[n] = A.detach()
             return A
 
         emb = tg.wte[torch.tensor(ids, device=dev)]
-        x = emb[None].expand(B, T, -1).clone()  # every output at its scale
-        xg = x.clone()  # complete graphs: their nodes' outputs in full
+        x = emb[None] if empty else emb[None].expand(B, T, -1).clone()  # every output at its scale
+        xg = x.clone() if both else x  # complete graphs: their nodes' outputs in full
+        causal = self._const(("causal", T), lambda: torch.ones(T, T, dtype=torch.bool, device=dev).tril())
         acts = {}
 
         def writer_out(wn, wi, space_U):  # (b, t, the writer's activation, its u) of writer rows wi
@@ -460,34 +602,38 @@ class Native:
 
         def read_resid(n, norm, z, zg, xs):
             V = tg.site(n).V
-            A = torch.where(G[n] & comp, zg @ V, z @ V)
+            A = torch.where(G[n] & comp, zg @ V, z @ V) if both else (z @ V).expand(B, T, -1)
             if n in R:
                 b, t, c = R[n][0], R[n][1], R[n][2]
-                inp = rms(xs[b, t] + topup(n, xs.shape[-1], resid_contrib), norm, eps)
+                inp = rms(xs.expand(B, T, -1)[b, t] + topup(n, xs.shape[-1], resid_contrib), norm, eps)
                 A = A.index_put((b, t, c), (inp * V.T[c]).sum(-1))
             return A
 
         for i in range(tg.n_layer):
             nm = {k: site_name(i, k) for k in vpd_model.KINDS}
             n1, n2 = tg.norms[2 * i], tg.norms[2 * i + 1]
-            z, zg = rms(x, n1, eps), rms(xg, n1, eps)
+            z = rms(x, n1, eps)
+            zg = rms(xg, n1, eps) if both else None
             for k in ("q_proj", "k_proj", "v_proj"):
                 acts[nm[k]] = fixed(nm[k], read_resid(nm[k], n1, z, zg, x))
-            qv = (acts[nm["q_proj"]] * scale(nm["q_proj"])) @ tg.site(nm["q_proj"]).U + rest(nm["q_proj"], z)
-            kv = (acts[nm["k_proj"]] * scale(nm["k_proj"])) @ tg.site(nm["k_proj"]).U + rest(nm["k_proj"], z)
+            qv = plus((acts[nm["q_proj"]] * scale(nm["q_proj"])) @ tg.site(nm["q_proj"]).U, rest(nm["q_proj"], z))
+            kv = plus((acts[nm["k_proj"]] * scale(nm["k_proj"])) @ tg.site(nm["k_proj"]).U, rest(nm["k_proj"], z))
             Uv = tg.site(nm["v_proj"]).U
             rv = rest(nm["v_proj"], z)
-            vs = (acts[nm["v_proj"]] * ux(nm["v_proj"])) @ Uv + rv
-            vg = (acts[nm["v_proj"]] * scale(nm["v_proj"])) @ Uv + rv
+            vs = None if empty else plus((acts[nm["v_proj"]] * ux(nm["v_proj"])) @ Uv, rv)  # empty: u = 0, the values write nothing
+            vg = plus((acts[nm["v_proj"]] * scale(nm["v_proj"])) @ Uv, rv) if both else vs
             heads = lambda y: y.view(B, T, H, hd).transpose(1, 2)  # noqa: E731
-            q, kk = tg._rope(heads(qv), T), tg._rope(heads(kv), T)
-            causal = torch.ones(T, T, dtype=torch.bool, device=dev).tril()
-            P = ((q @ kk.transpose(-1, -2)) / math.sqrt(hd)).masked_fill(~causal, float("-inf")).softmax(-1)  # [B, H, T, T]
-            att_s = (P @ heads(vs)).transpose(1, 2).reshape(B, T, -1)
-            att_g = (P @ heads(vg)).transpose(1, 2).reshape(B, T, -1)
             no = nm["o_proj"]
+            if not empty or no in R:
+                q, kk = tg._rope(heads(qv), T), tg._rope(heads(kv), T)
+                P = ((q @ kk.transpose(-1, -2)) / math.sqrt(hd)).masked_fill(~causal, float("-inf")).softmax(-1)  # [B, H, T, T]
+            att_s = None if empty else (P @ heads(vs)).transpose(1, 2).reshape(B, T, -1)
+            att_g = (P @ heads(vg)).transpose(1, 2).reshape(B, T, -1) if both else att_s
             Vo = tg.site(no).V
-            Ao = torch.where(G[no] & comp, att_g @ Vo, att_s @ Vo)
+            if both:
+                Ao = torch.where(G[no] & comp, att_g @ Vo, att_s @ Vo)
+            else:
+                Ao = torch.zeros(B, T, Vo.shape[1], device=dev) if empty else att_s @ Vo
             if no in R:
                 b, t, c = R[no][0], R[no][1], R[no][2]
                 extra = torch.zeros(len(b), Vo.shape[0], device=dev)
@@ -498,38 +644,48 @@ class Native:
                     share = strength((rn, wn), wi, ew) * (1 - uw) * a
                     pat = P[wb, :, t[ri], wt]  # [E, H]: how much the reader's position attends to the writer's
                     extra = extra.index_add(0, ri, share[:, None] * (pat.repeat_interleave(hd, dim=1) * Uv[wc]))
-                Ao = Ao.index_put((b, t, c), ((att_s[b, t] + extra) * Vo.T[c]).sum(-1))
+                Ao = Ao.index_put((b, t, c), (((torch.zeros(len(b), Vo.shape[0], device=dev) if empty else att_s[b, t]) + extra) * Vo.T[c]).sum(-1))
             acts[no] = Ao = fixed(no, Ao)
             Uo = tg.site(no).U
             ro = rest(no, att_s)
-            x = x + (Ao * ux(no)) @ Uo + ro
-            xg = xg + (Ao * scale(no)) @ Uo + ro
-            z2, zg2 = rms(x, n2, eps), rms(xg, n2, eps)
+            if not empty:
+                x = plus(x + (Ao * ux(no)) @ Uo, ro)
+            xg = plus(xg + (Ao * scale(no)) @ Uo, ro) if both else x
+            z2 = rms(x, n2, eps)
+            zg2 = rms(xg, n2, eps) if both else None
             nf, nd = nm["c_fc"], nm["down_proj"]
             acts[nf] = fixed(nf, read_resid(nf, n2, z2, zg2, x))
             Uf = tg.site(nf).U
             rf = rest(nf, z2)
-            pre_s = (acts[nf] * ux(nf)) @ Uf + rf
-            pre_g = (acts[nf] * scale(nf)) @ Uf + rf
+            pre_s = None if empty else plus((acts[nf] * ux(nf)) @ Uf, rf)
+            pre_g = plus((acts[nf] * scale(nf)) @ Uf, rf) if both else pre_s
+            gs = None if empty else gelu(pre_s)
             Vd = tg.site(nd).V
-            Ad = torch.where(G[nd] & comp, gelu(pre_g) @ Vd, gelu(pre_s) @ Vd)
+            if both:
+                Ad = torch.where(G[nd] & comp, gelu(pre_g) @ Vd, gs @ Vd)
+            else:
+                Ad = torch.zeros(B, T, Vd.shape[1], device=dev) if empty else gs @ Vd
             if nd in R:
                 b, t, c = R[nd][0], R[nd][1], R[nd][2]
 
                 def mlp_contrib(wn, wi, e):
                     _, _, wc, a, uw = writer_out(wn, wi, None)
                     return (e * (1 - uw) * a)[:, None] * Uf[wc]
-                Ad = Ad.index_put((b, t, c), (gelu(pre_s[b, t] + topup(nd, Uf.shape[1], mlp_contrib)) * Vd.T[c]).sum(-1))
+                pre = torch.zeros(len(b), Uf.shape[1], device=dev) if empty else pre_s[b, t]
+                Ad = Ad.index_put((b, t, c), (gelu(pre + topup(nd, Uf.shape[1], mlp_contrib)) * Vd.T[c]).sum(-1))
             acts[nd] = Ad = fixed(nd, Ad)
             Ud = tg.site(nd).U
-            rd = rest(nd, gelu(pre_s))
-            x = x + (Ad * ux(nd)) @ Ud + rd
-            xg = xg + (Ad * scale(nd)) @ Ud + rd
-        zt = torch.where(comp[:, :, :1].expand(B, 1, 1), xg[:, targets], x[:, targets])
+            rd = rest(nd, gs)
+            if not empty:
+                x = plus(x + (Ad * ux(nd)) @ Ud, rd)
+            xg = plus(xg + (Ad * scale(nd)) @ Ud, rd) if both else x
+        zt = torch.where(comp[:, :, :1].expand(B, 1, 1), xg[:, targets], x[:, targets]) if both else x[:, targets].expand(B, -1, -1)
         for wn, (b, t, wi) in O.items():
-            pos = torch.tensor([targets.index(int(a)) for a in t.tolist()], device=dev)
-            zt = zt.index_put((b, pos), resid_contrib(wn, wi, strength(wn, wi, ow)), accumulate=True)
-        return torch.log_softmax((rms(zt, tg.ln_f, eps) @ tg.wte.T).float(), -1)
+            key = ("_pos", wn, tuple(targets))
+            if key not in plan:
+                plan[key] = self._ints([[targets.index(a) for a in plan["out_t"][wn]]])[0]
+            zt = zt.index_put((b, plan[key]), resid_contrib(wn, wi, strength(wn, wi, ow)), accumulate=True)
+        return zt
 
     # ---- the verifier
 
@@ -537,7 +693,61 @@ class Native:
         return (logp.exp() * (logp - logq)).sum(-1).sum(-1) / LN2
 
     def _zero(self) -> tuple[dict, dict]:
-        return ({n: torch.zeros(1, 1, self.C[n], device=self.dev) for n in self.names}, {n: torch.zeros(1, 1, device=self.dev) for n in self.names})
+        """The ablation u = 0, remainders at 0 (the same objects every call: run() takes its shortcut for them)."""
+        return self._const("zero", lambda: ({n: torch.zeros(1, 1, self.C[n], device=self.dev) for n in self.names},
+                                            {n: torch.zeros(1, 1, device=self.dev) for n in self.names}))
+
+    def _one(self) -> tuple[dict, dict]:
+        """The ablation u = 1, remainders at 1: the whole model (the same objects every call)."""
+        return self._const("one", lambda: ({n: torch.ones(1, 1, self.C[n], device=self.dev) for n in self.names},
+                                           {n: torch.ones(1, 1, device=self.dev) for n in self.names}))
+
+    @torch.no_grad()
+    def _model_record(self, ids: list[int]) -> dict:
+        """Every matrix's activations [1, T, C] in the whole model on ids (the last text's kept)."""
+        if self._rec[0] != tuple(ids):
+            rec = {}
+            self.run(ids, [len(ids) - 1], self._full_plan(len(ids), 1), *self._one(), record=rec)
+            self._rec = (tuple(ids), rec)
+        return self._rec[1]
+
+    def _node_arrays(self, g: Graph, kept: dict) -> dict:
+        """A graph's nodes as matrix -> (positions, indices) int64 arrays; a complete graph's masks read once per
+        `kept` (keyed by the graph object, which it keeps alive)."""
+        if g.masks is not None:
+            if id(g) not in kept:
+                nz = {n: m.nonzero().cpu().numpy() for n, m in g.masks.items()}
+                kept[id(g)] = (g, {n: (a[:, 0].astype(np.int64), a[:, 1].astype(np.int64)) for n, a in nz.items() if len(a)})
+            return kept[id(g)][1]
+        per = {}
+        for n, t, c in g.nodes:
+            lst = per.setdefault(n, ([], []))
+            lst[0].append(t)
+            lst[1].append(c)
+        return {n: (np.array(ts, dtype=np.int64), np.array(cs, dtype=np.int64)) for n, (ts, cs) in per.items()}
+
+    def _held(self, graphs: list[Graph], T: int, seed: int, i: int, kept: dict) -> dict:
+        """faithfulness' holds on prompt i: per matrix with any, the [B, T, C] mask of the graphs' subcomponents held at
+        their values on the text; (matrix j, position t, index c) is held when torch.rand(1) under the CPU generator
+        seeded (seed * 7919 + i * 104729 + j * 1299709 + t * 15485863 + c) mod 2^62 is below 1/2 (below_half)."""
+        base = (seed * 7919 + i * 104729) % (1 << 62)
+        per = {}
+        for b, g in enumerate(graphs):
+            for n, (t, c) in self._node_arrays(g, kept).items():
+                per.setdefault(n, []).append((b, t, c))
+        out = {}
+        for n, parts in per.items():
+            t = np.concatenate([p[1] for p in parts])
+            c = np.concatenate([p[2] for p in parts])
+            b = np.concatenate([np.full(len(p[1]), p[0], dtype=np.int64) for p in parts])
+            j = self.names.index(n)
+            on = below_half(np.uint64(base) + np.uint64(j * 1299709) + t.astype(np.uint64) * np.uint64(15485863) + c.astype(np.uint64))
+            if on.any():
+                m = torch.zeros(len(graphs), T, self.C[n], dtype=torch.bool, device=self.dev)
+                bi, ti, ci = self._ints([b[on], t[on], c[on]])
+                m[bi, ti, ci] = True
+                out[n] = m
+        return out
 
     @torch.no_grad()
     def changes(self, ids: list[int], targets: list[int], n: int = CHANGES, seed: int = 0, chunk: int = 64) -> list[Changed]:
@@ -608,12 +818,10 @@ class Native:
         at = graphs if per_prompt else [graphs] * len(prompts)
         T, nb = len(ids), len(at[0])
         refs = [self.reference([x], targets) for x in prompts]
-        zero = self._zero()
-        one = ({n: torch.ones(1, 1, self.C[n], device=self.dev) for n in self.names}, {n: torch.ones(1, 1, device=self.dev) for n in self.names})
-        rec_m = {}
-        self.run(ids, targets, self._plan([self.everything(T)], T), *one, record=rec_m)
+        zero, one = self._zero(), self._one()
+        rec_m = self._model_record(ids)
         total = torch.zeros(nb, device=self.dev)
-        idx = {n: j for j, n in enumerate(self.names)}
+        kept = {}
         for i, (x, logp) in enumerate(zip(prompts, refs)):
             g = torch.Generator(device="cpu").manual_seed((seed * 1_000_003 + i) % (1 << 62))
             partial = bool(torch.rand(1, generator=g) < 0.5)
@@ -624,22 +832,17 @@ class Native:
                 part = at[i][s0:s0 + chunk]
                 B = len(part)
                 plan = self._plan(part, T)
-                mask = {}
-                for b, gr in enumerate(part):
-                    for n, t, c in gr.node_set():
-                        hg = torch.Generator(device="cpu").manual_seed((seed * 7919 + i * 104729 + idx[n] * 1299709 + t * 15485863 + c) % (1 << 62))
-                        if torch.rand(1, generator=hg) < 0.5:
-                            mask.setdefault(n, torch.zeros(B, T, self.C[n], dtype=torch.bool, device=self.dev))[b, t, c] = True
+                mask = self._held(part, T, seed, i, kept)
                 with torch.no_grad():
                     if not mask:
                         total[s0:s0 + B] += w * self._kl(logp, self.run(x, targets, plan, *rest))
                         continue
                     rec_g = {}
-                    self.run(ids, targets, plan, *rest, record=rec_g)
+                    self.run(ids, targets, plan, *rest, record=rec_g, keep=set(mask))
                     lq = self.run(x, targets, plan, *rest, patch={n: (m, rec_g[n]) for n, m in mask.items()})
-                    lp = self.run(x, targets, self._plan([self.everything(T)] * B, T), *one, patch={n: (m, rec_m[n].expand(B, -1, -1)) for n, m in mask.items()})
+                    lp = self.run(x, targets, self._full_plan(T, B), *one, patch={n: (m, rec_m[n].expand(B, -1, -1)) for n, m in mask.items()})
                     total[s0:s0 + B] += w * (lp.exp() * (lp - lq)).sum(-1).sum(-1) / LN2
-                free(self.dev)
+        free(self.dev)
         return (total / len(prompts)).tolist()
 
     @torch.no_grad()
@@ -662,9 +865,8 @@ class Native:
                 plain.append((x, {"position": diff[0], "old": ids[diff[0]], "new": x[diff[0]], "down": bool(lp[top] < base[top]), "weight": getattr(x, "weight", 1.0)}))
         if holds is None:
             return [e for _, e in plain]
-        one = ({n: torch.ones(1, 1, self.C[n], device=self.dev) for n in self.names}, {n: torch.ones(1, 1, device=self.dev) for n in self.names})
-        rec = {}
-        self.run(ids, targets, self._plan([self.everything(T)], T), *one, record=rec)
+        one = self._one()
+        rec = self._model_record(ids)
         g = torch.Generator(device="cpu").manual_seed(seed % (1 << 62))
         draws = torch.rand(len(plain), generator=g)
         out = [[e for _, e in plain] for _ in holds]
@@ -672,16 +874,25 @@ class Native:
         for i, (x, e) in enumerate(plain):
             if not live:
                 break
-            mask, ks = {}, {}
+            at, ks = {}, {}
             for b, j in enumerate(live):
                 k = min(int(draws[i] * len(holds[j])), len(holds[j]) - 1)
                 ks[j] = k
                 for n, t, c in holds[j][k]:
-                    mask.setdefault(n, torch.zeros(len(live), T, self.C[n], dtype=torch.bool, device=self.dev))[b, t, c] = True
-            lp = self.run(x, [last], self._plan([self.everything(T)] * len(live), T), *one, patch={n: (m, rec[n].expand(len(live), -1, -1)) for n, m in mask.items()})
+                    lst = at.setdefault(n, ([], [], []))
+                    lst[0].append(b)
+                    lst[1].append(t)
+                    lst[2].append(c)
+            mask = {}
+            for n, lst in at.items():
+                mask[n] = torch.zeros(len(live), T, self.C[n], dtype=torch.bool, device=self.dev)
+                bi, ti, ci = self._ints(list(lst))
+                mask[n][bi, ti, ci] = True
+            lp = self.run(x, [last], self._full_plan(T, len(live)), *one, patch={n: (m, rec[n].expand(len(live), -1, -1)) for n, m in mask.items()})
+            down = (lp[:, 0, top] < base[top]).tolist()  # log-probabilities both
             for b, j in enumerate(live):
-                out[j].append({**e, "hold": ks[j] + 1, "down": bool(lp[b, 0, top] < base[top])})  # log-probabilities both
-            free(self.dev)
+                out[j].append({**e, "hold": ks[j] + 1, "down": down[b]})
+        free(self.dev)
         return out
 
 
@@ -706,16 +917,13 @@ class Native:
             u[n][0, t, c] = 0.0
         ur = {n: torch.ones(1, T, device=self.dev) for n in self.names}
         none = {n: torch.zeros(1, T, self.C[n], dtype=torch.bool, device=self.dev) for n in self.names}
-        plan = {**self._plan([self.everything(T)], T), "G": none}  # no node held at 1: every subcomponent runs at its u
+        plan = {**self._full_plan(T, 1), "G": none, "none": True}  # no node held at 1: every subcomponent runs at its u
         return self.run(ids, targets, plan, u, ur)
 
     def contributions(self, ids: list[int], targets: list[int]) -> dict:
         """Per matrix, how much each subcomponent writes at each position on the text: |activation| x |write vector|,
         [T, C]."""
-        T = len(ids)
-        one = ({n: torch.ones(1, 1, self.C[n], device=self.dev) for n in self.names}, {n: torch.ones(1, 1, device=self.dev) for n in self.names})
-        rec = {}
-        self.run(ids, targets, self._plan([self.everything(T)], T), *one, record=rec)
+        rec = self._model_record(ids)
         return {n: rec[n][0].abs() * self.target.site(n).U.norm(dim=-1) for n in self.names}
 
     def adversarial(self, cases: list[tuple], steps: int = ADV_STEPS, step_size: float = ADV_STEP, seed: int = 0) -> list[float]:
