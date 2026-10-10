@@ -866,6 +866,8 @@ def prefix(ir: dict, k: int) -> tuple[Graph, list[str]]:
     g = ir["graph"]
     nd = [(site_name(layer, kind), t, c) for layer, kind, t, c in g["nodes"]]
     nodes = {nd[i] for i, s in enumerate(g["node_step"]) if s < k}
+    if g.get("complete_step") is not None and g["complete_step"] < k:  # "parts": every connection among the nodes
+        return Graph(nodes, complete=True), [u for u, s in zip(g["uses"], g["uses_step"]) if s < k]
     parents = {}
     for (r, w), s in zip(g["parents"], g["parent_step"]):
         if s < k:
@@ -954,6 +956,29 @@ def tidy(directory: Path, max_chars: int | None = None) -> None:
                 notes.append(g["notes"][k - 1] if k - 1 < len(g["notes"]) else "")
                 prev = h
         py.write_text(program(steps, notes=notes if any(notes) else None, explanation=g.get("explanation") or None))
+
+
+def parts_program(steps: list[Graph], explanation: str | None = None) -> str:
+    """Complete graphs (each containing the one before) as an answer of "parts" steps: the k-th lists the
+    subcomponents steps[k] has beyond steps[k - 1], by position (mech: every connection among them is in)."""
+    def tok(nd):
+        layer, kind = _layer_kind(nd)
+        return f"<p:{layer}.{dict(q_proj='q', k_proj='k', v_proj='v', o_proj='o', c_fc='fc', down_proj='down')[kind]}.{nd[2]}>"
+
+    lines = ["def graph(tokens, targets):"]
+    if explanation:
+        lines.append(f"    {explanation!r}")
+    lines.append("    return [")
+    prev = set()
+    for g in steps:
+        new = sorted(g.node_set() - prev, key=lambda nd: (nd[1], nd[0], nd[2]))
+        by = {}
+        for nd in new:
+            by.setdefault(nd[1], []).append(tok(nd))
+        lines.append("        {\"parts\": {" + ", ".join(f"{t}: \"{''.join(ts)}\"" for t, ts in by.items()) + "}},")
+        prev |= g.node_set()
+    lines.append("    ]")
+    return "\n".join(lines) + "\n"
 
 
 def program(steps: list[Graph], uses: list[list[str]] | None = None, notes: list[str] | None = None, explanation: str | None = None) -> str:

@@ -13,7 +13,10 @@ reads. An edge must be a connection the model has (connects()) and a node a subc
 whatever is written that is neither is left out of the graph and listed in the IR's "dropped" (score.py still counts its
 description length: it was written and explains nothing). Nodes are the readers and their parents. "uses"
 lists library entries (score.py's LIBRARY: recurring mechanisms, sets of edges at positions relative to the target)
-the step includes without writing them out. A single dict is an answer of one step.
+the step includes without writing them out. "parts": {position: string} lists subcomponents at positions without
+connections: from the step with "parts" on, the graph has every connection the model has among all its subcomponents
+(and from each attention or MLP output at the targets to the prediction), so an answer may name subcomponents alone,
+most important first. A single dict is an answer of one step.
 
     def graph(tokens, targets):
         '''At the last position the attention output reads the value written at position 3, which ...'''
@@ -173,9 +176,19 @@ def graph(fn, model: str, behavior: dict | None) -> dict:
     edges, reads, uses = [], [], []
     edge_step, read_step, uses_step = [], [], []
     seen_edges, seen_reads = set(), set()
+    complete_step = None  # the first step with "parts": from it on every connection among the nodes
     step = 0
     for step, st in enumerate(steps):
         for key, value in st.items():
+            if key == "parts":
+                if not isinstance(value, dict):
+                    raise MechError("parts: {position: subcomponents}")
+                for w in parents(value, []):
+                    if w is not None:
+                        add(w)
+                if complete_step is None:
+                    complete_step = step
+                continue
             if key == "uses":
                 if not (isinstance(value, (list, tuple)) and all(isinstance(u, str) for u in value)):
                     raise MechError("uses: a list of library entry names")
@@ -222,7 +235,7 @@ def graph(fn, model: str, behavior: dict | None) -> dict:
                     edges.append([ri, wi])
                     edge_step.append(step)
     return {"nodes": nodes, "parents": edges, "out": reads, "uses": uses, "node_step": node_step, "parent_step": edge_step,
-            "out_step": read_step, "uses_step": uses_step, "steps": len(steps), "dropped": dropped,
+            "out_step": read_step, "uses_step": uses_step, "steps": len(steps), "dropped": dropped, "complete_step": complete_step,
             "explanation": (getattr(fn, "__doc__", None) or "").strip()}
 
 
@@ -288,7 +301,7 @@ def _line_of(exc: BaseException) -> int | None:
     return lines[-1] if lines else None
 
 
-EMPTY_GRAPH = {"nodes": [], "parents": [], "out": [], "uses": [], "node_step": [], "parent_step": [], "out_step": [], "uses_step": [], "steps": 0,
+EMPTY_GRAPH = {"nodes": [], "parents": [], "out": [], "uses": [], "node_step": [], "parent_step": [], "out_step": [], "uses_step": [], "complete_step": None, "steps": 0,
                "dropped": [], "explanation": "", "notes": []}
 
 

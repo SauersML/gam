@@ -181,8 +181,8 @@ class Scorer:
         (code_bits; library entries it uses are given, their definitions not counted); its first k steps are the same
         program with its returned list cut to k entries (prefix_code). The program runs on every changed prompt
         (instances), its graph there tested there. The source "vpd" stands for VPD's own answer: its subcomponents ranked
-        by causal importance x how much each writes (native.vpd_steps), the k-th step the top 2^(k-1), each complete, its description length the listing of its
-        subcomponents (Graph.bits)."""
+        by causal importance x how much each writes (native.vpd_steps), the k-th step the top 2^(k-1), each complete, its
+        description length that of the same steps written as a "parts" answer (native.parts_program), like any answer's."""
         import mech
 
         prompt = task["prompts"][0]
@@ -201,8 +201,8 @@ class Scorer:
                 continue
             if src == "vpd":  # VPD's answer, its subcomponents in order of causal importance (native.vpd_steps)
                 steps = nat.vpd_steps(ids, targets)
-                for g in steps:
-                    rows.append((j, g.bits(positions, total), [g] * P))
+                for k, g in enumerate(steps):  # its description length: the code of its first steps as a "parts" answer
+                    rows.append((j, code_bits(self.native.parts_program(steps[:k + 1])), [g] * P))
                 out.append({"valid": True, "error": None, "steps": len(steps), "explanation": "", "notes": [], "base": steps[-1]})
                 continue
             ir = mech.trace(src, "vpd4l", behavior=task)
