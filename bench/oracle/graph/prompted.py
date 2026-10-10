@@ -41,6 +41,38 @@ ASK = ("You are given an answer to the question above, found by a search, and th
        "the answer in one ```python block.")
 
 
+LOOKUP = ("After the report: the answer's subcomponents, each with its layer and weight matrix, its position and token in "
+          "the text, and for an attention or MLP output the tokens its write vector raises most at the prediction (its "
+          "logit lens).")
+
+
+def evidence(nat, t, src, budget, count) -> str:
+    """The answer's subcomponents in words (describe.words), in the order its steps add them, while within `budget`
+    tokens (count: text -> token ids); "" when the answer does not run."""
+    import describe
+    import mech
+
+    ir = mech.trace_inline(src, "vpd4l", t)
+    if not ir["valid"]:
+        return ""
+    g = ir["graph"]
+    nodes = [(native.site_name(layer, kind), pos, c) for layer, kind, pos, c in
+             (g["nodes"][i] for i in sorted(range(len(g["nodes"])), key=lambda i: g["node_step"][i]))]
+    strings = mech.behavior_tokens(t, "vpd4l")["sequences"][0][1]
+    lens = nat.lens([nd for nd in nodes if isinstance(nd[2], int)])
+    short = {v: k for k, v in mech.SITES.items()}
+    lines, used = [], 0
+    for nd in nodes:
+        layer, kind = native._layer_kind(nd)
+        line = f'({nd[1]}, "<p:{layer}.{short[kind]}.{nd[2]}>"): {describe.words(nd, strings, lens)}'
+        used += len(count(line)) + 1
+        if used > budget:
+            lines.append(f"... and {len(nodes) - len(lines)} more")
+            break
+        lines.append(line)
+    return "\n".join(lines)
+
+
 class Vllm:
     """Sampling with vLLM on CUDA; sleep() moves the weights to host memory and drops the KV cache."""
 
@@ -112,6 +144,7 @@ def main():
     ap.add_argument("--tp", type=int, default=1, help="GPUs for the model (tensor parallel)")
     ap.add_argument("--gpu-memory", type=float, default=0.9, help="vLLM's share while it samples (it sleeps while the verifier scores)")
     ap.add_argument("--backend", choices=("vllm", "mlx"), default="vllm")
+    ap.add_argument("--evidence-tokens", type=int, default=0, help="tokens of the answer's subcomponents in words after the report (0: none)")
     ap.add_argument("--batch", type=int, default=8, help="MLX: replies generated at once (their KV caches share the Mac's memory)")
     ap.add_argument("--search-dir", type=Path, default=native.TEXTS / "search_heldout")
     ap.add_argument("--seed", type=int, default=1_000_003, help="the verifier's experiment seed (the evaluation's)")
@@ -151,8 +184,13 @@ def main():
     llm = (Mlx if a.backend == "mlx" else Vllm)(a)
     summary = {"search": sorted(score.key(best[t["id"]][1])[1] for t in tasks), "search_full": sorted(full_area.values())}
     for r in range(1, a.rounds + 1):
-        chats = [tok.apply_chat_template([{"role": "user", "content": render(t) + "\n\n" + ASK + "\n\nThe answer:\n```python\n" + best[t["id"]][0] + "```\n\n"
-                                           + train.feedback(best[t["id"]][1])}], add_generation_prompt=True, enable_thinking=True, tokenize=False) for t in tasks]
+        chats = []
+        for t in tasks:
+            src = best[t["id"]][0]
+            ev = evidence(sc.nat, t, src, a.evidence_tokens, count) if a.evidence_tokens else ""
+            ask = render(t) + "\n\n" + ASK + (" " + LOOKUP if ev else "") + "\n\nThe answer:\n```python\n" + src + "```\n\n" + train.feedback(best[t["id"]][1])
+            chats.append(tok.apply_chat_template([{"role": "user", "content": ask + ("\n\nThe answer's subcomponents:\n" + ev if ev else "")}],
+                                                 add_generation_prompt=True, enable_thinking=True, tokenize=False))
         clock = time.time()
         outs = llm.generate(chats)
         sampled = time.time() - clock
