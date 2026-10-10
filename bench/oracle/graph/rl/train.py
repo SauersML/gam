@@ -1150,10 +1150,41 @@ def shares(x: dict) -> dict:
     """An answer in the reporting terms: area (score.key: score.area over the question's range), kl (the whole answer's
     run-alone KL in bits), reproduces = 1 - kl / the empty graph's, bits (its description length), steps, nodes, edges."""
     if not x.get("valid", True) or not x.get("curve"):
-        return {"area": None, "kl": None, "reproduces": None, "bits": None, "steps": None, "nodes": None, "edges": None, "necessity": None, "adversarial": None}
+        return {"area": None, "kl": None, "reproduces": None, "bits": None, "steps": None, "nodes": None, "edges": None, "necessity": None, "adversarial": None, "shared_fraction": None}
     kl, empty = x.get("kl_bits"), x["curve"][0][1]
     return {"area": score_module.key(x)[1], "kl": kl, "reproduces": 1.0 - kl / empty if empty else None, "bits": x.get("bits"), "steps": x.get("steps"),
-            "nodes": x.get("nodes"), "edges": x.get("edges"), "necessity": x.get("necessity_kl_bits"), "adversarial": x.get("adversarial_kl_bits")}
+            "nodes": x.get("nodes"), "edges": x.get("edges"), "necessity": x.get("necessity_kl_bits"), "adversarial": x.get("adversarial_kl_bits"),
+            "shared_fraction": x.get("shared_fraction")}
+
+
+def relative_edges(source: str, task: dict) -> set:
+    """An answer's connections in coordinates relative to its target: (writer, writer offset, reader or "out", reader
+    offset), subcomponents as "<p:L.S.I>"."""
+    import mech
+
+    if not task.get("prompts"):
+        return set()
+    ir = mech.trace_inline(source, task.get("model", "vpd4l"), task)
+    if not ir["valid"]:
+        return set()
+    t = task["prompts"][0]["target_positions"][0]
+    codes = {v: k for k, v in mech.SITES.items()}
+    nd = [(f"<p:{a}.{codes[b]}.{d}>", c - t) for a, b, c, d in ir["graph"]["nodes"]]
+    return {(*nd[w], *nd[r]) for r, w in ir["graph"]["parents"]} | {(*nd[w], "out", 0) for w in ir["graph"]["out"]}
+
+
+def shared(groups: list[tuple[dict, list, dict]]) -> None:
+    """Each question's best answer gets "shared_fraction": the share of its connections (relative_edges) that the best
+    answer to some other question of the set also has, the machinery its prediction shares with others rather than
+    its own."""
+    best = [min(mine, key=lambda m: score_module.key(m[1])) for _, mine, _ in groups]
+    edges = [relative_edges(src, b) if x.get("valid", True) else set() for (b, _, _), (src, x) in zip(groups, best)]
+    count = {}
+    for es in edges:
+        for e in es:
+            count[e] = count.get(e, 0) + 1
+    for (_, x), es in zip(best, edges):
+        x["shared_fraction"] = sum(count[e] > 1 for e in es) / len(es) if es else None
 
 
 def summarize(name: str, step: int, groups: list[tuple[dict, list, dict]], log) -> dict:
@@ -1182,7 +1213,7 @@ def summarize(name: str, step: int, groups: list[tuple[dict, list, dict]], log) 
             row["adversarial_minus_vpd"] = best["adversarial_kl_bits"] - base["vpd"]["adversarial_kl_bits"]  # the same adversary, VPD's answer the reference
         rows.append(row)
         log.write(json.dumps(row) + "\n")
-    keys_ = ("area", "kl", "reproduces", "bits", "steps", "nodes", "edges", "necessity", "adversarial")
+    keys_ = ("area", "kl", "reproduces", "bits", "steps", "nodes", "edges", "necessity", "adversarial", "shared_fraction")
     return {"questions": len(rows), "valid_fraction": mean([r["valid_fraction"] for r in rows]), "best_first_area": mean([r["best_first_area"] for r in rows]),
             "best_is_revision": mean([r["best_is_revision"] for r in rows]),
             "best_beats_search": mean([r.get("beats_search") for r in rows]), "best_beats_vpd": mean([r.get("beats_vpd") for r in rows]),
@@ -1247,6 +1278,7 @@ def evaluate(sets: dict[str, list[dict]], pol, sampler, score, args, adapter: Pa
                     if "vpd" in base:
                         base["vpd"]["adversarial_kl_bits"] = v
             if out:
+                shared(out)
                 summary[name] = summarize(name, step, out, log)
             if getattr(sampler, "stats", None):
                 summary.setdefault(name, {})["sampling"] = dict(sampler.stats)
