@@ -20,6 +20,9 @@ lr = 1e-5
 [orchestrator]
 batch_size = 32  # 4 questions x 8 answers
 
+[orchestrator.concurrency]  # the controller starts from KV capacity / max context (6 here), blind to the shared prompts
+initial_inflight = 16
+
 [orchestrator.renderer]  # train.py's chat: Qwen3's template without thinking
 name = "qwen3"
 enable_thinking = false
@@ -39,8 +42,8 @@ env.taskset.task.seed = 0
 env.agent.harness.id = "null"
 env.agent.runtime.type = "subprocess"
 
-[orchestrator.eval]
-interval = 10
+[orchestrator.eval]  # before training and every 20 steps
+interval = 20
 
 [orchestrator.eval.sampling]
 max_completion_tokens = 4096
@@ -49,7 +52,7 @@ temperature = 1.0
 [[orchestrator.eval.source]]
 name = "graph-oracle-heldout"
 group_size = 2
-select.limit = 50
+select.limit = 40
 env.taskset.id = "graph-oracle"
 env.taskset.questions = "heldout.jsonl"
 env.taskset.task.seed = 1000003

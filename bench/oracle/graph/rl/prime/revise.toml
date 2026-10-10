@@ -18,7 +18,7 @@ env.agent.runtime.type = "subprocess"
 [[orchestrator.eval.source]]
 name = "graph-oracle-heldout"
 group_size = 2
-select.limit = 50
+select.limit = 40
 env.taskset.id = "graph-oracle"
 env.taskset.questions = "heldout.jsonl"
 env.taskset.task.seed = 1000003
