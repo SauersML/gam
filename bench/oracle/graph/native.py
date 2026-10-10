@@ -629,19 +629,32 @@ class Native:
         model's with the graph's subcomponents removed (everything else kept): how much the prediction depends on the
         graph's parts, the test an edit or unlearning relies on. A part with a backup elsewhere lowers it; it is not a
         verdict on the graph."""
-        T = len(ids)
-        plan = self._plan([self.everything(T)], T)
-        u = {n: torch.ones(1, T, self.C[n], device=self.dev) for n in self.names}
-        for n, t, c in g.node_set():
-            u[n][0, t, c] = 0.0
-        ur = {n: torch.ones(1, T, device=self.dev) for n in self.names}
-        none = ({n: torch.zeros(1, T, self.C[n], dtype=torch.bool, device=self.dev) for n in self.names})
+        nodes = g.node_set()
         total = 0.0
         for x in prompts:
-            logp = self.reference([x], targets)
-            plan_x = {**plan, "G": none}  # no node held at 1: every subcomponent runs at its u
-            total += getattr(x, "weight", 1.0) * float(self._kl(logp, self.run(x, targets, plan_x, u, ur)))
+            total += getattr(x, "weight", 1.0) * float(self._kl(self.reference([x], targets), self.without(x, targets, nodes)))
         return total / len(prompts)
+
+    def without(self, ids: list[int], targets: list[int], nodes) -> torch.Tensor:
+        """log q at the targets [1, len(targets), V] of the whole model with `nodes` ((matrix, position, subcomponent))
+        removed and everything else kept."""
+        T = len(ids)
+        u = {n: torch.ones(1, T, self.C[n], device=self.dev) for n in self.names}
+        for n, t, c in nodes:
+            u[n][0, t, c] = 0.0
+        ur = {n: torch.ones(1, T, device=self.dev) for n in self.names}
+        none = {n: torch.zeros(1, T, self.C[n], dtype=torch.bool, device=self.dev) for n in self.names}
+        plan = {**self._plan([self.everything(T)], T), "G": none}  # no node held at 1: every subcomponent runs at its u
+        return self.run(ids, targets, plan, u, ur)
+
+    def contributions(self, ids: list[int], targets: list[int]) -> dict:
+        """Per matrix, how much each subcomponent writes at each position on the text: |activation| x |write vector|,
+        [T, C]."""
+        T = len(ids)
+        one = ({n: torch.ones(1, 1, self.C[n], device=self.dev) for n in self.names}, {n: torch.ones(1, 1, device=self.dev) for n in self.names})
+        rec = {}
+        self.run(ids, targets, self._plan([self.everything(T)], T), *one, record=rec)
+        return {n: rec[n][0].abs() * self.target.site(n).U.norm(dim=-1) for n in self.names}
 
     def adversarial(self, cases: list[tuple], steps: int = ADV_STEPS, step_size: float = ADV_STEP, seed: int = 0) -> list[float]:
         """VPD's adversarial test of graphs, an evaluation measure: every subcomponent outside a graph (and every

@@ -71,7 +71,7 @@ def build(split: str, n: int, offset: int, seed: int, device: str = "mps") -> No
         ids = rows[r, :t + 1].tolist()
         name = f"{'hard' if split == 'hard' else 'text'}{offset + r}"
         prompt = {"text": tk.decode(ids), "token_ids": ids, "target_positions": [t], "model_top": [top(ids, device=device)],
-                  "actual_next": tk.decode([int(rows[r, t + 1])])}
+                  "actual_next": tk.decode([int(rows[r, t + 1])]), "actual_next_id": int(rows[r, t + 1])}
         (TEXTS / "vpd4l" / f"{name}.json").write_text(json.dumps({"id": name, "model": "vpd4l", "family": "text", "split": split,
                                                                   "description": "", "prompts": [prompt]}))
         if (r + 1) % 100 == 0:
