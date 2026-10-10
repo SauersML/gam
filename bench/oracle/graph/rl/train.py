@@ -344,17 +344,18 @@ class HfSampler:
 
 
 class VllmSampler:
-    """vLLM serving the base with the policy's adapter (reloaded by path at every version). It takes the
-    first visible GPU; the trainer takes the second when there is one (--gpu-memory set accordingly)."""
+    """vLLM serving the policy: the base with the policy's adapter merged into its linear maps, copied in place before
+    sampling (push_weights; vLLM serves no LoRA). It takes the first visible GPU; the trainer takes the second when
+    there is one (--gpu-memory set accordingly)."""
 
-    def __init__(self, args, rank: int, end: int, model: str | None = None):
+    def __init__(self, args, end: int, model: str | None = None):
         # Prompts as embeddings (--evidence): vLLM's asynchronous scheduling (the next step's inputs prepared while one
         # runs) crashed decoding with an illegal memory access, so it is off with them.
         self.engine_options, self.sample_options = ({"enable_prompt_embeds": True, "async_scheduling": False} if getattr(args, "evidence", False) else {}), {}
         # vLLM's sleep mode with prompts as embeddings (--evidence): after a wake, at full batch, garbage positions reach
         # the attention (a device assert, or an illegal memory access in eager mode); awake throughout it ran clean
         # (debug_evidence.sh nosleep). So with --evidence vLLM keeps its share and the trainer stays on the GPU.
-        self.share, self.args, self.rank = args.share_gpu and not getattr(args, "evidence", False), args, rank
+        self.share, self.args = args.share_gpu and not getattr(args, "evidence", False), args
         self.max_tokens, self.end = args.max_tokens, end
         self.policy = None  # with --share-gpu: the trainer, moved to the host while vLLM samples
         self.rows = None  # with part tokens: () -> (first id, input rows, output rows), copied into vLLM before sampling
@@ -370,8 +371,7 @@ class VllmSampler:
         a = self.args
         # Prefix caching keys blocks by token ids, which prompts given as embeddings (--evidence) do not have: with both,
         # vLLM 0.19.1 hit an illegal memory access on A100 and RTX PRO 6000 alike, so evidence runs go without it.
-        self.llm = LLM(model=model, dtype="bfloat16", enable_lora=True, max_lora_rank=self.rank, max_loras=1,
-                       enable_prefix_caching="enable_prompt_embeds" not in self.engine_options, enforce_eager=getattr(a, "enforce_eager", False),
+        self.llm = LLM(model=model, dtype="bfloat16", enable_prefix_caching="enable_prompt_embeds" not in self.engine_options, enforce_eager=getattr(a, "enforce_eager", False),
                        **({"enable_chunked_prefill": False, "max_num_batched_tokens": a.max_model_len} if getattr(a, "no_chunked_prefill", False) else {}),
                        gpu_memory_utilization=a.gpu_memory, max_model_len=a.max_model_len, seed=a.seed, enable_sleep_mode=self.share, **self.engine_options)
         if self.share:
@@ -388,6 +388,29 @@ class VllmSampler:
             model.lm_head.weight.data[first : first + rows_out.shape[0]].copy_(rows_out)
 
         self.llm.apply_model(put)
+        self.llm.reset_prefix_cache()
+
+    def push_weights(self):
+        """Copies the policy's linear maps with its adapter merged (the base weight plus the "default" adapter's delta)
+        into vLLM's model in place, one matrix at a time through vLLM's own loader (which fills its fused q/k/v and
+        gate/up matrices). vLLM serves no adapter: with prompts given as embeddings (--evidence), loading the second
+        adapter version (rl2's first update) crashed decoding with an illegal memory access (r15, A100), and the
+        answers sampled after updates in r14 were garbage."""
+        from peft.tuners.lora import LoraLayer
+
+        sent = []
+
+        def merged():
+            with torch.no_grad():
+                for name, m in self.policy.model.named_modules():
+                    if isinstance(m, LoraLayer) and "default" in m.lora_A:
+                        w = m.base_layer.weight
+                        sent.append(name)
+                        yield name.removeprefix("base_model.model.") + ".weight", (w.float() + m.get_delta_weight("default").float()).to(w.dtype)
+
+        loaded = self.llm.apply_model(lambda model: len(model.load_weights(merged())))[0]
+        if sent and not loaded:
+            raise RuntimeError(f"vLLM loaded none of the policy's {len(sent)} merged weights")
         self.llm.reset_prefix_cache()
 
     def reload(self, model: Path):
@@ -416,6 +439,8 @@ class VllmSampler:
             self.llm.wake_up()
         if rows is not None:
             self.push_rows(rows)
+        if self.policy is not None:
+            self.push_weights()
         self.ready = True
 
     def release(self):
@@ -438,7 +463,6 @@ class VllmSampler:
 
     def __call__(self, prompts: list[list[int]], n: int, adapter: Path, version: int) -> list[list[list[int]]]:
         from vllm import SamplingParams
-        from vllm.lora.request import LoRARequest
 
         if not self.ready:
             self.acquire()
@@ -451,7 +475,7 @@ class VllmSampler:
                             else {"prompt_token_ids": p} for p in prompts]
             else:
                 reqs = [{"prompt_token_ids": p} for p in prompts]
-            outs = self.llm.generate(reqs, params, lora_request=LoRARequest(f"policy{version}", version + 1, str(adapter)), use_tqdm=False)
+            outs = self.llm.generate(reqs, params, use_tqdm=False)
         finally:
             if not self.held:
                 self.release()
@@ -1418,8 +1442,7 @@ def main():
     if use_vllm:  # vLLM first, on the first visible GPU, before the trainer touches CUDA
         from transformers import AutoTokenizer
 
-        rank = json.loads((Path(args.init) / "adapter_config.json").read_text())["r"] if args.init else args.lora_rank
-        sampler = VllmSampler(args, rank, AutoTokenizer.from_pretrained(args.base).convert_tokens_to_ids("<|im_end|>"), None if args.part_tokens else args.base)
+        sampler = VllmSampler(args, AutoTokenizer.from_pretrained(args.base).convert_tokens_to_ids("<|im_end|>"), None if args.part_tokens else args.base)
     dev = torch.device(f"cuda:{torch.cuda.device_count() - 1}" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
     pol = Policy(args, dev)
     pol.evidence, pol.acts_fn = {}, None

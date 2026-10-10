@@ -119,7 +119,14 @@ def check_share_wake():
         def sleep(self, level):
             events.append("sleep")
 
-        def generate(self, prompts, params, lora_request=None, use_tqdm=False):
+        def apply_model(self, fn):
+            events.append("apply")
+            return [fn(types.SimpleNamespace(load_weights=lambda weights: {name for name, _ in weights}))]
+
+        def reset_prefix_cache(self):
+            pass
+
+        def generate(self, prompts, params, use_tqdm=False):
             events.append(f"generate {len(prompts)}x{params['n']}")
             return [types.SimpleNamespace(outputs=[types.SimpleNamespace(token_ids=[j % 2], logprobs=None) for j in range(params["n"])]) for _ in prompts]
 
@@ -127,14 +134,15 @@ def check_share_wake():
         def to(self, dev):
             events.append(f"to {dev}")
 
+        def named_modules(self):
+            return []
+
     fake = types.ModuleType("vllm")
     fake.SamplingParams = lambda **k: k
-    request = types.ModuleType("vllm.lora.request")
-    request.LoRARequest = lambda *a: None
-    saved = {k: sys.modules.get(k) for k in ("vllm", "vllm.lora", "vllm.lora.request")}
-    sys.modules.update({"vllm": fake, "vllm.lora": types.ModuleType("vllm.lora"), "vllm.lora.request": request})
+    saved = {"vllm": sys.modules.get("vllm")}
+    sys.modules["vllm"] = fake
     try:
-        inner = train.VllmSampler(types.SimpleNamespace(share_gpu=True, max_tokens=8), 4, 0)
+        inner = train.VllmSampler(types.SimpleNamespace(share_gpu=True, max_tokens=8), 0)
         inner.llm, inner.policy = Engine(), types.SimpleNamespace(model=Model(), dev="cuda:0")
         inner([[0], [0]], 2, Path("."), 0)
     finally:
@@ -143,7 +151,7 @@ def check_share_wake():
                 sys.modules.pop(k, None)
             else:
                 sys.modules[k] = v
-    assert events == ["to cpu", "wake", "generate 2x2", "sleep", "to cuda:0"], events
+    assert events == ["to cpu", "wake", "apply", "generate 2x2", "sleep", "to cuda:0"], events
 
 
 if __name__ == "__main__":
