@@ -260,6 +260,24 @@ class Native:
         zero, complete."""
         return Graph(masks={n: m > 0 for n, m in self.importance(ids).items()})
 
+    def _vpd_rank(self, ids: list[int], targets: list[int]) -> dict:
+        """Each subcomponent with causal importance above zero -> its place in vpd_steps' order (0 first)."""
+        ci = self.importance(ids)
+        writes = self.contributions(ids, targets)
+        flat = torch.cat([m.flatten() for m in ci.values()])
+        at_target = torch.cat([torch.isin(torch.arange(m.shape[0], device=m.device), torch.tensor(targets, device=m.device))[:, None].expand_as(m).flatten() for m in ci.values()])
+        rank = torch.cat([(ci[n] * writes[n]).flatten() for n in ci])
+        rank = rank + at_target * (rank.max() + 1)
+        order = rank.argsort(descending=True)[: int((flat > 0).sum())].tolist()
+        names, sizes = list(ci), [ci[n].numel() for n in ci]
+        starts = [sum(sizes[:i]) for i in range(len(sizes))]
+        out = {}
+        for place, i in enumerate(order):
+            j = max(k for k, st in enumerate(starts) if st <= i)
+            T, C = ci[names[j]].shape
+            out[(names[j], (i - starts[j]) // C, (i - starts[j]) % C)] = place
+        return out
+
     def vpd_steps(self, ids: list[int], targets: list[int]) -> list[Graph]:
         """VPD's answer as steps, most important first: its subcomponents with causal importance above zero, ranked by
         importance x how much each writes there on the text (native.contributions; many are tied at importance 1),
@@ -827,11 +845,16 @@ class Native:
         allitems = items + [(nd, None) for nd in qk]
         return [allitems[j] for j in (-ig).argsort().tolist()]
 
-    def ordered(self, ids: list[int], targets: list[int], prompts: list[list[int]], log=None) -> tuple[list[Graph], list[dict]]:
+    def ordered(self, ids: list[int], targets: list[int], prompts: list[list[int]], log=None, nodes_from: str = "ig") -> tuple[list[Graph], list[dict]]:
         """A bootstrap answer: (the graph after each step, their scores); see the module docstring. The subcomponents
-        whose connections are ranked: the most top-ranked whose connections fit MAX_CONNECTIONS."""
+        whose connections are ranked: the most top-ranked whose connections fit MAX_CONNECTIONS, ranked by integrated
+        gradients (nodes_from "ig") or in VPD's order (nodes_from "vpd": vpd_steps' ranking, causal importance x how
+        much each writes, the predicted position first)."""
         T = len(ids)
-        ranked = self._node_ranking(ids, targets, prompts, self.reachable(T, targets))
+        if nodes_from == "vpd":
+            ranked = sorted(self.vpd_steps(ids, targets)[-1].node_set(), key=self._vpd_rank(ids, targets).get)
+        else:
+            ranked = self._node_ranking(ids, targets, prompts, self.reachable(T, targets))
         lo = 1
         while lo < len(ranked) and count_edges(ranked[:2 * lo], targets) <= MAX_CONNECTIONS:  # doubling, then bisection:
             lo *= 2  # the largest prefix within MAX_CONNECTIONS
@@ -1079,7 +1102,7 @@ def task_seed(task_id: str) -> int:
     return int.from_bytes(task_id.encode()[-8:].rjust(8, b"\0"), "big") % (1 << 31)
 
 
-def search(split: str, n: int, offset: int = 0, stride: int = 1, out: Path | None = None, reverse: bool = False) -> None:
+def search(split: str, n: int, offset: int = 0, stride: int = 1, out: Path | None = None, reverse: bool = False, nodes_from: str = "ig") -> None:
     """Native.ordered on the split's texts offset, offset + stride, ... of its first n -> OUT/<id>.py (the answer) and
     .json (each step's score and the seconds); OUT defaults to texts/search (train) or texts/search_<split>."""
     nat = Native()
@@ -1091,7 +1114,7 @@ def search(split: str, n: int, offset: int = 0, stride: int = 1, out: Path | Non
         t0 = time.time()
         ids, targets = text(p)
         prompts = nat.changes(ids, targets, seed=task_seed(p.stem))
-        graphs, scores = nat.ordered(ids, targets, prompts)
+        graphs, scores = nat.ordered(ids, targets, prompts, nodes_from=nodes_from)
         empty = nat.score(ids, targets, [Graph()], prompts)[0]
         (out / f"{p.stem}.py").write_text(program(graphs))
         (out / f"{p.stem}.json").write_text(json.dumps({"empty": empty, "steps": scores, "seconds": round(time.time() - t0, 1)}))
@@ -1109,6 +1132,7 @@ def main():
     s.add_argument("--stride", type=int, default=1)
     s.add_argument("--out", type=Path)
     s.add_argument("--reverse", action="store_true", help="last text first")
+    s.add_argument("--nodes-from", choices=("ig", "vpd"), default="ig", help="the candidate subcomponents: integrated gradients' ranking or VPD's (Native.ordered)")
     t = sub.add_parser("tidy")
     t.add_argument("directory", type=Path)
     t.add_argument("--max-chars", type=int, help="cut each answer to its most first steps within this many characters first")
@@ -1116,7 +1140,7 @@ def main():
     if args.cmd == "tidy":
         tidy(args.directory, args.max_chars)
     else:
-        search(args.split, args.n, args.offset, args.stride, args.out, args.reverse)
+        search(args.split, args.n, args.offset, args.stride, args.out, args.reverse, args.nodes_from)
 
 
 if __name__ == "__main__":
