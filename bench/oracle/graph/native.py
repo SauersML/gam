@@ -1379,7 +1379,7 @@ def respond(split: str, n: int, positions: int, out: Path | None = None) -> None
     out = Path(out) if out else TEXTS / "vpd_responses"
     out.mkdir(parents=True, exist_ok=True)
     for p in tasks(split)[:n]:
-        if (out / f"{p.stem}.json").exists():
+        if (out / f"{p.stem}.json").exists() or not claim(out / f".{p.stem}.claim"):  # processes sharing OUT split the texts
             continue
         ids, targets = text(p)
         with torch.no_grad():
