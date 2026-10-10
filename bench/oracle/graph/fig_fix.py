@@ -121,26 +121,37 @@ def plot(results: list, out: str) -> None:
     arms = [("answer", ANSWER, "the answer's subcomponents"), ("vpd", VPD, "VPD's first subcomponents"), ("control", CONTROL, "as many active subcomponents")]
     fig, axes = plt.subplots(1, 2, figsize=(17, 7))
     grid = sorted({r["removed"] for res in results for r in res["steps"]})
+    floor = 1e-3  # the KL axis is logarithmic: values below it are drawn at it
     for ax, measure, start, ylabel in ((axes[0], "wrong", lambda res: res["p_wrong"], "model's probability of its wrong token"),
-                                       (axes[1], "rest", lambda res: 0.0, "KL of the rest of the prediction (bits)")):
+                                       (axes[1], "rest", None, "KL of the rest of the prediction (bits)")):
+        shown = (lambda v: v) if start else (lambda v: max(v, floor))
         for key, color, label in arms:
             for res in results:
-                ax.plot([1] + [r["removed"] for r in res["steps"]], [start(res)] + [r[f"{key}_{measure}"] for r in res["steps"]], color=color, lw=0.7, alpha=0.18)
-            med = []
+                xs = ([1] if start else []) + [r["removed"] for r in res["steps"]]
+                ys = ([start(res)] if start else []) + [shown(r[f"{key}_{measure}"]) for r in res["steps"]]
+                ax.plot(xs, ys, color=color, lw=0.7, alpha=0.18)
+            xs, med = [], []
             for x in grid:
                 vals = []
                 for res in results:  # each question's value at x: its last prefix with at most x subcomponents
                     before = [r[f"{key}_{measure}"] for r in res["steps"] if r["removed"] <= x]
-                    vals.append(before[-1] if before else start(res))
-                med.append(sorted(vals)[len(vals) // 2])
-            ax.plot(grid, med, color=color, lw=3, label=label)
+                    if before or start:
+                        vals.append(before[-1] if before else start(res))
+                if vals:
+                    xs.append(x)
+                    med.append(shown(sorted(vals)[len(vals) // 2]))
+            ax.plot(xs, med, color=color, lw=3, label=label)
         ax.set_xscale("log")
+        from matplotlib.ticker import FuncFormatter
+
+        ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:g}"))
         ax.set_xlabel("subcomponents removed", fontsize=16)
         ax.set_ylabel(ylabel, fontsize=16)
         ax.tick_params(labelsize=13)
         for side in ("top", "right"):
             ax.spines[side].set_visible(False)
-    axes[1].set_yscale("symlog", linthresh=0.01)
+    axes[1].set_yscale("log")
+    axes[1].yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:g}"))
     axes[0].legend(fontsize=14, frameon=False)
     fig.tight_layout()
     fig.savefig(out, dpi=130, facecolor="white")
