@@ -5,8 +5,10 @@ to the same process, so its changed prompts and baselines are computed once; a p
 answer to the same (text, seed, necessity).
 
   serve_scores.py [--port 8765] [--workers 4] [--device cuda] [--texts DIR]
-  POST /score {"task": TASK_ID, "sources": [SRC, ...], "seed": 0, "necessity": false}
-      -> {"scores": [{"valid", "error", "curve", "lo", "hi", "kl_bits", "bits", "steps", "area"}, ...]}
+  POST /score {"task": TASK_ID, "sources": [SRC, ...] | "answers": [REPLY, ...], "seed": 0, "necessity": false}
+      -> {"scores": [{"valid", "error", "curve", "lo", "hi", "kl_bits", "bits", "steps", "area", "reward"}, ...]}
+  A reply is an oracle's whole answer, its program taken by prompt.split_answer. "reward" is minus the curve area, an
+  answer that cannot run counting as the empty answer (score.EMPTY, scored with the request and cached).
   GET /health -> {"workers": N, "pending": requests in flight}
 """
 
@@ -34,6 +36,7 @@ def work(device: str | None, texts: str, inbox, outbox) -> None:
     """One scoring process: take a request, then every request already queued, score them grouped by (text, seed,
     necessity), and answer each with its own scores in order."""
     import score
+    from prompt import split_answer
 
     sc = score.Scorer(device)
     tasks = {}
@@ -53,12 +56,17 @@ def work(device: str | None, texts: str, inbox, outbox) -> None:
                 break
         groups = {}
         for rid, req in batch:
-            groups.setdefault((req["task"], int(req.get("seed", 0)), bool(req.get("necessity"))), []).append((rid, req["sources"]))
+            srcs = req["sources"] if "sources" in req else [split_answer(a if "```" in a else "```python\n" + a)[0] for a in req["answers"]]
+            groups.setdefault((req["task"], int(req.get("seed", 0)), bool(req.get("necessity"))), []).append((rid, srcs))
         for (tid, seed, nec), reqs in groups.items():
             sources = [s for _, srcs in reqs for s in srcs]
             try:
-                got = sc.score(task(tid), sources, seed, necessity=nec)
+                got = sc.score(task(tid), sources + [score.EMPTY], seed, necessity=nec)
+                empty = score.key(got.pop())[1]
                 got = [{**{k: s[k] for k in KEEP if k in s}, "area": score.key(s)[1]} for s in got]
+                for s in got:  # an answer that cannot run: no area (JSON has no infinity), the empty answer's reward
+                    ran = s.get("valid", True) and s["area"] < float("inf")
+                    s["area"], s["reward"] = (s["area"], -s["area"]) if ran else (None, -empty)
                 err = None
             except Exception as e:  # a bad request answers with its error; the process keeps serving
                 got, err = None, f"{type(e).__name__}: {e}"
