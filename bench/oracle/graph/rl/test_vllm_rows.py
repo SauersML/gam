@@ -1,4 +1,4 @@
-"""GPU check of part tokens and the merged adapter in vLLM (#2951; needs vLLM and a CUDA GPU): python test_vllm_rows.py [BASE]
+"""GPU check of part tokens and the merged adapter in vLLM (#2951; needs vLLM and a CUDA GPU): python test_vllm_rows.py [BASE [GPU_SHARE]]
 
 A policy with stand-in part tokens (random projections of random read/write vectors) writes the
 extended-vocabulary checkpoint, vLLM restarts on it in-process with --share-gpu, the policy's projections
@@ -47,7 +47,7 @@ def main():
     d = AutoConfig.from_pretrained(base).hidden_size
     train.load_parts = lambda spec, init, model, base_vocab, dev: Parts(d)  # stand-in parts
     with tempfile.TemporaryDirectory() as tmp:
-        args = argparse.Namespace(base=base, init=None, lora_rank=8, part_tokens="stand-in", share_gpu=True, gpu_memory=0.6, max_model_len=2048,
+        args = argparse.Namespace(base=base, init=None, lora_rank=8, part_tokens="stand-in", share_gpu=True, gpu_memory=float(sys.argv[2]) if len(sys.argv) > 2 else 0.6, max_model_len=2048,
                                   max_tokens=16, seed=0)
         pol = train.Policy(args, torch.device("cuda"))
         sampler = train.VllmSampler(args, pol.end)  # started on the extended-vocabulary checkpoint below
