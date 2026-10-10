@@ -260,7 +260,7 @@ class Native:
         self.names = self.vpd.names
         self.C = self.vpd.C
         self._consts: dict = {}  # zero and one ablations, full plans, causal masks: built once, never written
-        self._rec: tuple = (None, None)  # (ids, the whole model's activations on them): the last text's, reused
+        self._rec: tuple = (None, None, None)  # the last text's whole-model run: (ids, (activations, states), states per batch size)
 
     # ---- graphs from answers and from VPD
 
@@ -468,7 +468,8 @@ class Native:
         E = {k: (next(it), next(it)) for k in edges}
         O = {n: (next(it), next(it), next(it)) for n in out}
         return {"B": B, "G": G, "complete": comp, "any_complete": any(complete), "all_complete": all(complete),
-                "readers": R, "writers": Wr, "edges": E, "out": O, "out_t": {n: [e[1] for e in v] for n, v in out.items()}, "order": order}
+                "readers": R, "writers": Wr, "edges": E, "out": O, "out_t": {n: [e[1] for e in v] for n, v in out.items()}, "order": order,
+                "readers_t": {n: [k[1] for k in rows] for n, rows in readers.items()}}
 
     def edge_weights(self, plan: dict, w: torch.Tensor) -> tuple[dict, dict]:
         """Per-edge strengths in plan order (a vector over every edge of every graph) -> run()'s ew and ow."""
@@ -483,7 +484,8 @@ class Native:
         return {k: w[v] for k, v in ie.items()}, {k: w[v] for k, v in io.items()}
 
     def run(self, ids: list[int], targets: list[int], plan: dict, u: dict, ur: dict, ew: dict | None = None, ow: dict | None = None,
-            qk: dict | None = None, patch: dict | None = None, record: dict | None = None, keep=None) -> torch.Tensor:
+            qk: dict | None = None, patch: dict | None = None, record: dict | None = None, keep=None, fill: dict | None = None,
+            reuse: tuple | None = None) -> torch.Tensor:
         """log q at the targets [B, len(targets), V] of each graph under one ablation: u[matrix] [Bu, S, C] and
         ur[matrix] [Bu, S] in [0, 1], Bu = B or 1, S = T or 1. A subcomponent outside a graph runs at mask u; a graph
         node at 1. An output reaches a reader through a declared edge of strength e at e + (1 - e) u (e = 1 unless ew
@@ -491,17 +493,23 @@ class Native:
         in full. qk[matrix] [Bu, T, C] gives a query or key node a strength e: it enters the attention pattern at
         e + (1 - e) u (1 without qk). The token embedding always enters in full; remainders W - V U run at ur.
         patch[matrix] = (mask [B, T, C], values [B, T, C]) replaces those subcomponents' activations (an interchange);
-        record, a dict, receives every matrix's activations [B, T, C] (keep: only those of these matrices)."""
+        record, a dict, receives every matrix's activations [B, T, C] (keep: only those of these matrices).
+
+        fill, a dict, receives the run's states at every position; reuse = (fill of a run of the same plan and
+        ablation on other tokens base, base): the model is causal, so before the first position where ids differ
+        from base every state is that run's (a patch there must give that run's values), and only the positions from
+        there on are computed (_stream1)."""
         import vpd_model
 
         tg = self.target
-        return torch.log_softmax((vpd_model.rms(self._stream(ids, targets, plan, u, ur, ew, ow, qk, patch, record, keep), tg.ln_f, tg.eps) @ tg.wte.T).float(), -1)
+        return torch.log_softmax((vpd_model.rms(self._stream(ids, targets, plan, u, ur, ew, ow, qk, patch, record, keep, fill, reuse), tg.ln_f, tg.eps)
+                                  @ tg.wte.T).float(), -1)
 
-    def _stream(self, ids, targets, plan, u, ur, ew, ow, qk, patch, record, keep) -> torch.Tensor:
+    def _stream(self, ids, targets, plan, u, ur, ew, ow, qk, patch, record, keep, fill=None, reuse=None) -> torch.Tensor:
         """run()'s residual stream at the targets [B, len(targets), d], before the final norm; a split plan's two batches
         run apart and are put back in order."""
         if "split" not in plan:
-            return self._stream1(ids, targets, plan, u, ur, ew, ow, qk, patch, record, keep)
+            return self._stream1(ids, targets, plan, u, ur, ew, ow, qk, patch, record, keep, fill, reuse)
         if ew is not None or ow is not None or qk is not None:
             raise ValueError("edge and query/key strengths need a plan of complete graphs or of others, not both")
         B = plan["B"]
@@ -512,10 +520,11 @@ class Native:
             return {n: v[idx] if v.shape[0] > 1 else v for n, v in d.items()}
 
         zt, recs = None, []
-        for idx, sub in plan["split"]:
+        for k, (idx, sub) in enumerate(plan["split"]):
             pt = None if patch is None else {n: (m[idx], v[idx] if v.shape[0] > 1 else v) for n, (m, v) in patch.items()}
             rec = None if record is None else {}
-            z = self._stream1(ids, targets, sub, rows(u, idx), rows(ur, idx), None, None, None, pt, rec, keep)
+            z = self._stream1(ids, targets, sub, rows(u, idx), rows(ur, idx), None, None, None, pt, rec, keep,
+                              None if fill is None else fill.setdefault(k, {}), None if reuse is None else (reuse[0][k], reuse[1]))
             if zt is None:
                 zt = torch.empty(B, *z.shape[1:], dtype=z.dtype, device=z.device)
             zt.index_copy_(0, idx, z)
@@ -530,13 +539,19 @@ class Native:
                 record[n] = full
         return zt
 
-    def _stream1(self, ids, targets, plan, u, ur, ew, ow, qk, patch, record, keep) -> torch.Tensor:
+    def _stream1(self, ids, targets, plan, u, ur, ew, ow, qk, patch, record, keep, fill=None, reuse=None) -> torch.Tensor:
         """_stream for a batch of complete graphs or of others. Two residual streams: x, every output at its scale, and
         xg, a complete graph's nodes' outputs in full. Only complete graphs read xg; when every graph is complete and
         each node's scale is its u (u = 1 everywhere, or no node held: plan "none") the two are the same numbers and one
         is computed. With u = 0 and the remainders off (the _zero() ablation) and no complete graph, nothing outside a
         graph writes to x: it stays the embedding, the same for every graph, and only the graphs' nodes and the
-        queries and keys are computed; the numbers left out are exact zeros."""
+        queries and keys are computed; the numbers left out are exact zeros.
+
+        With reuse, the products and the MLP run on the positions from s on only (s: the first that differs, moved
+        earlier to keep at least 64 rows per product, whose rows then come out as in the whole batch). Attention reads
+        the queries, keys and values before s, and the graph's writers their activations there, from the reused run's
+        states; the norms and graph readers run on tensors of the whole sequence's shape, zeros before s, whose rows
+        come out as in the whole run. So every number is the one the whole run gives."""
         import vpd_model
 
         tg, dev = self.target, self.dev
@@ -550,21 +565,48 @@ class Native:
         empty = u is zu and no_rest and not plan["any_complete"]
         same = plan["all_complete"] and qk is None and (u is self._one()[0] or plan.get("none", False))
         both = plan["any_complete"] and not same
+        s = 0
+        if reuse is not None and not empty and record is None:
+            base = reuse[1]
+            s = next((p for p in range(min(len(base), T)) if ids[p] != base[p]), min(len(base), T))
+            s = min(s, T - -(-64 // B), min(targets))
+            s = max(s, 0)
+        cache = reuse[0] if s > 0 else None
+        if empty:
+            fill = None
 
-        def ux(n):  # [B, T, C]
-            return u[n].expand(B, T, -1)
+        def full(key, w):  # [B, T, ...]: the reused run's first s positions, then w (the positions from s)
+            if cache is None:
+                if fill is not None:
+                    fill[key] = w
+                return w
+            c = cache[key]
+            return torch.cat([c[:, :s].expand(w.shape[0], *([-1] * (c.dim() - 1))), w], 1)
+
+        def padded(w):  # [B, T, ...]: zeros at the first s positions, then w. For a per-position step (a norm, a
+            # reader's inputs) whose results before s are not used: each position's result is the one the whole
+            # sequence gives, the shape being the same
+            return w if s == 0 else torch.cat([w.new_zeros(w.shape[0], s, *w.shape[2:]), w], 1)
+
+        def win(t):  # positions from s of a [*, T, ...] tensor (or one shared across positions)
+            return t if s == 0 or t.shape[1] == 1 else t[:, s:]
+
+        L = T - s
+
+        def ux(n):  # [B, L, C]
+            return win(u[n]).expand(B, L, -1)
 
         def scale(n):  # 1 in the graph (a query or key node's strength under qk), u outside
             if qk is not None and n in qk:
-                w = qk[n].expand(B, T, -1)
-                return torch.where(G[n], w + (1 - w) * ux(n), ux(n))
-            return torch.where(G[n], 1.0, ux(n))
+                w = win(qk[n]).expand(B, L, -1)
+                return torch.where(win(G[n]), w + (1 - w) * ux(n), ux(n))
+            return torch.where(win(G[n]), 1.0, ux(n))
 
         def uat(n, b, t, c):
             return u[n][b if u[n].shape[0] > 1 else torch.zeros_like(b), t if u[n].shape[1] > 1 else torch.zeros_like(t), c]
 
         def rest(n, z):
-            return None if no_rest else ur[n].expand(B, T)[..., None] * (z @ tg.site(n).delta_T)
+            return None if no_rest else win(ur[n]).expand(B, L)[..., None] * (z @ tg.site(n).delta_T)
 
         def plus(a, r):
             return a if r is None else a + r
@@ -574,20 +616,26 @@ class Native:
 
         def fixed(n, A):  # an activation tensor after patching, recorded
             if patch is not None and n in patch:
-                A = torch.where(patch[n][0], patch[n][1], A)
+                A = torch.where(win(patch[n][0]), win(patch[n][1]), A)
             if record is not None and (keep is None or n in keep):
                 record[n] = A.detach()
             return A
 
-        emb = tg.wte[torch.tensor(ids, device=dev)]
-        x = emb[None] if empty else emb[None].expand(B, T, -1).clone()  # every output at its scale
+        tok = torch.tensor(ids, device=dev)
+        emb = tg.wte[tok if s == 0 else tok[s:]]
+        x = emb[None] if empty else emb[None].expand(B, L, -1).clone()  # every output at its scale
         xg = x.clone() if both else x  # complete graphs: their nodes' outputs in full
         causal = self._const(("causal", T), lambda: torch.ones(T, T, dtype=torch.bool, device=dev).tril())
-        acts = {}
+        acts, whole = {}, {}
 
-        def writer_out(wn, wi, space_U):  # (b, t, the writer's activation, its u) of writer rows wi
+        def writer_acts(wn):  # a writer matrix's activations at every position
+            if wn not in whole:
+                whole[wn] = full(("a", wn), acts[wn])
+            return whole[wn]
+
+        def writer_out(wn, wi, space_U):  # (b, t, c, the writer's activation, its u) of writer rows wi
             b, t, c = Wr[wn][0][wi], Wr[wn][1][wi], Wr[wn][2][wi]
-            return b, t, c, acts[wn][b, t, c], uat(wn, b, t, c)
+            return b, t, c, writer_acts(wn)[b, t, c], uat(wn, b, t, c)
 
         def topup(n, width, contrib):  # each reader node's declared parents' extra share
             out = torch.zeros(len(R[n][0]), width, device=dev)
@@ -600,28 +648,49 @@ class Native:
             _, _, c, a, uw = writer_out(wn, wi, None)
             return (e * (1 - uw) * a)[:, None] * tg.site(wn).U[c]
 
-        def read_resid(n, norm, z, zg, xs):
+        def put(n, A, vals):  # reader nodes' activations into A (those at positions from s)
+            b, t, c = R[n]
+            if s == 0:
+                return A.index_put((b, t, c), vals)
+            key = ("_window", n, s)
+            if key not in plan:
+                ts = plan["readers_t"][n]
+                sel = [j for j, p in enumerate(ts) if p >= s]
+                plan[key] = (self._ints([sel, [ts[j] - s for j in sel]]) if sel else None)
+            if plan[key] is None:
+                return A
+            sel, tw = plan[key]
+            return A.index_put((b[sel], tw, c[sel]), vals[sel])
+
+        def read_resid(n, norm, z, zg, xs):  # xs: the stream at every position
             V = tg.site(n).V
-            A = torch.where(G[n] & comp, zg @ V, z @ V) if both else (z @ V).expand(B, T, -1)
+            A = torch.where(win(G[n]) & comp, zg @ V, z @ V) if both else (z @ V).expand(B, L, -1)
             if n in R:
                 b, t, c = R[n][0], R[n][1], R[n][2]
                 inp = rms(xs.expand(B, T, -1)[b, t] + topup(n, xs.shape[-1], resid_contrib), norm, eps)
-                A = A.index_put((b, t, c), (inp * V.T[c]).sum(-1))
+                A = put(n, A, (inp * V.T[c]).sum(-1))
             return A
+
+        def normed(x, norm):  # (the stream at every position (zeros before s), its norm at the positions computed)
+            xf = padded(x)
+            if empty:  # one row for every graph; the norm over all of them, as each graph's
+                return xf, rms(xf.expand(B, T, -1).contiguous(), norm, eps)[:1]
+            z = rms(xf, norm, eps)
+            return xf, (z if s == 0 else z[:, s:].contiguous())
 
         for i in range(tg.n_layer):
             nm = {k: site_name(i, k) for k in vpd_model.KINDS}
             n1, n2 = tg.norms[2 * i], tg.norms[2 * i + 1]
-            z = rms(x, n1, eps)
-            zg = rms(xg, n1, eps) if both else None
+            xf, z = normed(x, n1)
+            zg = normed(xg, n1)[1] if both else None
             for k in ("q_proj", "k_proj", "v_proj"):
-                acts[nm[k]] = fixed(nm[k], read_resid(nm[k], n1, z, zg, x))
-            qv = plus((acts[nm["q_proj"]] * scale(nm["q_proj"])) @ tg.site(nm["q_proj"]).U, rest(nm["q_proj"], z))
-            kv = plus((acts[nm["k_proj"]] * scale(nm["k_proj"])) @ tg.site(nm["k_proj"]).U, rest(nm["k_proj"], z))
+                acts[nm[k]] = fixed(nm[k], read_resid(nm[k], n1, z, zg, xf))
+            qv = full(("qv", i), plus((acts[nm["q_proj"]] * scale(nm["q_proj"])) @ tg.site(nm["q_proj"]).U, rest(nm["q_proj"], z)))
+            kv = full(("kv", i), plus((acts[nm["k_proj"]] * scale(nm["k_proj"])) @ tg.site(nm["k_proj"]).U, rest(nm["k_proj"], z)))
             Uv = tg.site(nm["v_proj"]).U
             rv = rest(nm["v_proj"], z)
-            vs = None if empty else plus((acts[nm["v_proj"]] * ux(nm["v_proj"])) @ Uv, rv)  # empty: u = 0, the values write nothing
-            vg = plus((acts[nm["v_proj"]] * scale(nm["v_proj"])) @ Uv, rv) if both else vs
+            vs = None if empty else full(("vs", i), plus((acts[nm["v_proj"]] * ux(nm["v_proj"])) @ Uv, rv))  # empty: u = 0, the values write nothing
+            vg = full(("vg", i), plus((acts[nm["v_proj"]] * scale(nm["v_proj"])) @ Uv, rv)) if both else vs
             heads = lambda y: y.view(B, T, H, hd).transpose(1, 2)  # noqa: E731
             no = nm["o_proj"]
             if not empty or no in R:
@@ -629,11 +698,12 @@ class Native:
                 P = ((q @ kk.transpose(-1, -2)) / math.sqrt(hd)).masked_fill(~causal, float("-inf")).softmax(-1)  # [B, H, T, T]
             att_s = None if empty else (P @ heads(vs)).transpose(1, 2).reshape(B, T, -1)
             att_g = (P @ heads(vg)).transpose(1, 2).reshape(B, T, -1) if both else att_s
+            att_sw = None if empty else (att_s if s == 0 else att_s[:, s:].contiguous())
             Vo = tg.site(no).V
             if both:
-                Ao = torch.where(G[no] & comp, att_g @ Vo, att_s @ Vo)
+                Ao = torch.where(win(G[no]) & comp, (att_g if s == 0 else att_g[:, s:].contiguous()) @ Vo, att_sw @ Vo)
             else:
-                Ao = torch.zeros(B, T, Vo.shape[1], device=dev) if empty else att_s @ Vo
+                Ao = torch.zeros(B, T, Vo.shape[1], device=dev) if empty else att_sw @ Vo
             if no in R:
                 b, t, c = R[no][0], R[no][1], R[no][2]
                 extra = torch.zeros(len(b), Vo.shape[0], device=dev)
@@ -644,17 +714,17 @@ class Native:
                     share = strength((rn, wn), wi, ew) * (1 - uw) * a
                     pat = P[wb, :, t[ri], wt]  # [E, H]: how much the reader's position attends to the writer's
                     extra = extra.index_add(0, ri, share[:, None] * (pat.repeat_interleave(hd, dim=1) * Uv[wc]))
-                Ao = Ao.index_put((b, t, c), (((torch.zeros(len(b), Vo.shape[0], device=dev) if empty else att_s[b, t]) + extra) * Vo.T[c]).sum(-1))
+                Ao = put(no, Ao, (((torch.zeros(len(b), Vo.shape[0], device=dev) if empty else att_s[b, t]) + extra) * Vo.T[c]).sum(-1))
             acts[no] = Ao = fixed(no, Ao)
             Uo = tg.site(no).U
-            ro = rest(no, att_s)
+            ro = rest(no, att_sw)
             if not empty:
                 x = plus(x + (Ao * ux(no)) @ Uo, ro)
             xg = plus(xg + (Ao * scale(no)) @ Uo, ro) if both else x
-            z2 = rms(x, n2, eps)
-            zg2 = rms(xg, n2, eps) if both else None
+            xf2, z2 = normed(x, n2)
+            zg2 = normed(xg, n2)[1] if both else None
             nf, nd = nm["c_fc"], nm["down_proj"]
-            acts[nf] = fixed(nf, read_resid(nf, n2, z2, zg2, x))
+            acts[nf] = fixed(nf, read_resid(nf, n2, z2, zg2, xf2))
             Uf = tg.site(nf).U
             rf = rest(nf, z2)
             pre_s = None if empty else plus((acts[nf] * ux(nf)) @ Uf, rf)
@@ -662,7 +732,7 @@ class Native:
             gs = None if empty else gelu(pre_s)
             Vd = tg.site(nd).V
             if both:
-                Ad = torch.where(G[nd] & comp, gelu(pre_g) @ Vd, gs @ Vd)
+                Ad = torch.where(win(G[nd]) & comp, gelu(pre_g) @ Vd, gs @ Vd)
             else:
                 Ad = torch.zeros(B, T, Vd.shape[1], device=dev) if empty else gs @ Vd
             if nd in R:
@@ -671,15 +741,16 @@ class Native:
                 def mlp_contrib(wn, wi, e):
                     _, _, wc, a, uw = writer_out(wn, wi, None)
                     return (e * (1 - uw) * a)[:, None] * Uf[wc]
-                pre = torch.zeros(len(b), Uf.shape[1], device=dev) if empty else pre_s[b, t]
-                Ad = Ad.index_put((b, t, c), (gelu(pre + topup(nd, Uf.shape[1], mlp_contrib)) * Vd.T[c]).sum(-1))
+                pre = torch.zeros(len(b), Uf.shape[1], device=dev) if empty else padded(pre_s)[b, t]
+                Ad = put(nd, Ad, (gelu(pre + topup(nd, Uf.shape[1], mlp_contrib)) * Vd.T[c]).sum(-1))
             acts[nd] = Ad = fixed(nd, Ad)
             Ud = tg.site(nd).U
             rd = rest(nd, gs)
             if not empty:
                 x = plus(x + (Ad * ux(nd)) @ Ud, rd)
             xg = plus(xg + (Ad * scale(nd)) @ Ud, rd) if both else x
-        zt = torch.where(comp[:, :, :1].expand(B, 1, 1), xg[:, targets], x[:, targets]) if both else x[:, targets].expand(B, -1, -1)
+        tw = [p - s for p in targets]
+        zt = torch.where(comp[:, :, :1].expand(B, 1, 1), xg[:, tw], x[:, tw]) if both else x[:, tw].expand(B, -1, -1)
         for wn, (b, t, wi) in O.items():
             key = ("_pos", wn, tuple(targets))
             if key not in plan:
@@ -703,13 +774,25 @@ class Native:
                                            {n: torch.ones(1, 1, device=self.dev) for n in self.names}))
 
     @torch.no_grad()
-    def _model_record(self, ids: list[int]) -> dict:
-        """Every matrix's activations [1, T, C] in the whole model on ids (the last text's kept)."""
+    def _model_record(self, ids: list[int]) -> tuple[dict, dict]:
+        """(every matrix's activations [1, T, C], the run's states for run(reuse=)) of the whole model on ids (the last
+        text's kept)."""
         if self._rec[0] != tuple(ids):
-            rec = {}
-            self.run(ids, [len(ids) - 1], self._full_plan(len(ids), 1), *self._one(), record=rec)
-            self._rec = (tuple(ids), rec)
+            rec, states = {}, {}
+            self.run(ids, [len(ids) - 1], self._full_plan(len(ids), 1), *self._one(), record=rec, fill=states)
+            self._rec = (tuple(ids), (rec, states), {1: states})
         return self._rec[1]
+
+    @torch.no_grad()
+    def _model_states(self, ids: list[int], B: int) -> dict:
+        """The states (run(fill=)) of B copies of the whole model on ids, for run(reuse=) by a batch of B (a batch of
+        another size can round its norms differently)."""
+        self._model_record(ids)
+        by = self._rec[2]
+        if B not in by:
+            by[B] = {}
+            self.run(ids, [len(ids) - 1], self._full_plan(len(ids), B), *self._one(), fill=by[B])
+        return by[B]
 
     def _node_arrays(self, g: Graph, kept: dict) -> dict:
         """A graph's nodes as matrix -> (positions, indices) int64 arrays; a complete graph's masks read once per
@@ -790,9 +873,20 @@ class Native:
             x = list(ids)
             x[p] = int(torch.multinomial(other[p - 1], 1, generator=g))
             probe.append(x)
+        lqs = []
+        with torch.no_grad():
+            for s0 in range(0, len(probe), chunk):
+                batch = torch.tensor(probe[s0:s0 + chunk], device=self.dev)
+                if len(batch) > 1:  # the logits at the last target alone: the numbers they have in the whole sequence's
+                    self.vpd.clear()
+                    logits = (self.target.hidden(batch)[:, last:last + 1] @ self.target.wte.T)[:, 0]
+                else:
+                    logits = self.vpd.target_forward(batch)[:, last]
+                lqs.append(torch.log_softmax(logits.float(), -1))
+            lqs = torch.cat(lqs).cpu()  # one transfer
         moved = []
         for s0 in range(0, len(probe), chunk):
-            lq = torch.log_softmax(self.vpd.target_forward(torch.tensor(probe[s0:s0 + chunk], device=self.dev))[:, last].float(), -1).cpu()
+            lq = lqs[s0:s0 + chunk]
             moved.append((base.exp() * (base - lq)).sum(-1).clamp_min(0))
         return torch.cat(moved), other
 
@@ -819,7 +913,7 @@ class Native:
         T, nb = len(ids), len(at[0])
         refs = [self.reference([x], targets) for x in prompts]
         zero, one = self._zero(), self._one()
-        rec_m = self._model_record(ids)
+        rec_m = self._model_record(ids)[0]
         total = torch.zeros(nb, device=self.dev)
         kept = {}
         for i, (x, logp) in enumerate(zip(prompts, refs)):
@@ -837,12 +931,14 @@ class Native:
                     if not mask:
                         total[s0:s0 + B] += w * self._kl(logp, self.run(x, targets, plan, *rest))
                         continue
-                    rec_g = {}
-                    self.run(ids, targets, plan, *rest, record=rec_g, keep=set(mask))
-                    lq = self.run(x, targets, plan, *rest, patch={n: (m, rec_g[n]) for n, m in mask.items()})
-                    lp = self.run(x, targets, self._full_plan(T, B), *one, patch={n: (m, rec_m[n].expand(B, -1, -1)) for n, m in mask.items()})
+                    rec_g, states = {}, {}
+                    self.run(ids, targets, plan, *rest, record=rec_g, keep=set(mask), fill=states)
+                    lq = self.run(x, targets, plan, *rest, patch={n: (m, rec_g[n]) for n, m in mask.items()}, reuse=(states, ids))
+                    lp = self.run(x, targets, self._full_plan(T, B), *one, patch={n: (m, rec_m[n].expand(B, -1, -1)) for n, m in mask.items()},
+                                  reuse=(self._model_states(ids, B), ids))
+                    del states
                     total[s0:s0 + B] += w * (lp.exp() * (lp - lq)).sum(-1).sum(-1) / LN2
-        free(self.dev)
+                free(self.dev)
         return (total / len(prompts)).tolist()
 
     @torch.no_grad()
@@ -866,7 +962,7 @@ class Native:
         if holds is None:
             return [e for _, e in plain]
         one = self._one()
-        rec = self._model_record(ids)
+        rec = self._model_record(ids)[0]
         g = torch.Generator(device="cpu").manual_seed(seed % (1 << 62))
         draws = torch.rand(len(plain), generator=g)
         out = [[e for _, e in plain] for _ in holds]
@@ -888,11 +984,12 @@ class Native:
                 mask[n] = torch.zeros(len(live), T, self.C[n], dtype=torch.bool, device=self.dev)
                 bi, ti, ci = self._ints(list(lst))
                 mask[n][bi, ti, ci] = True
-            lp = self.run(x, [last], self._full_plan(T, len(live)), *one, patch={n: (m, rec[n].expand(len(live), -1, -1)) for n, m in mask.items()})
+            lp = self.run(x, [last], self._full_plan(T, len(live)), *one, patch={n: (m, rec[n].expand(len(live), -1, -1)) for n, m in mask.items()},
+                          reuse=(self._model_states(ids, len(live)), ids))
             down = (lp[:, 0, top] < base[top]).tolist()  # log-probabilities both
             for b, j in enumerate(live):
                 out[j].append({**e, "hold": ks[j] + 1, "down": down[b]})
-        free(self.dev)
+            free(self.dev)
         return out
 
 
@@ -923,7 +1020,7 @@ class Native:
     def contributions(self, ids: list[int], targets: list[int]) -> dict:
         """Per matrix, how much each subcomponent writes at each position on the text: |activation| x |write vector|,
         [T, C]."""
-        rec = self._model_record(ids)
+        rec = self._model_record(ids)[0]
         return {n: rec[n][0].abs() * self.target.site(n).U.norm(dim=-1) for n in self.names}
 
     def adversarial(self, cases: list[tuple], steps: int = ADV_STEPS, step_size: float = ADV_STEP, seed: int = 0) -> list[float]:
