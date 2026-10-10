@@ -116,7 +116,7 @@ class Mlx:
 
         prompts = [self.tok.encode(c, add_special_tokens=False) for c in chats for _ in range(self.a.samples)]
         texts = batch_generate(self.model, self.tok, prompts, max_tokens=self.a.max_tokens, sampler=make_sampler(temp=0.7, top_p=0.95),
-                               completion_batch_size=self.a.batch, prefill_batch_size=min(self.a.batch, 4)).texts
+                               completion_batch_size=self.a.batch, prefill_batch_size=min(self.a.batch, 4), verbose=True).texts
         mx.clear_cache()
         return [texts[i * self.a.samples:(i + 1) * self.a.samples] for i in range(len(chats))]
 
@@ -148,7 +148,7 @@ def main():
     ap.add_argument("--gpu-memory", type=float, default=0.9, help="vLLM's share while it samples (it sleeps while the verifier scores)")
     ap.add_argument("--backend", choices=("vllm", "mlx"), default="vllm")
     ap.add_argument("--evidence-tokens", type=int, default=0, help="tokens of the answer's subcomponents in words after the report (0: none)")
-    ap.add_argument("--batch", type=int, default=8, help="MLX: replies generated at once (their KV caches share the Mac's memory)")
+    ap.add_argument("--batch", type=int, default=3, help="MLX: replies generated at once (each takes ~4.6 GB of the Mac's memory at 28k tokens)")
     ap.add_argument("--search-dir", type=Path, default=native.TEXTS / "search_heldout")
     ap.add_argument("--seed", type=int, default=1_000_003, help="the verifier's experiment seed (the evaluation's)")
     ap.add_argument("--out", type=Path, required=True)
