@@ -493,21 +493,27 @@ class Native:
     @torch.no_grad()
     def changes(self, ids: list[int], targets: list[int], n: int = CHANGES, seed: int = 0, chunk: int = 64) -> list[Changed]:
         """n changed prompts of a text, each the token at one position replaced by a draw from the model's prediction
-        there, the positions being 1 to the last target (those whose token the model predicts). The average they
-        estimate gives every position the same weight; they are drawn by importance sampling, half the probability
-        uniform and half in proportion to how far one draw at that position moves the model's prediction at the last
-        target (a probe per position), and each carries its weight (uniform probability / drawing probability), so
-        weighted means keep that average while more experiments fall where the prediction depends on the text."""
+        there among the other tokens (a changed prompt changes its token: a draw of the token already there tests
+        nothing, and where the model is sure of the text's token, as at every token it can copy from earlier, it would
+        be drawn nearly always, so experiments would never test what the prediction reads from such tokens), the
+        positions being 1 to the last target (those whose token the model predicts). The position is drawn half
+        uniformly and half in proportion to how far one such change there moves the model's prediction at the last
+        target (a probe per position), and every experiment counts the same: the measure is how the graph follows the
+        model on the changes the prediction responds to, with every position still tried. (Weighting each position
+        equally instead made the one token a prediction copies from count 1/T: an answer that left out the copy
+        scored as faithful.)"""
         last = max(targets)
         if last < 1:
             return [Changed(ids, 1.0) for _ in range(n)]
         g = torch.Generator(device="cpu").manual_seed(seed)
         probs = self.vpd.target_forward(torch.tensor([ids], device=self.dev))[0].float().softmax(-1).cpu()
         base = torch.log(probs[last].clamp_min(1e-30))
+        other = probs.clone()  # other[p - 1]: the prediction for position p without the text's token there
+        other[torch.arange(len(ids) - 1), torch.tensor(ids[1:])] = 0.0
         probe = []
         for p in range(1, last + 1):
             x = list(ids)
-            x[p] = int(torch.multinomial(probs[p - 1], 1, generator=g))
+            x[p] = int(torch.multinomial(other[p - 1], 1, generator=g))
             probe.append(x)
         moved = []
         for s0 in range(0, len(probe), chunk):
@@ -520,8 +526,8 @@ class Native:
         for _ in range(n):
             j = int(torch.multinomial(q, 1, generator=g))
             x = list(ids)
-            x[j + 1] = int(torch.multinomial(probs[j], 1, generator=g))
-            out.append(Changed(x, float(uniform[j] / q[j])))
+            x[j + 1] = int(torch.multinomial(other[j], 1, generator=g))
+            out.append(Changed(x, 1.0))
         return out
 
     def faithfulness(self, ids: list[int], targets: list[int], graphs: list[Graph] | list[list[Graph]], prompts: list[list[int]], seed: int = 0,
