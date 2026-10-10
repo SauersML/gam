@@ -14,7 +14,7 @@ way it leaves the accelerator's memory while the verifier scores. Only the text 
 
   prompted.py --base Qwen/Qwen3-32B-FP8 --rounds 3 --samples 2 --questions 50 --out DIR
   prompted.py --backend mlx --base mlx-community/Qwen3-30B-A3B-Thinking-2507-4bit --out DIR
-Outputs: DIR/eval_samples.jsonl (every answer and baseline with its score, program "search" (the starting answer),
+A rerun into the same DIR reuses the baselines' scores already there. Outputs: DIR/eval_samples.jsonl (every answer and baseline with its score, program "search" (the starting answer),
 "search_full" (the search's whole answer), "vpd", "empty", "prompted_r<k>"), DIR/summary.json.
 """
 
@@ -103,6 +103,9 @@ class Mlx:
     sleep() unloads the model (the verifier shares the Mac's memory) and wake() loads it again."""
 
     def __init__(self, a):
+        import mlx.core as mx
+
+        mx.set_cache_limit(2 << 30)  # freed buffers MLX keeps for reuse count in the process's footprint
         self.a = a
         self.wake()
 
@@ -165,7 +168,14 @@ def main():
             t = json.loads(p.read_text())
             t["path"] = str(p)
             tasks.append(t)
-    log = open(a.out / "eval_samples.jsonl", "a")
+    samples = a.out / "eval_samples.jsonl"
+    done = {}  # (question, baseline) -> its row, from an earlier run into the same directory
+    if samples.exists():
+        for line in open(samples):
+            r = json.loads(line)
+            if not r["program"].startswith("prompted"):
+                done[(r["behavior"], r["program"])] = r
+    log = open(samples, "a")
 
     def write(t, name, src, s, reply=None):
         s = {k: v for k, v in s.items() if k != "events"}
@@ -176,9 +186,13 @@ def main():
     for t in tasks:
         full = (a.search_dir / f"{t['id']}.py").read_text()
         src = split_answer(train.cut("```python\n" + full + "```", a.budget, count))[0]
-        s_search, s_full, s_empty, s_vpd = sc.score(t, [src, full, score.EMPTY, "vpd"], seed=a.seed)
-        for name, x, s in (("search", src, s_search), ("search_full", full, s_full), ("empty", score.EMPTY, s_empty), ("vpd", "vpd", s_vpd)):
-            write(t, name, x, s)
+        names = ("search", "search_full", "empty", "vpd")
+        if all((t["id"], n) in done for n in names):
+            s_search, s_full = done[(t["id"], "search")]["score"], done[(t["id"], "search_full")]["score"]
+        else:
+            s_search, s_full, s_empty, s_vpd = sc.score(t, [src, full, score.EMPTY, "vpd"], seed=a.seed)
+            for name, x, s in zip(names, (src, full, score.EMPTY, "vpd"), (s_search, s_full, s_empty, s_vpd)):
+                write(t, name, x, s)
         best[t["id"]] = (src, s_search)
         full_area[t["id"]] = score.key(s_full)[1]
     llm = (Mlx if a.backend == "mlx" else Vllm)(a)
