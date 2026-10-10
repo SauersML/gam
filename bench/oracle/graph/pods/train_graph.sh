@@ -4,12 +4,13 @@
 # (answers ranked by their curves, edge credit, refinement, the English credited by the frozen reader); evaluation on
 # held-out questions against the search's answers (texts/search_heldout), plus the swap test (another text's activations).
 # The native verifier runs vpd4l on the pod's GPU beside the policy. The Python is origin/main's bench/oracle/graph at launch.
-#   bench/oracle/graph/pods/train_graph.sh RL_HOURS   (env: RUN, BASE, SFT_STEPS, EVIDENCE=1 for the activation tokens, REVISE=1 for the verifier-feedback
+#   bench/oracle/graph/pods/train_graph.sh RL_HOURS   (env: RUN, BASE, SFT_STEPS, EVIDENCE= for no activation tokens (default on), REVISE=1 for the verifier-feedback
 #   revision round in RL and evaluation (synchronous loop), SAMPLES and BPS (RL group size, questions per step), CREDIT, CREDIT_ANSWERS, REFINE,
 #   INIT (an SFT adapter directory to start RL from, skipping describe and SFT), GPU, PRICE, VRAM)
 cd /Users/user/gam
 RH=${1:-1.0}
 RUN=${RUN:-a}
+EVIDENCE=${EVIDENCE-1}  # the activation tokens by default; EVIDENCE= for the text-only oracle
 S=/Users/user/mpd-data/scratch/glead/v5/src_graph_$RUN
 git fetch -q origin main && rm -rf "$S" && mkdir -p "$S" && git archive origin/main bench/oracle/graph bench/vpd_2951/vpd_model.py | tar -x -C "$S" && echo "python source $(git rev-parse --short=10 origin/main)" > "$S/SOURCE"
 G=$S/bench/oracle/graph
@@ -22,7 +23,7 @@ DESCRIBE="python describe.py $B/search --split train --out $O/described --base $
 SFT="mkdir -p $O/sft; python rl/train.py --mode sft $COMMON --samples 4 --sft-steps ${SFT_STEPS:-80} --batch 8 --out $O/sft --run-name graphsft > $O/sft/log 2>&1"
 if [ -n "$REVISE" ]; then LOOP="--revise"; else LOOP="--async"; fi
 RL="mkdir -p $O/rl; python rl/train.py --mode rl2 $LOOP --reader $COMMON --init $O/sft/adapter --samples ${SAMPLES:-8} --behaviors-per-step ${BPS:-4} --credit ${CREDIT:-16} --credit-answers ${CREDIT_ANSWERS:-2} --refine ${REFINE:-1} --steps 1000 --hours $RH --out $O/rl --run-name graphrl > $O/rl/log 2>&1"
-EVAL="mkdir -p $O/eval_rl $O/eval_swap; python rl/train.py --mode eval $COMMON ${REVISE:+--revise} --necessity --adversarial --init $O/rl/adapter --samples 4 --out $O/eval_rl --run-name graphrl > $O/eval_rl/log 2>&1"
+EVAL="mkdir -p $O/eval_rl $O/eval_swap; python rl/train.py --mode eval $COMMON ${REVISE:+--revise} --necessity --adversarial --transfer --init $O/rl/adapter --samples 4 --out $O/eval_rl --run-name graphrl > $O/eval_rl/log 2>&1"
 SWAP="python rl/train.py --mode eval $COMMON --init $O/rl/adapter --samples 4 --swap-evidence --no-baselines --out $O/eval_swap --run-name graphrl_swap > $O/eval_swap/log 2>&1"
 if [ -n "$INIT" ]; then  # an SFT adapter from an earlier run (its directory): RL starts from it, no describe or SFT
   RL=${RL/--init $O\/sft\/adapter/--init $INIT}

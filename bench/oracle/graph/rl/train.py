@@ -1149,11 +1149,11 @@ def shares(x: dict) -> dict:
     """An answer in the reporting terms: area (score.key: score.area over the question's range), kl (the whole answer's
     run-alone KL in bits), reproduces = 1 - kl / the empty graph's, bits (its description length), steps, nodes, edges."""
     if not x.get("valid", True) or not x.get("curve"):
-        return {"area": None, "kl": None, "reproduces": None, "bits": None, "steps": None, "nodes": None, "edges": None, "necessity": None, "adversarial": None, "shared_fraction": None}
+        return {"area": None, "kl": None, "reproduces": None, "bits": None, "steps": None, "nodes": None, "edges": None, "necessity": None, "adversarial": None, "shared_fraction": None, "transfer_area": None, "transfer_minus_own": None}
     kl, empty = x.get("kl_bits"), x["curve"][0][1]
     return {"area": score_module.key(x)[1], "kl": kl, "reproduces": 1.0 - kl / empty if empty else None, "bits": x.get("bits"), "steps": x.get("steps"),
             "nodes": x.get("nodes"), "edges": x.get("edges"), "necessity": x.get("necessity_kl_bits"), "adversarial": x.get("adversarial_kl_bits"),
-            "shared_fraction": x.get("shared_fraction")}
+            "shared_fraction": x.get("shared_fraction"), "transfer_area": x.get("transfer_area"), "transfer_minus_own": x.get("transfer_minus_own")}
 
 
 def relative_edges(source: str, task: dict) -> set:
@@ -1212,7 +1212,7 @@ def summarize(name: str, step: int, groups: list[tuple[dict, list, dict]], log) 
             row["adversarial_minus_vpd"] = best["adversarial_kl_bits"] - base["vpd"]["adversarial_kl_bits"]  # the same adversary, VPD's answer the reference
         rows.append(row)
         log.write(json.dumps(row) + "\n")
-    keys_ = ("area", "kl", "reproduces", "bits", "steps", "nodes", "edges", "necessity", "adversarial", "shared_fraction")
+    keys_ = ("area", "kl", "reproduces", "bits", "steps", "nodes", "edges", "necessity", "adversarial", "shared_fraction", "transfer_area", "transfer_minus_own")
     return {"questions": len(rows), "valid_fraction": mean([r["valid_fraction"] for r in rows]), "best_first_area": mean([r["best_first_area"] for r in rows]),
             "best_is_revision": mean([r["best_is_revision"] for r in rows]),
             "best_beats_search": mean([r.get("beats_search") for r in rows]), "best_beats_vpd": mean([r.get("beats_vpd") for r in rows]),
@@ -1276,6 +1276,14 @@ def evaluate(sets: dict[str, list[dict]], pol, sampler, score, args, adapter: Pa
                     x["adversarial_kl_bits"] = a
                     if "vpd" in base:
                         base["vpd"]["adversarial_kl_bits"] = v
+            if out and getattr(args, "transfer", False):  # each best answer's program on the next question's text
+                best = [min(mine, key=lambda m: score_module.key(m[1])) for _, mine, _ in out]
+                moved = score([{**item("```python\n" + src + "\n```", out[(g + 1) % len(out)][0], args.eval_seed), "options": None} for g, (src, _) in enumerate(best)])
+                for (_, x), y in zip(best, moved):
+                    x["transfer_area"] = score_module.key(y)[1] if y.get("valid", True) and y.get("curve") else None
+                for g, (_, x) in enumerate(best):
+                    there = best[(g + 1) % len(best)][1]
+                    x["transfer_minus_own"] = (x["transfer_area"] - score_module.key(there)[1]) if x["transfer_area"] is not None and there.get("curve") else None
             if out:
                 shared(out)
                 summary[name] = summarize(name, step, out, log)
@@ -1334,6 +1342,7 @@ def main():
     ap.add_argument("--micro", type=int, default=2)
     ap.add_argument("--sampler", choices=["auto", "vllm", "hf"], default="auto")
     ap.add_argument("--evidence", action="store_true", help="the oracle also reads the model's activations: one input token per position and weight matrix, the subcomponents' features weighted by their activations through the part-token maps (needs --part-tokens)")
+    ap.add_argument("--transfer", action="store_true", help="eval: run each question's best answer program on the next question's text (does the mechanism transfer, or only this text's circuit?)")
     ap.add_argument("--adversarial", action="store_true", help="eval: VPD's adversary (native.adversarial), one shared across the set for the oracle's best answers and one for VPD's answers; reported, never trained on")
     ap.add_argument("--necessity", action="store_true", help="eval: also measure each answer's necessity (native.necessity: the model with the answer's subcomponents removed)")
     ap.add_argument("--swap-evidence", action="store_true", help="eval: give each held-out question another text's activations (if answers do not get worse, the oracle does not read them)")

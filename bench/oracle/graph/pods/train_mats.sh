@@ -26,6 +26,6 @@ CMD="mkdir -p $O/sft $O/eval_sft $O/rl $O/eval_rl $O/eval_swap; cd $G; $PY part_
 { $SFT; }; \
 $PY rl/train.py --mode eval $COMMON --revise --necessity --init $A --samples 4 --out $O/eval_sft --run-name ${N}_sft > $O/eval_sft/log 2>&1; \
 $PY rl/train.py --mode rl2 --revise --reader $COMMON --init $A --samples ${SAMPLES:-6} --behaviors-per-step ${BPS:-2} --credit 8 --credit-answers 1 --refine 0 --steps 1000 --hours $RH --out $O/rl --run-name ${N}_rl > $O/rl/log 2>&1; \
-$PY rl/train.py --mode eval $COMMON --revise --necessity --adversarial --init $O/rl/adapter --samples 4 --out $O/eval_rl --run-name ${N}_rl > $O/eval_rl/log 2>&1; \
+$PY rl/train.py --mode eval $COMMON --revise --necessity --adversarial --transfer --init $O/rl/adapter --samples 4 --out $O/eval_rl --run-name ${N}_rl > $O/eval_rl/log 2>&1; \
 ${EVIDENCE:+$SWAP} echo done"
 MATS_GPUS=1 MATS_BUILD=0 bench/mats/mats-run $N 8 ${MEM:-40} $(python3 -c "print(round($RH + 4.0, 2))") -- bash -c "$CMD"
