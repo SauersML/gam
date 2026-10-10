@@ -45,9 +45,10 @@ env.agent.runtime.type = "subprocess"
 [orchestrator.eval]  # before training and every 20 steps
 interval = 20
 
-[orchestrator.eval.sampling]
+[orchestrator.eval.sampling]  # evaluation goes through vLLM's chat completions, not the renderer: the same template asked for
 max_completion_tokens = 4096
 temperature = 1.0
+chat_template_kwargs = { enable_thinking = false }
 
 [[orchestrator.eval.source]]
 name = "graph-oracle-heldout"
