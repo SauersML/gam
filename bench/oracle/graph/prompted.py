@@ -43,21 +43,27 @@ ASK = ("You are given an answer to the question above, found by a search, and th
 
 LOOKUP = ("After the report: the answer's subcomponents, each with its layer and weight matrix, its position and token in "
           "the text, and for an attention or MLP output the tokens its write vector raises most at the prediction (its "
-          "logit lens).")
+          "logit lens); then other subcomponents the search found, in the order it ranked them, which the answer may use.")
 
 
-def evidence(nat, t, src, budget, count) -> str:
-    """The answer's subcomponents in words (describe.words), in the order its steps add them, while within `budget`
-    tokens (count: text -> token ids); "" when the answer does not run."""
-    import describe
+def nodes_of(t, src) -> list:
+    """An answer's nodes (weight matrix, position, subcomponent) in the order its steps add them; [] when it does not run."""
     import mech
 
     ir = mech.trace_inline(src, "vpd4l", t)
     if not ir["valid"]:
-        return ""
+        return []
     g = ir["graph"]
-    nodes = [(native.site_name(layer, kind), pos, c) for layer, kind, pos, c in
-             (g["nodes"][i] for i in sorted(range(len(g["nodes"])), key=lambda i: g["node_step"][i]))]
+    return [(native.site_name(layer, kind), pos, c) for layer, kind, pos, c in
+            (g["nodes"][i] for i in sorted(range(len(g["nodes"])), key=lambda i: g["node_step"][i]))]
+
+
+def words_of(nat, t, nodes, budget, count) -> str:
+    """Nodes in words (describe.words), one line each in the answer's own notation, while within `budget` tokens
+    (count: text -> token ids)."""
+    import describe
+    import mech
+
     strings = mech.behavior_tokens(t, "vpd4l")["sequences"][0][1]
     lens = nat.lens([nd for nd in nodes if isinstance(nd[2], int)])
     short = {v: k for k, v in mech.SITES.items()}
@@ -73,6 +79,15 @@ def evidence(nat, t, src, budget, count) -> str:
     return "\n".join(lines)
 
 
+def final(text: str) -> str:
+    """The answer part of a reasoning model's reply: after Qwen's </think> or in gpt-oss's final channel; "" for a reply
+    cut off while reasoning."""
+    for mark in ("</think>", "<|channel|>final<|message|>"):
+        if mark in text:
+            return text.split(mark)[-1]
+    return ""
+
+
 class Vllm:
     """Sampling with vLLM on CUDA; sleep() moves the weights to host memory and drops the KV cache."""
 
@@ -81,9 +96,9 @@ class Vllm:
         from vllm import LLM, SamplingParams
 
         torch.cuda.empty_cache()  # the verifier's cached blocks, before vLLM sizes its share
-        self.llm = LLM(model=a.base, tensor_parallel_size=a.tp, max_model_len=32768, gpu_memory_utilization=a.gpu_memory, kv_cache_dtype="fp8",
-                       seed=0, enable_sleep_mode=True)
-        self.params = SamplingParams(n=a.samples, temperature=0.7, top_p=0.95, max_tokens=a.max_tokens)
+        self.llm = LLM(model=a.base, tensor_parallel_size=a.tp, max_model_len=a.max_tokens + 24576, gpu_memory_utilization=a.gpu_memory,
+                       kv_cache_dtype=a.kv_dtype, seed=0, enable_sleep_mode=True)
+        self.params = SamplingParams(n=a.samples, temperature=0.7, top_p=0.95, max_tokens=a.max_tokens, skip_special_tokens=False)
 
     def generate(self, chats):
         return [[c.text for c in o.outputs] for o in self.llm.generate(chats, self.params, use_tqdm=False)]
@@ -147,7 +162,9 @@ def main():
     ap.add_argument("--tp", type=int, default=1, help="GPUs for the model (tensor parallel)")
     ap.add_argument("--gpu-memory", type=float, default=0.9, help="vLLM's share while it samples (it sleeps while the verifier scores)")
     ap.add_argument("--backend", choices=("vllm", "mlx"), default="vllm")
-    ap.add_argument("--evidence-tokens", type=int, default=0, help="tokens of the answer's subcomponents in words after the report (0: none)")
+    ap.add_argument("--evidence-tokens", type=int, default=0, help="tokens of the answer's subcomponents in words after the report, and "
+                    "as many of the search's other subcomponents (0: none)")
+    ap.add_argument("--kv-dtype", default="fp8", help="vLLM's KV cache type (auto for gpt-oss)")
     ap.add_argument("--batch", type=int, default=3, help="MLX: replies generated at once (each takes ~4.6 GB of the Mac's memory at 28k tokens)")
     ap.add_argument("--search-dir", type=Path, default=native.TEXTS / "search_heldout")
     ap.add_argument("--seed", type=int, default=1_000_003, help="the verifier's experiment seed (the evaluation's)")
@@ -182,7 +199,7 @@ def main():
         log.write(json.dumps({"behavior": t["id"], "program": name, "step": 0, "source": src, "score": s, **({"reply": reply} if reply is not None else {})}) + "\n")
         log.flush()
 
-    best, full_area = {}, {}
+    best, full_area, search_nodes = {}, {}, {}
     for t in tasks:
         full = (a.search_dir / f"{t['id']}.py").read_text()
         src = split_answer(train.cut("```python\n" + full + "```", a.budget, count))[0]
@@ -195,22 +212,27 @@ def main():
                 write(t, name, x, s)
         best[t["id"]] = (src, s_search)
         full_area[t["id"]] = score.key(s_full)[1]
+        search_nodes[t["id"]] = nodes_of(t, full) if a.evidence_tokens else []
     llm = (Mlx if a.backend == "mlx" else Vllm)(a)
     summary = {"search": sorted(score.key(best[t["id"]][1])[1] for t in tasks), "search_full": sorted(full_area.values())}
     for r in range(1, a.rounds + 1):
         chats = []
         for t in tasks:
             src = best[t["id"]][0]
-            ev = evidence(sc.nat, t, src, a.evidence_tokens, count) if a.evidence_tokens else ""
-            ask = render(t) + "\n\n" + ASK + (" " + LOOKUP if ev else "") + "\n\nThe answer:\n```python\n" + src + "```\n\n" + train.feedback(best[t["id"]][1])
-            chats.append(tok.apply_chat_template([{"role": "user", "content": ask + ("\n\nThe answer's subcomponents:\n" + ev if ev else "")}],
-                                                 add_generation_prompt=True, enable_thinking=True, tokenize=False))
+            ask = render(t) + "\n\n" + ASK + (" " + LOOKUP if a.evidence_tokens else "") + "\n\nThe answer:\n```python\n" + src + "```\n\n" + train.feedback(best[t["id"]][1])
+            if a.evidence_tokens:
+                used = nodes_of(t, src)
+                seen = set(used)
+                ask += ("\n\nThe answer's subcomponents:\n" + words_of(sc.nat, t, used, a.evidence_tokens, count)
+                        + "\n\nOther subcomponents the search found:\n" + words_of(sc.nat, t, [n for n in search_nodes[t["id"]] if n not in seen], a.evidence_tokens, count))
+            chats.append(tok.apply_chat_template([{"role": "user", "content": ask}], add_generation_prompt=True, enable_thinking=True,
+                                                 reasoning_effort="high", tokenize=False))
         clock = time.time()
         outs = llm.generate(chats)
         sampled = time.time() - clock
         llm.sleep()  # the accelerator is the verifier's while it scores
         for t, texts in zip(tasks, outs):
-            srcs = [split_answer(x.split("</think>")[-1])[0] if "</think>" in x else "" for x in texts]
+            srcs = [split_answer(final(x))[0] if final(x) else "" for x in texts]
             for src, x, s in zip(srcs, texts, sc.score(t, srcs, seed=a.seed)):
                 write(t, f"prompted_r{r}", src, s, reply=x)
                 if score.key(s) < score.key(best[t["id"]][1]):
