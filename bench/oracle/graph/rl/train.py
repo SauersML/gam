@@ -514,9 +514,9 @@ def read_answers(root) -> dict[str, str]:
 
 
 def refuse_heldout(paths) -> None:
-    """Held-out answers (search_heldout/) are evaluation baselines: no training input may come from that directory."""
+    """Held-out answers (search_heldout/, search_hard/) are evaluation baselines: no training input may come from those directories."""
     for path in paths:
-        if path and "search_heldout" in Path(path).expanduser().resolve().parts:
+        if path and {"search_heldout", "search_hard"} & set(Path(path).expanduser().resolve().parts):
             raise SystemExit(f"{path}: held-out answers are for evaluation only (--search-heldout), never training")
 
 
@@ -1364,6 +1364,8 @@ def main():
     ap.add_argument("--run-name", help="the run's name in runs/oracle/<task>.<run>.json (default: the --out directory's name)")
     ap.add_argument("--search", help="bootstrap search answers of the training questions (DIR/<task>.py, native.py search, or <task>.answer.txt): SFT answers")
     ap.add_argument("--search-heldout", help="the search's answers to the held-out questions: evaluation baselines only")
+    ap.add_argument("--eval-split", choices=("heldout", "hard"), default="heldout", help="the questions evaluation asks (text.py's hard split: "
+                    "predictions the text does not suggest; its search answers in texts/search_hard)")
     ap.add_argument("--revise", action="store_true", help="rl2: a second round in which the oracle revises each answer after reading the verifier's report on it (revise_groups)")
     ap.add_argument("--reader", action="store_true", help="rl2: credit each answer's English by the frozen base reader's bits (reader.py)")
     ap.add_argument("--credit", type=int, default=16, help="rl2: subcomponent names whose drop is scored per answer for per-token credit (0: episode advantages only)")
@@ -1423,11 +1425,11 @@ def main():
         READER.append(make_reader(args, pol, sampler))
     root = Path(args.behaviors)
     pool = behaviors(root, args.model, "train")
-    sets = {"heldout": behaviors(root, args.model, "heldout")}
+    sets = {args.eval_split: behaviors(root, args.model, args.eval_split)}
     if args.eval_behaviors:  # the first N in text order (arbitrary Pile rows), the same at every evaluation and the ones the search answers first
         sets = {k: sorted(v, key=lambda b: int(b["id"][4:]) if b["id"][4:].isdigit() else 0)[:args.eval_behaviors] for k, v in sets.items()}
     if args.swap_evidence:  # each held-out question reads the activations of the next held-out text at least as long, cut to its length
-        held = sets["heldout"]
+        held = sets[args.eval_split]
         pol.swap = {}
         for i, b in enumerate(held):
             T = len(b["prompts"][0]["token_ids"])
