@@ -1100,14 +1100,26 @@ def task_seed(task_id: str) -> int:
     return int.from_bytes(task_id.encode()[-8:].rjust(8, b"\0"), "big") % (1 << 31)
 
 
+def claim(path: Path) -> bool:
+    """Whether this process takes the text whose claim file is PATH, created here exclusively: processes sharing an
+    output directory, on one machine or several, split its texts between them (a claim left by a process that died
+    keeps its text skipped until the file is removed)."""
+    try:
+        path.open("x").close()
+        return True
+    except FileExistsError:
+        return False
+
+
 def search(split: str, n: int, offset: int = 0, stride: int = 1, out: Path | None = None, reverse: bool = False, nodes_from: str = "ig") -> None:
-    """Native.ordered on the split's texts offset, offset + stride, ... of its first n -> OUT/<id>.py (the answer) and
-    .json (each step's score and the seconds); OUT defaults to texts/search (train) or texts/search_<split>."""
+    """Native.ordered on the split's texts offset, offset + stride, ... of its first n, each text not yet answered or
+    claimed (claim) -> OUT/<id>.py (the answer) and .json (each step's score and the seconds); OUT defaults to
+    texts/search (train) or texts/search_<split>."""
     nat = Native()
     out = Path(out) if out else TEXTS / ("search" if split == "train" else f"search_{split}")
     out.mkdir(parents=True, exist_ok=True)
     for p in (lambda ps: ps[::-1] if reverse else ps)(tasks(split)[:n][offset::stride]):  # reverse: last text first (to meet another machine working forward)
-        if (out / f"{p.stem}.json").exists():
+        if (out / f"{p.stem}.json").exists() or not claim(out / f".{p.stem}.claim"):
             continue
         t0 = time.time()
         ids, targets = text(p)
