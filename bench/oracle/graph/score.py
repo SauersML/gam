@@ -180,8 +180,9 @@ class Scorer:
         answer's steps)}. An answer's description length is its code's
         (code_bits; library entries it uses are given, their definitions not counted); its first k steps are the same
         program with its returned list cut to k entries (prefix_code). The program runs on every changed prompt
-        (instances), its graph there tested there. The source "vpd" stands for VPD's own answer (complete, one step;
-        its description length the listing of its subcomponents, Graph.bits)."""
+        (instances), its graph there tested there. The source "vpd" stands for VPD's own answer: its subcomponents ranked
+        by causal importance x how much each writes (native.vpd_steps), the k-th step the top 2^(k-1), each complete, its description length the listing of its
+        subcomponents (Graph.bits)."""
         import mech
 
         prompt = task["prompts"][0]
@@ -198,10 +199,11 @@ class Scorer:
             if src == "vpd" and not nat.has_importance:
                 out.append({"valid": False, "error": "VPD's causal-importance network is not on this machine", "steps": 0, "explanation": "", "notes": []})
                 continue
-            if src == "vpd":
-                g = nat.vpd_answer(ids)
-                rows.append((j, g.bits(positions, total), [g] * P))
-                out.append({"valid": True, "error": None, "steps": 1, "explanation": "", "notes": [], "base": g})
+            if src == "vpd":  # VPD's answer, its subcomponents in order of causal importance (native.vpd_steps)
+                steps = nat.vpd_steps(ids, targets)
+                for g in steps:
+                    rows.append((j, g.bits(positions, total), [g] * P))
+                out.append({"valid": True, "error": None, "steps": len(steps), "explanation": "", "notes": [], "base": steps[-1]})
                 continue
             ir = mech.trace(src, "vpd4l", behavior=task)
             out.append({"valid": ir["valid"], "error": ir.get("error"), "steps": ir["graph"].get("steps", 0), "explanation": ir["graph"].get("explanation", ""),

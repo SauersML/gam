@@ -260,6 +260,35 @@ class Native:
         zero, complete."""
         return Graph(masks={n: m > 0 for n, m in self.importance(ids).items()})
 
+    def vpd_steps(self, ids: list[int], targets: list[int]) -> list[Graph]:
+        """VPD's answer as steps, most important first: its subcomponents with causal importance above zero, ranked by
+        importance x how much each writes there on the text (native.contributions; many are tied at importance 1),
+        those at the predicted positions first (VPD's mask covers every position's prediction; this one is computed
+        mostly at its own position), over all matrices, the k-th step the top 2^(k-1) of them (the last step all), each complete. Its
+        first steps are VPD's own short answers, comparable with any answer's prefixes."""
+        ci = self.importance(ids)
+        writes = self.contributions(ids, targets)
+        flat = torch.cat([m.flatten() for m in ci.values()])
+        at_target = torch.cat([torch.isin(torch.arange(m.shape[0], device=m.device), torch.tensor(targets, device=m.device))[:, None].expand_as(m).flatten() for m in ci.values()])
+        rank = torch.cat([(ci[n] * writes[n]).flatten() for n in ci])
+        rank = rank + at_target * (rank.max() + 1)  # the predicted position's subcomponents first, each group by its own order
+        order = rank.argsort(descending=True)[: int((flat > 0).sum())]
+        sizes, n = [], 1
+        while n < len(order):
+            sizes.append(n)
+            n *= 2
+        sizes.append(len(order))
+        names, offsets, o = list(ci), [], 0
+        for name in names:
+            offsets.append(o)
+            o += ci[name].numel()
+        steps = []
+        for k in sizes:
+            keep = torch.zeros_like(flat, dtype=torch.bool)
+            keep[order[:k]] = True
+            steps.append(Graph(masks={name: keep[off:off + ci[name].numel()].view_as(ci[name]) for name, off in zip(names, offsets)}))
+        return steps
+
     def everything(self, T: int) -> Graph:
         """Every subcomponent at every position, complete: the model itself."""
         return Graph(masks={n: torch.ones(T, self.C[n], dtype=torch.bool, device=self.dev) for n in self.names})
