@@ -117,6 +117,9 @@ class Scorer:
         graphs, owners, own_bits, groups = [self.native.Graph()], [None], [0.0], [[]]  # every graph to run, its answer, description length, steps
         out = []
         for j, src in enumerate(sources):
+            if src == "vpd" and not nat.has_importance:
+                out.append({"valid": False, "error": "VPD's causal-importance network is not on this machine", "steps": 0, "explanation": "", "notes": []})
+                continue
             if src == "vpd":
                 g = nat.vpd_answer(ids)
                 graphs.append(g)
@@ -176,6 +179,8 @@ class Scorer:
         for j, (task, src) in enumerate(zip(tasks, sources)):
             prompt = task["prompts"][0]
             ids, targets = prompt["token_ids"], prompt["target_positions"]
+            if src == "vpd" and not self.nat.has_importance:
+                continue
             if src == "vpd":
                 g = self.nat.vpd_answer(ids)
             else:

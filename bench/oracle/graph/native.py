@@ -243,6 +243,11 @@ class Native:
         self.vpd.clear()
         return out
 
+    @property
+    def has_importance(self) -> bool:
+        """Whether VPD's causal-importance network is loaded (a pod has only the subcomponents, UV)."""
+        return self.vpd.ci_fn is not None
+
     def vpd_answer(self, ids: list[int]) -> Graph:
         """VPD's own answer, for comparison: at every position the subcomponents whose causal importance there is above
         zero, complete."""
