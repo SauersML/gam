@@ -164,7 +164,7 @@ def main():
     ap.add_argument("--backend", choices=("vllm", "mlx"), default="vllm")
     ap.add_argument("--evidence-tokens", type=int, default=0, help="tokens of the answer's subcomponents in words after the report, and "
                     "as many of the search's other subcomponents (0: none)")
-    ap.add_argument("--kv-dtype", default="fp8", help="vLLM's KV cache type (auto for gpt-oss)")
+    ap.add_argument("--kv-dtype", default="auto", help="vLLM's KV cache type (fp8 halves it on Ada and Hopper; its kernels fail to build on RTX PRO 4500 Blackwell)")
     ap.add_argument("--batch", type=int, default=3, help="MLX: replies generated at once (each takes ~4.6 GB of the Mac's memory at 28k tokens)")
     ap.add_argument("--split", choices=("heldout", "hard"), default="heldout")
     ap.add_argument("--search-dir", type=Path, help="the search's answers (default texts/search_<split>)")
