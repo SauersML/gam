@@ -18,18 +18,47 @@ DEVICE = None  # the native scorer's device (its default when None)
 _SCORER = []
 
 
-def native(items: list[dict]) -> list[dict]:
+WORKERS = 1  # processes scoring at once (train.py --score-workers): the verifier's forward passes leave a GPU mostly idle one process at a time
+_WORKER = []
+
+
+def _start(device):
     import score
 
-    if not _SCORER:
-        _SCORER.append(score.Scorer(DEVICE))
+    _WORKER.append(score.Scorer(device))
+
+
+def _job(job):
+    behavior, sources, seed, necessity = job
+    return _WORKER[0].score(behavior, sources, seed, necessity=necessity)
+
+
+def native(items: list[dict]) -> list[dict]:
+    """score.Scorer.score over items, one call per (task, seed, necessity) group of answers; with WORKERS > 1 the
+    groups, cut into as many chunks of answers as fill the workers, go to that many processes (spawned per call and
+    closed after, so a sampler sharing the GPU gets its memory back)."""
+    import math
+
+    import score
+
     groups = {}
     for k, it in enumerate(items):
         groups.setdefault((it["behavior"]["path"], it.get("seed", 0), bool((it.get("options") or {}).get("necessity"))), []).append(k)
+    size = max(1, math.ceil(len(items) / WORKERS)) if WORKERS > 1 else len(items)
+    chunks = [(seed, nec, ks[i:i + size]) for (_, seed, nec), ks in groups.items() for i in range(0, len(ks), size)]
+    jobs = [(items[ks[0]]["behavior"], [items[k]["source"] for k in ks], seed, nec) for seed, nec, ks in chunks]
+    if WORKERS > 1 and len(jobs) > 1:
+        import multiprocessing
+
+        with multiprocessing.get_context("spawn").Pool(min(WORKERS, len(jobs)), initializer=_start, initargs=(DEVICE,)) as pool:
+            results = pool.map(_job, jobs, chunksize=1)
+    else:
+        if not _SCORER:
+            _SCORER.append(score.Scorer(DEVICE))
+        results = [_SCORER[0].score(b, srcs, seed, necessity=nec) for b, srcs, seed, nec in jobs]
     out = [None] * len(items)
-    for (_, seed, _), ks in groups.items():
-        for k, r in zip(ks, _SCORER[0].score(items[ks[0]]["behavior"], [items[k]["source"] for k in ks], seed,
-                                              necessity=bool((items[ks[0]].get("options") or {}).get("necessity")))):
+    for (_, _, ks), rs in zip(chunks, results):
+        for k, r in zip(ks, rs):
             out[k] = r
     return out
 

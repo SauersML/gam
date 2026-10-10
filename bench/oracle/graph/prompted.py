@@ -125,6 +125,32 @@ def responses(nat, t, budget, count) -> str:
     return "\n".join(lines)
 
 
+_SCORER = None
+
+
+def _start_worker():
+    global _SCORER
+    _SCORER = score.Scorer()
+
+
+def _score_job(job):
+    """One question's answers scored in a worker (score.Scorer.score); events left out (they stay with the worker)."""
+    t, srcs, seed = job
+    return [{k: v for k, v in s.items() if k not in ("events", "base")} for s in _SCORER.score(t, srcs, seed=seed)]
+
+
+def score_all(sc, jobs: list, seed: int, workers: int) -> list:
+    """Each (question, answers) job's scores, in order: in this process, or with workers > 1 in that many processes
+    (the verifier's forward passes leave a GPU mostly idle, one process at a time; the pool closes after, so vLLM gets
+    its memory back)."""
+    if workers <= 1 or len(jobs) <= 1:
+        return [sc.score(t, srcs, seed=seed) for t, srcs in jobs]
+    import multiprocessing
+
+    with multiprocessing.get_context("spawn").Pool(min(workers, len(jobs)), initializer=_start_worker) as pool:
+        return pool.map(_score_job, [(t, srcs, seed) for t, srcs in jobs], chunksize=1)
+
+
 def final(text: str) -> str:
     """The answer part of a reasoning model's reply: after Qwen's </think> or in gpt-oss's final channel; "" for a reply
     cut off while reasoning."""
@@ -210,6 +236,7 @@ def main():
     ap.add_argument("--backend", choices=("vllm", "mlx"), default="vllm")
     ap.add_argument("--evidence-tokens", type=int, default=0, help="tokens of the answer's subcomponents in words after the report, and "
                     "as many of the search's other subcomponents (0: none)")
+    ap.add_argument("--workers", type=int, default=1, help="processes scoring answers in parallel (a pod: 8; the Mac: 1)")
     ap.add_argument("--kv-dtype", default="auto", help="vLLM's KV cache type (fp8 halves it on Ada and Hopper; its kernels fail to build on RTX PRO 4500 Blackwell)")
     ap.add_argument("--batch", type=int, default=3, help="MLX: replies generated at once (each takes ~4.6 GB of the Mac's memory at 28k tokens)")
     ap.add_argument("--split", choices=("heldout", "hard"), default="heldout")
@@ -248,16 +275,20 @@ def main():
         log.flush()
 
     best, full_area, search_nodes, respond = {}, {}, {}, {}
+    names = ("search", "search_full", "empty", "vpd")
+    starts = {}
     for t in tasks:
         full = (a.search_dir / f"{t['id']}.py").read_text()
-        src = split_answer(train.cut("```python\n" + full + "```", a.budget, count))[0]
-        names = ("search", "search_full", "empty", "vpd")
-        if all((t["id"], n) in done for n in names):
-            s_search, s_full = done[(t["id"], "search")]["score"], done[(t["id"], "search_full")]["score"]
-        else:
-            s_search, s_full, s_empty, s_vpd = sc.score(t, [src, full, score.EMPTY, "vpd"], seed=a.seed)
-            for name, x, s in zip(names, (src, full, score.EMPTY, "vpd"), (s_search, s_full, s_empty, s_vpd)):
-                write(t, name, x, s)
+        starts[t["id"]] = (split_answer(train.cut("```python\n" + full + "```", a.budget, count))[0], full)
+    pending = [t for t in tasks if not all((t["id"], n) in done for n in names)]
+    scored = score_all(sc, [(t, [*starts[t["id"]], score.EMPTY, "vpd"]) for t in pending], a.seed, a.workers)
+    for t, ss in zip(pending, scored):
+        for name, x, s in zip(names, (*starts[t["id"]], score.EMPTY, "vpd"), ss):
+            write(t, name, x, s)
+            done[(t["id"], name)] = {"score": s}
+    for t in tasks:
+        src, full = starts[t["id"]]
+        s_search, s_full = done[(t["id"], "search")]["score"], done[(t["id"], "search_full")]["score"]
         best[t["id"]] = (src, s_search)
         full_area[t["id"]] = score.key(s_full)[1]
         search_nodes[t["id"]] = nodes_of(t, full) if a.evidence_tokens else []
@@ -281,9 +312,9 @@ def main():
         outs = llm.generate(chats)
         sampled = time.time() - clock
         llm.sleep()  # the accelerator is the verifier's while it scores
-        for t, texts in zip(tasks, outs):
-            srcs = [split_answer(final(x))[0] if final(x) else "" for x in texts]
-            for src, x, s in zip(srcs, texts, sc.score(t, srcs, seed=a.seed)):
+        srcs_all = [[split_answer(final(x))[0] if final(x) else "" for x in texts] for texts in outs]
+        for t, texts, srcs, ss in zip(tasks, outs, srcs_all, score_all(sc, list(zip(tasks, srcs_all)), a.seed, a.workers)):
+            for src, x, s in zip(srcs, texts, ss):
                 write(t, f"prompted_r{r}", src, s, reply=x)
                 if score.key(s) < score.key(best[t["id"]][1]):
                     best[t["id"]] = (src, s)

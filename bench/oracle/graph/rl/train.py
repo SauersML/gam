@@ -1368,6 +1368,7 @@ def main():
     ap.add_argument("--run-name", help="the run's name in runs/oracle/<task>.<run>.json (default: the --out directory's name)")
     ap.add_argument("--search", help="bootstrap search answers of the training questions (DIR/<task>.py, native.py search, or <task>.answer.txt): SFT answers")
     ap.add_argument("--search-heldout", help="the search's answers to the held-out questions: evaluation baselines only")
+    ap.add_argument("--score-workers", type=int, default=1, help="processes scoring answers at once (a pod's GPU: 8)")
     ap.add_argument("--eval-split", choices=("heldout", "hard"), default="heldout", help="the questions evaluation asks (text.py's hard split: "
                     "predictions the text does not suggest; its search answers in texts/search_hard)")
     ap.add_argument("--revise", action="store_true", help="rl2: a second round in which the oracle revises each answer after reading the verifier's report on it (revise_groups)")
@@ -1425,6 +1426,7 @@ def main():
         sampler = HfSampler(pol, args.max_tokens, args.hf_batch)
     score = SCORERS[args.scorer]
     scorer.DEVICE = args.scorer_device
+    scorer.WORKERS = args.score_workers
     if args.reader:
         READER.append(make_reader(args, pol, sampler))
     root = Path(args.behaviors)

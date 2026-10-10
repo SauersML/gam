@@ -22,7 +22,7 @@ COPYFILE_DISABLE=1 tar -cf "$T" -C /Users/user/mpd-data/graph_oracle texts/vpd4l
 RUNS=""  # one prompted.py per split in SPLITS (default heldout), into $O (held-out) or $O/<split>
 for split in ${SPLITS:-heldout}; do
   out=$O$([ "$split" = heldout ] || echo /$split)
-  RUNS="$RUNS mkdir -p $out; python prompted.py --split $split --base $BASE --rounds ${ROUNDS:-3} --samples ${SAMPLES:-2} --questions ${QUESTIONS:-50} ${ARGS:-} --out $out > $out/log 2>&1;"
+  RUNS="$RUNS mkdir -p $out; python prompted.py --split $split --base $BASE --rounds ${ROUNDS:-3} --samples ${SAMPLES:-2} --questions ${QUESTIONS:-50} --workers 8 ${ARGS:-} --out $out > $out/log 2>&1;"
 done
 COPYFILE_DISABLE=1 tar -cf "$S.tar" -C "$S" . && rm -rf "$S"  # the source too; rp-run uploads every existing path the command names, so only the archives exist here
 CMD="ln -sfn $W/mpd-data ~/mpd-data; mkdir -p $O $S ~/mpd-data/graph_oracle; tar -xf $T -C ~/mpd-data/graph_oracle; tar -xf $S.tar -C $S; ${PREV:+cp $PREV $O/eval_samples.jsonl;} ls /Users/user/mpd-data/vpd/t-9d2b8f02/model_step_99999.safetensors /Users/user/mpd-data/vpd/t-9d2b8f02/model_config.yaml /Users/user/mpd-data/vpd/t-9d2b8f02/tokenizer.json /Users/user/mpd-data/oracle/vpd/uv.safetensors > /dev/null; cd $G; $RUNS echo done"

@@ -140,6 +140,23 @@ class Scorer:
                 g.nodes |= {w, r}
         return g
 
+    @staticmethod
+    def static(src: str) -> bool:
+        """Whether the answer program never reads its arguments (graph's tokens and targets, nor anything that could
+        reach them: locals, vars, eval, exec, globals): its graph is then the same on every changed prompt (one token
+        replaced, the length unchanged), so one trace serves them all."""
+        import ast
+
+        try:
+            tree = ast.parse(src)
+        except SyntaxError:
+            return False
+        fn = next((n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "graph"), None)
+        if fn is None:
+            return False
+        args = {a.arg for a in fn.args.args + fn.args.kwonlyargs} | {"locals", "vars", "eval", "exec", "globals"}
+        return not any(isinstance(n, ast.Name) and n.id in args for stmt in fn.body for n in ast.walk(stmt))
+
     def instances(self, src: str, task: dict, prompts: list) -> list:
         """The answer program's IR on each changed prompt (the task with that prompt's tokens): a rule may bind
         differently there. An invalid trace (the program fails on that text) is None."""
@@ -191,7 +208,7 @@ class Scorer:
                         "notes": ir["graph"].get("notes", []), "dropped": [why for _, why in ir["graph"].get("dropped", [])]})
             if not ir["valid"]:
                 continue
-            irs = self.instances(src, task, prompts)
+            irs = [ir] * P if self.static(src) else self.instances(src, task, prompts)
             n = out[-1]["steps"]
             mine = []
             for k in range(1, n + 1):
