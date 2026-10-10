@@ -26,7 +26,7 @@ DT=/Users/user/mpd-data/graph_oracle/described-$RUN.tar  # not beside $O: rp-run
 [ -n "$DESCRIBED" ] && COPYFILE_DISABLE=1 tar -cf "$DT" -C "$DESCRIBED" .
 if [ -n "$EVIDENCE" ]; then LEN="--max-tokens 4096 --max-model-len 26624"; else LEN="--max-tokens 4096 --max-model-len 14336"; fi  # a revision prompt holds the first answer
 PT="~/mpd-data/graph_oracle/texts"  # the texts on the pod (unpacked from $T; a Mac path here would be uploaded file by file)
-COMMON="--base ${BASE:-Qwen/Qwen3-4B} --model vpd4l --behaviors $PT --search $O/described --search-heldout $PT/search_heldout --part-tokens /root/reg.safetensors --scorer native --score-workers 8 ${EVIDENCE:+--evidence} $LEN --share-gpu --gpu-memory 0.5 --micro 1 --eval-behaviors 50 --oracle-runs $O/oracle"
+COMMON="--base ${BASE:-Qwen/Qwen3-4B} --model vpd4l --behaviors $PT --search $O/described --search-heldout $PT/search_heldout --part-tokens /root/reg.safetensors --scorer native --score-workers 4 ${EVIDENCE:+--evidence} $LEN --share-gpu --gpu-memory 0.5 --micro 1 --eval-behaviors 50 --oracle-runs $O/oracle"
 DESCRIBE="python describe.py $PT/search --split train --out $O/described --base ${BASE:-Qwen/Qwen3-4B} --max-tokens 4096 > $O/describe.log 2>&1"
 SFT="mkdir -p $O/sft; python rl/train.py --mode sft $COMMON --samples 4 --sft-steps ${SFT_STEPS:-80} --batch 8 --out $O/sft --run-name graphsft > $O/sft/log 2>&1"
 if [ -n "$REVISE" ]; then LOOP="--revise"; else LOOP="--async"; fi

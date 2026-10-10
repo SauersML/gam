@@ -143,12 +143,17 @@ def score_all(sc, jobs: list, seed: int, workers: int) -> list:
     """Each (question, answers) job's scores, in order: in this process, or with workers > 1 in that many processes
     (the verifier's forward passes leave a GPU mostly idle, one process at a time; the pool closes after, so vLLM gets
     its memory back)."""
-    if workers <= 1 or len(jobs) <= 1:
-        return [sc.score(t, srcs, seed=seed) for t, srcs in jobs]
-    import multiprocessing
+    if workers > 1 and len(jobs) > 1:
+        import multiprocessing
+        from concurrent.futures import ProcessPoolExecutor
+        from concurrent.futures.process import BrokenProcessPool
 
-    with multiprocessing.get_context("spawn").Pool(min(workers, len(jobs)), initializer=_start_worker) as pool:
-        return pool.map(_score_job, [(t, srcs, seed) for t, srcs in jobs], chunksize=1)
+        try:  # a worker that dies (out of memory) breaks the pool instead of hanging it; the calls then run here
+            with ProcessPoolExecutor(min(workers, len(jobs)), mp_context=multiprocessing.get_context("spawn"), initializer=_start_worker) as pool:
+                return list(pool.map(_score_job, [(t, srcs, seed) for t, srcs in jobs]))
+        except BrokenProcessPool as e:
+            print(f"score_all: a worker died ({e}); scoring in this process", flush=True)
+    return [sc.score(t, srcs, seed=seed) for t, srcs in jobs]
 
 
 def final(text: str) -> str:

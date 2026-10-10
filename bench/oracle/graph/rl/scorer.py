@@ -47,12 +47,18 @@ def native(items: list[dict]) -> list[dict]:
     size = max(1, math.ceil(len(items) / WORKERS)) if WORKERS > 1 else len(items)
     chunks = [(seed, nec, ks[i:i + size]) for (_, seed, nec), ks in groups.items() for i in range(0, len(ks), size)]
     jobs = [(items[ks[0]]["behavior"], [items[k]["source"] for k in ks], seed, nec) for seed, nec, ks in chunks]
+    results = None
     if WORKERS > 1 and len(jobs) > 1:
         import multiprocessing
+        from concurrent.futures import ProcessPoolExecutor
+        from concurrent.futures.process import BrokenProcessPool
 
-        with multiprocessing.get_context("spawn").Pool(min(WORKERS, len(jobs)), initializer=_start, initargs=(DEVICE,)) as pool:
-            results = pool.map(_job, jobs, chunksize=1)
-    else:
+        try:  # a worker that dies (out of memory) breaks the pool instead of hanging it; the calls then run here
+            with ProcessPoolExecutor(min(WORKERS, len(jobs)), mp_context=multiprocessing.get_context("spawn"), initializer=_start, initargs=(DEVICE,)) as pool:
+                results = list(pool.map(_job, jobs))
+        except BrokenProcessPool as e:
+            print(f"scorer: a worker died ({e}); scoring in this process", flush=True)
+    if results is None:
         if not _SCORER:
             _SCORER.append(score.Scorer(DEVICE))
         results = [_SCORER[0].score(b, srcs, seed, necessity=nec) for b, srcs, seed, nec in jobs]
