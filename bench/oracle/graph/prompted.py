@@ -49,6 +49,18 @@ LOOKUP = ("After the report: the answer's subcomponents, each with its layer and
           "kind that write most there beyond what they write elsewhere in this text.")
 
 
+KINDS = {"q_proj": "attention query", "k_proj": "attention key", "v_proj": "attention value", "o_proj": "attention output",
+         "c_fc": "MLP input", "down_proj": "MLP output"}
+
+
+def words(nd, strings: list[str], lens: dict) -> str:
+    """A subcomponent in words: its layer and weight matrix, position and token, and for an attention or MLP output the
+    tokens its write vector raises most at the prediction (lens: native.lens)."""
+    layer, kind = native._layer_kind(nd)
+    w = f"layer {layer} {KINDS[kind]} subcomponent {nd[2]} at position {nd[1]} ({strings[nd[1]]!r})"
+    return w + (f", which writes toward {', '.join(map(repr, lens[nd]))}" if nd in lens else "")
+
+
 def nodes_of(t, src) -> list:
     """An answer's nodes (weight matrix, position, subcomponent) in the order its steps add them; [] when it does not run."""
     import mech
@@ -62,9 +74,8 @@ def nodes_of(t, src) -> list:
 
 
 def words_of(nat, t, nodes, budget, count) -> str:
-    """Nodes in words (describe.words), one line each in the answer's own notation, while within `budget` tokens
+    """Nodes in words (words()), one line each in the answer's own notation, while within `budget` tokens
     (count: text -> token ids)."""
-    import describe
     import mech
 
     strings = mech.behavior_tokens(t, "vpd4l")["sequences"][0][1]
@@ -73,7 +84,7 @@ def words_of(nat, t, nodes, budget, count) -> str:
     lines, used = [], 0
     for nd in nodes:
         layer, kind = native._layer_kind(nd)
-        line = f'({nd[1]}, "<p:{layer}.{short[kind]}.{nd[2]}>"): {describe.words(nd, strings, lens)}'
+        line = f'({nd[1]}, "<p:{layer}.{short[kind]}.{nd[2]}>"): {words(nd, strings, lens)}'
         used += len(count(line)) + 1
         if used > budget:
             lines.append(f"... and {len(nodes) - len(lines)} more")
@@ -89,7 +100,6 @@ def responses(nat, t, budget, count) -> str:
     that write most there beyond what they write on average over the text (native.contributions; the excess, so
     subcomponents active everywhere do not fill every position's list), in the answer's notation, while within
     `budget` tokens."""
-    import describe
     import mech
     import torch
 
@@ -114,7 +124,7 @@ def responses(nat, t, budget, count) -> str:
         items = []
         for nd in nodes:
             layer, kind = native._layer_kind(nd)
-            items.append(f'"<p:{layer}.{short[kind]}.{nd[2]}>" (layer {layer} {describe.KINDS[kind]}'
+            items.append(f'"<p:{layer}.{short[kind]}.{nd[2]}>" (layer {layer} {KINDS[kind]}'
                          + (f", writes toward {', '.join(map(repr, lens[nd]))}" if nd in lens else "") + ")")
         head = f"position {pos} ({strings[pos]!r})" + (", the last" if pos == last else f", changing its token moves the prediction {float(moved[pos - 1]) / 0.6931:.2f} bits")
         line = head + "; writing most there: " + ", ".join(items)
