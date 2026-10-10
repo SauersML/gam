@@ -46,9 +46,25 @@ def render(task: dict) -> str:
     return "\n".join([ASK.format(model=model)] + [line(model, p["token_ids"], p["target_positions"], p["model_top"]) for p in task["prompts"]])
 
 
+def complete_steps(source: str) -> str | None:
+    """A program cut off before its end (an output limit), as far as its last complete step: the returned list closed
+    after the last line "}," that leaves the program parsing. Its first steps are an answer like any prefix of one
+    (the verifier scores every prefix); None when no step is complete."""
+    lines = source.splitlines()
+    for i in range(len(lines) - 1, -1, -1):
+        if lines[i].strip() == "},":
+            cand = "\n".join(lines[:i + 1]) + "\n    ]\n"
+            try:
+                ast.parse(cand)
+            except SyntaxError:
+                continue
+            return cand
+    return None
+
+
 def split_answer(answer: str) -> tuple[str, str]:
-    """(program, the text after it) of an oracle's answer: the last fenced block that parses as Python. Without such
-    a block: (answer, "")."""
+    """(program, the text after it) of an oracle's answer: the last fenced block that parses as Python; else the last
+    block's complete steps when it was cut off (complete_steps). Without either: (answer, "")."""
     parts = answer.split("```")
     for k in range(len(parts) - 2, 0, -2):  # fenced blocks are the odd parts; take the last one that parses
         block = parts[k].split("\n", 1)[1] if "\n" in parts[k] else ""
@@ -57,6 +73,11 @@ def split_answer(answer: str) -> tuple[str, str]:
         except SyntaxError:
             continue
         return block, "```".join(parts[k + 1:]).strip()
+    last = answer.rfind("```python\n")
+    if last >= 0:  # the last block, closed or cut off
+        repaired = complete_steps(answer[last + len("```python\n"):].split("```")[0])
+        if repaired is not None:
+            return repaired, ""
     return answer, ""
 
 
