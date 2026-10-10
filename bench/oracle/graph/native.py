@@ -569,6 +569,7 @@ class Native:
                     lq = self.run(x, targets, plan, *zero, patch={n: (m, rec_g[n]) for n, m in mask.items()})
                     lp = self.run(x, targets, plan_m, *one, patch={n: (m, rec_m[n].expand(B, -1, -1)) for n, m in mask.items()})
                     total[s0:s0 + B] += w * (lp.exp() * (lp - lq)).sum(-1).sum(-1) / LN2
+                    free(self.dev)
         return (total / len(prompts)).tolist()
 
     @torch.no_grad()
