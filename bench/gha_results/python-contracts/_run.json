@@ -3,12 +3,12 @@
   "publish_job_status": "failure",
   "publish_job_status_note": "status of the job that PUBLISHED these results, not the conclusion of run_id -- this job is part of that run, so the run has not concluded here",
   "publish_job_failed_steps": "step 7: Build and install gam extension (maturin build + wheel install)",
-  "run_id": "38069018478",
-  "run_number": "365",
+  "run_id": "38108287569",
+  "run_number": "366",
   "run_attempt": "1",
   "event": "schedule",
   "ref": "refs/heads/main",
-  "sha": "a7c66825041d1c2362c0bd403c8010055c4085cc",
-  "completed_utc": "2026-10-10T16:51:24Z",
-  "run_url": "https://github.com/SauersML/gam/actions/runs/38069018478"
+  "sha": "a281b520b7ab6dc1596af0c577c5a0c64cc475d0",
+  "completed_utc": "2026-10-11T03:29:21Z",
+  "run_url": "https://github.com/SauersML/gam/actions/runs/38108287569"
 }
