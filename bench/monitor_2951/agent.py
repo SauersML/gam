@@ -3,7 +3,7 @@
 Each run is one append-only token stream: the chat-template prompt (system, user, tool schemas), then for every
 turn the tokens the model generated (thinking, then text and tool calls) and the tool results the harness
 appended. Nothing is re-rendered, so a forward pass over a finished stream gives the activations the model had
-while generating it. vLLM generates every live run's next turn in one batch.
+while generating it. All runs share one vLLM engine; a run's next turn is queued as soon as its tool calls return.
 
 The setup follows the authors' full scaffold (livecodebench_agent_full.py): func.py holds the signature and
 docstring, test.py the unit tests (impossible in the oneoff and conflicting splits), the system prompt their
@@ -316,6 +316,7 @@ def main():
     ap.add_argument("--temperature", type=float, default=0.6)
     ap.add_argument("--gpu-mem", type=float, default=0.90)
     ap.add_argument("--workers", type=int, default=16)
+    ap.add_argument("--deadline", type=float, default=1e9, help="seconds after which no new turn starts")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     st = sandbox.selftest()
@@ -366,108 +367,130 @@ def main():
     pool = ThreadPoolExecutor(a.workers)
     out_f = open(tpath, "a")
     t0 = time.time()
-    rnd = 0
-    while True:
-        live = [r for r in runs if not r.done]
-        if not live:
-            break
-        rnd += 1
-        reqs, sps = [], []
-        for r in live:
-            budget = a.action_tokens if r.phase_forced else a.turn_tokens
-            budget = min(budget, a.max_len - len(r.ids) - 8)
-            reqs.append(TokensPrompt(prompt_token_ids=list(r.ids)))
-            sps.append(SamplingParams(temperature=a.temperature, top_p=0.95, top_k=20, max_tokens=max(budget, 1),
-                                      stop_token_ids=[im_end, eot], seed=r.seed + 7919 * len(r.turns) + (1 if r.phase_forced else 0)))
-        t1 = time.time()
-        outs = llm.generate(reqs, sps, use_tqdm=False)
-        gen_tokens = sum(len(o.outputs[0].token_ids) for o in outs)
-        print(f"round {rnd}: {len(live)} live, {gen_tokens} tokens in {time.time() - t1:.0f} s ({gen_tokens / max(time.time() - t1, 1e-9):.0f} tok/s)", flush=True)
 
-        def advance(r, o):
-            c = o.outputs[0]
-            toks = list(c.token_ids)
-            if c.finish_reason == "stop" and (not toks or toks[-1] not in (im_end, eot)):
-                toks.append(im_end)
-            if not r.phase_forced:
-                r.turn_start = len(r.ids)
-            r.append(toks, SEG_GEN)
-            if c.finish_reason == "length":
-                if think_end not in r.ids[r.turn_start:]:
-                    if not r.phase_forced and len(r.ids) + 64 + a.action_tokens < a.max_len:
-                        r.append(enc(FORCE_END), SEG_FORCED)
-                        r.phase_forced = True
-                        return
-                r.append([im_end], SEG_FORCED)
-            r.phase_forced = False
-            turn_ids = r.ids[r.turn_start:]
-            text = tok.decode(turn_ids, skip_special_tokens=False)
-            thinking, _, content = text.partition("</think>")
-            if "</think>" not in text:
-                thinking, content = "", text
-            turn = {"turn": len(r.turns), "start": r.turn_start, "end": len(r.ids), "text": text, "calls": []}
-            calls = re.findall(r"<tool_call>\s*(.*?)\s*</tool_call>", content, re.S)
-            te = r.turn_start + turn_ids.index(think_end) if think_end in turn_ids else r.turn_start
-            turn["think_end"] = te
-            call_pos = [i for i in range(te, len(r.ids)) if r.ids[i] == tc_open]
-            results = []
-            for k, raw in enumerate(calls):
-                try:
-                    call = json.loads(raw, strict=False)
-                    name, args = call.get("name"), call.get("arguments") or {}
-                    if isinstance(args, str):
-                        args = json.loads(args, strict=False)
-                except Exception as e:
-                    name, args = None, {}
-                    res, wrote = f"Error: could not parse the tool call as JSON ({e}).", None
-                else:
-                    res, wrote = run_tool(r, name, args if isinstance(args, dict) else {})
-                pos = call_pos[k] if k < len(call_pos) else te
-                act = {"turn": turn["turn"], "call": k, "name": name, "args": args if isinstance(args, dict) else {}, "pos": pos,
-                       "gen_index": sum(1 for i in range(pos) if r.seg[i] == SEG_GEN), "result": res}
-                if wrote:
-                    ch = judge_write(r, wrote)
-                    act["cheat"] = ch
-                    if ch and r.first_cheat is None:
-                        r.first_cheat = {k2: act[k2] for k2 in ("turn", "call", "name", "pos", "gen_index")}
-                        r.first_cheat.update(ch, path=wrote)
-                turn["calls"].append(act)
-                r.actions.append(act)
-                results.append(res)
-            r.turns.append(turn)
-            if results:
-                env = "\n<|im_start|>user\n" + "\n".join(f"<tool_response>\n{x}\n</tool_response>" for x in results) + "<|im_end|>\n<|im_start|>assistant\n"
-            else:
-                r.attempts += 1
-                own, spec, modified, res = score(r)
-                r.final = {"pass_own": own, "pass_spec": spec, "tests_modified": modified, "test_output": res}
-                if own or r.attempts >= a.attempts:
-                    r.done, r.status = True, "submitted"
+    def advance(r, o):
+        c = o.outputs[0]
+        toks = list(c.token_ids)
+        if c.finish_reason == "stop" and (not toks or toks[-1] not in (im_end, eot)):
+            toks.append(im_end)
+        if not r.phase_forced:
+            r.turn_start = len(r.ids)
+        r.append(toks, SEG_GEN)
+        if c.finish_reason == "length":
+            if think_end not in r.ids[r.turn_start:]:
+                if not r.phase_forced and len(r.ids) + 64 + a.action_tokens < a.max_len:
+                    r.append(enc(FORCE_END), SEG_FORCED)
+                    r.phase_forced = True
                     return
-                env = "\n<|im_start|>user\n" + FEEDBACK.format(result=clip_lines(res, total=3000), instruction=INSTRUCTION) + "<|im_end|>\n<|im_start|>assistant\n"
-            if len(r.turns) >= a.max_turns or len(r.ids) + 512 > a.max_len - 256:
-                r.done, r.status = True, "turn_limit" if len(r.turns) >= a.max_turns else "context_limit"
+            r.append([im_end], SEG_FORCED)
+        r.phase_forced = False
+        turn_ids = r.ids[r.turn_start:]
+        text = tok.decode(turn_ids, skip_special_tokens=False)
+        thinking, _, content = text.partition("</think>")
+        if "</think>" not in text:
+            thinking, content = "", text
+        turn = {"turn": len(r.turns), "start": r.turn_start, "end": len(r.ids), "text": text, "calls": []}
+        calls = re.findall(r"<tool_call>\s*(.*?)\s*</tool_call>", content, re.S)
+        te = r.turn_start + turn_ids.index(think_end) if think_end in turn_ids else r.turn_start
+        turn["think_end"] = te
+        call_pos = [i for i in range(te, len(r.ids)) if r.ids[i] == tc_open]
+        results = []
+        for k, raw in enumerate(calls):
+            try:
+                call = json.loads(raw, strict=False)
+                name, args = call.get("name"), call.get("arguments") or {}
+                if isinstance(args, str):
+                    args = json.loads(args, strict=False)
+            except Exception as e:
+                name, args = None, {}
+                res, wrote = f"Error: could not parse the tool call as JSON ({e}).", None
+            else:
+                res, wrote = run_tool(r, name, args if isinstance(args, dict) else {})
+            pos = call_pos[k] if k < len(call_pos) else te
+            act = {"turn": turn["turn"], "call": k, "name": name, "args": args if isinstance(args, dict) else {}, "pos": pos,
+                   "gen_index": sum(1 for i in range(pos) if r.seg[i] == SEG_GEN), "result": res}
+            if wrote:
+                ch = judge_write(r, wrote)
+                act["cheat"] = ch
+                if ch and r.first_cheat is None:
+                    r.first_cheat = {k2: act[k2] for k2 in ("turn", "call", "name", "pos", "gen_index")}
+                    r.first_cheat.update(ch, path=wrote)
+            turn["calls"].append(act)
+            r.actions.append(act)
+            results.append(res)
+        r.turns.append(turn)
+        if results:
+            env = "\n<|im_start|>user\n" + "\n".join(f"<tool_response>\n{x}\n</tool_response>" for x in results) + "<|im_end|>\n<|im_start|>assistant\n"
+        else:
+            r.attempts += 1
+            own, spec, modified, res = score(r)
+            r.final = {"pass_own": own, "pass_spec": spec, "tests_modified": modified, "test_output": res}
+            if own or r.attempts >= a.attempts:
+                r.done, r.status = True, "submitted"
                 return
-            r.append(enc(env), SEG_ENV)
+            env = "\n<|im_start|>user\n" + FEEDBACK.format(result=clip_lines(res, total=3000), instruction=INSTRUCTION) + "<|im_end|>\n<|im_start|>assistant\n"
+        if len(r.turns) >= a.max_turns or len(r.ids) + 512 > a.max_len - 256:
+            r.done, r.status = True, "turn_limit" if len(r.turns) >= a.max_turns else "context_limit"
+            return
+        r.append(enc(env), SEG_ENV)
 
-        list(pool.map(lambda ro: advance(*ro), zip(live, outs)))
-        for r in live:
+    def params(r):
+        budget = min(a.action_tokens if r.phase_forced else a.turn_tokens, a.max_len - len(r.ids) - 8)
+        return SamplingParams(temperature=a.temperature, top_p=0.95, top_k=20, max_tokens=max(budget, 1),
+                              stop_token_ids=[im_end, eot], seed=r.seed + 7919 * len(r.turns) + (1 if r.phase_forced else 0))
+
+    def finish(r):
+        if not hasattr(r, "final") or r.status != "submitted":
+            own, spec, modified, res = score(r)
+            r.final = {"pass_own": own, "pass_spec": spec, "tests_modified": modified, "test_output": res}
+        f = r.final
+        lab = label(r, f["pass_own"], f["pass_spec"], f["tests_modified"])
+        rec = {"run_id": r.id, "task_id": r.task["task_id"], "split": r.split, "sample": r.sample, "seed": r.seed,
+               "model": a.model, "label": lab, "status": r.status, "attempts": r.attempts, **f,
+               "first_cheat": r.first_cheat, "n_tokens": len(r.ids), "n_generated": r.n_gen,
+               "n_forced": sum(1 for x in r.seg if x == SEG_FORCED), "turns": r.turns, "actions": r.actions,
+               "files": r.files(), "token_ids": r.ids, "seg": r.seg, "mutated": r.t["mutated"]}
+        out_f.write(json.dumps(rec) + "\n")
+        out_f.flush()
+        shutil.rmtree(r.dir, ignore_errors=True)
+
+    # Continuous: each run's next turn is queued as soon as its tools have run, so no run waits for the slowest
+    # of a round. Past --deadline seconds no new turn starts; runs still going are scored as they stand.
+    eng = llm.llm_engine
+    pending, working = {}, {}
+    n_done, n_tok, last = 0, 0, time.time()
+
+    def submit(r):
+        rid = f"{r.id}|{len(r.turns)}|{int(r.phase_forced)}"
+        eng.add_request(rid, TokensPrompt(prompt_token_ids=list(r.ids)), params(r))
+        pending[rid] = r
+
+    for r in runs:
+        submit(r)
+    while pending or working:
+        if pending:
+            for o in eng.step():
+                if o.finished:
+                    r = pending.pop(o.request_id)
+                    n_tok += len(o.outputs[0].token_ids)
+                    working[pool.submit(advance, r, o)] = r
+        else:
+            time.sleep(0.05)
+        for fut in [f for f in working if f.done()]:
+            r = working.pop(fut)
+            fut.result()
+            late = time.time() - t0 > a.deadline
+            if late and not r.done:
+                r.done, r.status = True, "deadline"
             if r.done:
-                if not hasattr(r, "final") or r.status != "submitted":
-                    own, spec, modified, res = score(r)
-                    r.final = {"pass_own": own, "pass_spec": spec, "tests_modified": modified, "test_output": res}
-                f = r.final
-                lab = label(r, f["pass_own"], f["pass_spec"], f["tests_modified"])
-                rec = {"run_id": r.id, "task_id": r.task["task_id"], "split": r.split, "sample": r.sample, "seed": r.seed,
-                       "model": a.model, "label": lab, "status": r.status, "attempts": r.attempts, **f,
-                       "first_cheat": r.first_cheat, "n_tokens": len(r.ids), "n_generated": r.n_gen,
-                       "n_forced": sum(1 for x in r.seg if x == SEG_FORCED), "turns": r.turns, "actions": r.actions,
-                       "files": r.files(), "token_ids": r.ids, "seg": r.seg, "mutated": r.t["mutated"]}
-                out_f.write(json.dumps(rec) + "\n")
-                out_f.flush()
-                shutil.rmtree(r.dir, ignore_errors=True)
-        runs = [r for r in runs if not r.done]
-        print(f"  {time.time() - t0:.0f} s elapsed, {len(runs)} runs left", flush=True)
+                finish(r)
+                n_done += 1
+            else:
+                submit(r)
+        if time.time() - last > 60:
+            last = time.time()
+            print(f"{last - t0:.0f} s: {n_done}/{len(runs)} runs done, {len(pending)} generating, {len(working)} in tools, "
+                  f"{n_tok} tokens ({n_tok / (last - t0):.0f} tok/s)", flush=True)
     out_f.close()
     print("generation done", flush=True)
 
