@@ -4,6 +4,8 @@ Layers, outermost first:
   - kernel: on Linux a new network namespace (unshare -rn: no interface but a downed loopback), on macOS
     sandbox-exec with a profile that denies all network and all file access outside the run directory
     and the interpreter's own files;
+  - seccomp on x86_64 Linux: socket(2), io_uring, ptrace and process_vm_* fail, so no network even if the
+    interpreter layer is bypassed (pods do not allow user namespaces);
   - identity: dropped to nobody when the harness runs as root (the pod), so files private to root stay closed;
   - limits: CPU seconds, address space, file size, process count, and a wall-clock timeout that kills the
     process group;
@@ -41,7 +43,7 @@ def _inside(p, roots):
     return any(p == r or p.startswith(r + os.sep) for r in roots)
 DENY = ("socket.", "subprocess.", "os.system", "os.exec", "os.posix_spawn", "os.spawn", "os.fork", "os.forkpty",
         "pty.", "ctypes.", "os.kill", "os.killpg", "signal.pthread_kill", "winreg.", "webbrowser.", "urllib.Request",
-        "http.client.", "ftplib.", "smtplib.", "telnetlib.", "imaplib.", "poplib.", "nntplib.", "os.chroot", "os.setuid")
+        "http.client.", "ftplib.", "code.__new__", "sys.setprofile", "sys.settrace", "smtplib.", "telnetlib.", "imaplib.", "poplib.", "nntplib.", "os.chroot", "os.setuid")
 PATHS = {"os.remove", "os.rename", "os.rmdir", "os.mkdir", "os.chmod", "os.chown", "os.link", "os.symlink",
          "os.truncate", "os.utime", "os.chdir", "os.chflags", "os.lchflags", "shutil.copyfile", "shutil.copymode",
          "shutil.copystat", "shutil.copytree", "shutil.move", "shutil.rmtree", "shutil.make_archive",
@@ -125,6 +127,47 @@ def _unshare_ok():
 UNSHARE = _unshare_ok()
 
 
+def _seccomp_prog():
+    """A seccomp filter for x86_64 Linux, applied after the drop to nobody: socket(2) (every address family),
+    io_uring_setup, ptrace and process_vm_readv/writev fail with EPERM, as does every x32 system call; another
+    architecture's call kills the process. With no socket there is no network, whatever the interpreter allows."""
+    if not sys.platform.startswith("linux") or os.uname().machine != "x86_64":
+        return None
+    import ctypes
+    import struct
+    LD, JEQ, JGE, RET = 0x20, 0x15, 0x35, 0x06
+    ALLOW, ERRNO, KILL = 0x7FFF0000, 0x00050000 | 1, 0
+    deny = [41, 425, 101, 310, 311]
+    ins = [(LD, 0, 0, 4), (JEQ, 1, 0, 0xC000003E), (RET, 0, 0, KILL), (LD, 0, 0, 0)]
+    n = len(deny) + 1
+    ins.append((JGE, n + 1 - 1, 0, 0x40000000))
+    for i, nr in enumerate(deny):
+        ins.append((JEQ, n - 1 - i, 0, nr))
+    ins += [(RET, 0, 0, ALLOW), (RET, 0, 0, ERRNO)]
+    raw = b"".join(struct.pack("HBBI", c, jt, jf, k) for c, jt, jf, k in ins)
+    buf = ctypes.create_string_buffer(raw, len(raw))
+
+    class Prog(ctypes.Structure):
+        _fields_ = [("len", ctypes.c_ushort), ("filter", ctypes.c_void_p)]
+    prog = Prog(len(ins), ctypes.cast(buf, ctypes.c_void_p))
+    libc = ctypes.CDLL(None, use_errno=True)
+    return libc, prog, buf
+
+
+SECCOMP = _seccomp_prog()
+
+
+def _apply_seccomp():
+    if SECCOMP is None:
+        return
+    import ctypes
+    libc, prog, _ = SECCOMP
+    if libc.prctl(38, 1, 0, 0, 0) != 0:  # PR_SET_NO_NEW_PRIVS
+        os._exit(97)
+    if libc.prctl(22, 2, ctypes.byref(prog), 0, 0) != 0:  # PR_SET_SECCOMP, SECCOMP_MODE_FILTER
+        os._exit(98)
+
+
 def _limits(cpu, mem_gb):
     def f():
         os.setsid()
@@ -138,10 +181,11 @@ def _limits(cpu, mem_gb):
             resource.setrlimit(resource.RLIMIT_NPROC, (64, 64))
         except Exception:
             pass
+        _apply_seccomp()
     return f
 
 
-def run(root, script, timeout=30, cpu=20, mem_gb=4):
+def run(root, script, timeout=30, cpu=20, mem_gb=4, hook=True):
     """Run ROOT/SCRIPT under every layer; returns (exit code, stdout, stderr, timed out)."""
     root = os.path.realpath(root)
     if os.getuid() == 0:
@@ -149,7 +193,7 @@ def run(root, script, timeout=30, cpu=20, mem_gb=4):
         for n in os.listdir(root):
             os.chmod(os.path.join(root, n), 0o666)
     pyroot = os.path.realpath(sys.base_prefix)
-    cmd = [PY, "-E", "-s", "-B", "-c", HOOK, root, os.path.join(root, script)]
+    cmd = [PY, "-E", "-s", "-B", "-c", HOOK, root, os.path.join(root, script)] if hook else [PY, "-E", "-s", "-B", os.path.join(root, script)]
     if sys.platform == "darwin":
         prof = SB_PROFILE.format(root=root, pyroot=pyroot)
         extra = {os.path.realpath(sys.prefix), os.path.realpath(os.path.dirname(os.path.realpath(PY)))} - {pyroot}
@@ -221,6 +265,13 @@ def selftest():
         if "ESCAPED" in out or "STARTED" not in out:
             leaks.append(name if "STARTED" in out else name + " (interpreter did not start: %s)" % err[-200:])
         shutil.rmtree(d, ignore_errors=True)
+    # The kernel layer alone (no audit hook) must refuse a connection (on Linux, the socket itself).
+    d = fresh({"t.py": "print('STARTED', flush=True)\nimport socket\ns = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\ns.settimeout(3)\ns.connect(('1.1.1.1', 53))\nprint('ESCAPED')\n"})
+    rc, out, err, _ = run(d, "t.py", timeout=20, hook=False)
+    kernel_net = "STARTED" in out and "ESCAPED" not in out
+    if not kernel_net:
+        leaks.append("kernel layer allows sockets" + ("" if "STARTED" in out else " (interpreter did not start: %s)" % err[-200:]))
+    shutil.rmtree(d, ignore_errors=True)
     for p in ("/tmp/sbx_escape_probe", "/tmp/sbx_escape_probe2", os.path.expanduser("~/sbx_escape_probe")):
         if os.path.exists(p):
             leaks.append("file appeared: " + p)
@@ -233,7 +284,7 @@ def selftest():
     rc, out, err, timed_out = run(d, "t.py", timeout=4, cpu=2)
     killed = rc != 0
     shutil.rmtree(d, ignore_errors=True)
-    return {"leaks": leaks, "inside_ok": inside_ok, "loop_killed": killed, "kernel": "sandbox-exec" if sys.platform == "darwin" else ("unshare -rn (network namespace)" if UNSHARE else "none: uid nobody + audit hook only"), "uid_drop": os.getuid() == 0, "escapes_tried": len(ESCAPES)}
+    return {"leaks": leaks, "inside_ok": inside_ok, "loop_killed": killed, "kernel": "sandbox-exec" if sys.platform == "darwin" else ("unshare -rn (network namespace)" if UNSHARE else "") + (" seccomp (no socket(2))" if SECCOMP else ""), "uid_drop": os.getuid() == 0, "escapes_tried": len(ESCAPES)}
 
 
 if __name__ == "__main__":
