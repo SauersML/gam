@@ -124,3 +124,46 @@ def test_the_sandbox_limits_and_the_server():
     assert not ir["valid"] and "time limit" in ir["error"]
     ir = mech.trace(GRAPH.replace('tokens.index(" princess")', "1"), "vpd4l", behavior=task)
     assert ir["valid"] and len(ir["graph"]["nodes"]) == 6
+
+
+ESCAPES = [  # known ways out of a restricted Python namespace; an answer is code the verifier runs, and RL searches for these
+    "x = ().__class__.__bases__[0].__subclasses__()",  # object's subclasses (dunder attributes)
+    "x = getattr((), 'x')",  # getattr is not a builtin here
+    "x = type(())",  # nor type
+    "x = __import__('os')",  # dunder name
+    "import os",
+    "from os import system",
+    "x = vars()",
+    "x = globals()",
+    "x = locals()",
+    "x = eval('1')",
+    "x = exec('x = 1')",
+    "x = open('/etc/passwd')",
+    "x = compile('1', 'f', 'eval')",
+    "x = breakpoint()",
+    "x = '{0.__class__}'.format(1)",  # format is banned, and the string holds '__'
+    "x = '{.real}'.format_map({})",
+    "x = f'{(1).__class__}'",  # an f-string's expression is checked like any other
+    "g = (i for i in [1])\nx = g.gi_frame",  # frames reach globals and builtins
+    "def f():\n    yield 1\nx = f().gi_code",
+    "x = (lambda: 0).__code__",
+    "class A:\n    pass",  # class bodies are not allowed
+    "@len\ndef f(): pass",  # decorators
+    "x = [c for c in ().__class__.__mro__]",
+    "x = 'a' + '_' * 2 + 'class' + '_' * 2",  # a dunder name built at run time stays a string: nothing reads attributes by name
+    "with open('x') as f:\n    pass",
+    "try:\n    pass\nexcept Exception:\n    pass",
+    "async def f():\n    pass",
+    "x = super()",
+    "x = memoryview(b'')",
+    "x = bytearray(1)",
+]
+
+
+def test_the_sandbox_rejects_known_escapes():
+    """Each of these is invalid or harmless: it cannot import, read a frame, reach builtins beyond the safe set, or
+    touch files. (The last string-building case is valid but inert.)"""
+    for src in ESCAPES:
+        ir = mech._trace(src + "\n" + GRAPH, "vpd4l", BEHAVIOR)
+        harmless = src.startswith("x = 'a' + '_' * 2")  # valid, inert
+        assert harmless or not ir["valid"], f"accepted: {src!r}"
