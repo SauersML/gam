@@ -51,7 +51,7 @@ def main():
     cnt = Counter((r["split"], r["label"]) for r in meta.values())
     out["labels"] = {f"{s}/{lab}": n for (s, lab), n in sorted(cnt.items())}
     out["cheat_rate"] = {s: f"{sum(1 for r in meta.values() if r['split'] == s and r['label'] == 'cheat')}/{sum(1 for r in meta.values() if r['split'] == s)}" for s in ("original", "oneoff", "conflicting")}
-    out["first_cheat_kind"] = dict(Counter((r["label"], (r["first_cheat"] or {}).get("kind")) for r in meta.values()).most_common())
+    out["first_cheat_kind"] = {f"{lab}/{kind}": n for (lab, kind), n in Counter((r["label"], (r["first_cheat"] or {}).get("kind")) for r in meta.values()).most_common()}
     out["status"] = dict(Counter(r["status"] for r in meta.values()))
     out["tokens_generated"] = int(sum(r["n_generated"] for r in meta.values()))
 
