@@ -47,6 +47,60 @@ def sources(a) -> dict:
     return {p.stem: p.read_text() for p in sorted(Path(a.answers).glob("*.py"))}
 
 
+def removals(nat, task_id: str, src: str, draws: int = 8) -> dict | None:
+    """One hard question's removal test: for each prefix of the answer's steps, (the wrong token's probability, the KL
+    of the rest of the prediction) with the prefix's subcomponents removed, with VPD's first as many removed, and with as
+    many active subcomponents removed (the control, `draws` draws). None for a text without a wrong prediction or an
+    answer without steps."""
+    task = json.loads((native.TEXTS / "vpd4l" / f"{task_id}.json").read_text())
+    prompt = task["prompts"][0]
+    if "actual_next_id" not in prompt:
+        return None
+    ids, targets = prompt["token_ids"], prompt["target_positions"]
+    ir = mech.trace_inline(src, "vpd4l", task)
+    if not ir["valid"] or not ir["graph"]["steps"]:
+        return None
+    g = ir["graph"]
+    nodes = [(native.site_name(layer, kind), pos, c) for layer, kind, pos, c in g["nodes"]]
+    with torch.no_grad():
+        p0 = nat.reference([ids], targets)[0, 0].exp()
+        wrong = int(p0.argmax())
+
+        def effect(removed):
+            """(the wrong token's probability, the KL in bits of the rest) with these subcomponents removed."""
+            q = nat.without(ids, targets, removed)[0, 0].exp()
+            a_, b_ = p0.clone(), q.clone()
+            a_[wrong], b_[wrong] = 0.0, 0.0
+            a_, b_ = a_ / a_.sum(), b_ / b_.sum()
+            return float(q[wrong]), float((a_ * (a_.clamp_min(1e-30).log2() - b_.clamp_min(1e-30).log2())).sum())
+
+        weights = nat.contributions(ids, targets)
+        rank = nat._vpd_rank(ids, targets)
+        vpd_order = sorted(rank, key=rank.get)
+        gen = torch.Generator(device="cpu").manual_seed(native.task_seed(task_id))
+        rows = []
+        for k in range(1, g["steps"] + 1):
+            removed = sorted({nodes[i] for i, s in enumerate(g["node_step"]) if s < k})
+            mine = {(n, t): set() for n, t, _ in removed}
+            for n, t, c in removed:
+                mine[(n, t)].add(c)
+            ctrl = []
+            for _ in range(draws):
+                picks = []
+                for (n, t), cs in mine.items():
+                    w = weights[n][t].clone().cpu()
+                    w[list(cs)] = 0.0
+                    m = min(len(cs), int((w > 0).sum()))
+                    picks += [(n, t, int(c)) for c in torch.multinomial(w, m, replacement=False, generator=gen)] if m else []
+                ctrl.append(effect(picks))
+            row = {"removed": len(removed)}
+            for arm, (pw, rest) in (("answer", effect(removed)), ("vpd", effect(vpd_order[:len(removed)])),
+                                    ("control", tuple(sum(x) / len(x) for x in zip(*ctrl)))):
+                row[f"{arm}_wrong"], row[f"{arm}_rest"] = pw, rest
+            rows.append(row)
+    return {"task": task_id, "p_wrong": float(p0[wrong]), "steps": rows}
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("out")
@@ -62,56 +116,13 @@ def main():
     nat = native.Native()
     results = []
     for task_id, src in sources(a).items():
-        task = json.loads((native.TEXTS / "vpd4l" / f"{task_id}.json").read_text())
-        prompt = task["prompts"][0]
-        if "actual_next_id" not in prompt:
+        res = removals(nat, task_id, src, a.draws)
+        if res is None:
             continue
-        ids, targets = prompt["token_ids"], prompt["target_positions"]
-        ir = mech.trace_inline(src, "vpd4l", task)
-        if not ir["valid"] or not ir["graph"]["steps"]:
-            continue
-        g = ir["graph"]
-        nodes = [(native.site_name(layer, kind), pos, c) for layer, kind, pos, c in g["nodes"]]
-        with torch.no_grad():
-            p0 = nat.reference([ids], targets)[0, 0].exp()
-            wrong = int(p0.argmax())
-
-            def effect(removed):
-                """(the wrong token's probability, the KL in bits of the rest) with these subcomponents removed."""
-                q = nat.without(ids, targets, removed)[0, 0].exp()
-                a_, b_ = p0.clone(), q.clone()
-                a_[wrong], b_[wrong] = 0.0, 0.0
-                a_, b_ = a_ / a_.sum(), b_ / b_.sum()
-                return float(q[wrong]), float((a_ * (a_.clamp_min(1e-30).log2() - b_.clamp_min(1e-30).log2())).sum())
-
-            weights = nat.contributions(ids, targets)
-            rank = nat._vpd_rank(ids, targets)
-            vpd_order = sorted(rank, key=rank.get)
-            gen = torch.Generator(device="cpu").manual_seed(native.task_seed(task_id))
-            rows = []
-            for k in range(1, g["steps"] + 1):
-                removed = sorted({nodes[i] for i, s in enumerate(g["node_step"]) if s < k})
-                mine = {(n, t): set() for n, t, _ in removed}
-                for n, t, c in removed:
-                    mine[(n, t)].add(c)
-                ctrl = []
-                for _ in range(a.draws):
-                    picks = []
-                    for (n, t), cs in mine.items():
-                        w = weights[n][t].clone().cpu()
-                        w[list(cs)] = 0.0
-                        m = min(len(cs), int((w > 0).sum()))
-                        picks += [(n, t, int(c)) for c in torch.multinomial(w, m, replacement=False, generator=gen)] if m else []
-                    ctrl.append(effect(picks))
-                row = {"removed": len(removed)}
-                for arm, (pw, rest) in (("answer", effect(removed)), ("vpd", effect(vpd_order[:len(removed)])),
-                                        ("control", tuple(sum(x) / len(x) for x in zip(*ctrl)))):
-                    row[f"{arm}_wrong"], row[f"{arm}_rest"] = pw, rest
-                rows.append(row)
-        results.append({"task": task_id, "p_wrong": float(p0[wrong]), "steps": rows})
-        print(f"{task_id}: p(wrong) {float(p0[wrong]):.3f} -> " + ", ".join(
+        results.append(res)
+        print(f"{task_id}: p(wrong) {res['p_wrong']:.3f} -> " + ", ".join(
             f"{r['removed']}: {r['answer_wrong']:.3f}/{r['answer_rest']:.2f} (VPD {r['vpd_wrong']:.3f}/{r['vpd_rest']:.2f}, control {r['control_wrong']:.3f}/{r['control_rest']:.2f})"
-            for r in rows[:5]), flush=True)
+            for r in res["steps"][:5]), flush=True)
     Path(a.out).with_suffix(".json").write_text(json.dumps(results))
 
     plot(results, a.out)
