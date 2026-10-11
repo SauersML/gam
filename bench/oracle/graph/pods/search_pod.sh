@@ -32,7 +32,7 @@ for entry in $SPLIT; do
   STAGES="$STAGES $JOBS wait;"
   [ -n "$SCORE" ] && [ "$split" != train ] && STAGES="$STAGES python native.py tidy $O/$out --max-chars 65536; mkdir -p $O/score_$split; python prompted.py --split $split --rounds 0 --questions $n --workers 6 --search-dir $O/$out --out $O/score_$split > $O/score_$split/log 2>&1;"
 done
-VPD_IN=$([ "${NODES_FROM:-ig}" = vpd ] || [ -n "$RANKED" ] && echo /Users/user/mpd-data/vpd/s-55ea3f9b/model_400000.pth)
+VPD_IN=$(case "${NODES_FROM:-ig}" in vpd*) echo /Users/user/mpd-data/vpd/s-55ea3f9b/model_400000.pth ;; *) [ -n "$RANKED" ] && echo /Users/user/mpd-data/vpd/s-55ea3f9b/model_400000.pth ;; esac)  # VPD's ranking needs its causal-importance network
 CMD="export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4; ln -sfn $W/mpd-data ~/mpd-data; mkdir -p $O $S ~/mpd-data/graph_oracle; tar -xf $T -C ~/mpd-data/graph_oracle; tar -xf $S.tar -C $S; ls /Users/user/mpd-data/vpd/t-9d2b8f02/model_step_99999.safetensors /Users/user/mpd-data/vpd/t-9d2b8f02/model_config.yaml /Users/user/mpd-data/vpd/t-9d2b8f02/tokenizer.json /Users/user/mpd-data/oracle/vpd/uv.safetensors $VPD_IN > /dev/null; cd $G; $STAGES echo done"
 RP_OWNER=lead RP_PARALLEL=1 RP_PYENV=oracle RP_MAX_PRICE=${PRICE:-0.80} RP_MIN_VRAM_GB=${VRAM:-44} RP_MIN_RAM_GB=64 \
   bench/runpod/rp-run $N "${GPU:-auto}" $H -- bash -c "$CMD" > /Users/user/mpd-data/scratch/glead/v5/rp_$N.log 2>&1
