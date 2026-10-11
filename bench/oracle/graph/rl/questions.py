@@ -5,7 +5,7 @@ prediction responds, with_vpd), and with --answers DIR "completion": [assistant 
 question in DIR as train.py's SFT reads it (train.read_answers; never a held-out search directory) cut to --max-tokens
 (train.cut). Questions whose lists are not computed yet are left out.
 
-  questions.py OUT.jsonl --split train [--root TEXTS] [--vpd-list 512] [--responses 32] [--answers DIR] [--max-tokens 4096]
+  questions.py OUT.jsonl --split train [--root TEXTS] [--vpd-list 512] [--responses 32] [--answers DIR] [--max-tokens 2048]
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ def main():
     ap.add_argument("--vpd-list", type=int, default=512)
     ap.add_argument("--responses", type=int, default=32)
     ap.add_argument("--answers", type=Path)
-    ap.add_argument("--max-tokens", type=int, default=4096)
+    ap.add_argument("--max-tokens", type=int, default=2048, help="the answer cut to its most first steps within this many tokens: half the sampling cap (train.py --sft-tokens)")
     ap.add_argument("--tokenizer", default="Qwen/Qwen3-4B", help="counts the answer's tokens for the cut (part tokens counted as their pieces: a cut on the safe side)")
     a = ap.parse_args()
     import train

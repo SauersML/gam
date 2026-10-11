@@ -1110,7 +1110,8 @@ def sft_examples(args, pol, pool: list[dict]) -> tuple[list, list]:
     by_id = {b["id"]: b for b in pool}
     end = [pol.end]
     target = (lambda text: pol.parts.reg.rewrite(text)) if getattr(pol, "parts", None) is not None else (lambda text: text)  # noqa: E731  addresses -> part tokens
-    programs = [(pol.question_ids(by_id[bid]), fit(pol.tok, target(text.strip()), args.max_tokens) + end) for bid, text in sorted(SEARCH.items()) if bid in by_id]
+    budget = getattr(args, "sft_tokens", None) or args.max_tokens // 2  # targets at the sampling cap teach answers that reach it (s3: 55% cut off, 83% unrunnable)
+    programs = [(pol.question_ids(by_id[bid]), fit(pol.tok, target(text.strip()), budget) + end) for bid, text in sorted(SEARCH.items()) if bid in by_id]
     questions = []
     for path in args.data or []:
         for line in open(os.path.expanduser(path)):
@@ -1392,6 +1393,7 @@ def main():
     ap.add_argument("--data", nargs="*", help="sft: JSONL files of further examples ({'messages': [user, assistant]} or {'prompt', 'completion'})")
     ap.add_argument("--program-share", type=float, default=1.0, help="sft: probability that a batch example is a search answer rather than a --data example")
     ap.add_argument("--sft-steps", type=int, default=200)
+    ap.add_argument("--sft-tokens", type=int, help="SFT targets cut to their most first steps within this many tokens (default --max-tokens / 2: a search answer runs to megabytes, and targets cut at the sampling cap teach answers that reach it)")
     ap.add_argument("--batch", type=int, default=8, help="sft: examples per optimizer step")
     ap.add_argument("--oracle-runs", help="directory of the per-task best-answer files (default ~/mpd-data/graph_oracle/runs/oracle; a pod writes under its outputs)")
     ap.add_argument("--run-name", help="the run's name in runs/oracle/<task>.<run>.json (default: the --out directory's name)")
