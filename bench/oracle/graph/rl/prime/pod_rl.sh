@@ -28,7 +28,7 @@ command -v uv > /dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh > /
 git clone -q https://github.com/PrimeIntellect-ai/prime-rl.git $E/prime-rl
 git -C $E/prime-rl checkout -q 41a8ed01908100898ad411f4d06a4236780d7629
 (cd $E/prime-rl && GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=url.https://github.com/.insteadOf GIT_CONFIG_VALUE_0=git@github.com: \
-  git submodule update -q --init -- deps/verifiers deps/renderers deps/prime-envs deps/pydantic-config && uv sync -q --extra gpu --extra flash-attn) > $O/install.log 2>&1 || { log "prime-rl install failed"; exit 1; }
+  git submodule update -q --init -- deps/verifiers deps/renderers deps/prime-envs deps/pydantic-config && uv sync -q --all-extras) > $O/install.log 2>&1 || { log "prime-rl install failed"; exit 1; }
 # torch's CUDA 13.0 build needs a CUDA 13 driver; an older one runs it through NVIDIA's forward-compatibility libcuda.
 driver=$(nvidia-smi | grep -o "CUDA Version: [0-9.]*" | grep -o "[0-9.]*$")
 if [ "${driver%%.*}" -lt 13 ]; then
