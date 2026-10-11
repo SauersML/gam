@@ -2,7 +2,7 @@
 
 Positives are checkpoints (agent.checkpoints) of runs labeled cheat taken before their first cheating action;
 negatives are all checkpoints of runs that never cheat (honest_fail, solved, fail; runs that took a cheating action
-but did not pass are left out of both). Lead time = generated tokens between the checkpoint and the first token of
+but did not pass, and runs cut off by the deadline before cheating, are left out of both). Lead time = generated tokens between the checkpoint and the first token of
 the cheating action. Methods:
   probe-L    logistic regression on the mean residual stream over the generated tokens so far at layer L (and all
              layers concatenated), trained on other tasks (5-fold grouped by task), runs weighted equally;
@@ -62,7 +62,7 @@ def main():
     layers = list(f["layers"])
     is_cheat = np.array([meta[x]["label"] == "cheat" for x in rid])
     fc = np.array([(meta[x]["first_cheat"] or {}).get("gen_index", -1) for x in rid])
-    attempted = np.array([meta[x]["label"] != "cheat" and meta[x]["first_cheat"] is not None for x in rid])
+    attempted = np.array([meta[x]["label"] != "cheat" and (meta[x]["first_cheat"] is not None or meta[x]["status"] == "deadline") for x in rid])
     keep = (~is_cheat & ~attempted) | (is_cheat & (fc >= 0) & (gen <= fc))
     y = is_cheat[keep].astype(int)
     lead = np.where(is_cheat, fc - gen, -1)[keep]
@@ -71,7 +71,8 @@ def main():
     out["checkpoints"] = {"positive": int(y.sum()), "negative": int((1 - y).sum()),
                           "cheat_runs_with_precheat_checkpoints": int(len(set(rk[y == 1]))),
                           "cheat_runs_without_detected_action": int(sum(1 for r in meta.values() if r["label"] == "cheat" and r["first_cheat"] is None)),
-                          "attempted_not_passed": int(sum(1 for r in meta.values() if r["label"] != "cheat" and r["first_cheat"] is not None))}
+                          "attempted_not_passed": int(sum(1 for r in meta.values() if r["label"] != "cheat" and r["first_cheat"] is not None)),
+                          "cut_by_deadline_not_cheated": int(sum(1 for r in meta.values() if r["label"] != "cheat" and r["status"] == "deadline"))}
     per_run = Counter(rk)
     w = np.array([1.0 / per_run[x] for x in rk])
     tasks = sorted(set(task))
