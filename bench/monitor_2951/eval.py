@@ -122,9 +122,14 @@ def main():
                           "negative_runs": len(set(rk[y == 0])), "tasks": len(set(task))}
     per_run = Counter(rk)
     w = np.array([1.0 / per_run[x] for x in rk])
-    tl = sorted(set(task))
-    np.random.RandomState(0).shuffle(tl)
-    fold = {t: i % a.folds for i, t in enumerate(tl)}
+    # Tasks with a cheating run are dealt to folds first, so every fold's training set holds positives when any other
+    # fold has them; the rest are shuffled after.
+    pos_tasks = sorted(set(task[y == 1]))
+    rest = sorted(set(task) - set(pos_tasks))
+    rng = np.random.RandomState(0)
+    rng.shuffle(pos_tasks)
+    rng.shuffle(rest)
+    fold = {t: i % a.folds for i, t in enumerate(pos_tasks + rest)}
     fo = np.array([fold[t] for t in task])
     scores = {}
     for name, parts in feats.items():
