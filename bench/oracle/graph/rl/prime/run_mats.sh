@@ -1,6 +1,6 @@
 #!/bin/bash
-# prime-rl RL of the graph oracle (#2951) on two MATS L40s: vLLM and serve_scores.py (two scoring processes) share the
-# first GPU, the trainer has the second. Submitted from a code snapshot's root on MATS (mpd-src/<commit>):
+# prime-rl RL of the graph oracle (#2951) on two MATS L40s: a vLLM replica on each (data parallel), serve_scores.py (two
+# scoring processes) beside the first, the trainer beside the second. Submitted from a code snapshot's root on MATS:
 #   sbatch bench/oracle/graph/rl/prime/run_mats.sh MODEL [rl args, e.g. --max-steps 100]    (env: RUN, REVISE=1)
 # MODEL: export_hf.py's checkpoint. The questions are written afresh (questions.py), so training holds every text whose
 # lists exist at the start. Uses the prime-rl install at /mnt/nw/home/s.sauers/prime-rl, with NVIDIA's CUDA 13
@@ -10,7 +10,7 @@
 #SBATCH --gres=gpu:2
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=64G
-#SBATCH --time=03:00:00
+#SBATCH --time=05:00:00
 #SBATCH --output=/mnt/nw/home/s.sauers/mpd-data/cluster/oracle-graph-prime/slurm-%j.out
 set -u
 MODEL=$1
@@ -54,7 +54,8 @@ export PYTHONPATH=$G/rl/prime  # graph_oracle: the taskset and its environment
 export PRL_OUTPUT_DIR=$E/runs WANDB_MODE=disabled XDG_CACHE_HOME=$E/cache VLLM_CACHE_ROOT=$E/cache/vllm TORCHINDUCTOR_CACHE_DIR=$E/cache/inductor UV_CACHE_DIR=$E/cache/uv
 cd $O/data
 start=$(date +%s)
-CUDA_VISIBLE_DEVICES=$A,$B rl @ $G/rl/prime/rl.toml ${REVISE:+@ $G/rl/prime/revise.toml} --model.name $MODEL --run.name $RUN --no-monitors.wandb \
+# The launcher takes inference GPUs first, then the trainer's, from this list: B twice puts a replica and the trainer on B.
+CUDA_VISIBLE_DEVICES=$A,$B,$B rl @ $G/rl/prime/rl.toml ${REVISE:+@ $G/rl/prime/revise.toml} --model.name $MODEL --run.name $RUN --no-monitors.wandb \
   --inference.server.port 8417 --orchestrator.model.client.base-url http://localhost:8417/v1 \
   --env-vars "{\"TRITON_CACHE_DIR\": \"$E/cache/triton\"}" "$@"
 echo "rl exit $? after $(( $(date +%s) - start )) s"

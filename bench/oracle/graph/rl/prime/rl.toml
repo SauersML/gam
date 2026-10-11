@@ -1,7 +1,7 @@
-# prime-rl RL of the graph oracle (#2951) on one MATS node (run_mats.sh: vLLM and serve_scores on the first GPU, the
-# trainer on the second). run_mats.sh sets model.name (export_hf.py's checkpoint) and launches from the directory holding
-# the questions files (questions.py), which the sources name relative to it.
-max_steps = 20
+# prime-rl RL of the graph oracle (#2951) on one MATS node (run_mats.sh: vLLM on both GPUs, data parallel, with
+# serve_scores on the first and the trainer on the second). run_mats.sh sets model.name (export_hf.py's checkpoint) and
+# launches from the directory holding the questions files (questions.py), which the sources name relative to it.
+max_steps = 60
 seq_len = 12288
 dashboard = false
 
@@ -15,7 +15,7 @@ alpha = 64
 [trainer.model.ac]
 
 [trainer.optim]
-lr = 1e-5
+lr = 1e-4
 
 [orchestrator]
 batch_size = 32  # 4 questions x 8 answers
@@ -62,8 +62,12 @@ env.agent.runtime.type = "subprocess"
 
 [ckpt]
 
+[deployment]  # sampling is the bottleneck: a vLLM replica on each GPU (run_mats.sh lists the second GPU twice)
+num_infer_gpus = 2
+num_train_gpus = 1
+
 [inference.vllm]
-gpu_memory_utilization = 0.45  # serve_scores' two scoring processes share this GPU (about 10 GB each)
+gpu_memory_utilization = 0.45  # per replica: serve_scores (about 12 GB) shares the first GPU, the trainer (21 GB) the second
 max_model_len = 12288
 
 [env_vars]
