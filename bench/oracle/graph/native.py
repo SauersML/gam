@@ -62,6 +62,7 @@ import mech  # noqa: E402
 TEXTS = Path.home() / "mpd-data/graph_oracle/texts"
 CHANGES = 16  # changed prompts per text: draws of the average that defines faithfulness (they set its precision, not what it is)
 MAX_CONNECTIONS = 150000  # the search's memory: the connections it ranks at once
+READ_POSITIONS, READ_PER = 16, 4  # nodes_from "vpd+reads": the positions where the prediction responds most, values/keys per layer there
 IG_STEPS = 16  # the search's integration points along each ranking's path
 ADV_STEPS, ADV_STEP = 20, 0.1  # Native.adversarial (evaluation only): VPD's headline setting is 20 steps shared across its batch
 LN2 = math.log(2)
@@ -362,6 +363,29 @@ class Native:
     def _vpd_rank(self, ids: list[int], targets: list[int]) -> dict:
         """Each subcomponent with causal importance above zero -> its place in vpd_steps' order (0 first)."""
         return {nd: place for place, nd in enumerate(self._vpd_order(ids, targets))}
+
+    def _read_candidates(self, ids: list[int], targets: list[int], positions: int = READ_POSITIONS, per: int = READ_PER) -> list:
+        """Subcomponents through which the prediction can read other positions, (matrix, position, index): at the
+        `positions` positions whose changed token moves the prediction most (sensitivity, the verifier's probe), for
+        each layer the `per` values and keys writing most there beyond their average over the text (contributions), and
+        the attention outputs of those layers at the targets that would read them. Whatever ranks the predicted
+        position first (VPD's order, integrated gradients) leaves these thousands of places down, so a search over
+        its top never states attention reading elsewhere: copying, induction."""
+        if max(targets) < 1:
+            return []
+        moved, _ = self.sensitivity(ids, targets, torch.Generator(device="cpu").manual_seed(task_seed(str(ids[:8]))))
+        where = [p for p in (moved.argsort(descending=True) + 1).tolist() if p not in targets][:positions]
+        excess = {n: w - w.mean(0, keepdim=True) for n, w in self.contributions(ids, targets).items()}
+        out = []
+        for p in where:
+            for n in self.names:
+                if _layer_kind((n, 0, 0))[1] in ("v_proj", "k_proj"):
+                    out += [(n, p, int(c)) for c in excess[n][p].topk(per).indices.tolist()]
+        for t in targets:
+            for n in self.names:
+                if _layer_kind((n, 0, 0))[1] == "o_proj":
+                    out += [(n, t, int(c)) for c in excess[n][t].topk(per).indices.tolist()]
+        return list(dict.fromkeys(out))
 
     def _vpd_order(self, ids: list[int], targets: list[int]) -> list:
         """The subcomponents with causal importance above zero, (matrix, position, index), in vpd_steps' order."""
@@ -1253,10 +1277,15 @@ class Native:
         """A bootstrap answer: (the graph after each step, their scores); see the module docstring. The subcomponents
         whose connections are ranked: the most top-ranked whose connections fit MAX_CONNECTIONS, ranked by integrated
         gradients (nodes_from "ig") or in VPD's order (nodes_from "vpd": vpd_steps' ranking, causal importance x how
-        much each writes, the predicted position first)."""
+        much each writes, the predicted position first), led by the places where attention can read other positions
+        (nodes_from "vpd+reads", _read_candidates)."""
         T = len(ids)
-        if nodes_from == "vpd":
+        if nodes_from in ("vpd", "vpd+reads"):
             ranked = self._vpd_order(ids, targets)  # vpd_steps' last step, its nodes in its order
+            if nodes_from == "vpd+reads":  # the reading places first, then VPD's order (_read_candidates)
+                reads = self._read_candidates(ids, targets)
+                first = set(reads)
+                ranked = reads + [nd for nd in ranked if nd not in first]
         else:
             ranked = self._node_ranking(ids, targets, prompts, self.reachable(T, targets))
         lo = 1
@@ -1604,7 +1633,7 @@ def main():
     s.add_argument("--stride", type=int, default=1)
     s.add_argument("--out", type=Path)
     s.add_argument("--reverse", action="store_true", help="last text first")
-    s.add_argument("--nodes-from", choices=("ig", "vpd"), default="ig", help="the candidate subcomponents: integrated gradients' ranking or VPD's (Native.ordered)")
+    s.add_argument("--nodes-from", choices=("ig", "vpd", "vpd+reads"), default="ig", help="the candidate subcomponents: integrated gradients' ranking, VPD's, or VPD's led by where attention can read other positions (Native.ordered)")
     r = sub.add_parser("ranked")
     r.add_argument("--split", choices=("train", "heldout", "hard"), nargs="+", required=True)
     r.add_argument("--n", type=int, required=True)
