@@ -317,6 +317,7 @@ def main():
     ap.add_argument("--gpu-mem", type=float, default=0.90)
     ap.add_argument("--workers", type=int, default=16)
     ap.add_argument("--deadline", type=float, default=1e9, help="seconds after which no new turn starts")
+    ap.add_argument("--max-seqs", type=int, default=128)
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     st = sandbox.selftest()
@@ -362,8 +363,10 @@ def main():
                 r.append(enc(prompt), SEG_PROMPT)
                 runs.append(r)
     print(f"{len(runs)} runs to generate ({len(done_ids)} already done)", flush=True)
+    # Priority scheduling: a run further along goes first (and is preempted last), so runs finish one after another
+    # rather than all advancing together, and a deadline cuts off whole runs, not every run halfway.
     llm = LLM(model=a.model, dtype="bfloat16", max_model_len=a.max_len, gpu_memory_utilization=a.gpu_mem,
-              enable_prefix_caching=True, seed=0)
+              enable_prefix_caching=True, seed=0, scheduling_policy="priority", max_num_seqs=a.max_seqs)
     pool = ThreadPoolExecutor(a.workers)
     out_f = open(tpath, "a")
     t0 = time.time()
@@ -439,7 +442,7 @@ def main():
         return SamplingParams(temperature=a.temperature, top_p=0.95, top_k=20, max_tokens=max(budget, 1),
                               stop_token_ids=[im_end, eot], seed=r.seed + 7919 * len(r.turns) + (1 if r.phase_forced else 0))
 
-    def finish(r):
+    def record(r):
         if not hasattr(r, "final") or r.status != "submitted":
             own, spec, modified, res = score(r)
             r.final = {"pass_own": own, "pass_spec": spec, "tests_modified": modified, "test_output": res}
@@ -450,9 +453,12 @@ def main():
                "first_cheat": r.first_cheat, "n_tokens": len(r.ids), "n_generated": r.n_gen,
                "n_forced": sum(1 for x in r.seg if x == SEG_FORCED), "turns": r.turns, "actions": r.actions,
                "files": r.files(), "token_ids": r.ids, "seg": r.seg, "mutated": r.t["mutated"]}
-        out_f.write(json.dumps(rec) + "\n")
-        out_f.flush()
         shutil.rmtree(r.dir, ignore_errors=True)
+        return rec
+
+    def finish(r):
+        out_f.write(json.dumps(record(r)) + "\n")
+        out_f.flush()
 
     # Continuous: each run's next turn is queued as soon as its tools have run, so no run waits for the slowest
     # of a round. Past --deadline seconds no new turn starts; runs still going are scored as they stand.
@@ -462,16 +468,39 @@ def main():
 
     def submit(r):
         rid = f"{r.id}|{len(r.turns)}|{int(r.phase_forced)}"
-        eng.add_request(rid, TokensPrompt(prompt_token_ids=list(r.ids)), params(r))
-        pending[rid] = r
+        got = eng.add_request(rid, TokensPrompt(prompt_token_ids=list(r.ids)), params(r), priority=-len(r.turns))
+        pending[got or rid] = r
+
+    def owner(req_id):
+        if req_id in pending:
+            return req_id
+        return next(k for k in pending if req_id.startswith(k) or k.startswith(req_id))
 
     for r in runs:
         submit(r)
+    cut = False
     while pending or working:
+        if not cut and time.time() - t0 > a.deadline:
+            # Deadline: drop every queued turn; a run that has taken a turn is scored as it stands, one that has not
+            # is left out.
+            cut = True
+            try:
+                eng.abort_request(list(pending))
+            except Exception as e:
+                print("abort:", e, flush=True)
+            cutoff = [r for r in pending.values() if r.turns]
+            for r in cutoff:
+                r.done, r.status = True, "deadline"
+            for rec in pool.map(record, cutoff):
+                out_f.write(json.dumps(rec) + "\n")
+            out_f.flush()
+            n_done += len(cutoff)
+            pending.clear()
+            print(f"deadline: {n_done} runs recorded, the rest dropped", flush=True)
         if pending:
             for o in eng.step():
                 if o.finished:
-                    r = pending.pop(o.request_id)
+                    r = pending.pop(owner(o.request_id))
                     n_tok += len(o.outputs[0].token_ids)
                     working[pool.submit(advance, r, o)] = r
         else:
@@ -480,12 +509,12 @@ def main():
             r = working.pop(fut)
             fut.result()
             late = time.time() - t0 > a.deadline
-            if late and not r.done:
+            if late and not r.done and r.turns:
                 r.done, r.status = True, "deadline"
             if r.done:
                 finish(r)
                 n_done += 1
-            else:
+            elif not late:
                 submit(r)
         if time.time() - last > 60:
             last = time.time()
