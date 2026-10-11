@@ -6,7 +6,8 @@
 # python first on PATH:
 #   rl/prime/pod_rl.sh ADAPTER QUESTIONS OUT NAME [rl args]    (env: REVISE=1 for the two-turn episode)
 # QUESTIONS: the directory holding questions.py's train.jsonl and heldout.jsonl. OUT gets the logs, metrics, trace
-# stream and configs (copied every minute), gpu.csv, serve_scores.log and the last adapter; checkpoints stay on the pod.
+# stream and configs and the newest complete adapter (OUT/adapter, its step in OUT/adapter/STEP), copied every minute,
+# so a run stopped early still leaves its latest adapter; gpu.csv and serve_scores.log; checkpoints stay on the pod.
 set -u
 ADAPTER=$1 Q=$2 O=$3 NAME=$4
 shift 4
@@ -46,7 +47,18 @@ SMI=$!
 setsid $PY rl/serve_scores.py --port 8765 --workers 2 --texts ~/mpd-data/graph_oracle/texts/vpd4l > $O/serve_scores.log 2>&1 &
 SCORER=$!
 R=$E/runs/$NAME
-sync_out() { rsync -a --exclude checkpoints --exclude broadcasts --exclude weights --exclude rollouts $R/ $O/run/ 2> /dev/null; }
+latest_adapter() {  # the newest broadcast prime-rl has finished writing (it touches .finished last)
+  for d in $(ls $R/broadcasts 2> /dev/null | sort -t_ -k2 -n -r); do [ -f $R/broadcasts/$d/.finished ] && { echo $d; return; }; done
+}
+sync_out() {
+  rsync -a --exclude checkpoints --exclude broadcasts --exclude weights --exclude rollouts $R/ $O/run/ 2> /dev/null
+  local d
+  d=$(latest_adapter)
+  [ -n "$d" ] && [ "$(cat $O/adapter/STEP 2> /dev/null)" != "$d" ] || return 0
+  # Copied whole, then swapped in: the Mac's sync skips *.partial and never sees half of one step and half of another.
+  rm -rf $O/adapter.partial && cp -r $R/broadcasts/$d $O/adapter.partial && rm -f $O/adapter.partial/.finished $O/adapter.partial/.started && \
+    echo $d > $O/adapter.partial/STEP && rm -rf $O/adapter && mv $O/adapter.partial $O/adapter
+}
 (while sleep 60; do sync_out; done) &
 SYNC=$!
 trap 'kill -TERM -- -$SCORER 2> /dev/null; kill $SMI $SYNC 2> /dev/null' EXIT
@@ -64,5 +76,3 @@ CUDA_VISIBLE_DEVICES=0,0 rl @ $G/rl/prime/rl.toml ${REVISE:+@ $G/rl/prime/revise
   --env-vars "{\"TRITON_CACHE_DIR\": \"$E/cache/triton\"}" "$@"
 log "rl exit $? after $(( $(date +%s) - start )) s"
 sync_out
-last=$(ls -v $R/broadcasts 2> /dev/null | tail -n 1)
-[ -n "$last" ] && cp -r $R/broadcasts/$last $O/adapter
