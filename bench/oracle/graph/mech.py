@@ -117,11 +117,14 @@ def _part(token, shape: dict) -> tuple[int, str, object]:
     return layer, site, int(m[3])
 
 
-def _names(parts) -> list:
-    """Subcomponents written as a list, or as one string of them written together."""
+def _names(parts, drop) -> list:
+    """Subcomponents written as a list, or as one string of them written together; other text in such a string is
+    not a subcomponent and goes to drop(why) (left out of the graph, still counted in the description length: one
+    stray token sampled among an answer's hundreds of part tokens no longer voids the whole answer)."""
     if isinstance(parts, str):
-        if PART.sub("", parts).strip():
-            raise MechError(f"{parts[:80]!r}: a string of subcomponents holds only \"<p:L.S.I>\" tokens")
+        stray = PART.sub(" ", parts).split()
+        if stray:
+            drop(f"{' '.join(stray)[:80]!r} in a string of subcomponents is not a subcomponent")
         return [m[0] for m in PART.finditer(parts)]
     if not isinstance(parts, (list, tuple, set, frozenset)):
         raise MechError(f"{parts!r}: parents are a string of subcomponents, a list of them, or {{position: string}}")
@@ -169,9 +172,12 @@ def graph(fn, model: str, behavior: dict | None) -> dict:
         return index[key]
 
     def parents(value, at: list[int]) -> list:
+        def drop(why):
+            dropped.append([step, why])
+
         if isinstance(value, dict):
-            return [ref(p, tok) for p, names in value.items() for tok in _names(names)]
-        return [ref(p, tok) for p in at for tok in _names(value)]
+            return [ref(p, tok) for p, names in value.items() for tok in _names(names, drop)]
+        return [ref(p, tok) for p in at for tok in _names(value, drop)]
 
     edges, reads, uses = [], [], []
     edge_step, read_step, uses_step = [], [], []

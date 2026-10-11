@@ -111,7 +111,7 @@ def test_a_graph_answer_says_what_is_wrong():
     assert "positions are 0..3" in dropped(GRAPH.replace("{p: ", "{9: "))[0]
     assert "a remainder is not a graph node" in dropped(GRAPH.replace("<p:3.v.5>", "<p:3.v.rest>"))[0]
     assert dropped(GRAPH)[0] == ""
-    assert "holds only" in error(GRAPH.replace("<p:3.v.5>", "<p:3.x.5>"))
+    assert "in a string of subcomponents is not a subcomponent" in dropped(GRAPH.replace("<p:3.v.5>", "<p:3.x.5>"))[0]  # stray text is dropped, not fatal
     assert "needs the task" in error(GRAPH, behavior=None)
     assert "defines no function graph" in error("x = 1\n")
     assert "imports nothing" in error("import os\n" + GRAPH)
