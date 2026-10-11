@@ -2,12 +2,14 @@
 
 An answer (mech.py) is a program run on the text and on each changed prompt of it (a rule may bind differently there);
 the graph of its first k steps is tested on the model (native.py) over experiments on the changed prompts, giving its
-faithfulness (KL in bits), and its description length is its code's (code_bits, compressed; the English is scored by the
-reader instead); with the empty
-graph at 0 bits these points are the answer's curve. One curve is better than another at a description length when its
-best point within that length has the lower KL. An answer's score (key) is area(): the mean KL its curve reaches within a
-description length drawn log-uniformly from the empty program's ("lo") to the whole model's listing, every subcomponent
-at every position ("hi"). The log-uniform weighting is a choice (no length scale preferred over another), a training
+faithfulness (KL in bits), and its description length is its graph's on the text, what a reader takes in (Graph.bits:
+each subcomponent, and each connection it keeps, a graph claiming every connection among its nodes paying for all of
+them; the English is scored by the reader instead); with the empty graph at the length of one subcomponent these points
+are the answer's curve. One curve is better than another at a description length when its best point within that length
+has the lower KL. An answer's score (key) is area(): the mean KL its curve reaches within a description length drawn
+log-uniformly from one subcomponent's ("lo") to the whole model's, every subcomponent at every position with every
+connection ("hi"). (Until 10-10 the length was the answer's compressed code, which let a three-line loop name 12,288
+subcomponents in 1,352 bits and charged nothing for the connections a complete graph keeps.) The log-uniform weighting is a choice (no length scale preferred over another), a training
 convenience; the curve itself is reported too. The range is the question's alone, so scores compare across answers,
 groups and baselines. No tolerance: an answer that explains nothing keeps the empty graph's KL over the whole range,
 the worst curve there is.
@@ -55,48 +57,6 @@ def key(s: dict) -> tuple:
 
 def keys(scores: list[dict]) -> list[tuple]:
     return [key(s) for s in scores]
-
-
-def strip(tree):
-    """graph()'s docstring removed from a parsed answer (the English is scored by the reader, not counted as code)."""
-    import ast
-
-    for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef) and node.name == "graph" and node.body and isinstance(node.body[0], ast.Expr) \
-                and isinstance(node.body[0].value, ast.Constant) and isinstance(node.body[0].value.value, str):
-            node.body = node.body[1:] or [ast.Pass()]
-    return tree
-
-
-def prefix_code(source: str, k: int) -> str:
-    """An answer's code (no docstring, no comments) with the list graph() returns cut to its first k entries when it
-    returns a list written out; otherwise the whole code (its steps come from code that cannot be cut)."""
-    import ast
-
-    try:
-        tree = strip(ast.parse(source))
-    except SyntaxError:
-        return source
-    for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef) and node.name == "graph":
-            for ret in ast.walk(node):
-                if isinstance(ret, ast.Return) and isinstance(ret.value, ast.List):
-                    ret.value.elts = ret.value.elts[:k]
-    return ast.unparse(tree)
-
-
-def code_bits(source: str) -> float:
-    """An answer's description length in bits: its code (no docstring, no comments, normalized by ast.unparse)
-    compressed with LZMA2 in a raw stream. A rule that computes many connections costs its code, a list of
-    connections its entries; a lookup table costs its table."""
-    import ast
-    import lzma
-
-    try:
-        code = ast.unparse(strip(ast.parse(source)))
-    except SyntaxError:
-        code = source
-    return 8.0 * len(lzma.compress(code.encode(), format=lzma.FORMAT_RAW, filters=[{"id": lzma.FILTER_LZMA2, "preset": 9 | lzma.PRESET_EXTREME}]))
 
 
 class Scorer:
@@ -173,16 +133,14 @@ class Scorer:
     def score(self, task: dict, sources: list[str], seed: int = 0, necessity: bool = False) -> list[dict]:
         """Each answer's score on a task (a text task record) under one draw of changed prompts (seed): {"valid",
         "error", "curve": [[bits, kl], ...] (the empty program, then each step), "lo" and "hi": the empty program's and
-        the whole model's description lengths, "kl_bits" and "bits" (the whole answer), "steps", "nodes", "edges",
+        the whole model's description lengths (Graph.bits), "kl_bits" and "bits" (the whole answer), "steps", "nodes", "edges",
         "explanation", "notes", "necessity_kl_bits" (with necessity: native.necessity of the whole answer on the text,
         an evaluation measure), "dropped": what the answer wrote that is not part of its graph (mech), "events": the
         English reader's questions with the model's answers (native.events: every changed prompt, and holds of the
-        answer's steps)}. An answer's description length is its code's
-        (code_bits; library entries it uses are given, their definitions not counted); its first k steps are the same
-        program with its returned list cut to k entries (prefix_code). The program runs on every changed prompt
-        (instances), its graph there tested there. The source "vpd" stands for VPD's own answer: its subcomponents ranked
-        by causal importance x how much each writes (native.vpd_steps), the k-th step the top 2^(k-1), each complete, its
-        description length that of the same steps written as a "parts" answer (native.parts_program), like any answer's."""
+        answer's steps)}. The description length of an answer's first k steps is Graph.bits of their graph on the text
+        (library entries expanded). The program runs on every changed prompt (instances), its graph there tested there.
+        The source "vpd" stands for VPD's own answer: its subcomponents ranked by causal importance x how much each
+        writes (native.vpd_steps), the k-th step the top 2^(k-1), each complete (paying for every connection it keeps)."""
         import mech
 
         prompt = task["prompts"][0]
@@ -190,7 +148,7 @@ class Scorer:
         nat = self.nat
         prompts = nat.changes(ids, targets, seed=(self.native.task_seed(task["id"]) + 1_000_003 * seed) % (1 << 31))
         positions, total = nat.positions(targets), sum(nat.C.values())
-        lo = code_bits(EMPTY)
+        lo = math.log2(positions * total)  # one subcomponent: where the empty graph's point sits
         P = len(prompts)
         rows = [(None, lo, [self.native.Graph()] * P)]  # (answer, description length, its graph on each prompt): the empty program first
         out, step_nodes = [], []  # step_nodes[j]: answer j's graph on the text after each step (node sets)
@@ -201,8 +159,8 @@ class Scorer:
                 continue
             if src == "vpd":  # VPD's answer, its subcomponents in order of causal importance (native.vpd_steps)
                 steps = nat.vpd_steps(ids, targets)
-                for k, g in enumerate(steps):  # its description length: the code of its first steps as a "parts" answer
-                    rows.append((j, code_bits(self.native.parts_program(steps[:k + 1])), [g] * P))
+                for g in steps:
+                    rows.append((j, g.bits(positions, total, targets), [g] * P))
                 out.append({"valid": True, "error": None, "steps": len(steps), "explanation": "", "notes": [], "base": steps[-1]})
                 continue
             ir = mech.trace(src, "vpd4l", behavior=task)
@@ -232,7 +190,7 @@ class Scorer:
                     gs.append(g)
                 if not out[-1]["valid"]:
                     break
-                mine.append((code_bits(prefix_code(src, k)), gs))
+                mine.append((gs[0].bits(positions, total, targets), gs))
             if out[-1]["valid"]:
                 step_nodes[j] = [gs[0].node_set() for _, gs in mine]
                 for bits, gs in mine:
@@ -243,7 +201,7 @@ class Scorer:
         kl = nat.faithfulness(ids, targets, [[r[2][i] for r in rows] for i in range(P)], prompts, seed)
         holds = [[b - a for a, b in zip([set()] + st[:-1], st)] for st in step_nodes]  # each answer's steps: the nodes each adds
         events = nat.events(ids, targets, prompts, [[h for h in hs if h] for hs in holds], seed)  # the English reader's questions (reader.py)
-        hi = positions * total * math.log2(positions * total)
+        hi = nat.everything_bits(targets)
         for s, ev in zip(out, events):
             s.update(curve=[[lo, kl[0]]], lo=lo, hi=max(hi, 2 * lo), events=ev)
         for (o, b, _), k in zip(rows[1:], kl[1:]):

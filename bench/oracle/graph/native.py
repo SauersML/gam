@@ -186,18 +186,17 @@ class Graph:
     def size(self) -> int:
         return self.count() + self.edges()
 
-    def bits(self, positions: int, subcomponents: int) -> float:
-        """Description length: each node one choice among positions x subcomponents, each edge its reader's and
-        writer's indices among the nodes, each edge into the prediction its writer's index (a complete graph states
-        no edges)."""
+    def bits(self, positions: int, subcomponents: int, targets: list[int]) -> float:
+        """Description length, what a reader of the graph takes in: each node one choice among positions x
+        subcomponents, each edge its reader's and writer's indices among the nodes, each edge into the prediction its
+        writer's index. A complete graph keeps every connection the model has among its nodes (implied_edges) and pays
+        for each like a stated one: claiming all of them is no shorter to read than listing them."""
         n = self.count()
         if n == 0:
             return 0.0
         nodes = n * math.log2(positions * subcomponents)
-        if self.complete:
-            return nodes
-        index = math.log2(n)
-        return nodes + index * (2 * sum(len(w) for w in self.parents.values()) + len(self.out))
+        inner, out = implied_edges(self.node_set(), targets) if self.complete else (sum(len(w) for w in self.parents.values()), len(self.out))
+        return nodes + math.log2(n) * (2 * inner + out)
 
 
 @lru_cache(None)
@@ -217,6 +216,36 @@ def connects(writer: tuple, reader: tuple | None, targets: list[int]) -> bool:
         return mech.connects(wl, wk, writer[1], None, None, None, targets)
     rl, rk = _layer_kind(reader)
     return mech.connects(wl, wk, writer[1], rl, rk, reader[1], targets)
+
+
+def implied_edges(nodes, targets: list[int]) -> tuple[int, int]:
+    """(connections among the nodes, connections into the prediction) the model has (mech.connects' rule, as
+    _candidates lists them), counted without listing them: residual readers from residual writers before them at their
+    position, attention outputs from values of their layer at their position or earlier, MLP outputs from their MLP's
+    input at their position; the prediction from residual writers at the targets."""
+    import bisect
+
+    resid, values, inputs = {}, {}, {}
+    for nd in nodes:
+        layer, kind = _layer_kind(nd)
+        if kind in mech.RESID_WRITERS:
+            resid.setdefault(nd[1], []).append(mech.stage(layer, kind))
+        elif kind == "v_proj":
+            values.setdefault(layer, []).append(nd[1])
+        elif kind == "c_fc":
+            inputs[(layer, nd[1])] = inputs.get((layer, nd[1]), 0) + 1
+    for v in (*resid.values(), *values.values()):
+        v.sort()
+    inner = 0
+    for nd in nodes:
+        layer, kind = _layer_kind(nd)
+        if kind in mech.RESID_READERS:
+            inner += bisect.bisect_right(resid.get(nd[1], []), mech.stage(layer, kind))
+        elif kind == "o_proj":
+            inner += bisect.bisect_right(values.get(layer, []), nd[1])
+        elif kind == "down_proj":
+            inner += inputs.get((layer, nd[1]), 0)
+    return inner, sum(len(resid.get(t, [])) for t in set(targets))
 
 
 def _candidates(nodes) -> dict:
@@ -1118,11 +1147,24 @@ class Native:
         """The positions a graph's nodes can sit at: 0 to the last target."""
         return max(targets) + 1
 
+    def everything_bits(self, targets: list[int]) -> float:
+        """Graph.bits of the whole model, every subcomponent at every position a node can sit at and every connection
+        among them (implied_edges' rule, counted per site without listing): the top of the description-length range."""
+        P, total = self.positions(targets), sum(self.C.values())
+        C = {_layer_kind((n, 0, 0)): c for n, c in self.C.items()}
+        writers = [(mech.stage(l, k), c) for (l, k), c in C.items() if k in mech.RESID_WRITERS]
+        per_position = sum(c * sum(cw for st, cw in writers if st <= mech.stage(l, k)) for (l, k), c in C.items() if k in mech.RESID_READERS)
+        layers = {l for l, _ in C}
+        inner = P * per_position + sum(C.get((l, "o_proj"), 0) * C.get((l, "v_proj"), 0) * P * (P + 1) // 2 + C.get((l, "down_proj"), 0) * C.get((l, "c_fc"), 0) * P for l in layers)
+        out = len(set(targets)) * sum(c for _, c in writers)
+        n = P * total
+        return n * math.log2(P * total) + math.log2(n) * (2 * inner + out)
+
     def score(self, ids: list[int], targets: list[int], graphs: list[Graph], prompts: list[list[int]], seed: int = 0) -> list[dict]:
         """{"kl_bits", "bits", "nodes", "edges"} per graph: its faithfulness and its graph's description length (Graph.bits)."""
         total = sum(self.C.values())
         kl = self.faithfulness(ids, targets, graphs, prompts, seed)
-        return [{"kl_bits": k, "bits": g.bits(self.positions(targets), total), "nodes": g.count(), "edges": None if g.complete else g.edges()}
+        return [{"kl_bits": k, "bits": g.bits(self.positions(targets), total, targets), "nodes": g.count(), "edges": None if g.complete else g.edges()}
                 for g, k in zip(graphs, kl)]
 
     @torch.no_grad()
