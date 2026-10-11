@@ -84,7 +84,8 @@ def with_vpd(task: dict, root: Path, k: int, positions: int = 0) -> dict:
 def feedback(s: dict) -> str:
     """The verifier's report on an answer as the oracle reads it before revising: why it could not run, or the KL in
     bits of the model's next-token distribution from the graph of its first k steps and that graph's description
-    length, for each k, and each distinct reason something written is not part of the graph."""
+    length, for each k, and the most frequent reasons something written is not part of the graph (at most SHOWN_REASONS,
+    most frequent first: an answer can have thousands of distinct ones, which would outgrow the revising prompt)."""
     if not s.get("valid", True):
         return f"The verifier could not run your answer: {s.get('error')}"
     c = s.get("curve") or [[0.0, float("nan")]]
@@ -94,9 +95,16 @@ def feedback(s: dict) -> str:
               "graph's:\n" + "\n".join(lines))
     dropped = s.get("dropped") or []
     if dropped:
+        from collections import Counter
+
+        reasons = Counter(dropped).most_common()
         report += (f"\n{len(dropped)} things you wrote are not part of the graph (they still count in its description length):\n"
-                   + "\n".join(f"- {why}" for why in dict.fromkeys(dropped)))
+                   + "\n".join(f"- {why}" + (f" ({n} times)" if n > 1 else "") for why, n in reasons[:SHOWN_REASONS])
+                   + (f"\n- and {len(reasons) - SHOWN_REASONS} other reasons" if len(reasons) > SHOWN_REASONS else ""))
     return report
+
+
+SHOWN_REASONS = 10
 
 
 REVISE = ("Write an improved answer in the same format: as faithful as possible at every description length, the most "

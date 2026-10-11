@@ -27,7 +27,7 @@ T='/ephemeral/$USER/'$N  # scratch and caches on the worker's local disk (the ad
 WAIT=${WAIT:-3}  # hours the job may wait for its GPU to be free (gpu_free.py)
 EVIDENCE=${EVIDENCE-1}  # empty: the text-only oracle
 if [ -n "$EVIDENCE" ]; then EV="--evidence --max-tokens 4096 --max-model-len 26624"; else EV="--max-tokens 4096 --max-model-len 14336"; fi
-SHARE=$([ -n "$EVIDENCE" ] && echo "--gpu-memory 0.4 --score-workers 2" || echo "--gpu-memory 0.5 --score-workers 3")  # with evidence vLLM stays awake (train.py): a fixed share of the L40
+SHARE=$([ -n "$EVIDENCE" ] && echo "--gpu-memory 0.4 --score-workers 2" || echo "--gpu-memory 0.5 --score-workers 2")  # with evidence vLLM stays awake (train.py): a fixed share of the L40; a scoring process peaks near 12 GB (3 beside the trainer ran out of memory)
 BASIC="--base Qwen/Qwen3-4B --model vpd4l --behaviors $B --search $D --part-tokens $O/reg.safetensors --scorer native $EV ${VPD_LIST:+--vpd-list $VPD_LIST} ${RESPONSES:+--responses $RESPONSES} --share-gpu $SHARE --micro 1 --eval-behaviors 50 --oracle-runs $O/oracle"
 COMMON="$BASIC --search-heldout ${HELD:-$B/search_heldout}"
 SFT="$PY rl/train.py --mode sft $COMMON --samples 4 --sft-steps ${SFT_STEPS:-80} --batch 8 ${SFT_FROM:+--init $SFT_FROM} --out $O/sft --run-name ${N}_sft > $O/sft/log 2>&1"
