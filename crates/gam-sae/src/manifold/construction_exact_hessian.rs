@@ -3624,20 +3624,24 @@ impl SaeManifoldTerm {
                         // bit-for-bit the historical RHS.
                         let w_row = row_w.map_or(1.0, |w| w[row]);
                         let base = cache.row_offsets[row] + block_start;
-                        // #4077 — an active-bound pinned slot's assembled gradient
-                        // is projected to exactly zero (`B`'s Riemannian
-                        // conversion), and the IFT operator holds the slot at the
-                        // metric's unit stiffness uncoupled, so this RHS entry must
-                        // be projected to zero the same way or the solve reads it
-                        // as a real force on a coordinate the retraction holds
-                        // fixed: `A⁺·(∂g/∂ρ)` would move the pinned coordinate by
-                        // `∂g/∂ρ` itself.
-                        if self
-                            .last_pinned_bound_slots
-                            .contains(&(row, block_start + axis))
-                        {
-                            continue;
-                        }
+                        // #4077 — this RHS is the RAW `∂g/∂log α`, and a pinned
+                        // slot's entry is live here: the half-line mass the
+                        // criterion prices differentiates the raw gradient
+                        // `g_u`, whose ARD prior leg `w_row·∂V'/∂log α` moves
+                        // with `log α` while the coordinate sits on its bound.
+                        // The analytic gradient's half-line leg
+                        // (`analytic_outer_rho_gradient_components_with_bundle`)
+                        // reads this entry BEFORE projecting, exactly as
+                        // `project_pinned_ift_rhs`'s doc prescribes ("a caller
+                        // reads that first"); the PROJECTED stationarity the
+                        // IFT differentiates zeroes the entry at the solve
+                        // itself. Skipping the entry here would silently zero
+                        // the half-line gradient leg while the value keeps
+                        // pricing the mass — the fixed-state ARD partial then
+                        // misses `Σ_u κ₁·sign(g_u)·w_row·α·(|t|−|lo|)` against
+                        // its own finite difference (measured −9.711e-2 on
+                        // `tests_interval_active_bound_3438`, agreeing with the
+                        // gap to 2e-10).
                         match sphere {
                             // On an embedded unit sphere at `x` the assembled gradient
                             // is its tangent projection `P g`, so the RHS is
@@ -5868,21 +5872,23 @@ impl SaeManifoldTerm {
         let dim = sae_exact_stationarity_dim(cache.delta_t_len(), cache.k);
         let mut a = Array2::<f64>::zeros((dim, dim));
         let gap_border = self.probe_exact_hessian_arrow(rho, target, cache, &mut a)?;
-        // #3438/#4077 — an active-bound pinned slot enters `A = B + ΔC` with an
-        // exactly-zero row and column (`B`'s Riemannian conversion zeroes it,
-        // and `ΔC` is projected there too), so the probe above writes a
-        // structural zero diagonal. The evidence pencil carries that slot at
-        // the METRIC's unit stiffness — the same constant `+1` the per-row
-        // spectral deflation installs (`eeb8b136b1`: an all-null block is `d`
-        // unit-stiffness directions, priced at `log 1 = 0`) — so the dense
-        // materialization reads the operator its consumers price: coupled to
-        // nothing (the probe already wrote the zeros), held at the unit (write
-        // it here). The write is exact: the raw entry is exactly zero by the
-        // same projections the test pins, so `0 + 1 = 1` carries no rounding.
+        // #3438/#4077 — an active-bound pinned slot enters `A = B + ΔC` with
+        // `B`'s Riemannian conversion holding it as the metric's unit
+        // direction: uncoupled from the rest of the operator (`ΔC` is
+        // projected there too), carried at stiffness exactly one — the same
+        // constant `+1` the per-row spectral deflation installs (`eeb8b136b1`:
+        // an all-null block is `d` unit-stiffness directions, priced at
+        // `log 1 = 0`). After `f93ac59151` the probe above already writes that
+        // unit row (`apply_exact_hessian_prepared` carries B's conversion), so
+        // this loop ASSIGNS the unit rather than adding it: a second `+= 1`
+        // double-prices the slot at 2 (`#4579` measured a structural zero at
+        // its base `55d679763b`, which `f93ac59151` — merged after — replaced;
+        // `tests_interval_active_bound_3438` pins the diagonal at 1 to
+        // `ε·max|A|`).
         for &(row, local) in &self.last_pinned_bound_slots {
             let index = cache.row_offsets.get(row).map_or(0, |start| start + local);
             if index < a.nrows() {
-                a[[index, index]] += 1.0;
+                a[[index, index]] = 1.0;
             }
         }
         Ok((a, gap_border))
