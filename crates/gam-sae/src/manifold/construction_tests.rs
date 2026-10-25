@@ -68,12 +68,24 @@ mod exact_hessian_fixture_tests {
     /// 4.67e-16 at ae0d368e20 against 1.01e-4 at its parent, with byte-identical test
     /// bodies. A polish test built on it measures an early return.
     ///
-    /// This state is the majorized evidence inner loop's own fixed point instead: the
-    /// same term and `rho` re-enter `run_joint_fit_arrow_schur_for_quasi_laplace` until
-    /// a whole re-entry finds no strict decrease. That drive has no acceptance,
-    /// refinement or polish site, so nothing on its path carries the state to the
-    /// root, and the exact-A step the polish takes still resolves descent there. The
-    /// premise is a property of the state, asserted with the criterion's own KKT gate
+    /// This state comes from the majorized evidence inner loop instead: the same term
+    /// and `rho` re-enter `run_joint_fit_arrow_schur_for_quasi_laplace` until a whole
+    /// re-entry finds no strict decrease. That drive still has no acceptance,
+    /// refinement or polish site — but since f93ac59151 (#4077) its strict-decrease
+    /// floor is the objective's own rounding band, not the old constant
+    /// `1e-8·(1+|f|)`, so a re-entry can resolve decreases that floor used to refuse
+    /// and the drive now walks its fixed point INSIDE the KKT band (measured at main
+    /// `a5147cbe7d`: fixed point after 5 re-entries at `‖g‖ = 3.69e-7` against
+    /// `tol = 3.78e-5`, while `f93ac59151~1` stopped at `1.43e-4`, live). A state the
+    /// KKT gate accepts is exactly the state production never hands the polish: every
+    /// `terminal_exact_newton_polish` site arms on `!gradient_stationary`
+    /// (`construction_undamped_inner.rs`), and the phase itself returns `Ok(true)`
+    /// at a stationary gate without stepping. So the loop banks each KKT-refused
+    /// state as its re-entry leaves it — with the `rho` that re-entry was invoked at,
+    /// since the drive takes `&mut rho` — and restores the LAST banked one at the
+    /// fixed point. That is the production entry contract: the most advanced state
+    /// the criterion's own gate still refuses. The premise is a property of the
+    /// restored state, asserted with the criterion's own KKT gate
     /// (`quasi_laplace_kkt_stationary` at `SAE_MANIFOLD_INNER_GRAD_REL_TOL ·
     /// inner_iterate_scale`), and printed before it is asserted.
     pub(super) fn majorized_fixed_point_with_residual()
@@ -93,8 +105,14 @@ mod exact_hessian_fixture_tests {
         }
         // Each re-entry that is not a fixed point committed a strict decrease of the
         // penalized objective under its own gates, so the loop ends where the drive
-        // itself stops moving the state.
+        // itself stops moving the state. Every re-entry whose EXIT state the KKT gate
+        // refuses is banked (state + the rho it ran at); the fixed point restores the
+        // last one, because a fixed point inside the band is not a polish entry.
         let mut reentries = 0usize;
+        // Assigned once at the fixed-point break, the loop's only exit; `-D
+        // unused-mut`/`-D unused-assignments` reject both a `mut` and an initializer.
+        let fixed_point_grad_norm;
+        let mut last_live: Option<(SaeManifoldRho, SaeManifoldMutableState)> = None;
         loop {
             let outcome = term
                 .run_joint_fit_arrow_schur_for_quasi_laplace(
@@ -108,21 +126,59 @@ mod exact_hessian_fixture_tests {
                 )
                 .expect("the majorized evidence drive must run on the PD-basin fixture");
             reentries += 1;
+            let lambda_smooth = rho.lambda_smooth_vec().expect("smoothness strengths");
+            let tolerance = SAE_MANIFOLD_INNER_GRAD_REL_TOL * term.inner_iterate_scale();
+            let live = |term: &mut SaeManifoldTerm, rho: &SaeManifoldRho| {
+                let system = term
+                    .assemble_arrow_schur(target.view(), rho, None)
+                    .expect("arrow-Schur assembly at a re-entry exit state");
+                let grad_norm_sq = SaeManifoldTerm::system_grad_norm_sq(&system);
+                let quotient_grad_norm = term.quotient_gradient_norm_from_system(
+                    &system,
+                    grad_norm_sq,
+                    &lambda_smooth,
+                );
+                (
+                    grad_norm_sq.sqrt(),
+                    quotient_grad_norm,
+                    !SaeManifoldTerm::quasi_laplace_kkt_stationary(
+                        grad_norm_sq.sqrt(),
+                        quotient_grad_norm,
+                        tolerance,
+                    ),
+                )
+            };
+            let (grad_norm, quotient_grad_norm, is_live) = live(&mut term, &rho);
+            if is_live {
+                last_live = Some((rho.clone(), term.snapshot_mutable_state()));
+            }
             if outcome.fixed_point {
+                fixed_point_grad_norm = grad_norm;
+                eprintln!(
+                    "[#2080 polish fixture] majorized fixed point after {reentries} \
+                     re-entries: ‖g‖={grad_norm:.6e} ‖Π⊥null g‖={quotient_grad_norm:.6e} \
+                     tol={tolerance:.6e}"
+                );
                 break;
             }
         }
+        if let Some((banked_rho, banked_state)) = last_live.as_ref() {
+            rho = banked_rho.clone();
+            term.restore_mutable_state(banked_state)
+                .expect("the banked KKT-refused state must restore");
+        }
         let system = term
             .assemble_arrow_schur(target.view(), &rho, None)
-            .expect("arrow-Schur assembly at the majorized fixed point");
+            .expect("arrow-Schur assembly at the polish entry state");
         let grad_norm_sq = SaeManifoldTerm::system_grad_norm_sq(&system);
         let lambda_smooth = rho.lambda_smooth_vec().expect("smoothness strengths");
         let quotient_grad_norm =
             term.quotient_gradient_norm_from_system(&system, grad_norm_sq, &lambda_smooth);
         let tolerance = SAE_MANIFOLD_INNER_GRAD_REL_TOL * term.inner_iterate_scale();
         eprintln!(
-            "[#2080 polish fixture] majorized fixed point after {reentries} re-entries: \
-             ‖g‖={:.6e} ‖Π⊥null g‖={quotient_grad_norm:.6e} tol={tolerance:.6e}",
+            "[#2080 polish fixture] polish entry restored to the last KKT-refused \
+             re-entry exit: ‖g‖={:.6e} ‖Π⊥null g‖={quotient_grad_norm:.6e} \
+             tol={tolerance:.6e} (fixed point sat at ‖g‖={fixed_point_grad_norm:.6e})",
             grad_norm_sq.sqrt(),
         );
         assert!(
