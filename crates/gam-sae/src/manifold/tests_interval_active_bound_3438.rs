@@ -709,3 +709,147 @@ fn pinned_half_line_mass_enters_the_outer_gradient_4077() {
         (implicit - implicit_fd).abs()
     );
 }
+
+/// #4077 — operand-level decomposition of the fixed-state ARD partial's analytic/FD gap.
+///
+/// The analytic partial's half-line gradient leg reads `∂g_u/∂ρ` from
+/// `outer_rho_gradient_ift_rhs`, which after `f93ac59151` assembles from the PROJECTED
+/// gradient — identically zero at every slot `B`'s conversion pinned — while the half-line
+/// mass differentiates the RAW gradient, whose ARD prior leg is live in `log α`. This test
+/// measures both sides of that mismatch without assuming which is right: it FDs the raw
+/// operands (`g_u`, `σ_u`) directly through `pinned_half_line_slots` at `ρ ± ε` (the term's
+/// state and pinned list frozen), and receipts the missing-leg estimate
+/// `Σ_u κ₁·sign(g_u)·∂g_u/∂log α` against the analytic-vs-FD gap of the full partial.
+#[test]
+fn half_line_gradient_leg_gap_decomposition_4077() {
+    let (mut state, target, rho) = converged_interval_state();
+    let flat = rho.ard_flat_index(0, 0);
+    let (_, cache) = fitted_cache(&mut state, &target, &rho);
+    let slots = state
+        .pinned_half_line_slots(&rho, target.view(), &cache)
+        .expect("half-line operands at the converged state");
+    assert!(!slots.is_empty());
+
+    // The analytic partial's half-line legs, as the production gradient forms them.
+    let legs = state
+        .pinned_half_line_gradient_legs(&rho, target.view(), &cache)
+        .expect("gradient-leg coefficients");
+    let rhs = state
+        .outer_rho_gradient_ift_rhs(&rho, flat, &cache)
+        .expect("the implicit right-hand side the gradient leg reads");
+    let mut analytic_leg = 0.0_f64;
+    let mut rhs_max = 0.0_f64;
+    for &(index, coefficient) in &legs {
+        analytic_leg += coefficient * rhs.t[index];
+        rhs_max = rhs_max.max(rhs.t[index].abs());
+    }
+    println!(
+        "[#4077-legs] analytic gradient leg = {analytic_leg:.12e} (max |rhs| on pinned slots \
+         {rhs_max:.6e})"
+    );
+
+    // The raw operands' own ρ-derivative, central-differenced on the frozen state.
+    let eps = 1.0e-4_f64;
+    let at = |shift: f64| {
+        let mut at = rho.clone();
+        at.log_ard[0][0] += shift;
+        at
+    };
+    let plus = state
+        .pinned_half_line_slots(&at(eps), target.view(), &cache)
+        .expect("operands at rho + eps");
+    let minus = state
+        .pinned_half_line_slots(&at(-eps), target.view(), &cache)
+        .expect("operands at rho - eps");
+    let mut raw_leg = 0.0_f64;
+    for ((base, shifted_up), shifted_down) in slots.iter().zip(plus.iter()).zip(minus.iter()) {
+        let dgrad = (shifted_up.gradient - shifted_down.gradient) / (2.0 * eps);
+        let dcurv = (shifted_up.curvature - shifted_down.curvature) / (2.0 * eps);
+        // `pinned_half_line_gradient_legs` carries the criterion's ½: κ₁·sign(g)·∂g.
+        let coefficient = 0.5 * base.gradient_coefficient();
+        raw_leg += coefficient * dgrad;
+        println!(
+            "[#4077-legs] row {}: g {:.6e} σ {:.6e} ∂g/∂logα {dgrad:+.6e} ∂σ/∂logα {dcurv:+.6e} \
+             κ₁ {:+.6e} coeff {coefficient:+.6e} contribution {:+.6e}",
+            base.row,
+            base.gradient,
+            base.curvature,
+            base.jet[1],
+            coefficient * dgrad
+        );
+    }
+    println!(
+        "[#4077-legs] raw-operand gradient leg = {raw_leg:.12e} (analytic reads \
+         {analytic_leg:.12e}; the route is zero on pinned slots at rhs max {rhs_max:.3e})"
+    );
+
+    // The full partial's analytic/FD gap, priced exactly as the test above prices it.
+    let price = |at: &SaeManifoldRho| -> f64 {
+        let mut arm = state.clone();
+        arm.penalized_quasi_laplace_criterion_with_cache(
+            target.view(),
+            at,
+            None,
+            0,
+            0.4,
+            1.0e-8,
+            1.0e-8,
+        )
+        .expect("the criterion prices the frozen state")
+        .0
+    };
+    let fd = |step: f64| (price(&at(step)) - price(&at(-step))) / (2.0 * step);
+    let richardson = |coarse: f64, fine: f64| (4.0 * fine - coarse) / 3.0;
+    let partial_fd = richardson(fd(1.0e-3), fd(0.5e-3));
+    let (_cost, loss, cache2, geometry) = state
+        .penalized_quasi_laplace_criterion_with_geometry(
+            target.view(),
+            &rho,
+            None,
+            0,
+            0.4,
+            1.0e-8,
+            1.0e-8,
+            true,
+        )
+        .expect("the criterion prices the converged state");
+    let geometry = geometry.expect("the dense criterion hands out the block it priced");
+    let components = state
+        .analytic_outer_rho_gradient_components_with_bundle(
+            target.view(),
+            &rho,
+            &loss,
+            &cache2,
+            None,
+            None,
+            Some(&geometry),
+        )
+        .expect("dense gradient components at the converged state");
+    let partial =
+        components.explicit[flat] + components.logdet_trace[flat] + components.occam[flat];
+    let gap = partial - partial_fd;
+    println!(
+        "[#4077-legs] partial={partial:.12e} partial_fd={partial_fd:.12e} gap={gap:+.12e}; \
+         raw-leg estimate {raw_leg:+.12e}; residual after subtracting the raw leg \
+         {:+.6e}",
+        gap - raw_leg
+    );
+
+    // The receipt, post-fix: the analytic route now prices the raw-operand leg
+    // (analytic_leg ≈ raw_leg, the rhs no longer zero at pinned slots), and the
+    // full partial's analytic/FD gap CLOSES. On unfixed main both fail with the
+    // decomposition printed above (analytic_leg = 0, gap = −raw_leg).
+    let tolerance = 1.0e-2 * raw_leg.abs().max(1.0e-3);
+    assert!(
+        (analytic_leg - raw_leg).abs() <= tolerance,
+        "the analytic gradient leg {analytic_leg:.6e} does not price the raw-operand leg \
+         {raw_leg:.6e} (|Δ| = {:.3e}, tolerance {tolerance:.3e})",
+        (analytic_leg - raw_leg).abs()
+    );
+    let gap_tolerance = 10.0 * 1.621e-8_f64.max(1.0e-6 * partial_fd.abs());
+    assert!(
+        gap.abs() <= gap_tolerance,
+        "the fixed-state ARD partial's analytic/FD gap did not close: {gap:+.6e} against \
+         tolerance {gap_tolerance:.3e} (raw leg {raw_leg:+.6e})"
+    );
+}
