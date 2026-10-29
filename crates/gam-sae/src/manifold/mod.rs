@@ -242,6 +242,9 @@ mod tests;
 mod tests_dense_solver_oracles;
 
 #[cfg(test)]
+mod tests_null_evidence_gate_3355;
+
+#[cfg(test)]
 mod tests_basin_bundle_envelope;
 
 #[cfg(test)]
