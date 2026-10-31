@@ -1,22 +1,22 @@
 # python-contracts full-suite triage (#1512) — recovered summary
 
 collected            3406
-passed               3073
+passed               3072
 skipped              79
-failed (diagnosed)   172
+failed (diagnosed)   175
 errored (diagnosed)  6
-CENSORED             76   (worker killed at the per-test bound;
+CENSORED             74   (worker killed at the per-test bound;
                           the JUnit records no reason and time=0.000)
 
 faulthandler dumps in the step log: 81
 
-## The 76 censored tests, with the frame each was stuck in
+## The 74 censored tests, with the frame each was stuck in
 
 Recovered from the faulthandler dumps, which fire before the kill and
 write straight to fd 2. A test listed here is NOT a crashed interpreter:
 it is a call that had not returned when the bound expired.
 
-[19] tests.test_documentation_examples
+[18] tests.test_documentation_examples
       test_python_documentation_example[README.md:277]
           stuck in gamfit/_api.py:1222 in fit
       test_python_documentation_example[README_PYPI.md:243]
@@ -41,8 +41,6 @@ it is a call that had not returned when the bound expired.
           stuck in gamfit/_api.py:1222 in fit
       test_python_documentation_example[docs/marginal-slope.md:844]
           stuck in gamfit/_api.py:1222 in fit
-      test_python_documentation_example[docs/marginal-slope.md:909]
-          stuck in gamfit/_api.py:1222 in fit
       test_python_documentation_example[docs/survival.md:264]
           stuck in gamfit/_api.py:1222 in fit
       test_python_documentation_example[docs/survival.md:295]
@@ -64,16 +62,6 @@ it is a call that had not returned when the bound expired.
       test_standalone_per_atom_projection
           stuck in gamfit/_sae_manifold.py:216 in sae_manifold_fit
       test_warm_start_accepted_and_refines
-          stuck in gamfit/_sae_manifold.py:216 in sae_manifold_fit
-
-[4] tests.test_sae_manifold_shape_band_save_load
-      test_on_disk_format_is_compact_per_channel_not_dense_joint
-          stuck in gamfit/_sae_manifold.py:216 in sae_manifold_fit
-      test_reconstruction_and_band_are_physical_under_heterogeneous_column_scale
-          stuck in gamfit/_sae_manifold.py:216 in sae_manifold_fit
-      test_restored_covariance_reproduces_analytic_band
-          stuck in gamfit/_sae_manifold.py:216 in sae_manifold_fit
-      test_shape_band_survives_save_load_to_tight_tolerance
           stuck in gamfit/_sae_manifold.py:216 in sae_manifold_fit
 
 [4] tests.test_structure_certificate_1058
@@ -100,6 +88,14 @@ it is a call that had not returned when the bound expired.
       test_sae_fit_random_state_changes_output
           stuck in gamfit/_sae_manifold.py:216 in sae_manifold_fit
       test_sae_fit_random_state_changes_output_topk_path
+          stuck in gamfit/_sae_manifold.py:216 in sae_manifold_fit
+
+[3] tests.test_sae_manifold_shape_band_save_load
+      test_on_disk_format_is_compact_per_channel_not_dense_joint
+          stuck in gamfit/_sae_manifold.py:216 in sae_manifold_fit
+      test_restored_covariance_reproduces_analytic_band
+          stuck in gamfit/_sae_manifold.py:216 in sae_manifold_fit
+      test_shape_band_survives_save_load_to_tight_tolerance
           stuck in gamfit/_sae_manifold.py:216 in sae_manifold_fit
 
 [3] tests.test_sae_manifold_shape_uncertainty
@@ -178,10 +174,6 @@ it is a call that had not returned when the bound expired.
       test_tiny_ordered_beta_bernoulli_circle_fit_does_not_kill_the_process
           stuck in (no gamfit frame)
 
-[1] tests.bug_hunt_smooth_pvalue_null_uniform_on_interaction_terms_test
-      test_null_interaction_pvalues_are_uniform_over_the_whole_range[ti]
-          stuck in gamfit/_api.py:1222 in fit
-
 [1] tests.bug_hunt_smooth_significance_tensor_beside_factor_4563_test
       test_smooth_significance_does_not_manufacture_a_tensor_beside_a_factor_4563
           stuck in gamfit/_model.py:858 in smooth_significance
@@ -204,10 +196,14 @@ it is a call that had not returned when the bound expired.
 
 [1] tests.test_bug_hunt_marginal_slope_predict_interval
       test_marginal_slope_posterior_band_covers_truth_at_nominal_rate
-          stuck in gamfit/_api.py:1222 in fit
+          stuck in gamfit/_sampling.py:116 in _call
 
 [1] tests.test_bug_hunt_survival_surface_query_beyond_predict_exit
       test_survival_surface_not_truncated_by_small_predict_exit[transformation]
+          stuck in gamfit/_model.py:426 in predict
+
+[1] tests.test_bug_hunt_survival_surface_truncated_by_prediction_exit
+      test_survival_surface_is_invariant_to_prediction_exit_placeholder
           stuck in gamfit/_model.py:426 in predict
 
 [1] tests.test_event_history_forecast_history
@@ -236,33 +232,34 @@ it is a call that had not returned when the bound expired.
 
 ## Entry-point census over the censored population
 
-    31  gamfit/_api.py:1222 in fit
-    31  gamfit/_sae_manifold.py:216 in sae_manifold_fit
-     6  gamfit/_model.py:426 in predict
+    30  gamfit/_sae_manifold.py:216 in sae_manifold_fit
+    28  gamfit/_api.py:1222 in fit
+     7  gamfit/_model.py:426 in predict
      4  (no gamfit frame)
      3  gamfit/_event_history.py:571 in fit_event_history
+     1  gamfit/_sampling.py:116 in _call
      1  gamfit/_model.py:858 in smooth_significance
 
 ## 20 slowest tests that DID report a duration
 
-      271.4s  tests.test_sae_manifold_shape_uncertainty::test_more_data_tightens_the_posterior_band
-      242.7s  tests.test_sae_manifold_heterogeneous_d_atom_2088::test_heterogeneous_d_atom_passes_validation_when_row_block_penalties_disabled
-      161.2s  tests.test_smoothing_correction_first_order::test_corrected_intervals_cover_the_mean_and_partial_dependence[binomial]
+      278.6s  tests.test_documentation_examples::test_python_documentation_example[docs/marginal-slope.md:909]
+      260.9s  tests.bug_hunt_smooth_pvalue_null_uniform_on_interaction_terms_test::test_null_interaction_pvalues_are_uniform_over_the_whole_range[ti]
+      241.4s  tests.test_sae_manifold_shape_band_save_load::test_reconstruction_and_band_are_physical_under_heterogeneous_column_scale
+      201.4s  tests.test_sae_manifold_shape_uncertainty::test_more_data_tightens_the_posterior_band
+      179.7s  tests.test_smoothing_correction_first_order::test_corrected_intervals_cover_the_mean_and_partial_dependence[binomial]
+      173.2s  tests.test_sae_manifold_heterogeneous_d_atom_2088::test_heterogeneous_d_atom_passes_validation_when_row_block_penalties_disabled
       120.3s  tests.test_documentation_examples::test_cli_documentation_example[docs/cli.md:149]
       120.2s  tests.test_documentation_examples::test_cli_documentation_example[docs/cli.md:136]
-       77.3s  tests.test_survival_marginal_slope_clustered_pc_808::test_survival_marginal_slope_clustered_pc_converges_808
-       60.1s  tests.examples_smoke_test::test_python_example_runs[sae_manifold_nuclear_rank.py]
+       90.1s  tests.test_survival_marginal_slope_clustered_pc_808::test_survival_marginal_slope_clustered_pc_converges_808
+       79.1s  tests.test_documentation_examples::test_python_documentation_example[docs/marginal-slope.md:312]
+       73.1s  tests.test_latent_center_collision_gradient::test_a_c1_latent_kernel_fits_through_a_center_collision[y ~ s(t, bs='duchon', centers=32)-2]
        60.1s  tests.examples_smoke_test::test_python_example_runs[sae_manifold_incoherence.py]
-       60.1s  tests.examples_smoke_test::test_python_example_runs[sae_manifold_ordered_beta_bernoulli_topology_atoms.py]
+       60.1s  tests.examples_smoke_test::test_python_example_runs[sae_manifold_nuclear_rank.py]
        60.1s  tests.examples_smoke_test::test_python_example_runs[ordered_beta_bernoulli_anneal_demo.py]
-       60.1s  tests.examples_smoke_test::test_python_example_runs[sae_manifold_uncertainty.py]
+       60.1s  tests.examples_smoke_test::test_python_example_runs[sae_manifold_ordered_beta_bernoulli_topology_atoms.py]
        60.1s  tests.examples_smoke_test::test_python_example_runs[sae_manifold_scad_mcp_sparsity.py]
+       60.1s  tests.examples_smoke_test::test_python_example_runs[sae_manifold_uncertainty.py]
        60.1s  tests.examples_smoke_test::test_python_example_runs[threshold_gate_sae_demo.py]
-       58.8s  tests.test_latent_center_collision_gradient::test_a_c1_latent_kernel_fits_through_a_center_collision[y ~ s(t, bs='duchon', centers=32)-2]
-       55.7s  tests.test_documentation_examples::test_python_documentation_example[docs/survival.md:223]
-       55.3s  tests.test_documentation_examples::test_python_documentation_example[docs/marginal-slope.md:312]
-       45.6s  tests.examples_smoke_test::test_python_example_runs[standard_fit_latent_demo.py]
-       36.7s  tests.examples_smoke_test::test_python_example_runs[sae_manifold_demo.py]
-       36.4s  tests.test_basis_check_pvalue_calibration::test_basis_check_is_uniform_under_an_adequate_basis[binomial]
-       34.2s  tests.examples_smoke_test::test_python_example_runs[topology_auto_selector_ring_demo.py]
+       58.4s  tests.examples_smoke_test::test_python_example_runs[topology_auto_selector_ring_demo.py]
+       57.5s  tests.examples_smoke_test::test_python_example_runs[standard_fit_latent_demo.py]
 
