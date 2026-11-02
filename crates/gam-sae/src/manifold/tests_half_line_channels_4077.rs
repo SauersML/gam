@@ -22,7 +22,15 @@
 //!    `A_raw` is affine in the target, `[σ(1+δ/2) − σ(1−δ/2)]/(2δ)` must
 //!    reproduce it to rounding — an independent measurement with different
 //!    probe points. The block's implicit right-hand side entries at the pinned
-//!    slots are checked the same way against `∂g_u/∂log λ`.
+//!    slots are checked the same way against `∂g_u/∂log λ`;
+//! 4. the ASSEMBLY: the complete block-coordinate gradient (data channel +
+//!    Jacobian `−n·p_ℓ/2` + `½tr(A⁺∂A/∂log λ_ℓ)` trace + implicit `−½Γᵀθ̂`
+//!    adjoint, the last two carrying the half-line legs) against a central
+//!    difference of the value `fit_at_fixed_rho` itself re-prices at
+//!    `log λ = ±δ` — each arm through its own authoritative inner solve on the
+//!    objective's own `√λ`-scaled target. The factor-wise #2231 receipt runs on
+//!    a fixture WITHOUT pinned slots; this one runs where the half-line
+//!    channels are live.
 
 use super::*;
 use crate::basis::EuclideanPatchEvaluator;
@@ -371,4 +379,123 @@ fn crosscoder_span_leg_prices_exact_sigma_and_gradient_derivatives_4077() {
             slot.index
         );
     }
+}
+
+/// #4077/#2231 — the COMPLETE block-coordinate gradient is the derivative of
+/// the value the objective itself re-prices.
+///
+/// `log λ` enters the reported cost through the target scaling `√λ·Y` (applied
+/// by `fit_at_fixed_rho`'s authoritative lane), the change-of-variables
+/// Jacobian `−(n·p_ℓ/2)·log λ_ℓ`, and the inner re-solve — and the analytic
+/// entry assembles four channels ([`outer_objective`] documents them at the
+/// `block_log_lambda_gradient` doc): the envelope data derivative `D_ℓ`, the
+/// Jacobian `−n·p_ℓ/2`, the `½tr(A⁺∂A/∂log λ_ℓ)` trace, and the implicit
+/// `−½·Γᵀθ̂_ρ` adjoint — the last two carrying the half-line legs this module's
+/// other two receipts verified in isolation (the span σ-probe and the block
+/// rhs entries). `tests_crosscoder_block_gradient_2231` checks the channels
+/// factor-wise at a frozen state WITHOUT pinned slots; here the state pins
+/// slots (the half-line channels are live), each perturbed arm runs its own
+/// authoritative inner solve, and the central difference of the reported costs
+/// meets the complete analytic entry in one shot.
+///
+/// [`outer_objective`]: super::outer_objective
+#[test]
+fn block_coordinate_complete_gradient_is_the_repriced_value_derivative_4077() {
+    use super::tests_kappa_outer_gradient_2935::richardson;
+
+    let (state, target, rho_seed) = converged_interval_state();
+    let n = target.nrows() as f64;
+    let p = target.ncols();
+    let mut template = rho_seed.clone();
+    template.log_lambda_block = vec![0.0];
+
+    // One anchor column and one output relevance block, as #2231 installs.
+    let mut objective = SaeManifoldOuterObjective::new(
+        state.clone(),
+        target.clone(),
+        None,
+        template.clone(),
+        60,
+        0.4,
+        1.0e-8,
+        1.0e-8,
+    )
+    .with_crosscoder_blocks(1, vec![p - 1])
+    .expect("one anchor column and one output block");
+    let baseline = objective.baseline_rho.clone();
+    let block = baseline.block_flat_range().start;
+    let flat = baseline
+        .to_flat(&objective.term.assignment)
+        .expect("the typed flat layout");
+
+    // Base arm: re-price at log λ = 0 through the production lane.
+    objective
+        .fit_at_fixed_rho(flat.view())
+        .expect("the base arm re-prices");
+    let base_cost = objective
+        .terminal_penalized_quasi_laplace_criterion
+        .expect("the base arm prices a finite value");
+
+    // The dense route re-prices the installed state; the Jacobian vanishes at
+    // log λ = 0, so its cost must be the fixed-rho cost.
+    let evaluation = objective
+        .evaluate_outer_criterion_route(&baseline, true, false)
+        .expect("the dense route prices the fitted state");
+    assert!(
+        (evaluation.cost - base_cost).abs() <= 1.0e-9 * base_cost.abs().max(1.0),
+        "the dense route's cost {} and the fixed-rho cost {} disagree at log λ = 0",
+        evaluation.cost,
+        base_cost
+    );
+    // The state the gradient differentiates pins slots — the half-line
+    // channels contribute to its block entry, they are not dormant here.
+    let mut fitted = objective.term.clone();
+    let cache = fitted_cache(&mut fitted, &target, &baseline);
+    let pinned = fitted
+        .pinned_half_line_slots(&baseline, target.view(), &cache)
+        .expect("half-line operands at the fitted state");
+    assert!(!pinned.is_empty(), "the re-priced state pins no slot");
+    let analytic = objective
+        .analytic_gradient_for_outer_evaluation(&baseline, &evaluation)
+        .expect("the dense route differentiates the fitted state")[block];
+
+    // FD arms: fresh objectives re-pricing at log λ = ±δ, each through its own
+    // authoritative lane (own target scaling, own inner solve, own Jacobian).
+    let repriced = |delta: f64| -> f64 {
+        let mut arm = SaeManifoldOuterObjective::new(
+            state.clone(),
+            target.clone(),
+            None,
+            template.clone(),
+            60,
+            0.4,
+            1.0e-8,
+            1.0e-8,
+        )
+        .with_crosscoder_blocks(1, vec![p - 1])
+        .expect("one anchor column and one output block");
+        let mut shifted = flat.clone();
+        shifted[block] += delta;
+        arm.fit_at_fixed_rho(shifted.view())
+            .unwrap_or_else(|err| panic!("the arm at log λ = {delta} re-prices: {err}"));
+        arm.terminal_penalized_quasi_laplace_criterion
+            .unwrap_or_else(|| panic!("the arm at log λ = {delta} prices a finite value"))
+    };
+    let central = |delta: f64| (repriced(delta) - repriced(-delta)) / (2.0 * delta);
+    let coarse = central(1.25e-2);
+    let fine = central(6.25e-3);
+    let (derivative, spread) = richardson(coarse, fine);
+    println!(
+        "[#4077 assembly] complete dV/dlog λ = {analytic:.12e}; re-priced FD {derivative:.12e} \
+         (coarse {coarse:.12e}, fine {fine:.12e}, spread {spread:.3e}); base cost {base_cost:.9e}; \
+         Jacobian channel −n·p_ℓ/2 = {}",
+        -0.5 * n * (p - 1) as f64
+    );
+    let tolerance = 10.0 * spread + 1.0e-8 * derivative.abs().max(1.0);
+    assert!(
+        (analytic - derivative).abs() <= tolerance,
+        "the complete block gradient {analytic} is not the re-priced value's log λ derivative \
+         {derivative} (|Δ| = {}, tolerance {tolerance})",
+        (analytic - derivative).abs()
+    );
 }
