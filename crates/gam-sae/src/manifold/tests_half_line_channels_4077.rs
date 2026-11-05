@@ -499,3 +499,156 @@ fn block_coordinate_complete_gradient_is_the_repriced_value_derivative_4077() {
         (analytic - derivative).abs()
     );
 }
+
+/// #2822/#4077 — the global-dispersion coordinate's COMPLETE gradient is
+/// the derivative of the value the objective itself re-prices — the second
+/// coordinate family of the assembly ladder.
+///
+/// `with_global_dispersion` installs the SAME four-channel assembly over a
+/// different coordinate: one `log λ` over every output column (`p_x = 0`, no
+/// anchor column), and a Jacobian that prices the flat-prior decoder
+/// directions the change of variables does not normalize
+/// (`M_null = extra + Σ_k r_k·(M_k − rank S_k)`, folded in at install from the
+/// atoms — `with_crosscoder_blocks` prices null dims as 0).
+/// `tests_crosscoder_block_gradient_2231` checks this family's dense/streaming
+/// route parity at one frozen state; the crosscoder family's assembly receipt
+/// is the test above. Here the #2822 coordinate is verified at the assembly
+/// level at TWO installs: this fixture's atoms price `Σ_k r_k·(M_k − rank S_k)
+/// = 0` (a full-rank penalty), so the second pass adds `extra_null_dims = 1`
+/// — the peeled-per-column-mean semantic the builder's doc names — to run the
+/// Jacobian's null-dims channel at a nonzero value (a hardcoded 0 there
+/// passes the crosscoder family, whose null dims are all 0, but not this
+/// arm). Both passes pin slots (the half-line channels ride the global
+/// coordinate too, not only a per-column block), each perturbed arm re-scales
+/// the whole target and re-runs its own authoritative inner solve, and the
+/// central difference of the reported costs meets the complete analytic entry
+/// in one shot.
+#[test]
+fn global_dispersion_complete_gradient_is_the_repriced_value_derivative_2822() {
+    assert_global_dispersion_complete_gradient_is_repriced_derivative(0, "M_null = 0");
+    assert_global_dispersion_complete_gradient_is_repriced_derivative(
+        1,
+        "one peeled-mean null dim",
+    );
+}
+
+fn assert_global_dispersion_complete_gradient_is_repriced_derivative(
+    extra_null_dims: usize,
+    label: &str,
+) {
+    use super::tests_kappa_outer_gradient_2935::richardson;
+
+    let (state, target, rho_seed) = converged_interval_state();
+    let n = target.nrows() as f64;
+    let p = target.ncols();
+    let mut template = rho_seed.clone();
+    template.log_lambda_block = vec![0.0];
+
+    // One log-noise-precision coordinate over every output column, as #2822
+    // installs (p_x = 0; the whole target is the one block).
+    let mut objective = SaeManifoldOuterObjective::new(
+        state.clone(),
+        target.clone(),
+        None,
+        template.clone(),
+        60,
+        0.4,
+        1.0e-8,
+        1.0e-8,
+    )
+    .with_global_dispersion(extra_null_dims)
+    .expect("one global dispersion coordinate over every column");
+    let baseline = objective.baseline_rho.clone();
+    let block = baseline.block_flat_range().start;
+    let flat = baseline
+        .to_flat(&objective.term.assignment)
+        .expect("the typed flat layout");
+
+    // Base arm: re-price at log λ = 0 through the production lane.
+    objective
+        .fit_at_fixed_rho(flat.view())
+        .expect("the base arm re-prices");
+    let base_cost = objective
+        .terminal_penalized_quasi_laplace_criterion
+        .expect("the base arm prices a finite value");
+
+    // The dense route re-prices the installed state; the Jacobian vanishes at
+    // log λ = 0, so its cost must be the fixed-rho cost.
+    let evaluation = objective
+        .evaluate_outer_criterion_route(&baseline, true, false)
+        .expect("the dense route prices the fitted state");
+    assert!(
+        (evaluation.cost - base_cost).abs() <= 1.0e-9 * base_cost.abs().max(1.0),
+        "the dense route's cost {} and the fixed-rho cost {} disagree at log λ = 0",
+        evaluation.cost,
+        base_cost
+    );
+    // The state the gradient differentiates pins slots — the half-line
+    // channels contribute to the global coordinate's entry, they are not
+    // dormant here either.
+    let mut fitted = objective.term.clone();
+    let cache = fitted_cache(&mut fitted, &target, &baseline);
+    let pinned = fitted
+        .pinned_half_line_slots(&baseline, target.view(), &cache)
+        .expect("half-line operands at the fitted state");
+    assert!(!pinned.is_empty(), "the re-priced state pins no slot");
+    let analytic = objective
+        .analytic_gradient_for_outer_evaluation(&baseline, &evaluation)
+        .expect("the dense route differentiates the fitted state")[block];
+
+    // The M_null the install priced from the atoms (the same sum
+    // with_global_dispersion folds into the Jacobian channel); read from the
+    // pre-fit clone the install itself saw, so the print cannot drift.
+    let m_null: f64 = extra_null_dims as f64
+        + state
+            .atoms
+            .iter()
+            .map(|atom| {
+                let rank_s = SaeManifoldTerm::symmetric_rank(atom.smooth_penalty())
+                    .expect("the fixture's penalty has a symmetric rank");
+                let m_k = atom.smooth_penalty().nrows();
+                (atom.border_frame_rank() * m_k.saturating_sub(rank_s)) as f64
+            })
+            .sum::<f64>();
+
+    // FD arms: fresh objectives re-pricing at log λ = ±δ, each through its own
+    // authoritative lane (own whole-target scaling, own inner solve, own
+    // Jacobian with the M_null correction).
+    let repriced = |delta: f64| -> f64 {
+        let mut arm = SaeManifoldOuterObjective::new(
+            state.clone(),
+            target.clone(),
+            None,
+            template.clone(),
+            60,
+            0.4,
+            1.0e-8,
+            1.0e-8,
+        )
+        .with_global_dispersion(extra_null_dims)
+        .expect("one global dispersion coordinate over every column");
+        let mut shifted = flat.clone();
+        shifted[block] += delta;
+        arm.fit_at_fixed_rho(shifted.view())
+            .unwrap_or_else(|err| panic!("the arm at log λ = {delta} re-prices: {err}"));
+        arm.terminal_penalized_quasi_laplace_criterion
+            .unwrap_or_else(|| panic!("the arm at log λ = {delta} prices a finite value"))
+    };
+    let central = |delta: f64| (repriced(delta) - repriced(-delta)) / (2.0 * delta);
+    let coarse = central(1.25e-2);
+    let fine = central(6.25e-3);
+    let (derivative, spread) = richardson(coarse, fine);
+    println!(
+        "[#2822 assembly, {label}] complete dV/dlog λ = {analytic:.12e}; re-priced FD {derivative:.12e} \
+         (coarse {coarse:.12e}, fine {fine:.12e}, spread {spread:.3e}); base cost {base_cost:.9e}; \
+         Jacobian channel −(n·p − M_null)/2 = {} (M_null = {m_null} over p = {p} columns)",
+        -0.5 * (n * p as f64 - m_null)
+    );
+    let tolerance = 10.0 * spread + 1.0e-8 * derivative.abs().max(1.0);
+    assert!(
+        (analytic - derivative).abs() <= tolerance,
+        "the complete global-dispersion gradient {analytic} ({label}) is not the re-priced value's \
+         log λ derivative {derivative} (|Δ| = {}, tolerance {tolerance})",
+        (analytic - derivative).abs()
+    );
+}
