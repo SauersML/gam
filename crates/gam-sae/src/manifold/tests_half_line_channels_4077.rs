@@ -42,6 +42,14 @@ const LO: f64 = -1.0;
 const HI: f64 = 1.0;
 
 fn interval_fixture() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
+    interval_fixture_with_gram(|width| Array2::<f64>::eye(width))
+}
+
+/// #2822 — the same interval fixture at a caller-provided reference gram, so a
+/// rank-deficient roughness can be installed without forking the generator.
+fn interval_fixture_with_gram(
+    gram: impl FnOnce(usize) -> Array2<f64>,
+) -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
     let n = 8usize;
     let p = 2usize;
     let evaluator = Arc::new(EuclideanPatchEvaluator::new(1, 2).expect("patch basis"));
@@ -71,7 +79,7 @@ fn interval_fixture() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
         phi,
         jet,
         decoder,
-        Array2::<f64>::eye(width),
+        gram(width),
     )
     .expect("atom shapes agree")
     .with_basis_second_jet(evaluator);
@@ -101,6 +109,100 @@ fn converged_interval_state() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) 
         1.0e-8,
     )
     .expect("the criterion prices the interval fixture");
+    (term, target, rho)
+}
+
+/// #2822 — the interval fixture with a rank-deficient reference gram whose
+/// null space SURVIVES production's entry stages:
+///
+/// `prepare_entry_stages` (construction.rs) runs the #1117 data-supported
+/// basis reduction before every criterion built over the supplied state; it
+/// screens the weighted data Gram `G_k = Φ_kᵀ diag(a_k²) Φ_k` and
+/// reparametrizes any atom whose Gram is rank-deficient onto the span above
+/// `SAE_MANIFOLD_SPECTRAL_RANK_CUTOFF`, contracting the penalty to `QᵀSQ`.
+/// A planted null survives iff it lies in that span — and on this fixture the
+/// Gram is numerically rank 2/3, with the data-null direction mixing every
+/// basis axis, so an AXIS-ALIGNED planted null (span{1}, span{s}, span{s²}
+/// were each tried) is generically absorbed and `QᵀSQ` comes back full rank:
+/// the hand-derived `M_null` assert caught exactly that (the fold-in then
+/// correctly prices `M_null = 0` for the reduced model — the receipt doing
+/// its job).
+///
+/// So the null is planted on the TOP eigenvector of the production Gram
+/// itself — the maximally data-supported direction, provably retained by any
+/// cutoff-relative reduction — computed here through the SAME accumulator the
+/// reduction reads (`empty_decoder_gram_accumulator` +
+/// `accumulate_decoder_gram`), then `S = I − vvᵀ`. Exactly one null survives
+/// whether the reduction fires (`2·(2−1)`) or not (`2·(3−2)`): the
+/// hand-derived `M_null = r_k·1` is reduction-invariant.
+fn rank_deficient_interval_fixture() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
+    let (probe, _, _) = interval_fixture_with_gram(|width| Array2::<f64>::eye(width));
+    let mut grams = probe.empty_decoder_gram_accumulator();
+    probe
+        .accumulate_decoder_gram(&mut grams)
+        .expect("the probe term accumulates its decoder gram");
+    let mut gram = grams
+        .first()
+        .expect("the probe term carries the fixture atom")
+        .clone();
+    for i in 0..gram.nrows() {
+        for j in 0..i {
+            let sym = 0.5 * (gram[[i, j]] + gram[[j, i]]);
+            gram[[i, j]] = sym;
+            gram[[j, i]] = sym;
+        }
+    }
+    let (evals, evecs) = gram
+        .eigh(Side::Lower)
+        .expect("the fixture's data gram eigendecomposes");
+    let top = evals
+        .iter()
+        .enumerate()
+        .max_by(|x, y| x.1.partial_cmp(y.1).expect("finite eigenvalues"))
+        .expect("the data gram has a spectrum")
+        .0;
+    let v = evecs.column(top).to_owned();
+    interval_fixture_with_gram(move |width| {
+        let mut planted = Array2::<f64>::eye(width);
+        for i in 0..width {
+            for j in 0..width {
+                planted[[i, j]] -= v[i] * v[j];
+            }
+        }
+        planted
+    })
+}
+
+/// The rank-deficient fixture converged at its seed `ρ` — the state the
+/// assembly receipt below re-prices. The structural asserts pin the
+/// hand-derivation: exactly the one planted null survives the entry stages,
+/// and no decoder frame re-profiles the border (the derived `M_null = 2`
+/// assumes `r_k = output_dim = 2`).
+fn converged_rank_deficient_penalty_state() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
+    let (mut term, target, rho) = rank_deficient_interval_fixture();
+    term.penalized_quasi_laplace_criterion_with_cache(
+        target.view(),
+        &rho,
+        None,
+        60,
+        0.4,
+        1.0e-8,
+        1.0e-8,
+    )
+    .expect("the criterion prices the rank-deficient interval fixture");
+    let rank_s = SaeManifoldTerm::symmetric_rank(term.atoms[0].smooth_penalty())
+        .expect("the fixture's penalty has a symmetric rank");
+    let m_k = term.atoms[0].smooth_penalty().nrows();
+    assert_eq!(
+        rank_s + 1,
+        m_k,
+        "exactly the one planted null (the top data-Gram direction) may survive the entry stages"
+    );
+    assert_eq!(
+        term.atoms[0].border_frame_rank(),
+        2,
+        "the decoder frame re-profiled the border; the hand-derived M_null = 2·1 assumes r_k = 2"
+    );
     (term, target, rho)
 }
 
@@ -525,20 +627,64 @@ fn block_coordinate_complete_gradient_is_the_repriced_value_derivative_4077() {
 /// in one shot.
 #[test]
 fn global_dispersion_complete_gradient_is_the_repriced_value_derivative_2822() {
-    assert_global_dispersion_complete_gradient_is_repriced_derivative(0, "M_null = 0");
     assert_global_dispersion_complete_gradient_is_repriced_derivative(
+        converged_interval_state(),
+        0,
+        0.0,
+        "M_null = 0",
+    );
+    assert_global_dispersion_complete_gradient_is_repriced_derivative(
+        converged_interval_state(),
         1,
+        1.0,
         "one peeled-mean null dim",
     );
 }
 
+/// #2822 — the per-atom fold-in `r_k·(M_k − rank S_k)` at a GENUINELY
+/// rank-deficient penalty: the fixture's gram `I − vvᵀ`, with `v` the TOP
+/// eigenvector of the production data Gram, carries a one-dimensional null
+/// space planted on the maximally data-supported direction — so it survives
+/// the #1117 data-supported basis reduction (see the fixture's doc for the
+/// axis-aligned attempts that did not) — and `with_global_dispersion` prices
+/// `M_null = 2·1 = 2` from the atoms alone, no `extra_null_dims`. The FD
+/// receipt verifies value≡gradient at that install, the exact `M_null == 2`
+/// (then `3` with one peeled-mean dim beside the geometric null) checks the
+/// fold-in against hand-derived geometry, and the two analytic entries over
+/// identical states differ by exactly the one null-dim channel's `+0.5` —
+/// the same isolation #4608 observed by print, now asserted on top of a
+/// geometric null space rather than a constant.
+#[test]
+fn global_dispersion_gradient_prices_the_penalty_null_space_2822() {
+    let geometric = assert_global_dispersion_complete_gradient_is_repriced_derivative(
+        converged_rank_deficient_penalty_state(),
+        0,
+        2.0,
+        "geometric penalty null space",
+    );
+    let beside_geometric = assert_global_dispersion_complete_gradient_is_repriced_derivative(
+        converged_rank_deficient_penalty_state(),
+        1,
+        3.0,
+        "one peeled-mean null dim beside the geometric null space",
+    );
+    assert!(
+        (beside_geometric - geometric - 0.5).abs() <= 1.0e-12,
+        "one extra null dim shifts dV/dlog λ by {:+e}, not the Jacobian channel's exact +0.5 \
+         ({geometric:.12e} → {beside_geometric:.12e} over identical states)",
+        beside_geometric - geometric - 0.5
+    );
+}
+
 fn assert_global_dispersion_complete_gradient_is_repriced_derivative(
+    fixture: (SaeManifoldTerm, Array2<f64>, SaeManifoldRho),
     extra_null_dims: usize,
+    expected_m_null: f64,
     label: &str,
-) {
+) -> f64 {
     use super::tests_kappa_outer_gradient_2935::richardson;
 
-    let (state, target, rho_seed) = converged_interval_state();
+    let (state, target, rho_seed) = fixture;
     let n = target.nrows() as f64;
     let p = target.ncols();
     let mut template = rho_seed.clone();
@@ -611,6 +757,17 @@ fn assert_global_dispersion_complete_gradient_is_repriced_derivative(
             })
             .sum::<f64>();
 
+    // The fold-in's output, checked against the HAND-DERIVED null count of the
+    // fixture's construction — not the same sum re-run. `block_jacobian` feeds
+    // this `null_dims` to the value every FD arm re-prices AND to the analytic
+    // gradient, so the FD receipt below is blind to a wrong fold-in (a
+    // misranked penalty, a wrong frame multiplicity, a dropped atom); this
+    // exact assertion is that independent receipt.
+    assert_eq!(
+        m_null, expected_m_null,
+        "the install's per-atom fold-in M_null ({label}) disagrees with the hand-derived null count"
+    );
+
     // FD arms: fresh objectives re-pricing at log λ = ±δ, each through its own
     // authoritative lane (own whole-target scaling, own inner solve, own
     // Jacobian with the M_null correction).
@@ -651,4 +808,5 @@ fn assert_global_dispersion_complete_gradient_is_repriced_derivative(
          log λ derivative {derivative} (|Δ| = {}, tolerance {tolerance})",
         (analytic - derivative).abs()
     );
+    analytic
 }
