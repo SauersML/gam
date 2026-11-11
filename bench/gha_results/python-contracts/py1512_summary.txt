@@ -1,22 +1,22 @@
 # python-contracts full-suite triage (#1512) — recovered summary
 
 collected            3406
-passed               3075
+passed               3077
 skipped              79
-failed (diagnosed)   172
+failed (diagnosed)   173
 errored (diagnosed)  6
-CENSORED             74   (worker killed at the per-test bound;
+CENSORED             71   (worker killed at the per-test bound;
                           the JUnit records no reason and time=0.000)
 
 faulthandler dumps in the step log: 78
 
-## The 74 censored tests, with the frame each was stuck in
+## The 71 censored tests, with the frame each was stuck in
 
 Recovered from the faulthandler dumps, which fire before the kill and
 write straight to fd 2. A test listed here is NOT a crashed interpreter:
 it is a call that had not returned when the bound expired.
 
-[20] tests.test_documentation_examples
+[19] tests.test_documentation_examples
       test_python_documentation_example[README.md:277]
           stuck in gamfit/_api.py:1222 in fit
       test_python_documentation_example[README_PYPI.md:243]
@@ -42,8 +42,6 @@ it is a call that had not returned when the bound expired.
       test_python_documentation_example[docs/marginal-slope.md:844]
           stuck in gamfit/_api.py:1222 in fit
       test_python_documentation_example[docs/marginal-slope.md:909]
-          stuck in gamfit/_api.py:1222 in fit
-      test_python_documentation_example[docs/predictions.md:423]
           stuck in gamfit/_api.py:1222 in fit
       test_python_documentation_example[docs/survival.md:264]
           stuck in gamfit/_api.py:1222 in fit
@@ -84,7 +82,7 @@ it is a call that had not returned when the bound expired.
       test_certify_external_returns_typed_nonfit_for_perturbed_state
           stuck in gamfit/_sae_manifold.py:216 in sae_manifold_fit
       test_certify_external_round_trips_a_genuinely_converged_native_fit
-          stuck in (no dump recovered — dump may have interleaved with a concurrent worker)
+          stuck in gamfit/_sae_manifold.py:216 in sae_manifold_fit
 
 [3] tests.test_sae_manifold_determinism
       test_sae_fit_is_deterministic_for_fixed_seed
@@ -146,12 +144,6 @@ it is a call that had not returned when the bound expired.
       test_single_circle_quickstart_converges_with_default_regularizers
           stuck in gamfit/_sae_manifold.py:216 in sae_manifold_fit
 
-[2] tests.test_sae_manifold_top_k_issue
-      test_topk_fit_uses_exact_fixed_support[1]
-          stuck in gamfit/_sae_manifold.py:216 in sae_manifold_fit
-      test_topk_fit_uses_exact_fixed_support[2]
-          stuck in gamfit/_sae_manifold.py:216 in sae_manifold_fit
-
 [2] tests.test_shape_constraints_tensor_conjunction_by
       test_every_factor_by_level_curve_satisfies_its_constraint
           stuck in gamfit/_api.py:1222 in fit
@@ -192,10 +184,6 @@ it is a call that had not returned when the bound expired.
       test_pspline_single_penalty_linear_data_control
           stuck in gamfit/_api.py:1222 in fit
 
-[1] tests.bug_hunt_transformation_normal_generate_draws_on_latent_scale_wrong_direction_test
-      test_ctm_generate_conditional_mean_increases_with_covariate
-          stuck in (no gamfit frame)
-
 [1] tests.generic_variance_link_cells_test
       test_generic_cell_gam_recovers_truth_and_bands_cover_it[binomial-log-<lambda>-1.0-6000]
           stuck in gamfit/_api.py:1222 in fit
@@ -228,37 +216,40 @@ it is a call that had not returned when the bound expired.
       test_isometry_on_circle_recovers_planted_geometry_normalized_reference
           stuck in gamfit/_sae_manifold.py:216 in sae_manifold_fit
 
+[1] tests.test_sae_manifold_top_k_issue
+      test_topk_fit_uses_exact_fixed_support[1]
+          stuck in gamfit/_sae_manifold.py:216 in sae_manifold_fit
+
 ## Entry-point census over the censored population
 
-    31  gamfit/_api.py:1222 in fit
+    30  gamfit/_api.py:1222 in fit
     29  gamfit/_sae_manifold.py:216 in sae_manifold_fit
      5  gamfit/_model.py:426 in predict
-     3  (no gamfit frame)
      3  gamfit/_event_history.py:571 in fit_event_history
-     1  (no dump recovered)
+     2  (no gamfit frame)
      1  gamfit/_sampling.py:116 in _call
      1  gamfit/_model.py:858 in smooth_significance
 
 ## 20 slowest tests that DID report a duration
 
-      266.1s  tests.test_sae_manifold_shape_uncertainty::test_more_data_tightens_the_posterior_band
-      214.2s  tests.test_sae_manifold_heterogeneous_d_atom_2088::test_heterogeneous_d_atom_passes_validation_when_row_block_penalties_disabled
-      190.3s  tests.test_sae_manifold_shape_band_save_load::test_reconstruction_and_band_are_physical_under_heterogeneous_column_scale
-      166.9s  tests.test_smoothing_correction_first_order::test_corrected_intervals_cover_the_mean_and_partial_dependence[binomial]
-      120.3s  tests.test_documentation_examples::test_cli_documentation_example[docs/cli.md:136]
-      120.3s  tests.test_documentation_examples::test_cli_documentation_example[docs/cli.md:149]
+      287.0s  tests.test_sae_manifold_top_k_issue::test_topk_fit_uses_exact_fixed_support[2]
+      274.4s  tests.test_sae_manifold_shape_band_save_load::test_reconstruction_and_band_are_physical_under_heterogeneous_column_scale
+      256.0s  tests.test_smoothing_correction_first_order::test_corrected_intervals_cover_the_mean_and_partial_dependence[binomial]
+      189.5s  tests.test_sae_manifold_heterogeneous_d_atom_2088::test_heterogeneous_d_atom_passes_validation_when_row_block_penalties_disabled
+      170.3s  tests.test_sae_manifold_shape_uncertainty::test_more_data_tightens_the_posterior_band
+      120.4s  tests.test_documentation_examples::test_cli_documentation_example[docs/cli.md:149]
+      120.2s  tests.test_documentation_examples::test_cli_documentation_example[docs/cli.md:136]
        90.1s  tests.test_survival_marginal_slope_clustered_pc_808::test_survival_marginal_slope_clustered_pc_converges_808
-       60.1s  tests.examples_smoke_test::test_python_example_runs[ordered_beta_bernoulli_anneal_demo.py]
-       60.1s  tests.examples_smoke_test::test_python_example_runs[sae_manifold_nuclear_rank.py]
+       85.0s  tests.test_documentation_examples::test_python_documentation_example[docs/marginal-slope.md:312]
+       60.3s  tests.examples_smoke_test::test_python_example_runs[topology_auto_selector_ring_demo.py]
+       60.2s  tests.examples_smoke_test::test_python_example_runs[standard_fit_latent_demo.py]
+       60.2s  tests.examples_smoke_test::test_python_example_runs[sae_manifold_nuclear_rank.py]
        60.1s  tests.examples_smoke_test::test_python_example_runs[sae_manifold_scad_mcp_sparsity.py]
-       60.1s  tests.examples_smoke_test::test_python_example_runs[sae_manifold_incoherence.py]
        60.1s  tests.examples_smoke_test::test_python_example_runs[sae_manifold_ordered_beta_bernoulli_topology_atoms.py]
        60.1s  tests.examples_smoke_test::test_python_example_runs[sae_manifold_uncertainty.py]
+       60.1s  tests.examples_smoke_test::test_python_example_runs[sae_manifold_incoherence.py]
        60.1s  tests.examples_smoke_test::test_python_example_runs[threshold_gate_sae_demo.py]
-       57.3s  tests.test_documentation_examples::test_python_documentation_example[docs/marginal-slope.md:312]
-       57.1s  tests.test_latent_center_collision_gradient::test_a_c1_latent_kernel_fits_through_a_center_collision[y ~ s(t, bs='duchon', centers=32)-2]
-       53.8s  tests.examples_smoke_test::test_python_example_runs[standard_fit_latent_demo.py]
-       45.7s  tests.test_documentation_examples::test_python_documentation_example[docs/survival.md:223]
-       29.6s  tests.test_documentation_examples::test_python_documentation_example[docs/event-history.md:214]
-       29.1s  tests.test_sae_manifold_synthetic_quality_ground_truth::test_fit_oos_quality_matches_training_on_planted_oracle_distribution
+       60.1s  tests.examples_smoke_test::test_python_example_runs[ordered_beta_bernoulli_anneal_demo.py]
+       56.3s  tests.test_latent_center_collision_gradient::test_a_c1_latent_kernel_fits_through_a_center_collision[y ~ s(t, bs='duchon', centers=32)-2]
+       53.9s  tests.test_sae_manifold_synthetic_quality_ground_truth::test_fit_oos_quality_matches_training_on_planted_oracle_distribution
 
