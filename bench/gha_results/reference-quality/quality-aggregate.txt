@@ -2,127 +2,451 @@ execution record: /tmp/quality-report/quality_results.tsv
 complete case manifest: /tmp/quality-report/quality_cases.txt (437 cases)
 === #1561 whole-suite quality meta-gate ===
 category        n scored GAMwin REFwin   medlogR  p(1-sided)      p_BH
-factors         1      1      0      1    0.0173      1.0000    1.0000
-families       51     51     32     19   -0.0055      0.0037    0.0220
-manifolds      11     11      8      2   -0.0033      0.0527    0.0945
-misc           29     29     18     11   -0.0006      0.0630    0.0945
-smooths        41     41     25     16   -0.0100      0.0093    0.0278
-survival       12     12      7      5   -0.0092      0.2349    0.2818
+families        5      5      2      3    0.0006      0.4062    0.7812
+manifolds       1      1      0      1    0.0541      1.0000    1.0000
+misc            1      1      1      0   -0.0604      0.5000    0.7812
+smooths         3      3      1      2    0.0083      0.6250    0.7812
+survival        1      1      1      0  -34.6398      0.5000    0.7812
 ------------------------------------------------------------------------
-OVERALL       145    145     90     54   -0.0055      0.0000 
+OVERALL        11     11      5      6    0.0006      0.1826 
 
-CLOSURE (exact per-case p<0.05, negative median, valid metrics, complete successful execution): FAIL (p=0.0000, median log(gam/ref)=-0.0055, wins 90 / losses 54)
-Experimental units: 145 cases from 186 metric pairs.
+CLOSURE (exact per-case p<0.05, negative median, valid metrics, complete successful execution): FAIL (p=0.1826, median log(gam/ref)=0.0006, wins 5 / losses 6)
+Experimental units: 11 cases from 15 metric pairs.
 INCOMPLETE: absent manifest, mismatched execution, or failed cases; closure blocked.
+  listed case was not executed: calibration::registry::covariance_and_interval_modes_map_to_registered_bands
+  listed case was not executed: calibration::registry::multinomial_payload_uncertainty_fields_are_all_registered
+  listed case was not executed: calibration::registry::multinomial_smooth_significance_fields_are_all_registered
+  listed case was not executed: calibration::registry::posterior_mean_payload_uncertainty_fields_are_all_registered
+  listed case was not executed: calibration::registry::predict_payload_uncertainty_fields_are_all_registered
+  listed case was not executed: calibration::registry::registry_is_internally_well_formed
+  listed case was not executed: calibration::registry::survival_predict_payload_uncertainty_fields_are_all_registered
+  listed case was not executed: factors::quality_vs_mgcv_thin_plate_by_factor::gam_thin_plate_by_factor_predict_replays_frozen_basis
+  listed case was not executed: factors::quality_vs_mgcv_thin_plate_by_factor::gam_thin_plate_by_factor_recovers_per_level_truth
+  listed case was not executed: families::mgcv_defect_gumbls_second_predictor_response_se::second_predictor_response_se_is_not_a_recycled_scalar
+  listed case was not executed: families::quality_latent_cloglog_frailty_binary::gam_latent_cloglog_recovers_frailty_marginal_probability
+  listed case was not executed: families::quality_vs_betareg_beta_logit::gam_beta_logit_recovers_smooth_truth
+  listed case was not executed: families::quality_vs_brute_force_loo_poisson_log::alo_loo_recovers_truth_and_matches_exact_brute_force_poisson_log_on_real_data
+  listed case was not executed: families::quality_vs_gamboostlss_gaussian_location_scale::gam_gaussian_location_scale_matches_gamboostlss
+  listed case was not executed: families::quality_vs_gamlss_binomial_location_scale::gam_binomial_location_scale_real_data_timeout_case_rejects_before_optimizer
+  listed case was not executed: families::quality_vs_gamlss_binomial_location_scale::gam_binomial_location_scale_rejects_smooth_log_sigma_on_bernoulli_data
+  listed case was not executed: families::quality_vs_gamlss_crps_gaussian_location_scale::gam_gaussian_location_scale_crps_matches_gamlss
+  listed case was not executed: families::quality_vs_gamlss_crps_gaussian_location_scale::gam_gaussian_location_scale_crps_matches_gamlss_on_real_data
+  listed case was not executed: families::quality_vs_gamlss_custom_family_location_scale_gaussian::gam_custom_family_location_scale_matches_gamlss
+  listed case was not executed: families::quality_vs_gamlss_custom_family_location_scale_gaussian::gam_custom_family_location_scale_matches_gamlss_on_real_data
+  listed case was not executed: families::quality_vs_gamlss_gamma_dispersion_location_scale_1060::gam_gamma_dispersion_location_scale_recovers_shape_surface_vs_gamlss
+  listed case was not executed: families::quality_vs_gamlss_gaussian_location_scale::gam_gaussian_location_scale_matches_gamlss_on_real_data
+  listed case was not executed: families::quality_vs_gamlss_gaussian_location_scale_by_group::gam_location_scale_by_group_matches_gamlss
+  listed case was not executed: families::quality_vs_gamlss_gaussian_location_scale_cyclic::gam_cyclic_location_scale_recovers_truth
+  listed case was not executed: families::quality_vs_gamlss_gaussian_location_scale_cyclic::gam_cyclic_location_scale_recovers_truth_above_the_fundamental
+  listed case was not executed: families::quality_vs_gamlss_gaussian_location_scale_cyclic::gam_cyclic_location_scale_recovers_truth_on_real_data
+  listed case was not executed: families::quality_vs_gamlss_gaussian_multi_smooth::gam_gaussian_multi_smooth_matches_gamlss
+  listed case was not executed: families::quality_vs_hand_coded_beta_logit_negative_log_likelihood::beta_logit_custom_family_recovers_truth_and_generalises
+  listed case was not executed: families::quality_vs_inla_gaussian_smooth_posterior_mean::gam_smooth_predicts_heldout_lidar_at_least_as_well_as_inla
+  listed case was not executed: families::quality_vs_inla_gaussian_smooth_posterior_mean::gam_smooth_predicts_heldout_lidar_at_least_as_well_as_inla_on_real_data
+  listed case was not executed: families::quality_vs_interpret_ml_pygam_binomial_logit_comparative::gam_binomial_logit_holdout_predictive_quality
+  listed case was not executed: families::quality_vs_interpretml_ebm_binomial_logit::gam_binomial_logit_heldout_accuracy_beats_ebm
+  listed case was not executed: families::quality_vs_loo_psis_gaussian_smooth::gam_alo_is_honest_loo_predictive_error_on_lidar_on_real_data
+  listed case was not executed: families::quality_vs_manual_mixture_link_logistic_probit_cloglog_blend::mixture_link_blend_matches_handcoded_reference
+  listed case was not executed: families::quality_vs_mgcv_confidence_interval_gaussian_coverage_90::ci_coverage_near_nominal_on_gaussian_truth_90pct
+  listed case was not executed: families::quality_vs_mgcv_confidence_interval_gaussian_logistic_link::confidence_intervals_cover_truth_under_logistic_link
+  listed case was not executed: families::quality_vs_mgcv_confidence_interval_gaussian_response_scale::response_scale_ci_is_calibrated_and_matches_or_beats_mgcv
+  listed case was not executed: families::quality_vs_mgcv_confidence_interval_gaussian_se::gam_pointwise_ci_covers_truth_and_matches_mgcv_on_gaussian_smooth
+  listed case was not executed: families::quality_vs_mgcv_confidence_interval_gaussian_sweep_coverage::gam_confidence_interval_domain_averaged_coverage_hits_nominal
+  listed case was not executed: families::quality_vs_mgcv_gaulss_gaussian::gam_gaulss_linear_mean_smooth_sigma_predicts_lidar_at_least_as_well_as_mgcv
+  listed case was not executed: families::quality_vs_mgcv_gaussian_smooth::gam_smooth_predicts_lidar_better_than_baseline
+  listed case was not executed: families::quality_vs_mgcv_gaussian_smooth::gam_smooth_predicts_lidar_better_than_baseline_on_real_data
+  listed case was not executed: families::quality_vs_mgcv_high_leverage_gaussian_alo_stabilized::alo_stabilized_reml_is_bit_preserving_on_low_leverage_gaussian
+  listed case was not executed: families::quality_vs_mgcv_high_leverage_gaussian_alo_stabilized::alo_stabilized_reml_matches_or_beats_mgcv_on_high_leverage_gaussian
+  listed case was not executed: families::quality_vs_mgcv_poisson_badhealth_doctor_visits::gam_poisson_predicts_badhealth_visits_better_than_baseline
+  listed case was not executed: families::quality_vs_mgcv_poisson_tensor::gam_poisson_tensor_recovers_true_mean_surface_on_real_data
+  listed case was not executed: families::quality_vs_mgcv_tensor_te_2d_binomial::gam_tensor_te_2d_binomial_logit_matches_mgcv
+  listed case was not executed: families::quality_vs_mgcv_tensor_te_2d_gamma::gam_tensor_te_2d_gamma_matches_mgcv
+  listed case was not executed: families::quality_vs_mgcv_tensor_te_2d_gamma::gam_tensor_te_2d_gamma_matches_mgcv_on_real_data
+  listed case was not executed: families::quality_vs_mgcv_tensor_te_2d_gaussian::gam_te_2d_smooth_matches_mgcv_on_separable_grid
+  listed case was not executed: families::quality_vs_mgcv_tensor_te_2d_poisson::gam_tensor_te_2d_poisson_matches_mgcv
+  listed case was not executed: families::quality_vs_mgcv_tensor_te_2d_poisson::gam_tensor_te_2d_poisson_matches_mgcv_on_real_data
+  listed case was not executed: families::quality_vs_mgcv_tensor_te_2d_tweedie::gam_tensor_te_2d_tweedie_matches_mgcv
+  listed case was not executed: families::quality_vs_mgcv_tensor_te_3d_gaussian::gam_te_3d_recovers_nonadditive_surface
+  listed case was not executed: families::quality_vs_mgcv_tensor_ti_2d_gaussian::gam_ti_2d_interaction_recovers_truth
+  listed case was not executed: families::quality_vs_mgcv_tensor_tp_2d_gaussian::gam_thin_plate_2d_matches_mgcv_gaussian
+  listed case was not executed: families::quality_vs_numpyro_nuts_poisson_loglink::gam_nuts_poisson_loglink_predicts_heldout_counts
+  listed case was not executed: families::quality_vs_properscoring_crps_gaussian_location_scale::gam_gaussian_location_scale_crps_matches_properscoring
+  listed case was not executed: families::quality_vs_properscoring_crps_gaussian_location_scale::gam_gaussian_location_scale_crps_matches_properscoring_on_real_data
+  listed case was not executed: families::quality_vs_pygam_poisson_2d_shape::gam_poisson_2d_recovers_true_log_mean_surface_on_real_data
+  listed case was not executed: families::quality_vs_pygam_student_t_outliers::student_t_matches_or_beats_pygam_truth_mse_on_outlier_contaminated_smooth
+  listed case was not executed: families::quality_vs_pymc_hmc_binomial_penalized_vs_unpenalized::gam_penalized_binomial_posterior_matches_pymc_and_concentrates_with_lambda
+  listed case was not executed: families::quality_vs_pymc_hmc_binomial_penalized_vs_unpenalized::gam_penalized_binomial_posterior_matches_pymc_and_concentrates_with_lambda_on_real_data
+  listed case was not executed: families::quality_vs_pymc_nuts_binomial_logit::gam_nuts_binomial_logit_recovers_truth_and_is_calibrated
+  listed case was not executed: families::quality_vs_pymc_nuts_binomial_logit::gam_nuts_binomial_logit_recovers_truth_and_is_calibrated_on_real_data
+  listed case was not executed: families::quality_vs_scipy_conjugate_gaussian_posterior::gam_nuts_posterior_matches_scipy_exact_conjugate_gaussian
+  listed case was not executed: families::quality_vs_scipy_johnsonsu_sas_link_transform_math::gam_sas_link_transform_matches_scipy_sinh_arcsinh_cdf
+  listed case was not executed: families::quality_vs_scoringrules_pit_gaussian_location_scale::gam_location_scale_pit_is_calibrated_on_holdout
+  listed case was not executed: families::quality_vs_scoringrules_pit_gaussian_location_scale::gam_location_scale_pit_is_calibrated_on_holdout_on_real_data
+  listed case was not executed: families::quality_vs_sklearn_binomial_logit::gam_binomial_logit_generalizes_on_heldout_prostate
+  listed case was not executed: families::quality_vs_sklearn_binomial_logit::gam_binomial_logit_generalizes_on_heldout_prostate_on_real_data
+  listed case was not executed: families::quality_vs_sklearn_poisson_log::gam_poisson_log_recovers_truth
+  listed case was not executed: families::quality_vs_sklearn_poisson_log::gam_poisson_log_recovers_truth_on_real_data
+  listed case was not executed: families::quality_vs_statsmodels_binomial_probit::gam_binomial_probit_recovers_truth_on_real_data
+  listed case was not executed: families::quality_vs_statsmodels_custom_family_poisson_loglink::custom_poisson_identity_link_recovers_truth_and_predicts
+  listed case was not executed: families::quality_vs_statsmodels_custom_family_poisson_loglink::custom_poisson_identity_link_recovers_truth_and_predicts_on_real_data
+  listed case was not executed: families::quality_vs_statsmodels_gamma_log::gam_gamma_log_matches_statsmodels
+  listed case was not executed: families::quality_vs_statsmodels_gamma_log_coefficient_se::gamma_log_coefficient_se_matches_statsmodels_no_double_count
+  listed case was not executed: families::quality_vs_statsmodels_multinomial::multinomial_coefficient_covariance_equals_observed_information_inverse
+  listed case was not executed: families::quality_vs_statsmodels_multinomial::multinomial_logit_recovers_true_softmax_and_beats_statsmodels
+  listed case was not executed: families::quality_vs_statsmodels_multinomial::multinomial_logit_recovers_true_softmax_and_beats_statsmodels_on_real_data
+  listed case was not executed: families::quality_vs_statsmodels_multinomial::multinomial_per_class_probability_se_intervals_are_calibrated_over_refits
+  listed case was not executed: families::quality_vs_statsmodels_ordinal_mnlogit::gam_multinomial_recovers_true_class_simplex
+  listed case was not executed: families::quality_vs_statsmodels_ordinal_mnlogit::gam_multinomial_recovers_true_class_simplex_on_real_data
+  listed case was not executed: families::quality_vs_statsmodels_tweedie::gam_tweedie_matches_statsmodels_power_variance
+  listed case was not executed: families::quality_vs_statsmodels_tweedie::gam_tweedie_matches_statsmodels_power_variance_on_real_data
+  listed case was not executed: families::quality_vs_synthetic_multinomial_deviance_identity::multinomial_recovers_decision_boundary_on_held_out_split
+  listed case was not executed: families::quality_vs_vgam_beta_logistic_link_parameterization::gam_beta_logistic_link_matches_vgam_beta_parameterization
+  listed case was not executed: families::quality_vs_vgam_multinomial_smooth_by_factor::gam_multinomial_smooth_by_factor_recovers_truth
+  listed case was not executed: families::quality_vs_vgam_multinomial_softmax::gam_multinomial_softmax_heterogeneous_smoothness_beats_fixed_df
+  listed case was not executed: families::quality_vs_vgam_multinomial_softmax::gam_multinomial_softmax_recovers_true_simplex
+  listed case was not executed: families::quality_vs_vgam_multinomial_softmax::gam_multinomial_softmax_recovers_true_simplex_on_real_data
+  listed case was not executed: manifolds::quality_vs_geomstats_crabs_spd_manifold::crabs_group_covariances_match_geomstats_spd_geometry
+  listed case was not executed: manifolds::quality_vs_geomstats_crabs_spd_manifold::crabs_group_covariances_match_geomstats_spd_geometry_on_real_data
+  listed case was not executed: manifolds::quality_vs_geomstats_poincare_exp_log_roundtrip::gam_poincare_exp_log_satisfies_manifold_axioms
+  listed case was not executed: manifolds::quality_vs_geomstats_poincare_geodesic::poincare_geodesic_is_a_correct_metric
+  listed case was not executed: manifolds::quality_vs_mgcv_global_city_temp_sphere_s2::gam_sphere_smooth_predicts_global_city_temp_better_than_mgcv_sos
+  listed case was not executed: manifolds::quality_vs_mgcv_global_city_temp_sphere_s2::gam_sphere_smooth_predicts_global_city_temp_better_than_mgcv_sos_on_real_data
+  listed case was not executed: manifolds::quality_vs_mgcv_solar_zenith_cylinder::gam_solar_zenith_cylinder_predicts_heldout_and_closes_seam
+  listed case was not executed: manifolds::quality_vs_mgcv_sphere_rotation_equivariance_s2::gam_sphere_smooth_is_rotation_equivariant_and_recovers_truth
+  listed case was not executed: manifolds::quality_vs_mgcv_sphere_rotation_equivariance_s2::gam_sphere_smooth_is_rotation_equivariant_and_recovers_truth_on_real_data
+  listed case was not executed: manifolds::quality_vs_scipy_sphere_geodesic_consistency::gam_sphere_smooth_recovers_geodesic_truth_at_least_as_well_as_mgcv_sos
+  listed case was not executed: misc::additive_models_quality_batch_f::cycle_71_smooth_plus_periodic
+  listed case was not executed: misc::additive_models_quality_batch_f::cycle_72_smooth_plus_sphere
+  listed case was not executed: misc::additive_models_quality_batch_f::cycle_73_bc_clamped_plus_sphere_harmonic
+  listed case was not executed: misc::additive_models_quality_batch_f::cycle_74_three_smooth_terms
+  listed case was not executed: misc::bc_quality_batch_b::cycle_55_bc_clamped_tiny_n
+  listed case was not executed: misc::bc_quality_batch_b::cycle_56_bc_anchored_bimodal_truth
+  listed case was not executed: misc::bc_quality_batch_b::cycle_57_bc_clamped_nonzero_endpoint_slope
+  listed case was not executed: misc::bc_quality_batch_b::cycle_58_bc_mixed_left_clamped_right_anchored
+  listed case was not executed: misc::broad_sweep_batch_h::bc_anchored_pins_predictions_at_data_extremes
+  listed case was not executed: misc::broad_sweep_batch_h::bc_anchored_with_data_far_from_zero
+  listed case was not executed: misc::broad_sweep_batch_h::bc_clamped_with_constant_truth_stays_flat
+  listed case was not executed: misc::broad_sweep_batch_h::matern_low_n_does_not_crash
+  listed case was not executed: misc::broad_sweep_batch_h::periodic_1d_high_amplitude_sin
+  listed case was not executed: misc::broad_sweep_batch_h::periodic_with_only_few_points
+  listed case was not executed: misc::broad_sweep_batch_h::smooth_recovers_step_continuously
+  listed case was not executed: misc::broad_sweep_batch_h::sphere_extrapolation_far_from_data_bounded
+  listed case was not executed: misc::broad_sweep_batch_h::sphere_predict_north_pole_with_random_lon
+  listed case was not executed: misc::broad_sweep_batch_h::sphere_predict_zero_lat_lon_finite
+  listed case was not executed: misc::broad_sweep_batch_h::tensor_2d_smooth_truth_recovery
+  listed case was not executed: misc::broad_sweep_batch_i::bc_clamped_at_high_k_smooths_correctly
+  listed case was not executed: misc::broad_sweep_batch_i::cylinder_clean_seam_with_negative_h
+  listed case was not executed: misc::broad_sweep_batch_i::periodic_1d_zero_amplitude_truth
+  listed case was not executed: misc::broad_sweep_batch_i::periodic_with_offset_data_range
+  listed case was not executed: misc::broad_sweep_batch_i::sphere_handles_lat_at_minus_90
+  listed case was not executed: misc::broad_sweep_batch_i::sphere_harmonic_with_small_n
+  listed case was not executed: misc::broad_sweep_batch_i::sphere_logit_predict_finite_at_pole
+  listed case was not executed: misc::broad_sweep_batch_i::sphere_rejects_constant_lon_column
+  listed case was not executed: misc::broad_sweep_batch_i::sphere_with_method_alias_sos
+  listed case was not executed: misc::broad_sweep_batch_i::te_periodic_data_outside_period_works
+  listed case was not executed: misc::broad_sweep_batch_i::te_single_period_broadcasts_to_periodic_axis
+  listed case was not executed: misc::feature_correctness_sweep::bc_bspline_all_endpoint_combinations_build
+  listed case was not executed: misc::feature_correctness_sweep::bc_bspline_anchored_at_left_vanishes_at_x_zero
+  listed case was not executed: misc::feature_correctness_sweep::bc_bspline_clamped_at_right_has_zero_derivative_at_x_one
+  listed case was not executed: misc::feature_correctness_sweep::bc_bspline_columns_drop_by_constraint_count
+  listed case was not executed: misc::feature_correctness_sweep::bc_bspline_realizes_nonzero_anchor_as_affine_lift
+  listed case was not executed: misc::feature_correctness_sweep::both_sphere_methods_give_rotation_invariant_smoothers
+  listed case was not executed: misc::feature_correctness_sweep::cyclic_derivative_penalty_constant_in_nullspace_across_orders_and_k
+  listed case was not executed: misc::feature_correctness_sweep::periodic_bspline_derivative_preserves_analytic_periodic_invariants
+  listed case was not executed: misc::feature_correctness_sweep::periodic_bspline_evaluates_seam_exactly
+  listed case was not executed: misc::feature_correctness_sweep::periodic_bspline_for_all_supported_degrees
+  listed case was not executed: misc::feature_correctness_sweep::periodic_bspline_partition_of_unity_across_periods_and_k
+  listed case was not executed: misc::feature_correctness_sweep::periodic_bspline_rejects_nonfinite_data
+  listed case was not executed: misc::feature_correctness_sweep::periodic_bspline_rejects_too_few_basis
+  listed case was not executed: misc::feature_correctness_sweep::sphere_harmonic_at_north_pole_reduces_to_legendre
+  listed case was not executed: misc::feature_correctness_sweep::sphere_harmonic_basis_dim_is_l_times_l_plus_2
+  listed case was not executed: misc::feature_correctness_sweep::sphere_harmonic_design_finite_for_all_l_at_random_points
+  listed case was not executed: misc::feature_correctness_sweep::sphere_harmonic_penalty_diagonal_eigenvalues_match_l_l_plus_1_squared
+  listed case was not executed: misc::feature_correctness_sweep::sphere_harmonic_radians_matches_degrees_across_l_and_points
+  listed case was not executed: misc::feature_correctness_sweep::sphere_harmonic_rejects_l_zero_and_too_large
+  listed case was not executed: misc::feature_correctness_sweep::sphere_harmonic_row_gram_invariant_under_longitude_shift
+  listed case was not executed: misc::fit_quality_stress::bimodal_sharp_bumps_bc
+  listed case was not executed: misc::fit_quality_stress::boundary_discontinuity_step
+  listed case was not executed: misc::fit_quality_stress::cyclic_two_laps_of_declared_period
+  listed case was not executed: misc::fit_quality_stress::heteroscedastic_noise_mean_recovery
+  listed case was not executed: misc::fit_quality_stress::hifreq_bc_k10
+  listed case was not executed: misc::fit_quality_stress::hifreq_bc_k6
+  listed case was not executed: misc::fit_quality_stress::hifreq_bc_k8
+  listed case was not executed: misc::fit_quality_stress::hifreq_cyclic_k10
+  listed case was not executed: misc::fit_quality_stress::hifreq_cyclic_k4
+  listed case was not executed: misc::fit_quality_stress::hifreq_cyclic_k6
+  listed case was not executed: misc::fit_quality_stress::hifreq_cyclic_k8
+  listed case was not executed: misc::fit_quality_stress::hifreq_sphere_l4
+  listed case was not executed: misc::fit_quality_stress::hifreq_sphere_l6
+  listed case was not executed: misc::fit_quality_stress::hifreq_sphere_l8
+  listed case was not executed: misc::fit_quality_stress::hifreq_tensor_k10
+  listed case was not executed: misc::fit_quality_stress::hifreq_tensor_k4
+  listed case was not executed: misc::fit_quality_stress::hifreq_tensor_k6
+  listed case was not executed: misc::fit_quality_stress::hifreq_tensor_k8
+  listed case was not executed: misc::fit_quality_stress::near_flat_signal
+  listed case was not executed: misc::fit_quality_stress::outlier_contamination
+  listed case was not executed: misc::fit_quality_stress::sparse_dense_imbalance
+  listed case was not executed: misc::fit_quality_stress::tensor_multicollinear_inputs
+  listed case was not executed: misc::fit_quality_stress::zz_measure_hifreq_tensor_k10_seed_costs
+  listed case was not executed: misc::fit_quality_stress::zz_measure_hifreq_tensor_k8_lambda_readout
+  listed case was not executed: misc::mega_batch_j::bc_anchored_with_few_data
+  listed case was not executed: misc::mega_batch_j::bc_clamped_with_few_data
+  listed case was not executed: misc::mega_batch_j::periodic_negative_truth
+  listed case was not executed: misc::mega_batch_j::periodic_recovers_cos2t
+  listed case was not executed: misc::mega_batch_j::periodic_with_high_k
+  listed case was not executed: misc::mega_batch_j::periodic_with_large_period
+  listed case was not executed: misc::mega_batch_j::smooth_cubic_recovery
+  listed case was not executed: misc::mega_batch_j::smooth_exponential
+  listed case was not executed: misc::mega_batch_j::smooth_fits_logistic_dose_response
+  listed case was not executed: misc::mega_batch_j::smooth_log_recovers_monotone
+  listed case was not executed: misc::mega_batch_j::smooth_negative_y_range
+  listed case was not executed: misc::mega_batch_j::smooth_quadratic_recovery
+  listed case was not executed: misc::mega_batch_j::smooth_sin_recovery
+  listed case was not executed: misc::mega_batch_j::smooth_with_intercept_match
+  listed case was not executed: misc::mega_batch_j::smooth_with_no_intercept_explicit
+  listed case was not executed: misc::mega_batch_j::smooth_with_offset_in_y
+  listed case was not executed: misc::mega_batch_j::smooth_with_outlier
+  listed case was not executed: misc::mega_batch_j::smooth_with_periodic_aliased_data
+  listed case was not executed: misc::mega_batch_j::sphere_dense_polar
+  listed case was not executed: misc::mega_batch_j::sphere_equatorial_data
+  listed case was not executed: misc::mega_batch_j::sphere_fits_lat_dependent_truth
+  listed case was not executed: misc::mega_batch_j::sphere_fits_uniform_constant_truth
+  listed case was not executed: misc::mega_batch_j::sphere_harmonic_with_m_equals_3
+  listed case was not executed: misc::mega_batch_j::sphere_with_explicit_m_equals_1_is_refused_with_both_remedies
+  listed case was not executed: misc::mega_batch_k::all_smooth_families_in_one_formula
+  listed case was not executed: misc::mega_batch_k::bc_anchored_handles_polynomial_truth
+  listed case was not executed: misc::mega_batch_k::bc_anchored_pred_at_data_min_endpoint
+  listed case was not executed: misc::mega_batch_k::bc_anchored_with_lots_of_data
+  listed case was not executed: misc::mega_batch_k::bc_clamped_handles_constant_truth
+  listed case was not executed: misc::mega_batch_k::bc_clamped_pred_at_data_min_endpoint
+  listed case was not executed: misc::mega_batch_k::bc_clamped_with_truth_zero_at_endpoints
+  listed case was not executed: misc::mega_batch_k::cylinder_recovers_h_only
+  listed case was not executed: misc::mega_batch_k::cylinder_recovers_theta_only
+  listed case was not executed: misc::mega_batch_k::cylinder_seam_continuity_finite
+  listed case was not executed: misc::mega_batch_k::matern_nu_half_1d
+  listed case was not executed: misc::mega_batch_k::matern_nu_seven_halves_1d
+  listed case was not executed: misc::mega_batch_k::matern_nu_three_halves_1d
+  listed case was not executed: misc::mega_batch_k::matern_recovers_polynomial
+  listed case was not executed: misc::mega_batch_k::matern_with_explicit_centers
+  listed case was not executed: misc::mega_batch_k::periodic_at_seam_doubled
+  listed case was not executed: misc::mega_batch_k::periodic_double_amplitude
+  listed case was not executed: misc::mega_batch_k::periodic_handles_quarter_period_data
+  listed case was not executed: misc::mega_batch_k::periodic_handles_three_quarter_period_data
+  listed case was not executed: misc::mega_batch_k::periodic_predictions_smooth_across_grid
+  listed case was not executed: misc::mega_batch_k::periodic_recovers_zero_truth
+  listed case was not executed: misc::mega_batch_k::periodic_with_high_freq_truth
+  listed case was not executed: misc::mega_batch_k::periodic_with_k_equal_basis_minimum
+  listed case was not executed: misc::mega_batch_k::periodic_with_lots_of_data
+  listed case was not executed: misc::mega_batch_k::periodic_with_low_freq_truth
+  listed case was not executed: misc::mega_batch_k::smooth_at_data_extremes
+  listed case was not executed: misc::mega_batch_k::smooth_consistent_across_seeds
+  listed case was not executed: misc::mega_batch_k::smooth_finite_at_data_centroid
+  listed case was not executed: misc::mega_batch_k::smooth_handles_one_outlier_high
+  listed case was not executed: misc::mega_batch_k::smooth_handles_one_outlier_low
+  listed case was not executed: misc::mega_batch_k::smooth_k_consistency_check
+  listed case was not executed: misc::mega_batch_k::smooth_recovers_decreasing_truth
+  listed case was not executed: misc::mega_batch_k::smooth_recovers_increasing_truth
+  listed case was not executed: misc::mega_batch_k::smooth_recovers_inverted_v_shape
+  listed case was not executed: misc::mega_batch_k::smooth_recovers_quadratic_in_offset_domain
+  listed case was not executed: misc::mega_batch_k::smooth_recovers_v_shape
+  listed case was not executed: misc::mega_batch_k::smooth_recovers_zero_truth
+  listed case was not executed: misc::mega_batch_k::smooth_with_data_in_negative_range
+  listed case was not executed: misc::mega_batch_k::smooth_with_explicit_intercept_excluded
+  listed case was not executed: misc::mega_batch_k::smooth_with_large_data_count_finishes
+  listed case was not executed: misc::mega_batch_k::smooth_with_normal_noise_high_sigma
+  listed case was not executed: misc::mega_batch_k::smooth_x_squared_inflection_at_zero
+  listed case was not executed: misc::mega_batch_k::sphere_consistent_across_seeds
+  listed case was not executed: misc::mega_batch_k::sphere_finite_at_pole_predict
+  listed case was not executed: misc::mega_batch_k::sphere_grid_data_works
+  listed case was not executed: misc::mega_batch_k::sphere_harmonic_smoke_test
+  listed case was not executed: misc::mega_batch_k::sphere_lat_zero_lon_varies_finite
+  listed case was not executed: misc::mega_batch_k::sphere_predictions_smooth_along_lat_band
+  listed case was not executed: misc::mega_batch_k::sphere_recovers_lat_squared
+  listed case was not executed: misc::mega_batch_k::sphere_recovers_lon_dependent
+  listed case was not executed: misc::mega_batch_k::sphere_recovers_zero_truth
+  listed case was not executed: misc::mega_batch_k::sphere_removed_method_aliases_are_refused
+  listed case was not executed: misc::mega_batch_k::sphere_strict_lat_bound_at_90
+  listed case was not executed: misc::mega_batch_k::sphere_wahba_default_method_is_sobolev
+  listed case was not executed: misc::mega_batch_k::sphere_with_lots_of_data
+  listed case was not executed: misc::mega_batch_k::sphere_with_method_harmonic
+  listed case was not executed: misc::mega_batch_k::sphere_with_minimum_basis_finite
+  listed case was not executed: misc::mega_batch_k::te_recovers_zero_truth
+  listed case was not executed: misc::mega_batch_k::te_with_disparate_scales
+  listed case was not executed: misc::mega_batch_k::te_with_low_k
+  listed case was not executed: misc::mega_batch_k::te_with_minimum_basis_finite
+  listed case was not executed: misc::mega_batch_k::tensor_2d_finite_at_origin
+  listed case was not executed: misc::mega_batch_k::tensor_2d_interaction
+  listed case was not executed: misc::mega_batch_k::tensor_2d_recovers_x
+  listed case was not executed: misc::mega_batch_k::tensor_2d_recovers_y
+  listed case was not executed: misc::mega_batch_k::torus_recovers_double_periodic
+  listed case was not executed: misc::mega_batch_k::torus_seam_u_continuous
+  listed case was not executed: misc::mega_batch_k::torus_seam_v_continuous
+  listed case was not executed: misc::quality_expectile_band_coverage_heteroscedastic::expectile_bands_cover_true_expectile_under_heteroscedastic_noise
+  listed case was not executed: misc::quality_expectile_band_coverage_heteroscedastic::expectile_covariance_is_the_penalized_newey_powell_sandwich
+  listed case was not executed: misc::quality_expectile_gam_heteroscedastic_truth::expectile_gam_recovers_closed_form_heteroscedastic_expectiles
+  listed case was not executed: misc::quality_expectile_joint_noncrossing::joint_expectile_curves_match_separate_fits_when_homoscedastic
+  listed case was not executed: misc::quality_expectile_joint_noncrossing::joint_expectile_curves_never_cross_where_separate_fits_do
+  listed case was not executed: misc::quality_llm_weekday_circle::weekday_is_bound_to_month_when_planted_jointly_and_fissions_when_additive
+  listed case was not executed: misc::quality_re_random_slope_partial_pools_to_population::re_random_slope_partial_pools_toward_population
+  listed case was not executed: misc::quality_ti_anova_scattered_recovers_truth::gam_ss_ti_anova_recovers_truth_on_scattered_data
+  listed case was not executed: misc::quality_validation_baseline_1471::concurvity_two_smooths_corr_090_recovers_truth_and_matches_mgcv
+  listed case was not executed: misc::quality_validation_baseline_1471::cyclic_tensor_periodic_clamped_wraps_and_matches_mgcv
+  listed case was not executed: misc::quality_validation_baseline_1471::poisson_response_ci_is_calibrated_and_matches_mgcv
+  listed case was not executed: misc::quality_validation_baseline_1471::smooth_plus_linear_same_var_recovers_truth_and_matches_mgcv
+  listed case was not executed: misc::quality_validation_baseline_1471::tweedie_log_smooth_recovers_truth_and_matches_mgcv
+  listed case was not executed: misc::quality_vs_compositions_alr_closure::simplex_frechet_mean_is_the_optimal_aitchison_center
+  listed case was not executed: misc::quality_vs_compositions_alr_closure::simplex_frechet_mean_is_the_optimal_aitchison_center_on_real_data
+  listed case was not executed: misc::quality_vs_compositions_frechet_mean::frechet_mean_is_the_aitchison_barycenter
+  listed case was not executed: misc::quality_vs_compositions_frechet_mean::frechet_mean_is_the_aitchison_barycenter_on_real_data
+  listed case was not executed: misc::quality_vs_compositions_skye_afm_aitchison_center::gam_aitchison_center_of_skye_afm_lavas_is_optimal_and_clr_exact
+  listed case was not executed: misc::quality_vs_flexsurv_piecewise_constant_vs_rp_baseline::gam_smooth_ispline_baseline_predicts_icu_survival
+  listed case was not executed: misc::quality_vs_flexsurv_rp_baseline::gam_rp_baseline_holdout_concordance_matches_or_beats_flexsurvspline_on_heart_failure
+  listed case was not executed: misc::quality_vs_flexsurv_rp_baseline::gam_rp_baseline_holdout_concordance_matches_or_beats_flexsurvspline_on_veteran
+  listed case was not executed: misc::quality_vs_gamlss_beta_dispersion_location_scale_1060::gam_beta_dispersion_location_scale_recovers_phi_surface_vs_gamlss
+  listed case was not executed: misc::quality_vs_gamlss_gagurine_location_scale::gam_location_scale_predicts_gagurine_better_than_baseline
+  listed case was not executed: misc::quality_vs_gamlss_negbin_dispersion_location_scale_1060::gam_negbin_dispersion_location_scale_recovers_theta_surface_vs_gamlss
+  listed case was not executed: misc::quality_vs_geomstats_grassmann_exp_log_roundtrip::grassmann_exp_log_roundtrip_matches_geomstats
+  listed case was not executed: misc::quality_vs_geomstats_olive_oils_grassmann::olive_oils_grassmann_distance_matches_geomstats
+  listed case was not executed: misc::quality_vs_geomstats_olive_oils_grassmann::olive_oils_grassmann_distance_matches_geomstats_on_real_data
+  listed case was not executed: misc::quality_vs_geomstats_stiefel_exp_log_roundtrip::gam_stiefel_exp_is_a_valid_canonical_metric_geodesic
+  listed case was not executed: misc::quality_vs_gpyto_gp_regression::gam_gp_regression_recovers_truth
+  listed case was not executed: misc::quality_vs_gpyto_gp_regression::gam_gp_regression_recovers_truth_on_real_data
+  listed case was not executed: misc::quality_vs_inla_rw2_spde_penalized_baseline::gam_rw2_pspline_predicts_held_out_at_least_as_well_as_inla
+  listed case was not executed: misc::quality_vs_inla_rw2_spde_penalized_baseline::gam_rw2_pspline_predicts_held_out_at_least_as_well_as_inla_on_real_data
+  listed case was not executed: misc::quality_vs_lifelines_interval_censored_truth_recovery::gam_recovers_interval_censored_latent_truth_match_or_beat_lifelines
+  listed case was not executed: misc::quality_vs_lme4_random_intercept::gam_random_intercept_matches_lme4
+  listed case was not executed: misc::quality_vs_lme4_random_intercept::gam_random_intercept_matches_lme4_on_real_data
+  listed case was not executed: misc::quality_vs_lme4_random_slope::gam_factor_smooth_random_slope_matches_lme4
+  listed case was not executed: misc::quality_vs_lme4_random_slope::gam_factor_smooth_random_slope_matches_lme4_on_real_data
+  listed case was not executed: misc::quality_vs_lme4_sleepstudy_random_slope_forecast::gam_sleepstudy_random_slope_forecasts_held_out_days_vs_lme4
+  listed case was not executed: misc::quality_vs_mass_ordinal_polr::gam_continuation_ratio_matches_vgam_sratio
+  listed case was not executed: misc::quality_vs_mass_ordinal_polr::gam_continuation_ratio_matches_vgam_sratio_on_real_data
+  listed case was not executed: misc::quality_vs_mgcv_bike_sharing_torus::gam_torus_predicts_bike_sharing_diurnal_seasonal_cycle_vs_mgcv
+  listed case was not executed: misc::quality_vs_mgcv_thin_plate_1d::gam_thin_plate_1d_predicts_heldout_lidar_at_least_as_well_as_mgcv
+  listed case was not executed: misc::quality_vs_mgcv_thin_plate_1d::gam_thin_plate_1d_predicts_heldout_lidar_at_least_as_well_as_mgcv_on_real_data
+  listed case was not executed: misc::quality_vs_mgcv_thin_plate_1d::tp_single_penalty_does_not_overfit_linear_data_1271
+  listed case was not executed: misc::quality_vs_pygam_logistic_1d_shape::gam_logistic_1d_shape_matches_pygam_on_logit_scale
+  listed case was not executed: misc::quality_vs_pygam_logistic_1d_shape::gam_logistic_1d_shape_matches_pygam_on_logit_scale_on_real_data
+  listed case was not executed: misc::quality_vs_python_scipy_alr_geometric_mean::simplex_geometric_mean_minimizes_aitchison_frechet_objective
+  listed case was not executed: misc::quality_vs_r_fields_mkriging::gam_matern_kriging_matches_fields_mkrig
+  listed case was not executed: misc::quality_vs_r_gpgp_likelihood::gam_gp_smooth_recovers_truth_and_predicts
+  listed case was not executed: misc::quality_vs_r_mlt_conditional_transformation_binary_covariate::gam_conditional_transformation_pit_is_calibrated_on_bone
+  listed case was not executed: misc::quality_vs_robcompositions_generalized_mean_coordinates::gam_simplex_frechet_mean_recovers_known_aitchison_center
+  listed case was not executed: misc::quality_vs_robcompositions_generalized_mean_coordinates::gam_simplex_frechet_mean_recovers_known_aitchison_center_on_real_data
+  listed case was not executed: misc::quality_vs_rstpm2_pstpm2_monotone_baseline_constraint::gam_penalized_baseline_is_monotone_and_concordant_on_cirrhosis
+  listed case was not executed: misc::quality_vs_rstpm2_pstpm2_penalized_baseline::gam_penalized_baseline_predicts_heldout_survival_on_cirrhosis
+  listed case was not executed: misc::quality_vs_scam_monotone_baseline::gam_monotone_baseline_recovers_log_cumhaz_truth
+  listed case was not executed: misc::quality_vs_scipy_pit_transformation_normal::transformation_normal_held_out_pit_is_uniform
+  listed case was not executed: misc::quality_vs_scipy_yeojohnson_skewed_positive_transformation::gam_transform_objectively_normalizes_skewed_positive_sample
+  listed case was not executed: misc::quality_vs_simplex_dirichlet_regression::gam_dirichlet_regression_recovers_truth
+  listed case was not executed: misc::quality_vs_simplex_dirichlet_regression::gam_dirichlet_regression_recovers_truth_on_real_data
+  listed case was not executed: misc::quality_vs_statsmodels_gam_additive::gam_additive_matches_statsmodels_gam
+  listed case was not executed: misc::quality_vs_statsmodels_gam_additive::gam_additive_matches_statsmodels_gam_on_real_data
+  listed case was not executed: misc::quality_vs_statsmodels_negbin::gam_negbin_matches_statsmodels_overdispersed_counts_on_real_data
+  listed case was not executed: misc::quality_vs_statsmodels_negbin_coefficient_se::negbin_log_coefficient_se_matches_statsmodels_no_theta_inflation
+  listed case was not executed: misc::quality_vs_synthetic_frailty_hazard_multiplier_likelihood::lognormal_hazard_multiplier_kernel_recovers_frailty_variance
+  listed case was not executed: misc::ws4a_end_to_end::ws4a_subsampled_fit_matches_full_data_fit
+  listed case was not executed: regressions::owed_1082_reml::poisson_fixture_sampler_has_the_declared_mean_and_variance
+  listed case was not executed: regressions::owed_1082_reml::poisson_tensor_te_recovers_true_mean_surface_not_oversmoothed_1373
+  listed case was not executed: regressions::perf_1082_outer_loop_repro::negbin_te_2d_outer_loop_converges_in_budget_1082
+  listed case was not executed: smooths::quality_spline_scan_vs_mgcv::spline_scan_matches_or_beats_mgcv_on_truth_recovery
+  listed case was not executed: smooths::quality_vs_flexsurv_rp_spline::gam_rp_spline_holdout_concordance_matches_or_beats_flexsurvspline_on_cirrhosis
+  listed case was not executed: smooths::quality_vs_flexsurv_rp_spline::gam_rp_spline_holdout_concordance_matches_or_beats_flexsurvspline_on_cirrhosis_on_real_data
+  listed case was not executed: smooths::quality_vs_inla_smooth_posterior_sd_credible_interval::gam_credible_intervals_are_calibrated_against_truth
+  listed case was not executed: smooths::quality_vs_inla_tensor_product_spde::gam_tensor_product_predicts_held_out_pc1_better_than_inla_spde
+  listed case was not executed: smooths::quality_vs_lifelines_smooth_tensor_baseline::gam_tensor_baseline_stratified_heldout_concordance
+  listed case was not executed: smooths::quality_vs_lme4_mgcv_random_intercept_by_smooth::gam_random_intercept_by_smooth_recovers_truth
+  listed case was not executed: smooths::quality_vs_mgcv_cyclic_cubic::gam_cyclic_cubic_matches_mgcv_on_sine
+  listed case was not executed: smooths::quality_vs_mgcv_cyclic_cubic::gam_cyclic_cubic_matches_mgcv_on_sine_on_real_data
+  listed case was not executed: smooths::quality_vs_mgcv_cylinder_tensor_cc_ps::gam_cylinder_tensor_cc_ps_recovers_truth_and_mixes_boundaries
+  listed case was not executed: smooths::quality_vs_mgcv_cylinder_tensor_cc_ps::gam_cylinder_tensor_cc_ps_recovers_truth_and_mixes_boundaries_on_real_data
+  listed case was not executed: smooths::quality_vs_mgcv_duchon_2d::gam_duchon_2d_surface_matches_mgcv_ds
+  listed case was not executed: smooths::quality_vs_mgcv_duchon_default_rank::gam_duchon_1d_default_rank_matches_mgcv_moderate_n
+  listed case was not executed: smooths::quality_vs_mgcv_duchon_default_rank::gam_duchon_1d_default_rank_matches_mgcv_small_n
+  listed case was not executed: smooths::quality_vs_mgcv_duchon_default_rank::gam_duchon_2d_default_rank_matches_mgcv_moderate_n
+  listed case was not executed: smooths::quality_vs_mgcv_duchon_default_rank::gam_duchon_2d_default_rank_matches_mgcv_small_n
+  listed case was not executed: smooths::quality_vs_mgcv_duchon_regimes::gam_duchon_1d_heavy_noise_smooth_truth_matches_mgcv
+  listed case was not executed: smooths::quality_vs_mgcv_duchon_regimes::gam_duchon_1d_poisson_log_mean_recovery_matches_mgcv
+  listed case was not executed: smooths::quality_vs_mgcv_duchon_regimes::gam_duchon_1d_two_component_wave_larger_k_matches_mgcv
+  listed case was not executed: smooths::quality_vs_mgcv_duchon_smooth::gam_duchon_1d_matches_mgcv_ds
+  listed case was not executed: smooths::quality_vs_mgcv_factor_smooth_fs::gam_factor_smooth_fs_recovers_truth
+  listed case was not executed: smooths::quality_vs_mgcv_factor_smooth_sz::gam_factor_smooth_sz_matches_mgcv
+  listed case was not executed: smooths::quality_vs_mgcv_gaulss_tensor::gam_gaulss_tensor_product_matches_mgcv
+  listed case was not executed: smooths::quality_vs_mgcv_matern_smooth::gam_matern_smooth_recovers_truth
+  listed case was not executed: smooths::quality_vs_mgcv_matern_smooth::gam_matern_smooth_recovers_truth_on_real_data
+  listed case was not executed: smooths::quality_vs_mgcv_matern_varying_nu::gam_matern_family_recovers_truth_across_nu
+  listed case was not executed: smooths::quality_vs_mgcv_negbin_estimated_theta_smooth::gam_negbin_estimated_theta_smooth_matches_mgcv_nb
+  listed case was not executed: smooths::quality_vs_mgcv_nottem_cyclic::gam_cyclic_predicts_nottem_seasonal_cycle_vs_mgcv
+  listed case was not executed: smooths::quality_vs_mgcv_pspline_smooth::gam_pspline_generalizes_on_lidar
+  listed case was not executed: smooths::quality_vs_mgcv_pspline_smooth::gam_pspline_generalizes_on_lidar_on_real_data
+  listed case was not executed: smooths::quality_vs_mgcv_quakes_spatial_smooth::diag_quakes_spatial_1074
+  listed case was not executed: smooths::quality_vs_mgcv_quakes_spatial_smooth::gam_spatial_smooth_predicts_quakes_better_than_baseline
+  listed case was not executed: smooths::quality_vs_mgcv_quakes_spatial_smooth::gam_spatial_smooth_predicts_quakes_better_than_baseline_on_real_data
+  listed case was not executed: smooths::quality_vs_mgcv_tensor_additive_tp_te::gam_additive_tp_plus_te_matches_mgcv
+  listed case was not executed: smooths::quality_vs_mgcv_tensor_te_2d_beta::gam_tensor_te_2d_beta_matches_mgcv
+  listed case was not executed: smooths::quality_vs_mgcv_tensor_te_2d_negbin::gam_tensor_te_2d_negbin_matches_mgcv_on_real_data
+  listed case was not executed: smooths::quality_vs_mgcv_torus_tensor_cc_cc::gam_torus_tensor_cc_cc_recovers_truth_and_wraps_at_both_seams
+  listed case was not executed: smooths::quality_vs_mgcv_torus_tensor_cc_cc::gam_torus_tensor_cc_cc_recovers_truth_and_wraps_at_both_seams_on_real_data
+  listed case was not executed: smooths::quality_vs_pygam_pspline::gam_pspline_held_out_accuracy_beats_pygam_on_lidar
+  listed case was not executed: smooths::quality_vs_pygam_pspline::gam_pspline_held_out_accuracy_beats_pygam_on_lidar_on_real_data
+  listed case was not executed: smooths::quality_vs_r_tram_smooth_continuous_covariate_transformation::gam_smooth_transformation_matches_r_tram_on_heart_failure
+  listed case was not executed: smooths::quality_vs_rstpm2_pstpm2_smooth_covariate::gam_smooth_covariate_recovers_flat_noise_effect_and_valid_survival_on_bone
+  listed case was not executed: smooths::quality_vs_scam_convex_smooth::gam_convex_smooth_recovers_truth_is_convex_and_matches_scam
+  listed case was not executed: smooths::quality_vs_scam_monotone_increasing_smooth::gam_monotone_increasing_smooth_recovers_truth_and_matches_scam
+  listed case was not executed: smooths::quality_vs_sklearn_gp_matern_regression::gam_matern_gp_recovers_truth_and_beats_sklearn
+  listed case was not executed: smooths::quality_vs_sklearn_gp_matern_regression::gam_matern_gp_recovers_truth_and_beats_sklearn_on_real_data
+  listed case was not executed: survival::quality_competing_risks_truth_recovery::joint_competing_risks_transformation_recovers_true_cause_specific_cifs
+  listed case was not executed: survival::quality_vs_flexsurv_weibull_aft::gam_weibull_survival_objective_quality_on_bone
+  listed case was not executed: survival::quality_vs_flexsurv_weibull_aft::gam_weibull_survival_objective_quality_on_bone_on_real_data
+  listed case was not executed: survival::quality_vs_gam_competing_risks_integral_identity::gam_crude_cif_recovers_closed_form_truth_beating_aalen_johansen_on_real_data
+  listed case was not executed: survival::quality_vs_gamlss_gaussian_survival_ls::gam_gaussian_survival_location_scale_matches_gamlss
+  listed case was not executed: survival::quality_vs_gamlss_gaussian_survival_ls::gam_gaussian_survival_location_scale_matches_gamlss_on_real_data
+  listed case was not executed: survival::quality_vs_inla_survival_random_intercept_baseline::gam_survival_frailty_random_intercept_matches_inla
+  listed case was not executed: survival::quality_vs_inla_survival_random_intercept_baseline::gam_survival_frailty_random_intercept_matches_inla_on_real_data
+  listed case was not executed: survival::quality_vs_lifelines_competing_risks_cif::gam_competing_risks_cif_matches_lifelines_aalen_johansen_on_cirrhosis
+  listed case was not executed: survival::quality_vs_lifelines_cox_like_marginal::gam_marginal_slope_heldout_concordance_matches_or_beats_lifelines_coxph
+  listed case was not executed: survival::quality_vs_lifelines_crps_lognormal_aft::gam_lognormal_aft_crps_calibration_matches_lifelines
+  listed case was not executed: survival::quality_vs_lifelines_crps_lognormal_aft::gam_lognormal_aft_crps_calibration_matches_lifelines_on_real_data
+  listed case was not executed: survival::quality_vs_lifelines_loglogistic_aft::gam_loglogistic_aft_matches_lifelines_on_haberman_ages
+  listed case was not executed: survival::quality_vs_lifelines_lognormal_aft::gam_lognormal_aft_interaction_recovers_truth
+  listed case was not executed: survival::quality_vs_lifelines_weibull_aft_by::gam_weibull_aft_by_factor_recovers_true_survival
+  listed case was not executed: survival::quality_vs_lifelines_weibull_aft_by::gam_weibull_aft_by_factor_recovers_true_survival_curved_acceleration
+  listed case was not executed: survival::quality_vs_lifelines_weibull_aft_by::gam_weibull_aft_by_factor_recovers_true_survival_on_real_data
+  listed case was not executed: survival::quality_vs_statsmodels_transformation_survival::gam_transformation_survival_prediction_grid_matches_scipy
+  listed case was not executed: survival::quality_vs_statsmodels_transformation_survival::gam_transformation_survival_prediction_grid_matches_scipy_on_real_data
+  listed case was not executed: survival::quality_vs_survival_coxph_frailty_hazard_multiplier::gam_hazard_multiplier_frailty_matches_coxph_frailty
+  listed case was not executed: survival::quality_vs_survival_coxph_frailty_hazard_multiplier::gam_hazard_multiplier_frailty_matches_coxph_frailty_on_real_data
+  listed case was not executed: survival::quality_vs_survival_location_scale_lognormal::gam_lognormal_location_scale_aft_smooth_matches_survreg
+  listed case was not executed: survival::quality_vs_survival_location_scale_lognormal::gam_lognormal_location_scale_aft_smooth_matches_survreg_on_real_data
+  listed case was not executed: survival::quality_vs_survival_weibull_veteran_lung_aft::gam_weibull_survival_out_of_sample_quality_on_veteran_lung
+  listed case was not executed: survival::quality_vs_survival_weibull_veteran_lung_aft::gam_weibull_survival_out_of_sample_quality_on_veteran_lung_on_real_data
 
 --- execution vs emission (silent-attrition guard) ---
 category     executed  failed  emitting
-calibration         8       0         0
-factors             2       0         1
-families           90       5        51
-manifolds          11       0        11
-misc              247       6        29
-regressions         3       0         0
-smooths            49       5        41
-survival           27       3        12
+calibration         1       0         0
+families            7       0         5
+manifolds           1       0         1
+misc               16       0         1
+smooths             3       0         3
+survival            2       0         1
 
-SILENT ATTRITION: 9 test(s) failed BEFORE emitting a pair (excluded from the significance set):
-  GAM_ERROR/gam_fit_failed families::quality_vs_synthetic_multinomial_deviance_identity::multinomial_recovers_decision_boundary_on_held_out_split
-  GAM_ERROR/gam_fit_failed families::quality_vs_vgam_multinomial_smooth_by_factor::gam_multinomial_smooth_by_factor_recovers_truth
-  METRIC_OFF/quality_metric misc::fit_quality_stress::hifreq_tensor_k4
-  TIMEOUT/per_test_bound misc::quality_expectile_band_coverage_heteroscedastic::expectile_bands_cover_true_expectile_under_heteroscedastic_noise
-  GAM_ERROR/gam_fit_failed misc::quality_vs_simplex_dirichlet_regression::gam_dirichlet_regression_recovers_truth_on_real_data
-  TIMEOUT/per_test_bound misc::quality_vs_lifelines_interval_censored_truth_recovery::gam_recovers_interval_censored_latent_truth_match_or_beat_lifelines
-  METRIC_OFF/quality_metric smooths::quality_vs_rstpm2_pstpm2_smooth_covariate::gam_smooth_covariate_recovers_flat_noise_effect_and_valid_survival_on_bone
-  TIMEOUT/per_test_bound survival::quality_vs_survival_coxph_frailty_hazard_multiplier::gam_hazard_multiplier_frailty_matches_coxph_frailty_on_real_data
-  TIMEOUT/per_test_bound survival::quality_vs_survival_coxph_frailty_hazard_multiplier::gam_hazard_multiplier_frailty_matches_coxph_frailty
+No silent attrition: every failed test still emitted its pair.
 
 --- #2395 paired-panel power ---
-33 of 186 pairs carry a paired fold panel: 3 resolved BETTER, 2 resolved WORSE, 28 unresolved.
-Pairing gain (unpaired SEM / paired SEM) over these panels: min 1.00x, median 4.88x, max 345.92x. Values above 1 are the common fold-draw swing that comparing two separately-averaged arms would have paid for.
+1 of 15 pairs carry a paired fold panel: 0 resolved BETTER, 0 resolved WORSE, 1 unresolved.
+Pairing gain (unpaired SEM / paired SEM) over these panels: min 3.64x, median 3.64x, max 3.64x. Values above 1 are the common fold-draw swing that comparing two separately-averaged arms would have paid for.
 
 pair                                                         K   effect%    sem%  |e|/sem     d_z   wins  verdict
-smooths/quality_vs_mgcv_cyclic_cubic                        10   -34.732   8.310     5.34   -1.69  10/10  gam_resolved_better
-smooths/quality_vs_mgcv_duchon_regimes::heavy_noise_smooth  10    -3.909   0.903     4.43   -1.40  10/10  gam_resolved_better
-smooths/quality_vs_mgcv_matern_varying_nu                   25    +8.330   1.982     4.08   +0.82   6/25  gam_resolved_worse
-families/quality_vs_mgcv_gaussian_smooth::ps_basis          10    -2.071   0.561     3.74   -1.18   9/10  gam_resolved_better
-families/quality_vs_gamlss_gaussian_location_scale_cyclic:  25    +1.989   0.656     3.01   +0.60   5/25  gam_resolved_worse
-families/quality_vs_mgcv_gaussian_smooth::default_basis     10    +0.684   0.229     2.98   +0.94   1/10  unresolved_tie
-smooths/quality_vs_mgcv_matern_smooth::test                 10    -1.373   0.485     2.85   -0.90   9/10  unresolved_tie
-smooths/quality_vs_mgcv_cyclic_cubic::test                  10    -0.592   0.214     2.79   -0.88   8/10  unresolved_tie
-misc/quality_vs_mgcv_thin_plate_1d::seeded_split            10    +0.055   0.021     2.64   +0.83   3/10  unresolved_tie
-families/quality_vs_gamlss_gaussian_location_scale_cyclic:  25   -11.596   4.814     2.62   -0.52  19/25  unresolved_tie
-smooths/quality_vs_mgcv_duchon_regimes::mu                  10    +6.715   2.526     2.61   +0.82   2/10  unresolved_tie
-misc/quality_vs_pygam_logistic_1d_shape                     25    -4.276   1.834     2.40   -0.48  17/25  unresolved_tie
 families/quality_vs_mgcv_poisson_tensor                     25    +5.253   2.280     2.27   +0.45   7/25  unresolved_tie
-survival/quality_vs_lifelines_weibull_aft_by::linear_accel  10   +14.442   6.874     2.03   +0.64   3/10  unresolved_tie
-families/quality_vs_gamlss_gaussian_location_scale::gaguri   4   +25.655  12.029     2.01   +1.01   1/4   unresolved_tie
-families/quality_vs_gamlss_custom_family_location_scale_ga   4   +27.886  14.126     1.86   +0.93   1/4   unresolved_tie
-smooths/quality_vs_mgcv_pspline_smooth::real_data_alt       10    -0.182   0.108     1.69   -0.53   7/10  unresolved_tie
-smooths/quality_vs_mgcv_nottem_cyclic                       10    +0.575   0.358     1.60   +0.51   3/10  unresolved_tie
-families/quality_vs_gamlss_gaussian_location_scale_cyclic:  25    -4.401   3.187     1.43   -0.29  15/25  unresolved_tie
-smooths/quality_vs_mgcv_duchon_regimes::two_component_k30   10    +8.828   6.115     1.43   +0.45   5/10  unresolved_tie
-smooths/quality_vs_mgcv_matern_varying_nu                   25    +4.052   2.957     1.36   +0.27  10/25  unresolved_tie
-families/quality_vs_gamlss_gaussian_multi_smooth::mu        23    -4.419   3.558     1.29   -0.27  17/23  unresolved_tie
-families/quality_vs_gamlss_gaussian_multi_smooth::log_sigm  23   -12.995  13.733     1.08   -0.23  20/23  unresolved_tie
-smooths/quality_vs_mgcv_matern_varying_nu                   25    -0.931   0.880     1.07   -0.21  16/25  unresolved_tie
-families/quality_vs_gamlss_gaussian_location_scale::gaguri   4    +3.582   4.394     0.82   +0.41   1/4   unresolved_tie
-families/quality_vs_gamlss_custom_family_location_scale_ga   4    +5.682   7.010     0.82   +0.41   3/4   unresolved_tie
-families/quality_vs_gamlss_gaussian_location_scale_cyclic:  25    +2.266   3.379     0.67   +0.13  11/25  unresolved_tie
-survival/quality_vs_lifelines_weibull_aft_by::curved_accel  10    +3.976   7.183     0.56   +0.18   5/10  unresolved_tie
-misc/quality_vs_mgcv_thin_plate_1d::i_mod_4_split           10    +0.017   0.037     0.47   +0.15   2/10  unresolved_tie
-smooths/quality_vs_mgcv_pspline_smooth                      10    +0.044   0.143     0.31   +0.10   3/10  unresolved_tie
-smooths/quality_vs_mgcv_quakes_spatial_smooth               10    -0.003   0.039     0.09   -0.03   5/10  unresolved_tie
-families/quality_vs_gamlss_custom_family_location_scale_ga   4    +1.730  26.012     0.07   +0.04   2/4   unresolved_tie
-families/quality_vs_gamlss_gaussian_location_scale::gaguri   4    -0.057  23.930     0.00   -0.00   2/4   unresolved_tie
 
-REAL FINDINGS: 2 pair(s) where gam is worse by more than the paired fold spread can explain. These are systematic, not split noise, and each deserves its own investigation:
-  families/quality_vs_gamlss_gaussian_location_scale_cyclic::above_fundamental::mu [mu_rmse_to_truth] vs gamlss: +1.989% over 25 folds (3.0 SEM, gam won 5/25)
-  smooths/quality_vs_mgcv_matern_varying_nu [rmse_vs_truth_nu2.5] vs mgcv: +8.330% over 25 folds (4.1 SEM, gam won 6/25)
-
-DILUTION: 28 paired pair(s) remain unresolved — their sign is not established even after fold averaging. They still enter the rank test above with full weight. Raising K on these is the lever that converts them into evidence:
-  families/quality_vs_gamlss_gaussian_location_scale::gagurine::constant_sigma: -0.057% +- 23.930% (0.00 SEM over 4 folds)
-  families/quality_vs_gamlss_custom_family_location_scale_gaussian::gagurine::constant_sigma: +1.730% +- 26.012% (0.07 SEM over 4 folds)
-  smooths/quality_vs_mgcv_quakes_spatial_smooth: -0.003% +- 0.039% (0.09 SEM over 10 folds)
-  smooths/quality_vs_mgcv_pspline_smooth: +0.044% +- 0.143% (0.31 SEM over 10 folds)
-  misc/quality_vs_mgcv_thin_plate_1d::i_mod_4_split: +0.017% +- 0.037% (0.47 SEM over 10 folds)
-  survival/quality_vs_lifelines_weibull_aft_by::curved_acceleration::truth_surface: +3.976% +- 7.183% (0.56 SEM over 10 folds)
-  families/quality_vs_gamlss_gaussian_location_scale_cyclic::fundamental::mu: +2.266% +- 3.379% (0.67 SEM over 25 folds)
-  families/quality_vs_gamlss_custom_family_location_scale_gaussian::gagurine::mgcv: +5.682% +- 7.010% (0.82 SEM over 4 folds)
-  families/quality_vs_gamlss_gaussian_location_scale::gagurine::mgcv: +3.582% +- 4.394% (0.82 SEM over 4 folds)
-  smooths/quality_vs_mgcv_matern_varying_nu: -0.931% +- 0.880% (1.07 SEM over 25 folds)
-  families/quality_vs_gamlss_gaussian_multi_smooth::log_sigma: -12.995% +- 13.733% (1.08 SEM over 23 folds)
-  families/quality_vs_gamlss_gaussian_multi_smooth::mu: -4.419% +- 3.558% (1.29 SEM over 23 folds)
-  smooths/quality_vs_mgcv_matern_varying_nu: +4.052% +- 2.957% (1.36 SEM over 25 folds)
-  smooths/quality_vs_mgcv_duchon_regimes::two_component_k30: +8.828% +- 6.115% (1.43 SEM over 10 folds)
-  families/quality_vs_gamlss_gaussian_location_scale_cyclic::above_fundamental::log_sigma: -4.401% +- 3.187% (1.43 SEM over 25 folds)
-  smooths/quality_vs_mgcv_nottem_cyclic: +0.575% +- 0.358% (1.60 SEM over 10 folds)
-  smooths/quality_vs_mgcv_pspline_smooth::real_data_alt: -0.182% +- 0.108% (1.69 SEM over 10 folds)
-  families/quality_vs_gamlss_custom_family_location_scale_gaussian::gagurine::gamlss: +27.886% +- 14.126% (1.86 SEM over 4 folds)
-  families/quality_vs_gamlss_gaussian_location_scale::gagurine::gamlss: +25.655% +- 12.029% (2.01 SEM over 4 folds)
-  survival/quality_vs_lifelines_weibull_aft_by::linear_acceleration::truth_surface: +14.442% +- 6.874% (2.03 SEM over 10 folds)
+DILUTION: 1 paired pair(s) remain unresolved — their sign is not established even after fold averaging. They still enter the rank test above with full weight. Raising K on these is the lever that converts them into evidence:
   families/quality_vs_mgcv_poisson_tensor: +5.253% +- 2.280% (2.27 SEM over 25 folds)
-  misc/quality_vs_pygam_logistic_1d_shape: -4.276% +- 1.834% (2.40 SEM over 25 folds)
-  smooths/quality_vs_mgcv_duchon_regimes::mu: +6.715% +- 2.526% (2.61 SEM over 10 folds)
-  families/quality_vs_gamlss_gaussian_location_scale_cyclic::fundamental::log_sigma: -11.596% +- 4.814% (2.62 SEM over 25 folds)
-  misc/quality_vs_mgcv_thin_plate_1d::seeded_split: +0.055% +- 0.021% (2.64 SEM over 10 folds)
-  smooths/quality_vs_mgcv_cyclic_cubic::test: -0.592% +- 0.214% (2.79 SEM over 10 folds)
-  smooths/quality_vs_mgcv_matern_smooth::test: -1.373% +- 0.485% (2.85 SEM over 10 folds)
-  families/quality_vs_mgcv_gaussian_smooth::default_basis: +0.684% +- 0.229% (2.98 SEM over 10 folds)
 
 Top tests GAM loses (largest log(gam/ref) > 0):
-  +4.5360  survival/quality_vs_gamlss_gaussian_survival_ls::loc [rmse_to_truth] gam=29.565 vs gamlss=0.31682
-  +1.1847  survival/quality_vs_gamlss_gaussian_survival_ls::log_sigma [rmse_to_truth] gam=1.2232 vs gamlss=0.37409
-  +0.5570  misc/quality_vs_mass_ordinal_polr::x2_slope [x2_slope_abs_err] gam=0.029624 vs mgcv=0.016971
-  +0.5084  families/quality_vs_mgcv_tensor_te_2d_tweedie [eta_rmse_to_truth] gam=0.22335 vs mgcv=0.13434
   +0.3370  manifolds/quality_vs_mgcv_sphere_s2_wahba_vs_sos [grid_rmse] gam=2.165 vs mgcv=1.5456
-  +0.2939  families/quality_vs_gamlss_custom_family_location_scale_gaussian::gagurine::gamlss [held_out_perplexity] gam=22.409 vs gamlss=16.703
-  +0.2725  families/quality_vs_gamlss_gaussian_location_scale::gagurine::gamlss [held_out_perplexity] gam=21.934 vs gamlss=16.703
-  +0.1959  families/quality_vs_mgcv_tensor_ti_2d_gaussian [interaction_rmse_to_truth] gam=0.03469 vs mgcv=0.028519
-  +0.1851  smooths/quality_vs_mgcv_tensor_te_2d_beta [eta_err] gam=0.11123 vs mgcv=0.092429
-  +0.1673  misc/quality_vs_gamlss_negbin_dispersion_location_scale_1060::mu [rmse_log_mu] gam=0.048651 vs gamlss=0.041154
-  +0.1347  misc/quality_vs_gpyto_gp_regression [truth_rmse] gam=0.016387 vs gpytorch=0.014322
-  +0.1250  misc/quality_vs_gamlss_beta_dispersion_location_scale_1060::log_phi [rmse_log_phi] gam=0.074602 vs gamlss=0.065833
-  +0.1176  smooths/quality_vs_mgcv_duchon_regimes::two_component_k30 [truth_rmse] gam=0.021399 vs mgcv=0.019025
-  +0.1143  misc/quality_vs_r_fields_mkriging [rmse] gam=0.115 vs fields=0.10258
-  +0.1079  misc/quality_vs_gamlss_gagurine_location_scale [nll] gam=3.4549 vs gamlss=3.1015
+  +0.0995  families/quality_vs_gamlss_gaussian_location_scale::mu [mu_rmse_to_truth] gam=0.016681 vs gamlss=0.015101
+  +0.0499  families/quality_vs_mgcv_poisson_tensor [rmse_to_truth] gam=0.3182 vs mgcv=0.30273
+  +0.0113  smooths/quality_vs_lme4_mgcv_random_intercept_by_smooth [test_rmse] gam=28.382 vs lme4=28.064
+  +0.0083  smooths/quality_vs_mgcv_factor_smooth_fs::test [test_rmse] gam=16.897 vs mgcv=16.758
+  +0.0008  families/quality_vs_interpret_ml_pygam_binomial_logit_comparative::ebm [holdout_nll] gam=0.62153 vs interpretml=0.62106
+  +0.0004  families/quality_vs_interpret_ml_pygam_binomial_logit_comparative::pygam [holdout_nll] gam=0.62153 vs pygam=0.62126

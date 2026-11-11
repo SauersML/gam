@@ -2,13 +2,13 @@
   "workflow": "Reference Quality Suite",
   "publish_job_status": "failure",
   "publish_job_status_note": "status of the job that PUBLISHED these results, not the conclusion of run_id -- this job is part of that run, so the run has not concluded here",
-  "publish_job_failed_steps": "step 5: Gate the suite on the merged outcomes",
-  "run_id": "42959768635",
-  "run_number": "788",
+  "publish_job_failed_steps": "",
+  "run_id": "43029495967",
+  "run_number": "789",
   "run_attempt": "1",
   "event": "schedule",
   "ref": "refs/heads/main",
-  "sha": "c95ac7c4f4f7bd6b0f47b81313f6b2f88ae4cd96",
-  "completed_utc": "2026-11-11T05:20:27Z",
-  "run_url": "https://github.com/SauersML/gam/actions/runs/42959768635"
+  "sha": "972039e7c2943e21da1d73080135742a93062db5",
+  "completed_utc": "2026-11-11T17:14:04Z",
+  "run_url": "https://github.com/SauersML/gam/actions/runs/43029495967"
 }

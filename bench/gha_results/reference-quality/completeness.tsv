@@ -1,6 +1,6 @@
-completeness	COMPLETE
+completeness	PARTIAL
 measured	true
 enumerated	437
-rows_written	437
-shards	15
+rows_written	30
+shards	1
 duplicate_rows	0
