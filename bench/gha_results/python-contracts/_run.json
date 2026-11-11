@@ -2,13 +2,13 @@
   "workflow": "Python Contracts",
   "publish_job_status": "failure",
   "publish_job_status_note": "status of the job that PUBLISHED these results, not the conclusion of run_id -- this job is part of that run, so the run has not concluded here",
-  "publish_job_failed_steps": "step 13: Run bench-package Python tests (#1512 orphans) | step 16: Triage full Python suite on the fresh wheel (#1512)",
-  "run_id": "42957448414",
-  "run_number": "428",
+  "publish_job_failed_steps": "step 13: Run bench-package Python tests (#1512 orphans) | step 15: Build gam release binary for CLI contracts",
+  "run_id": "43084234580",
+  "run_number": "429",
   "run_attempt": "1",
   "event": "schedule",
   "ref": "refs/heads/main",
-  "sha": "c95ac7c4f4f7bd6b0f47b81313f6b2f88ae4cd96",
-  "completed_utc": "2026-11-11T07:34:12Z",
-  "run_url": "https://github.com/SauersML/gam/actions/runs/42957448414"
+  "sha": "d68fecd6f5c19b993784a07bb28f04b92fddb107",
+  "completed_utc": "2026-11-11T20:56:46Z",
+  "run_url": "https://github.com/SauersML/gam/actions/runs/43084234580"
 }
