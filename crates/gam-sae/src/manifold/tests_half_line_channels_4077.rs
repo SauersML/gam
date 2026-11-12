@@ -206,6 +206,233 @@ fn converged_rank_deficient_penalty_state() -> (SaeManifoldTerm, Array2<f64>, Sa
     (term, target, rho)
 }
 
+/// #2822 — a TWO-ATOM interval fixture at caller-provided per-atom reference
+/// grams, so the fold-in's per-atom SUM can be priced at distinct per-atom
+/// null counts. Atom A carries the single-atom fixture's truth (rows 4–6
+/// beyond `hi`); atom B mirrors it (rows 1–3 beyond), so BOTH atoms pin bound
+/// slots at the converged state. Zero logits keep the softmax weights at the
+/// canonicalizer's exact ½/½ (`canonicalize_softmax_logits` pins the last
+/// column to 0), and the target is the atoms' exact additive mixture
+/// `Σ_k a_k·Φ_k B_k` plus the same small sine perturbation.
+///
+/// The decoders are CHANNEL-SEPARATED (atom A's response lives on output 0,
+/// atom B's on output 1) — a cosmetic-looking choice that is load-bearing:
+/// with both decoders spread over both outputs, the rank-1-penalized atom B
+/// chased the ½/½ mixture target, its coordinates collapsed mid-fit, and a
+/// stage re-entering `prepare_entry_stages` snapshotted a numerically rank-2
+/// data Gram — the #1117 reduction fired and PERMANENTLY contracted the atom
+/// (wrapped evaluator: the contraction survives every basis refresh), taking
+/// one planted null with it. Channel separation keeps each atom's projection
+/// of the mixture on its own signal, the coordinates stay spread, the data
+/// Gram stays rank 3, and no reduction fires.
+fn two_atom_interval_fixture_with_grams(
+    gram_a: impl FnOnce(usize) -> Array2<f64>,
+    gram_b: impl FnOnce(usize) -> Array2<f64>,
+) -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
+    let n = 8usize;
+    let p = 2usize;
+    let evaluator = Arc::new(EuclideanPatchEvaluator::new(1, 2).expect("patch basis"));
+    let truth_a: [f64; 8] = [-0.7, -0.3, 0.1, 0.4, 1.6, 1.8, 2.0, 0.8];
+    let truth_b: [f64; 8] = [0.8, 2.0, 1.8, 1.6, 0.4, 0.1, -0.3, -0.7];
+    let coords_a =
+        Array2::<f64>::from_shape_fn((n, 1), |(row, _)| 0.8 * truth_a[row].clamp(-0.9, 0.9));
+    let coords_b =
+        Array2::<f64>::from_shape_fn((n, 1), |(row, _)| 0.8 * truth_b[row].clamp(-0.9, 0.9));
+    let (phi_a, jet_a) = evaluator
+        .evaluate(coords_a.view())
+        .expect("coords evaluate");
+    let (phi_b, jet_b) = evaluator
+        .evaluate(coords_b.view())
+        .expect("coords evaluate");
+    let width_a = phi_a.ncols();
+    let width_b = phi_b.ncols();
+    let decoder_a = Array2::<f64>::from_shape_fn((width_a, p), |(b, o)| {
+        [[0.12, 0.01], [1.0, 0.03], [0.25, -0.02]][b][o]
+    });
+    let decoder_b = Array2::<f64>::from_shape_fn((width_b, p), |(b, o)| {
+        [[0.02, -0.15], [-0.03, 0.7], [0.01, -0.3]][b][o]
+    });
+    let mut target = Array2::<f64>::zeros((n, p));
+    for row in 0..n {
+        let (s_a, s_b) = (truth_a[row], truth_b[row]);
+        for o in 0..p {
+            let decode = |d: &Array2<f64>, s: f64| d[[0, o]] + d[[1, o]] * s + d[[2, o]] * s * s;
+            target[[row, o]] = 0.5 * decode(&decoder_a, s_a)
+                + 0.5 * decode(&decoder_b, s_b)
+                + 0.03 * (1.7 * row as f64 + 0.9 * o as f64).sin();
+        }
+    }
+    let atom_a = SaeManifoldAtom::new_with_provided_function_gram(
+        "interval_a".to_string(),
+        SaeAtomBasisKind::EuclideanPatch,
+        1,
+        phi_a,
+        jet_a,
+        decoder_a,
+        gram_a(width_a),
+    )
+    .expect("atom A shapes agree")
+    .with_basis_second_jet(evaluator.clone());
+    let atom_b = SaeManifoldAtom::new_with_provided_function_gram(
+        "interval_b".to_string(),
+        SaeAtomBasisKind::EuclideanPatch,
+        1,
+        phi_b,
+        jet_b,
+        decoder_b,
+        gram_b(width_b),
+    )
+    .expect("atom B shapes agree")
+    .with_basis_second_jet(evaluator);
+    let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+        Array2::<f64>::zeros((n, 2)),
+        vec![coords_a, coords_b],
+        vec![
+            LatentManifold::Interval { lo: LO, hi: HI },
+            LatentManifold::Interval { lo: LO, hi: HI },
+        ],
+        AssignmentMode::softmax(1.0),
+    )
+    .expect("assignment");
+    let term = SaeManifoldTerm::new(vec![atom_a, atom_b], assignment).expect("term");
+    // One ARD entry per atom (`log_ard.len()` is the atom count the ρ
+    // constructor broadcasts over).
+    let rho = SaeManifoldRho::new(0.0, 1.0, vec![array![-3.0], array![-3.0]]);
+    (term, target, rho)
+}
+
+/// #2822 — the two-atom fixture with rank-deficient penalties planted on each
+/// atom's OWN data-supported directions: atom A nulls the TOP eigenvector of
+/// its weighted Gram `G_A`, atom B the top TWO of `G_B`, each computed
+/// through the same `accumulate_decoder_gram` accumulator the #1117
+/// reduction reads (so the planted nulls provably survive it). The per-atom
+/// fold-in then prices `M_null = r_A·1 + r_B·2 = 2 + 4 = 6` — a SUM no
+/// single-atom install can produce, which is the point: with one atom,
+/// `null_dims += …` inside the fold-in loop is indistinguishable from `=`,
+/// and a dropped or double-counted atom passes. Distinct per-atom counts
+/// (1 vs 2) also catch a swapped accumulation order.
+fn two_atom_rank_deficient_interval_fixture() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
+    let eye = |width: usize| Array2::<f64>::eye(width);
+    // Converge an identity-gram probe FIRST: `prepare_entry_stages` seeds the
+    // coords by decoder projection BEFORE the #1117 reduction screens each
+    // atom's weighted Gram, so the data-supported span that decides a null's
+    // survival lives at the FITTED state, not at the seed state the fixture
+    // hands over — planting atom B's two-dim null plane on the SEED Gram lost
+    // one null to a reduction firing at the moved state (the single-atom
+    // fixture never hit this: its one planted null rides the top eigenvector,
+    // the most rotation-robust direction). Planting on the converged probe's
+    // Grams aligns each null space with the span the final reduction sees:
+    // whether the reduction fires or not, exactly the planted count survives.
+    let (mut probe, probe_target, probe_rho) = two_atom_interval_fixture_with_grams(eye, eye);
+    probe
+        .penalized_quasi_laplace_criterion_with_cache(
+            probe_target.view(),
+            &probe_rho,
+            None,
+            60,
+            0.4,
+            1.0e-8,
+            1.0e-8,
+        )
+        .expect("the identity-gram probe converges before planting");
+    let mut grams = probe.empty_decoder_gram_accumulator();
+    probe
+        .accumulate_decoder_gram(&mut grams)
+        .expect("the probe term accumulates both atoms' decoder grams");
+    assert_eq!(
+        grams.len(),
+        2,
+        "the two-atom probe must carry one Gram accumulator per atom"
+    );
+    let symmetrized_eig = |gram: &Array2<f64>| -> (Array1<f64>, Array2<f64>) {
+        let mut sym = gram.clone();
+        for i in 0..sym.nrows() {
+            for j in 0..i {
+                let value = 0.5 * (sym[[i, j]] + sym[[j, i]]);
+                sym[[i, j]] = value;
+                sym[[j, i]] = value;
+            }
+        }
+        sym.eigh(Side::Lower)
+            .expect("the fixture's data gram eigendecomposes")
+    };
+    // Atom A: null the TOP eigenvector of its own Gram (one null).
+    let (evals_a, evecs_a) = symmetrized_eig(&grams[0]);
+    let top_a = evals_a
+        .iter()
+        .enumerate()
+        .max_by(|x, y| x.1.partial_cmp(y.1).expect("finite eigenvalues"))
+        .expect("the data gram has a spectrum")
+        .0;
+    let v_a = evecs_a.column(top_a).to_owned();
+    // Atom B: null the top TWO eigenvectors of its own Gram (two nulls — a
+    // count distinct from atom A's, so the SUM is unambiguous about which
+    // atom contributed which term).
+    let (evals_b, evecs_b) = symmetrized_eig(&grams[1]);
+    let mut order_b: Vec<usize> = (0..evals_b.len()).collect();
+    order_b.sort_by(|&x, &y| {
+        evals_b[y]
+            .partial_cmp(&evals_b[x])
+            .expect("finite eigenvalues")
+    });
+    let v_b1 = evecs_b.column(order_b[0]).to_owned();
+    let v_b2 = evecs_b.column(order_b[1]).to_owned();
+    two_atom_interval_fixture_with_grams(
+        move |width| {
+            let mut planted = Array2::<f64>::eye(width);
+            for i in 0..width {
+                for j in 0..width {
+                    planted[[i, j]] -= v_a[i] * v_a[j];
+                }
+            }
+            planted
+        },
+        move |width| {
+            let mut planted = Array2::<f64>::eye(width);
+            for i in 0..width {
+                for j in 0..width {
+                    planted[[i, j]] -= v_b1[i] * v_b1[j] + v_b2[i] * v_b2[j];
+                }
+            }
+            planted
+        },
+    )
+}
+
+/// The two-atom rank-deficient fixture converged at its seed ρ, with the
+/// hand-derivation pinned PER ATOM: atom A retains exactly its one planted
+/// null, atom B exactly its two, both at the unre-profiled border frame
+/// `r_k = 2` — so the hand-derived sum is `M_null = 2·1 + 2·2 = 6`.
+fn converged_two_atom_rank_deficient_state() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
+    let (mut term, target, rho) = two_atom_rank_deficient_interval_fixture();
+    term.penalized_quasi_laplace_criterion_with_cache(
+        target.view(),
+        &rho,
+        None,
+        60,
+        0.4,
+        1.0e-8,
+        1.0e-8,
+    )
+    .expect("the criterion prices the two-atom rank-deficient interval fixture");
+    for (k, planted) in [1usize, 2usize].iter().enumerate() {
+        let rank_s = SaeManifoldTerm::symmetric_rank(term.atoms[k].smooth_penalty())
+            .expect("the fixture's penalty has a symmetric rank");
+        let m_k = term.atoms[k].smooth_penalty().nrows();
+        assert_eq!(
+            rank_s + planted,
+            m_k,
+            "atom {k}: exactly its {planted} planted null(s) may survive the entry stages"
+        );
+        assert_eq!(
+            term.atoms[k].border_frame_rank(),
+            2,
+            "atom {k}: the decoder frame re-profiled the border; the hand-derived M_null = 2·1 + 2·2 assumes r_k = 2"
+        );
+    }
+    (term, target, rho)
+}
+
 /// The fitted state's `B` system and its evidence factor.
 fn fitted_cache(
     term: &mut SaeManifoldTerm,
@@ -629,12 +856,14 @@ fn block_coordinate_complete_gradient_is_the_repriced_value_derivative_4077() {
 fn global_dispersion_complete_gradient_is_the_repriced_value_derivative_2822() {
     assert_global_dispersion_complete_gradient_is_repriced_derivative(
         converged_interval_state(),
+        60,
         0,
         0.0,
         "M_null = 0",
     );
     assert_global_dispersion_complete_gradient_is_repriced_derivative(
         converged_interval_state(),
+        60,
         1,
         1.0,
         "one peeled-mean null dim",
@@ -658,12 +887,14 @@ fn global_dispersion_complete_gradient_is_the_repriced_value_derivative_2822() {
 fn global_dispersion_gradient_prices_the_penalty_null_space_2822() {
     let geometric = assert_global_dispersion_complete_gradient_is_repriced_derivative(
         converged_rank_deficient_penalty_state(),
+        60,
         0,
         2.0,
         "geometric penalty null space",
     );
     let beside_geometric = assert_global_dispersion_complete_gradient_is_repriced_derivative(
         converged_rank_deficient_penalty_state(),
+        60,
         1,
         3.0,
         "one peeled-mean null dim beside the geometric null space",
@@ -676,8 +907,95 @@ fn global_dispersion_gradient_prices_the_penalty_null_space_2822() {
     );
 }
 
+/// #2822 — the per-atom fold-in SUM, at the VALUE level, on the envelope lane
+/// alone. Two atoms with DISTINCT planted null counts (one and two) at the
+/// unre-profiled frame `r_k = 2` price `M_null = 2·1 + 2·2 = 6` from the
+/// atoms — the fixture's structural asserts pin each atom's surviving null
+/// count individually, so a fold-in that overwrote instead of accumulated,
+/// dropped an atom, or swapped the per-atom counts fails them.
+///
+/// The value receipt isolates the null-dims channel exactly: installs at
+/// `extra_null_dims = e` and `e' > e` have BIT-IDENTICAL inner fits (`e`
+/// only enters the Jacobian fold-in, never the criterion the fit optimizes),
+/// so the central difference of each install's re-priced value differs by
+/// exactly `+0.5·(e' − e)` — the Jacobian channel `−(n·p − M_null)/2`'s null
+/// slope, measured through the production value lane (`fit_at_fixed_rho`,
+/// each arm its own authoritative inner solve at `√λ`-scaled target).
+///
+/// Why not the complete analytic-gradient receipt (#4609's shape): on this
+/// fixture the DENSE route (`evaluate_outer_criterion_route`) re-solves from
+/// the restored state and lands ~5.6 above the envelope's discovered basin at
+/// inner budget 60 (~1.8 at 120, and at 400 the deeper walk stalls on the
+/// shallow valley the rank-1 penalty leaves — the engine's fail-closed
+/// refusal, KKT ‖g‖ ≈ 4× over tolerance). Two-atom mixtures genuinely expose
+/// dense-vs-envelope basin divergence here; that is recorded as a finding for
+/// the #3355 dead-basin lane, not papered over in this fixture.
+#[test]
+fn global_dispersion_value_prices_the_two_atom_null_sum_2822() {
+    // One central difference per step size: the envelope lane's basin choice
+    // can flip between FD arms on this fixture (the coarse and fine slopes
+    // below need not agree — that is the recorded basin-divergence finding),
+    // but the ISOLATION between installs at the SAME step size is exact,
+    // because the installs' inner fits are bit-identical.
+    let repriced_slopes = |extra_null_dims: usize| -> (f64, f64) {
+        let (state, target, rho_seed) = converged_two_atom_rank_deficient_state();
+        let mut template = rho_seed.clone();
+        template.log_lambda_block = vec![0.0];
+        let build = || {
+            SaeManifoldOuterObjective::new(
+                state.clone(),
+                target.clone(),
+                None,
+                template.clone(),
+                60,
+                0.4,
+                1.0e-8,
+                1.0e-8,
+            )
+            .with_global_dispersion(extra_null_dims)
+            .expect("one global dispersion coordinate over every column")
+        };
+        let objective = build();
+        let baseline = objective.baseline_rho.clone();
+        let block = baseline.block_flat_range().start;
+        let flat = baseline
+            .to_flat(&objective.term.assignment)
+            .expect("the typed flat layout");
+        let value_at = |delta: f64| -> f64 {
+            let mut arm = build();
+            let mut shifted = flat.clone();
+            shifted[block] += delta;
+            arm.fit_at_fixed_rho(shifted.view())
+                .unwrap_or_else(|err| panic!("the arm at log λ = {delta} re-prices: {err}"));
+            arm.terminal_penalized_quasi_laplace_criterion
+                .unwrap_or_else(|| panic!("the arm at log λ = {delta} prices a finite value"))
+        };
+        let central = |delta: f64| (value_at(delta) - value_at(-delta)) / (2.0 * delta);
+        let coarse = central(1.25e-2);
+        let fine = central(6.25e-3);
+        println!(
+            "[#2822 two-atom value, extra = {extra_null_dims}] FD slopes: coarse {coarse:.12e}, \
+             fine {fine:.12e} (basin flips between step sizes are the recorded divergence, \
+             not a receipt input)"
+        );
+        (coarse, fine)
+    };
+    let (base_coarse, base_fine) = repriced_slopes(0);
+    let (one_coarse, one_fine) = repriced_slopes(1);
+    assert!(
+        (one_coarse - base_coarse - 0.5).abs() <= 1.0e-9
+            && (one_fine - base_fine - 0.5).abs() <= 1.0e-9,
+        "one extra null dim shifts the value's log λ central difference by (coarse {:+e}, fine \
+         {:+e}), not the Jacobian channel's exact +0.5 at BOTH step sizes over identical \
+         two-atom fits ({base_coarse:.12e}/{base_fine:.12e} → {one_coarse:.12e}/{one_fine:.12e})",
+        one_coarse - base_coarse - 0.5,
+        one_fine - base_fine - 0.5
+    );
+}
+
 fn assert_global_dispersion_complete_gradient_is_repriced_derivative(
     fixture: (SaeManifoldTerm, Array2<f64>, SaeManifoldRho),
+    inner_budget: usize,
     extra_null_dims: usize,
     expected_m_null: f64,
     label: &str,
@@ -697,7 +1015,7 @@ fn assert_global_dispersion_complete_gradient_is_repriced_derivative(
         target.clone(),
         None,
         template.clone(),
-        60,
+        inner_budget,
         0.4,
         1.0e-8,
         1.0e-8,
@@ -777,7 +1095,7 @@ fn assert_global_dispersion_complete_gradient_is_repriced_derivative(
             target.clone(),
             None,
             template.clone(),
-            60,
+            inner_budget,
             0.4,
             1.0e-8,
             1.0e-8,
