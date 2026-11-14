@@ -1,16 +1,16 @@
 # python-contracts full-suite triage (#1512) — recovered summary
 
 collected            3406
-passed               3066
+passed               3064
 skipped              79
 failed (diagnosed)   166
 errored (diagnosed)  6
-CENSORED             89   (worker killed at the per-test bound;
+CENSORED             91   (worker killed at the per-test bound;
                           the JUnit records no reason and time=0.000)
 
 faulthandler dumps in the step log: 97
 
-## The 89 censored tests, with the frame each was stuck in
+## The 91 censored tests, with the frame each was stuck in
 
 Recovered from the faulthandler dumps, which fire before the kill and
 write straight to fd 2. A test listed here is NOT a crashed interpreter:
@@ -18,47 +18,47 @@ it is a call that had not returned when the bound expired.
 
 [21] tests.test_documentation_examples
       test_python_documentation_example[README.md:246]
-          stuck in gamfit/_model.py:426 in predict
+          stuck in gamfit/_api.py:1222 in fit
       test_python_documentation_example[README.md:277]
-          stuck in gamfit/_model.py:426 in predict
+          stuck in gamfit/_api.py:1222 in fit
       test_python_documentation_example[README_PYPI.md:243]
-          stuck in gamfit/_model.py:426 in predict
+          stuck in gamfit/_api.py:1222 in fit
       test_python_documentation_example[README_PYPI.md:274]
-          stuck in gamfit/_model.py:426 in predict
+          stuck in gamfit/_api.py:1222 in fit
       test_python_documentation_example[docs/cookbook.md:289]
-          stuck in gamfit/_model.py:426 in predict
+          stuck in gamfit/_api.py:1222 in fit
       test_python_documentation_example[docs/cookbook.md:314]
-          stuck in gamfit/_model.py:426 in predict
+          stuck in gamfit/_api.py:1222 in fit
       test_python_documentation_example[docs/cookbook.md:341]
-          stuck in gamfit/_model.py:426 in predict
+          stuck in gamfit/_api.py:1222 in fit
       test_python_documentation_example[docs/cookbook.md:370]
-          stuck in gamfit/_model.py:426 in predict
+          stuck in gamfit/_api.py:1222 in fit
       test_python_documentation_example[docs/data-input.md:140]
-          stuck in gamfit/_model.py:426 in predict
+          stuck in gamfit/_api.py:1222 in fit
       test_python_documentation_example[docs/gpu_acceleration.md:32]
-          stuck in gamfit/_model.py:426 in predict
+          stuck in gamfit/_api.py:1222 in fit
       test_python_documentation_example[docs/marginal-slope.md:145]
-          stuck in gamfit/_model.py:426 in predict
+          stuck in gamfit/_api.py:1222 in fit
       test_python_documentation_example[docs/marginal-slope.md:64]
-          stuck in gamfit/_model.py:426 in predict
+          stuck in gamfit/_api.py:1222 in fit
       test_python_documentation_example[docs/marginal-slope.md:844]
-          stuck in gamfit/_model.py:426 in predict
+          stuck in gamfit/_api.py:1222 in fit
       test_python_documentation_example[docs/marginal-slope.md:909]
-          stuck in gamfit/_model.py:426 in predict
+          stuck in gamfit/_api.py:1222 in fit
       test_python_documentation_example[docs/predictions.md:423]
-          stuck in gamfit/_model.py:426 in predict
+          stuck in gamfit/_api.py:1222 in fit
       test_python_documentation_example[docs/survival.md:264]
-          stuck in gamfit/_model.py:426 in predict
+          stuck in gamfit/_api.py:1222 in fit
       test_python_documentation_example[docs/survival.md:295]
-          stuck in gamfit/_model.py:426 in predict
+          stuck in gamfit/_api.py:1222 in fit
       test_python_documentation_example[docs/survival.md:321]
-          stuck in gamfit/_model.py:426 in predict
+          stuck in gamfit/_api.py:1222 in fit
       test_python_documentation_example[docs/survival.md:391]
-          stuck in gamfit/_model.py:426 in predict
+          stuck in gamfit/_api.py:1222 in fit
       test_python_documentation_example[docs/survival.md:437]
-          stuck in gamfit/_model.py:426 in predict
+          stuck in gamfit/_api.py:1222 in fit
       test_python_documentation_example[docs/survival.md:43]
-          stuck in gamfit/_model.py:426 in predict
+          stuck in gamfit/_api.py:1222 in fit
 
 [4] tests.test_sae_manifold_converged_latents_issue_357
       test_converged_latents_exposes_t_star_and_a_star
@@ -132,6 +132,12 @@ it is a call that had not returned when the bound expired.
       test_survival_transformation_is_reachable_from_fit
           stuck in gamfit/_model.py:426 in predict
 
+[2] tests.bench_run_suite_mapping_test.RunSuiteMappingTests
+      test_geo_latlon_dataset_builds_without_external_pc_file
+          stuck in (no gamfit frame)
+      test_geo_subpop16_dataset_builds_without_external_pc_file
+          stuck in (no gamfit frame)
+
 [2] tests.bug_hunt_left_truncated_survival_predicts_degenerate_covariate_independent_survival_test
       test_left_truncated_survival_is_nondegenerate_and_covariate_dependent
           stuck in gamfit/_model.py:426 in predict
@@ -143,12 +149,6 @@ it is a call that had not returned when the bound expired.
           stuck in gamfit/_api.py:1222 in fit
       test_a_flexible_link_keyword_fits_the_formula_linkwiggle[extra1]
           stuck in gamfit/_api.py:1222 in fit
-
-[2] tests.test_bug_hunt_marginal_slope_predict_interval
-      test_marginal_slope_interval_covers_truth_at_nominal_rate
-          stuck in gamfit/_api.py:1222 in fit
-      test_marginal_slope_posterior_band_covers_truth_at_nominal_rate
-          stuck in gamfit/_sampling.py:116 in _call
 
 [2] tests.test_event_history_score_slope
       test_a_ctn_calibrated_score_composes_in_front_of_the_fit
@@ -192,10 +192,6 @@ it is a call that had not returned when the bound expired.
       test_transformation_survival_nonlinear_baseline_fits[gompertz]
           stuck in gamfit/_model.py:426 in predict
 
-[1] tests.bench_run_suite_mapping_test.RunSuiteMappingTests
-      test_geo_latlon_dataset_builds_without_external_pc_file
-          stuck in (no gamfit frame)
-
 [1] tests.bug_hunt_double_penalty_inflates_edf_instead_of_shrinking_test
       test_bspline_double_penalty_does_not_inflate_linear_edf
           stuck in gamfit/_api.py:1222 in fit
@@ -211,6 +207,10 @@ it is a call that had not returned when the bound expired.
 [1] tests.bug_hunt_smooth_pvalue_null_uniform_on_interaction_terms_test
       test_null_interaction_pvalues_are_uniform_over_the_whole_range[ti]
           stuck in gamfit/_api.py:1222 in fit
+
+[1] tests.bug_hunt_smooth_significance_ref_df_tracks_edf_not_basis_dim_test
+      test_pure_noise_fits_converge_and_null_p_values_are_uniform
+          stuck in gamfit/_model.py:858 in smooth_significance
 
 [1] tests.bug_hunt_smooth_significance_tensor_beside_factor_4563_test
       test_smooth_significance_does_not_manufacture_a_tensor_beside_a_factor_4563
@@ -231,6 +231,14 @@ it is a call that had not returned when the bound expired.
 [1] tests.generic_variance_link_cells_test
       test_generic_cell_gam_recovers_truth_and_bands_cover_it[binomial-log-<lambda>-1.0-6000]
           stuck in gamfit/_api.py:1222 in fit
+
+[1] tests.test_bug_hunt_2026_tweedie_estimated_power_conditional_coverage
+      test_true_power_strictly_beats_pinned_1p5_in_low_mean_stratum
+          stuck in gamfit/_model.py:426 in predict
+
+[1] tests.test_bug_hunt_marginal_slope_predict_interval
+      test_marginal_slope_posterior_band_covers_truth_at_nominal_rate
+          stuck in gamfit/_sampling.py:116 in _call
 
 [1] tests.test_bug_hunt_survival_surface_query_beyond_predict_exit
       test_survival_surface_not_truncated_by_small_predict_exit[transformation]
@@ -274,34 +282,34 @@ it is a call that had not returned when the bound expired.
 
 ## Entry-point census over the censored population
 
+    34  gamfit/_api.py:1222 in fit
     34  gamfit/_sae_manifold.py:216 in sae_manifold_fit
-    33  gamfit/_model.py:426 in predict
-    14  gamfit/_api.py:1222 in fit
-     3  (no gamfit frame)
+    13  gamfit/_model.py:426 in predict
+     4  (no gamfit frame)
      3  gamfit/_event_history.py:571 in fit_event_history
+     2  gamfit/_model.py:858 in smooth_significance
      1  gamfit/_sampling.py:116 in _call
-     1  gamfit/_model.py:858 in smooth_significance
 
 ## 20 slowest tests that DID report a duration
 
       120.5s  tests.test_documentation_examples::test_cli_documentation_example[docs/cli.md:149]
-      120.5s  tests.test_documentation_examples::test_cli_documentation_example[docs/marginal-slope.md:339]
+      120.3s  tests.test_documentation_examples::test_cli_documentation_example[docs/marginal-slope.md:339]
       120.3s  tests.test_documentation_examples::test_cli_documentation_example[docs/cli.md:136]
-      114.4s  tests.test_documentation_examples::test_python_documentation_example[docs/marginal-slope.md:312]
-      113.5s  tests.test_sae_manifold_synthetic_quality_ground_truth::test_fit_oos_quality_matches_training_on_planted_oracle_distribution
-      111.5s  tests.test_latent_center_collision_gradient::test_a_c1_latent_kernel_fits_through_a_center_collision[y ~ s(t, bs='duchon', centers=32)-2]
-      110.3s  tests.test_sae_manifold_synthetic_quality_ground_truth::test_fit_learns_disjoint_periodic_atoms_without_inactive_leakage
-       95.9s  tests.test_documentation_examples::test_python_documentation_example[docs/survival.md:223]
+      109.7s  tests.test_documentation_examples::test_python_documentation_example[docs/marginal-slope.md:312]
+       93.0s  tests.test_latent_center_collision_gradient::test_a_c1_latent_kernel_fits_through_a_center_collision[y ~ s(t, bs='duchon', centers=32)-2]
        90.1s  tests.test_survival_marginal_slope_clustered_pc_808::test_survival_marginal_slope_clustered_pc_converges_808
-       74.0s  tests.generic_variance_link_cells_test::test_generic_cell_gam_recovers_truth_and_bands_cover_it[gamma-inverse-<lambda>-0.1-3000]
-       60.2s  tests.examples_smoke_test::test_python_example_runs[standard_fit_latent_demo.py]
+       69.1s  tests.generic_variance_link_cells_test::test_generic_cell_gam_recovers_truth_and_bands_cover_it[gamma-inverse-<lambda>-0.1-3000]
+       60.3s  tests.test_documentation_examples::test_python_documentation_example[docs/survival.md:223]
+       60.1s  tests.examples_smoke_test::test_python_example_runs[sae_manifold_nuclear_rank.py]
+       60.1s  tests.examples_smoke_test::test_python_example_runs[standard_fit_latent_demo.py]
+       60.1s  tests.examples_smoke_test::test_python_example_runs[sae_manifold_scad_mcp_sparsity.py]
        60.1s  tests.examples_smoke_test::test_python_example_runs[sae_manifold_incoherence.py]
        60.1s  tests.examples_smoke_test::test_python_example_runs[sae_manifold_ordered_beta_bernoulli_topology_atoms.py]
-       60.1s  tests.examples_smoke_test::test_python_example_runs[sae_manifold_scad_mcp_sparsity.py]
-       60.1s  tests.examples_smoke_test::test_python_example_runs[sae_manifold_uncertainty.py]
        60.1s  tests.examples_smoke_test::test_python_example_runs[ordered_beta_bernoulli_anneal_demo.py]
-       60.1s  tests.examples_smoke_test::test_python_example_runs[sae_manifold_nuclear_rank.py]
+       60.1s  tests.examples_smoke_test::test_python_example_runs[sae_manifold_uncertainty.py]
        60.1s  tests.examples_smoke_test::test_python_example_runs[threshold_gate_sae_demo.py]
-       56.6s  tests.test_basis_check_pvalue_calibration::test_basis_check_is_uniform_under_an_adequate_basis[binomial]
-       54.2s  tests.examples_smoke_test::test_python_example_runs[topology_auto_selector_ring_demo.py]
+       50.6s  tests.test_basis_check_pvalue_calibration::test_basis_check_is_deterministic_and_matches_the_summary
+       50.6s  tests.test_basis_check_pvalue_calibration::test_basis_check_is_uniform_under_an_adequate_basis[binomial]
+       50.3s  tests.examples_smoke_test::test_python_example_runs[topology_auto_selector_ring_demo.py]
+       48.9s  tests.test_sae_manifold_synthetic_quality_ground_truth::test_fit_oos_quality_matches_training_on_planted_oracle_distribution
 
