@@ -2007,10 +2007,101 @@ struct SurvivalSmoothingSelection {
     outer_gradient: Option<Array1<f64>>,
 }
 
+/// The start of the smoothing selector's first inner solve (#4589).
+///
+/// Without delayed entry the inner penalized objective is convex on the
+/// monotonicity cone, every certified solve has one objective value, and the
+/// cold structural start `beta0` is returned as is.
+///
+/// A delayed-entry row subtracts `exp(η_entry)` curvature, and the objective
+/// can then hold more than one certified mode at one ρ. The cold start has
+/// every time coefficient next to the cone's faces, on the axis of the branch
+/// where the intercept carries the level of the cumulative hazard and the time
+/// block collapses. On the #2814 cohort it converges along that branch to a
+/// mode with three binding faces and an indefinite Hessian, 3.46 nats above
+/// the interior mode at the same ρ, and the LAML refuses it.
+///
+/// So under delayed entry the seed ρ is solved from both structural starts,
+/// the cold one and the exponential baseline, and the start is the certified
+/// mode with the lowest penalized objective. A solve that fails or does not
+/// certify is not a candidate. With no candidate the cold start is returned,
+/// and the selector's first evaluation reports that failure through its typed
+/// path.
+fn survival_first_inner_start(
+    model: &crate::survival::WorkingModelSurvival,
+    beta0: &Array1<f64>,
+    intercept_column: Option<usize>,
+    structural_lower_bounds: Option<&Array1<f64>>,
+    seed_rho: &Array1<f64>,
+) -> Array1<f64> {
+    let Some(exponential_start) = intercept_column
+        .filter(|_| model.has_delayed_entry())
+        .and_then(|column| model.exponential_baseline_start(column))
+    else {
+        return beta0.clone();
+    };
+    // (end point, its penalized objective at the seed ρ, terminal status)
+    let solve_at_seed = |start: &Array1<f64>| -> Result<
+        (Array1<f64>, f64, gam_solve::pirls::PirlsStatus),
+        gam_solve::estimate::EstimationError,
+    > {
+        let mut candidate = model.clone();
+        let lambdas = gam_problem::checked_exp_log_strengths(seed_rho.iter().copied())?;
+        candidate.set_penalty_lambdas(&lambdas)?;
+        let opts = gam_solve::pirls::WorkingModelPirlsOptions {
+            max_iterations: SURVIVAL_TRANSFORMATION_PIRLS_MAX_ITERATIONS,
+            convergence_tolerance: SURVIVAL_TRANSFORMATION_PIRLS_CONVERGENCE_TOL,
+            max_step_halving: SURVIVAL_TRANSFORMATION_PIRLS_MAX_STEP_HALVING,
+            firth_bias_reduction: false,
+            coefficient_lower_bounds: structural_lower_bounds.cloned(),
+            linear_constraints: None,
+            initial_lm_lambda: None,
+        };
+        let summary = gam_solve::pirls::runworking_model_pirls(
+            &mut candidate,
+            gam_problem::Coefficients::new(start.clone()),
+            &opts,
+            None,
+        )?;
+        let beta = summary.beta.as_ref().to_owned();
+        let objective = candidate.update_state(&beta)?.penalized_objective();
+        Ok((beta, objective, summary.status))
+    };
+    let solves = [
+        ("cold", solve_at_seed(beta0)),
+        ("exponential baseline", solve_at_seed(&exponential_start)),
+    ];
+    // `min_by` keeps the first of equal objectives, which is the cold start.
+    let selected = solves
+        .iter()
+        .filter_map(|(name, solved)| match solved {
+            Ok((mode, objective, status)) if survival_pirls_status_is_certified(*status) => {
+                Some((*name, mode, *objective))
+            }
+            _ => None,
+        })
+        .min_by(|a, b| a.2.total_cmp(&b.2));
+    for (name, solved) in &solves {
+        match solved {
+            Ok((_, objective, status)) => log::debug!(
+                "[SURV-TRANS first inner start] {name}: status={status:?} \
+                 penalized objective={objective}"
+            ),
+            Err(error) => log::debug!("[SURV-TRANS first inner start] {name}: {error}"),
+        }
+    }
+    log::debug!(
+        "[SURV-TRANS first inner start] selected={}",
+        selected.map_or("none", |(name, ..)| name)
+    );
+    selected.map_or_else(|| beta0.clone(), |(_, mode, _)| mode.clone())
+}
+
 fn optimize_survival_transformation_smoothing(
     model: &crate::survival::WorkingModelSurvival,
     penalty_blocks: &[PenaltyBlock],
     beta0: &Array1<f64>,
+    intercept_column: Option<usize>,
     structural_lower_bounds: Option<&Array1<f64>>,
 ) -> Result<Option<SurvivalSmoothingSelection>, FitFailure> {
     use gam_problem::{Derivative, HessianValue, OuterEval};
@@ -2070,13 +2161,25 @@ fn optimize_survival_transformation_smoothing(
     // where the stale cold seed leaves the coupled constrained inner PIRLS
     // non-convergent: `eval_at` then returns typed inner non-convergence, every
     // line-search step reads +∞ cost, and BFGS starves — the observed death at ~5
-    // iterations with |Pg| ≫ tol and the baseline coordinate railed. The inner
-    // penalized likelihood is strictly convex on the feasible (monotonicity) cone,
-    // so β̂(ρ) is independent of the feasible seed: the LAML envelope value and
-    // ρ-gradient are unchanged bit-for-bit, only the inner convergence at drifted
-    // ρ is restored. A non-converged probe never advances the seed (see below), so
-    // a bad probe cannot corrupt the warm start for the next attempt.
-    let warm_beta: std::cell::RefCell<Array1<f64>> = std::cell::RefCell::new(beta0.clone());
+    // iterations with |Pg| ≫ tol and the baseline coordinate railed.
+    //
+    // Without delayed entry the inner penalized likelihood is convex on the
+    // feasible (monotonicity) cone, so every certified solve at one ρ has the
+    // same objective value whatever its feasible seed, and chaining only restores
+    // the inner convergence at drifted ρ. With delayed entry it is not convex: it
+    // can hold more than one certified mode at one ρ, and the seed decides which
+    // one a solve reaches (#4589). The chain then follows the branch of its
+    // first mode, which `survival_first_inner_start` selects. A non-converged
+    // probe never advances the seed (see below), so a bad probe cannot corrupt
+    // the warm start for the next attempt.
+    let warm_beta: std::cell::RefCell<Array1<f64>> =
+        std::cell::RefCell::new(survival_first_inner_start(
+            model,
+            beta0,
+            intercept_column,
+            structural_lower_bounds,
+            &seed_rho,
+        ));
     // Evaluate the LAML objective at a ρ proposal, its ρ-gradient when the order
     // asks for one, and its analytic ρ-Hessian when it asks for curvature: set the
     // λ, re-run the constrained inner PIRLS, and evaluate the unified survival
@@ -4049,6 +4152,8 @@ pub(crate) fn fit_survival_transformation_model(
         &model,
         &penalty_blocks,
         &beta0,
+        (!covariate_design.intercept_range.is_empty())
+            .then(|| prepared.time_design_exit.ncols() + covariate_design.intercept_range.start),
         structural_lower_bounds.as_ref(),
     )? {
         model
