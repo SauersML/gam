@@ -2022,11 +2022,15 @@ struct SurvivalSmoothingSelection {
 /// the interior mode at the same ρ, and the LAML refuses it.
 ///
 /// So under delayed entry the seed ρ is solved from both structural starts,
-/// the cold one and the exponential baseline, and the start is the certified
-/// mode with the lowest penalized objective. A solve that fails or does not
-/// certify is not a candidate. With no candidate the cold start is returned,
-/// and the selector's first evaluation reports that failure through its typed
-/// path.
+/// the cold one and the exponential baseline. A solve that fails or does not
+/// certify is not a candidate. The selector needs a mode where the Laplace
+/// approximation exists, so the start is the candidate with the lowest
+/// penalized objective among those where the LAML gives a value and a
+/// ρ-gradient. On a small cohort the collapsed branch can hold the lower mode
+/// of the two, and the start is then not the lowest certified mode. When the
+/// LAML evaluates at no candidate, the start is the lowest certified mode.
+/// With no candidate at all it is the cold start. In both cases the selector's
+/// first evaluation decides through its typed path.
 fn survival_first_inner_start(
     model: &crate::survival::WorkingModelSurvival,
     beta0: &Array1<f64>,
@@ -2040,52 +2044,87 @@ fn survival_first_inner_start(
     else {
         return beta0.clone();
     };
-    // (end point, its penalized objective at the seed ρ, terminal status)
-    let solve_at_seed = |start: &Array1<f64>| -> Result<
-        (Array1<f64>, f64, gam_solve::pirls::PirlsStatus),
-        gam_solve::estimate::EstimationError,
-    > {
-        let mut candidate = model.clone();
-        let lambdas = gam_problem::checked_exp_log_strengths(seed_rho.iter().copied())?;
-        candidate.set_penalty_lambdas(&lambdas)?;
-        let opts = gam_solve::pirls::WorkingModelPirlsOptions {
-            max_iterations: SURVIVAL_TRANSFORMATION_PIRLS_MAX_ITERATIONS,
-            convergence_tolerance: SURVIVAL_TRANSFORMATION_PIRLS_CONVERGENCE_TOL,
-            max_step_halving: SURVIVAL_TRANSFORMATION_PIRLS_MAX_STEP_HALVING,
-            firth_bias_reduction: false,
-            coefficient_lower_bounds: structural_lower_bounds.cloned(),
-            linear_constraints: None,
-            initial_lm_lambda: None,
+    struct SeedSolve {
+        end_point: Array1<f64>,
+        penalized_objective: f64,
+        penalty: f64,
+        status: gam_solve::pirls::PirlsStatus,
+        /// Whether the LAML gives a value and a ρ-gradient at a certified end
+        /// point; `None` without one.
+        laml: Option<Result<(), gam_solve::estimate::EstimationError>>,
+    }
+    let solve_at_seed =
+        |start: &Array1<f64>| -> Result<SeedSolve, gam_solve::estimate::EstimationError> {
+            let mut candidate = model.clone();
+            let lambdas = gam_problem::checked_exp_log_strengths(seed_rho.iter().copied())?;
+            candidate.set_penalty_lambdas(&lambdas)?;
+            let opts = gam_solve::pirls::WorkingModelPirlsOptions {
+                max_iterations: SURVIVAL_TRANSFORMATION_PIRLS_MAX_ITERATIONS,
+                convergence_tolerance: SURVIVAL_TRANSFORMATION_PIRLS_CONVERGENCE_TOL,
+                max_step_halving: SURVIVAL_TRANSFORMATION_PIRLS_MAX_STEP_HALVING,
+                firth_bias_reduction: false,
+                coefficient_lower_bounds: structural_lower_bounds.cloned(),
+                linear_constraints: None,
+                initial_lm_lambda: None,
+            };
+            let summary = gam_solve::pirls::runworking_model_pirls(
+                &mut candidate,
+                gam_problem::Coefficients::new(start.clone()),
+                &opts,
+                None,
+            )?;
+            let end_point = summary.beta.as_ref().to_owned();
+            let state = candidate.update_state(&end_point)?;
+            let laml = survival_pirls_status_is_certified(summary.status).then(|| {
+                candidate
+                    .unified_lamlobjective_and_rhogradient(
+                        &end_point,
+                        &state,
+                        seed_rho,
+                        gam_problem::EvalMode::ValueAndGradient,
+                    )
+                    .map(|_| ())
+            });
+            Ok(SeedSolve {
+                end_point,
+                penalized_objective: state.penalized_objective(),
+                penalty: state.penalty_term,
+                status: summary.status,
+                laml,
+            })
         };
-        let summary = gam_solve::pirls::runworking_model_pirls(
-            &mut candidate,
-            gam_problem::Coefficients::new(start.clone()),
-            &opts,
-            None,
-        )?;
-        let beta = summary.beta.as_ref().to_owned();
-        let objective = candidate.update_state(&beta)?.penalized_objective();
-        Ok((beta, objective, summary.status))
-    };
     let solves = [
         ("cold", solve_at_seed(beta0)),
         ("exponential baseline", solve_at_seed(&exponential_start)),
     ];
-    // `min_by` keeps the first of equal objectives, which is the cold start.
+    // Candidates where the LAML evaluates come first, then the lower objective.
+    // `min_by` keeps the first of equal candidates, which is the cold start.
     let selected = solves
         .iter()
         .filter_map(|(name, solved)| match solved {
-            Ok((mode, objective, status)) if survival_pirls_status_is_certified(*status) => {
-                Some((*name, mode, *objective))
-            }
-            _ => None,
+            Ok(solve) => solve
+                .laml
+                .as_ref()
+                .map(|laml| (*name, solve, laml.is_err())),
+            Err(_) => None,
         })
-        .min_by(|a, b| a.2.total_cmp(&b.2));
+        .min_by(|a, b| {
+            a.2.cmp(&b.2)
+                .then(a.1.penalized_objective.total_cmp(&b.1.penalized_objective))
+        });
     for (name, solved) in &solves {
         match solved {
-            Ok((_, objective, status)) => log::debug!(
-                "[SURV-TRANS first inner start] {name}: status={status:?} \
-                 penalized objective={objective}"
+            Ok(solve) => log::debug!(
+                "[SURV-TRANS first inner start] {name}: status={:?} penalized objective={} \
+                 (penalty term {}) LAML: {}",
+                solve.status,
+                solve.penalized_objective,
+                solve.penalty,
+                match &solve.laml {
+                    None => "not evaluated".to_string(),
+                    Some(Ok(())) => "evaluates".to_string(),
+                    Some(Err(refusal)) => refusal.to_string(),
+                }
             ),
             Err(error) => log::debug!("[SURV-TRANS first inner start] {name}: {error}"),
         }
@@ -2094,7 +2133,7 @@ fn survival_first_inner_start(
         "[SURV-TRANS first inner start] selected={}",
         selected.map_or("none", |(name, ..)| name)
     );
-    selected.map_or_else(|| beta0.clone(), |(_, mode, _)| mode.clone())
+    selected.map_or_else(|| beta0.clone(), |(_, solve, _)| solve.end_point.clone())
 }
 
 fn optimize_survival_transformation_smoothing(
@@ -2166,12 +2205,12 @@ fn optimize_survival_transformation_smoothing(
     // Without delayed entry the inner penalized likelihood is convex on the
     // feasible (monotonicity) cone, so every certified solve at one ρ has the
     // same objective value whatever its feasible seed, and chaining only restores
-    // the inner convergence at drifted ρ. With delayed entry it is not convex: it
-    // can hold more than one certified mode at one ρ, and the seed decides which
-    // one a solve reaches (#4589). The chain then follows the branch of its
-    // first mode, which `survival_first_inner_start` selects. A non-converged
-    // probe never advances the seed (see below), so a bad probe cannot corrupt
-    // the warm start for the next attempt.
+    // the inner convergence at drifted ρ. With delayed entry it need not be
+    // convex: it can hold more than one certified mode at one ρ, and the seed
+    // decides which one a solve reaches (#4589). The chain then follows the
+    // branch of its first mode, which `survival_first_inner_start` selects. A
+    // non-converged probe never advances the seed (see below). A converged probe
+    // advances it even when the LAML then refuses its mode.
     let warm_beta: std::cell::RefCell<Array1<f64>> =
         std::cell::RefCell::new(survival_first_inner_start(
             model,

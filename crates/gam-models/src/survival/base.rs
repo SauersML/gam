@@ -2314,9 +2314,9 @@ impl WorkingModelSurvival {
     }
 
     /// Whether any weighted row enters after the time origin (left truncation).
-    /// Such a row adds `−exp(η_entry)·x_entry x_entryᵀ` to the Hessian, so the
-    /// inner penalized objective need not be convex and can have more than one
-    /// mode at one ρ (#4589).
+    /// Such a row adds `−w·exp(η_entry)·x_entry x_entryᵀ` to the Hessian, so
+    /// the inner penalized objective need not be convex and can have more than
+    /// one mode at one ρ (#4589).
     pub(crate) fn has_delayed_entry(&self) -> bool {
         self.entry_at_origin
             .iter()
@@ -2344,8 +2344,11 @@ impl WorkingModelSurvival {
     /// entry term on the delayed-entry rows only.
     ///
     /// `None` when the block has no such start: it is not structurally
-    /// monotone, the least-squares system is singular, a component of `a` is
-    /// not strictly inside the cone, or the data hold no event or no exposure.
+    /// monotone, the structural columns are not the time block, the
+    /// least-squares system is singular, a component of `a` is not strictly
+    /// inside the cone, or the data hold no event or no exposure. The rows are
+    /// not checked one by one: the solve that takes the start rejects one whose
+    /// cumulative hazard decreases over a row.
     pub(crate) fn exponential_baseline_start(
         &self,
         intercept_column: usize,
@@ -2362,6 +2365,9 @@ impl WorkingModelSurvival {
                 time_derivative, ..
             } => time_derivative,
         };
+        if p_time > time_derivative.ncols() {
+            return None;
+        }
         // Rows the likelihood skips take no part: their row and target are zero.
         let row_scale = Array1::from_shape_fn(self.nrows(), |i| {
             if self.sampleweight[i] > 0.0 {
@@ -2394,6 +2400,11 @@ impl WorkingModelSurvival {
         start.slice_mut(ndarray::s![..p_time]).assign(&direction);
         let eta_exit = self.exit_dot(&start) + &self.offset_eta_exit;
         let eta_entry = self.entry_dot(&start) + &self.offset_eta_entry;
+        // The exposure is taken relative to the largest exit predictor, so a
+        // large common offset neither overflows nor underflows the exponentials.
+        let reference = (0..self.nrows())
+            .filter(|&i| self.sampleweight[i] > 0.0)
+            .fold(f64::NEG_INFINITY, |acc, i| acc.max(eta_exit[i]));
         let mut events = 0.0;
         let mut exposure = 0.0;
         for i in 0..self.nrows() {
@@ -2402,14 +2413,14 @@ impl WorkingModelSurvival {
                 continue;
             }
             events += w * f64::from(self.event_target[i]);
-            let cumulative_hazard_at_entry = if self.entry_at_origin[i] {
-                0.0
+            exposure += w * if self.entry_at_origin[i] {
+                (eta_exit[i] - reference).exp()
             } else {
-                eta_entry[i].exp()
+                // `exp(exit) − exp(entry)`, without cancellation on a short row.
+                (eta_entry[i] - reference).exp() * (eta_exit[i] - eta_entry[i]).exp_m1()
             };
-            exposure += w * (eta_exit[i].exp() - cumulative_hazard_at_entry);
         }
-        let level = events.ln() - exposure.ln();
+        let level = events.ln() - exposure.ln() - reference;
         if !level.is_finite() {
             return None;
         }
@@ -5020,11 +5031,12 @@ mod tests {
     /// columns sum to `log t`, with an intercept in column 2 and a covariate in
     /// column 3. The derivative offset `0.1/t` leaves the block a slope of `0.9`
     /// in `log t`. The last row has weight zero, and its derivative offset is
-    /// off that curve.
+    /// off that curve. `eta_offset_shift` moves every predictor offset.
     fn log_time_block_model(
         age_entry: Array1<f64>,
         event_target: Array1<u8>,
         structural: bool,
+        eta_offset_shift: f64,
     ) -> WorkingModelSurvival {
         let age_exit = array![1.4_f64, 1.0, 2.0, 1.1, 40.0];
         let event_competing = Array1::<u8>::zeros(5);
@@ -5051,8 +5063,8 @@ mod tests {
             x_derivative[[i, 0]] = 1.0 / (exit * (1.0 + exit));
             x_derivative[[i, 1]] = 1.0 / (1.0 + exit);
         }
-        let o_entry = array![0.2_f64, 0.0, 0.1, 0.05, 0.3];
-        let o_exit = array![0.4_f64, 0.5, 0.7, 0.3, 0.9];
+        let o_entry = array![0.2_f64, 0.0, 0.1, 0.05, 0.3] + eta_offset_shift;
+        let o_exit = array![0.4_f64, 0.5, 0.7, 0.3, 0.9] + eta_offset_shift;
         let mut o_deriv = age_exit.mapv(|t| 0.1 / t);
         o_deriv[4] = 0.5;
         let mut model = survival_model_with_offsets(
@@ -5087,43 +5099,48 @@ mod tests {
     /// The exponential-baseline start gives the log cumulative hazard a unit
     /// slope in `log t`, and its level is the one where the model's own gradient
     /// is zero in the intercept. The zero-weight row, an event with a long
-    /// exposure and its own derivative offset, moves neither (#4589).
+    /// exposure and its own derivative offset, moves neither. A common predictor
+    /// offset that would overflow or underflow `exp` moves only the level
+    /// (#4589).
     #[test]
     fn exponential_baseline_start_is_a_unit_log_time_slope_at_its_stationary_level_4589() {
-        let model = log_time_block_model(
-            array![0.5, 0.0, 0.3, 0.9, 0.2],
-            array![1u8, 1u8, 0u8, 1u8, 1u8],
-            true,
-        );
-        assert!(model.has_delayed_entry());
-        let start = model.exponential_baseline_start(2).expect("start");
-        assert!((start[0] - 0.9).abs() < 1e-9, "a[0]={:.12e}", start[0]);
-        assert!((start[1] - 0.9).abs() < 1e-9, "a[1]={:.12e}", start[1]);
-        assert_eq!(start[3], 0.0);
-        let state = model.update_state(&start).expect("state");
-        assert!(
-            state.gradient[2].abs() < 1e-10,
-            "intercept gradient at the start: {:.3e}",
-            state.gradient[2]
-        );
+        for eta_offset_shift in [0.0, -744.0, 800.0] {
+            let model = log_time_block_model(
+                array![0.5, 0.0, 0.3, 0.9, 0.2],
+                array![1u8, 1u8, 0u8, 1u8, 1u8],
+                true,
+                eta_offset_shift,
+            );
+            assert!(model.has_delayed_entry());
+            let start = model.exponential_baseline_start(2).expect("start");
+            assert!((start[0] - 0.9).abs() < 1e-9, "a[0]={:.12e}", start[0]);
+            assert!((start[1] - 0.9).abs() < 1e-9, "a[1]={:.12e}", start[1]);
+            assert_eq!(start[3], 0.0);
+            let state = model.update_state(&start).expect("state");
+            assert!(
+                state.gradient[2].abs() < 1e-9,
+                "intercept gradient at the start, offset shift {eta_offset_shift}: {:.3e}",
+                state.gradient[2]
+            );
+        }
     }
 
     #[test]
     fn exponential_baseline_start_needs_a_structural_block_an_intercept_and_an_event_4589() {
         let entry = array![0.5, 0.0, 0.3, 0.9, 0.2];
         let events = array![1u8, 1u8, 0u8, 1u8, 1u8];
-        let structural = log_time_block_model(entry.clone(), events.clone(), true);
+        let structural = log_time_block_model(entry.clone(), events.clone(), true, 0.0);
         // Column 1 is in the time block and column 4 does not exist.
         assert!(structural.exponential_baseline_start(1).is_none());
         assert!(structural.exponential_baseline_start(4).is_none());
         assert!(
-            log_time_block_model(entry.clone(), events, false)
+            log_time_block_model(entry.clone(), events, false, 0.0)
                 .exponential_baseline_start(2)
                 .is_none()
         );
         // The only event left is on the zero-weight row.
         assert!(
-            log_time_block_model(entry, array![0u8, 0u8, 0u8, 0u8, 1u8], true)
+            log_time_block_model(entry, array![0u8, 0u8, 0u8, 0u8, 1u8], true, 0.0)
                 .exponential_baseline_start(2)
                 .is_none()
         );
@@ -5134,11 +5151,12 @@ mod tests {
     fn delayed_entry_counts_weighted_rows_only_4589() {
         let events = array![1u8, 1u8, 0u8, 1u8, 1u8];
         assert!(
-            !log_time_block_model(array![0.0, 0.0, 0.0, 0.0, 0.2], events.clone(), true)
+            !log_time_block_model(array![0.0, 0.0, 0.0, 0.0, 0.2], events.clone(), true, 0.0)
                 .has_delayed_entry()
         );
         assert!(
-            log_time_block_model(array![0.0, 0.0, 0.3, 0.0, 0.0], events, true).has_delayed_entry()
+            log_time_block_model(array![0.0, 0.0, 0.3, 0.0, 0.0], events, true, 0.0)
+                .has_delayed_entry()
         );
     }
 
