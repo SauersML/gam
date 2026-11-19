@@ -336,6 +336,10 @@ mod tests_ard_constrained_partition_2933;
 #[cfg(test)]
 mod tests_interval_active_bound_3438;
 #[cfg(test)]
+mod tests_half_line_channels_4077;
+#[cfg(test)]
+mod tests_midfit_contraction_stiff_1117;
+#[cfg(test)]
 mod tests_half_line_before_4077;
 #[cfg(test)]
 mod tests_topk_ard_active_slots_2933;
