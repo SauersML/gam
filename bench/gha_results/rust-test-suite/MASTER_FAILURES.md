@@ -1,14 +1,14 @@
 # MASTER_FAILURES
 
 - Compile failures: **0**
-- Workspace tests run: **NOT MEASURED** (12853 runnable in the archive listing)
+- Workspace tests run: **NOT MEASURED** (the archive population was never listed)
 - Runtime test failures (FAIL/TIMEOUT/TERMINATING/LEAK): **NOT MEASURED** (0 seen in the shards that did run)
-- Python test failures: **NOT MEASURED — at least 99** (LOWER BOUND, not a count: Python API tests (job `cancelled`) did not run to completion, so the tests they never reached are unmeasured, not passing)
+- Python test failures: **NOT MEASURED — at least 100** (LOWER BOUND, not a count: Python API tests (job `cancelled`) did not run to completion, so the tests they never reached are unmeasured, not passing)
 - Forbidden runtime signatures seen: **NOT MEASURED** (0 seen in the shards that did run)
 - Slow/timeout notices (#1393): **NOT MEASURED** (0 seen in the shards that did run)
 
 Coverage:
-- workspace shards: **NOT MEASURED** (build `failure`, matrix `skipped`, workspace shard set differs from 1..10: missing=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10], extra=[])
+- workspace shards: **NOT MEASURED** (build `failure`, matrix `skipped`, the build job published no archive test listing, so the population that should have run is unknown)
 - gam-pyffi unit tests: **MEASURED** (job `success`)
 - Python API tests: **NOT MEASURED** (job `cancelled`)
 - Python populations (slow + torch): **MEASURED** (job `failure`)
@@ -17,7 +17,7 @@ Coverage:
 
 > NOTE: the Python surface was NOT measured — the Python job reported `cancelled`. The Python counter above is not a result.
 
-> NOTE: the runtime surface was NOT measured — the archive build reported `failure`; the shard matrix reported `skipped`; only 0 of 10 planned shard logs were collected; no workspace shard log was collected at all; the workspace test population was not certified: workspace shard set differs from 1..10: missing=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10], extra=[]; a shard reported ARCHIVE_MISSING. Runtime counters above are not results. Fix the build first; the runtime surface will then be exercised.
+> NOTE: the runtime surface was NOT measured — the archive build reported `failure`; the shard matrix reported `skipped`; only 0 of 10 planned shard logs were collected; no workspace shard log was collected at all; the workspace test population was not certified: the build job published no archive test listing, so the population that should have run is unknown; a shard reported ARCHIVE_MISSING. Runtime counters above are not results. Fix the build first; the runtime surface will then be exercised.
 >
 > The archive is missing and NO compile error was captured either, so this run reports nothing at all about the workspace — neither that it builds nor that it passes. Read the build-logs artifact.
 
@@ -31,7 +31,7 @@ _None._
 
 ## Python test failures
 
-_Lower bound: 99 recorded before the run stopped. Unmeasured: Python API tests (job `cancelled`)._
+_Lower bound: 100 recorded before the run stopped. Unmeasured: Python API tests (job `cancelled`)._
 
 - **FAIL** `python::tests/test_sae_manifold_accuracy_oos` :: `test_curved_circle_atom_in_sample_r2_per_seed[0]`
 - **FAIL** `python::tests/test_pygam_audit_predict_interval_hygiene` :: `test_gauss_small_estimated_scale_interval_coverage_is_nominal`
@@ -39,69 +39,70 @@ _Lower bound: 99 recorded before the run stopped. Unmeasured: Python API tests (
 - **FAIL** `python::tests/test_basis_check_pvalue_calibration` :: `test_basis_check_is_uniform_under_an_adequate_basis[poisson-low-count]`
 - **FAIL** `python::tests/test_sae_atom_inference_roundtrip` :: `test_atom_inference_reports_functionals_and_no_e_value`
 - **FAIL** `python::tests/test_sae_atom_inference_roundtrip` :: `test_atom_inference_reports_survive_json_roundtrip`
-- **FAIL** `python::tests/test_basis_check_pvalue_calibration` :: `test_basis_check_is_uniform_under_an_adequate_basis[binomial-low-rate]`
 - **FAIL** `python::tests/test_sae_manifold_accuracy_oos` :: `test_curved_circle_atom_in_sample_r2_per_seed[1]`
+- **FAIL** `python::tests/test_basis_check_pvalue_calibration` :: `test_basis_check_is_uniform_under_an_adequate_basis[binomial-low-rate]`
 - **FAIL** `python::tests/test_sae_manifold_accuracy_oos` :: `test_curved_circle_atom_mean_r2_across_seeds`
 - **ABORT** `python::tests/test_examples_compose_tiers` :: `test_compose_adds_reconstruction_over_linear_tier`
 - **FAIL** `python::tests/test_sae_manifold_accuracy_oos` :: `test_curved_circle_atom_in_sample_r2_per_seed[2]`
 - **FAIL** `python::tests/test_sae_manifold_accuracy_oos` :: `test_curved_circle_atom_oos_r2`
 - **FAIL** `python::tests/test_sae_manifold_accuracy_oos` :: `test_oos_uses_fit_time_hyperparameters`
-- **FAIL** `python::tests/test_sae_manifold_accuracy_oos` :: `test_curved_circle_atom_in_sample_r2_per_seed[7]`
 - **ABORT** `python::tests/test_sae_manifold_accuracy_oos` :: `test_curved_sphere_atom_on_sphere_data`
+- **FAIL** `python::tests/test_sae_manifold_accuracy_oos` :: `test_curved_circle_atom_in_sample_r2_per_seed[7]`
 - **FAIL** `python::tests/test_sae_manifold_accuracy_oos` :: `test_curved_circle_atom_in_sample_r2_per_seed[13]`
+- **FAIL** `python::tests/test_sae_manifold_duchon_euclidean_issue` :: `test_sae_manifold_fit_euclidean_atom_dim_succeeds[2]`
+- **ABORT** `python::tests/test_sae_manifold_duchon_euclidean_issue` :: `test_sae_manifold_fit_duchon_2d_does_not_violate_collocation`
 - **FAIL** `python::tests/test_sae_manifold_dim_matrix` :: `test_sae_manifold_fits_each_topology_dimension_pair[1-torus]`
 - **FAIL** `python::tests/test_sae_manifold_dim_matrix` :: `test_sae_manifold_fits_each_topology_dimension_pair[1-sphere]`
 - **FAIL** `python::tests/test_sae_manifold_dim_matrix` :: `test_sae_manifold_fits_each_topology_dimension_pair[2-circle]`
 - **FAIL** `python::tests/test_sae_manifold_dim_matrix` :: `test_sae_manifold_fits_each_topology_dimension_pair[2-euclidean]`
 - **ABORT** `python::tests/test_sae_manifold_dim_matrix` :: `test_sae_manifold_fits_each_topology_dimension_pair[2-torus]`
-- **FAIL** `python::tests/test_sae_manifold_duchon_euclidean_issue` :: `test_sae_manifold_fit_euclidean_atom_dim_succeeds[2]`
-- **ABORT** `python::tests/test_sae_manifold_duchon_euclidean_issue` :: `test_sae_manifold_fit_duchon_2d_does_not_violate_collocation`
-- **ABORT** `python::tests/test_sae_manifold_multi_topology` :: `test_single_atom_recovers_each_supported_topology[euclidean]`
+- **ABORT** `python::tests/test_sae_manifold_multi_topology` :: `test_single_atom_recovers_each_supported_topology[sphere]`
+- **FAIL** `python::tests/test_sae_manifold_oos_noise_sweep` :: `test_periodic_atom_oos_r2_noise_sweep[0.1]`
 - **FAIL** `python::tests/test_sae_manifold_oos_noise_sweep` :: `test_periodic_atom_oos_r2_noise_sweep[0.2]`
+- **FAIL** `python::tests/test_sae_manifold_row_loss_weights_1062` :: `test_row_weights_pull_fit_toward_upweighted_rows`
+- **FAIL** `python::tests/test_sae_manifold_row_loss_weights_1062` :: `test_uniform_weights_match_unweighted`
+- **FAIL** `python::tests/test_sae_manifold_sphere_pole_stability` :: `test_sphere_atom_stable_at_poles`
 - **FAIL** `python::tests/test_sae_manifold_ordered_beta_bernoulli_prior_saturation` :: `test_penalized_quasi_laplace_resolves_true_k_under_prior_saturation`
-- **FAIL** `python::tests/test_sae_manifold_ordered_beta_bernoulli_prior_saturation` :: `test_ordered_beta_bernoulli_assignments_decay_not_truncate_under_saturation`
-- **FAIL** `python::tests/test_sae_manifold_topology_stale` :: `test_summary_topology_matches_atom_basis[sphere-sphere-2]`
-- **FAIL** `python::tests/test_sae_manifold_topology_stale` :: `test_summary_topology_matches_atom_basis[torus-torus-2]`
-- **FAIL** `python::tests/test_sae_manifold_topology_stale` :: `test_payload_round_trip_preserves_topology[sphere-sphere-2]`
 - **FAIL** `python::tests/test_sae_manifold_topology_stale` :: `test_payload_round_trip_preserves_topology[torus-torus-2]`
-- **FAIL** `python::tests/test_sae_manifold_topology_stale` :: `test_summary_topology_matches_atom_basis[periodic-circle-1]`
-- **FAIL** `python::tests/test_sae_oos_returns_converged_latents_issue_1229` :: `test_oos_returned_routing_is_the_softmax_of_the_returned_logits`
-- **FAIL** `python::tests/test_sample_smoothing_corrected_coverage` :: `test_sample_mean_intervals_cover_like_predict[poisson]`
+- **ABORT** `python::tests/test_sae_manifold_ordered_beta_bernoulli_prior_saturation` :: `test_ordered_beta_bernoulli_assignments_decay_not_truncate_under_saturation`
+- **ABORT** `python::tests/test_sae_oos_returns_converged_latents_issue_1229` :: `test_oos_returned_routing_is_the_softmax_of_the_returned_logits`
 - **FAIL** `python::tests/test_sae_manifold_topology_stale` :: `test_geometry_plans_and_topology_are_internally_consistent`
 - **FAIL** `python::tests/test_sae_manifold_topology_stale` :: `test_linear_topology_is_distinct_from_euclidean_quadratic_patch`
-- **FAIL** `python::tests/test_smooth_lr_pvalue_calibration` :: `test_smooth_lr_is_sized_and_keeps_its_power[gaussian_n60]`
-- **ABORT** `python::tests/test_sae_manifold_ordered_beta_bernoulli_prior_saturation` :: `test_reml_keeps_k1_winner_under_saturation`
 - **ABORT** `python::tests/test_smooth_lr_pvalue_calibration` :: `test_smooth_lr_is_sized_and_keeps_its_power[binomial_n400]`
-- **ABORT** `python::tests/test_smooth_lr_pvalue_calibration` :: `test_smooth_lr_is_sized_and_keeps_its_power[poisson_n200]`
-- **FAIL** `python::tests/test_sae_oos_returns_converged_latents_issue_1229` :: `test_oos_returned_assignments_reconstruct_the_returned_fitted`
+- **FAIL** `python::tests/test_sae_manifold_topology_stale` :: `test_summary_topology_matches_atom_basis[sphere-sphere-2]`
+- **FAIL** `python::tests/test_sae_manifold_topology_stale` :: `test_summary_topology_matches_atom_basis[torus-torus-2]`
+- **FAIL** `python::tests/test_smooth_lr_pvalue_calibration` :: `test_smooth_lr_is_sized_and_keeps_its_power[gaussian_n60]`
 - **ABORT** `python::tests/test_examples_sae_supervised` :: `test_sae_supervised_end_to_end_returns_uniform_result`
-- **FAIL** `python::tests/test_sae_manifold_capacity` :: `test_penalized_quasi_laplace_picks_k1_on_one_harmonic_data`
+- **FAIL** `python::tests/test_sae_manifold_topology_stale` :: `test_summary_topology_matches_atom_basis[periodic-circle-1]`
+- **FAIL** `python::tests/test_sae_manifold_topology_stale` :: `test_payload_round_trip_preserves_topology[sphere-sphere-2]`
+- **ABORT** `python::tests/test_examples_sae_supervised` :: `test_sae_supervised_oos_predict_runs_the_frozen_decoder_encoder`
 - **FAIL** `python::tests/test_sae_manifold_curved_beats_linear` :: `test_curved_atom_beats_linear_shards_on_one_harmonic`
-- **FAIL** `python::tests/test_sae_manifold_dim_matrix` :: `test_sae_manifold_fits_each_topology_dimension_pair[1-euclidean]`
-- **FAIL** `python::tests/test_sample_smoothing_corrected_coverage` :: `test_sample_mean_intervals_cover_like_predict[binomial]`
 - **ABORT** `python::tests/test_sae_manifold_decoder_incoherence_crossgram` :: `test_decoder_incoherence_reduces_recovered_cross_atom_decoder_cross_gram`
+- **ABORT** `python::tests/test_smooth_lr_pvalue_calibration` :: `test_smooth_lr_is_sized_and_keeps_its_power[poisson_n200]`
+- **FAIL** `python::tests/test_sae_manifold_dim_matrix` :: `test_sae_manifold_fits_each_topology_dimension_pair[1-euclidean]`
 - **FAIL** `python::tests/test_sae_manifold_accuracy_oos` :: `test_sae_manifold_oos_reconstruction_idempotence`
-- **ABORT** `python::tests/test_sae_manifold_duchon_euclidean_issue` :: `test_sae_manifold_fit_duchon_atom_dim_succeeds[1]`
+- **ABORT** `python::tests/test_sae_manifold_dim_matrix` :: `test_sae_manifold_fits_each_topology_dimension_pair[2-sphere]`
 - **FAIL** `python::tests/test_sae_manifold_accuracy_oos` :: `test_near_duplicate_training_input_takes_oos_path_not_cache`
-- **FAIL** `python::tests/test_sae_manifold_duchon_euclidean_issue` :: `test_sae_manifold_fit_duchon_atom_dim_succeeds[3]`
+- **ABORT** `python::tests/test_sae_manifold_duchon_euclidean_issue` :: `test_sae_manifold_fit_duchon_atom_dim_succeeds[2]`
 - **ABORT** `python::tests/test_sae_manifold_duchon_euclidean_issue` :: `test_sae_manifold_fit_duchon_1d_builds_primary_penalty`
 - **FAIL** `python::tests/test_sae_manifold_duchon_euclidean_issue` :: `test_euclidean_atom_is_not_thin_plate`
 - **ABORT** `python::tests/test_sae_manifold_euclidean_k4_oos_issue_1132` :: `test_euclidean_k4_fit_and_oos_reconstruct_issue_1132`
-- **ABORT** `python::tests/test_sae_manifold_multi_topology` :: `test_single_atom_recovers_each_supported_topology[sphere]`
+- **ABORT** `python::tests/test_sae_manifold_multi_topology` :: `test_single_atom_recovers_each_supported_topology[euclidean]`
 - **FAIL** `python::tests/test_sae_manifold_oos_noise_sweep` :: `test_periodic_atom_oos_r2_noise_sweep[0.01]`
 - **FAIL** `python::tests/test_sae_manifold_oos_noise_sweep` :: `test_periodic_atom_oos_r2_noise_sweep[0.05]`
-- **FAIL** `python::tests/test_sae_manifold_oos_noise_sweep` :: `test_periodic_atom_oos_r2_noise_sweep[0.1]`
-- **FAIL** `python::tests/test_sae_manifold_row_loss_weights_1062` :: `test_uniform_weights_match_unweighted`
-- **FAIL** `python::tests/test_sae_manifold_sphere_pole_stability` :: `test_sphere_atom_stable_at_poles`
-- **FAIL** `python::tests/test_sae_manifold_row_loss_weights_1062` :: `test_row_weights_pull_fit_toward_upweighted_rows`
+- **ABORT** `python::tests/test_sae_manifold_ordered_beta_bernoulli_prior_saturation` :: `test_reml_keeps_k1_winner_under_saturation`
+- **FAIL** `python::tests/test_sample_smoothing_corrected_coverage` :: `test_sample_mean_intervals_cover_like_predict[binomial]`
+- **ABORT** `python::tests/test_smooth_lr_pvalue_calibration` :: `test_smooth_lr_is_sized_and_keeps_its_power[gaussian_n200]`
+- **FAIL** `python::tests/test_sample_smoothing_corrected_coverage` :: `test_sample_mean_intervals_cover_like_predict[poisson]`
 - **FAIL** `python::tests/test_survival_marginal_slope_large_scale_hard` :: `test_survival_marginal_slope_large_scale_startup_seeds_do_not_all_reject`
-- **ABORT** `python::tests/test_examples_sae_supervised` :: `test_sae_supervised_predicts_on_training_X`
-- **ABORT** `python::tests/test_sae_manifold_dim_matrix` :: `test_sae_manifold_fits_each_topology_dimension_pair[2-sphere]`
+- **ABORT** `python::tests/test_sae_manifold_duchon_euclidean_issue` :: `test_sae_manifold_fit_duchon_atom_dim_succeeds[1]`
 - **FAIL** `python::tests/test_sae_manifold_duchon_euclidean_issue` :: `test_sae_manifold_fit_multi_atom_duchon_mix`
 - **FAIL** `python::tests/test_sae_manifold_multi_topology` :: `test_single_atom_recovers_each_supported_topology[periodic]`
-- **ABORT** `python::tests/test_smooth_lr_pvalue_calibration` :: `test_smooth_lr_is_sized_and_keeps_its_power[gaussian_n200]`
 - **ABORT** `python::tests/test_sae_manifold_multi_topology` :: `test_single_atom_recovers_each_supported_topology[duchon]`
-- **ABORT** `python::tests/test_examples_sae_supervised` :: `test_sae_supervised_oos_predict_runs_the_frozen_decoder_encoder`
+- **FAIL** `python::tests/test_sae_manifold_capacity` :: `test_penalized_quasi_laplace_picks_k1_on_one_harmonic_data`
+- **ABORT** `python::tests/test_examples_sae_supervised` :: `test_sae_supervised_predicts_on_training_X`
+- **FAIL** `python::tests/test_sae_oos_returns_converged_latents_issue_1229` :: `test_oos_returned_assignments_reconstruct_the_returned_fitted`
+- **FAIL** `python::tests/test_sae_manifold_duchon_euclidean_issue` :: `test_sae_manifold_fit_duchon_atom_dim_succeeds[3]`
 - **FAIL** `python::tests/torch/test_basis_evaluators_match_rust` :: `test_basis_evaluators_match_rust`
 - **FAIL** `python::tests/torch/test_gated_sae_decoder_atoms_match_rust` :: `test_gated_sae_decoder_atoms_match_rust`
 - **FAIL** `python::tests/torch/test_gated_sae_decoder_heaviside_contract` :: `test_python_decode_matches_heaviside_reference`
