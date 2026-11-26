@@ -33,6 +33,14 @@
 //!   refine rounds → off-optimum refusal) without contracting: the
 //!   synthetic projector was never the trigger, and channel separation is
 //!   NOT load-bearing against the production-shaped one.
+//! - That refusal is BUDGET-INDEPENDENT: inner budgets 60 / 240 / 960 all
+//!   refuse with the same stall kind, the KKT gradient norm frozen to six
+//!   digits (‖g‖ = 2.357e-2, ~525× over tolerance), the objective frozen
+//!   at 9.717682, and sizes `[3, 3]` at every rung. The walk is at a fixed
+//!   point of its own dynamics (both line-search families find zero
+//!   band-material drop on all 20 finite trials) — "raise the budget" is
+//!   not a remedy for this arm; the fail-closed refusal is the stable
+//!   behavior.
 //!
 //! These tests PIN the current behavior so any change (#4611's remedies:
 //! per-evaluation freeze, entry-state-derived rank, or a contraction
@@ -42,7 +50,7 @@
 use super::*;
 use crate::basis::EuclideanPatchEvaluator;
 use gam_terms::latent::LatentManifold;
-use ndarray::{Array2, array};
+use ndarray::{Array1, Array2, array};
 use std::sync::Arc;
 
 const LO: f64 = -1.0;
@@ -180,17 +188,12 @@ fn run_criterion(
     .map_err(|err| err.to_string())
 }
 
-/// #4611 — the 11-12 configuration (planted rank-1 projector on atom B's
-/// top data-Gram direction, blurred decoder B) currently REFUSES at this
-/// budget without contracting: the objective stalls for 3 consecutive
-/// refine rounds and the lane declines to rank an off-optimum criterion.
-/// The synthetic projector is NOT the mid-fit contraction trigger on
-/// current bytes.
-#[test]
-fn planted_projector_blurred_refuses_without_contracting_4611() {
+/// The planting discipline of #4609/#4610: converge an identity-gram probe
+/// first, then return the top eigenvector of atom B's FITTED decoder gram —
+/// the direction the data itself supports best, so the planted projector
+/// `I − vvᵀ` removes exactly the data-favorite direction from the penalty.
+fn planted_projector_direction() -> Array1<f64> {
     let eye = |width: usize| Array2::<f64>::eye(width);
-    // Converge an identity-gram probe first so the projector rides the top
-    // eigenvector of the FITTED gram (the planting discipline of #4609/#4610).
     let (mut probe, probe_target, probe_rho) =
         two_atom_fixture_open_decoder_b(&blurred_decoder_b(), eye);
     probe
@@ -225,9 +228,13 @@ fn planted_projector_blurred_refuses_without_contracting_4611() {
         .max_by(|x, y| x.1.partial_cmp(y.1).expect("finite eigenvalues"))
         .expect("the gram has a spectrum")
         .0;
-    let v = evecs.column(top).to_owned();
+    evecs.column(top).to_owned()
+}
 
-    let (mut term, target, rho) = two_atom_fixture_open_decoder_b(&blurred_decoder_b(), |width| {
+/// The planted-projector fixture: atom B's roughness Gram is `I − vvᵀ`
+/// with `v` the fitted gram's top direction.
+fn planted_projector_fixture(v: &Array1<f64>) -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
+    two_atom_fixture_open_decoder_b(&blurred_decoder_b(), |width| {
         let mut planted = Array2::<f64>::eye(width);
         for i in 0..width {
             for j in 0..width {
@@ -235,7 +242,19 @@ fn planted_projector_blurred_refuses_without_contracting_4611() {
             }
         }
         planted
-    });
+    })
+}
+
+/// #4611 — the 11-12 configuration (planted rank-1 projector on atom B's
+/// top data-Gram direction, blurred decoder B) currently REFUSES at this
+/// budget without contracting: the objective stalls for 3 consecutive
+/// refine rounds and the lane declines to rank an off-optimum criterion.
+/// The synthetic projector is NOT the mid-fit contraction trigger on
+/// current bytes.
+#[test]
+fn planted_projector_blurred_refuses_without_contracting_4611() {
+    let v = planted_projector_direction();
+    let (mut term, target, rho) = planted_projector_fixture(&v);
     let outcome = run_criterion(&mut term, &target, &rho);
     let refusal = outcome.expect_err(
         "the planted-projector arm currently refuses (objective stalled across refine rounds); \
@@ -306,6 +325,51 @@ fn tps_stiff_contracted_midfit_blurred_dose_response_4611() {
             sizes_again,
             vec![1, 2],
             "kappa={kappa:.0e}: the contraction must persist across criterion calls"
+        );
+    }
+}
+
+/// #4611 — the planted-projector arm's refusal is BUDGET-INDEPENDENT: at
+/// inner budgets 60 / 240 / 960 (16× the shipped one) the walk refuses with
+/// the same stall kind ("objective stalled for 3 consecutive refine
+/// rounds"), the KKT gradient norm is frozen to six digits (‖g‖ = 2.357e-2
+/// → 2.3567e-2, still ~525× over tolerance), the objective is frozen at
+/// 9.717682, and neither atom contracts at any rung. The walk is at a fixed
+/// point of its own dynamics — both line-search families (orbit gauge and
+/// ambient) find zero band-material objective drop on all 20 finite trials
+/// — NOT a slow grind that more iterations would resolve. "Raise the
+/// budget" is not a remedy for this arm; the fail-closed refusal is the
+/// stable behavior on current bytes.
+#[test]
+fn planted_projector_refusal_budget_independent_4611() {
+    let v = planted_projector_direction();
+    for budget in [60usize, 240, 960] {
+        let (mut term, target, rho) = planted_projector_fixture(&v);
+        let outcome = term.penalized_quasi_laplace_criterion_with_cache(
+            target.view(),
+            &rho,
+            None,
+            budget,
+            0.4,
+            1.0e-8,
+            1.0e-8,
+        );
+        let refusal = outcome.map_err(|err| err.to_string()).expect_err(&format!(
+            "budget={budget}: the planted-projector arm refuses at every inner budget; \
+                 if it now converges, re-measure the verdict and update #4611"
+        ));
+        assert!(
+            refusal.contains("did not converge"),
+            "budget={budget}: unexpected refusal kind: {refusal}"
+        );
+        assert!(
+            refusal.contains("objective stalled"),
+            "budget={budget}: expected the stall refusal kind: {refusal}"
+        );
+        assert_eq!(
+            (term.atoms[0].basis_size(), term.atoms[1].basis_size()),
+            (3, 3),
+            "budget={budget}: the planted-projector arm must not contract at any budget"
         );
     }
 }
