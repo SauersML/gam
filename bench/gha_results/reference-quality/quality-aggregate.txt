@@ -3,15 +3,15 @@ complete case manifest: /tmp/quality-report/quality_cases.txt (437 cases)
 === #1561 whole-suite quality meta-gate ===
 category        n scored GAMwin REFwin   medlogR  p(1-sided)      p_BH
 factors         1      1      0      1    0.0173      1.0000    1.0000
-families       51     51     33     18   -0.0055      0.0027    0.0162
+families       50     50     31     19   -0.0069      0.0043    0.0258
 manifolds      11     11      8      2   -0.0033      0.0527    0.0945
 misc           29     29     18     11   -0.0006      0.0630    0.0945
-smooths        39     39     23     16   -0.0058      0.0222    0.0665
+smooths        40     40     24     16   -0.0079      0.0134    0.0403
 survival       12     12      7      5   -0.0092      0.2349    0.2818
 ------------------------------------------------------------------------
-OVERALL       143    143     89     53   -0.0045      0.0000 
+OVERALL       143    143     88     54   -0.0055      0.0000 
 
-CLOSURE (exact per-case p<0.05, negative median, valid metrics, complete successful execution): FAIL (p=0.0000, median log(gam/ref)=-0.0045, wins 89 / losses 53)
+CLOSURE (exact per-case p<0.05, negative median, valid metrics, complete successful execution): FAIL (p=0.0000, median log(gam/ref)=-0.0055, wins 88 / losses 54)
 Experimental units: 143 cases from 184 metric pairs.
 INCOMPLETE: absent manifest, mismatched execution, or failed cases; closure blocked.
 
@@ -19,11 +19,11 @@ INCOMPLETE: absent manifest, mismatched execution, or failed cases; closure bloc
 category     executed  failed  emitting
 calibration         8       0         0
 factors             2       0         1
-families           90       5        51
+families           90       5        50
 manifolds          11       0        11
 misc              247       7        29
 regressions         3       0         0
-smooths            49       6        39
+smooths            49       6        40
 survival           27       3        12
 
 SILENT ATTRITION: 11 test(s) failed BEFORE emitting a pair (excluded from the significance set):
