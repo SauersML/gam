@@ -3,7 +3,7 @@ complete case manifest: /tmp/quality-report/quality_cases.txt (437 cases)
 === #1561 whole-suite quality meta-gate ===
 category        n scored GAMwin REFwin   medlogR  p(1-sided)      p_BH
 factors         1      1      0      1    0.0173      1.0000    1.0000
-families       50     50     31     19   -0.0069      0.0039    0.0235
+families       50     50     31     19   -0.0069      0.0040    0.0243
 manifolds      11     11      8      2   -0.0033      0.0527    0.0919
 misc           27     27     17     10   -0.0006      0.0613    0.0919
 smooths        38     38     23     15   -0.0079      0.0142    0.0427
