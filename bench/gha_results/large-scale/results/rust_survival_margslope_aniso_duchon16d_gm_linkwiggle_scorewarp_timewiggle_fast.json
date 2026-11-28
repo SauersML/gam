@@ -1,9 +1,9 @@
 {
-  "created_at_utc": "2026-11-27T18:02:22.656941+00:00",
+  "created_at_utc": "2026-11-28T16:47:14.875399+00:00",
   "status": "timeout",
   "method": "rust_survival_margslope_aniso_duchon16d_gm_linkwiggle_scorewarp_timewiggle_fast",
   "dataset": "survival",
   "family": "survival",
   "timeout_sec": 2400,
-  "error": "[HEARTBEAT] command-timeout rc=124 timeout_sec=2400 pid=3060 cmd='/home/runner/work/gam/gam/target/release/gam -v fit --survival-likelihood marginal-slope ...'"
+  "error": "[HEARTBEAT] command-timeout rc=124 timeout_sec=2400 pid=2581 cmd='/home/runner/work/gam/gam/target/release/gam -v fit --survival-likelihood marginal-slope ...'"
 }
