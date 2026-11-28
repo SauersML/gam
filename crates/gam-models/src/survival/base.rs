@@ -2313,6 +2313,121 @@ impl WorkingModelSurvival {
         self.age_exit.len()
     }
 
+    /// Whether any weighted row enters after the time origin (left truncation).
+    /// Such a row adds `−w·exp(η_entry)·x_entry x_entryᵀ` to the Hessian, so
+    /// the inner penalized objective need not be convex and can have more than
+    /// one mode at one ρ (#4589).
+    pub(crate) fn has_delayed_entry(&self) -> bool {
+        self.entry_at_origin
+            .iter()
+            .zip(self.sampleweight.iter())
+            .any(|(&at_origin, &w)| w > 0.0 && !at_origin)
+    }
+
+    /// The exponential-baseline start of a structurally monotone time block: a
+    /// constant hazard at its maximum-likelihood rate, with every other
+    /// coefficient at zero (#4589).
+    ///
+    /// The time coefficients `a` give the log cumulative hazard a unit slope in
+    /// `log t`: they are the least-squares solution of `t·(D a + o_D) = 1` over
+    /// the weighted exit rows, with `D` the exit derivative design of the time
+    /// block and `o_D` its offset. The solution is exact when the block
+    /// reproduces `1/t − o_D` on those rows. With no offset that is a block that
+    /// spans `log t`, as the structural I-spline block does. Otherwise the
+    /// hazard at the start is the nearest to constant in that least-squares
+    /// sense.
+    ///
+    /// `intercept_column` must be a column of ones in the entry and exit
+    /// designs. It takes the level `c` at which the likelihood is stationary in
+    /// the constant, `exp(c) = Σ w δ / Σ w (exp(u_exit) − exp(u_entry))`: the
+    /// events over the exposure, with `u` the predictor at `a` alone and the
+    /// entry term on the delayed-entry rows only.
+    ///
+    /// `None` when the block has no such start: it is not structurally
+    /// monotone, the structural columns are not the time block, the
+    /// least-squares system is singular, a component of `a` is not strictly
+    /// inside the cone, or the data hold no event or no exposure. The rows are
+    /// not checked one by one: the solve that takes the start rejects one whose
+    /// cumulative hazard decreases over a row.
+    pub(crate) fn exponential_baseline_start(
+        &self,
+        intercept_column: usize,
+    ) -> Option<Array1<f64>> {
+        use gam_linalg::faer_ndarray::FaerCholesky;
+        let p = self.coefficient_dim();
+        let p_time = self.structural_time_columns;
+        if !self.structurally_monotonic || !(p_time..p).contains(&intercept_column) {
+            return None;
+        }
+        let time_derivative = match &self.design {
+            SurvivalDesign::Flat { x_derivative, .. } => x_derivative,
+            SurvivalDesign::TimeCovariateShared {
+                time_derivative, ..
+            } => time_derivative,
+        };
+        if p_time > time_derivative.ncols() {
+            return None;
+        }
+        // Rows the likelihood skips take no part: their row and target are zero.
+        let row_scale = Array1::from_shape_fn(self.nrows(), |i| {
+            if self.sampleweight[i] > 0.0 {
+                self.age_exit[i]
+            } else {
+                0.0
+            }
+        });
+        let mut log_time_slope = time_derivative.slice(ndarray::s![.., ..p_time]).to_owned();
+        for (mut row, &scale) in log_time_slope.outer_iter_mut().zip(row_scale.iter()) {
+            row *= scale;
+        }
+        let target = Array1::from_shape_fn(self.nrows(), |i| {
+            if self.sampleweight[i] > 0.0 {
+                1.0 - row_scale[i] * self.offset_derivative_exit[i]
+            } else {
+                0.0
+            }
+        });
+        let direction = log_time_slope
+            .t()
+            .dot(&log_time_slope)
+            .cholesky(faer::Side::Lower)
+            .ok()?
+            .solvevec(&log_time_slope.t().dot(&target));
+        if !direction.iter().all(|&a| a.is_finite() && a > 0.0) {
+            return None;
+        }
+        let mut start = Array1::<f64>::zeros(p);
+        start.slice_mut(ndarray::s![..p_time]).assign(&direction);
+        let eta_exit = self.exit_dot(&start) + &self.offset_eta_exit;
+        let eta_entry = self.entry_dot(&start) + &self.offset_eta_entry;
+        // The exposure is taken relative to the largest exit predictor, so a
+        // large common offset neither overflows nor underflows the exponentials.
+        let reference = (0..self.nrows())
+            .filter(|&i| self.sampleweight[i] > 0.0)
+            .fold(f64::NEG_INFINITY, |acc, i| acc.max(eta_exit[i]));
+        let mut events = 0.0;
+        let mut exposure = 0.0;
+        for i in 0..self.nrows() {
+            let w = self.sampleweight[i];
+            if w <= 0.0 {
+                continue;
+            }
+            events += w * f64::from(self.event_target[i]);
+            exposure += w * if self.entry_at_origin[i] {
+                (eta_exit[i] - reference).exp()
+            } else {
+                // `exp(exit) − exp(entry)`, without cancellation on a short row.
+                (eta_entry[i] - reference).exp() * (eta_exit[i] - eta_entry[i]).exp_m1()
+            };
+        }
+        let level = events.ln() - exposure.ln() - reference;
+        if !level.is_finite() {
+            return None;
+        }
+        start[intercept_column] = level;
+        Some(start)
+    }
+
     /// The λ-selection domain of the active penalty blocks (#2812): per block,
     /// the resolvability interval of the block's penalty against the exit
     /// design's Gram on the block's columns. Below the lower edge the block is
@@ -4910,6 +5025,139 @@ mod tests {
             .update_state(&beta)
             .expect("a censored row at a zero structural derivative is feasible");
         assert!(state.deviance.is_finite(), "deviance {}", state.deviance);
+    }
+
+    /// A structural model on the time block `[log(t/(1+t)), log(1+t)]`, whose
+    /// columns sum to `log t`, with an intercept in column 2 and a covariate in
+    /// column 3. The derivative offset `0.1/t` leaves the block a slope of `0.9`
+    /// in `log t`. The last row has weight zero, and its derivative offset is
+    /// off that curve. `eta_offset_shift` moves every predictor offset.
+    fn log_time_block_model(
+        age_entry: Array1<f64>,
+        event_target: Array1<u8>,
+        structural: bool,
+        eta_offset_shift: f64,
+    ) -> WorkingModelSurvival {
+        let age_exit = array![1.4_f64, 1.0, 2.0, 1.1, 40.0];
+        let event_competing = Array1::<u8>::zeros(5);
+        let sampleweight = array![1.0_f64, 2.5, 0.7, 1.3, 0.0];
+        let covariate = array![0.4_f64, -1.1, 0.8, 0.2, 3.0];
+        let mut x_entry = Array2::<f64>::zeros((5, 4));
+        let mut x_exit = Array2::<f64>::zeros((5, 4));
+        let mut x_derivative = Array2::<f64>::zeros((5, 4));
+        for i in 0..5 {
+            let entry = age_entry[i].max(1e-8);
+            let exit = age_exit[i];
+            x_entry.row_mut(i).assign(&array![
+                (entry / (1.0 + entry)).ln(),
+                entry.ln_1p(),
+                1.0,
+                covariate[i]
+            ]);
+            x_exit.row_mut(i).assign(&array![
+                (exit / (1.0 + exit)).ln(),
+                exit.ln_1p(),
+                1.0,
+                covariate[i]
+            ]);
+            x_derivative[[i, 0]] = 1.0 / (exit * (1.0 + exit));
+            x_derivative[[i, 1]] = 1.0 / (1.0 + exit);
+        }
+        let o_entry = array![0.2_f64, 0.0, 0.1, 0.05, 0.3] + eta_offset_shift;
+        let o_exit = array![0.4_f64, 0.5, 0.7, 0.3, 0.9] + eta_offset_shift;
+        let mut o_deriv = age_exit.mapv(|t| 0.1 / t);
+        o_deriv[4] = 0.5;
+        let mut model = survival_model_with_offsets(
+            survival_inputs(
+                &age_entry,
+                &age_exit,
+                &event_target,
+                &event_competing,
+                &sampleweight,
+                &x_entry,
+                &x_exit,
+                &x_derivative,
+            ),
+            Some(SurvivalBaselineOffsets {
+                eta_entry: o_entry.view(),
+                eta_exit: o_exit.view(),
+                derivative_exit: o_deriv.view(),
+            }),
+            PenaltyBlocks::new(Vec::new()),
+            SurvivalMonotonicityPenalty { tolerance: 0.0 },
+            SurvivalSpec::Net,
+        )
+        .expect("model build");
+        if structural {
+            model
+                .set_structural_monotonicity(true, 2)
+                .expect("structural monotonicity");
+        }
+        model
+    }
+
+    /// The exponential-baseline start gives the log cumulative hazard a unit
+    /// slope in `log t`, and its level is the one where the model's own gradient
+    /// is zero in the intercept. The zero-weight row, an event with a long
+    /// exposure and its own derivative offset, moves neither. A common predictor
+    /// offset that would overflow or underflow `exp` moves only the level
+    /// (#4589).
+    #[test]
+    fn exponential_baseline_start_is_a_unit_log_time_slope_at_its_stationary_level_4589() {
+        for eta_offset_shift in [0.0, -744.0, 800.0] {
+            let model = log_time_block_model(
+                array![0.5, 0.0, 0.3, 0.9, 0.2],
+                array![1u8, 1u8, 0u8, 1u8, 1u8],
+                true,
+                eta_offset_shift,
+            );
+            assert!(model.has_delayed_entry());
+            let start = model.exponential_baseline_start(2).expect("start");
+            assert!((start[0] - 0.9).abs() < 1e-9, "a[0]={:.12e}", start[0]);
+            assert!((start[1] - 0.9).abs() < 1e-9, "a[1]={:.12e}", start[1]);
+            assert_eq!(start[3], 0.0);
+            let state = model.update_state(&start).expect("state");
+            assert!(
+                state.gradient[2].abs() < 1e-9,
+                "intercept gradient at the start, offset shift {eta_offset_shift}: {:.3e}",
+                state.gradient[2]
+            );
+        }
+    }
+
+    #[test]
+    fn exponential_baseline_start_needs_a_structural_block_an_intercept_and_an_event_4589() {
+        let entry = array![0.5, 0.0, 0.3, 0.9, 0.2];
+        let events = array![1u8, 1u8, 0u8, 1u8, 1u8];
+        let structural = log_time_block_model(entry.clone(), events.clone(), true, 0.0);
+        // Column 1 is in the time block and column 4 does not exist.
+        assert!(structural.exponential_baseline_start(1).is_none());
+        assert!(structural.exponential_baseline_start(4).is_none());
+        assert!(
+            log_time_block_model(entry.clone(), events, false, 0.0)
+                .exponential_baseline_start(2)
+                .is_none()
+        );
+        // The only event left is on the zero-weight row.
+        assert!(
+            log_time_block_model(entry, array![0u8, 0u8, 0u8, 0u8, 1u8], true, 0.0)
+                .exponential_baseline_start(2)
+                .is_none()
+        );
+    }
+
+    /// A delayed entry on a zero-weight row is not in the likelihood (#4589).
+    #[test]
+    fn delayed_entry_counts_weighted_rows_only_4589() {
+        let events = array![1u8, 1u8, 0u8, 1u8, 1u8];
+        assert!(
+            !log_time_block_model(array![0.0, 0.0, 0.0, 0.0, 0.2], events.clone(), true, 0.0)
+                .has_delayed_entry()
+        );
+        assert!(
+            log_time_block_model(array![0.0, 0.0, 0.3, 0.0, 0.0], events, true, 0.0)
+                .has_delayed_entry()
+        );
     }
 
     /// The delayed-entry objective's β-gradient and β-Hessian are the
